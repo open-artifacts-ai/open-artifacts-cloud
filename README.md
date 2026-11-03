@@ -24,7 +24,10 @@ pinned public release, with this tree copied on top.
 | `scripts/overlay.sh` | Builds the overlay: `overlay.sh <public-checkout> <private-dir>`. |
 | `scripts/sync-from-public.sh` | Copies the private paths from a public checkout: `sync-from-public.sh <public-checkout> [<dest>]`. |
 | `scripts/dev-overlay.sh` | Builds the overlay in a new local worktree, for agents: `dev-overlay.sh <new-dir>`. |
-| `scripts/overlay.test.sh` | Tests for the two scripts above, on throwaway repos. |
+| `scripts/ci-plan.sh` | CI: lists the private packages and every private test, and fails on a package without `test`/`typecheck` or a test nothing would run. |
+| `scripts/ci-public-tests.sh` | CI: runs private tests that live in public packages through that package's own vitest configs. |
+| `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
+| `hosted-workflows/` | Written by the sync: the hosted workflows, inert. GitHub never runs them from here; the cut-over PR moves them into `.github/workflows/`. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
 
 ## Overlay rules
@@ -44,9 +47,11 @@ pinned public release, with this tree copied on top.
    from public's root `package.json` and git, so they stay the public tag's.
    Private runs everything through `pnpm --filter`.
 5. **This repo's own files never overlay**: root-level files (this README,
-   PUBLIC_PIN, SYNCED_FROM, private-paths.txt), files directly in `scripts/`
-   (this tooling) and `.github/workflows/ci.yml` (this repo's CI; public has
-   its own). Everything else in the tree overlays, at the same path.
+   PUBLIC_PIN, SYNCED_FROM, private-paths.txt), the tooling scripts listed in
+   `TOOLING` in `overlay.sh`, `.github/workflows/ci.yml` (this repo's CI;
+   public has its own) and `hosted-workflows/`. Any other file directly in
+   `scripts/` fails the run. Everything else in the tree overlays, at the
+   same path.
 
 The overlay sits at the public checkout's root, not in a subfolder, because
 private code reads public files by relative path (the server's wrangler
@@ -74,8 +79,25 @@ One PR per bump:
 `scripts/sync-from-public.sh <public-checkout>` mirrors each listed path from
 the public checkout into this repo (old copies are removed first, only
 tracked public files are copied) and writes SYNCED_FROM. It refuses a dirty
-public checkout, a listed path public doesn't have, a root-level or `..`
-entry, and uncommitted changes under a listed path here.
+public checkout, a listed path public doesn't have, an absolute, root-level
+or `..` entry, and uncommitted changes under a listed path here.
+
+The sync never writes under `.github/workflows/`. A listed hosted workflow
+lands in `hosted-workflows/` instead: several run on a schedule or on
+`workflow_run`, and must not start here before the cut-over. The cut-over PR
+moves them into `.github/workflows/` by hand.
+
+## What CI runs
+
+`scripts/ci-plan.sh` reads this repo's tracked files and makes three sets:
+the private packages (each must define `test` and `typecheck`; CI runs them
+one by one and logs each), the root-vitest tests in `scripts/ci` and
+`scripts/ops`, and every other `*.test.ts`. That last set is private tests
+inside public packages (auth-broker's platform-ticket, server's
+mcp-sdk-iserror, ...); `scripts/ci-public-tests.sh` runs each through its
+owning package's vitest, under whichever of that package's test configs
+include it. A test with no owning package, or one no config includes, fails
+CI. So does an empty tree once SYNCED_FROM exists.
 
 Until the public repo deletes its hosted code, the pinned tag still contains
 every private path, so an overlay of a synced tree on that tag collides on

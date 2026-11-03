@@ -16,13 +16,18 @@
 #   4. Private ships no root package.json, so VERSION and COMMIT stay the
 #      public tag's.
 #   5. This repo's own files never overlay: root-level files (README.md,
-#      PUBLIC_PIN, SYNCED_FROM, private-paths.txt, ...), files directly in
-#      scripts/ (this tooling) and .github/workflows/ci.yml (this repo's CI).
+#      PUBLIC_PIN, SYNCED_FROM, private-paths.txt, ...), the tooling listed in
+#      TOOLING below, .github/workflows/ci.yml (this repo's CI) and
+#      hosted-workflows/ (inert copies of the hosted workflows, until the
+#      cut-over). Any other file directly in scripts/ fails the run: it is
+#      neither tooling nor a path public could hold.
 #
 # Exit 0 on success, 1 on a rule failure, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "overlay: $*" >&2; exit 1; }
+# This repo's tooling, directly in scripts/. Rule 5: it never overlays.
+TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh "
 [ "$#" -eq 2 ] || { echo "usage: overlay.sh <public-checkout-dir> <private-dir>" >&2; exit 2; }
 
 PUB=$(cd "$1" 2> /dev/null && pwd) || die "public checkout not found: $1"
@@ -68,6 +73,7 @@ fi
 overlay=$(mktemp) || die "mktemp failed"
 trap 'rm -f "$list" "$overlay"' EXIT
 lock=no
+strays=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   # git ls-files -co can list a tracked file deleted in the work tree.
@@ -80,11 +86,20 @@ while IFS= read -r f; do
   case "$f" in
     .git/* | */.git/* | node_modules/* | */node_modules/*) continue ;;
     .github/workflows/ci.yml) continue ;;   # Rule 5: this repo's CI
+    hosted-workflows/*) continue ;;         # Rule 5: inert until the cut-over
     scripts/*/*) ;;
-    scripts/*) continue ;;                  # Rule 5: this repo's tooling
+    scripts/*)
+      case "$TOOLING" in
+        *" ${f#scripts/} "*) continue ;;    # Rule 5: this repo's tooling
+      esac
+      echo "overlay: unknown file directly in scripts/: $f (not in TOOLING)" >&2
+      strays=$((strays + 1))
+      continue
+      ;;
   esac
   printf '%s\n' "$f" >> "$overlay"
 done < "$list"
+[ "$strays" -eq 0 ] || die "$strays unknown file(s) directly in scripts/; nothing was copied"
 
 # --- Rule 2: collisions, all reported, before any copy -----------------------
 collisions=0

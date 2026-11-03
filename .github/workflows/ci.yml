@@ -63,60 +63,76 @@ jobs:
       - name: pnpm install
         working-directory: public
         run: pnpm install --frozen-lockfile
-      # The private packages: workspace packages (apps/*, packages/*, scripts/*,
-      # tests/*) whose package.json is in this repo's tree.
+      # What to build and test, from this repo's tracked files: private
+      # packages, root-vitest tests (scripts/ci, scripts/ops) and private tests
+      # inside public packages. Fails on a package without test or typecheck,
+      # a test with no owning package, or an empty tree after the sync.
       - id: pkgs
-        name: list private packages
+        name: plan (private packages and tests)
+        env:
+          PLAN: ${{ runner.temp }}/plan
         run: |
           set -euo pipefail
-          files=$(git -C private ls-files)
-          dirs=$( (grep -E '^(apps|packages|scripts|tests)/[^/]+/package\.json$' <<< "$files" || true) | sed 's|/package\.json$||')
-          # Root-vitest tests (scripts/ci, scripts/ops) that this repo owns.
-          tests=$( (grep -E '^scripts/(ci|ops)/[^/]+\.test\.ts$' <<< "$files" || true) | tr '\n' ' ')
-          build="" only="" count=0
-          while read -r d; do
-            [ -n "$d" ] || continue
-            build="$build --filter {./$d}..."; only="$only --filter ./$d"; count=$((count + 1))
-          done <<< "$dirs"
-          {
-            echo "count=$count"
-            echo "build=$build"
-            echo "only=$only"
-            echo "tests=$tests"
-          } >> "$GITHUB_OUTPUT"
-          echo "private packages ($count):"; printf '%s\n' "$dirs"
+          private/scripts/ci-plan.sh public private "$PLAN"
+          echo "count=$(grep -c '' "$PLAN/packages.txt" || true)" >> "$GITHUB_OUTPUT"
+          echo "dir=$PLAN" >> "$GITHUB_OUTPUT"
       - name: no private packages yet
         if: ${{ steps.pkgs.outputs.count == '0' }}
-        run: echo "::warning::No private packages in this tree yet (before the sync). Build, typecheck and test are skipped."
+        run: |
+          if [ -f private/SYNCED_FROM ]; then
+            echo "::error::SYNCED_FROM exists but there are no private packages; the job must not pass empty"
+            exit 1
+          fi
+          echo "::warning::No private packages in this tree yet (before the sync). Build, typecheck and test are skipped."
       - name: build
         if: ${{ steps.pkgs.outputs.count != '0' }}
         working-directory: public
         env:
-          FILTERS: ${{ steps.pkgs.outputs.build }}
+          PLAN: ${{ steps.pkgs.outputs.dir }}
         run: |
-          read -ra f <<< "$FILTERS"
+          set -euo pipefail
+          f=()
+          while IFS= read -r d; do f+=(--filter "{./$d}..."); done < "$PLAN/packages.txt"
           pnpm -r --if-present "${f[@]}" build
+      # Each private package must define typecheck and test (ci-plan checks);
+      # run them one by one, without --if-present, so each one visibly runs.
       - name: typecheck
         if: ${{ steps.pkgs.outputs.count != '0' }}
         working-directory: public
         env:
-          FILTERS: ${{ steps.pkgs.outputs.only }}
+          PLAN: ${{ steps.pkgs.outputs.dir }}
         run: |
-          read -ra f <<< "$FILTERS"
-          pnpm -r --if-present "${f[@]}" typecheck
+          set -euo pipefail
+          while IFS= read -r d; do
+            echo "::group::typecheck $d"
+            pnpm --filter "./$d" run typecheck
+            echo "::endgroup::"
+            echo "typecheck ran: $d"
+          done < "$PLAN/packages.txt"
       - name: test (private packages)
         if: ${{ steps.pkgs.outputs.count != '0' }}
         working-directory: public
         env:
-          FILTERS: ${{ steps.pkgs.outputs.only }}
+          PLAN: ${{ steps.pkgs.outputs.dir }}
         run: |
-          read -ra f <<< "$FILTERS"
-          pnpm -r --if-present --workspace-concurrency=1 "${f[@]}" test
+          set -euo pipefail
+          while IFS= read -r d; do
+            echo "::group::test $d"
+            pnpm --filter "./$d" run test
+            echo "::endgroup::"
+            echo "test ran: $d"
+          done < "$PLAN/packages.txt"
       - name: test (private scripts/ci and scripts/ops)
-        if: ${{ steps.pkgs.outputs.tests != '' }}
         working-directory: public
         env:
-          TESTS: ${{ steps.pkgs.outputs.tests }}
+          PLAN: ${{ steps.pkgs.outputs.dir }}
         run: |
-          read -ra t <<< "$TESTS"
+          set -euo pipefail
+          mapfile -t t < "$PLAN/root-tests.txt"
+          if [ "${#t[@]}" -eq 0 ]; then echo "no private root-vitest tests"; exit 0; fi
           pnpm exec vitest run "${t[@]}"
+      - name: test (private tests inside public packages)
+        working-directory: public
+        env:
+          PLAN: ${{ steps.pkgs.outputs.dir }}
+        run: ../private/scripts/ci-public-tests.sh . "$PLAN"

@@ -13,14 +13,30 @@
 # public's tracked files under it are copied. Only tracked files are copied,
 # never node_modules or build output.
 #
+# Workflows never go live here: a listed .github/workflows/<file> lands in
+# hosted-workflows/<file>, an inert directory GitHub does not run. Sync never
+# writes anything under .github/workflows/. Some hosted workflows run on a
+# schedule or on workflow_run, and must not start in this repo before the
+# cut-over; the cut-over PR moves them into .github/workflows/ by hand.
+#
 # Refuses: a dirty public checkout, a listed path public doesn't have, a list
-# entry that is absolute, has "..", or is a root-level file, and (when
+# entry that is absolute, has "..", is a root-level file, is
+# .github/workflows itself or is under hosted-workflows/, and (when
 # <dest-dir> is a git checkout) uncommitted changes under a listed path.
 #
 # Exit 0 on success, 1 on a refusal, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "sync: $*" >&2; exit 1; }
+# Where a public path lands in this repo: workflows go to the inert dir.
+WF=.github/workflows
+INERT=hosted-workflows
+dest_path() {
+  case "$1" in
+    "$WF"/*) printf '%s\n' "$INERT/${1#"$WF"/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
   echo "usage: sync-from-public.sh <public-checkout-dir> [<dest-dir>]" >&2
   exit 2
@@ -49,7 +65,7 @@ fi
 [ -f "$LIST" ] || die "no path list: $LIST"
 echo "sync: path list $list_name"
 
-paths=()
+paths=() dpaths=()
 while IFS= read -r line || [ -n "$line" ]; do
   p=${line%%#*}
   p=$(printf '%s' "$p" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
@@ -58,15 +74,18 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$p" in
     /*) die "absolute path in list: $p" ;;
     .. | ../* | */.. | */../*) die "'..' in list entry: $p" ;;
+    "$WF") die "list entry is $WF itself; list each hosted workflow file" ;;
+    "$INERT" | "$INERT"/*) die "list entry under $INERT/ (sync writes that dir): $p" ;;
     */*) ;;
     *) die "root-level entry in list: $p (private ships no root files)" ;;
   esac
   paths+=("$p")
+  dpaths+=("$(dest_path "$p")")
 done < "$LIST"
 [ "${#paths[@]}" -gt 0 ] || die "path list is empty"
 
 if git -C "$DEST" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
-  pending=$(git -C "$DEST" status --porcelain -- "${paths[@]}") || die "git status failed in $DEST"
+  pending=$(git -C "$DEST" status --porcelain -- "${dpaths[@]}") || die "git status failed in $DEST"
   [ -z "$pending" ] || die "uncommitted changes under listed paths in $DEST:
 $pending"
 fi
@@ -78,10 +97,21 @@ for p in "${paths[@]}"; do
   [ "$n" -gt 0 ] || die "public has no tracked files at $p ($src_sha)"
 done
 
-for p in "${paths[@]}"; do
+for p in "${dpaths[@]}"; do
   rm -rf "${DEST:?}/$p" || die "cannot clear $DEST/$p"
 done
-tar -C "$PUB" -cf - -T "$files" | tar -C "$DEST" -xf - || die "copy failed"
+plain=$(mktemp) || die "mktemp failed"
+trap 'rm -f "$files" "$plain"' EXIT
+grep -v "^\\.github/workflows/" "$files" > "$plain"
+if [ -s "$plain" ]; then
+  tar -C "$PUB" -cf - -T "$plain" | tar -C "$DEST" -xf - || die "copy failed"
+fi
+while IFS= read -r f; do
+  d=$(dest_path "$f")
+  mkdir -p "$DEST/$(dirname "$d")" || die "cannot create $DEST/$(dirname "$d")"
+  cp -P "$PUB/$f" "$DEST/$d" || die "copy failed: $f"
+  echo "sync: $f -> $d (inert until the cut-over)"
+done < <(grep "^\\.github/workflows/" "$files")
 
 {
   echo "# Written by scripts/sync-from-public.sh: the public commit the private"
