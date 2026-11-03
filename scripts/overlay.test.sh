@@ -14,6 +14,10 @@ G() { git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false
 pass=0 fail=0
 ok() { echo "ok   $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL $1" >&2; fail=$((fail + 1)); }
+check() { # name cmd...
+  local name=$1; shift
+  if "$@"; then ok "$name"; else bad "$name"; fi
+}
 expect_exit() { # name want cmd...
   local name=$1 want=$2; shift 2
   "$@" > "$T/out" 2>&1
@@ -50,21 +54,21 @@ mkpriv() { # dir pubdir
 # --- overlay: the happy path ---------------------------------------------------
 mkpub "$T/p1"; mkpriv "$T/v1" "$T/p1"
 expect_exit "overlay succeeds on a clean pinned checkout" 0 "$OVERLAY" "$T/p1" "$T/v1"
-[ "$(cat "$T/p1/apps/admin/src/index.ts" 2> /dev/null)" = admin ] && ok "private file overlaid" || bad "private file overlaid"
-[ "$(cat "$T/p1/.github/workflows/hosted.yml" 2> /dev/null)" = "hosted wf" ] && ok "private workflow overlaid" || bad "private workflow overlaid"
-[ "$(cat "$T/p1/pnpm-lock.yaml")" = merged-lock ] && ok "lockfile is the one overwrite" || bad "lockfile is the one overwrite"
-[ "$(cat "$T/p1/README.md")" = "public readme" ] && ok "root files never overlay" || bad "root files never overlay"
-[ "$(cat "$T/p1/.github/workflows/ci.yml")" = "public ci" ] && ok "this repo's ci.yml never overlays" || bad "this repo's ci.yml never overlays"
-[ ! -e "$T/p1/scripts/overlay.sh" ] && ok "scripts/ tooling never overlays" || bad "scripts/ tooling never overlays"
-[ ! -e "$T/p1/PUBLIC_PIN" ] && ok "PUBLIC_PIN never overlays" || bad "PUBLIC_PIN never overlays"
+check "private file overlaid" [ "$(cat "$T/p1/apps/admin/src/index.ts" 2> /dev/null)" = admin ]
+check "private workflow overlaid" [ "$(cat "$T/p1/.github/workflows/hosted.yml" 2> /dev/null)" = "hosted wf" ]
+check "lockfile is the one overwrite" [ "$(cat "$T/p1/pnpm-lock.yaml")" = merged-lock ]
+check "root files never overlay" [ "$(cat "$T/p1/README.md")" = "public readme" ]
+check "this repo's ci.yml never overlays" [ "$(cat "$T/p1/.github/workflows/ci.yml")" = "public ci" ]
+check "scripts/ tooling never overlays" [ ! -e "$T/p1/scripts/overlay.sh" ]
+check "PUBLIC_PIN never overlays" [ ! -e "$T/p1/PUBLIC_PIN" ]
 
 # --- overlay: refusals -----------------------------------------------------------
 mkpub "$T/p2"; mkpriv "$T/v2" "$T/p2"
 mkdir -p "$T/v2/apps/server"; echo 'shadow' > "$T/v2/apps/server/index.ts"
 expect_exit "collision fails" 1 "$OVERLAY" "$T/p2" "$T/v2"
-grep -q 'collision: apps/server/index.ts' "$T/out" && ok "collision is named" || bad "collision is named"
-[ ! -e "$T/p2/apps/admin/src/index.ts" ] && ok "nothing copied on collision" || bad "nothing copied on collision"
-[ "$(cat "$T/p2/apps/server/index.ts")" = server ] && ok "public file untouched on collision" || bad "public file untouched on collision"
+check "collision is named" grep -q 'collision: apps/server/index.ts' "$T/out"
+check "nothing copied on collision" [ ! -e "$T/p2/apps/admin/src/index.ts" ]
+check "public file untouched on collision" [ "$(cat "$T/p2/apps/server/index.ts")" = server ]
 
 mkpub "$T/p3"; mkpriv "$T/v3" "$T/p3"
 mkdir -p "$T/v3/apps/afile"; echo x > "$T/v3/apps/afile/y.ts"
@@ -85,7 +89,7 @@ expect_exit "modified public checkout fails" 1 "$OVERLAY" "$T/p6" "$T/v6"
 mkpub "$T/p7"; mkpriv "$T/v7" "$T/p7"
 echo x > "$T/p7/new.txt"; G -C "$T/p7" add -A; G -C "$T/p7" commit -qm more
 G -C "$T/p7" checkout -q v1
-G -C "$T/p7" tag -f v1 "$(git -C "$T/p7" rev-parse HEAD@{1})" > /dev/null 2>&1
+G -C "$T/p7" tag -f v1 "$(git -C "$T/p7" rev-parse "HEAD@{1}")" > /dev/null 2>&1
 expect_exit "moved tag fails" 1 "$OVERLAY" "$T/p7" "$T/v7"
 
 expect_exit "bad usage exits 2" 2 "$OVERLAY" "$T/p1"
@@ -95,16 +99,16 @@ mkpub "$T/s1"
 mkdir -p "$T/d1/scripts"; cp "$SYNC" "$T/d1/scripts/"; cp "$T/s1/list.txt" "$T/d1/private-paths.txt"
 mkdir -p "$T/d1/apps/hosted"; echo stale > "$T/d1/apps/hosted/stale.ts"
 expect_exit "sync succeeds" 0 "$T/d1/scripts/sync-from-public.sh" "$T/s1"
-[ "$(cat "$T/d1/apps/hosted/src/index.ts" 2> /dev/null)" = hosted ] && ok "sync copies a listed dir" || bad "sync copies a listed dir"
-[ ! -e "$T/d1/apps/hosted/stale.ts" ] && ok "sync mirrors (stale file removed)" || bad "sync mirrors (stale file removed)"
-[ ! -e "$T/d1/apps/server/index.ts" ] && ok "sync copies only listed paths" || bad "sync copies only listed paths"
-grep -qx "sha=$(git -C "$T/s1" rev-parse HEAD)" "$T/d1/SYNCED_FROM" && ok "SYNCED_FROM records the sha" || bad "SYNCED_FROM records the sha"
-grep -qx "tag=v1" "$T/d1/SYNCED_FROM" && ok "SYNCED_FROM records the tag" || bad "SYNCED_FROM records the tag"
+check "sync copies a listed dir" [ "$(cat "$T/d1/apps/hosted/src/index.ts" 2> /dev/null)" = hosted ]
+check "sync mirrors (stale file removed)" [ ! -e "$T/d1/apps/hosted/stale.ts" ]
+check "sync copies only listed paths" [ ! -e "$T/d1/apps/server/index.ts" ]
+check "SYNCED_FROM records the sha" grep -qx "sha=$(git -C "$T/s1" rev-parse HEAD)" "$T/d1/SYNCED_FROM"
+check "SYNCED_FROM records the tag" grep -qx "tag=v1" "$T/d1/SYNCED_FROM"
 
 mkdir -p "$T/s1/scripts/ci"; printf 'apps/hosted\n' > "$T/s1/scripts/ci/private-paths.txt"
 G -C "$T/s1" add -A; G -C "$T/s1" commit -qm list
 expect_exit "sync prefers public's list" 0 "$T/d1/scripts/sync-from-public.sh" "$T/s1" "$T/d1b"
-grep -qx "list=public:scripts/ci/private-paths.txt" "$T/d1b/SYNCED_FROM" && ok "public list recorded" || bad "public list recorded"
+check "public list recorded" grep -qx "list=public:scripts/ci/private-paths.txt" "$T/d1b/SYNCED_FROM"
 
 mkpub "$T/s2"
 mkdir -p "$T/d2/scripts"; cp "$SYNC" "$T/d2/scripts/"; printf 'package.json\n' > "$T/d2/private-paths.txt"

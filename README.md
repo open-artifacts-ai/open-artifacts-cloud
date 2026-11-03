@@ -88,7 +88,7 @@ to the release with the delete.
 scripts/dev-overlay.sh ~/code/oa-overlay-<task>
 cd ~/code/oa-overlay-<task>
 pnpm install --frozen-lockfile
-pnpm -r --filter "./apps/provisioning..." build
+pnpm -r --filter "{./apps/provisioning}..." build   # braces: deps included
 ```
 
 `OA_PUBLIC_REPO` (default `~/code/open-artifacts`) is the public clone the

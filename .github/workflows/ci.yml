@@ -76,7 +76,7 @@ jobs:
           build="" only="" count=0
           while read -r d; do
             [ -n "$d" ] || continue
-            build="$build --filter ./$d..."; only="$only --filter ./$d"; count=$((count + 1))
+            build="$build --filter {./$d}..."; only="$only --filter ./$d"; count=$((count + 1))
           done <<< "$dirs"
           {
             echo "count=$count"
