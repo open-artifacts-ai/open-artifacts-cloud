@@ -1,0 +1,122 @@
+name: CI
+# Builds and tests the private packages on the overlay: the public repo at
+# PUBLIC_PIN, with this repo copied on top by scripts/overlay.sh.
+# No secrets, no environments, no deploys: those come at the cut-over (#1056).
+on:
+  pull_request:
+  push:
+    branches: [main, scaffold]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: overlay and sync tests
+        run: scripts/overlay.test.sh
+
+  overlay:
+    runs-on: ubuntu-latest
+    env:
+      # Real-build tests fail instead of skipping when the build is missing.
+      OA_REQUIRE_REAL_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: private
+          persist-credentials: false
+      - id: pin
+        name: read PUBLIC_PIN
+        run: |
+          set -euo pipefail
+          tag=$(sed -n 's/^tag=//p' private/PUBLIC_PIN)
+          sha=$(sed -n 's/^sha=//p' private/PUBLIC_PIN)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::PUBLIC_PIN tag '$tag' is not vX.Y.Z"; exit 1; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::PUBLIC_PIN sha '$sha' is not a full sha"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: open-artifacts-ai/open-artifacts
+          ref: refs/tags/${{ steps.pin.outputs.tag }}
+          path: public
+          persist-credentials: false
+      - name: overlay (checks the pin, fails on any path collision)
+        run: private/scripts/overlay.sh public private
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: public/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: public/.nvmrc
+          cache: pnpm
+          cache-dependency-path: public/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: public
+        run: pnpm install --frozen-lockfile
+      # The private packages: workspace packages (apps/*, packages/*, scripts/*,
+      # tests/*) whose package.json is in this repo's tree.
+      - id: pkgs
+        name: list private packages
+        run: |
+          set -euo pipefail
+          files=$(git -C private ls-files)
+          dirs=$( (grep -E '^(apps|packages|scripts|tests)/[^/]+/package\.json$' <<< "$files" || true) | sed 's|/package\.json$||')
+          # Root-vitest tests (scripts/ci, scripts/ops) that this repo owns.
+          tests=$( (grep -E '^scripts/(ci|ops)/[^/]+\.test\.ts$' <<< "$files" || true) | tr '\n' ' ')
+          build="" only="" count=0
+          while read -r d; do
+            [ -n "$d" ] || continue
+            build="$build --filter ./$d..."; only="$only --filter ./$d"; count=$((count + 1))
+          done <<< "$dirs"
+          {
+            echo "count=$count"
+            echo "build=$build"
+            echo "only=$only"
+            echo "tests=$tests"
+          } >> "$GITHUB_OUTPUT"
+          echo "private packages ($count):"; printf '%s\n' "$dirs"
+      - name: no private packages yet
+        if: ${{ steps.pkgs.outputs.count == '0' }}
+        run: echo "::warning::No private packages in this tree yet (before the sync). Build, typecheck and test are skipped."
+      - name: build
+        if: ${{ steps.pkgs.outputs.count != '0' }}
+        working-directory: public
+        env:
+          FILTERS: ${{ steps.pkgs.outputs.build }}
+        run: |
+          read -ra f <<< "$FILTERS"
+          pnpm -r --if-present "${f[@]}" build
+      - name: typecheck
+        if: ${{ steps.pkgs.outputs.count != '0' }}
+        working-directory: public
+        env:
+          FILTERS: ${{ steps.pkgs.outputs.only }}
+        run: |
+          read -ra f <<< "$FILTERS"
+          pnpm -r --if-present "${f[@]}" typecheck
+      - name: test (private packages)
+        if: ${{ steps.pkgs.outputs.count != '0' }}
+        working-directory: public
+        env:
+          FILTERS: ${{ steps.pkgs.outputs.only }}
+        run: |
+          read -ra f <<< "$FILTERS"
+          pnpm -r --if-present --workspace-concurrency=1 "${f[@]}" test
+      - name: test (private scripts/ci and scripts/ops)
+        if: ${{ steps.pkgs.outputs.tests != '' }}
+        working-directory: public
+        env:
+          TESTS: ${{ steps.pkgs.outputs.tests }}
+        run: |
+          read -ra t <<< "$TESTS"
+          pnpm exec vitest run "${t[@]}"
