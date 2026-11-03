@@ -41,10 +41,11 @@ for pkg in "${owners[@]}"; do
     }
     console.log([...out].join("\n"));
   ' "$OVL/$pkg/package.json")
-  [ "${#cfgs[@]}" -gt 0 ] && [ -n "${cfgs[0]}" ] || {
+  if [ "${#cfgs[@]}" -eq 0 ] || [ -z "${cfgs[0]}" ]; then
     echo "ci-public-tests: $pkg: its test script runs no vitest; cannot run ${want[*]}" >&2
-    failures=$((failures + 1)); continue
-  }
+    failures=$((failures + 1))
+    continue
+  fi
   : > "$work/covered"
   for cfg in "${cfgs[@]}"; do
     cargs=()
@@ -65,7 +66,7 @@ for pkg in "${owners[@]}"; do
         if (want.has(rel)) console.log(rel);
       }
     ' "$json" "$OVL/$pkg" "${want[@]}" | sort -u)
-    [ "${#hit[@]}" -gt 0 ] && [ -n "${hit[0]}" ] || continue
+    if [ "${#hit[@]}" -eq 0 ] || [ -z "${hit[0]}" ]; then continue; fi
     printf '%s\n' "${hit[@]}" >> "$work/covered"
     echo "ci-public-tests: $pkg [${cfg/#-/vitest.config (default)}]: ${hit[*]}"
     if ! (cd "$OVL/$pkg" && pnpm exec vitest run "${cargs[@]}" "${hit[@]}"); then
