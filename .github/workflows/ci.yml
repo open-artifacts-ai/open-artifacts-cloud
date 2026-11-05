@@ -4,6 +4,8 @@ name: CI
 # No secrets, no environments, no deploys: those come at the cut-over (#1056).
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, scaffold]
   workflow_dispatch:
