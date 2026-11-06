@@ -6,6 +6,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OVERLAY="$HERE/overlay.sh"
 SYNC="$HERE/sync-from-public.sh"
+EQUIV="$HERE/equivalence.sh"
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -245,6 +246,76 @@ expect_exit "ci-plan fails an empty tree after the sync" 1 "$PLAN" "$T/o4" "$T/q
 
 expect_exit "ci-public-tests with no tests passes" 0 "$HERE/ci-public-tests.sh" "$T/o4" "$T/plan4"
 expect_exit "ci-public-tests without a plan fails" 1 "$HERE/ci-public-tests.sh" "$T/o4" "$T/nonexistent-plan"
+
+# --- --pre-split ------------------------------------------------------------
+# A public repo that still holds its hosted paths and lists them.
+mkpub_hosted() { # dir
+  mkpub "$1"
+  mkdir -p "$1/scripts/ci"
+  echo 'public-only' > "$1/apps/hosted/src/public-only-file.ts"
+  echo 'hosted wf' > "$1/.github/workflows/hosted.yml"
+  printf '# hosted\napps/hosted\n.github/workflows/hosted.yml\n' > "$1/scripts/ci/private-paths.txt"
+  G -C "$1" add -A; G -C "$1" commit -qm hosted; G -C "$1" tag -f v1 > /dev/null
+}
+mkpriv_hosted() { # dir pubdir: a private tree that edits the hosted code
+  mkpriv "$1" "$2"
+  mkdir -p "$1/apps/hosted/src"; echo 'private edit' > "$1/apps/hosted/src/index.ts"
+  rm -f "$1/.github/workflows/hosted.yml"
+}
+mkpub_hosted "$T/ps1"; mkpriv_hosted "$T/psv1" "$T/ps1"
+expect_exit "without --pre-split a hosted path collides" 1 "$OVERLAY" "$T/ps1" "$T/psv1"
+expect_exit "--pre-split succeeds" 0 "$OVERLAY" --pre-split "$T/ps1" "$T/psv1"
+check "--pre-split overlays private's file" [ "$(cat "$T/ps1/apps/hosted/src/index.ts" 2> /dev/null)" = 'private edit' ]
+check "--pre-split strips a listed public-only file" [ ! -e "$T/ps1/apps/hosted/src/public-only-file.ts" ]
+check "--pre-split strips a listed workflow" [ ! -e "$T/ps1/.github/workflows/hosted.yml" ]
+check "--pre-split keeps unlisted public files" [ "$(cat "$T/ps1/apps/server/index.ts")" = server ]
+mkpub_hosted "$T/ps2"; mkpriv_hosted "$T/psv2" "$T/ps2"
+printf 'package.json\n' > "$T/ps2/scripts/ci/private-paths.txt"; G -C "$T/ps2" add -A; G -C "$T/ps2" commit -qm badlist; G -C "$T/ps2" tag -f v1 > /dev/null
+printf 'tag=v1\nsha=%s\n' "$(git -C "$T/ps2" rev-parse HEAD)" > "$T/psv2/PUBLIC_PIN"
+expect_exit "--pre-split refuses a root-level list entry" 1 "$OVERLAY" --pre-split "$T/ps2" "$T/psv2"
+expect_exit "unknown flag exits 2" 2 "$OVERLAY" --bogus "$T/ps2" "$T/psv2"
+
+# --- equivalence ---------------------------------------------------------------
+# A synced cloud dir for a hosted public repo, built with the real sync.
+mkcloud() { # pubdir dest
+  mkdir -p "$2/scripts"; cp "$SYNC" "$OVERLAY" "$EQUIV" "$2/scripts/"
+  echo 'cloud readme' > "$2/README.md"
+  "$2/scripts/sync-from-public.sh" "$1" > /dev/null 2>&1 || echo "mkcloud: sync failed" >&2
+}
+mkpub_hosted "$T/e1"; mkdir -p "$T/ec0"; mkdir -p "$T/ec0/scripts"; cp "$OVERLAY" "$EQUIV" "$T/ec0/scripts/"
+expect_exit "equivalence skips without SYNCED_FROM" 0 "$T/ec0/scripts/equivalence.sh" "$T/e1"
+check "skip says why" grep -q 'SKIPPED: no SYNCED_FROM' "$T/out"
+
+mkcloud "$T/e1" "$T/ec1"
+echo 'later' > "$T/e1/later.txt"; G -C "$T/e1" add -A; G -C "$T/e1" commit -qm later
+expect_exit "equivalence passes after a sync (public HEAD may be ahead of S)" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "pass names the allowlisted count" grep -q 'OK:' "$T/out"
+
+echo 'ours' > "$T/ec1/pnpm-lock.yaml"; echo 'changed readme' > "$T/ec1/README.md"; echo 'x' > "$T/ec1/NOTES-ignored"
+expect_exit "an allowlisted difference passes" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+
+rm "$T/ec1/apps/hosted/src/index.ts"
+expect_exit "a dropped file fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "dropped file is named" grep -q 'DIFF: apps/hosted/src/index.ts (only in public (dropped))' "$T/out"
+
+mkcloud "$T/e1" "$T/ec2"
+echo 'extra' > "$T/ec2/apps/hosted/src/extra.ts"
+expect_exit "an extra file fails" 1 "$T/ec2/scripts/equivalence.sh" "$T/e1" "$T/ec2"
+check "extra file is named" grep -q 'DIFF: apps/hosted/src/extra.ts (only in overlay (extra))' "$T/out"
+
+mkcloud "$T/e1" "$T/ec3"
+echo 'drifted' > "$T/ec3/apps/hosted/src/index.ts"
+expect_exit "a changed file fails" 1 "$T/ec3/scripts/equivalence.sh" "$T/e1" "$T/ec3"
+check "changed file is named" grep -q 'DIFF: apps/hosted/src/index.ts (content differs)' "$T/out"
+
+mkcloud "$T/e1" "$T/ec4"
+echo 'drifted wf' > "$T/ec4/hosted-workflows/hosted.yml"
+expect_exit "a drifted hosted workflow fails (compared as .github/workflows/)" 1 "$T/ec4/scripts/equivalence.sh" "$T/e1" "$T/ec4"
+check "workflow drift is named" grep -q 'DIFF: .github/workflows/hosted.yml' "$T/out"
+
+mkcloud "$T/e1" "$T/ec5"
+sed -i 's/^sha=.*/sha=0123456789abcdef0123456789abcdef01234567/' "$T/ec5/SYNCED_FROM"
+expect_exit "a SYNCED_FROM sha public lacks fails" 1 "$T/ec5/scripts/equivalence.sh" "$T/e1" "$T/ec5"
 
 echo "overlay tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

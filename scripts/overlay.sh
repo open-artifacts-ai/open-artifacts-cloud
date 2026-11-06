@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# overlay.sh <public-checkout-dir> <private-dir>
+# overlay.sh [--pre-split] <public-checkout-dir> <private-dir>
 #
 # Builds the hosted workspace: copies this private tree onto a public
 # open-artifacts checkout, so both sides form one pnpm workspace and every
@@ -22,16 +22,34 @@
 #      cut-over). Any other file directly in scripts/ fails the run: it is
 #      neither tooling nor a path public could hold.
 #
+# --pre-split: for the time before the hosted paths are deleted from public.
+# After rule 1 and before the collision check, overlay.sh removes from the
+# public checkout every path in its scripts/ci/private-paths.txt (this repo's
+# private-paths.txt when the checkout has none, as for sync-from-public.sh),
+# the way scripts/ci/public-only.sh does, then overlays as usual. The public
+# checkout is modified in place: discard it afterwards. Without the flag, a
+# private file that is still in public collides, on purpose.
+#
 # Exit 0 on success, 1 on a rule failure, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "overlay: $*" >&2; exit 1; }
 # This repo's tooling, directly in scripts/. Rule 5: it never overlays.
-TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh "
-[ "$#" -eq 2 ] || { echo "usage: overlay.sh <public-checkout-dir> <private-dir>" >&2; exit 2; }
+TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh "
+usage() { echo "usage: overlay.sh [--pre-split] <public-checkout-dir> <private-dir>" >&2; exit 2; }
+pre_split=no
+args=()
+for a in "$@"; do
+  case "$a" in
+    --pre-split) pre_split=yes ;;
+    -*) usage ;;
+    *) args+=("$a") ;;
+  esac
+done
+[ "${#args[@]}" -eq 2 ] || usage
 
-PUB=$(cd "$1" 2> /dev/null && pwd) || die "public checkout not found: $1"
-PRIV=$(cd "$2" 2> /dev/null && pwd) || die "private dir not found: $2"
+PUB=$(cd "${args[0]}" 2> /dev/null && pwd) || die "public checkout not found: ${args[0]}"
+PRIV=$(cd "${args[1]}" 2> /dev/null && pwd) || die "private dir not found: ${args[1]}"
 [ "$PUB" != "$PRIV" ] || die "public and private dirs are the same"
 
 # --- Rule 1: the pin --------------------------------------------------------
@@ -100,6 +118,41 @@ while IFS= read -r f; do
   printf '%s\n' "$f" >> "$overlay"
 done < "$list"
 [ "$strays" -eq 0 ] || die "$strays unknown file(s) directly in scripts/; nothing was copied"
+
+# --- --pre-split: remove the hosted paths from the public checkout ---------
+if [ "$pre_split" = yes ]; then
+  if [ -f "$PUB/scripts/ci/private-paths.txt" ]; then
+    plist="$PUB/scripts/ci/private-paths.txt"
+  else
+    plist="$PRIV/private-paths.txt"
+  fi
+  [ -f "$plist" ] || die "--pre-split: no path list: $plist"
+  rm_paths=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    p=${line%%#*}
+    p=$(printf '%s' "$p" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
+    [ -n "$p" ] || continue
+    p=${p%/}
+    printf '%s' "$p" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._/-]*$' || die "--pre-split: unsafe path in list: '$p'"
+    case "/$p/" in
+      */../* | */./*) die "--pre-split: unsafe path in list: '$p'" ;;
+    esac
+    case "$p" in
+      */*) ;;
+      *) die "--pre-split: root-level entry in list: $p" ;;
+    esac
+    rm_paths+=("$p")
+  done < "$plist"
+  [ "${#rm_paths[@]}" -gt 0 ] || die "--pre-split: path list is empty: $plist"
+  removed=0
+  for p in "${rm_paths[@]}"; do
+    if [ -e "$PUB/$p" ] || [ -L "$PUB/$p" ]; then
+      rm -rf -- "${PUB:?}/$p" || die "--pre-split: cannot remove $p"
+      removed=$((removed + 1))
+    fi
+  done
+  echo "overlay: --pre-split: removed $removed of ${#rm_paths[@]} listed path(s) from public ($plist)"
+fi
 
 # --- Rule 2: collisions, all reported, before any copy -----------------------
 collisions=0
