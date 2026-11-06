@@ -145,6 +145,14 @@ if [ "$pre_split" = yes ]; then
   done < "$plist"
   [ "${#rm_paths[@]}" -gt 0 ] || die "--pre-split: path list is empty: $plist"
   removed=0
+  # Never remove through a symlinked parent: it could point outside the checkout.
+  for p in "${rm_paths[@]}"; do
+    d=$(dirname "$p")
+    while [ "$d" != "." ]; do
+      [ ! -L "$PUB/$d" ] || die "--pre-split: $d is a symlink in the public checkout; refusing to remove $p through it"
+      d=$(dirname "$d")
+    done
+  done
   for p in "${rm_paths[@]}"; do
     if [ -e "$PUB/$p" ] || [ -L "$PUB/$p" ]; then
       rm -rf -- "${PUB:?}/$p" || die "--pre-split: cannot remove $p"

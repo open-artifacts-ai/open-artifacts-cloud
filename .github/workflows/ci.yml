@@ -62,7 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           sha=""
-          if [ -f private/SYNCED_FROM ]; then
+          if [ -e private/SYNCED_FROM ] || [ -L private/SYNCED_FROM ]; then
+            [ -f private/SYNCED_FROM ] && [ ! -L private/SYNCED_FROM ] || { echo "::error::SYNCED_FROM exists but is not a regular file"; exit 1; }
             sha=$(sed -n 's/^sha=//p' private/SYNCED_FROM)
             [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SYNCED_FROM sha '$sha' is not a full sha"; exit 1; }
           fi

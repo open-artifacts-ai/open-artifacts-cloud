@@ -255,6 +255,8 @@ mkpub_hosted() { # dir
   echo 'public-only' > "$1/apps/hosted/src/public-only-file.ts"
   echo 'hosted wf' > "$1/.github/workflows/hosted.yml"
   printf '# hosted\napps/hosted\n.github/workflows/hosted.yml\n' > "$1/scripts/ci/private-paths.txt"
+  printf "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a: 1\n\n  apps/hosted:\n    dependencies:\n      c: 1\n\n  apps/server:\n    dependencies:\n      b: 1\n\npackages:\n  x: {}\n" > "$1/pnpm-lock.yaml"
+  echo '#!/bin/sh' > "$1/scripts/ci/run.sh"; chmod 755 "$1/scripts/ci/run.sh"
   G -C "$1" add -A; G -C "$1" commit -qm hosted; G -C "$1" tag -f v1 > /dev/null
 }
 mkpriv_hosted() { # dir pubdir: a private tree that edits the hosted code
@@ -275,6 +277,29 @@ printf 'tag=v1\nsha=%s\n' "$(git -C "$T/ps2" rev-parse HEAD)" > "$T/psv2/PUBLIC_
 expect_exit "--pre-split refuses a root-level list entry" 1 "$OVERLAY" --pre-split "$T/ps2" "$T/psv2"
 expect_exit "unknown flag exits 2" 2 "$OVERLAY" --bogus "$T/ps2" "$T/psv2"
 
+# --pre-split list hygiene: '..', '.', CRLF, symlinked parent.
+mkpre() { # name listcontent(printf format)
+  mkpub_hosted "$T/$1"; mkpriv_hosted "$T/${1}v" "$T/$1"
+  printf "$2" > "$T/$1/scripts/ci/private-paths.txt"; G -C "$T/$1" add -A; G -C "$T/$1" commit -qm list; G -C "$T/$1" tag -f v1 > /dev/null
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$T/$1" rev-parse HEAD)" > "$T/${1}v/PUBLIC_PIN"
+}
+mkpre pd 'apps/../package.json\n'
+expect_exit "--pre-split refuses '..' in the list" 1 "$OVERLAY" --pre-split "$T/pd" "$T/pdv"
+check "'..' refusal removed nothing" [ -e "$T/pd/package.json" ]
+mkpre pe 'apps/./hosted\n'
+expect_exit "--pre-split refuses '.' in the list" 1 "$OVERLAY" --pre-split "$T/pe" "$T/pev"
+check "'.' refusal removed nothing" [ -e "$T/pe/apps/hosted/src/index.ts" ]
+mkpre pf 'apps/hosted\r\n.github/workflows/hosted.yml\r\n'
+expect_exit "--pre-split reads a CRLF list" 0 "$OVERLAY" --pre-split "$T/pf" "$T/pfv"
+check "CRLF entries are stripped, then removed" [ "$(cat "$T/pf/apps/hosted/src/index.ts")" = 'private edit' ] && [ ! -e "$T/pf/apps/hosted/src/public-only-file.ts" ]
+mkpub_hosted "$T/pg"; mkpriv_hosted "$T/pgv" "$T/pg"
+ln -s apps/hosted "$T/pg/lnk"; printf 'lnk/src/index.ts\n' > "$T/pg/scripts/ci/private-paths.txt"
+G -C "$T/pg" add -A; G -C "$T/pg" commit -qm link; G -C "$T/pg" tag -f v1 > /dev/null
+printf 'tag=v1\nsha=%s\n' "$(git -C "$T/pg" rev-parse HEAD)" > "$T/pgv/PUBLIC_PIN"
+expect_exit "--pre-split refuses a symlinked parent" 1 "$OVERLAY" --pre-split "$T/pg" "$T/pgv"
+check "symlink refusal is named" grep -q 'lnk is a symlink' "$T/out"
+check "nothing removed through the symlink" [ -e "$T/pg/apps/hosted/src/index.ts" ]
+
 # --- equivalence ---------------------------------------------------------------
 # A synced cloud dir for a hosted public repo, built with the real sync.
 mkcloud() { # pubdir dest
@@ -291,8 +316,15 @@ echo 'later' > "$T/e1/later.txt"; G -C "$T/e1" add -A; G -C "$T/e1" commit -qm l
 expect_exit "equivalence passes after a sync (public HEAD may be ahead of S)" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
 check "pass names the allowlisted count" grep -q 'OK:' "$T/out"
 
-echo 'ours' > "$T/ec1/pnpm-lock.yaml"; echo 'changed readme' > "$T/ec1/README.md"; echo 'x' > "$T/ec1/NOTES-ignored"
-expect_exit "an allowlisted difference passes" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+# A real diff through ALLOW: the merged lockfile adds a private importer and
+# other packages, and keeps public's importers.
+printf "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a: 1\n\n  apps/server:\n    dependencies:\n      b: 1\n\n  apps/hosted:\n    dependencies:\n      z: 9\n\npackages:\n  x: {}\n  y: {}\n" > "$T/ec1/pnpm-lock.yaml"
+expect_exit "an allowlisted lockfile difference passes" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "the lockfile really differed (count shows it)" grep -q '(1 allowlisted difference(s))' "$T/out"
+sed -i 's/      b: 1/      b: 2/' "$T/ec1/pnpm-lock.yaml"
+expect_exit "a changed public importer in the lockfile fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "the importer is named" grep -q 'apps/server' "$T/out"
+rm "$T/ec1/pnpm-lock.yaml"
 
 rm "$T/ec1/apps/hosted/src/index.ts"
 expect_exit "a dropped file fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
@@ -312,6 +344,27 @@ mkcloud "$T/e1" "$T/ec4"
 echo 'drifted wf' > "$T/ec4/hosted-workflows/hosted.yml"
 expect_exit "a drifted hosted workflow fails (compared as .github/workflows/)" 1 "$T/ec4/scripts/equivalence.sh" "$T/e1" "$T/ec4"
 check "workflow drift is named" grep -q 'DIFF: .github/workflows/hosted.yml' "$T/out"
+
+mkcloud "$T/e1" "$T/ec6"
+chmod 755 "$T/ec6/apps/hosted/src/index.ts"
+expect_exit "a chmod difference in a private file fails" 1 "$T/ec6/scripts/equivalence.sh" "$T/e1" "$T/ec6"
+check "chmod difference is named" grep -q 'DIFF: apps/hosted/src/index.ts (executable bit differs)' "$T/out"
+
+mkcloud "$T/e1" "$T/ec7"
+echo 'mine' > "$T/ec7/hosted-workflows/ci.yml"
+expect_exit "a hosted-workflows file whose target exists fails" 1 "$T/ec7/scripts/equivalence.sh" "$T/e1" "$T/ec7"
+check "the overwrite is named" grep -q 'would overwrite .github/workflows/ci.yml' "$T/out"
+
+mkcloud "$T/e1" "$T/ec8"
+mv "$T/ec8/SYNCED_FROM" "$T/ec8/SYNCED_FROM.real"; ln -s SYNCED_FROM.real "$T/ec8/SYNCED_FROM"
+expect_exit "a symlinked SYNCED_FROM fails, not skips" 1 "$T/ec8/scripts/equivalence.sh" "$T/e1" "$T/ec8"
+mkcloud "$T/e1" "$T/ec9"
+rm "$T/ec9/SYNCED_FROM"; mkdir "$T/ec9/SYNCED_FROM"
+expect_exit "a SYNCED_FROM that is a directory fails, not skips" 1 "$T/ec9/scripts/equivalence.sh" "$T/e1" "$T/ec9"
+check "not skipped" bash -c '! grep -q SKIPPED "$0"' "$T/out"
+mkcloud "$T/e1" "$T/ec10"
+: > "$T/ec10/SYNCED_FROM"
+expect_exit "an empty SYNCED_FROM fails, not skips" 1 "$T/ec10/scripts/equivalence.sh" "$T/e1" "$T/ec10"
 
 mkcloud "$T/e1" "$T/ec5"
 sed -i 's/^sha=.*/sha=0123456789abcdef0123456789abcdef01234567/' "$T/ec5/SYNCED_FROM"
