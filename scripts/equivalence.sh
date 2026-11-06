@@ -27,7 +27,6 @@ set -uo pipefail
 # public's byte for byte. The packages/snapshots sections are not compared:
 # they follow from the importers and are pnpm's to resolve.
 ALLOW=(
-  pnpm-lock.yaml
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
