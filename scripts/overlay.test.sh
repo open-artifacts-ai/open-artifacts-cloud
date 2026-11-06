@@ -19,6 +19,7 @@ check() { # name cmd...
   local name=$1; shift
   if "$@"; then ok "$name"; else bad "$name"; fi
 }
+nogrep() { ! grep -q "$@"; }
 expect_exit() { # name want cmd...
   local name=$1 want=$2; shift 2
   "$@" > "$T/out" 2>&1
@@ -280,7 +281,7 @@ expect_exit "unknown flag exits 2" 2 "$OVERLAY" --bogus "$T/ps2" "$T/psv2"
 # --pre-split list hygiene: '..', '.', CRLF, symlinked parent.
 mkpre() { # name listcontent(printf format)
   mkpub_hosted "$T/$1"; mkpriv_hosted "$T/${1}v" "$T/$1"
-  printf "$2" > "$T/$1/scripts/ci/private-paths.txt"; G -C "$T/$1" add -A; G -C "$T/$1" commit -qm list; G -C "$T/$1" tag -f v1 > /dev/null
+  printf '%b' "$2" > "$T/$1/scripts/ci/private-paths.txt"; G -C "$T/$1" add -A; G -C "$T/$1" commit -qm list; G -C "$T/$1" tag -f v1 > /dev/null
   printf 'tag=v1\nsha=%s\n' "$(git -C "$T/$1" rev-parse HEAD)" > "$T/${1}v/PUBLIC_PIN"
 }
 mkpre pd 'apps/../package.json\n'
@@ -361,7 +362,7 @@ expect_exit "a symlinked SYNCED_FROM fails, not skips" 1 "$T/ec8/scripts/equival
 mkcloud "$T/e1" "$T/ec9"
 rm "$T/ec9/SYNCED_FROM"; mkdir "$T/ec9/SYNCED_FROM"
 expect_exit "a SYNCED_FROM that is a directory fails, not skips" 1 "$T/ec9/scripts/equivalence.sh" "$T/e1" "$T/ec9"
-check "not skipped" bash -c '! grep -q SKIPPED "$0"' "$T/out"
+check "not skipped" nogrep SKIPPED "$T/out"
 mkcloud "$T/e1" "$T/ec10"
 : > "$T/ec10/SYNCED_FROM"
 expect_exit "an empty SYNCED_FROM fails, not skips" 1 "$T/ec10/scripts/equivalence.sh" "$T/e1" "$T/ec10"
