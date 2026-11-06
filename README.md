@@ -21,11 +21,12 @@ pinned public release, with this tree copied on top.
 | `PUBLIC_PIN` | The public tag and the full commit sha it resolves to. |
 | `private-paths.txt` | The paths this repo owns. Interim copy: once public has `scripts/ci/private-paths.txt`, that list wins. |
 | `SYNCED_FROM` | Written by the sync: the public commit the private paths were copied from. |
-| `scripts/overlay.sh` | Builds the overlay: `overlay.sh <public-checkout> <private-dir>`. |
+| `scripts/overlay.sh` | Builds the overlay: `overlay.sh [--pre-split] <public-checkout> <private-dir>`. `--pre-split` first removes the hosted paths (public's `scripts/ci/private-paths.txt`) from the checkout, as `public-only.sh` does. |
 | `scripts/sync-from-public.sh` | Copies the private paths from a public checkout: `sync-from-public.sh <public-checkout> [<dest>]`. |
 | `scripts/dev-overlay.sh` | Builds the overlay in a new local worktree, for agents: `dev-overlay.sh <new-dir>`. |
 | `scripts/ci-plan.sh` | CI: lists the private packages and every private test, and fails on a package without `test`/`typecheck` or a test nothing would run. |
 | `scripts/ci-public-tests.sh` | CI: runs private tests that live in public packages through that package's own vitest configs. |
+| `scripts/equivalence.sh` | CI: builds `overlay.sh --pre-split` of public at `SYNCED_FROM` and fails on any difference from public outside the allowlist in the script. Skips before the first sync: `equivalence.sh <public-checkout> [<private-dir>]`. |
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
 | `hosted-workflows/` | Written by the sync: the hosted workflows, inert. GitHub never runs them from here; the cut-over PR moves them into `.github/workflows/`. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |

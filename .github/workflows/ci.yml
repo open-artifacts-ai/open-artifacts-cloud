@@ -54,6 +54,28 @@ jobs:
           persist-credentials: false
       - name: overlay (checks the pin, fails on any path collision)
         run: private/scripts/overlay.sh public private
+      # Equivalence (#1056 B2): overlay(public@S minus private paths, this
+      # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
+      # sync there is no SYNCED_FROM and the script skips with a message.
+      - id: synced
+        name: read SYNCED_FROM
+        run: |
+          set -euo pipefail
+          sha=""
+          if [ -f private/SYNCED_FROM ]; then
+            sha=$(sed -n 's/^sha=//p' private/SYNCED_FROM)
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SYNCED_FROM sha '$sha' is not a full sha"; exit 1; }
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - if: ${{ steps.synced.outputs.sha != '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: open-artifacts-ai/open-artifacts
+          ref: ${{ steps.synced.outputs.sha }}
+          path: public-synced
+          persist-credentials: false
+      - name: equivalence (pre-split overlay equals public at SYNCED_FROM)
+        run: private/scripts/equivalence.sh public-synced private
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: public/package.json
