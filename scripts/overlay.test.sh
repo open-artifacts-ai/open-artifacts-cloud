@@ -278,6 +278,41 @@ printf 'tag=v1\nsha=%s\n' "$(git -C "$T/ps2" rev-parse HEAD)" > "$T/psv2/PUBLIC_
 expect_exit "--pre-split refuses a root-level list entry" 1 "$OVERLAY" --pre-split "$T/ps2" "$T/psv2"
 expect_exit "unknown flag exits 2" 2 "$OVERLAY" --bogus "$T/ps2" "$T/psv2"
 
+# --auto-split: pre-split while the pinned tree holds the hosted paths, strict
+# once it holds none, a failure when it holds some. Decided from the tree.
+pin_to() { # pubdir privdir: commit the pub changes and pin the private tree to them
+  G -C "$1" add -A; G -C "$1" commit -qm pin --allow-empty; G -C "$1" tag -f v1 > /dev/null
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$1" rev-parse HEAD)" > "$2/PUBLIC_PIN"
+}
+mkpub_hosted "$T/as1"; mkpriv_hosted "$T/asv1" "$T/as1"
+expect_exit "--auto-split pre-splits while public holds every listed path" 0 "$OVERLAY" --auto-split "$T/as1" "$T/asv1"
+check "--auto-split said pre-split mode" grep -q 'pre-split mode' "$T/out"
+check "--auto-split stripped a listed public-only file" [ ! -e "$T/as1/apps/hosted/src/public-only-file.ts" ]
+check "--auto-split overlaid private's file" [ "$(cat "$T/as1/apps/hosted/src/index.ts")" = 'private edit' ]
+# After the delete: public holds none of the listed paths (and no list of its own).
+mkpub_hosted "$T/as2"; mkpriv_hosted "$T/asv2" "$T/as2"
+G -C "$T/as2" rm -rq apps/hosted .github/workflows/hosted.yml scripts/ci/private-paths.txt
+printf 'apps/hosted\n.github/workflows/hosted.yml\n' > "$T/asv2/private-paths.txt"; pin_to "$T/as2" "$T/asv2"
+expect_exit "--auto-split is strict once public holds none" 0 "$OVERLAY" --auto-split "$T/as2" "$T/asv2"
+check "--auto-split said strict mode" grep -q 'strict mode' "$T/out"
+check "--auto-split strict still overlays" [ "$(cat "$T/as2/apps/hosted/src/index.ts")" = 'private edit' ]
+# Strict means a collision still fails, with the flag on.
+mkpub_hosted "$T/as3"; mkpriv_hosted "$T/asv3" "$T/as3"
+G -C "$T/as3" rm -rq apps/hosted .github/workflows/hosted.yml scripts/ci/private-paths.txt
+printf 'apps/hosted\n.github/workflows/hosted.yml\n' > "$T/asv3/private-paths.txt"; mkdir -p "$T/asv3/apps/server"; echo mine > "$T/asv3/apps/server/index.ts"; pin_to "$T/as3" "$T/asv3"
+expect_exit "--auto-split strict mode fails on a collision" 1 "$OVERLAY" --auto-split "$T/as3" "$T/asv3"
+check "--auto-split collision is named" grep -q 'collision: apps/server/index.ts' "$T/out"
+# Some listed paths present, some not: neither mode, fail.
+mkpub_hosted "$T/as4"; mkpriv_hosted "$T/asv4" "$T/as4"
+G -C "$T/as4" rm -q .github/workflows/hosted.yml; pin_to "$T/as4" "$T/asv4"
+expect_exit "--auto-split refuses a half-deleted pin" 1 "$OVERLAY" --auto-split "$T/as4" "$T/asv4"
+check "half-deleted refusal is named" grep -q 'half-deleted' "$T/out"
+check "half-deleted refusal removed nothing" [ -e "$T/as4/apps/hosted/src/public-only-file.ts" ]
+# No list anywhere: fail closed.
+mkpub_hosted "$T/as5"; mkpriv_hosted "$T/asv5" "$T/as5"
+G -C "$T/as5" rm -q scripts/ci/private-paths.txt; pin_to "$T/as5" "$T/asv5"
+expect_exit "--auto-split fails without a path list" 1 "$OVERLAY" --auto-split "$T/as5" "$T/asv5"
+
 # --pre-split list hygiene: '..', '.', CRLF, symlinked parent.
 mkpre() { # name listcontent(printf format)
   mkpub_hosted "$T/$1"; mkpriv_hosted "$T/${1}v" "$T/$1"

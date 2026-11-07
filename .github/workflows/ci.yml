@@ -52,8 +52,12 @@ jobs:
           ref: refs/tags/${{ steps.pin.outputs.tag }}
           path: public
           persist-credentials: false
-      - name: overlay (checks the pin, fails on any path collision)
-        run: private/scripts/overlay.sh public private
+      # --auto-split decides from the pinned tree: while it still holds the
+      # hosted paths (before the delete at cut-over F1) it removes them first
+      # (--pre-split); once it holds none it is strict, so a collision fails.
+      # A tree with only some of them fails. No hand-set flag.
+      - name: overlay (checks the pin; pre-split or strict, from the pinned tree)
+        run: private/scripts/overlay.sh --auto-split public private
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
       # sync there is no SYNCED_FROM and the script skips with a message.
