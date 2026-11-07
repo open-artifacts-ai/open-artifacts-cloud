@@ -677,16 +677,16 @@ expect_exit "pin-check does not apply once public holds none of the paths" 0 "$T
 check "strict mode is named" grep -q 'strict mode' "$T/out"
 
 # Strict mode is not blind: a fix made before the delete must be ported.
-strictfix() { # name: public with a pre-delete fix then the delete D; cloud at S
+strictfix() { # name: public with a pre-delete fix then the delete D; cloud at S. Sets SF_S, SF_F, SF_D
   mkpub_hosted "$T/$1"; mkc "$T/$1" "$T/${1}c"
-  eval "${1}_S=$(git -C "$T/$1" rev-parse HEAD)"
+  SF_S=$(git -C "$T/$1" rev-parse HEAD)
   adv "$T/$1" apps/hosted/src/index.ts 'SECURITY FIX'
-  eval "${1}_F=$(git -C "$T/$1" rev-parse HEAD)"
+  SF_F=$(git -C "$T/$1" rev-parse HEAD)
   G -C "$T/$1" rm -rq apps/hosted .github/workflows/hosted.yml
   G -C "$T/$1" commit -qm delete
-  eval "${1}_D=$(git -C "$T/$1" rev-parse HEAD)"
+  SF_D=$(git -C "$T/$1" rev-parse HEAD)
 }
-strictfix kf
+strictfix kf; kf_S=$SF_S; kf_F=$SF_F; kf_D=$SF_D
 pin_at "$T/kfc" "$kf_D"
 expect_exit "fix then delete: pin at D, SYNCED_FROM unchanged, fails" 1 "$T/kfc/scripts/pin-check.sh" "$T/kf" "$T/kfc"
 check "that failure names the pre-delete fix" grep -q 'before the delete' "$T/out"
@@ -703,7 +703,7 @@ sed -i "s/^sha=.*/sha=$kf_F/" "$T/kfc/SYNCED_FROM"
 expect_exit "fix then delete: SYNCED_FROM at the last pre-delete commit with the port passes" 0 "$T/kfc/scripts/pin-check.sh" --prev "$kf_S" "$T/kf" "$T/kfc"
 # A delete alone (no fix before it) still lets the pin lead.
 strictfix kg
-G -C "$T/kg" reset -q --hard "$kg_S"
+G -C "$T/kg" reset -q --hard "$SF_S"
 G -C "$T/kg" rm -rq apps/hosted .github/workflows/hosted.yml; G -C "$T/kg" commit -qm delete
 pin_at "$T/kgc" "$(git -C "$T/kg" rev-parse HEAD)"
 expect_exit "delete alone: pin at D, SYNCED_FROM unchanged, passes" 0 "$T/kgc/scripts/pin-check.sh" "$T/kg" "$T/kgc"
