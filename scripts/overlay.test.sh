@@ -51,6 +51,7 @@ mkpriv() { # dir pubdir
   echo 'private readme' > "$1/README.md"
   echo 'private ci' > "$1/.github/workflows/ci.yml"
   echo 'hosted wf' > "$1/.github/workflows/hosted.yml"
+  mkdir -p "$1/.github/actions/overlay"; echo 'action' > "$1/.github/actions/overlay/action.yml"
   echo 'tool' > "$1/scripts/overlay.sh"
   echo 'admin' > "$1/apps/admin/src/index.ts"
   echo 'merged-lock' > "$1/pnpm-lock.yaml"
@@ -64,6 +65,7 @@ check "private workflow overlaid" [ "$(cat "$T/p1/.github/workflows/hosted.yml" 
 check "lockfile is the one overwrite" [ "$(cat "$T/p1/pnpm-lock.yaml")" = merged-lock ]
 check "root files never overlay" [ "$(cat "$T/p1/README.md")" = "public readme" ]
 check "this repo's ci.yml never overlays" [ "$(cat "$T/p1/.github/workflows/ci.yml")" = "public ci" ]
+check "this repo's .github/actions never overlay" [ ! -e "$T/p1/.github/actions" ]
 check "scripts/ tooling never overlays" [ ! -e "$T/p1/scripts/overlay.sh" ]
 check "PUBLIC_PIN never overlays" [ ! -e "$T/p1/PUBLIC_PIN" ]
 

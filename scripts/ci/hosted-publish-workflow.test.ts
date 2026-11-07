@@ -22,9 +22,9 @@ const named = (job: string, n: string) =>
 const ENVS = { "publish-staging": "staging", "publish-prod": "prod" } as const;
 
 describe("hosted-publish.yml", () => {
-  it("runs after release-please on main, or by hand with tag, env and floor_run_id", () => {
+  it("runs after hosted-release on main, or by hand with tag, env and floor_run_id", () => {
     expect(w.on.workflow_run).toEqual({
-      workflows: ["release-please"],
+      workflows: ["hosted-release"],
       types: ["completed"],
       branches: ["main"],
     });
@@ -119,11 +119,14 @@ describe("hosted-publish.yml", () => {
           "cancel-in-progress": false,
         });
         expect(steps(job)[0]?.run).toBe('test "$REF" = refs/heads/main');
-        for (const s of steps(job).filter((s) => s.uses)) {
+        for (const s of steps(job).filter(
+          (s) => s.uses && s.uses !== "./_cloud/.github/actions/overlay",
+        )) {
           expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
           if (String(s.uses).startsWith("actions/checkout@"))
             expect(s.with).toEqual({
               ref: "${{ github.sha }}",
+              path: "_cloud",
               "persist-credentials": false,
             });
         }
