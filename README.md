@@ -31,6 +31,7 @@ pinned public release, with this tree copied on top.
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
 | `hosted-workflows/` | Written by the sync: the hosted workflows, inert. GitHub never runs them from here; the cut-over PR moves them into `.github/workflows/`. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
+| `.github/ISSUE_TEMPLATE/blocker.yml` | Repo-only GitHub config so the hosted workflows can open `blocker` issues here. Never overlaid; `equivalence.sh` requires it to be byte-identical to public's at `SYNCED_FROM`. |
 
 ## Overlay rules
 
@@ -51,7 +52,9 @@ pinned public release, with this tree copied on top.
 5. **This repo's own files never overlay**: root-level files (this README,
    PUBLIC_PIN, SYNCED_FROM, private-paths.txt), the tooling scripts listed in
    `TOOLING` in `overlay.sh`, `.github/workflows/ci.yml` (this repo's CI;
-   public has its own) and `hosted-workflows/`. Any other file directly in
+   public has its own), `.github/ISSUE_TEMPLATE/blocker.yml` (repo-only
+   GitHub config, checked equal to public's by `equivalence.sh`) and
+   `hosted-workflows/`. Any other file directly in
    `scripts/` fails the run. Everything else in the tree overlays, at the
    same path.
 

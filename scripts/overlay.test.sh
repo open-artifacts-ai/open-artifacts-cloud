@@ -67,6 +67,20 @@ check "this repo's ci.yml never overlays" [ "$(cat "$T/p1/.github/workflows/ci.y
 check "scripts/ tooling never overlays" [ ! -e "$T/p1/scripts/overlay.sh" ]
 check "PUBLIC_PIN never overlays" [ ! -e "$T/p1/PUBLIC_PIN" ]
 
+# The blocker issue template is repo-only GitHub config: it never collides.
+mkpub "$T/pb"; mkpriv "$T/vb" "$T/pb"
+mkdir -p "$T/pb/.github/ISSUE_TEMPLATE" "$T/vb/.github/ISSUE_TEMPLATE"
+echo 'name: Blocker' > "$T/pb/.github/ISSUE_TEMPLATE/blocker.yml"; echo 'name: Blocker' > "$T/vb/.github/ISSUE_TEMPLATE/blocker.yml"
+G -C "$T/pb" add -A; G -C "$T/pb" commit -qm tmpl; G -C "$T/pb" tag -f v1 > /dev/null
+printf 'tag=v1\nsha=%s\n' "$(git -C "$T/pb" rev-parse HEAD)" > "$T/vb/PUBLIC_PIN"
+expect_exit "a cloud blocker.yml does not collide with public's" 0 "$OVERLAY" "$T/pb" "$T/vb"
+mkpub "$T/pc"; mkpriv "$T/vc" "$T/pc"
+mkdir -p "$T/vc/.github/ISSUE_TEMPLATE"; echo 'name: Other' > "$T/vc/.github/ISSUE_TEMPLATE/other.yml"
+mkdir -p "$T/pc/.github/ISSUE_TEMPLATE"; echo 'name: Other' > "$T/pc/.github/ISSUE_TEMPLATE/other.yml"
+G -C "$T/pc" add -A; G -C "$T/pc" commit -qm other; G -C "$T/pc" tag -f v1 > /dev/null
+printf 'tag=v1\nsha=%s\n' "$(git -C "$T/pc" rev-parse HEAD)" > "$T/vc/PUBLIC_PIN"
+expect_exit "any other ISSUE_TEMPLATE file still collides" 1 "$OVERLAY" "$T/pc" "$T/vc"
+
 # --- overlay: refusals -----------------------------------------------------------
 mkpub "$T/p2"; mkpriv "$T/v2" "$T/p2"
 mkdir -p "$T/v2/apps/server"; echo 'shadow' > "$T/v2/apps/server/index.ts"
@@ -368,6 +382,19 @@ sed -i 's/      b: 1/      b: 2/' "$T/ec1/pnpm-lock.yaml"
 expect_exit "a changed public importer in the lockfile fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
 check "the importer is named" grep -q 'apps/server' "$T/out"
 rm "$T/ec1/pnpm-lock.yaml"
+
+# The blocker issue template: repo-only, must equal public@S byte for byte.
+mkpub_hosted "$T/eb"; mkdir -p "$T/eb/.github/ISSUE_TEMPLATE"; echo 'name: Blocker' > "$T/eb/.github/ISSUE_TEMPLATE/blocker.yml"
+G -C "$T/eb" add -A; G -C "$T/eb" commit -qm tmpl
+mkcloud "$T/eb" "$T/ebc"
+mkdir -p "$T/ebc/.github/ISSUE_TEMPLATE"; echo 'name: Blocker' > "$T/ebc/.github/ISSUE_TEMPLATE/blocker.yml"
+expect_exit "a blocker.yml identical to public's passes" 0 "$T/ebc/scripts/equivalence.sh" "$T/eb" "$T/ebc"
+echo 'name: Edited' > "$T/ebc/.github/ISSUE_TEMPLATE/blocker.yml"
+expect_exit "a blocker.yml that differs from public's fails" 1 "$T/ebc/scripts/equivalence.sh" "$T/eb" "$T/ebc"
+check "the difference is named" grep -q 'DIFF: .github/ISSUE_TEMPLATE/blocker.yml' "$T/out"
+mkcloud "$T/e1" "$T/ebd"
+mkdir -p "$T/ebd/.github/ISSUE_TEMPLATE"; echo 'name: Blocker' > "$T/ebd/.github/ISSUE_TEMPLATE/blocker.yml"
+expect_exit "a blocker.yml that public lacks fails" 1 "$T/ebd/scripts/equivalence.sh" "$T/e1" "$T/ebd"
 
 # CLOUD owns the private paths: edits, deletions and additions inside them pass.
 rm "$T/ec1/apps/hosted/src/index.ts"
