@@ -171,10 +171,10 @@ describe("hosted-publish.yml", () => {
       it("publishes with oa:hosted for this env only", () => {
         const p = named(job, "Publish");
         expect(p.run).toContain(
-          `release) pnpm -s oa:hosted publish-release --env ${env} --tag "$TAG" ;;`,
+          `release) pnpm -s --silent --filter @oa/hosted start publish-release --env ${env} --tag "$TAG" ;;`,
         );
         expect(p.run).toContain(
-          `floor) pnpm -s oa:hosted publish-floor --env ${env} --floor "$FLOOR" ;;`,
+          `floor) pnpm -s --silent --filter @oa/hosted start publish-floor --env ${env} --floor "$FLOOR" ;;`,
         );
         expect(p.env.OA_HOSTED_ENVIRONMENT).toBe(`hosted-${env}-deploy`);
         const other = env === "prod" ? "staging" : "prod";

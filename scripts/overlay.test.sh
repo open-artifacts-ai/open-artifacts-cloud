@@ -799,5 +799,19 @@ mkdir -p "$T/mc4/.github/workflows"; mv "$T/mc4/hosted-workflows/hosted.yml" "$T
 rm -rf "$T/mc4/hosted-workflows"
 expect_exit "a listed workflow already placed under .github/workflows passes the existence guard" 0 "$T/mc4/scripts/equivalence.sh" "$T/m4" "$T/mc4"
 
+# N5 (moved from a test on the public ci.yml, which drops that job at the split):
+# this repo's own CI runs provision's release-t3b "real build" test and never
+# skips it. ci.yml is this repo's, never overlaid, so it is checked here.
+CI_YML="$HERE/../.github/workflows/ci.yml"
+check "N5: ci.yml's overlay job sets OA_REQUIRE_REAL_BUILD=1 (real build never skips)" \
+  grep -Eq '^      OA_REQUIRE_REAL_BUILD: "1"$' "$CI_YML"
+# shellcheck disable=SC2016
+check "N5: ci.yml runs each private package's tests, one by one" \
+  grep -qF 'pnpm --filter "./$d" run test' "$CI_YML"
+check "N5: provision holds the real-build test" \
+  grep -q 'real build' "$HERE/../packages/provision/test/release-t3b.test.ts"
+check "N5: the provision package's test script runs vitest" \
+  grep -Eq '"test": ".*vitest run' "$HERE/../packages/provision/package.json"
+
 echo "overlay tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
