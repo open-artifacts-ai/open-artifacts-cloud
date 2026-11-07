@@ -58,6 +58,24 @@ jobs:
       # A tree with only some of them fails. No hand-set flag.
       - name: overlay (checks the pin; pre-split or strict, from the pinned tree)
         run: private/scripts/overlay.sh --auto-split public private
+      # Private tests read the hosted workflows at .github/workflows/. Until
+      # the cut-over they are parked in hosted-workflows/; place them in the
+      # overlay tree as the cut-over will. GitHub reads workflows only from
+      # this repo's own root, so these copies never run. An existing target is
+      # a failure, never an overwrite.
+      - name: place parked hosted workflows in the overlay tree
+        run: |
+          set -euo pipefail
+          mkdir -p public/.github/workflows
+          n=0
+          for f in private/hosted-workflows/*; do
+            [ -f "$f" ] || continue
+            t="public/.github/workflows/$(basename "$f")"
+            if [ -e "$t" ] || [ -L "$t" ]; then echo "::error::$t already exists"; exit 1; fi
+            cp "$f" "$t"
+            n=$((n + 1))
+          done
+          echo "placed $n hosted workflow(s)"
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
       # sync there is no SYNCED_FROM and the script skips with a message.
