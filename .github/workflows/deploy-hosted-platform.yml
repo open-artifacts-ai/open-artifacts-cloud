@@ -74,6 +74,12 @@ on:
     # (run 42109047045). A dispatched run reads every secret from its own
     # job's Environment (hosted-<env>-deploy), plus the repo's OA_OWNER_EMAIL.
 
+# The public repo: the release and smoke gates read its releases, its tag
+# commit, its release-please run and its deploy-staging.yml smoke from here;
+# everything hosted (jobs, assets, red-line runs) is this repo's own.
+env:
+  PUBLIC_REPO: open-artifacts-ai/open-artifacts
+
 # actions: read lets the release gate read release-please.yml's run and jobs
 # (and the staging-first gate redline-staging.yml's runs); issues: write lets
 # the token read-back open its expiry issue and a break-glass run its record.
@@ -177,17 +183,16 @@ jobs:
           body="$RUNNER_TEMP/break-glass.md"
           printf 'Reason: %s\n\nRun: %s\n\nActor: %s\n' "$REASON" "$RUN_URL" "$ACTOR" > "$body"
           gh issue create --repo "$GITHUB_REPOSITORY" --title "Break-glass platform deploy: $DEPLOY_ENV $TAG $TARGETS" --body-file "$body"
+      # The CLOUD tag, overlaid on the public tree at the tag's PUBLIC_PIN.
+      # The action refuses a checkout that is not exactly the tag.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: refs/tags/${{ inputs.tag }}
+          path: _cloud
           persist-credentials: false
-      - name: The checkout is exactly the tag
-        env:
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          test "$(git describe --tags --exact-match)" = "$TAG"
-          test -z "$(git status --porcelain)"
+      - uses: ./_cloud/.github/actions/overlay
+        with:
+          exact-tag: ${{ inputs.tag }}
       # The deploy logic is this workflow's own commit on main (reviewed, and
       # the Environment allows only main); what it deploys is the tag's.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

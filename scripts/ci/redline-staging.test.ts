@@ -125,7 +125,9 @@ describe("redline-staging.yml", () => {
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
-    for (const s of steps) if (s.uses) expect(s.uses).toMatch(SHA_PIN);
+    for (const s of steps)
+      if (s.uses && s.uses !== "./_cloud/.github/actions/overlay")
+        expect(s.uses).toMatch(SHA_PIN);
     const checkouts = steps.filter((s) =>
       String(s.uses).startsWith("actions/checkout@"),
     );
@@ -192,12 +194,12 @@ describe("redline-staging.yml", () => {
     expect(steps[1]?.uses).toMatch(/^actions\/checkout@/);
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(steps[1]?.with?.ref).toBe("refs/tags/${{ inputs.tag }}");
-    const exact = named("The checkout is exactly the tag");
-    expect(steps[2]).toBe(exact);
-    expect(exact.run).toContain(
-      'test "$(git describe --tags --exact-match)" = "$TAG"',
-    );
-    expect(exact.run).toContain('test -z "$(git status --porcelain)"');
+    // The CLOUD tag goes to _cloud; the overlay action puts it on the public
+    // tree at the tag's PUBLIC_PIN and refuses anything but exactly the tag.
+    expect(steps[1]?.with?.path).toBe("_cloud");
+    expect(steps[2]?.uses).toBe("./_cloud/.github/actions/overlay");
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(steps[2]?.with).toEqual({ "exact-tag": "${{ inputs.tag }}" });
     // Nothing else may check out a different ref, and the deploy logic stays
     // main's: platform-tags keeps its own checkout of the workflow's commit.
     expect(text.match(/refs\/tags\//g)).toHaveLength(1);

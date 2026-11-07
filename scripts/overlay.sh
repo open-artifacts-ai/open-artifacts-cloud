@@ -17,9 +17,11 @@
 #      public tag's.
 #   5. This repo's own files never overlay: root-level files (README.md,
 #      PUBLIC_PIN, SYNCED_FROM, private-paths.txt, ...), the tooling listed in
-#      TOOLING below, .github/workflows/ci.yml (this repo's CI) and
-#      hosted-workflows/ (inert copies of the hosted workflows, until the
-#      cut-over). Any other file directly in scripts/ fails the run: it is
+#      TOOLING below, .github/workflows/ci.yml (this repo's CI),
+#      .github/actions/ (this repo's own CI actions, the overlay prelude
+#      among them) and hosted-workflows/ (where the sync parks public's
+#      copies of the hosted workflows; the live ones are .github/workflows/).
+#      Any other file directly in scripts/ fails the run: it is
 #      neither tooling nor a path public could hold.
 #
 # --pre-split: for the time before the hosted paths are deleted from public.
@@ -114,7 +116,8 @@ while IFS= read -r f; do
   case "$f" in
     .git/* | */.git/* | node_modules/* | */node_modules/*) continue ;;
     .github/workflows/ci.yml) continue ;;   # Rule 5: this repo's CI
-    hosted-workflows/*) continue ;;         # Rule 5: inert until the cut-over
+    .github/actions/*) continue ;;          # Rule 5: this repo's CI actions
+    hosted-workflows/*) continue ;;         # Rule 5: parked copies (the sync's landing dir)
     scripts/*/*) ;;
     scripts/*)
       case "$TOOLING" in

@@ -29,8 +29,11 @@ pinned public release, with this tree copied on top.
 | `scripts/pin-check.sh` | CI: ties `PUBLIC_PIN` to `SYNCED_FROM` while public still holds the hosted paths: `pin-check.sh <public-checkout-with-history> [<private-dir>]`. |
 | `scripts/place-workflows.sh` | The one place step: copies `hosted-workflows/` into an overlay tree's `.github/workflows/` (recursive, `cp -P -p`, refuses a symlinked dir and an existing target). Used by CI and `equivalence.sh`. |
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
-| `hosted-workflows/` | Written by the sync: the hosted workflows, inert. GitHub never runs them from here; the cut-over PR moves them into `.github/workflows/`. |
+| `hosted-workflows/` | Where the sync parks public's copies of the hosted workflows (it never writes under `.github/workflows/`). Empty since C2: the live workflows are in `.github/workflows/`, edited for this repo, and a re-sync's changes are hand-ported into them. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
+| `.github/workflows/<hosted>.yml` | The hosted workflows (deploy, publish, floor, red-line, monitors, token pings), live since C2 (#1056). Dispatch only, plus `hosted-publish`'s `workflow_run` on `hosted-release` (C3). The two schedules (`prodclean-monitor`, `redline-nightly`) stay off until cut-over step F5. `PROD_RELEASE_CHAIN` stays unset. |
+| `.github/actions/overlay/` | The overlay prelude every hosted job that installs or builds uses: check this repo out at `_cloud`, then this action puts public at the `PUBLIC_PIN` of that checkout with this repo on top, at the workspace root. |
+| `.nvmrc` | Node version for jobs that check out only this repo (scripts, no install). CI fails if it differs from public's at the pin. |
 
 ## Overlay rules
 
@@ -51,7 +54,8 @@ pinned public release, with this tree copied on top.
 5. **This repo's own files never overlay**: root-level files (this README,
    PUBLIC_PIN, SYNCED_FROM, private-paths.txt), the tooling scripts listed in
    `TOOLING` in `overlay.sh`, `.github/workflows/ci.yml` (this repo's CI;
-   public has its own) and `hosted-workflows/`. Any other file directly in
+   public has its own), `.github/actions/` (this repo's CI actions) and
+   `hosted-workflows/`. Any other file directly in
    `scripts/` fails the run. Everything else in the tree overlays, at the
    same path.
 
@@ -188,8 +192,9 @@ every private path, so a plain overlay on that tag collides on purpose. CI
 uses `--auto-split`, which removes the listed paths from the pinned tree while
 they are all there and is strict once none are. The order is: public untangle,
 sync, public delete, then a pin bump to the release with the delete.
-`place-workflows.sh` then puts the parked workflows where private tests read
-them, as the cut-over will.
+The hosted workflows live at `.github/workflows/`, so the overlay copies them
+to the tree where the private workflow tests read them. `place-workflows.sh`
+is still run: it places whatever is parked in `hosted-workflows/` (nothing, now).
 
 ## Local development
 
@@ -208,5 +213,6 @@ fresh overlay. Remove one with
 
 ## Not here yet
 
-- Secrets and GitHub environments' remaining values, and the deploy, release,
-  sign and publish workflows. They come at the cut-over (plan: C2 to C5).
+- Secrets and GitHub environments' remaining values, and the signing and
+  release workflow (`hosted-release`, C3). The deploy, publish, floor and
+  red-line workflows are live since C2.

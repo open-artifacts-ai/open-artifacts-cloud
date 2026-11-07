@@ -51,14 +51,11 @@ const UPLOAD =
   "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 
 describe("prodclean-monitor.yml", () => {
-  it("runs hourly and on dispatch only", () => {
-    expect(Object.keys(wf.on).sort()).toEqual([
-      "schedule",
-      "workflow_dispatch",
-    ]);
-    const s = wf.on.schedule as { cron: string }[];
-    expect(s).toHaveLength(1);
-    expect(s[0]?.cron).toMatch(/^\d{1,2} \* \* \* \*$/);
+  // The hourly schedule is off in this repo until cut-over step F5 (#1056):
+  // public's copy still runs it, and two monitors would double-run. F5 puts
+  // the schedule back (one hourly cron) and this test with it.
+  it("runs on dispatch only, until F5 turns the schedule on", () => {
+    expect(Object.keys(wf.on)).toEqual(["workflow_dispatch"]);
   });
 
   it("two jobs: build has contents: read only, monitor has id-token: write only", () => {
@@ -130,7 +127,11 @@ describe("prodclean-monitor.yml", () => {
   });
 
   it("every action is pinned to a full SHA; checkout keeps no credentials", () => {
-    const uses = allSteps.flatMap((s) => (s.uses ? [s.uses] : []));
+    // The local overlay action (this repo's own, at the checked-out _cloud)
+    // has no SHA: it is the commit the job runs.
+    const uses = allSteps.flatMap((s) =>
+      s.uses && s.uses !== "./_cloud/.github/actions/overlay" ? [s.uses] : [],
+    );
     expect(uses.length).toBeGreaterThan(0);
     for (const u of uses) expect(u).toMatch(/^[\w.-]+\/[\w.-]+@[0-9a-f]{40}$/);
     // The same SHAs as redline-staging.yml, plus download-artifact (v4.3.0).
