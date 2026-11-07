@@ -31,6 +31,7 @@ pinned public release, with this tree copied on top.
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
 | `hosted-workflows/` | Written by the sync: the hosted workflows, inert. GitHub never runs them from here; the cut-over PR moves them into `.github/workflows/`. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
+| `.github/workflows/hosted-release.yml` | Mirrors the public release at `PUBLIC_PIN` into this repo (tag and release, by the release App), then builds, signs and attaches the hosted release files (cut-over step C3, #1056). `workflow_dispatch` only until step F2; `dry_run` (the default) builds and signs with the staging key and stops before the tag and the attach. |
 
 ## Overlay rules
 

@@ -33,8 +33,13 @@ set -uo pipefail
 # blindly: check_lock below still requires every non-private importer to match
 # public's byte for byte. The packages/snapshots sections are not compared:
 # they follow from the importers and are pnpm's to resolve.
+#
+# .github/workflows/hosted-release.yml is this repo's own workflow (#1056 C3):
+# public has no such file, so it is an extra in the overlay tree by design. It
+# is listed by exact path so that any other new workflow still fails.
 ALLOW=(
   pnpm-lock.yaml
+  .github/workflows/hosted-release.yml
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

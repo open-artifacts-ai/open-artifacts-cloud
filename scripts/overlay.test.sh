@@ -369,6 +369,16 @@ expect_exit "a changed public importer in the lockfile fails" 1 "$T/ec1/scripts/
 check "the importer is named" grep -q 'apps/server' "$T/out"
 rm "$T/ec1/pnpm-lock.yaml"
 
+# hosted-release.yml is this repo's own workflow (C3): public has none, so it is
+# an allowlisted extra. Any other new workflow still fails.
+mkdir -p "$T/ec1/.github/workflows"
+echo 'name: hosted-release' > "$T/ec1/.github/workflows/hosted-release.yml"
+expect_exit "this repo's hosted-release.yml is an allowed extra" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+echo 'name: other' > "$T/ec1/.github/workflows/other.yml"
+expect_exit "another new workflow fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "the other workflow is named" grep -q 'other.yml (only in overlay (extra))' "$T/out"
+rm "$T/ec1/.github/workflows/other.yml" "$T/ec1/.github/workflows/hosted-release.yml"
+
 # CLOUD owns the private paths: edits, deletions and additions inside them pass.
 rm "$T/ec1/apps/hosted/src/index.ts"
 expect_exit "a dropped private file passes (CLOUD-owned)" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"

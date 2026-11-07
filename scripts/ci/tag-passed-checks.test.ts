@@ -350,3 +350,410 @@ describe("tag-passed-checks.sh", () => {
     }
   });
 });
+
+// Split mode (#1056 C3): the hosted jobs and assets are in the hosted repo's
+// hosted-release run; the public release and its release-please run are read
+// from PUBLIC_REPO. A tag with no release in the hosted repo is legacy: the
+// old read of the public repo.
+describe("tag-passed-checks.sh, two repos", () => {
+  const CLOUD = "open-artifacts-ai/open-artifacts-cloud";
+  const CSHA = "e".repeat(40);
+  // gh api -X GET [-H ...] <path>: $STATE/<pub|cloud>-<key>.json; a missing file
+  // is a 404, a <key>.err file is that error.
+  const ghTwo = `
+p="\${@: -1}"
+case "$p" in
+  repos/${REPO}/*) side=pub; p="\${p#repos/${REPO}/}" ;;
+  repos/${CLOUD}/*) side=cloud; p="\${p#repos/${CLOUD}/}" ;;
+  *) exit 1 ;;
+esac
+case "$p" in
+  releases/tags/*) k=release ;;
+  commits/*) k=commit ;;
+  compare/*) k=compare ;;
+  contents/PUBLIC_PIN\\?*) k=pin ;;
+  actions/workflows/release-please.yml/runs\\?*) k=runs ;;
+  actions/workflows/hosted-release.yml/runs\\?*) k=runs ;;
+  actions/runs/*/jobs\\?*) k=jobs ;;
+  *) exit 1 ;;
+esac
+k="$side-$k"
+[ -f "$STATE/$k.err" ] && { cat "$STATE/$k.err" >&2; exit 1; }
+[ -f "$STATE/$k.json" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+cat "$STATE/$k.json"`;
+
+  const jobsOf = (names: string[]) => ({
+    jobs: names.map((name) => ({
+      name,
+      status: "completed",
+      conclusion: "success",
+    })),
+  });
+  const rel = (assets: string[]) => ({
+    tag_name: TAG,
+    draft: false,
+    prerelease: false,
+    published_at: "2026-10-30T00:00:00Z",
+    assets: assets.map((name) => ({ name, state: "uploaded" })),
+  });
+  const runOf = (sha: string, extra: Record<string, unknown> = {}) => ({
+    workflow_runs: [
+      {
+        id: 41,
+        head_sha: sha,
+        event: "push",
+        display_title: "hosted-release",
+        status: "completed",
+        conclusion: "success",
+        created_at: "2026-10-30T00:00:00Z",
+        ...extra,
+      },
+    ],
+  });
+  const two = (): State => ({
+    "pub-release": rel([]),
+    "pub-commit": { sha: SHA },
+    "pub-compare": { status: "behind" },
+    "pub-runs": runOf(SHA),
+    "pub-jobs": jobsOf(["release-please", "verify-release", "pack-npm"]),
+    "cloud-release": rel([
+      "oa-release-staging-0.80.0.tar",
+      "oa-release-prod-0.80.0.tar",
+    ]),
+    "cloud-commit": { sha: CSHA },
+    "cloud-compare": { status: "identical" },
+    "cloud-runs": runOf(CSHA),
+    "cloud-jobs": jobsOf([
+      "mirror",
+      "hosted-guard",
+      "hosted-build",
+      "hosted-check",
+      "hosted-sign-staging",
+      "hosted-sign-prod",
+      "hosted-attach-staging",
+      "hosted-attach-prod",
+    ]),
+    "cloud-pin": `tag=${TAG}\nsha=${SHA}\n`,
+  });
+  const runTwo = (state: State, env = "prod", repo = CLOUD) => {
+    const sb = sandbox({ gh: ghTwo });
+    const dir = join(sb.dir, "state");
+    mkdirSync(dir);
+    for (const [k, v] of Object.entries(state))
+      if (v !== undefined)
+        writeFileSync(
+          join(dir, k.endsWith(".err") ? k : `${k}.json`),
+          typeof v === "string" ? v : JSON.stringify(v),
+        );
+    const r = sb.run(["bash", SCRIPT, env, TAG], {
+      env: {
+        STATE: dir,
+        GH_TOKEN: "gh-token-SHOULD-NEVER-APPEAR",
+        GITHUB_REPOSITORY: repo,
+      },
+    });
+    expect(r.out + r.err).not.toContain("SHOULD-NEVER-APPEAR");
+    return { ...r, calls: sb.log() };
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: test fixtures
+  const tweak = (f: (s: any) => void): State => {
+    const s = two();
+    f(s);
+    return s;
+  };
+  const cloudJob = (name: string, conclusion: string | null) =>
+    // biome-ignore lint/suspicious/noExplicitAny: test fixtures
+    tweak((s: any) => {
+      s["cloud-jobs"].jobs = s["cloud-jobs"].jobs.map((j: { name: string }) =>
+        j.name === name
+          ? {
+              name,
+              status: conclusion === null ? "in_progress" : "completed",
+              conclusion,
+            }
+          : j,
+      );
+    });
+
+  it("passes when both halves hold, for both envs, reading only", () => {
+    for (const env of ["staging", "prod"]) {
+      const r = runTwo(two(), env);
+      expect(r.code, r.err).toBe(0);
+      expect(r.out).toContain(`${TAG} passed every check for ${env}`);
+      expect(r.out).toContain(`hosted commit ${CSHA}`);
+      for (const c of r.calls.filter((c) => c.startsWith("gh ")))
+        expect(c).toMatch(/^gh api -X GET /);
+    }
+  });
+
+  it("reads the hosted jobs and assets from the hosted repo, not the public one", () => {
+    // The public run has no hosted-* jobs and no assets: still a pass.
+    const r = runTwo(two());
+    expect(r.code, r.err).toBe(0);
+    const paths = r.calls.map((c) => c.split(" ").at(-1) ?? "");
+    expect(
+      paths.some((p) =>
+        p.startsWith(
+          `repos/${CLOUD}/actions/workflows/hosted-release.yml/runs`,
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      paths.some((p) =>
+        p.startsWith(`repos/${REPO}/actions/workflows/release-please.yml/runs`),
+      ),
+    ).toBe(true);
+    expect(
+      paths.some((p) =>
+        p.startsWith(`repos/${CLOUD}/actions/workflows/release-please.yml`),
+      ),
+    ).toBe(false);
+  });
+
+  const cases: [string, State, RegExp][] = [
+    [
+      "the public release is missing",
+      tweak((s) => delete s["pub-release"]),
+      /release v0\.80\.0: GitHub API error/,
+    ],
+    [
+      "the public release is a prerelease",
+      tweak((s) => (s["pub-release"].prerelease = true)),
+      /is a prerelease/,
+    ],
+    [
+      "the public commit is off public main",
+      tweak((s) => (s["pub-compare"].status = "diverged")),
+      /not on main \(diverged\)/,
+    ],
+    [
+      "no public release-please push run",
+      tweak((s) => (s["pub-runs"].workflow_runs = [])),
+      /release-please run: no push run/,
+    ],
+    [
+      "public verify-release failed",
+      tweak((s) => {
+        s["pub-jobs"].jobs[1].conclusion = "failure";
+      }),
+      /job verify-release: failure/,
+    ],
+    [
+      "public verify-release missing",
+      tweak((s) => {
+        s["pub-jobs"].jobs = s["pub-jobs"].jobs.filter(
+          (j: { name: string }) => j.name !== "verify-release",
+        );
+      }),
+      /job verify-release: missing/,
+    ],
+    [
+      "the hosted release is a draft",
+      tweak((s) => (s["cloud-release"].draft = true)),
+      /is a draft/,
+    ],
+    [
+      "the hosted commit is off hosted main",
+      tweak((s) => (s["cloud-compare"].status = "ahead")),
+      /not on main \(ahead\)/,
+    ],
+    [
+      "no hosted-release run",
+      tweak((s) => (s["cloud-runs"].workflow_runs = [])),
+      /hosted-release run: no push run/,
+    ],
+    [
+      "only a dry run exists",
+      tweak((s) => {
+        s["cloud-runs"] = runOf(CSHA, {
+          event: "workflow_dispatch",
+          display_title: "hosted-release (dry run)",
+        });
+      }),
+      /hosted-release run: no push run/,
+    ],
+    [
+      "hosted-guard failed",
+      cloudJob("hosted-guard", "failure"),
+      /job hosted-guard: failure/,
+    ],
+    ["mirror skipped", cloudJob("mirror", "skipped"), /job mirror: skipped/],
+    [
+      "hosted-build still running",
+      cloudJob("hosted-build", null),
+      /job hosted-build: not completed \(in_progress\)/,
+    ],
+    [
+      "hosted-check failed",
+      cloudJob("hosted-check", "failure"),
+      /job hosted-check: failure/,
+    ],
+    [
+      "hosted-sign-prod failed",
+      cloudJob("hosted-sign-prod", "failure"),
+      /job hosted-sign-prod: failure/,
+    ],
+    [
+      "hosted-attach-prod failed",
+      cloudJob("hosted-attach-prod", "failure"),
+      /job hosted-attach-prod: failure/,
+    ],
+    [
+      "hosted-attach-prod missing",
+      tweak((s) => {
+        s["cloud-jobs"].jobs = s["cloud-jobs"].jobs.filter(
+          (j: { name: string }) => j.name !== "hosted-attach-prod",
+        );
+      }),
+      /job hosted-attach-prod: missing/,
+    ],
+    [
+      "another hosted job failed",
+      tweak((s) =>
+        s["cloud-jobs"].jobs.push({
+          name: "new-job",
+          status: "completed",
+          conclusion: "failure",
+        }),
+      ),
+      /job new-job: failure/,
+    ],
+    [
+      "no prod asset on the hosted release",
+      tweak(
+        (s) =>
+          (s["cloud-release"].assets = [
+            { name: "oa-release-staging-0.80.0.tar", state: "uploaded" },
+          ]),
+      ),
+      /no oa-release-prod-\* asset/,
+    ],
+    [
+      "an asset only on the public release",
+      tweak((s) => {
+        s["cloud-release"].assets = [];
+        s["pub-release"].assets = [
+          { name: "oa-release-prod-0.80.0.tar", state: "uploaded" },
+        ];
+      }),
+      /no oa-release-prod-\* asset/,
+    ],
+    [
+      "PUBLIC_PIN names another tag",
+      tweak((s) => (s["cloud-pin"] = `tag=v0.79.0\nsha=${SHA}\n`)),
+      /PUBLIC_PIN at e+: not v0\.80\.0/,
+    ],
+    [
+      "PUBLIC_PIN names another public commit",
+      tweak((s) => (s["cloud-pin"] = `tag=${TAG}\nsha=${"d".repeat(40)}\n`)),
+      /PUBLIC_PIN at e+: not public commit c+/,
+    ],
+    [
+      "PUBLIC_PIN unreadable",
+      tweak((s) => delete s["cloud-pin"]),
+      /PUBLIC_PIN at e+: GitHub API error/,
+    ],
+    [
+      "the hosted release lookup errors (not a 404)",
+      tweak((s) => {
+        delete s["cloud-release"];
+        s["cloud-release.err"] = "gh: Server Error (HTTP 500)";
+      }),
+      /release v0\.80\.0: GitHub API error/,
+    ],
+  ];
+  it.each(cases)("fails closed on %s, naming the check", (_n, state, msg) => {
+    const r = runTwo(state);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/^release gate failed: /m);
+    expect(r.err).toMatch(msg);
+    expect(r.out).not.toContain("passed every check");
+  });
+
+  it("a successful run is not hidden by a later dry run", () => {
+    const s = tweak((x) => {
+      x["cloud-runs"].workflow_runs.push({
+        ...x["cloud-runs"].workflow_runs[0],
+        id: 99,
+        event: "workflow_dispatch",
+        display_title: "hosted-release (dry run)",
+        created_at: "2026-10-30T09:00:00Z",
+      });
+    });
+    const r = runTwo(s);
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain("run 41");
+  });
+
+  it("accepts a dispatched (non dry) hosted-release run", () => {
+    const s = tweak((x) => {
+      x["cloud-runs"] = runOf(CSHA, { event: "workflow_dispatch" });
+    });
+    expect(runTwo(s).code).toBe(0);
+  });
+
+  it("a tag with no hosted release is legacy: everything is read from the public repo", () => {
+    const s = two();
+    delete s["cloud-release"];
+    // The legacy run carries the hosted jobs and assets, as before the split.
+    s["pub-release"] = rel([
+      "oa-release-staging-0.80.0.tar",
+      "oa-release-prod-0.80.0.tar",
+    ]);
+    s["pub-jobs"] = jobsOf([
+      "release-please",
+      "verify-release",
+      "hosted-guard",
+      "hosted-build",
+      "hosted-check",
+      "hosted-sign-staging",
+      "hosted-sign-prod",
+      "hosted-attach-staging",
+      "hosted-attach-prod",
+    ]);
+    const r = runTwo(s);
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain(`commit ${SHA}`);
+    expect(r.calls.some((c) => c.includes("hosted-release.yml"))).toBe(false);
+  });
+
+  it("a legacy tag still needs its hosted jobs in the public run", () => {
+    const s = two();
+    delete s["cloud-release"];
+    // two() has no hosted jobs in the public run and no assets.
+    const r = runTwo(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/job hosted-guard: missing/);
+  });
+
+  it("a hosted release does not make up for a failing public run", () => {
+    const s = tweak((x) => {
+      x["pub-jobs"].jobs[0].conclusion = "failure";
+    });
+    const r = runTwo(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/job release-please: failure/);
+  });
+
+  it("running in the public repo itself is always the legacy read", () => {
+    const s = two();
+    s["pub-release"] = rel([
+      "oa-release-staging-0.80.0.tar",
+      "oa-release-prod-0.80.0.tar",
+    ]);
+    s["pub-jobs"] = jobsOf([
+      "release-please",
+      "verify-release",
+      "hosted-guard",
+      "hosted-build",
+      "hosted-check",
+      "hosted-sign-staging",
+      "hosted-sign-prod",
+      "hosted-attach-staging",
+      "hosted-attach-prod",
+    ]);
+    const r = runTwo(s, "prod", REPO);
+    expect(r.code, r.err).toBe(0);
+    expect(r.calls.some((c) => c.includes(CLOUD))).toBe(false);
+  });
+});
