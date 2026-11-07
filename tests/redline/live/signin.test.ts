@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, it } from "vitest";
+import { mark } from "../src/barrier.ts";
 import {
   ID_TOKEN_CASES,
   idTokenOutcome,
@@ -72,6 +73,7 @@ beforeAll(async () => {
 
 const cleanup: { t: Target; pat: Cred; id: string }[] = [];
 afterAll(async () => {
+  mark("broker-done");
   for (const s of [A, B])
     if (s) cleanup.push({ t: s.t, pat: s.pat, id: s.markerId });
   // Per id, one retry, never a throw mid-loop: a failed delete is noted.
@@ -162,6 +164,12 @@ describe("sign-in: ID tokens", () => {
 });
 
 describe("sign-in: broker", () => {
+  // The OIDC and broker describes above are the file's only spenders of the
+  // broker's per-IP bucket (startGoogle follows its redirect). P34 floods
+  // that bucket on purpose, so it waits for this mark (src/barrier.ts); the
+  // file-level afterAll marks too, for a run that never reaches here.
+  afterAll(() => mark("broker-done"));
+
   it("a tampered install id at the broker callback is refused", async (ctx) => {
     if (T.mode !== "staging")
       return proof(ctx, "staging-only", "no auth broker in local mode");

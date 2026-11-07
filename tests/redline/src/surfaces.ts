@@ -1643,18 +1643,21 @@ export async function throwaway(
   if (fresh === "grant") {
     // The consent flow, as the admin (the code names the grant). Listed
     // before and after, so a code without one still finds the grant and
-    // dispose always revokes it.
+    // dispose always revokes it. The fallback keeps only grants of the client
+    // registered here (#1730): another lane's consent, or an earlier run's
+    // grant, can't be mistaken for this one. More than one left is no
+    // answer: it throws rather than pick.
     const before = new Set(await grantIds(side));
+    const client = await registerClient(t);
     const code = await authorizeCode(
       t,
       side.cookie,
-      await registerClient(t),
+      client,
       pkce(),
       mcpResource(t),
     );
     const grantId =
-      code.split(":")[1] ||
-      (await grantIds(side)).find((id) => !before.has(id));
+      code.split(":")[1] || (await ownGrantId(side, client, before));
     if (!grantId) throw new Error(`${t.name}: the consent made no grant`);
     x.grantId = grantId;
     return x;
@@ -1773,12 +1776,47 @@ async function grantSnapshot(side: Side, id: string): Promise<string> {
   return entry(side, "/api/v1/oauth-clients", id, { ms: GRANT_LIST_MS });
 }
 
+/** The admin's grants (GET R.oauthClients). */
+async function grantList(
+  side: Side,
+): Promise<{ grantId: string; clientId?: string }[]> {
+  const v = (await api(side.t, side.pat, "GET", "/api/v1/oauth-clients")) as
+    | { grantId: string; clientId?: string }[]
+    | { items?: { grantId: string; clientId?: string }[] };
+  return Array.isArray(v) ? v : (v.items ?? []);
+}
+
 /** The admin's grant ids (GET R.oauthClients). */
 async function grantIds(side: Side): Promise<string[]> {
-  const v = (await api(side.t, side.pat, "GET", "/api/v1/oauth-clients")) as
-    | { grantId: string }[]
-    | { items?: { grantId: string }[] };
-  return (Array.isArray(v) ? v : (v.items ?? [])).map((g) => g.grantId);
+  return (await grantList(side)).map((g) => g.grantId);
+}
+
+/**
+ * The new grant of `clientId`, when the consent's code did not name it: the
+ * grants not in `before` whose clientId is the client just registered.
+ * Undefined when there is none yet; throws when more than one remains.
+ */
+export function pickOwnGrant(
+  list: readonly { grantId: string; clientId?: string }[],
+  clientId: string,
+  before: ReadonlySet<string>,
+): string | undefined {
+  const own = list.filter(
+    (g) => !before.has(g.grantId) && g.clientId === clientId,
+  );
+  if (own.length > 1)
+    throw new Error(
+      `the consent made ${own.length} grants for one client; refusing to pick`,
+    );
+  return own[0]?.grantId;
+}
+
+async function ownGrantId(
+  side: Side,
+  clientId: string,
+  before: ReadonlySet<string>,
+): Promise<string | undefined> {
+  return pickOwnGrant(await grantList(side), clientId, before);
 }
 
 /**

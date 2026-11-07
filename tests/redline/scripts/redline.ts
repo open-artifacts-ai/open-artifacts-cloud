@@ -6,6 +6,10 @@
 // The files run in the lanes of src/lanes.ts: phases one after another, the
 // lanes of a phase at the same time, each lane one vitest run whose files run
 // one at a time. Each lane writes a part; this script builds the one report.
+// REDLINE_PLAN=serial runs the two-phase plan of before #1730 (the kill switch).
+// Lanes share `${REPORT}.locks/` (src/locks.ts) and `${REPORT}.barriers/`
+// (src/barrier.ts, with a `lane-exit.<name>` file written when a lane's vitest
+// closes), both wiped at the start like the retry slots.
 import { type ChildProcess, spawn } from "node:child_process";
 import {
   existsSync,
@@ -14,10 +18,20 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { type LaneResult, laneName, mergeLanes, PLAN } from "../src/lanes.ts";
+import { BARRIER_DIR_ENV, barrierDirOf, laneExitFile } from "../src/barrier.ts";
+import {
+  type Lane,
+  type LaneResult,
+  laneName,
+  mergeLanes,
+  planProblems,
+  selectPlan,
+} from "../src/lanes.ts";
+import { LOCK_DIR_ENV, lockDirOf } from "../src/locks.ts";
 import { exitCode, formatReport, gateOn, type Report } from "../src/report.ts";
 import { finalReport, type LanePart, writeReport } from "../src/reporter.ts";
 
@@ -27,17 +41,29 @@ const reportFile =
   process.env.REDLINE_REPORT ||
   join(mkdtempSync(join(tmpdir(), "oa-redline-report-")), "report.json");
 const partsDir = `${reportFile.replace(/\.json$/, "")}.lanes`;
+const barrierDir = barrierDirOf(reportFile);
+const lockDir = lockDirOf(reportFile);
+const PLAN = selectPlan(process.env);
+const bad = planProblems(PLAN);
+if (bad.length) {
+  console.error(`redline: the plan is wrong: ${bad.join("; ")}`);
+  process.exit(1);
+}
 
 // A stale report, part or retry slot must never stand in for this run's.
 rmSync(reportFile, { force: true });
 rmSync(reportFile.replace(/\.json$/, ".txt"), { force: true });
 rmSync(partsDir, { recursive: true, force: true });
+rmSync(barrierDir, { recursive: true, force: true });
+rmSync(lockDir, { recursive: true, force: true });
 const dir = dirname(reportFile);
 if (existsSync(dir))
   for (const f of readdirSync(dir))
     if (f.startsWith(`${basename(reportFile)}.retries`))
       rmSync(join(dir, f), { force: true });
 mkdirSync(partsDir, { recursive: true, mode: 0o700 });
+mkdirSync(barrierDir, { recursive: true, mode: 0o700 });
+mkdirSync(lockDir, { recursive: true, mode: 0o700 });
 
 const vitest = join(pkg, "node_modules", ".bin", "vitest");
 const live = new Set<ChildProcess>();
@@ -66,24 +92,29 @@ function prefixed(
   });
 }
 
-function runLane(
-  lane: readonly string[],
-  prefix: boolean,
-): Promise<LaneResult> {
+function runLane(lane: Lane, prefix: boolean): Promise<LaneResult> {
   const name = laneName(lane);
   const part = join(partsDir, `${name}.json`);
-  const child = spawn(vitest, ["run", "-c", "vitest.live.config.ts", ...lane], {
-    cwd: pkg,
-    stdio: prefix ? ["ignore", "pipe", "pipe"] : "inherit",
-    // The reporter writes this lane's part and leaves the exit to us; the
-    // retry budget (src/retry.ts) still counts beside REDLINE_REPORT.
-    env: {
-      ...process.env,
-      REDLINE_REPORT: reportFile,
-      REDLINE_REPORT_PART: part,
-      REDLINE_GATE: "0",
+  const child = spawn(
+    vitest,
+    ["run", "-c", "vitest.live.config.ts", ...lane.files],
+    {
+      cwd: pkg,
+      stdio: prefix ? ["ignore", "pipe", "pipe"] : "inherit",
+      // The reporter writes this lane's part and leaves the exit to us; the
+      // retry budget (src/retry.ts) still counts beside REDLINE_REPORT.
+      env: {
+        ...process.env,
+        ...lane.env,
+        REDLINE_LANE: name,
+        [BARRIER_DIR_ENV]: barrierDir,
+        [LOCK_DIR_ENV]: lockDir,
+        REDLINE_REPORT: reportFile,
+        REDLINE_REPORT_PART: part,
+        REDLINE_GATE: "0",
+      },
     },
-  });
+  );
   live.add(child);
   if (prefix && child.stdout && child.stderr) {
     prefixed(child.stdout, process.stdout, `[${name}] `);
@@ -92,6 +123,10 @@ function runLane(
   return new Promise((res) =>
     child.on("close", (code, sig) => {
       live.delete(child);
+      // A lane that ended releases whoever waits on it (src/barrier.ts).
+      writeFileSync(laneExitFile(barrierDir, name), String(code ?? sig), {
+        mode: 0o600,
+      });
       let p: LanePart | null = null;
       try {
         const v = JSON.parse(readFileSync(part, "utf8")) as LanePart;
@@ -107,7 +142,7 @@ function runLane(
 const results: LaneResult[] = [];
 for (const [i, phase] of PLAN.entries()) {
   console.log(
-    `redline: phase ${i + 1} of ${PLAN.length}: ${phase.map((l) => l.join(", ")).join(" | ")}`,
+    `redline: phase ${i + 1} of ${PLAN.length}: ${phase.map((l) => `${l.name}: ${l.files.join(", ")}`).join(" | ")}`,
   );
   results.push(
     ...(await Promise.all(phase.map((l) => runLane(l, phase.length > 1)))),

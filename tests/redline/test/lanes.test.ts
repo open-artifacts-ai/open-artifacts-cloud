@@ -9,14 +9,21 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { BARRIERS } from "../src/barrier.ts";
 import {
   CLAIMS,
   type Claims,
   conflicts,
+  type Lane,
   type LaneResult,
   mergeLanes,
+  observe,
+  orderedBarriers,
   type Phase,
   PLAN,
+  PLAN_SERIAL,
+  planProblems,
+  selectPlan,
 } from "../src/lanes.ts";
 import {
   buildReport,
@@ -32,47 +39,198 @@ const liveFiles = readdirSync(join(pkg, "live"))
   .filter((f) => f.endsWith(".test.ts"))
   .map((f) => `live/${f}`)
   .sort();
-const planned = PLAN.flat(2);
+const planned = PLAN.flat().flatMap((l) => l.files);
+const L = (name: string, ...files: string[]): Lane => ({
+  name,
+  files: files.map((f) => `live/${f}.test.ts`),
+});
+/** A copy of CLAIMS with one file's claims changed. */
+const claimsWith = (
+  file: string,
+  f: (c: Claims) => Claims,
+): Record<string, Claims> => ({
+  ...CLAIMS,
+  [file]: f(CLAIMS[file] as Claims),
+});
 
 describe("the lane plan", () => {
   it("runs every live file exactly once, and only live files", () => {
     expect([...planned].sort()).toEqual(liveFiles);
     expect(new Set(planned).size).toBe(planned.length);
     expect(Object.keys(CLAIMS).sort()).toEqual(liveFiles);
+    expect(planProblems(PLAN)).toEqual([]);
+    expect(planProblems(PLAN_SERIAL)).toEqual([]);
   });
 
-  it("runs every file the manifest requires", () => {
+  it("runs every file the manifest requires, each in exactly one lane", () => {
     const m = parseManifest(read("live/manifest.json"));
-    for (const c of m.cases) expect(planned).toContain(c.file);
+    for (const c of m.cases) {
+      const lanes = PLAN.flat().filter((l) => l.files.includes(c.file));
+      expect(lanes, c.file).toHaveLength(1);
+    }
   });
 
-  it("puts no shared state or rate-limit bucket in two lanes of one phase", () => {
+  it("is one phase of five lanes, with signin first in its lane and codes in one lane", () => {
+    expect(PLAN).toHaveLength(1);
+    expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
+      "creds",
+      "front",
+      "guard",
+      "prov",
+      "surfaces",
+    ]);
+    const front = PLAN[0]?.find((l) => l.name === "front") as Lane;
+    expect(front.files).toEqual([
+      "live/signin.test.ts",
+      "live/edge.test.ts",
+      "live/live.test.ts",
+    ]);
+    const spendCodes = liveFiles.filter(
+      (f) => "rl-a/codes" in (CLAIMS[f] as Claims).buckets,
+    );
+    expect(spendCodes).toEqual(["live/edge.test.ts", "live/signin.test.ts"]);
+  });
+
+  it("puts no shared state or rate-limit bucket in two lanes of one phase, in either plan", () => {
     expect(conflicts()).toEqual([]);
+    expect(conflicts(PLAN)).toEqual([]);
+    expect(conflicts(PLAN_SERIAL)).toEqual([]);
   });
 
-  // The check above can fail: each of these plans breaks one rule.
+  it("PLAN_SERIAL is the two-phase plan from before #1730", () => {
+    expect(PLAN_SERIAL.map((ph) => ph.map((l) => [...l.files]))).toEqual([
+      [["live/signin.test.ts", "live/edge.test.ts"]],
+      [
+        [
+          "live/credentials.test.ts",
+          "live/live.test.ts",
+          "live/guard.test.ts",
+          "live/surfaces.test.ts",
+        ],
+        ["live/provisioning.test.ts"],
+      ],
+    ]);
+  });
+
+  it("REDLINE_PLAN picks the plan: serial is the kill switch, anything else unknown throws", () => {
+    expect(selectPlan({})).toBe(PLAN);
+    expect(selectPlan({ REDLINE_PLAN: "" })).toBe(PLAN);
+    expect(selectPlan({ REDLINE_PLAN: "lanes" })).toBe(PLAN);
+    expect(selectPlan({ REDLINE_PLAN: "serial" })).toBe(PLAN_SERIAL);
+    // The local pair defaults to serial; an explicit choice wins.
+    const local = JSON.stringify({ mode: "local" });
+    expect(selectPlan({ REDLINE_TARGETS: local })).toBe(PLAN_SERIAL);
+    expect(selectPlan({ REDLINE_TARGETS: local, REDLINE_PLAN: "lanes" })).toBe(
+      PLAN,
+    );
+    expect(selectPlan({ REDLINE_TARGETS: "{" })).toBe(PLAN);
+    expect(() => selectPlan({ REDLINE_PLAN: "seriel" })).toThrow(
+      /REDLINE_PLAN/,
+    );
+  });
+
+  it("a plan with a repeated lane name or file is refused", () => {
+    expect(planProblems([[L("x", "guard"), L("x", "live")]]).join()).toMatch(
+      /used twice/,
+    );
+    expect(planProblems([[L("x", "guard"), L("y", "guard")]]).join()).toMatch(
+      /in two lanes/,
+    );
+    expect(planProblems([[L("x")]]).join()).toMatch(/no file/);
+  });
+
+  it("every observe says why, and every ordered bucket names a barrier barrier.ts exports", () => {
+    for (const [f, c] of Object.entries(CLAIMS))
+      for (const [k, m] of Object.entries(c.state))
+        if (typeof m === "object" && "observe" in m)
+          expect(m.observe.length, `${f} ${k}`).toBeGreaterThan(10);
+    for (const b of orderedBarriers()) expect(BARRIERS).toContain(b);
+    expect(orderedBarriers()).toEqual(["broker-done"]);
+  });
+
+  it("an observe without a reason is a conflict", () => {
+    const c = claimsWith("live/guard.test.ts", (x) => ({
+      ...x,
+      state: { ...x.state, "rl-x/hook-audit": observe("") },
+    }));
+    expect(
+      conflicts([[L("g", "guard"), L("c", "credentials")]], {
+        ...c,
+        "live/credentials.test.ts": {
+          ...(c["live/credentials.test.ts"] as Claims),
+          state: {
+            ...(c["live/credentials.test.ts"] as Claims).state,
+            "rl-x/hook-audit": "write",
+          },
+        },
+      }).join("\n"),
+    ).toMatch(/observe without a reason/);
+  });
+
+  // The check above can fail: each plan or claim set below breaks one rule.
+  // These are the mutations of #1730's three mechanisms (lock, barrier, pacing).
+  it("dropping the members lock brings the conflict back", () => {
+    const c = claimsWith("live/credentials.test.ts", (x) => ({
+      ...x,
+      state: { ...x.state, "rl-b/members+member-user": "write" },
+    }));
+    expect(conflicts(PLAN, c).join("\n")).toMatch(
+      /live\/credentials.test.ts[\s\S]*both hold rl-b\/members\+member-user/,
+    );
+    const shared = claimsWith("live/surfaces.test.ts", (x) => {
+      const { ["rl-b/members+member-user"]: _drop, ...state } = x.state;
+      return { ...x, state: { ...state, "rl-b/members+member-user": "write" } };
+    });
+    expect(conflicts(PLAN, shared).join("\n")).toMatch(
+      /both hold rl-b\/members/,
+    );
+  });
+
+  it("dropping the barrier brings the broker-ip conflict back", () => {
+    const c = claimsWith("live/provisioning.test.ts", (x) => ({
+      ...x,
+      buckets: { ...x.buckets, "broker-ip": "exclusive" },
+    }));
+    expect(conflicts(PLAN, c).join("\n")).toMatch(
+      /live\/provisioning.test.ts and live\/signin.test.ts both spend broker-ip/,
+    );
+    // A different barrier name is not the same ordering.
+    const other = claimsWith("live/provisioning.test.ts", (x) => ({
+      ...x,
+      buckets: { ...x.buckets, "broker-ip": { ordered: "some-other" } },
+    }));
+    expect(conflicts(PLAN, other).join("\n")).toMatch(/both spend broker-ip/);
+  });
+
+  it("dropping a pacing entry brings the bucket conflict back", () => {
+    for (const bucket of ["rl-anon", "rl-a/hooks", "rl-b/hooks"]) {
+      const c = claimsWith("live/guard.test.ts", (x) => ({
+        ...x,
+        buckets: { ...x.buckets, [bucket]: "exclusive" },
+      }));
+      expect(conflicts(PLAN, c).join("\n"), bucket).toMatch(
+        new RegExp(`both spend ${bucket}`),
+      );
+    }
+  });
+
   it.each<[string, Phase[], RegExp]>([
     [
-      "two install files side by side",
-      [[["live/guard.test.ts"], ["live/live.test.ts"]]],
-      /both hold rl-a/,
+      "signin and edge in two lanes (both spend the codes bucket)",
+      [[L("s", "signin"), L("e", "edge")]],
+      /both spend rl-a\/codes/,
     ],
     [
-      "edge (the token snapshot) beside provisioning (P36's PAT use)",
-      [[["live/edge.test.ts"], ["live/provisioning.test.ts"]]],
-      /both hold rl-a\/admin-pat/,
-    ],
-    [
-      "signin beside provisioning (P34 spends the broker's IP bucket)",
-      [[["live/signin.test.ts"], ["live/provisioning.test.ts"]]],
-      /both spend broker-ip/,
+      "two lanes both running surfaces (it writes the world)",
+      [[L("a", "surfaces"), L("b", "surfaces")]],
+      /both hold rl-x\/world/,
     ],
   ])("finds the conflict: %s", (_, plan, want) => {
     expect(conflicts(plan).join("\n")).toMatch(want);
   });
 
   it("a file without claims is refused", () => {
-    expect(() => conflicts([[["live/new.test.ts"], ["x"]]])).toThrow(
+    expect(() => conflicts([[L("a", "new"), L("b", "x")]])).toThrow(
       /no claims/,
     );
   });
@@ -94,35 +252,65 @@ function claimGaps(file: string, c: Claims): string[] {
   };
   const all = [text, ...imports.map(read)].join("\n");
   if (text.includes("loadTargets(")) {
-    for (const k of ["rl-a", "rl-b"])
-      need(c.state[k] === "write", `loadTargets: needs ${k} write`);
-    for (const b of [
-      "rl-a/hooks",
-      "rl-b/hooks",
-      "rl-a/codes",
-      "rl-b/codes",
-      "anon-ip",
-    ])
-      need(c.buckets.includes(b), `loadTargets: needs bucket ${b}`);
+    for (const k of ["rl-x/hook-audit", "rl-x/admin-lists"])
+      need(c.state[k] !== undefined, `loadTargets: needs state ${k}`);
+    for (const b of ["rl-a/hooks", "rl-b/hooks", "rl-anon"])
+      need(
+        typeof c.buckets[b] === "object" && "paced" in (c.buckets[b] as object),
+        `loadTargets: needs bucket ${b} paced`,
+      );
   } else {
     // No install of its own: no hook, session or seeding on rl-a or rl-b.
     for (const s of ["hook(", "prepareSide(", "sessionCred(", "loadTargets("])
       need(!all.includes(s), `calls ${s} without claiming the installs`);
   }
-  if (/state: "\/api\/v1\/tokens"|"GET", "\/api\/v1\/tokens"/.test(text))
-    for (const k of ["rl-a/admin-pat", "rl-b/admin-pat"])
-      need(
-        c.state[k] === "write",
-        `snapshots the token list: needs ${k} write`,
-      );
-  if (text.includes("brokerState(") || imports.includes("src/provisioning.ts"))
+  // Only the files that send codes hold the codes bucket (exclusive: one lane).
+  const sendsCodes = imports.includes("src/signin.ts");
+  for (const b of ["rl-a/codes", "rl-b/codes"]) {
     need(
-      c.buckets.includes("broker-ip"),
-      "reaches the broker: needs broker-ip",
+      !sendsCodes || c.buckets[b] === "exclusive",
+      `sends one-time codes: needs bucket ${b} exclusive`,
     );
+    need(
+      sendsCodes || c.buckets[b] === undefined,
+      `claims ${b} without sending codes`,
+    );
+  }
+  if (/state: "\/api\/v1\/tokens"|"GET", "\/api\/v1\/tokens"/.test(text)) {
+    // Snapshots a token list whole: only of a user no other lane touches.
+    need(
+      /redline-csrf@/.test(text),
+      "snapshots the token list: must act as a user of its own (redline-csrf@)",
+    );
+    need(c.state["rl-x/admin-lists"] === "use", "admin-lists is only used");
+  }
+  if (
+    text.includes("brokerState(") ||
+    text.includes("startGoogle(") ||
+    text.includes("mustStart(")
+  ) {
+    need(
+      JSON.stringify(c.buckets["broker-ip"]) ===
+        JSON.stringify({ ordered: "broker-done" }),
+      "reaches the broker: needs broker-ip ordered(broker-done)",
+    );
+    need(
+      text.includes('mark("broker-done")'),
+      'reaches the broker: must mark("broker-done")',
+    );
+  }
   if (imports.includes("src/provisioning.ts")) {
     need(
-      c.buckets.includes("provisioning-api"),
+      JSON.stringify(c.buckets["broker-ip"]) ===
+        JSON.stringify({ ordered: "broker-done" }),
+      "reaches the broker: needs broker-ip ordered(broker-done)",
+    );
+    need(
+      read("src/provisioning.ts").includes('waitFor("broker-done"'),
+      'P34 must waitFor("broker-done")',
+    );
+    need(
+      c.buckets["provisioning-api"] === "exclusive",
       "the Provisioning API: needs provisioning-api",
     );
     need(
@@ -130,7 +318,26 @@ function claimGaps(file: string, c: Claims): string[] {
         c.state["rl-a/admin-pat"] !== undefined,
       "P36 uses rl-a's admin PAT: needs rl-a/admin-pat",
     );
+    need(
+      c.state["staging-inventory"] === "write",
+      "creates installs: needs staging-inventory write",
+    );
   }
+  if (text.includes("staging inventory") || text.includes("inventoryBearer(")) {
+    need(
+      c.state["staging-inventory"] !== undefined,
+      "reads the inventory: needs staging-inventory",
+    );
+  }
+  // The members lock: credentials holds it exclusive around its link cases.
+  const exclusive = (text.match(/withLock\(MEMBERS_LOCK, "exclusive"/g) ?? [])
+    .length;
+  const mine = c.state["rl-b/members+member-user"];
+  if (exclusive > 0)
+    need(
+      typeof mine === "object" && "guarded" in mine && mine.as === "exclusive",
+      "takes the members lock exclusive: must claim it exclusive",
+    );
   return gaps;
 }
 
@@ -141,31 +348,69 @@ describe("the claims match the code", () => {
     );
   });
 
+  it("credentials takes the members lock around both link cases", () => {
+    const t = read("live/credentials.test.ts");
+    expect((t.match(/withLock\(MEMBERS_LOCK, "exclusive"/g) ?? []).length).toBe(
+      2,
+    );
+  });
+
+  it("the other writers of rl-b's members claim the lock shared", () => {
+    for (const f of [
+      "live/surfaces.test.ts",
+      "live/signin.test.ts",
+      "live/edge.test.ts",
+    ])
+      expect((CLAIMS[f] as Claims).state["rl-b/members+member-user"]).toEqual({
+        guarded: "rl-b-members",
+        as: "shared",
+      });
+  });
+
   it.each([
-    ["live/surfaces.test.ts", { state: {}, buckets: [] }, /needs rl-a write/],
+    [
+      "live/surfaces.test.ts",
+      { state: {}, buckets: {} },
+      /needs state rl-x\/hook-audit/,
+    ],
     [
       "live/edge.test.ts",
       {
-        state: { "rl-a": "write", "rl-b": "write" },
-        buckets: [
-          "rl-a/hooks",
-          "rl-b/hooks",
-          "rl-a/codes",
-          "rl-b/codes",
-          "anon-ip",
-        ],
+        ...(CLAIMS["live/edge.test.ts"] as Claims),
+        buckets: {
+          "rl-a/hooks": { paced: "x" },
+          "rl-b/hooks": { paced: "x" },
+          "rl-anon": { paced: "x" },
+        },
       },
-      /snapshots the token list/,
+      /needs bucket rl-a\/codes exclusive/,
     ],
     [
       "live/signin.test.ts",
-      { ...(CLAIMS["live/signin.test.ts"] as Claims), buckets: [] },
-      /needs broker-ip/,
+      {
+        ...(CLAIMS["live/signin.test.ts"] as Claims),
+        buckets: {
+          ...(CLAIMS["live/signin.test.ts"] as Claims).buckets,
+          "broker-ip": "exclusive",
+        },
+      },
+      /needs broker-ip ordered/,
     ],
     [
       "live/provisioning.test.ts",
-      { state: {}, buckets: ["broker-ip"] },
+      { state: {}, buckets: { "broker-ip": { ordered: "broker-done" } } },
       /needs provisioning-api[\s\S]*needs rl-a\/admin-pat/,
+    ],
+    [
+      "live/credentials.test.ts",
+      {
+        ...(CLAIMS["live/credentials.test.ts"] as Claims),
+        state: {
+          ...(CLAIMS["live/credentials.test.ts"] as Claims).state,
+          "rl-b/members+member-user": { guarded: "rl-b-members", as: "shared" },
+        },
+      },
+      /must claim it exclusive/,
     ],
   ] as [string, Claims, RegExp][])(
     "a missing claim fails: %s",
@@ -185,7 +430,14 @@ describe("mergeLanes", () => {
     files: string[],
     part: LaneResult["part"],
     exit = 0,
-  ): LaneResult => ({ lane: files, exit, part });
+  ): LaneResult => ({
+    lane: {
+      name: (files[0] ?? "").replace(/^live\/|\.test\.ts$/g, ""),
+      files,
+    },
+    exit,
+    part,
+  });
 
   it("keeps every lane's cases and notes, in plan order", () => {
     const m = mergeLanes([
@@ -212,6 +464,27 @@ describe("mergeLanes", () => {
       expect.objectContaining({ name: "lane a: no results", level: "fail" }),
     ]);
     expect(m.runExit).toBe(7);
+  });
+
+  it("one case reported twice is a fail case", () => {
+    const m = mergeLanes([
+      lane(["live/a.test.ts"], {
+        cases: [pass("live/a.test.ts", "same")],
+        fileNotes: [],
+      }),
+      lane(["live/a.test.ts", "live/b.test.ts"], {
+        cases: [pass("live/a.test.ts", "same"), pass("live/b.test.ts", "same")],
+        fileNotes: [],
+      }),
+    ]);
+    const dups = m.cases.filter((c) => /duplicate/.test(c.name));
+    expect(dups).toEqual([
+      expect.objectContaining({
+        name: "lane a: duplicate live/a.test.ts same",
+        level: "fail",
+      }),
+    ]);
+    expect(buildReport(m.cases, "staging").gate.passed).toBe(false);
   });
 
   it("a case from a file outside its lane is a fail case", () => {
@@ -335,43 +608,67 @@ console.log("took " + n);`;
 // every lane writes its part, the report holds every manifest case, and the
 // run fails.
 describe("scripts/redline.ts with no targets", () => {
-  it("runs every lane, builds one report, and fails the run", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "rl-lanes-run-"));
-    try {
-      const report = join(dir, "report.json");
-      const r = await node(
-        ["scripts/redline.ts", "--gate"],
-        {
-          PATH: process.env.PATH ?? "",
-          HOME: process.env.HOME ?? "",
-          REDLINE_REPORT: report,
-        },
-        170_000,
-      );
-      expect(r.code).not.toBe(0);
-      for (let i = 1; i <= PLAN.length; i++)
-        expect(r.out).toContain(`redline: phase ${i} of ${PLAN.length}`);
-      // Phase 2's lanes ran beside each other: their output is prefixed.
-      expect(r.out).toContain("[credentials] ");
-      expect(r.out).toContain("[provisioning] ");
-      const parts = readdirSync(join(dir, "report.lanes")).sort();
-      expect(parts).toEqual(
-        PLAN.flat()
-          .map(
-            (l) => `${(l[0] ?? "").replace(/^live\/|\.test\.ts$/g, "")}.json`,
-          )
-          .sort(),
-      );
-      const rep = JSON.parse(readFileSync(report, "utf8")) as Report;
-      expect(existsSync(join(dir, "report.txt"))).toBe(true);
-      const m = parseManifest(read("live/manifest.json"));
-      const names = new Set(rep.cases.map((c) => `${c.file} ${c.name}`));
-      for (const c of m.cases) expect(names).toContain(`${c.file} ${c.name}`);
-      expect(rep.gate.passed).toBe(false);
-      expect(rep.cases.some((c) => c.level === "pass")).toBe(false);
-      expect(rep.cases.some((c) => /^lane /.test(c.name))).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 180_000);
+  it.each([
+    ["the lanes plan", "", PLAN],
+    ["REDLINE_PLAN=serial", "serial", PLAN_SERIAL],
+  ] as const)(
+    "runs every lane, builds one report, and fails the run: %s",
+    async (_, plan, expected) => {
+      const dir = mkdtempSync(join(tmpdir(), "rl-lanes-run-"));
+      try {
+        const report = join(dir, "report.json");
+        const r = await node(
+          ["scripts/redline.ts", "--gate"],
+          {
+            PATH: process.env.PATH ?? "",
+            HOME: process.env.HOME ?? "",
+            REDLINE_REPORT: report,
+            REDLINE_PLAN: plan,
+          },
+          170_000,
+        );
+        expect(r.code).not.toBe(0);
+        for (let i = 1; i <= expected.length; i++)
+          expect(r.out).toContain(`redline: phase ${i} of ${expected.length}`);
+        // A phase with several lanes ran them beside each other: prefixed output.
+        for (const ph of expected)
+          if (ph.length > 1)
+            for (const l of ph) expect(r.out).toContain(`[${l.name}] `);
+        const parts = readdirSync(join(dir, "report.lanes")).sort();
+        expect(parts).toEqual(
+          expected
+            .flat()
+            .map((l) => `${l.name}.json`)
+            .sort(),
+        );
+        // Every lane's exit left a lane-exit mark, and the lock and barrier
+        // directories were made for the run.
+        expect(readdirSync(join(dir, "report.json.barriers")).sort()).toEqual(
+          expected
+            .flat()
+            .map((l) => `lane-exit.${l.name}`)
+            .sort()
+            // mark.broker-done: the signin file's afterAll marks even with no targets
+            .concat(
+              readdirSync(join(dir, "report.json.barriers")).filter((f) =>
+                f.startsWith("mark."),
+              ),
+            )
+            .sort(),
+        );
+        expect(existsSync(join(dir, "report.json.locks"))).toBe(true);
+        const rep = JSON.parse(readFileSync(report, "utf8")) as Report;
+        expect(existsSync(join(dir, "report.txt"))).toBe(true);
+        const m = parseManifest(read("live/manifest.json"));
+        const names = new Set(rep.cases.map((c) => `${c.file} ${c.name}`));
+        for (const c of m.cases) expect(names).toContain(`${c.file} ${c.name}`);
+        expect(rep.gate.passed).toBe(false);
+        expect(rep.cases.some((c) => c.level === "pass")).toBe(false);
+        expect(rep.cases.some((c) => /^lane /.test(c.name))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    180_000,
+  );
 });

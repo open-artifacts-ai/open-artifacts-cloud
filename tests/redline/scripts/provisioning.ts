@@ -3,6 +3,9 @@
 //   node --experimental-strip-types scripts/provisioning.ts bringup
 //   node --experimental-strip-types scripts/provisioning.ts staged-version <file>
 //   node --experimental-strip-types scripts/provisioning.ts revoke
+//   node --experimental-strip-types scripts/provisioning.ts t19-recipient
+//   node --experimental-strip-types scripts/provisioning.ts t19-seal <pub> <out>
+//   node --experimental-strip-types scripts/provisioning.ts t19-open
 // mint-oidc writes one GitHub OIDC JWT per audience key (provisioning,
 // stagingInventory, prodInventory) into REDLINE_TARGETS.secretsDir as 0600
 // files. bringup upgrades rl-a and rl-b to REDLINE_RELEASE (R5) and writes
@@ -10,7 +13,11 @@
 // REDLINE_RELEASE (X.Y.Z) to <file> once rl-a's and rl-b's /healthz both
 // report it (the redline-staged-version artifact). revoke is the job's
 // if: always() end: R26 revoke on both, and their PATs must then be 401.
+// t19-recipient, t19-seal and t19-open hand rl-a's hook key from the redline
+// job to the t19 job, sealed to a key only the t19 job holds (src/t19-seal.ts).
 // Every value is masked (::add-mask::) before anything else could print it.
+
+import { join } from "node:path";
 import type { AudienceKey } from "../src/oidc.ts";
 import { AUDIENCES } from "../src/oidc.ts";
 import {
@@ -20,12 +27,39 @@ import {
   revokeAll,
   writeStagedVersion,
 } from "../src/provisioning-live.ts";
+import {
+  recipientDir,
+  t19Open,
+  t19Recipient,
+  t19Seal,
+} from "../src/t19-seal.ts";
 
 const [cmd, ...rest] = process.argv.slice(2);
 const env = process.env;
 
 async function main(): Promise<number> {
+  if (cmd === "t19-recipient") {
+    await t19Recipient(recipientDir(env));
+    return 0;
+  }
   const t = rawTargets(env.REDLINE_TARGETS);
+  if (cmd === "t19-seal") {
+    if (rest.length !== 2 || !rest[0] || !rest[1])
+      throw new Error("t19-seal: <public key file> <sealed output file>");
+    await t19Seal(env, t, rest[0], rest[1]);
+    return 0;
+  }
+  if (cmd === "t19-open") {
+    // The sealed value comes from the redline job's t19-sealed artifact,
+    // downloaded to <RUNNER_TEMP>/t19-sealed/sealed.
+    await t19Open(
+      env,
+      t,
+      recipientDir(env),
+      join(env.RUNNER_TEMP ?? "", "t19-sealed", "sealed"),
+    );
+    return 0;
+  }
   if (cmd === "mint-oidc") {
     const keys = rest as AudienceKey[];
     if (!keys.length || !keys.every((k) => k in AUDIENCES))
@@ -47,7 +81,7 @@ async function main(): Promise<number> {
   }
   if (cmd === "revoke") return revokeAll(env, t);
   throw new Error(
-    "usage: provisioning.ts mint-oidc <key>... | bringup | staged-version <file> | revoke",
+    "usage: provisioning.ts mint-oidc <key>... | bringup | staged-version <file> | revoke | t19-recipient | t19-seal <pub> <out> | t19-open",
   );
 }
 
