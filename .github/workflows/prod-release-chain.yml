@@ -36,6 +36,12 @@ on:
     workflows: [redline-staging]
     types: [completed]
 
+# The public repo: the release and smoke gates read its releases, its tag
+# commit, its release-please run and its deploy-staging.yml smoke from here;
+# everything hosted (jobs, assets, red-line runs) is this repo's own.
+env:
+  PUBLIC_REPO: open-artifacts-ai/open-artifacts
+
 permissions: {}
 
 concurrency:

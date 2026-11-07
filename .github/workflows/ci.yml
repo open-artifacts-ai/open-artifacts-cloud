@@ -58,15 +58,16 @@ jobs:
       # A tree with only some of them fails. No hand-set flag.
       - name: overlay (checks the pin; pre-split or strict, from the pinned tree)
         run: private/scripts/overlay.sh --auto-split public private
-      # Private tests read the hosted workflows at .github/workflows/. Until
-      # the cut-over they are parked in hosted-workflows/; place them in the
-      # overlay tree as the cut-over will. GitHub reads workflows only from
-      # this repo's own root, so these copies never run. An existing target is
-      # a failure, never an overwrite.
-      # The same helper equivalence.sh uses: recursive, cp -P -p, refuses a
-      # symlinked hosted-workflows and an existing target.
+      # Private tests read the hosted workflows at .github/workflows/. They
+      # live there in this repo (C2), so the overlay above copied them into
+      # the tree. place-workflows.sh places only what is still parked in
+      # hosted-workflows/ (nothing now) and refuses an existing target.
       - name: place parked hosted workflows in the overlay tree
         run: private/scripts/place-workflows.sh private public
+      # The root .nvmrc here serves jobs that check out only this repo; it
+      # must stay public's at the pin.
+      - name: .nvmrc matches public's at the pin
+        run: cmp private/.nvmrc public/.nvmrc
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
       # sync there is no SYNCED_FROM and the script skips with a message.
@@ -221,3 +222,29 @@ jobs:
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
         run: ../private/scripts/ci-public-tests.sh . "$PLAN"
+
+  # The overlay prelude the hosted workflows use (.github/actions/overlay),
+  # run for real: this repo at _cloud, then the action. Proves the tree lands
+  # at the workspace root and the later steps' relative paths hold.
+  overlay-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - name: the merged tree is at the workspace root
+        run: |
+          set -euo pipefail
+          test -f package.json
+          test -f scripts/ci/tag-passed-checks.sh
+          test -f .github/workflows/deploy-hosted-platform.yml
+          test -f .github/hosted/staging.json
+          test -d apps/provisioning
+          test -f pnpm-lock.yaml
+          test -f .nvmrc
+          test ! -e _public
+          test -d "$RUNNER_TEMP/cloud-checkout/.git"
+          test ! -e _cloud
+          test "$(git rev-parse HEAD)" = "$(sed -n 's/^sha=//p' "$RUNNER_TEMP/cloud-checkout/PUBLIC_PIN")"

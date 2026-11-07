@@ -181,9 +181,12 @@ describe("deploy-hosted-platform.yml", () => {
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
-    for (const l of text.split("\n").filter((l) => /^\s*- uses: /.test(l)))
+    const local = "./_cloud/.github/actions/overlay";
+    for (const l of text
+      .split("\n")
+      .filter((l) => /^\s*- uses: /.test(l) && !l.endsWith(local)))
       expect(l).toMatch(/@[0-9a-f]{40} # v\d/);
-    for (const s of steps.filter((s) => s.uses)) {
+    for (const s of steps.filter((s) => s.uses && s.uses !== local)) {
       expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
       if (String(s.uses).startsWith("actions/checkout@"))
         expect(s.with["persist-credentials"]).toBe(false);
@@ -195,16 +198,23 @@ describe("deploy-hosted-platform.yml", () => {
       String(s.uses).startsWith("actions/checkout@"),
     );
     expect(outs).toHaveLength(3);
-    expect(outs[1]?.with.ref).toBe("refs/tags/${{ inputs.tag }}");
+    // The CLOUD tag goes to _cloud; the overlay action puts it on the public
+    // tree at the tag's PUBLIC_PIN and refuses anything but exactly the tag.
+    expect(outs[1]?.with).toEqual({
+      ref: "refs/tags/${{ inputs.tag }}",
+      path: "_cloud",
+      "persist-credentials": false,
+    });
+    const overlay =
+      steps[steps.indexOf(outs[1] as Record<string, unknown>) + 1];
+    expect(overlay?.uses).toBe("./_cloud/.github/actions/overlay");
+    expect(overlay?.with).toEqual({ "exact-tag": "${{ inputs.tag }}" });
     expect(outs[2]?.with).toMatchObject({
       ref: "${{ github.sha }}",
       path: ".deploy-logic",
       "sparse-checkout":
         "scripts/ops\nscripts/ci\npackages/provision/src\napps/platform-db\n.github/hosted\n",
     });
-    expect(named("The checkout is exactly the tag").run).toContain(
-      'test "$(git describe --tags --exact-match)" = "$TAG"',
-    );
     const use = named("Use main's deploy scripts").run as string;
     expect(use).toContain(
       "for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
