@@ -107,8 +107,21 @@ freeze). One PR here, in this order:
 4. In the same PR set `PUBLIC_PIN` (tag and sha) to `T`/`P`, set `SYNCED_FROM`
    `sha=` and `tag=` to the same, and regenerate the merged lockfile (see
    "Bumping the pin").
-5. CI must be green: `pin-check.sh` and `equivalence.sh` run against the new
-   `SYNCED_FROM`.
+5. CI must be green. When `SYNCED_FROM` moves, CI takes the base's
+   `SYNCED_FROM` as `OLD` and runs the port check (`pin-check.sh --prev OLD`):
+   the public diff `OLD..NEW` over the listed paths, with workflows renamed to
+   `hosted-workflows/`, must reverse-apply (`git apply -R --check`) to this
+   tree. A bump that ports nothing fails. Where CLOUD deliberately keeps its
+   own side of a changed file (the repo-name pins, keys), list that public
+   path in `port-exceptions.txt` (one path per line, the reason after `#`).
+   The exceptions file is reviewed like code: a new line there is the claim
+   that the hunk is intentionally not taken.
+
+`SYNCED_FROM` is required. Deleting it does not turn the checks off:
+`pin-check.sh`, `equivalence.sh` and the sync refuse, and CI fails, whenever
+the tree holds any listed path. `equivalence.sh` also fails if a whole listed
+path is gone from this repo (at its own path, in `hosted-workflows/` or in
+`.github/workflows/`); deletions inside a path stay CLOUD's call.
 
 Do not run the sync to take a public fix: it refuses once CLOUD has edited a
 listed path.
@@ -122,7 +135,10 @@ One PR per bump:
 2. If public changed any hosted path or the list since `SYNCED_FROM`, hand-port
    it and bump `SYNCED_FROM` to the same commit in this PR ("Hand-porting a
    public fix"). `pin-check.sh` fails the PR otherwise. If it did not, leave
-   `SYNCED_FROM` alone: the pin may lead it.
+   `SYNCED_FROM` alone: the pin may lead it. A pin that leads `SYNCED_FROM`
+   over any change to public's non-private lockfile importers still fails
+   `equivalence.sh` (CI installs at the pin, equivalence compares at the sync),
+   so a lockfile change also needs `SYNCED_FROM` moved, with its port.
 3. Build the overlay (`scripts/dev-overlay.sh`) and run `pnpm install` in it
    without `--frozen-lockfile`, to regenerate the merged lockfile. Copy the
    overlay's `pnpm-lock.yaml` back here.

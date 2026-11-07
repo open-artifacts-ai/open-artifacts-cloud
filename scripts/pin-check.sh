@@ -17,16 +17,34 @@
 #   4. This repo's private-paths.txt must list the same paths as public's list
 #      at S, so the fallback list never goes stale.
 #
-# Before the first sync (no SYNCED_FROM) it skips. Exit 0 on a pass or skip,
-# 1 on a failure, 2 on bad usage.
+#   5. Port check (--prev <sha>, CI passes the SYNCED_FROM of the PR base): when
+#      SYNCED_FROM moved from <sha>, every public change to the listed paths
+#      between <sha> and SYNCED_FROM must already be in this tree. The public
+#      diff, with workflows renamed to hosted-workflows/, must reverse-apply
+#      (git apply -R --check). Files named in port-exceptions.txt (one public
+#      path per line, a reason after #) are skipped: CLOUD kept its own side.
+#      That file is a reviewed change like any other.
+#
+# SYNCED_FROM is required: absent, the check skips only if this tree holds none
+# of the listed paths (before the first sync); otherwise it fails.
+# Exit 0 on a pass or skip, 1 on a failure, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "pin-check: $*" >&2; exit 1; }
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: pin-check.sh <public-checkout-dir> [<private-dir>]" >&2; exit 2; }
+prev=""
+if [ "${1:-}" = "--prev" ]; then
+  [ "$#" -ge 2 ] || { echo "usage: pin-check.sh [--prev <sha>] <public-checkout-dir> [<private-dir>]" >&2; exit 2; }
+  prev=$2; shift 2
+fi
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: pin-check.sh [--prev <sha>] <public-checkout-dir> [<private-dir>]" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 PRIV=$(cd "${2:-$HERE/..}" 2> /dev/null && pwd) || die "private dir not found: ${2:-$HERE/..}"
 if [ ! -e "$PRIV/SYNCED_FROM" ] && [ ! -L "$PRIV/SYNCED_FROM" ]; then
-  echo "pin-check: SKIPPED: no SYNCED_FROM in $PRIV (no sync yet)"
+  held=$("$HERE/listed-present.sh" "$1" "$PRIV") || die "cannot list present paths"
+  [ -z "$held" ] || die "SYNCED_FROM is missing but this tree holds listed private paths:
+$(printf '%s\n' "$held" | sed 's/^/  /')
+SYNCED_FROM is required once the paths are synced; restore it."
+  echo "pin-check: SKIPPED: no SYNCED_FROM in $PRIV and no listed private paths (no sync yet)"
   exit 0
 fi
 [ -f "$PRIV/SYNCED_FROM" ] && [ ! -L "$PRIV/SYNCED_FROM" ] && [ -r "$PRIV/SYNCED_FROM" ] \
@@ -65,6 +83,30 @@ if [ "$present" -eq 0 ]; then
 fi
 
 list_s=$(list_at "$s")
+if [ -n "$prev" ] && [ "$prev" != "$s" ]; then
+  printf '%s' "$prev" | grep -Eq '^[0-9a-f]{40}$' || die "--prev is not a full sha: '$prev'"
+  git -C "$PUB" cat-file -e "$prev^{commit}" 2> /dev/null || die "public checkout has no commit $prev (the base SYNCED_FROM); fetch full history"
+  git -C "$PUB" merge-base --is-ancestor "$prev" "$s" || die "the base SYNCED_FROM ($prev) is not an ancestor of SYNCED_FROM ($s)"
+  specs=()
+  while IFS= read -r q; do specs+=("$q"); done < <({ list_at "$prev"; printf '%s\n' "$list_s"; } | LC_ALL=C sort -u)
+  if [ -f "$PRIV/port-exceptions.txt" ]; then
+    while IFS= read -r q; do specs+=(":(exclude,literal)$q"); done < <(norm < "$PRIV/port-exceptions.txt")
+  fi
+  # git apply -R --check cannot validate hunks that the pathspec dropped.
+  pdiff=$(git -C "$PUB" diff --binary "$prev" "$s" -- "${specs[@]}") || die "git diff failed"
+  if [ -n "$pdiff" ]; then
+    errf=$(mktemp) || die "mktemp failed"
+    if ! printf '%s\n' "$pdiff" \
+      | sed -e '/^diff --git /s|\([ab]\)/\.github/workflows/|\1/hosted-workflows/|g' -e '/^\(---\|+++\) [ab]\//s|\([ab]\)/\.github/workflows/|\1/hosted-workflows/|g' \
+      | git -C "$PRIV" apply -R --check 2> "$errf"; then
+      echo "pin-check: public changes between $prev and SYNCED_FROM ($s) are not all in this tree:" >&2
+      sed 's/^/  /' "$errf" >&2; rm -f "$errf"
+      die "SYNCED_FROM moved without porting the public fix. Port it (README, \"Hand-porting a public fix\") or, where CLOUD deliberately keeps its own side, name the file in port-exceptions.txt."
+    fi
+    rm -f "$errf"
+    echo "pin-check: port check: every public change to the listed paths from $prev to $s is in this tree"
+  fi
+fi
 if [ "$s" != "$p" ]; then
   [ "$list_s" = "$list_p" ] || die "public's private-paths list changed between SYNCED_FROM ($s) and PUBLIC_PIN ($p). Hand-port the change and bump SYNCED_FROM to the pin in the same PR."
   paths=()

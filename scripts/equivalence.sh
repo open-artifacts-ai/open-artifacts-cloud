@@ -43,6 +43,10 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 PRIV=$(cd "${2:-$HERE/..}" 2> /dev/null && pwd) || die "private dir not found: ${2:-$HERE/..}"
 
 if [ ! -e "$PRIV/SYNCED_FROM" ] && [ ! -L "$PRIV/SYNCED_FROM" ]; then
+  held=$("$HERE/listed-present.sh" "$1" "$PRIV") || die "cannot list present paths"
+  [ -z "$held" ] || die "SYNCED_FROM is missing but this tree holds listed private paths:
+$(printf '%s\n' "$held" | sed 's/^/  /')
+SYNCED_FROM is required once the paths are synced; restore it."
   echo "equivalence: SKIPPED: no SYNCED_FROM in $PRIV, so no sync has happened and this repo holds no private paths yet. The check runs once SYNCED_FROM exists."
   exit 0
 fi
@@ -89,6 +93,21 @@ while IFS= read -r line || [ -n "$line" ]; do
   q=$(printf '%s' "$q" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
   [ -n "$q" ] && private+=("${q%/}")
 done < "$plist"
+
+# Every listed path must still exist in CLOUD: at its own path or, for a hosted
+# workflow, under hosted-workflows/ or .github/workflows/. Deletions inside a
+# path stay CLOUD's call. Dropping a whole listed path is not.
+missing=0
+for q in "${private[@]}"; do
+  if [ -e "$PRIV/$q" ] || [ -L "$PRIV/$q" ]; then continue; fi
+  if [[ "$q" == .github/workflows/* ]]; then
+    wf="hosted-workflows/${q#.github/workflows/}"
+    if [ -e "$PRIV/$wf" ] || [ -L "$PRIV/$wf" ]; then continue; fi
+  fi
+  echo "equivalence: DIFF: listed path $q is gone from this repo (CLOUD must keep every listed path)" >&2
+  missing=$((missing + 1))
+done
+[ "$missing" -eq 0 ] || die "$missing listed private path(s) missing from this repo"
 
 is_private() { # importer key or path
   local q

@@ -101,6 +101,15 @@ $pending"
 fi
 
 # --- CLOUD owns the private paths: refuse to destroy its changes ------------
+if [ ! -e "$DEST/SYNCED_FROM" ] && [ ! -L "$DEST/SYNCED_FROM" ]; then
+  # A first sync has nothing to protect only if no listed path is here yet.
+  # Without SYNCED_FROM the clobber guard cannot tell CLOUD edits from a first
+  # sync, so a tree that already holds listed paths is refused.
+  held=$(for dp in "${dpaths[@]}"; do if [ -e "$DEST/$dp" ] || [ -L "$DEST/$dp" ]; then echo "$dp"; fi; done)
+  [ -z "$held" ] || die "SYNCED_FROM is missing from $DEST but it already holds listed paths (a re-sync would destroy CLOUD edits):
+$(printf '%s\n' "$held" | sed 's/^/  /')
+Restore SYNCED_FROM (it is required once synced); never sync over an existing tree without it."
+fi
 if [ -e "$DEST/SYNCED_FROM" ] || [ -L "$DEST/SYNCED_FROM" ]; then
   old=$(sed -n 's/^sha=//p' "$DEST/SYNCED_FROM")
   printf '%s' "$old" | grep -Eq '^[0-9a-f]{40}$' || die "SYNCED_FROM in $DEST has no full sha: '$old'"
@@ -108,6 +117,15 @@ if [ -e "$DEST/SYNCED_FROM" ] || [ -L "$DEST/SYNCED_FROM" ]; then
   exp=$(mktemp -d) || die "mktemp failed"
   trap 'rm -rf "$exp"' EXIT
   execs() { (cd "$1" && find . -type f -perm /111 -print | LC_ALL=C sort); }
+  oldlist=$(git -C "$PUB" show "$old:scripts/ci/private-paths.txt" 2> /dev/null | tr -d '\r' | sed 's/#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//; s|/$||' | grep -v '^$' || true)
+  old_listed() { # dest path: was its public path in public's list at SYNCED_FROM?
+    local j
+    for j in "${!dpaths[@]}"; do
+      [ "${dpaths[$j]}" = "$1" ] || continue
+      printf '%s\n' "$oldlist" | grep -qxF -- "${paths[$j]}" && return 0
+    done
+    return 1
+  }
   changed=()
   for i in "${!paths[@]}"; do
     p=${paths[$i]} dp=${dpaths[$i]}
@@ -133,7 +151,13 @@ if [ -e "$DEST/SYNCED_FROM" ] || [ -L "$DEST/SYNCED_FROM" ]; then
   done
   if [ "${#changed[@]}" -gt 0 ]; then
     echo "sync: these listed paths in $DEST differ from public's copy at SYNCED_FROM ($old):" >&2
-    printf '  %s\n' "${changed[@]}" >&2
+    for c in "${changed[@]}"; do
+      if [ ! -e "$DEST/$c" ] && [ ! -L "$DEST/$c" ] && ! old_listed "$c"; then
+        echo "  $c (newly listed since SYNCED_FROM; this tree has none of it. Port it by hand.)" >&2
+      else
+        echo "  $c" >&2
+      fi
+    done
     die "refusing to overwrite CLOUD-owned changes. Hand-port the public fix instead (README, \"Hand-porting a public fix\")."
   fi
 fi

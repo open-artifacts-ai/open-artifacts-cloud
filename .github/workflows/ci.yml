@@ -70,8 +70,16 @@ jobs:
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
       # sync there is no SYNCED_FROM and the script skips with a message.
+      # SYNCED_FROM is required (B1 is done): it may be missing only while this
+      # tree holds none of the listed paths. prev is the SYNCED_FROM of the
+      # base this change lands on, so pin-check can prove that a moved
+      # SYNCED_FROM carried the public fix (port check).
       - id: synced
-        name: read SYNCED_FROM
+        name: read SYNCED_FROM (and the base's)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           sha=""
@@ -79,8 +87,26 @@ jobs:
             [ -f private/SYNCED_FROM ] && [ ! -L private/SYNCED_FROM ] || { echo "::error::SYNCED_FROM exists but is not a regular file"; exit 1; }
             sha=$(sed -n 's/^sha=//p' private/SYNCED_FROM)
             [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SYNCED_FROM sha '$sha' is not a full sha"; exit 1; }
+          else
+            held=$(private/scripts/listed-present.sh public private)
+            if [ -n "$held" ]; then
+              echo "::error::SYNCED_FROM is missing but this tree holds listed private paths: $held"
+              exit 1
+            fi
+          fi
+          prev=""
+          if [ -n "$sha" ] && [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$BASE_SHA" =~ ^0+$ ]]; then
+            if body=$(gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/SYNCED_FROM?ref=$BASE_SHA" 2> "$RUNNER_TEMP/gh.err"); then
+              prev=$(printf '%s\n' "$body" | sed -n 's/^sha=//p')
+              [[ "$prev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the base's SYNCED_FROM sha '$prev' is not a full sha"; exit 1; }
+            elif grep -q "Not Found" "$RUNNER_TEMP/gh.err"; then
+              echo "the base has no SYNCED_FROM (first sync): no port check"
+            else
+              cat "$RUNNER_TEMP/gh.err"; echo "::error::cannot read the base's SYNCED_FROM"; exit 1
+            fi
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
       - if: ${{ steps.synced.outputs.sha != '' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -90,10 +116,19 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # pin-check needs SYNCED_FROM and PUBLIC_PIN in one history
       # PUBLIC_PIN is tied to SYNCED_FROM while public holds the hosted paths:
-      # the pin may lead the sync only if public did not touch them (cloud #5).
+      # the pin may lead the sync only if public did not touch them (cloud #5),
+      # and a moved SYNCED_FROM must carry the public fix (port check).
       - if: ${{ steps.synced.outputs.sha != '' }}
         name: pin-check (PUBLIC_PIN is tied to SYNCED_FROM)
-        run: private/scripts/pin-check.sh public-synced private
+        env:
+          PREV: ${{ steps.synced.outputs.prev }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PREV" ]; then
+            private/scripts/pin-check.sh --prev "$PREV" public-synced private
+          else
+            private/scripts/pin-check.sh public-synced private
+          fi
       - if: ${{ steps.synced.outputs.sha != '' }}
         name: equivalence (outside the private paths, the overlay equals public at SYNCED_FROM)
         run: private/scripts/equivalence.sh public-synced private
@@ -129,6 +164,11 @@ jobs:
             exit 1
           fi
           echo "::warning::No private packages in this tree yet (before the sync). Build, typecheck and test are skipped."
+      - name: SYNCED_FROM is required once there are private packages
+        if: ${{ steps.pkgs.outputs.count != '0' && steps.synced.outputs.sha == '' }}
+        run: |
+          echo "::error::the plan found private packages but there is no SYNCED_FROM: no pin tie and no equivalence check would run"
+          exit 1
       - name: build
         if: ${{ steps.pkgs.outputs.count != '0' }}
         working-directory: public

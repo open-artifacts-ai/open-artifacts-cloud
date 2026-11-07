@@ -43,7 +43,7 @@ set -uo pipefail
 
 die() { echo "overlay: $*" >&2; exit 1; }
 # This repo's tooling, directly in scripts/. Rule 5: it never overlays.
-TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh place-workflows.sh pin-check.sh "
+TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh place-workflows.sh pin-check.sh listed-present.sh "
 usage() { echo "usage: overlay.sh [--pre-split | --auto-split] <public-checkout-dir> <private-dir>" >&2; exit 2; }
 usage_both() { echo "overlay: --pre-split and --auto-split are exclusive (auto decides pre-split itself)" >&2; usage; }
 pre_split=no
