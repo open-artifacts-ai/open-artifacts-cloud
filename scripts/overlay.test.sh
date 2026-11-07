@@ -7,6 +7,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 OVERLAY="$HERE/overlay.sh"
 SYNC="$HERE/sync-from-public.sh"
 EQUIV="$HERE/equivalence.sh"
+PLACE="$HERE/place-workflows.sh"
+PINCHK="$HERE/pin-check.sh"
+LISTED="$HERE/listed-present.sh"
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -100,9 +103,13 @@ expect_exit "bad usage exits 2" 2 "$OVERLAY" "$T/p1"
 mkpub "$T/s1"
 mkdir -p "$T/d1/scripts"; cp "$SYNC" "$T/d1/scripts/"; cp "$T/s1/list.txt" "$T/d1/private-paths.txt"
 mkdir -p "$T/d1/apps/hosted"; echo stale > "$T/d1/apps/hosted/stale.ts"
+expect_exit "sync refuses a tree that holds listed paths but has no SYNCED_FROM" 1 "$T/d1/scripts/sync-from-public.sh" "$T/s1"
+check "that refusal names the missing SYNCED_FROM" grep -q 'SYNCED_FROM is missing' "$T/out"
+check "that refusal left the tree alone" [ -e "$T/d1/apps/hosted/stale.ts" ]
+rm -rf "$T/d1/apps"
 expect_exit "sync succeeds" 0 "$T/d1/scripts/sync-from-public.sh" "$T/s1"
 check "sync copies a listed dir" [ "$(cat "$T/d1/apps/hosted/src/index.ts" 2> /dev/null)" = hosted ]
-check "sync mirrors (stale file removed)" [ ! -e "$T/d1/apps/hosted/stale.ts" ]
+check "sync copies the listed file" [ ! -e "$T/d1/apps/hosted/stale.ts" ]
 check "sync copies only listed paths" [ ! -e "$T/d1/apps/server/index.ts" ]
 check "SYNCED_FROM records the sha" grep -qx "sha=$(git -C "$T/s1" rev-parse HEAD)" "$T/d1/SYNCED_FROM"
 check "SYNCED_FROM records the tag" grep -qx "tag=v1" "$T/d1/SYNCED_FROM"
@@ -149,11 +156,10 @@ echo 'on: schedule' > "$T/s4/.github/workflows/nightly.yml"
 echo 'on: workflow_run' > "$T/s4/.github/workflows/publish.yml"
 echo 'const' > "$T/s4/.github/hosted/constants.sh"
 G -C "$T/s4" add -A; G -C "$T/s4" commit -qm workflows
-mkdir -p "$T/d4/scripts" "$T/d4/.github/workflows" "$T/d4/hosted-workflows"
+mkdir -p "$T/d4/scripts" "$T/d4/.github/workflows"
 cp "$SYNC" "$T/d4/scripts/"
 printf 'apps/hosted\n.github/hosted\n.github/workflows/nightly.yml\n.github/workflows/publish.yml\n' > "$T/d4/private-paths.txt"
 echo 'private ci' > "$T/d4/.github/workflows/ci.yml"
-echo 'stale' > "$T/d4/hosted-workflows/nightly.yml"
 wf_snapshot() { (cd "$T/d4/.github/workflows" && find . -print0 | sort -z | xargs -0 sha256sum 2> /dev/null; find . | sort); }
 wf_before=$(wf_snapshot)
 expect_exit "sync with workflow entries succeeds" 0 "$T/d4/scripts/sync-from-public.sh" "$T/s4"
@@ -340,11 +346,11 @@ check "nothing removed through the symlink" [ -e "$T/pg/apps/hosted/src/index.ts
 # --- equivalence ---------------------------------------------------------------
 # A synced cloud dir for a hosted public repo, built with the real sync.
 mkcloud() { # pubdir dest
-  mkdir -p "$2/scripts"; cp "$SYNC" "$OVERLAY" "$EQUIV" "$2/scripts/"
+  mkdir -p "$2/scripts"; cp "$SYNC" "$OVERLAY" "$EQUIV" "$PLACE" "$PINCHK" "$LISTED" "$2/scripts/"
   echo 'cloud readme' > "$2/README.md"
   "$2/scripts/sync-from-public.sh" "$1" > /dev/null 2>&1 || echo "mkcloud: sync failed" >&2
 }
-mkpub_hosted "$T/e1"; mkdir -p "$T/ec0"; mkdir -p "$T/ec0/scripts"; cp "$OVERLAY" "$EQUIV" "$T/ec0/scripts/"
+mkpub_hosted "$T/e1"; mkdir -p "$T/ec0"; mkdir -p "$T/ec0/scripts"; cp "$OVERLAY" "$EQUIV" "$PLACE" "$LISTED" "$T/ec0/scripts/"
 expect_exit "equivalence skips without SYNCED_FROM" 0 "$T/ec0/scripts/equivalence.sh" "$T/e1"
 check "skip says why" grep -q 'SKIPPED: no SYNCED_FROM' "$T/out"
 
@@ -357,35 +363,46 @@ check "pass names the allowlisted count" grep -q 'OK:' "$T/out"
 # other packages, and keeps public's importers.
 printf "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a: 1\n\n  apps/server:\n    dependencies:\n      b: 1\n\n  apps/hosted:\n    dependencies:\n      z: 9\n\npackages:\n  x: {}\n  y: {}\n" > "$T/ec1/pnpm-lock.yaml"
 expect_exit "an allowlisted lockfile difference passes" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
-check "the lockfile really differed (count shows it)" grep -q '(1 allowlisted difference(s))' "$T/out"
+check "the lockfile really differed (count shows it)" grep -q '(1 allowlisted difference(s);' "$T/out"
 sed -i 's/      b: 1/      b: 2/' "$T/ec1/pnpm-lock.yaml"
 expect_exit "a changed public importer in the lockfile fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
 check "the importer is named" grep -q 'apps/server' "$T/out"
 rm "$T/ec1/pnpm-lock.yaml"
 
+# CLOUD owns the private paths: edits, deletions and additions inside them pass.
 rm "$T/ec1/apps/hosted/src/index.ts"
-expect_exit "a dropped file fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
-check "dropped file is named" grep -q 'DIFF: apps/hosted/src/index.ts (only in public (dropped))' "$T/out"
+expect_exit "a dropped private file passes (CLOUD-owned)" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "owned differences are counted" grep -q '1 CLOUD-owned difference(s)' "$T/out"
 
 mkcloud "$T/e1" "$T/ec2"
 echo 'extra' > "$T/ec2/apps/hosted/src/extra.ts"
-expect_exit "an extra file fails" 1 "$T/ec2/scripts/equivalence.sh" "$T/e1" "$T/ec2"
-check "extra file is named" grep -q 'DIFF: apps/hosted/src/extra.ts (only in overlay (extra))' "$T/out"
+expect_exit "an extra private file passes (CLOUD-owned)" 0 "$T/ec2/scripts/equivalence.sh" "$T/e1" "$T/ec2"
 
 mkcloud "$T/e1" "$T/ec3"
-echo 'drifted' > "$T/ec3/apps/hosted/src/index.ts"
-expect_exit "a changed file fails" 1 "$T/ec3/scripts/equivalence.sh" "$T/e1" "$T/ec3"
-check "changed file is named" grep -q 'DIFF: apps/hosted/src/index.ts (content differs)' "$T/out"
+echo 'renamed repo pin' > "$T/ec3/apps/hosted/src/index.ts"
+expect_exit "a changed private file passes (CLOUD-owned)" 0 "$T/ec3/scripts/equivalence.sh" "$T/e1" "$T/ec3"
 
 mkcloud "$T/e1" "$T/ec4"
-echo 'drifted wf' > "$T/ec4/hosted-workflows/hosted.yml"
-expect_exit "a drifted hosted workflow fails (compared as .github/workflows/)" 1 "$T/ec4/scripts/equivalence.sh" "$T/e1" "$T/ec4"
-check "workflow drift is named" grep -q 'DIFF: .github/workflows/hosted.yml' "$T/out"
+echo 'edited wf' > "$T/ec4/hosted-workflows/hosted.yml"
+expect_exit "a changed hosted workflow passes (CLOUD-owned)" 0 "$T/ec4/scripts/equivalence.sh" "$T/e1" "$T/ec4"
 
 mkcloud "$T/e1" "$T/ec6"
 chmod 755 "$T/ec6/apps/hosted/src/index.ts"
-expect_exit "a chmod difference in a private file fails" 1 "$T/ec6/scripts/equivalence.sh" "$T/e1" "$T/ec6"
-check "chmod difference is named" grep -q 'DIFF: apps/hosted/src/index.ts (executable bit differs)' "$T/out"
+expect_exit "a chmod of a private file passes (CLOUD-owned)" 0 "$T/ec6/scripts/equivalence.sh" "$T/e1" "$T/ec6"
+
+# Everything outside the private paths stays strict.
+mkcloud "$T/e1" "$T/ec11"
+mkdir -p "$T/ec11/apps/server"; echo 'extra' > "$T/ec11/apps/server/extra.ts"
+expect_exit "an extra non-private file fails" 1 "$T/ec11/scripts/equivalence.sh" "$T/e1" "$T/ec11"
+check "extra non-private file is named" grep -q 'DIFF: apps/server/extra.ts (only in overlay (extra))' "$T/out"
+mkcloud "$T/e1" "$T/ec12"
+echo 'wf' > "$T/ec12/hosted-workflows/other.yml"
+expect_exit "a parked workflow that is not listed fails" 1 "$T/ec12/scripts/equivalence.sh" "$T/e1" "$T/ec12"
+check "unlisted workflow is named" grep -q 'DIFF: .github/workflows/other.yml' "$T/out"
+mkcloud "$T/e1" "$T/ec13"
+mkdir -p "$T/ec13/apps/newapp"; echo x > "$T/ec13/apps/newapp/i.ts"
+expect_exit "a new non-private directory fails" 1 "$T/ec13/scripts/equivalence.sh" "$T/e1" "$T/ec13"
+check "new directory is named" grep -q 'DIFF: apps/newapp' "$T/out"
 
 mkcloud "$T/e1" "$T/ec7"
 echo 'mine' > "$T/ec7/hosted-workflows/ci.yml"
@@ -406,6 +423,254 @@ expect_exit "an empty SYNCED_FROM fails, not skips" 1 "$T/ec10/scripts/equivalen
 mkcloud "$T/e1" "$T/ec5"
 sed -i 's/^sha=.*/sha=0123456789abcdef0123456789abcdef01234567/' "$T/ec5/SYNCED_FROM"
 expect_exit "a SYNCED_FROM sha public lacks fails" 1 "$T/ec5/scripts/equivalence.sh" "$T/e1" "$T/ec5"
+
+# --- overlay: flag and list gaps (cloud #5) --------------------------------------
+mkpub_hosted "$T/g1"; mkpriv_hosted "$T/gv1" "$T/g1"
+expect_exit "--pre-split with --auto-split exits 2" 2 "$OVERLAY" --pre-split --auto-split "$T/g1" "$T/gv1"
+expect_exit "--auto-split with --pre-split exits 2" 2 "$OVERLAY" --auto-split --pre-split "$T/g1" "$T/gv1"
+check "the exclusive flags are named" grep -q 'exclusive' "$T/out"
+check "nothing was removed on the bad flags" [ -e "$T/g1/apps/hosted/src/public-only-file.ts" ]
+
+# An empty list (comments only) dies, in both modes.
+mkpre g2 '# only a comment\n\n'
+expect_exit "--pre-split fails on an empty list" 1 "$OVERLAY" --pre-split "$T/g2" "$T/g2v"
+check "empty list is named" grep -q 'path list is empty' "$T/out"
+mkpre g3 '\n'
+expect_exit "--auto-split fails on an empty list" 1 "$OVERLAY" --auto-split "$T/g3" "$T/g3v"
+check "auto-split errors carry the --auto-split prefix" grep -q -- '--auto-split: path list is empty' "$T/out"
+
+# A dangling symlink counts as present (the -L half of the check): all listed
+# paths present means pre-split, and the link is removed, not left to collide.
+mkpub_hosted "$T/g4"; mkpriv_hosted "$T/gv4" "$T/g4"
+rm -rf "$T/g4/apps/hosted" "$T/g4/.github/workflows/hosted.yml"
+ln -s nowhere "$T/g4/apps/hosted"; ln -s nowhere "$T/g4/.github/workflows/hosted.yml"
+pin_to "$T/g4" "$T/gv4"
+expect_exit "--auto-split counts dangling symlinks as present" 0 "$OVERLAY" --auto-split "$T/g4" "$T/gv4"
+check "dangling symlinks: pre-split mode" grep -q 'all 2 listed path(s) are in public: pre-split mode' "$T/out"
+check "the dangling link was replaced by private's file" [ "$(cat "$T/g4/apps/hosted/src/index.ts")" = 'private edit' ]
+# One dangling link and one absent path is a half-deleted pin, not strict.
+mkpub_hosted "$T/g5"; mkpriv_hosted "$T/gv5" "$T/g5"
+G -C "$T/g5" rm -rq apps/hosted; ln -s nowhere "$T/g5/apps/hosted"; G -C "$T/g5" rm -q .github/workflows/hosted.yml
+pin_to "$T/g5" "$T/gv5"
+expect_exit "--auto-split: one dangling link, one absent path is half-deleted" 1 "$OVERLAY" --auto-split "$T/g5" "$T/gv5"
+check "half-deleted is named" grep -q '1 of 2' "$T/out"
+
+# Strict mode while public still ships its own list: the list stays in the
+# tree, none of its paths do, so it is strict and a collision still fails.
+mkpub_hosted "$T/g6"; mkpriv_hosted "$T/gv6" "$T/g6"
+G -C "$T/g6" rm -rq apps/hosted .github/workflows/hosted.yml
+pin_to "$T/g6" "$T/gv6"
+check "public still ships its list" [ -f "$T/g6/scripts/ci/private-paths.txt" ]
+expect_exit "--auto-split is strict when public keeps its list but none of its paths" 0 "$OVERLAY" --auto-split "$T/g6" "$T/gv6"
+check "that was strict mode" grep -q 'strict mode' "$T/out"
+mkpub_hosted "$T/g7"; mkpriv_hosted "$T/gv7" "$T/g7"
+G -C "$T/g7" rm -rq apps/hosted .github/workflows/hosted.yml
+mkdir -p "$T/gv7/apps/server"; echo mine > "$T/gv7/apps/server/index.ts"; pin_to "$T/g7" "$T/gv7"
+expect_exit "strict mode with public's own list still fails a collision" 1 "$OVERLAY" --auto-split "$T/g7" "$T/gv7"
+
+# --- place-workflows ---------------------------------------------------------------
+mkdir -p "$T/pw1/hosted-workflows/sub" "$T/pw1o/.github/workflows"
+echo a > "$T/pw1/hosted-workflows/a.yml"; echo b > "$T/pw1/hosted-workflows/sub/b.yml"
+printf '#!/bin/sh\n' > "$T/pw1/hosted-workflows/run.sh"; chmod 755 "$T/pw1/hosted-workflows/run.sh"
+ln -s a.yml "$T/pw1/hosted-workflows/link.yml"
+expect_exit "place copies workflows" 0 "$PLACE" "$T/pw1" "$T/pw1o"
+check "place is recursive" [ "$(cat "$T/pw1o/.github/workflows/sub/b.yml" 2> /dev/null)" = b ]
+check "place keeps the executable bit" [ -x "$T/pw1o/.github/workflows/run.sh" ]
+check "place keeps symlinks as symlinks" [ -L "$T/pw1o/.github/workflows/link.yml" ]
+check "place counts them" grep -q 'placed 4 hosted workflow' "$T/out"
+expect_exit "place refuses an existing target" 1 "$PLACE" "$T/pw1" "$T/pw1o"
+check "existing target is named" grep -q 'would overwrite .github/workflows/' "$T/out"
+mkdir -p "$T/pw2/real" "$T/pw2o"; echo a > "$T/pw2/real/a.yml"; ln -s real "$T/pw2/hosted-workflows"
+expect_exit "place refuses a symlinked hosted-workflows" 1 "$PLACE" "$T/pw2" "$T/pw2o"
+check "symlinked dir is named" grep -q 'is a symlink' "$T/out"
+check "nothing placed through the symlink" [ ! -e "$T/pw2o/.github/workflows/a.yml" ]
+mkdir -p "$T/pw3" "$T/pw3o"
+expect_exit "place with no hosted-workflows places nothing" 0 "$PLACE" "$T/pw3" "$T/pw3o"
+mkdir -p "$T/pw4/hosted-workflows" "$T/pw4o/.github/workflows/sub"; echo a > "$T/pw4/hosted-workflows/sub"
+expect_exit "place refuses a file where the tree has a directory" 1 "$PLACE" "$T/pw4" "$T/pw4o"
+expect_exit "place bad usage exits 2" 2 "$PLACE" "$T/pw4"
+
+# --- sync: CLOUD owns the private paths ------------------------------------------
+# A synced cloud dir with a PUBLIC_PIN at public's HEAD.
+mkc() { # pubdir dest
+  mkcloud "$1" "$2"
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$1" rev-parse HEAD)" > "$2/PUBLIC_PIN"
+}
+adv() { # pubdir relpath content: a new public commit
+  mkdir -p "$1/$(dirname "$2")"; printf '%s\n' "$3" > "$1/$2"
+  G -C "$1" add -A; G -C "$1" commit -qm adv
+}
+mkpub_hosted "$T/y1"; mkc "$T/y1" "$T/yc1"
+check "the first sync writes private-paths.txt from public's list" grep -qx 'apps/hosted' "$T/yc1/private-paths.txt"
+adv "$T/y1" apps/hosted/src/index.ts 'public fix'
+expect_exit "a re-sync of an untouched cloud tree succeeds" 0 "$T/yc1/scripts/sync-from-public.sh" "$T/y1"
+check "the re-sync took public's change" [ "$(cat "$T/yc1/apps/hosted/src/index.ts")" = 'public fix' ]
+check "the re-sync advanced SYNCED_FROM" grep -qx "sha=$(git -C "$T/y1" rev-parse HEAD)" "$T/yc1/SYNCED_FROM"
+
+mkpub_hosted "$T/y2"; mkc "$T/y2" "$T/yc2"
+echo 'cloud edit' > "$T/yc2/apps/hosted/src/index.ts"
+adv "$T/y2" apps/hosted/src/other.ts 'public change'
+expect_exit "sync refuses to overwrite a CLOUD-changed private file" 1 "$T/yc2/scripts/sync-from-public.sh" "$T/y2"
+check "the changed path is named" grep -q 'apps/hosted' "$T/out"
+check "the refusal points at the hand-port procedure" grep -q 'Hand-port' "$T/out"
+check "the CLOUD edit survived" [ "$(cat "$T/yc2/apps/hosted/src/index.ts")" = 'cloud edit' ]
+check "SYNCED_FROM did not move" nogrep "sha=$(git -C "$T/y2" rev-parse HEAD)" "$T/yc2/SYNCED_FROM"
+
+mkpub_hosted "$T/y3"; mkc "$T/y3" "$T/yc3"
+echo 'new' > "$T/yc3/apps/hosted/src/cloud-only.ts"
+adv "$T/y3" README.md 'x'
+expect_exit "sync refuses when CLOUD added a file under a private path" 1 "$T/yc3/scripts/sync-from-public.sh" "$T/y3"
+check "the CLOUD-owned refusal fired (y3)" grep -q "differ from public's copy at SYNCED_FROM" "$T/out"
+check "the cloud-only file survived" [ -e "$T/yc3/apps/hosted/src/cloud-only.ts" ]
+
+mkpub_hosted "$T/y4"; mkc "$T/y4" "$T/yc4"
+echo 'cloud wf' > "$T/yc4/hosted-workflows/hosted.yml"
+adv "$T/y4" README.md 'x'
+expect_exit "sync refuses when CLOUD edited a parked workflow" 1 "$T/yc4/scripts/sync-from-public.sh" "$T/y4"
+check "the workflow is named by its parked path" grep -q 'hosted-workflows/hosted.yml' "$T/out"
+
+mkpub_hosted "$T/y5"; mkc "$T/y5" "$T/yc5"
+rm "$T/yc5/apps/hosted/src/index.ts"
+adv "$T/y5" README.md 'x'
+expect_exit "sync refuses when CLOUD deleted a private file" 1 "$T/yc5/scripts/sync-from-public.sh" "$T/y5"
+check "the CLOUD-owned refusal fired (y5)" grep -q "differ from public's copy at SYNCED_FROM" "$T/out"
+
+mkpub_hosted "$T/y6"; mkc "$T/y6" "$T/yc6"
+chmod 755 "$T/yc6/apps/hosted/src/index.ts"
+adv "$T/y6" README.md 'x'
+expect_exit "sync refuses when CLOUD changed a mode" 1 "$T/yc6/scripts/sync-from-public.sh" "$T/y6"
+check "the CLOUD-owned refusal fired (y6)" grep -q "differ from public's copy at SYNCED_FROM" "$T/out"
+
+# The file-level executable bit: a listed single file whose mode changed.
+mkpub_hosted "$T/y9"
+printf '# hosted\napps/hosted\n.github/workflows/hosted.yml\nscripts/ci/run.sh\n' > "$T/y9/scripts/ci/private-paths.txt"
+G -C "$T/y9" add -A; G -C "$T/y9" commit -qm 'list a file'
+mkc "$T/y9" "$T/yc9"
+chmod 644 "$T/yc9/scripts/ci/run.sh"
+adv "$T/y9" README.md 'x'
+expect_exit "sync refuses when CLOUD changed the mode of a listed single file" 1 "$T/yc9/scripts/sync-from-public.sh" "$T/y9"
+check "the single file is named" grep -q 'scripts/ci/run.sh' "$T/out"
+check "the mode refusal is the CLOUD-owned one" grep -q "differ from public's copy at SYNCED_FROM" "$T/out"
+
+# A path public starts listing that CLOUD lacks is called newly listed.
+mkpub_hosted "$T/y10"; mkc "$T/y10" "$T/yc10"
+printf '# hosted\napps/hosted\n.github/workflows/hosted.yml\napps/server\n' > "$T/y10/scripts/ci/private-paths.txt"
+G -C "$T/y10" add -A; G -C "$T/y10" commit -qm 'list grows'
+expect_exit "sync refuses a newly listed path CLOUD lacks" 1 "$T/yc10/scripts/sync-from-public.sh" "$T/y10"
+check "the refusal says newly listed" grep -q 'newly listed' "$T/out"
+
+mkpub_hosted "$T/y7"; mkc "$T/y7" "$T/yc7"
+printf 'stale/path\n' > "$T/yc7/private-paths.txt"
+adv "$T/y7" README.md 'x'
+expect_exit "a re-sync refreshes a stale private-paths.txt" 0 "$T/yc7/scripts/sync-from-public.sh" "$T/y7"
+check "stale entry gone" nogrep 'stale/path' "$T/yc7/private-paths.txt"
+check "public's entries present" grep -qx '.github/workflows/hosted.yml' "$T/yc7/private-paths.txt"
+
+mkpub_hosted "$T/y8"; mkc "$T/y8" "$T/yc8"
+G -C "$T/y8" cat-file -e HEAD > /dev/null
+mkpub "$T/y8b"
+expect_exit "sync refuses when public lacks the old SYNCED_FROM commit" 1 "$T/yc8/scripts/sync-from-public.sh" "$T/y8b"
+
+# --- pin-check ---------------------------------------------------------------------
+pin_at() { # cloud sha
+  printf 'tag=v1\nsha=%s\n' "$2" > "$1/PUBLIC_PIN"
+}
+mkpub_hosted "$T/k1"; mkc "$T/k1" "$T/kc1"
+expect_exit "pin-check passes when the pin equals SYNCED_FROM" 0 "$T/kc1/scripts/pin-check.sh" "$T/k1" "$T/kc1"
+check "pin-check says equal" grep -q 'equal' "$T/out"
+S1=$(git -C "$T/k1" rev-parse HEAD)
+adv "$T/k1" apps/server/new.ts 'non-hosted change'
+pin_at "$T/kc1" "$(git -C "$T/k1" rev-parse HEAD)"
+expect_exit "pin-check lets the pin lead over non-hosted changes" 0 "$T/kc1/scripts/pin-check.sh" "$T/k1" "$T/kc1"
+check "pin-check says the pin leads" grep -q 'pin leads' "$T/out"
+adv "$T/k1" apps/hosted/src/index.ts 'hosted change upstream'
+pin_at "$T/kc1" "$(git -C "$T/k1" rev-parse HEAD)"
+expect_exit "pin-check fails when the pin leads over a hosted change" 1 "$T/kc1/scripts/pin-check.sh" "$T/k1" "$T/kc1"
+check "the changed hosted file is named" grep -q 'apps/hosted/src/index.ts' "$T/out"
+check "the remedy is named" grep -q 'bump SYNCED_FROM' "$T/out"
+# The hand-port PR: SYNCED_FROM bumped to the pin, with the port.
+sed -i "s/^sha=.*/sha=$(git -C "$T/k1" rev-parse HEAD)/" "$T/kc1/SYNCED_FROM"
+echo 'hosted change upstream' > "$T/kc1/apps/hosted/src/index.ts"
+expect_exit "pin-check passes once SYNCED_FROM is bumped to the pin (no base known)" 0 "$T/kc1/scripts/pin-check.sh" "$T/k1" "$T/kc1"
+check "that pass is the 'equal' one, which proves no port" grep -q 'equal' "$T/out"
+expect_exit "port check passes when the bump carries the port" 0 "$T/kc1/scripts/pin-check.sh" --prev "$S1" "$T/k1" "$T/kc1"
+check "port check says it ran" grep -q 'port check: every public change' "$T/out"
+# The same bump WITHOUT the port must fail (a pin bump that ports nothing).
+echo 'hosted' > "$T/kc1/apps/hosted/src/index.ts"
+expect_exit "port check fails when SYNCED_FROM moved without the port" 1 "$T/kc1/scripts/pin-check.sh" --prev "$S1" "$T/k1" "$T/kc1"
+check "the unported fix is the failure" grep -q 'without porting' "$T/out"
+# A reviewed exception for that file: CLOUD kept its own side.
+printf 'apps/hosted/src/index.ts  # CLOUD keeps its own line\n' > "$T/kc1/port-exceptions.txt"
+expect_exit "port-exceptions.txt exempts a named file" 0 "$T/kc1/scripts/pin-check.sh" --prev "$S1" "$T/k1" "$T/kc1"
+rm "$T/kc1/port-exceptions.txt"
+# A fix to a hosted workflow must be ported into hosted-workflows/.
+mkpub_hosted "$T/k7"; mkc "$T/k7" "$T/kc7"; S7=$(git -C "$T/k7" rev-parse HEAD)
+adv "$T/k7" .github/workflows/hosted.yml 'hosted wf fixed'
+sed -i "s/^sha=.*/sha=$(git -C "$T/k7" rev-parse HEAD)/" "$T/kc7/SYNCED_FROM"; pin_at "$T/kc7" "$(git -C "$T/k7" rev-parse HEAD)"
+expect_exit "port check fails on an unported workflow fix" 1 "$T/kc7/scripts/pin-check.sh" --prev "$S7" "$T/k7" "$T/kc7"
+echo 'hosted wf fixed' > "$T/kc7/hosted-workflows/hosted.yml"
+expect_exit "port check passes once the workflow fix is in hosted-workflows/" 0 "$T/kc7/scripts/pin-check.sh" --prev "$S7" "$T/k7" "$T/kc7"
+# The SECURITY FIX scenario: pin and SYNCED_FROM both move, CLOUD copy unchanged.
+mkpub_hosted "$T/k8"; mkc "$T/k8" "$T/kc8"; S8=$(git -C "$T/k8" rev-parse HEAD)
+adv "$T/k8" apps/hosted/src/index.ts 'SECURITY FIX'
+sed -i "s/^sha=.*/sha=$(git -C "$T/k8" rev-parse HEAD)/" "$T/kc8/SYNCED_FROM"; pin_at "$T/kc8" "$(git -C "$T/k8" rev-parse HEAD)"
+expect_exit "pin-check alone cannot see the bump (no base)" 0 "$T/kc8/scripts/pin-check.sh" "$T/k8" "$T/kc8"
+expect_exit "a bump with the CLOUD copy unchanged fails the port check" 1 "$T/kc8/scripts/pin-check.sh" --prev "$S8" "$T/k8" "$T/kc8"
+expect_exit "--prev equal to SYNCED_FROM means nothing moved" 0 "$T/kc1/scripts/pin-check.sh" --prev "$(sed -n 's/^sha=//p' "$T/kc1/SYNCED_FROM")" "$T/k1" "$T/kc1"
+expect_exit "--prev must be a full sha" 1 "$T/kc8/scripts/pin-check.sh" --prev abc "$T/k8" "$T/kc8"
+# A pin behind the sync.
+pin_at "$T/kc1" "$S1"
+expect_exit "pin-check fails when the pin is behind SYNCED_FROM" 1 "$T/kc1/scripts/pin-check.sh" "$T/k1" "$T/kc1"
+check "behind pin is named" grep -q 'not PUBLIC_PIN' "$T/out"
+
+mkpub_hosted "$T/k2"; mkc "$T/k2" "$T/kc2"
+printf '# hosted\napps/hosted\n.github/workflows/hosted.yml\nscripts/ci/run.sh\n' > "$T/k2/scripts/ci/private-paths.txt"
+G -C "$T/k2" add -A; G -C "$T/k2" commit -qm 'list grows'
+pin_at "$T/kc2" "$(git -C "$T/k2" rev-parse HEAD)"
+expect_exit "pin-check fails when public's list changed under the pin" 1 "$T/kc2/scripts/pin-check.sh" "$T/k2" "$T/kc2"
+check "list change is named" grep -q 'list changed' "$T/out"
+
+mkpub_hosted "$T/k3"; mkc "$T/k3" "$T/kc3"
+printf 'stale/path\n' > "$T/kc3/private-paths.txt"
+expect_exit "pin-check fails on a stale private-paths.txt" 1 "$T/kc3/scripts/pin-check.sh" "$T/k3" "$T/kc3"
+check "stale list is named" grep -q 'private-paths.txt does not match' "$T/out"
+
+mkpub_hosted "$T/k4"; mkc "$T/k4" "$T/kc4"
+G -C "$T/k4" rm -rq apps/hosted .github/workflows/hosted.yml
+G -C "$T/k4" commit -qm delete
+pin_at "$T/kc4" "$(git -C "$T/k4" rev-parse HEAD)"
+expect_exit "pin-check does not apply once public holds none of the paths" 0 "$T/kc4/scripts/pin-check.sh" "$T/k4" "$T/kc4"
+check "strict mode is named" grep -q 'strict mode' "$T/out"
+
+mkdir -p "$T/kc5/scripts"; cp "$PINCHK" "$LISTED" "$T/kc5/scripts/"
+expect_exit "pin-check skips without SYNCED_FROM" 0 "$T/kc5/scripts/pin-check.sh" "$T/k1" "$T/kc5"
+mkpub_hosted "$T/k6"; mkc "$T/k6" "$T/kc6"
+sed -i 's/^sha=.*/sha=0123456789abcdef0123456789abcdef01234567/' "$T/kc6/SYNCED_FROM"
+expect_exit "pin-check fails on a SYNCED_FROM commit public lacks" 1 "$T/kc6/scripts/pin-check.sh" "$T/k6" "$T/kc6"
+expect_exit "pin-check bad usage exits 2" 2 "$PINCHK"
+expect_exit "--prev without a value exits 2" 2 "$PINCHK" --prev
+
+# SYNCED_FROM is required once the listed paths are here.
+mkpub_hosted "$T/m1"; mkc "$T/m1" "$T/mc1"; rm "$T/mc1/SYNCED_FROM"
+expect_exit "pin-check refuses (not skips) when SYNCED_FROM is deleted" 1 "$T/mc1/scripts/pin-check.sh" "$T/m1" "$T/mc1"
+check "pin-check names the missing SYNCED_FROM" grep -q 'SYNCED_FROM is missing' "$T/out"
+expect_exit "equivalence refuses (not skips) when SYNCED_FROM is deleted" 1 "$T/mc1/scripts/equivalence.sh" "$T/m1" "$T/mc1"
+check "equivalence names the missing SYNCED_FROM" grep -q 'SYNCED_FROM is missing' "$T/out"
+expect_exit "sync refuses (not first-syncs) when SYNCED_FROM is deleted" 1 "$T/mc1/scripts/sync-from-public.sh" "$T/m1"
+check "sync keeps the CLOUD edit tree" [ -e "$T/mc1/apps/hosted/src/index.ts" ]
+# A workflow-only tree still counts (parked under hosted-workflows/).
+mkpub_hosted "$T/m2"; mkc "$T/m2" "$T/mc2"; rm "$T/mc2/SYNCED_FROM"; rm -rf "$T/mc2/apps"
+expect_exit "a tree holding only a parked hosted workflow also refuses" 1 "$T/mc2/scripts/pin-check.sh" "$T/m2" "$T/mc2"
+# Equivalence: dropping a whole listed path is a failure.
+mkpub_hosted "$T/m3"; mkc "$T/m3" "$T/mc3"
+rm -rf "$T/mc3/apps/hosted" "$T/mc3/hosted-workflows"
+expect_exit "equivalence fails when whole listed paths are dropped" 1 "$T/mc3/scripts/equivalence.sh" "$T/m3" "$T/mc3"
+check "the dropped path is named" grep -q 'listed path apps/hosted is gone' "$T/out"
+check "the dropped workflow is named" grep -q 'listed path .github/workflows/hosted.yml is gone' "$T/out"
+mkpub_hosted "$T/m4"; mkc "$T/m4" "$T/mc4"
+mkdir -p "$T/mc4/.github/workflows"; mv "$T/mc4/hosted-workflows/hosted.yml" "$T/mc4/.github/workflows/hosted.yml"
+rm -rf "$T/mc4/hosted-workflows"
+expect_exit "a listed workflow already placed under .github/workflows passes the existence guard" 0 "$T/mc4/scripts/equivalence.sh" "$T/m4" "$T/mc4"
 
 echo "overlay tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -1,12 +1,7 @@
-# Paths that belong to this private repo (#1056). sync-from-public.sh copies
-# them from a public checkout. Interim copy: once the public repo has
-# scripts/ci/private-paths.txt, sync-from-public.sh reads that one instead.
-#
-# One path per line, relative to the repo root: a directory or a file.
-# Blank lines and # comments are ignored. No root-level files.
-# Source: the approved boundary (Private Repo Boundary, artifact HHdMxQRjp1R2SPWh).
-
-# Control plane apps
+# Paths that belong to this repo (#1056). Written by scripts/sync-from-public.sh
+# from public's scripts/ci/private-paths.txt at 662f977a50cda623a67aadf09904d5b57bdb353c. The overlay reads
+# public's list while the pinned tree has one and this file after public's
+# delete. One path per line, a directory or a file; no root-level files.
 apps/admin
 apps/provisioner
 apps/provisioning
@@ -14,88 +9,80 @@ apps/scheduler
 apps/dispatch
 apps/inventory
 apps/platform-db
-
-# Packages. provision goes whole once the bundle builder has moved to a
-# public module (untangle A, branch pl/untangle-bundle).
-packages/gh-oidc
+apps/billing
 packages/provision
-
-# Hosted CLI, red-line, hosted constants, spikes
+packages/gh-oidc
+packages/billing-core
 scripts/hosted
 tests/redline
+scripts/audit
 .github/hosted
 spikes/provapi-staging
-
-# Hosted runbooks
 docs/ops/hosted.md
 docs/ops/redline-signin.md
-
-# Hosted workflows
 .github/workflows/deploy-hosted-platform.yml
-.github/workflows/hosted-publish.yml
 .github/workflows/hosted-floor.yml
+.github/workflows/hosted-publish.yml
 .github/workflows/prod-inspect.yml
+.github/workflows/prod-release-chain.yml
 .github/workflows/prodclean-monitor.yml
 .github/workflows/provapi-staging-spikes.yml
-.github/workflows/redline-staging.yml
 .github/workflows/redline-nightly.yml
+.github/workflows/redline-staging.yml
 .github/workflows/staging-test-admin.yml
-
-# The Provisioning API contract inside @oa/shared. Interim: the untangle
-# carves it into its own private package; then these lines become that
-# package's directory.
-packages/shared/src/provisioning
-packages/shared/src/mocks/provisioning.ts
-packages/shared/test/provisioning
-packages/shared/test/provisioning-alerts.test.ts
-
-# Public-package tests that pin hosted contracts (they move private)
-apps/server/test/node/mcp-sdk-iserror.test.ts
-apps/auth-broker/test/registry-contract.test.ts
-apps/auth-broker/test/platform-ticket.test.ts
-apps/auth-broker/test/node/config.test.ts
-apps/directory-broker/test/node/config.test.ts
-
-# scripts/ci: hosted release, signing, publish, gates
+.github/workflows/staging-test-member.yml
+.github/workflows/token-ping-prod.yml
+.github/workflows/token-ping.yml
 scripts/ci/assemble-release.mjs
 scripts/ci/build-hosted-release.ts
+scripts/ci/chain-dispatch.test.ts
+scripts/ci/chain-dispatch.ts
 scripts/ci/check-hosted-release.ts
-scripts/ci/sign-release.mjs
-scripts/ci/sign-floor.mjs
-scripts/ci/release-artifact.mjs
-scripts/ci/release-pubkeys.mjs
+scripts/ci/deploy-hosted-platform-workflow.test.ts
+scripts/ci/deploy-token-expiry.sh
+scripts/ci/deploy-token-expiry.test.ts
+scripts/ci/deploy-token-identity.sh
+scripts/ci/deploy-token-identity.test.ts
 scripts/ci/hosted-cf.sh
+scripts/ci/hosted-ci-lookups.test.ts
 scripts/ci/hosted-constants.sh
+scripts/ci/hosted-constants.test.ts
 scripts/ci/hosted-floor-fetch.sh
 scripts/ci/hosted-publish-resolve.sh
-scripts/ci/hosted-r2-key.sh
-scripts/ci/hosted-resource-ids.sh
-scripts/ci/platform-tags.sh
-scripts/ci/prod-inspect.sh
-scripts/ci/provapi-spikes.sh
-scripts/ci/provapi-token-verify.sh
-scripts/ci/redline-nightly.ts
-scripts/ci/staging-first-gate.sh
-scripts/ci/tag-passed-checks.sh
-scripts/ci/deploy-token-expiry.sh
-scripts/ci/deploy-hosted-platform-workflow.test.ts
-scripts/ci/deploy-token-expiry.test.ts
-scripts/ci/hosted-ci-lookups.test.ts
-scripts/ci/hosted-constants.test.ts
-scripts/ci/hosted-publish.test.ts
 scripts/ci/hosted-publish-workflow.test.ts
+scripts/ci/hosted-publish.test.ts
+scripts/ci/hosted-r2-key.sh
 scripts/ci/hosted-release.test.ts
+scripts/ci/hosted-workflow-rules.test.ts
+scripts/ci/hosted-resource-ids.sh
+scripts/ci/owner-email-guard-hosted.test.ts
+scripts/ci/platform-tags.sh
 scripts/ci/platform-tags.test.ts
-scripts/ci/prod-inspect.test.ts
 scripts/ci/prod-inspect-workflow.test.ts
+scripts/ci/prod-inspect.sh
+scripts/ci/prod-inspect.test.ts
+scripts/ci/prod-release-chain.test.ts
+scripts/ci/prod-release-chain.ts
+scripts/ci/provapi-spikes.sh
 scripts/ci/provapi-spikes.test.ts
+scripts/ci/provapi-token-verify.sh
 scripts/ci/redline-nightly.test.ts
+scripts/ci/redline-nightly.ts
 scripts/ci/redline-staging.test.ts
+scripts/ci/release-artifact.mjs
+scripts/ci/release-pubkeys.mjs
+scripts/ci/sign-floor.mjs
+scripts/ci/sign-release.mjs
+scripts/ci/staging-first-gate.sh
 scripts/ci/staging-first-gate.test.ts
+scripts/ci/staging-smoke-gate.sh
+scripts/ci/staging-smoke-gate.test.ts
+scripts/ci/strict-signature-call-sites.test.ts
+scripts/ci/tag-passed-checks.sh
 scripts/ci/tag-passed-checks.test.ts
-
-# scripts/ops: hosted platform deploy and admin. The staging, landing and
-# prod-token checkers stay public.
+scripts/ci/token-ping.sh
+scripts/ci/token-ping.test.ts
+scripts/ci/worker-tag.sh
 scripts/ops/broker-key.ts
 scripts/ops/check-migration-lock.mjs
 scripts/ops/check-migration-lock.test.ts
@@ -107,10 +94,12 @@ scripts/ops/hosted-set-signing-key.sh
 scripts/ops/hosted-set-signing-key.test.ts
 scripts/ops/hosted-zones.sh
 scripts/ops/hosted-zones.test.ts
-scripts/ops/platform-db.ts
 scripts/ops/platform-db.test.ts
-scripts/ops/staging-test-admin.ts
+scripts/ops/platform-db.ts
 scripts/ops/staging-test-admin.test.ts
-scripts/ops/wrangler-env.ts
-scripts/ops/wrangler-env.test.ts
+scripts/ops/staging-test-admin.ts
+scripts/ops/staging-test-member.test.ts
+scripts/ops/staging-test-member.ts
 scripts/ops/testdata
+scripts/ops/wrangler-env.test.ts
+scripts/ops/wrangler-env.ts

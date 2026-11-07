@@ -36,19 +36,22 @@
 # present means pre-split, none present means strict, some present fails (a
 # half-deleted pin is neither). An unreadable or empty list fails too.
 #
+# The two flags are exclusive: together they exit 2.
+#
 # Exit 0 on success, 1 on a rule failure, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "overlay: $*" >&2; exit 1; }
 # This repo's tooling, directly in scripts/. Rule 5: it never overlays.
-TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh "
+TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh place-workflows.sh pin-check.sh listed-present.sh "
 usage() { echo "usage: overlay.sh [--pre-split | --auto-split] <public-checkout-dir> <private-dir>" >&2; exit 2; }
+usage_both() { echo "overlay: --pre-split and --auto-split are exclusive (auto decides pre-split itself)" >&2; usage; }
 pre_split=no
 args=()
 for a in "$@"; do
   case "$a" in
-    --pre-split) pre_split=yes ;;
-    --auto-split) pre_split=auto ;;
+    --pre-split) [ "$pre_split" != auto ] || usage_both; pre_split=yes ;;
+    --auto-split) [ "$pre_split" != yes ] || usage_both; pre_split=auto ;;
     -*) usage ;;
     *) args+=("$a") ;;
   esac
@@ -128,29 +131,30 @@ done < "$list"
 
 # --- --pre-split: remove the hosted paths from the public checkout ---------
 if [ "$pre_split" != no ]; then
+  flag=--pre-split; [ "$pre_split" != auto ] || flag=--auto-split
   if [ -f "$PUB/scripts/ci/private-paths.txt" ]; then
     plist="$PUB/scripts/ci/private-paths.txt"
   else
     plist="$PRIV/private-paths.txt"
   fi
-  [ -f "$plist" ] || die "--pre-split: no path list: $plist"
+  [ -f "$plist" ] || die "$flag: no path list: $plist"
   rm_paths=()
   while IFS= read -r line || [ -n "$line" ]; do
     p=${line%%#*}
     p=$(printf '%s' "$p" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
     [ -n "$p" ] || continue
     p=${p%/}
-    printf '%s' "$p" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._/-]*$' || die "--pre-split: unsafe path in list: '$p'"
+    printf '%s' "$p" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._/-]*$' || die "$flag: unsafe path in list: '$p'"
     case "/$p/" in
-      */../* | */./*) die "--pre-split: unsafe path in list: '$p'" ;;
+      */../* | */./*) die "$flag: unsafe path in list: '$p'" ;;
     esac
     case "$p" in
       */*) ;;
-      *) die "--pre-split: root-level entry in list: $p" ;;
+      *) die "$flag: root-level entry in list: $p" ;;
     esac
     rm_paths+=("$p")
   done < "$plist"
-  [ "${#rm_paths[@]}" -gt 0 ] || die "--pre-split: path list is empty: $plist"
+  [ "${#rm_paths[@]}" -gt 0 ] || die "$flag: path list is empty: $plist"
   if [ "$pre_split" = auto ]; then
     present=0
     for p in "${rm_paths[@]}"; do
@@ -162,7 +166,7 @@ if [ "$pre_split" != no ]; then
     elif [ "$present" -eq "${#rm_paths[@]}" ]; then
       echo "overlay: --auto-split: all ${#rm_paths[@]} listed path(s) are in public: pre-split mode"
     else
-      die "--auto-split: $present of ${#rm_paths[@]} listed path(s) are in public; a half-deleted pin, refusing (list: $plist)"
+      die "$flag: $present of ${#rm_paths[@]} listed path(s) are in public; a half-deleted pin, refusing (list: $plist)"
     fi
   fi
 fi
@@ -172,17 +176,17 @@ if [ "$pre_split" != no ] && [ "$pre_split" != strict ]; then
   for p in "${rm_paths[@]}"; do
     d=$(dirname "$p")
     while [ "$d" != "." ]; do
-      [ ! -L "$PUB/$d" ] || die "--pre-split: $d is a symlink in the public checkout; refusing to remove $p through it"
+      [ ! -L "$PUB/$d" ] || die "$flag: $d is a symlink in the public checkout; refusing to remove $p through it"
       d=$(dirname "$d")
     done
   done
   for p in "${rm_paths[@]}"; do
     if [ -e "$PUB/$p" ] || [ -L "$PUB/$p" ]; then
-      rm -rf -- "${PUB:?}/$p" || die "--pre-split: cannot remove $p"
+      rm -rf -- "${PUB:?}/$p" || die "$flag: cannot remove $p"
       removed=$((removed + 1))
     fi
   done
-  echo "overlay: --pre-split: removed $removed of ${#rm_paths[@]} listed path(s) from public ($plist)"
+  echo "overlay: $flag: removed $removed of ${#rm_paths[@]} listed path(s) from public ($plist)"
 fi
 
 # --- Rule 2: collisions, all reported, before any copy -----------------------

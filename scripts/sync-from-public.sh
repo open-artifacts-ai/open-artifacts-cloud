@@ -19,6 +19,16 @@
 # schedule or on workflow_run, and must not start in this repo before the
 # cut-over; the cut-over PR moves them into .github/workflows/ by hand.
 #
+# CLOUD owns the private paths after the first sync (README, "CLOUD owns the
+# private paths"). So a later sync refuses to overwrite a listed path that
+# differs here from public's copy at the SYNCED_FROM commit: that is a CLOUD
+# change the sync would destroy. Port public's fix by hand instead (README,
+# "Hand-porting a public fix"). The first sync, with no SYNCED_FROM, has
+# nothing to protect.
+#
+# When the path list is public's, the sync also rewrites this repo's
+# private-paths.txt from it, so the fallback list cannot go stale.
+#
 # Refuses: a dirty public checkout, a listed path public doesn't have, a list
 # entry that is absolute, has "..", is a root-level file, is
 # .github/workflows itself or is under hosted-workflows/, and (when
@@ -90,8 +100,70 @@ if git -C "$DEST" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
 $pending"
 fi
 
+# --- CLOUD owns the private paths: refuse to destroy its changes ------------
+if [ ! -e "$DEST/SYNCED_FROM" ] && [ ! -L "$DEST/SYNCED_FROM" ]; then
+  # A first sync has nothing to protect only if no listed path is here yet.
+  # Without SYNCED_FROM the clobber guard cannot tell CLOUD edits from a first
+  # sync, so a tree that already holds listed paths is refused.
+  held=$(for dp in "${dpaths[@]}"; do if [ -e "$DEST/$dp" ] || [ -L "$DEST/$dp" ]; then echo "$dp"; fi; done)
+  [ -z "$held" ] || die "SYNCED_FROM is missing from $DEST but it already holds listed paths (a re-sync would destroy CLOUD edits):
+$(printf '%s\n' "$held" | sed 's/^/  /')
+Restore SYNCED_FROM (it is required once synced); never sync over an existing tree without it."
+fi
+if [ -e "$DEST/SYNCED_FROM" ] || [ -L "$DEST/SYNCED_FROM" ]; then
+  old=$(sed -n 's/^sha=//p' "$DEST/SYNCED_FROM")
+  printf '%s' "$old" | grep -Eq '^[0-9a-f]{40}$' || die "SYNCED_FROM in $DEST has no full sha: '$old'"
+  git -C "$PUB" cat-file -e "$old^{commit}" 2> /dev/null || die "public checkout has no commit $old (the SYNCED_FROM of $DEST); fetch full history"
+  exp=$(mktemp -d) || die "mktemp failed"
+  trap 'rm -rf "$exp"' EXIT
+  execs() { (cd "$1" && find . -type f -perm /111 -print | LC_ALL=C sort); }
+  oldlist=$(git -C "$PUB" show "$old:scripts/ci/private-paths.txt" 2> /dev/null | tr -d '\r' | sed 's/#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//; s|/$||' | grep -v '^$' || true)
+  old_listed() { # dest path: was its public path in public's list at SYNCED_FROM?
+    local j
+    for j in "${!dpaths[@]}"; do
+      [ "${dpaths[$j]}" = "$1" ] || continue
+      printf '%s\n' "$oldlist" | grep -qxF -- "${paths[$j]}" && return 0
+    done
+    return 1
+  }
+  changed=()
+  for i in "${!paths[@]}"; do
+    p=${paths[$i]} dp=${dpaths[$i]}
+    if [ -n "$(git -C "$PUB" ls-tree --name-only "$old" -- "$p")" ]; then
+      git -C "$PUB" archive "$old" -- "$p" | tar -C "$exp" -xf - || die "cannot export $p at $old"
+      if [ "$dp" != "$p" ]; then
+        mkdir -p "$exp/$(dirname "$dp")" || die "cannot map $p"
+        mv "$exp/$p" "$exp/$dp" || die "cannot map $p"
+      fi
+    fi
+    if [ ! -e "$exp/$dp" ] && [ ! -L "$exp/$dp" ]; then
+      # Public had nothing here at the old sync: anything here is CLOUD's.
+      if [ -e "$DEST/$dp" ] || [ -L "$DEST/$dp" ]; then changed+=("$dp"); fi
+    elif [ ! -e "$DEST/$dp" ] && [ ! -L "$DEST/$dp" ]; then
+      changed+=("$dp")
+    elif ! diff -rq --no-dereference -x node_modules -x .git "$exp/$dp" "$DEST/$dp" > /dev/null 2>&1; then
+      changed+=("$dp")
+    elif [ -d "$exp/$dp" ] && [ -n "$(comm -3 <(execs "$exp/$dp") <(execs "$DEST/$dp"))" ]; then
+      changed+=("$dp")
+    elif [ -f "$exp/$dp" ] && [ "$([ -x "$exp/$dp" ] && echo x)" != "$([ -x "$DEST/$dp" ] && echo x)" ]; then
+      changed+=("$dp")
+    fi
+  done
+  if [ "${#changed[@]}" -gt 0 ]; then
+    echo "sync: these listed paths in $DEST differ from public's copy at SYNCED_FROM ($old):" >&2
+    for c in "${changed[@]}"; do
+      if [ ! -e "$DEST/$c" ] && [ ! -L "$DEST/$c" ] && ! old_listed "$c"; then
+        echo "  $c (newly listed since SYNCED_FROM; this tree has none of it. Port it by hand.)" >&2
+      else
+        echo "  $c" >&2
+      fi
+    done
+    die "refusing to overwrite CLOUD-owned changes. Hand-port the public fix instead (README, \"Hand-porting a public fix\")."
+  fi
+fi
+
 files=$(mktemp) || die "mktemp failed"
-trap 'rm -f "$files"' EXIT
+trap 'rm -f "$files"; rm -rf "${exp:-}"' EXIT
 for p in "${paths[@]}"; do
   n=$(git -C "$PUB" ls-files -- "$p" | tee -a "$files" | grep -c '')
   [ "$n" -gt 0 ] || die "public has no tracked files at $p ($src_sha)"
@@ -101,7 +173,7 @@ for p in "${dpaths[@]}"; do
   rm -rf "${DEST:?}/$p" || die "cannot clear $DEST/$p"
 done
 plain=$(mktemp) || die "mktemp failed"
-trap 'rm -f "$files" "$plain"' EXIT
+trap 'rm -f "$files" "$plain"; rm -rf "${exp:-}"' EXIT
 grep -v "^\\.github/workflows/" "$files" > "$plain"
 if [ -s "$plain" ]; then
   tar -C "$PUB" -cf - -T "$plain" | tar -C "$DEST" -xf - || die "copy failed"
@@ -112,6 +184,18 @@ while IFS= read -r f; do
   cp -P "$PUB/$f" "$DEST/$d" || die "copy failed: $f"
   echo "sync: $f -> $d (inert until the cut-over)"
 done < <(grep "^\\.github/workflows/" "$files")
+
+# The fallback list follows public's, so it cannot go stale (pin-check.sh
+# compares them).
+if [ "$list_name" != private-paths.txt ]; then
+  {
+    echo "# Paths that belong to this repo (#1056). Written by scripts/sync-from-public.sh"
+    echo "# from public's scripts/ci/private-paths.txt at $src_sha. The overlay reads"
+    echo "# public's list while the pinned tree has one and this file after public's"
+    echo "# delete. One path per line, a directory or a file; no root-level files."
+    printf '%s\n' "${paths[@]}"
+  } > "$DEST/private-paths.txt" || die "cannot write private-paths.txt"
+fi
 
 {
   echo "# Written by scripts/sync-from-public.sh: the public commit the private"

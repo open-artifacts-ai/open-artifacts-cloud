@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # equivalence.sh <public-checkout-dir> [<private-dir>]
 #
-# Proves the pre-split overlay reproduces public. With S the commit in
-# SYNCED_FROM, it builds overlay(PUB@S minus the private paths, this repo)
-# in a temp dir and diffs that tree against PUB@S. Any difference outside
-# ALLOW below fails: a file the sync dropped, or one this repo added.
+# Proves this repo changes nothing outside its private paths. With S the
+# commit in SYNCED_FROM, it builds overlay(PUB@S minus the private paths, this
+# repo) in a temp dir and diffs that tree against PUB@S.
+#
+# Decision (README, "CLOUD owns the private paths"): after the one-time sync
+# (B1) this repo owns the private paths and edits them (C1 renames repo pins
+# inside them), so they are NOT compared to PUB@S. Every other path stays
+# strict: any difference outside the private paths and ALLOW below fails, a
+# non-private file the overlay dropped, added or changed. The private paths are
+# the list the overlay used (public's at S, else this repo's). The lockfile
+# is still checked importer by importer.
 #
 # Hosted workflows are parked in hosted-workflows/ (inert) until the cut-over;
 # the check moves them to .github/workflows/ in the temp tree, as the
@@ -36,6 +43,10 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 PRIV=$(cd "${2:-$HERE/..}" 2> /dev/null && pwd) || die "private dir not found: ${2:-$HERE/..}"
 
 if [ ! -e "$PRIV/SYNCED_FROM" ] && [ ! -L "$PRIV/SYNCED_FROM" ]; then
+  held=$("$HERE/listed-present.sh" "$1" "$PRIV") || die "cannot list present paths"
+  [ -z "$held" ] || die "SYNCED_FROM is missing but this tree holds listed private paths:
+$(printf '%s\n' "$held" | sed 's/^/  /')
+SYNCED_FROM is required once the paths are synced; restore it."
   echo "equivalence: SKIPPED: no SYNCED_FROM in $PRIV, so no sync has happened and this repo holds no private paths yet. The check runs once SYNCED_FROM exists."
   exit 0
 fi
@@ -70,20 +81,9 @@ printf 'tag=%s\nsha=%s\n' "$tag" "$sha" > "$priv/PUBLIC_PIN"
 
 "$HERE/overlay.sh" --pre-split "$work" "$priv" || die "overlay --pre-split failed"
 
-# What the cut-over does: parked hosted workflows go live. A file whose
-# target already exists (public's ci.yml, say) is a failure, not a difference.
-if [ -L "$priv/hosted-workflows" ]; then die "hosted-workflows is a symlink"; fi
-if [ -d "$priv/hosted-workflows" ]; then
-  mkdir -p "$work/.github/workflows" || exit 2
-  while IFS= read -r -d '' f; do
-    f=${f#./}
-    if [ -e "$work/.github/workflows/$f" ] || [ -L "$work/.github/workflows/$f" ]; then
-      die "hosted-workflows/$f would overwrite .github/workflows/$f"
-    fi
-    mkdir -p "$work/.github/workflows/$(dirname "$f")" || exit 2
-    cp -P -p "$priv/hosted-workflows/$f" "$work/.github/workflows/$f" || die "cannot move hosted-workflows/$f"
-  done < <(cd "$priv/hosted-workflows" && find . \( -type f -o -type l \) -print0)
-fi
+# What the cut-over does: parked hosted workflows go live (the shared helper
+# CI uses too). A target that already exists is a failure, not a difference.
+"$HERE/place-workflows.sh" "$priv" "$work" > /dev/null || die "cannot place hosted workflows (place-workflows.sh)"
 
 # The private path list the overlay used (public's at S, else this repo's).
 if [ -f "$ref/scripts/ci/private-paths.txt" ]; then plist="$ref/scripts/ci/private-paths.txt"; else plist="$priv/private-paths.txt"; fi
@@ -94,7 +94,22 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ -n "$q" ] && private+=("${q%/}")
 done < "$plist"
 
-is_private() { # importer key
+# Every listed path must still exist in CLOUD: at its own path or, for a hosted
+# workflow, under hosted-workflows/ or .github/workflows/. Deletions inside a
+# path stay CLOUD's call. Dropping a whole listed path is not.
+missing=0
+for q in "${private[@]}"; do
+  if [ -e "$PRIV/$q" ] || [ -L "$PRIV/$q" ]; then continue; fi
+  if [[ "$q" == .github/workflows/* ]]; then
+    wf="hosted-workflows/${q#.github/workflows/}"
+    if [ -e "$PRIV/$wf" ] || [ -L "$PRIV/$wf" ]; then continue; fi
+  fi
+  echo "equivalence: DIFF: listed path $q is gone from this repo (CLOUD must keep every listed path)" >&2
+  missing=$((missing + 1))
+done
+[ "$missing" -eq 0 ] || die "$missing listed private path(s) missing from this repo"
+
+is_private() { # importer key or path
   local q
   for q in "${private[@]}"; do
     [ "$1" = "$q" ] && return 0
@@ -141,7 +156,7 @@ allowed() { # path
 
 # Paths that differ, one per line: "Only in", "differ" and type changes.
 diffs=$(cd "$T" && diff -rq --no-dereference -x .git ref work 2>&1)
-bad=0 seen=0
+bad=0 seen=0 owned=0
 while IFS= read -r line; do
   [ -n "$line" ] || continue
   case "$line" in
@@ -156,6 +171,7 @@ while IFS= read -r line; do
       rest=${line#File }; path=${rest%% is *}; path=${path#ref/}; path=${path#work/}; kind="type differs" ;;
     *) echo "equivalence: unreadable diff line: $line" >&2; bad=$((bad + 1)); continue ;;
   esac
+  if is_private "$path"; then owned=$((owned + 1)); continue; fi   # CLOUD-owned
   seen=$((seen + 1))
   if allowed "$path"; then
     if [ "$path" = pnpm-lock.yaml ]; then check_lock || bad=$((bad + 1)); fi
@@ -169,6 +185,7 @@ done <<< "$diffs"
 execs() { (cd "$1" && find . -path ./.git -prune -o -type f -perm /111 -print | sed 's|^\./||' | LC_ALL=C sort); }
 while IFS= read -r path; do
   [ -n "$path" ] || continue
+  is_private "$path" && continue   # CLOUD-owned: its mode is its own
   # Only paths in both trees: others are reported above.
   [ -f "$ref/$path" ] && [ -f "$work/$path" ] || continue
   echo "equivalence: DIFF: $path (executable bit differs)" >&2
@@ -178,4 +195,4 @@ done < <(comm -3 <(execs "$ref") <(execs "$work") | sed 's/^[[:space:]]*//')
 if [ "$bad" -gt 0 ]; then
   die "$bad difference(s) outside the allowlist between overlay and public $tag ($sha)"
 fi
-echo "equivalence: OK: overlay(public@$sha minus private paths, this repo) matches public ($seen allowlisted difference(s))"
+echo "equivalence: OK: overlay(public@$sha minus private paths, this repo) matches public outside the private paths ($seen allowlisted difference(s); $owned CLOUD-owned difference(s) in the ${#private[@]} private path(s) not compared)"
