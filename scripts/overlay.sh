@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# overlay.sh [--pre-split] <public-checkout-dir> <private-dir>
+# overlay.sh [--pre-split | --auto-split] <public-checkout-dir> <private-dir>
 #
 # Builds the hosted workspace: copies this private tree onto a public
 # open-artifacts checkout, so both sides form one pnpm workspace and every
@@ -30,18 +30,25 @@
 # checkout is modified in place: discard it afterwards. Without the flag, a
 # private file that is still in public collides, on purpose.
 #
+# --auto-split: --pre-split while the pinned public tree still holds the
+# hosted paths, strict (collisions fail) once it holds none. Decided from the
+# pinned tree itself, with the same path list as --pre-split: all listed paths
+# present means pre-split, none present means strict, some present fails (a
+# half-deleted pin is neither). An unreadable or empty list fails too.
+#
 # Exit 0 on success, 1 on a rule failure, 2 on bad usage.
 set -uo pipefail
 
 die() { echo "overlay: $*" >&2; exit 1; }
 # This repo's tooling, directly in scripts/. Rule 5: it never overlays.
 TOOLING=" overlay.sh sync-from-public.sh dev-overlay.sh overlay.test.sh ci-plan.sh ci-public-tests.sh equivalence.sh "
-usage() { echo "usage: overlay.sh [--pre-split] <public-checkout-dir> <private-dir>" >&2; exit 2; }
+usage() { echo "usage: overlay.sh [--pre-split | --auto-split] <public-checkout-dir> <private-dir>" >&2; exit 2; }
 pre_split=no
 args=()
 for a in "$@"; do
   case "$a" in
     --pre-split) pre_split=yes ;;
+    --auto-split) pre_split=auto ;;
     -*) usage ;;
     *) args+=("$a") ;;
   esac
@@ -120,7 +127,7 @@ done < "$list"
 [ "$strays" -eq 0 ] || die "$strays unknown file(s) directly in scripts/; nothing was copied"
 
 # --- --pre-split: remove the hosted paths from the public checkout ---------
-if [ "$pre_split" = yes ]; then
+if [ "$pre_split" != no ]; then
   if [ -f "$PUB/scripts/ci/private-paths.txt" ]; then
     plist="$PUB/scripts/ci/private-paths.txt"
   else
@@ -144,6 +151,22 @@ if [ "$pre_split" = yes ]; then
     rm_paths+=("$p")
   done < "$plist"
   [ "${#rm_paths[@]}" -gt 0 ] || die "--pre-split: path list is empty: $plist"
+  if [ "$pre_split" = auto ]; then
+    present=0
+    for p in "${rm_paths[@]}"; do
+      if [ -e "$PUB/$p" ] || [ -L "$PUB/$p" ]; then present=$((present + 1)); fi
+    done
+    if [ "$present" -eq 0 ]; then
+      echo "overlay: --auto-split: none of ${#rm_paths[@]} listed path(s) is in public: strict mode"
+      pre_split=strict
+    elif [ "$present" -eq "${#rm_paths[@]}" ]; then
+      echo "overlay: --auto-split: all ${#rm_paths[@]} listed path(s) are in public: pre-split mode"
+    else
+      die "--auto-split: $present of ${#rm_paths[@]} listed path(s) are in public; a half-deleted pin, refusing (list: $plist)"
+    fi
+  fi
+fi
+if [ "$pre_split" != no ] && [ "$pre_split" != strict ]; then
   removed=0
   # Never remove through a symlinked parent: it could point outside the checkout.
   for p in "${rm_paths[@]}"; do
