@@ -41,7 +41,7 @@ vi.mock("../src/auth/oidc.js", async (orig) => {
   };
 });
 
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const WF = `${REPO}/.github/workflows/redline-staging.yml@refs/heads/main`;
 const BASE = `https://${STAGING_API_HOST}`;
 

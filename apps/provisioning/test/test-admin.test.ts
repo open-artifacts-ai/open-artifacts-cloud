@@ -70,7 +70,7 @@ const TA_OIDC: Principal = {
     actor: "octocat",
     runId: "123456",
     workflowRef:
-      "open-artifacts-ai/open-artifacts/.github/workflows/staging-test-admin.yml@refs/heads/main",
+      "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-admin.yml@refs/heads/main",
   },
 };
 const RL_OIDC: Principal = { ...OIDC_P, oidcWorkflow: "redline" };

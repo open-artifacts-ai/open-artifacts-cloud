@@ -100,7 +100,7 @@ Env: CLOUDFLARE_ACCOUNT_ID (the hosted account id). Output: one JSON line per st
 export const DOMAINS = HOSTED_DOMAINS;
 
 /** The GitHub repo whose releases publish-release downloads. */
-export const REPO = "open-artifacts-ai/open-artifacts";
+export const REPO = "open-artifacts-ai/open-artifacts-cloud";
 
 export const keychainItem = (env: Env) => `oa-hosted-${env}`;
 /** The env's R2 API token (Object Read & Write on oa-<p>-releases only). */

@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFile = promisify(execFileCb);
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const WORKFLOW = "staging-test-admin.yml";
 export const ADMIN_HOST = "admin.open-artifacts-staging.app";
 export const COOKIE = "__Host-oa-admin";

@@ -155,7 +155,7 @@ export const OIDC_P: Principal = {
   kind: "oidc",
   actorKey: "oidc:42",
   rateKey: "oidc:42",
-  label: "open-artifacts-ai/open-artifacts",
+  label: "open-artifacts-ai/open-artifacts-cloud",
   scopes: [],
 };
 export const userP = (sub = "u1", email = "u1@acme.test"): Principal => ({

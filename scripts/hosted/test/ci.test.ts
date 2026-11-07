@@ -195,7 +195,7 @@ describe("prod in CI: credentials from the 0600 files, with the same checks", ()
     expect(await main(STATUS(id, "prod"), w.deps)).toBe(0);
     expect(w.execs.filter((e) => e.file === SECURITY)).toEqual([]);
     expect(w.audit()[0]?.actor).toBe(
-      "https://github.com/open-artifacts-ai/open-artifacts/actions/runs/42",
+      "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/42",
     );
     const out = w.lines.join("\n");
     expect(out).not.toContain(w.fake.token);

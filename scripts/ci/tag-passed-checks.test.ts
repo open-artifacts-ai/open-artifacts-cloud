@@ -9,7 +9,7 @@ import { sandbox, script } from "./stubs.ts";
 const SCRIPT = script("tag-passed-checks.sh");
 const TAG = "v0.80.0";
 const SHA = "c".repeat(40);
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 
 // gh api -X GET <path>: $STATE/<key>.json, or exit 1 when it is missing.
 const gh = `

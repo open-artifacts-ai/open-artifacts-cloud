@@ -2117,7 +2117,7 @@ describe("deploy-hosted-platform.sh", () => {
           expect(ok.err).toBe("");
           expect(ok.code).toBe(0);
           // W8's refs as the Manager approved them (6.3 amended).
-          const base = "open-artifacts-ai/open-artifacts/.github/workflows";
+          const base = "open-artifacts-ai/open-artifacts-cloud/.github/workflows";
           expect(VARS.OIDC_JOB_WORKFLOW_REFS).toBe(
             env === "prod"
               ? `${base}/redline-staging.yml@refs/heads/main,${base}/prodclean-monitor.yml@refs/heads/main`

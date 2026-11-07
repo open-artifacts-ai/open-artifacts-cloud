@@ -26,7 +26,7 @@ export const TEST_USER_DOMAIN = "test.invalid";
  * and nothing else, and no other caller may call R28 (authorize).
  */
 export const TEST_ADMIN_WORKFLOW_REF =
-  "open-artifacts-ai/open-artifacts/.github/workflows/staging-test-admin.yml@refs/heads/main";
+  "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-admin.yml@refs/heads/main";
 
 /**
  * The one workflow whose JWT may take the staging test member's credentials
@@ -35,11 +35,11 @@ export const TEST_ADMIN_WORKFLOW_REF =
  * and sealed results are its own (actorKey `oidc:<repository_id>:test-member`).
  */
 export const TEST_MEMBER_WORKFLOW_REF =
-  "open-artifacts-ai/open-artifacts/.github/workflows/staging-test-member.yml@refs/heads/main";
+  "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-member.yml@refs/heads/main";
 
 /** Red-line's workflow (redline-staging.yml): the rl- test installs' scope. */
 export const REDLINE_WORKFLOW_REF =
-  "open-artifacts-ai/open-artifacts/.github/workflows/redline-staging.yml@refs/heads/main";
+  "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main";
 
 /**
  * Each pinned workflow's scope. A JWT whose job_workflow_ref is in

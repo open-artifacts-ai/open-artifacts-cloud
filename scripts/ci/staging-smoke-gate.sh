@@ -8,7 +8,7 @@
 # not at or after the tag is exit 1.
 #
 # The run it reads is the newest deploy-staging.yml run on main of any
-# status: event push, head_branch main, of this repository, newest by when
+# status: event push, head_branch main, of the public repository, newest by when
 # its latest attempt started (run_started_at, so a re-run of an older run,
 # which puts older code on staging, counts as the newest, and a red run being
 # re-run is never passed over for an older green one).
@@ -29,7 +29,7 @@
 # by creation, newest first). A re-run of a run older than those 100 is then
 # missed: the gate reads the newest of the 100 instead, which can pass while
 # staging runs the re-run's older code. If the page holds no push run on main
-# of this repository, it refuses ("no run").
+# of the public repository, it refuses ("no run").
 # Usage: scripts/ci/staging-smoke-gate.sh vX.Y.Z
 set -euo pipefail
 
@@ -37,8 +37,11 @@ set -euo pipefail
 tag="$1"
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must be a stable vX.Y.Z" >&2; exit 2; }
 : "${GH_TOKEN:?GH_TOKEN is required}"
-: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-R="repos/$GITHUB_REPOSITORY"
+# deploy-staging.yml is the public repo's self-host staging smoke, so every read
+# here is of the public repo, not of $GITHUB_REPOSITORY (the cloud repo, where
+# this runs). PUBLIC_REPO overrides it for tests and forks.
+PUBLIC_REPO="${PUBLIC_REPO:-open-artifacts-ai/open-artifacts}"
+R="repos/$PUBLIC_REPO"
 
 fail() { echo "staging smoke: $1; prod waits until the newest deploy-staging.yml run on main is at or after $tag and passed its smoke job (re-run deploy-staging.yml on main if its last run was cancelled or flaked)" >&2; exit 1; }
 # api <what> <path>: the JSON body, or fail naming what was read.
@@ -53,7 +56,7 @@ sha="$(api "the commit of $tag" "$R/commits/$tag" | jq -r '.sha // ""')"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "no commit for $tag"
 
 runs="$(api "deploy-staging.yml runs" "$R/actions/workflows/deploy-staging.yml/runs?branch=main&event=push&per_page=100")"
-run="$(jq -r --arg repo "$GITHUB_REPOSITORY" '
+run="$(jq -r --arg repo "$PUBLIC_REPO" '
   if (.workflow_runs | type) != "array" then error("no runs") else . end
   | [.workflow_runs[]
     | select(.head_branch == "main" and .event == "push")

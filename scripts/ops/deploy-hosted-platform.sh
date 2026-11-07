@@ -617,7 +617,7 @@ case "$target" in
     # The refs (design v7 6.3, amended): full refs on main, exactly W8's
     # committed list. Prod's adds the monitor's (POST /prodclean). The tag's
     # committed list must equal it before deploying; the deployed one after.
-    base="open-artifacts-ai/open-artifacts/.github/workflows"
+    base="open-artifacts-ai/open-artifacts-cloud/.github/workflows"
     refs_want="$base/redline-staging.yml@refs/heads/main"
     [ "$env" = staging ] || refs_want="$refs_want,$base/prodclean-monitor.yml@refs/heads/main"
     refs_committed="$(ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" committed inventory vars | jq -r '.OIDC_JOB_WORKFLOW_REFS // empty')" || refs_committed=""

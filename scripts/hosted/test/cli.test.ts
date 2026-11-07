@@ -212,7 +212,7 @@ describe("token source", () => {
     expect(await main(STATUS(id), w.deps)).toBe(0);
     expect(w.execs.filter((e) => /security/.test(e.file))).toEqual([]);
     expect(w.audit()[0]?.actor).toBe(
-      "https://github.com/open-artifacts-ai/open-artifacts/actions/runs/42",
+      "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/42",
     );
   });
 
@@ -420,7 +420,7 @@ describe("commands", () => {
       "download",
       "v0.30.0",
       "--repo",
-      "open-artifacts-ai/open-artifacts",
+      "open-artifacts-ai/open-artifacts-cloud",
       "--pattern",
       "oa-release-staging-*",
       "--dir",

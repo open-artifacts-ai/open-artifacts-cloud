@@ -1,6 +1,6 @@
 # Publishes signed releases (and floors) to each env's releases bucket,
 # oa-<p>-releases (design v7 6.4): the only CI step on the provisioning path.
-# After every release-please run on main (not cancelled; the release gate
+# After every hosted-release run on main (not cancelled; the release gate
 # decides, so an npm-only failure does not block), the release whose tag's
 # commit is that run's head goes to staging, then prod; most runs cut no
 # release and publish nothing. By hand (workflow_dispatch on main): a tag
@@ -13,9 +13,13 @@
 # create-only and record.sig.json last; `publish-floor` verifies the floor.
 name: hosted-publish
 
+# The trigger is the hosted-release workflow of this repo (cut-over step C3,
+# not here yet): workflow_run cannot cross repositories, so the public
+# repo's release-please can no longer start it. Until hosted-release exists
+# nothing triggers this by itself; dispatch by hand.
 on:
   workflow_run:
-    workflows: [release-please]
+    workflows: [hosted-release]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -36,6 +40,12 @@ on:
         required: false
         default: ""
         type: string
+
+# The public repo: the release and smoke gates read its releases, its tag
+# commit, its release-please run and its deploy-staging.yml smoke from here;
+# everything hosted (jobs, assets, red-line runs) is this repo's own.
+env:
+  PUBLIC_REPO: open-artifacts-ai/open-artifacts
 
 permissions: {}
 
@@ -85,7 +95,7 @@ jobs:
     if: ${{ needs.resolve.outputs.staging == 'true' }}
     runs-on: ubuntu-latest
     environment: hosted-staging-deploy
-    # actions: read lets the release gate read release-please's run and jobs,
+    # actions: read lets the release gate read the release workflows' runs and jobs,
     # and the floor fetch read and download the hosted-floor run.
     permissions:
       contents: read
@@ -99,10 +109,13 @@ jobs:
         env:
           REF: ${{ github.ref }}
         run: test "$REF" = refs/heads/main
+      # main, overlaid on the public tree at PUBLIC_PIN.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.sha }}
+          path: _cloud
           persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -185,10 +198,13 @@ jobs:
         env:
           REF: ${{ github.ref }}
         run: test "$REF" = refs/heads/main
+      # main, overlaid on the public tree at PUBLIC_PIN.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.sha }}
+          path: _cloud
           persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

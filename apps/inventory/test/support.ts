@@ -5,7 +5,7 @@ import type { Verify } from "../src/auth.ts";
 import { type Env, makeWorker } from "../src/index.ts";
 import { REQUIRED_TABLES, SCHEMA_SQL } from "../src/schema.ts";
 
-export const REPO = "open-artifacts-ai/open-artifacts";
+export const REPO = "open-artifacts-ai/open-artifacts-cloud";
 export const WF = `${REPO}/.github/workflows`;
 export const MONITOR = `${WF}/prodclean-monitor.yml@refs/heads/main`;
 export const REDLINE = `${WF}/redline-staging.yml@refs/heads/main`;

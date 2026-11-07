@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { type Exec, plan, ranArtifact, report } from "./redline-nightly.ts";
 
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const NOW = Date.parse("2026-11-03T03:17:00Z");
 const hoursAgo = (h: number) => new Date(NOW - h * 3_600_000).toISOString();
 const TAG = "v0.99.0";
@@ -244,8 +244,11 @@ describe("redline-nightly.yml", () => {
   // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
   const w: any = parse(text);
 
-  it("runs on a schedule only: a manual run would fire P30's alert", () => {
-    expect(Object.keys(w.on)).toEqual(["schedule"]);
+  // Until cut-over step F5 (#1056) the schedule is off here, so the public
+  // repo's copy is the only one running it. A manual run here is not a
+  // scheduled run: it would run P30 and fire its alert, so do not dispatch it.
+  it("has no schedule yet (F5); dispatch only", () => {
+    expect(Object.keys(w.on)).toEqual(["workflow_dispatch"]);
     expect(w.permissions).toEqual({});
   });
 

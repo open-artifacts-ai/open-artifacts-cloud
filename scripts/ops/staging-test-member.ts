@@ -20,7 +20,7 @@ import { promisify } from "node:util";
 import { openSealedNode } from "./staging-test-admin.ts";
 
 const execFile = promisify(execFileCb);
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 export const WORKFLOW = "staging-test-member.yml";
 /** The one install this signs in to; the workflow checks R2 says the same. */
 export const APP_HOST = "rl-agents.open-artifacts-staging.app";
