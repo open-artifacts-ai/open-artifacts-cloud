@@ -1,6 +1,8 @@
 // T3b: the hosted release jobs in release-please.yml (guard, build, check,
 // sign and attach per env) and hosted-floor.yml. The signing key never
 // shares a job with installed code.
+
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -31,8 +33,10 @@ const stepsOf = (wf: any, job: string): Step[] => wf.jobs[job].steps;
 const steps = (job: string) => stepsOf(w, job);
 const needs = (job: string): string[] => [w.jobs[job].needs ?? []].flat();
 const runOf = (st: Step[]) => st.map((s) => s.run ?? "").join("\n");
+const APP_TOKEN =
+  "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
 const SHA_PIN =
-  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node)|pnpm\/action-setup)@[0-9a-f]{40}$/;
+  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node|create-github-app-token)|pnpm\/action-setup)@[0-9a-f]{40}$/;
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
 const GUARD_SHA = "${{ needs.hosted-guard.outputs.sha }}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
@@ -661,5 +665,370 @@ describe("build-release-bundle.ts", () => {
     expect(src).toContain("--variant");
     expect(src).toMatch(/"release"/);
     expect(src).toMatch(/"redline"/);
+  });
+});
+
+// #1056 C3: hosted-release.yml in this repo, the hosted release jobs moved out
+// of the public repo's release-please.yml. Same rules, on the overlay tree.
+describe("hosted-release.yml (the cloud repo's hosted release)", () => {
+  const src = read(".github/workflows/hosted-release.yml");
+  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+  const hr: any = parse(src);
+  const jobs: Record<string, Step> = hr.jobs;
+  const JOBS = [
+    "mirror",
+    "hosted-guard",
+    "hosted-build",
+    "hosted-check",
+    "hosted-sign-staging",
+    "hosted-sign-prod",
+    "hosted-attach-staging",
+    "hosted-attach-prod",
+    "hosted-dry-run",
+  ];
+  const needsOf = (j: string): string[] => [jobs[j].needs ?? []].flat();
+  const allSteps = (j: string): Step[] => jobs[j].steps;
+  const PUB_COMMIT = "${{ needs.hosted-guard.outputs.public_sha }}";
+
+  it("has exactly the mirror and the moved hosted jobs", () => {
+    expect(Object.keys(jobs)).toEqual(JOBS);
+  });
+
+  it("is dispatch only, with dry_run a boolean defaulting to true (the push trigger is F2)", () => {
+    expect(Object.keys(hr.on)).toEqual(["workflow_dispatch"]);
+    const input = hr.on.workflow_dispatch.inputs;
+    expect(Object.keys(input)).toEqual(["dry_run"]);
+    expect(input.dry_run.type).toBe("boolean");
+    expect(input.dry_run.default).toBe(true);
+    expect(hr.permissions).toEqual({});
+  });
+
+  it("names a dry run '(dry run)', the name tag-passed-checks.sh skips", () => {
+    expect(hr["run-name"]).toContain("inputs.dry_run");
+    expect(hr["run-name"]).toContain("(dry run)");
+    expect(read("scripts/ci/tag-passed-checks.sh")).toContain('"(dry run)"');
+  });
+
+  it("job ids are the names tag-passed-checks.sh requires", () => {
+    const gate = read("scripts/ci/tag-passed-checks.sh");
+    for (const j of [
+      "mirror",
+      "hosted-guard",
+      "hosted-build",
+      "hosted-check",
+      "hosted-sign-$env",
+      "hosted-attach-$env",
+    ])
+      expect(gate).toContain(j);
+    for (const j of JOBS) expect(jobs[j].name).toBeUndefined();
+  });
+
+  it("chains guard to build to check to sign to attach, behind the mirror", () => {
+    expect(needsOf("mirror")).toEqual([]);
+    expect(needsOf("hosted-guard")).toEqual(["mirror"]);
+    expect(needsOf("hosted-build")).toEqual(["hosted-guard"]);
+    expect(needsOf("hosted-check")).toEqual(["hosted-guard", "hosted-build"]);
+    for (const e of ENVS) {
+      expect(needsOf(`hosted-sign-${e}`)).toEqual([
+        "hosted-guard",
+        "hosted-build",
+        "hosted-check",
+      ]);
+      expect(needsOf(`hosted-attach-${e}`)).toEqual([
+        "hosted-guard",
+        "hosted-build",
+        "hosted-check",
+        `hosted-sign-${e}`,
+      ]);
+    }
+  });
+
+  it("the mirror mints the release App token, only outside a dry run", () => {
+    const st = allSteps("mirror");
+    const app = st.find((s) => s.id === "app") as Step;
+    expect(app.uses).toBe(APP_TOKEN);
+    expect(app.with).toEqual({
+      "app-id": "${{ secrets.RELEASE_APP_ID }}",
+      "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+    });
+    expect(app.if).toBe("${{ !inputs.dry_run }}");
+    const create = st.find((s) => s.name === "Create the tag and the release");
+    expect(create?.if).toBe("${{ !inputs.dry_run }}");
+    expect(create?.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    // The read step uses GITHUB_TOKEN and cannot create anything.
+    const reads = st.find((s) =>
+      /published, on public main/.test(s.name ?? ""),
+    );
+    expect(reads?.env.GH_TOKEN).toBe("${{ github.token }}");
+    expect(reads?.run).not.toMatch(/-X POST|release create|--method/);
+    // Only the create step writes, and only after the checks.
+    for (const s of st)
+      if (s !== create)
+        expect(s.run ?? "").not.toMatch(/git\/refs|release create/);
+    expect(st.indexOf(create as Step)).toBeGreaterThan(
+      st.indexOf(reads as Step),
+    );
+    // A real run needs main.
+    expect(jobs.mirror.if).toContain("github.ref == 'refs/heads/main'");
+    expect(jobs.mirror.permissions).toEqual({
+      contents: "read",
+      actions: "read",
+    });
+    expect(jobs.mirror.environment).toBeUndefined();
+  });
+
+  it("the mirror checks the public release before any tag", () => {
+    const run = runOf(allSteps("mirror"));
+    expect(run).toContain("prerelease");
+    expect(run).toContain("compare/$main_sha...$PUB_SHA");
+    expect(run).toContain("release-please.yml/runs");
+    for (const j of ["release-please", "verify-release"])
+      expect(run).toContain(j);
+    expect(run).toContain("package.json?ref=$PUB_SHA");
+    // The tag it creates is this repo's commit, which must be main's head.
+    expect(run).toContain('[ "$main_sha" = "$SHA" ]');
+  });
+
+  // Runs the real create step with a fake gh. A re-run after main moved must
+  // not fail (the tag cannot be changed, so a stuck release is permanent).
+  describe("create step behavior", () => {
+    const MAIN = "b".repeat(40);
+    const X = "a".repeat(40);
+    function runCreate(o: {
+      tagAt?: string;
+      main: string;
+      compare: string;
+      sha: string;
+    }) {
+      const dir = mkdtempSync(join(tmpdir(), "relcreate-"));
+      const log = join(dir, "calls.log");
+      const fake = [
+        "#!/usr/bin/env bash",
+        'echo "$*" >> "$LOG"',
+        'case "$*" in',
+        '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
+        `  "api repos/o/r/git/ref/tags/"*) [ -n "\${TAG_AT:-}" ] || exit 1; echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
+        '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
+        '  "release view"*) exit 0 ;;',
+        "  *) exit 0 ;;",
+        "esac",
+      ].join("\n");
+      writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
+      const st = allSteps("mirror").find(
+        (x) => x.name === "Create the tag and the release",
+      ) as Step;
+      const r = spawnSync("bash", ["-c", st.run], {
+        encoding: "utf8",
+        env: {
+          PATH: `${dir}:${process.env.PATH}`,
+          LOG: log,
+          MAIN: o.main,
+          COMPARE: o.compare,
+          TAG_AT: o.tagAt ?? "",
+          REPO: "o/r",
+          TAG: "v1.2.3",
+          SHA: o.sha,
+          PUBLIC_REPO: "p/p",
+        },
+      });
+      const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+      return { status: r.status, out: r.stdout + r.stderr, calls };
+    }
+    it("tag exists at SHA and main has moved: a no-op success", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain("already points at");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("tag exists at SHA but SHA left main: fails", () => {
+      const r = runCreate({
+        tagAt: X,
+        main: MAIN,
+        compare: "diverged",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("is not on main");
+    });
+    it("tag exists at another commit: fails", () => {
+      const r = runCreate({
+        tagAt: MAIN,
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("already exists and is not");
+    });
+    it("no tag and main has moved: fails, creates nothing", () => {
+      const r = runCreate({ main: MAIN, compare: "behind", sha: X });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("not the head of main");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("no tag and SHA is main's head: creates the tag", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toContain("-X POST");
+    });
+  });
+
+  it("a real run needs main; the guard ties the tag, the commit and PUBLIC_PIN", () => {
+    const run = runOf(allSteps("hosted-guard"));
+    expect(run).toContain("refs/heads/main");
+    expect(run).toContain("PUBLIC_PIN?ref=$sha");
+    expect(run).toContain("git/ref/tags/$TAG");
+    expect(run).toContain('"$tsha" = "$sha"');
+    expect(run).toContain("target_commitish");
+    expect(jobs["hosted-guard"].permissions).toEqual({ contents: "read" });
+  });
+
+  it("every job sets its own permissions; only attach writes contents", () => {
+    for (const j of JOBS) {
+      expect(jobs[j].permissions, j).toBeDefined();
+      const writes = Object.entries(jobs[j].permissions).filter(
+        ([, v]) => v === "write",
+      );
+      expect(writes.length, j).toBe(j.startsWith("hosted-attach-") ? 1 : 0);
+    }
+    for (const e of ENVS)
+      expect(jobs[`hosted-attach-${e}`].permissions).toEqual({
+        contents: "write",
+      });
+  });
+
+  it("pins every action by SHA, the release App's too", () => {
+    for (const j of JOBS)
+      for (const s of allSteps(j)) {
+        if (!s.uses) continue;
+        expect(s.uses, `${j}: ${s.uses}`).toMatch(SHA_PIN);
+      }
+  });
+
+  it("secrets: the App secrets only in the mirror, the key only in a sign step", () => {
+    for (const j of JOBS) {
+      const job = jobs[j];
+      const outside = JSON.stringify({ ...job, steps: undefined });
+      expect(outside, j).not.toContain("secrets.");
+      for (const s of allSteps(j)) {
+        const text = JSON.stringify(s);
+        if (j === "mirror") {
+          expect(text).not.toContain("RELEASE_SIGNING_KEY");
+          continue;
+        }
+        expect(text).not.toMatch(/RELEASE_APP_/);
+        const inSign = j.startsWith("hosted-sign-") && s.id === "sign";
+        if (!inSign) expect(text, `${j}: ${s.name}`).not.toContain("secrets.");
+      }
+    }
+    for (const e of ENVS) {
+      const sign = allSteps(`hosted-sign-${e}`).find(
+        (s) => s.id === "sign",
+      ) as Step;
+      expect(sign.env.RELEASE_SIGNING_KEY).toBe(
+        "${{ secrets.RELEASE_SIGNING_KEY }}",
+      );
+      expect(jobs[`hosted-sign-${e}`].environment).toBe(`hosted-${e}`);
+      // stdin only, not argv or the shell's history.
+      expect(sign.run).toContain(
+        "printf '%s' \"$RELEASE_SIGNING_KEY\" | node scripts/ci/sign-release.mjs",
+      );
+      expect(sign.run).not.toMatch(/--key/);
+    }
+  });
+
+  it("the key jobs install nothing and run only node", () => {
+    for (const e of ENVS) {
+      const j = `hosted-sign-${e}`;
+      const st = allSteps(j);
+      expect(runOf(st).replace(/pnpm-lock\.yaml/g, "")).not.toMatch(INSTALL);
+      expect(runOf(st)).not.toContain("strip-types");
+      expect(
+        st.map((s) => (s.uses ?? "").split("@")[0]).filter(Boolean),
+      ).toEqual([
+        "actions/checkout",
+        "actions/checkout",
+        "actions/setup-node",
+        "actions/download-artifact",
+      ]);
+      expect(st.some((s) => s.run === NODE22_ASSERT)).toBe(true);
+      for (const s of st)
+        if (s.uses?.startsWith("actions/setup-node"))
+          expect(s.with).toEqual({ "node-version-file": "public/.nvmrc" });
+      expect(jobs[j].env).toBeUndefined();
+    }
+  });
+
+  it("a dry run signs with staging only, and attaches nothing", () => {
+    expect(jobs["hosted-sign-staging"].if).not.toContain("inputs.dry_run");
+    expect(jobs["hosted-sign-prod"].if).toContain("!inputs.dry_run");
+    for (const e of ENVS)
+      expect(jobs[`hosted-attach-${e}`].if).toContain("!inputs.dry_run");
+    const dry = jobs["hosted-dry-run"];
+    expect(dry.if).toContain("inputs.dry_run");
+    expect(dry.if).not.toContain("!inputs.dry_run");
+    expect(dry.permissions).toEqual({ contents: "read" });
+    const run = runOf(dry.steps);
+    expect(run).toContain("assemble-release.mjs");
+    expect(run).not.toMatch(/gh release|gh api/);
+    const up = dry.steps.at(-1);
+    expect(up.uses).toMatch(/^actions\/upload-artifact@/);
+    expect(up.with.name).toBe("hosted-signed-staging-dry-run");
+  });
+
+  it("builds on the overlay: public at the pinned commit, this repo on top", () => {
+    for (const j of [
+      "hosted-build",
+      "hosted-check",
+      ...ENVS.flatMap((e) => [`hosted-sign-${e}`, `hosted-attach-${e}`]),
+      "hosted-dry-run",
+    ]) {
+      const st = allSteps(j);
+      const [priv, pub] = st;
+      expect(priv.uses).toMatch(/^actions\/checkout@/);
+      expect(priv.with.ref).toBe("${{ needs.hosted-guard.outputs.sha }}");
+      expect(priv.with.path).toBe("private");
+      expect(priv.with["persist-credentials"]).toBe(false);
+      expect(pub.with.repository).toBe("open-artifacts-ai/open-artifacts");
+      expect(pub.with.ref).toBe(PUB_COMMIT);
+      expect(pub.with.path).toBe("public");
+      expect(pub.with["persist-credentials"]).toBe(false);
+      expect(st[2].run).toBe(
+        "private/scripts/overlay.sh --auto-split public private",
+      );
+    }
+  });
+
+  it("records the public commit everywhere, never this repo's", () => {
+    for (const j of JOBS.filter((x) => /build|sign|attach|dry-run/.test(x))) {
+      const run = runOf(allSteps(j));
+      for (const m of run.matchAll(/--commit "\$(\w+)"/g))
+        expect(m[1], j).toBe("PUB_SHA");
+    }
+    expect(src).not.toMatch(/--commit "\$GUARD_SHA"/);
+    // The lockfile is the overlay's merged one, from public's root.
+    expect(src).toContain("--lockfile pnpm-lock.yaml");
+  });
+
+  it("attaches to this repo's release, once per env, refusing existing assets", () => {
+    for (const e of ENVS) {
+      const run = runOf(allSteps(`hosted-attach-${e}`));
+      expect(run).toContain(`grep '^oa-release-${e}-'`);
+      expect(run).toContain('gh release upload "$TAG" --repo "$REPO"');
+      expect(
+        allSteps(`hosted-attach-${e}`).some(
+          (s) => s.env?.REPO === "${{ github.repository }}",
+        ),
+      ).toBe(true);
+      expect(jobs[`hosted-attach-${e}`].concurrency.group).toContain(
+        `hosted-attach-${e}-`,
+      );
+    }
+  });
+
+  it("never writes to the public repo", () => {
+    expect(src).not.toMatch(/-R\s+\$PUBLIC_REPO|--repo\s+"?\$PUBLIC_REPO/);
+    for (const m of src.matchAll(/gh api -X (POST|PUT|PATCH|DELETE)[^\n]*/g))
+      expect(m[0]).toContain("repos/$REPO/");
   });
 });
