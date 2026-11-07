@@ -218,6 +218,10 @@ jobs:
           REDLINE_PROD_ACCOUNT_ID: ${{ vars.REDLINE_PROD_ACCOUNT_ID }}
           REDLINE_PROD_INVENTORY_URL: ${{ vars.REDLINE_PROD_INVENTORY_URL }}
           REDLINE_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+          # The plan: unset or empty is the 5-lane plan, `serial` the plan of
+          # before #1730 (a settings flip, no code change). Anything else
+          # fails the run before any case starts (tests/redline/src/lanes.ts).
+          REDLINE_PLAN: ${{ vars.REDLINE_PLAN }}
           # The gate, enforced: the run fails unless every case passes or is
           # one the report accepts by name. staging-first-gate.sh reads only
           # the run's conclusion, so without this the rule was only printed.

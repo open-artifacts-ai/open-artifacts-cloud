@@ -620,6 +620,29 @@ console.log("took " + n);`;
 // every lane writes its part, the report holds every manifest case, and the
 // run fails.
 describe("scripts/redline.ts with no targets", () => {
+  it("an unknown REDLINE_PLAN fails closed with a clear error, before any lane starts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-lanes-badplan-"));
+    try {
+      const r = await node(
+        ["scripts/redline.ts", "--gate"],
+        {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          REDLINE_REPORT: join(dir, "report.json"),
+          REDLINE_PLAN: "seriel",
+        },
+        30_000,
+      );
+      expect(r.code).toBe(1);
+      expect(r.out).toContain(
+        'redline: REDLINE_PLAN must be "lanes" or "serial", not "seriel"',
+      );
+      expect(r.out).not.toContain("redline: phase 1");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   it.each([
     ["the lanes plan", "", PLAN],
     ["REDLINE_PLAN=serial", "serial", PLAN_SERIAL],

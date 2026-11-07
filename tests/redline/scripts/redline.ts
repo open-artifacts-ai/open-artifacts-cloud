@@ -43,7 +43,14 @@ const reportFile =
 const partsDir = `${reportFile.replace(/\.json$/, "")}.lanes`;
 const barrierDir = barrierDirOf(reportFile);
 const lockDir = lockDirOf(reportFile);
-const PLAN = selectPlan(process.env);
+let PLAN: ReturnType<typeof selectPlan>;
+try {
+  PLAN = selectPlan(process.env);
+} catch (e) {
+  // An unknown REDLINE_PLAN fails closed, before any case starts.
+  console.error(`redline: ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
 const bad = planProblems(PLAN);
 if (bad.length) {
   console.error(`redline: the plan is wrong: ${bad.join("; ")}`);
