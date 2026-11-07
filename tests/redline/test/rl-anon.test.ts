@@ -17,7 +17,9 @@ import {
   guardedFetch,
   KEY_TABLE,
   MEMBERS_LOCK,
+  pacingNote,
   paceAnon,
+  resetPacingStats,
   targetsFromEnv,
   tripwire,
 } from "../src/rl-anon.ts";
@@ -153,6 +155,19 @@ describe("paceAnon", () => {
     claimed.length = 0;
     await paceAnon(req("GET", `${A.app}/api/v1/me`), T, claim);
     expect(claimed).toEqual([]);
+  });
+});
+
+describe("the pacing note", () => {
+  it("counts each key's claims and the hook calls, per file", async () => {
+    resetPacingStats();
+    await paceAnon(req("POST", `${A.app}/oauth/token`), T, async () => {});
+    await paceAnon(req("POST", `${B.app}/oauth/token`), T, async () => {});
+    await paceAnon(req("POST", `${A.app}/oauth/register`), T, async () => {});
+    expect(pacingNote("live/x.test.ts", "creds")).toMatch(
+      /^pacing \(lane creds, live\/x.test.ts\): 0 hook claim\(s\), 3 RL_ANON claim\(s\) \(reg:ip 1, tok:ip 2\), waited \d+\.\d s in all$/,
+    );
+    resetPacingStats();
   });
 });
 

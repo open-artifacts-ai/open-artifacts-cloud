@@ -3,7 +3,7 @@ import { getCurrentTest } from "vitest/suite";
 import { boundFetch, INNER_KEY, unbound } from "../src/fetch-timeout.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
 import { watchResets } from "../src/resets.ts";
-import { guardedFetch, targetsFromEnv } from "../src/rl-anon.ts";
+import { guardedFetch, pacingNote, targetsFromEnv } from "../src/rl-anon.ts";
 import { transportFetch } from "../src/transport.ts";
 
 // Notes (a retried setup GET, say): on the running test's meta, else on the
@@ -32,7 +32,13 @@ globalThis.fetch = guarded;
 // vitest parses the first argument as a fixture pattern; the file is second.
 // biome-ignore lint/correctness/noEmptyPattern: required by vitest's fixture parser
 afterAll(({}, file) => {
-  const notes = [...takeFileNotes(), resets.totals()];
+  const notes = [
+    ...takeFileNotes(),
+    resets.totals(),
+    // Per lane and file: the claims and the time they waited, so the first
+    // real run measures the pacing (#1730).
+    ...(targets.length ? [pacingNote(file.name)] : []),
+  ];
   if (notes.length)
     (file.meta as { redlineNotes?: string[] }).redlineNotes = notes;
 });

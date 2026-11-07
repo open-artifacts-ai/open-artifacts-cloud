@@ -177,6 +177,35 @@ export const anonKeys = (
 
 export type Claim = (key: string) => Promise<unknown>;
 
+/**
+ * What this process claimed, for the part's notes (#1730: the first real run
+ * measures the pacing): each RL_ANON key's claims, the hook calls, and how
+ * long the claims waited in all.
+ */
+const stats = {
+  anon: new Map<string, number>(),
+  hooks: 0,
+  waitedMs: 0,
+};
+export const countHook = (waitedMs: number): void => {
+  stats.hooks++;
+  stats.waitedMs += waitedMs;
+};
+export function pacingNote(
+  file: string,
+  lane = process.env.REDLINE_LANE ?? "run",
+): string {
+  const anon = [...stats.anon].sort(([a], [b]) => a.localeCompare(b));
+  const total = anon.reduce((n, [, c]) => n + c, 0);
+  return `pacing (lane ${lane}, ${file}): ${stats.hooks} hook claim(s), ${total} RL_ANON claim(s)${anon.length ? ` (${anon.map(([k, c]) => `${k} ${c}`).join(", ")})` : ""}, waited ${(stats.waitedMs / 1000).toFixed(1)} s in all`;
+}
+/** @internal Test seam. */
+export const resetPacingStats = (): void => {
+  stats.anon.clear();
+  stats.hooks = 0;
+  stats.waitedMs = 0;
+};
+
 /** The public ledger claim for one key, one ledger per key. */
 export const ledgerClaim: Claim = (key) => claimHookSlot(`rl-anon/${key}`);
 
@@ -187,7 +216,12 @@ export async function paceAnon(
   claim: Claim = ledgerClaim,
 ): Promise<string[]> {
   const keys = anonKeys(req, targets);
-  for (const k of keys) await claim(k);
+  for (const k of keys) {
+    const t0 = Date.now();
+    await claim(k);
+    stats.waitedMs += Date.now() - t0;
+    stats.anon.set(k, (stats.anon.get(k) ?? 0) + 1);
+  }
   return keys;
 }
 

@@ -355,6 +355,18 @@ describe("the claims match the code", () => {
     );
   });
 
+  it("signin marks broker-done when its broker describes end, before the rest of the file runs", () => {
+    const t = read("live/signin.test.ts");
+    const mark = t.indexOf('afterAll(() => mark("broker-done"))');
+    expect(mark).toBeGreaterThan(t.indexOf('describe("sign-in: broker"'));
+    expect(mark).toBeLessThan(t.indexOf('describe("sign-in: Turnstile"'));
+    // Every spender of the broker bucket (startGoogle, brokerState) is in the
+    // describes before Turnstile's: the afterAll of the last of them runs
+    // after all of them.
+    const after = t.slice(t.indexOf('describe("sign-in: Turnstile"'));
+    expect(after).not.toMatch(/brokerState\(|mustStart\(|startGoogle\(/);
+  });
+
   it("the other writers of rl-b's members claim the lock shared", () => {
     for (const f of [
       "live/surfaces.test.ts",
