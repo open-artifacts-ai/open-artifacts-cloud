@@ -673,7 +673,10 @@ mkpub_hosted "$T/k4"; mkc "$T/k4" "$T/kc4"
 G -C "$T/k4" rm -rq apps/hosted .github/workflows/hosted.yml
 G -C "$T/k4" commit -qm delete
 pin_at "$T/kc4" "$(git -C "$T/k4" rev-parse HEAD)"
-expect_exit "pin-check does not apply once public holds none of the paths" 0 "$T/kc4/scripts/pin-check.sh" "$T/k4" "$T/kc4"
+S4=$(sed -n 's/^sha=//p' "$T/kc4/SYNCED_FROM")
+expect_exit "strict mode with the pin ahead and no --prev fails (base unknown)" 1 "$T/kc4/scripts/pin-check.sh" "$T/k4" "$T/kc4"
+check "that failure says no --prev" grep -q 'no --prev' "$T/out"
+expect_exit "pin-check does not apply once public holds none of the paths" 0 "$T/kc4/scripts/pin-check.sh" --prev "$S4" "$T/k4" "$T/kc4"
 check "strict mode is named" grep -q 'strict mode' "$T/out"
 
 # Strict mode is not blind: a fix made before the delete must be ported.
@@ -706,7 +709,53 @@ strictfix kg
 G -C "$T/kg" reset -q --hard "$SF_S"
 G -C "$T/kg" rm -rq apps/hosted .github/workflows/hosted.yml; G -C "$T/kg" commit -qm delete
 pin_at "$T/kgc" "$(git -C "$T/kg" rev-parse HEAD)"
-expect_exit "delete alone: pin at D, SYNCED_FROM unchanged, passes" 0 "$T/kgc/scripts/pin-check.sh" "$T/kg" "$T/kgc"
+expect_exit "delete alone: pin at D, SYNCED_FROM unchanged, passes" 0 "$T/kgc/scripts/pin-check.sh" --prev "$SF_S" "$T/kg" "$T/kgc"
+
+# Paths public adds to the list between S and the delete are still ported.
+addlist() { # pubdir path: public adds a hosted path (with a file) to its list
+  mkdir -p "$1/$2"; echo 'new hosted svc' > "$1/$2/x.ts"; echo "$2" >> "$1/scripts/ci/private-paths.txt"
+  G -C "$1" add -A; G -C "$1" commit -qm "list $2"
+}
+# A1: new hosted path, then delete everything; pin at D, SYNCED_FROM unchanged.
+mkpub_hosted "$T/ka1"; mkc "$T/ka1" "$T/kca1"; A1S=$(git -C "$T/ka1" rev-parse HEAD)
+addlist "$T/ka1" apps/hosted2
+G -C "$T/ka1" rm -rq apps/hosted apps/hosted2 .github/workflows/hosted.yml; G -C "$T/ka1" commit -qm delete
+pin_at "$T/kca1" "$(git -C "$T/ka1" rev-parse HEAD)"
+expect_exit "A1: a hosted path added to the list then deleted, pin at D, SYNCED_FROM unchanged, fails" 1 "$T/kca1/scripts/pin-check.sh" --prev "$A1S" "$T/ka1" "$T/kca1"
+check "A1 names the pre-delete change" grep -q 'before deleting' "$T/out"
+# A1b: public fixes a file under a path it adds to the list in the same commit.
+mkpub_hosted "$T/ka1b"; mkc "$T/ka1b" "$T/kca1b"; A1bS=$(git -C "$T/ka1b" rev-parse HEAD)
+echo 'SECURITY FIX' > "$T/ka1b/apps/server/x.ts"; echo apps/server >> "$T/ka1b/scripts/ci/private-paths.txt"; G -C "$T/ka1b" add -A; G -C "$T/ka1b" commit -qm 'fix server and list it'
+G -C "$T/ka1b" rm -rq apps/hosted apps/server .github/workflows/hosted.yml; G -C "$T/ka1b" commit -qm delete
+pin_at "$T/kca1b" "$(git -C "$T/ka1b" rev-parse HEAD)"
+expect_exit "A1b: a fix to a file whose path joins the list in the same commit, pin at D, fails" 1 "$T/kca1b/scripts/pin-check.sh" --prev "$A1bS" "$T/ka1b" "$T/kca1b"
+# A2: SYNCED_FROM and pin at D; D also deletes the list file; hosted2 never ported.
+mkpub_hosted "$T/ka2"; mkc "$T/ka2" "$T/kca2"; A2S=$(git -C "$T/ka2" rev-parse HEAD)
+addlist "$T/ka2" apps/hosted2
+G -C "$T/ka2" rm -rq apps/hosted apps/hosted2 .github/workflows/hosted.yml scripts/ci/private-paths.txt; G -C "$T/ka2" commit -qm delete
+A2D=$(git -C "$T/ka2" rev-parse HEAD)
+sed -i "s/^sha=.*/sha=$A2D/" "$T/kca2/SYNCED_FROM"; pin_at "$T/kca2" "$A2D"
+expect_exit "A2: SYNCED_FROM and pin at D after a list add, list file deleted, hosted2 unported, fails" 1 "$T/kca2/scripts/pin-check.sh" --prev "$A2S" "$T/ka2" "$T/kca2"
+check "A2 is the unported-fix failure" grep -q 'without porting' "$T/out"
+# A2b: same, but D keeps the list file and drops hosted2 from it.
+mkpub_hosted "$T/ka2b"; mkc "$T/ka2b" "$T/kca2b"; A2bS=$(git -C "$T/ka2b" rev-parse HEAD)
+addlist "$T/ka2b" apps/hosted2
+G -C "$T/ka2b" rm -rq apps/hosted apps/hosted2 .github/workflows/hosted.yml
+printf 'apps/hosted\n.github/workflows/hosted.yml\n' > "$T/ka2b/scripts/ci/private-paths.txt"; G -C "$T/ka2b" add -A; G -C "$T/ka2b" commit -qm delete
+A2bD=$(git -C "$T/ka2b" rev-parse HEAD)
+sed -i "s/^sha=.*/sha=$A2bD/" "$T/kca2b/SYNCED_FROM"; pin_at "$T/kca2b" "$A2bD"
+expect_exit "A2b: SYNCED_FROM and pin at D, D drops hosted2 from the list, hosted2 unported, fails" 1 "$T/kca2b/scripts/pin-check.sh" --prev "$A2bS" "$T/ka2b" "$T/kca2b"
+# Legit: hosted2 ported, SYNCED_FROM at the list-add commit, pin at D.
+mkpub_hosted "$T/ka3"; mkc "$T/ka3" "$T/kca3"; A3S=$(git -C "$T/ka3" rev-parse HEAD)
+addlist "$T/ka3" apps/hosted2; A3N=$(git -C "$T/ka3" rev-parse HEAD)
+G -C "$T/ka3" rm -rq apps/hosted apps/hosted2 .github/workflows/hosted.yml; G -C "$T/ka3" commit -qm delete
+mkdir -p "$T/kca3/apps/hosted2"; echo 'new hosted svc' > "$T/kca3/apps/hosted2/x.ts"; git -C "$T/ka3" show "$A3N:scripts/ci/private-paths.txt" > "$T/kca3/private-paths.txt"
+sed -i "s/^sha=.*/sha=$A3N/" "$T/kca3/SYNCED_FROM"; pin_at "$T/kca3" "$(git -C "$T/ka3" rev-parse HEAD)"
+expect_exit "a list add ported, SYNCED_FROM at the last pre-delete commit, pin at D, passes" 0 "$T/kca3/scripts/pin-check.sh" --prev "$A3S" "$T/ka3" "$T/kca3"
+# A trailing exceptions line with no newline is still read.
+printf 'apps/hosted/src/index.ts %s' "$A3S" > "$T/kca3/port-exceptions.txt"
+expect_exit "an exceptions file without a final newline is fully read (stale last line fails)" 1 "$T/kca3/scripts/pin-check.sh" --prev "$A3S" "$T/ka3" "$T/kca3"
+rm "$T/kca3/port-exceptions.txt"
 
 mkdir -p "$T/kc5/scripts"; cp "$PINCHK" "$LISTED" "$T/kc5/scripts/"
 expect_exit "pin-check skips without SYNCED_FROM" 0 "$T/kc5/scripts/pin-check.sh" "$T/k1" "$T/kc5"

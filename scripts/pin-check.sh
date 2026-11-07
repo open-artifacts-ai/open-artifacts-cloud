@@ -72,7 +72,7 @@ git -C "$PUB" merge-base --is-ancestor "$s" "$p" \
 # whose new SYNCED_FROM is <sha>; any other entry is stale and fails.
 exc_paths=()
 if [ -f "$PRIV/port-exceptions.txt" ]; then
-  while IFS= read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
     line=$(printf '%s' "$line" | tr -d '\r' | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -n "$line" ] || continue
     read -r e_path e_sha e_rest <<< "$line"
@@ -93,6 +93,11 @@ list_at() { # commit: public's list at that commit, else this repo's
     norm < "$PRIV/private-paths.txt"
   fi
 }
+list_union() { # from to: listed paths at from, at to, and at every commit between that changed the list
+  { list_at "$1"; list_at "$2"
+    git -C "$PUB" log --format=%H --full-history "$1..$2" -- scripts/ci/private-paths.txt | while IFS= read -r c; do list_at "$c"; done
+  } | LC_ALL=C sort -u
+}
 [ -f "$PRIV/private-paths.txt" ] || die "no private-paths.txt in $PRIV"
 list_p=$(list_at "$p")
 [ -n "$list_p" ] || die "the path list at PUBLIC_PIN is empty"
@@ -112,7 +117,7 @@ if [ -n "$prev" ] && [ "$prev" != "$s" ]; then
   git -C "$PUB" cat-file -e "$prev^{commit}" 2> /dev/null || die "public checkout has no commit $prev (the base SYNCED_FROM); fetch full history"
   git -C "$PUB" merge-base --is-ancestor "$prev" "$s" || die "the base SYNCED_FROM ($prev) is not an ancestor of SYNCED_FROM ($s)"
   specs=()
-  while IFS= read -r q; do specs+=("$q"); done < <({ list_at "$prev"; printf '%s\n' "$list_s"; } | LC_ALL=C sort -u)
+  while IFS= read -r q; do specs+=("$q"); done < <(list_union "$prev" "$s")
   for q in ${exc_paths[@]+"${exc_paths[@]}"}; do specs+=(":(exclude,literal)$q"); done
   # When SYNCED_FROM is past the delete, the net diff only shows the deletion
   # and hides a fix made before it. Port against the last commit before the
@@ -152,13 +157,16 @@ if [ "$present" -eq 0 ]; then
   # sync only if public made no non-deletion change to the listed paths since.
   if [ "$s" != "$p" ]; then
     paths=()
-    while IFS= read -r q; do paths+=("$q"); done <<< "$list_s"
+    while IFS= read -r q; do paths+=("$q"); done < <(list_union "$s" "$p")
     late=$(git -C "$PUB" log --format=%H --full-history -m --no-renames --diff-filter=AMRT "$s..$p" -- "${paths[@]}") || die "git log failed"
     if [ -n "$late" ]; then
       echo "pin-check: public changed listed paths between SYNCED_FROM and PUBLIC_PIN before deleting them:" >&2
       printf '%s\n' "$late" | sed 's/^/  /' >&2
       die "PUBLIC_PIN ($p) leads SYNCED_FROM ($s) over hosted changes made before the delete. Hand-port them and bump SYNCED_FROM to the last commit before the delete in the same PR."
     fi
+  fi
+  if [ "$s" != "$p" ] && [ -z "$prev" ]; then
+    die "strict mode with PUBLIC_PIN ($p) ahead of SYNCED_FROM ($s) and no --prev: the base is unknown, so the port check cannot run. Run it from a pull_request, merge_group or push."
   fi
   echo "pin-check: OK: public at PUBLIC_PIN holds none of the private paths (strict mode); no pre-delete change is unported"
   exit 0
