@@ -243,38 +243,74 @@ export function tripwire(
   );
 }
 
-/** The targets REDLINE_TARGETS names, read without loading secrets; none when unset or not JSON. */
+/**
+ * The targets REDLINE_TARGETS names, read without loading secrets. Lenient:
+ * none when unset, not JSON, local mode or incomplete (unit tests, local pair).
+ */
 export function targetsFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): AnonTarget[] {
-  const raw = env.REDLINE_TARGETS;
-  if (!raw) return [];
   try {
-    const v = JSON.parse(raw) as Record<string, unknown>;
-    // Local mode runs a wrangler pair whose limiter is not the account's.
-    if (v.mode === "local") return [];
-    const out: AnonTarget[] = [];
-    for (const k of ["a", "b"]) {
-      const t = v[k] as Partial<AnonTarget> | undefined;
-      if (t && typeof t.app === "string" && typeof t.content === "string")
-        out.push({
-          name: typeof t.name === "string" ? t.name : k,
-          installId: typeof t.installId === "string" ? t.installId : k,
-          app: t.app,
-          content: t.content,
-        });
-    }
-    return out;
+    return liveTargetsFromEnv(env);
   } catch {
     return [];
   }
 }
+
+/**
+ * The same read for a run against live installs: none only for local mode
+ * (a wrangler pair whose limiter is not the account's). Anything else that
+ * leaves a or b unnamed throws InfraError, so pacing, the members lock and
+ * the 429 tripwire are never silently dropped.
+ */
+export function liveTargetsFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): AnonTarget[] {
+  const raw = env.REDLINE_TARGETS;
+  if (!raw)
+    throw new InfraError(
+      "REDLINE_TARGETS is not set: RL_ANON pacing, the members lock and the 429 tripwire cannot run",
+    );
+  let v: Record<string, unknown>;
+  try {
+    v = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new InfraError(
+      "REDLINE_TARGETS is not JSON: RL_ANON pacing, the members lock and the 429 tripwire cannot run",
+    );
+  }
+  if (!v || typeof v !== "object")
+    throw new InfraError("REDLINE_TARGETS is not a JSON object");
+  if (v.mode === "local") return [];
+  const out: AnonTarget[] = [];
+  for (const k of ["a", "b"]) {
+    const t = v[k] as Partial<AnonTarget> | undefined;
+    if (!t || typeof t.app !== "string" || typeof t.content !== "string")
+      throw new InfraError(
+        `REDLINE_TARGETS.${k} needs app and content: RL_ANON pacing, the members lock and the 429 tripwire cannot run`,
+      );
+    out.push({
+      name: typeof t.name === "string" ? t.name : k,
+      installId: typeof t.installId === "string" ? t.installId : k,
+      app: t.app,
+      content: t.content,
+    });
+  }
+  return out;
+}
+
+/** Pacing and lock waits of one case may total this long: under the 180 s case timeout. */
+export const WAIT_BUDGET_MS = 120_000;
 
 export interface GuardDeps {
   targets: readonly AnonTarget[];
   claim?: Claim;
   /** rl-b's app origin takes the members lock shared for non-GET requests. */
   membersOrigin?: string;
+  /** Total pacing and lock wait one scope (a case) may spend; default WAIT_BUDGET_MS. */
+  waitBudgetMs?: number;
+  /** The running case, as an object: the budget is per scope. Default: one scope. */
+  scope?: () => object | undefined;
 }
 
 const READS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -288,6 +324,20 @@ const READS = new Set(["GET", "HEAD", "OPTIONS"]);
  */
 export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
   // targetsFromEnv lists a then b: b is the second.
+  const budget = d.waitBudgetMs ?? WAIT_BUDGET_MS;
+  const spent = new WeakMap<object, number>();
+  const global = {};
+  const key = () => d.scope?.() ?? global;
+  const left = (what: string): number => {
+    const r = budget - (spent.get(key()) ?? 0);
+    if (r <= 0)
+      throw new InfraError(
+        `${what}: this case has waited ${budget / 1000} s on pacing and locks, which would run it past its timeout`,
+      );
+    return r;
+  };
+  const spend = (since: number) =>
+    spent.set(key(), (spent.get(key()) ?? 0) + Date.now() - since);
   const members = d.membersOrigin ?? urlOf(d.targets[1]?.app ?? "")?.origin;
   return async (input, init) => {
     const method = (
@@ -304,7 +354,28 @@ export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
     );
     const req: ReqLike = { method, url, headers };
     if (d.targets.length === 0) return inner(input, init);
-    await paceAnon(req, d.targets, d.claim);
+    const t0 = Date.now();
+    const ms = left("pacing");
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        paceAnon(req, d.targets, d.claim),
+        new Promise<never>((_, rej) => {
+          timer = setTimeout(
+            () =>
+              rej(
+                new InfraError(
+                  `pacing: waited ${budget / 1000} s in this case, which would run it past its timeout`,
+                ),
+              ),
+            ms,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      spend(t0);
+    }
     const run = async () => {
       const res = await inner(input, init);
       tripwire(req, res.status, d.targets);
@@ -315,8 +386,24 @@ export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
       !READS.has(method) &&
       urlOf(url)?.origin === members &&
       !holdsExclusive(MEMBERS_LOCK)
-    )
-      return withLock(MEMBERS_LOCK, "shared", run);
+    ) {
+      const t1 = Date.now();
+      const tl = left("members lock");
+      let waited = 0;
+      return withLock(
+        MEMBERS_LOCK,
+        "shared",
+        () => {
+          waited = Date.now() - t1;
+          spend(t1);
+          return run();
+        },
+        { deadlineMs: tl },
+      ).catch((e) => {
+        if (!waited) spend(t1);
+        throw e;
+      });
+    }
     return run();
   };
 }

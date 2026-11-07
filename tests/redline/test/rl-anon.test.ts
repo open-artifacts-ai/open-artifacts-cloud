@@ -1,9 +1,11 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +17,8 @@ import {
   anonKeys,
   classify,
   guardedFetch,
+  liveTargetsFromEnv,
+  WAIT_BUDGET_MS,
   KEY_TABLE,
   MEMBERS_LOCK,
   pacingNote,
@@ -305,6 +309,112 @@ describe("targetsFromEnv", () => {
     ).toEqual([]);
     expect(targetsFromEnv({})).toEqual([]);
     expect(targetsFromEnv({ REDLINE_TARGETS: "{" })).toEqual([]);
+  });
+});
+
+describe("liveTargetsFromEnv fails closed", () => {
+  const ok = JSON.stringify({ mode: "staging", a: A, b: B });
+  it("reads a and b; local mode is none", () => {
+    expect(
+      liveTargetsFromEnv({ REDLINE_TARGETS: ok }).map((t) => t.app),
+    ).toEqual([A.app, B.app]);
+    expect(
+      liveTargetsFromEnv({
+        REDLINE_TARGETS: JSON.stringify({ mode: "local", a: A, b: B }),
+      }),
+    ).toEqual([]);
+  });
+  it.each([
+    ["unset", {}, /not set/],
+    ["not JSON", { REDLINE_TARGETS: "{" }, /not JSON/],
+    ["JSON null", { REDLINE_TARGETS: "null" }, /not a JSON object/],
+    [
+      "a without app",
+      { REDLINE_TARGETS: JSON.stringify({ a: { content: A.content }, b: B }) },
+      /REDLINE_TARGETS\.a needs app and content/,
+    ],
+    [
+      "b without content",
+      { REDLINE_TARGETS: JSON.stringify({ a: A, b: { app: B.app } }) },
+      /REDLINE_TARGETS\.b needs app and content/,
+    ],
+    [
+      "b missing",
+      { REDLINE_TARGETS: JSON.stringify({ mode: "staging", a: A }) },
+      /REDLINE_TARGETS\.b needs/,
+    ],
+  ])("%s throws InfraError", (_n, env, re) => {
+    let err: unknown;
+    try {
+      liveTargetsFromEnv(env);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InfraError);
+    expect((err as Error).message).toMatch(re);
+  });
+});
+
+describe("waits stay under the case timeout", () => {
+  const answer = (status: number) => async () => new Response("x", { status });
+  it("a pacing wait past the budget is an InfraError, not a hang", async () => {
+    const f = guardedFetch(answer(200) as typeof fetch, {
+      targets: T,
+      claim: () => new Promise<void>(() => {}),
+      waitBudgetMs: 30,
+    });
+    await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
+      /infra: pacing: waited/,
+    );
+  });
+  it("waits already spent in a case use up its budget", async () => {
+    const scope = {};
+    const f = guardedFetch(answer(200) as typeof fetch, {
+      targets: T,
+      claim: () => new Promise<void>((r) => setTimeout(r, 40)),
+      waitBudgetMs: 50,
+      scope: () => scope,
+    });
+    await f(`${A.app}/oauth/token`, { method: "POST" });
+    await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
+      /infra: /,
+    );
+    await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
+      /infra: pacing: this case has waited/,
+    );
+    // another case starts with a full budget
+    const other = guardedFetch(answer(200) as typeof fetch, {
+      targets: T,
+      claim: async () => {},
+      waitBudgetMs: 50,
+      scope: () => ({}),
+    });
+    expect(
+      (await other(`${A.app}/oauth/token`, { method: "POST" })).status,
+    ).toBe(200);
+  });
+  it("a members lock held by another process is an InfraError within the budget", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-anon-wait-"));
+    process.env[LOCK_DIR_ENV] = dir;
+    try {
+      mkdirSync(join(dir, MEMBERS_LOCK), { recursive: true });
+      // pid 1 is alive and is not ours: a writer that never leaves.
+      writeFileSync(join(dir, MEMBERS_LOCK, "wi.other"), "1");
+      const f = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: async () => {},
+        waitBudgetMs: 150,
+      });
+      await expect(
+        f(`${B.app}/api/v1/artifacts`, { method: "POST" }),
+      ).rejects.toThrow(/infra: lock .*not free/);
+    } finally {
+      delete process.env[LOCK_DIR_ENV];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("the budget stays under the 180 s case timeout", () => {
+    expect(WAIT_BUDGET_MS).toBeLessThan(180_000);
   });
 });
 

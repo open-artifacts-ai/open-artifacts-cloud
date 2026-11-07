@@ -3,7 +3,11 @@ import { getCurrentTest } from "vitest/suite";
 import { boundFetch, INNER_KEY, unbound } from "../src/fetch-timeout.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
 import { watchResets } from "../src/resets.ts";
-import { guardedFetch, pacingNote, targetsFromEnv } from "../src/rl-anon.ts";
+import {
+  guardedFetch,
+  liveTargetsFromEnv,
+  pacingNote,
+} from "../src/rl-anon.ts";
 import { transportFetch } from "../src/transport.ts";
 
 // Notes (a retried setup GET, say): on the running test's meta, else on the
@@ -22,8 +26,10 @@ const bound = boundFetch(transportFetch(globalThis.fetch, resets));
 // FRONT of the bound (src/rl-anon.ts), so a wait never counts against a
 // request's timeout. setupFetch re-bounds `unbound(fetch)`: that gets the
 // same rules around the raw fetch.
-const targets = targetsFromEnv();
-const rules = (f: typeof fetch) => guardedFetch(f, { targets });
+// Fails closed: a live run never loses its pacing, lock or tripwire silently.
+const targets = liveTargetsFromEnv();
+const rules = (f: typeof fetch) =>
+  guardedFetch(f, { targets, scope: () => getCurrentTest() });
 const guarded = rules(bound);
 (guarded as unknown as Record<symbol, unknown>)[INNER_KEY] = rules(
   unbound(bound),
