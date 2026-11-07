@@ -92,8 +92,8 @@ moves them into `.github/workflows/` by hand.
 
 `scripts/ci-plan.sh` reads this repo's tracked files and makes three sets:
 the private packages (each must define `test` and `typecheck`; CI runs them
-one by one and logs each), the root-vitest tests in `scripts/ci` and
-`scripts/ops`, and every other `*.test.ts`. That last set is private tests
+one by one and logs each), the root-vitest tests in `scripts/ci`,
+`scripts/ops` and `scripts/audit`, and every other `*.test.ts`. That last set is private tests
 inside public packages (auth-broker's platform-ticket, server's
 mcp-sdk-iserror, ...); `scripts/ci-public-tests.sh` runs each through its
 owning package's vitest, under whichever of that package's test configs

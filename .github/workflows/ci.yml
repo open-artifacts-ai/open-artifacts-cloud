@@ -93,7 +93,7 @@ jobs:
         working-directory: public
         run: pnpm install --frozen-lockfile
       # What to build and test, from this repo's tracked files: private
-      # packages, root-vitest tests (scripts/ci, scripts/ops) and private tests
+      # packages, root-vitest tests (scripts/ci, scripts/ops, scripts/audit) and private tests
       # inside public packages. Fails on a package without test or typecheck,
       # a test with no owning package, or an empty tree after the sync.
       - id: pkgs
@@ -151,7 +151,7 @@ jobs:
             echo "::endgroup::"
             echo "test ran: $d"
           done < "$PLAN/packages.txt"
-      - name: test (private scripts/ci and scripts/ops)
+      - name: test (private scripts/ci, scripts/ops and scripts/audit)
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}

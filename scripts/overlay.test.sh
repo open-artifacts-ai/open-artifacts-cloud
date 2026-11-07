@@ -202,7 +202,7 @@ mkplan() { # ovl priv
   mkdir -p "$1/apps/server" "$1/apps/auth-broker" "$1/apps/admin"
   echo '{"name":"server"}' > "$1/apps/server/package.json"
   echo '{"name":"auth-broker"}' > "$1/apps/auth-broker/package.json"
-  mkdir -p "$2/apps/admin/test" "$2/apps/server/test/node" "$2/apps/auth-broker/test/node" "$2/scripts/ci" "$2/scripts/ops/testdata"
+  mkdir -p "$2/apps/admin/test" "$2/apps/server/test/node" "$2/apps/auth-broker/test/node" "$2/scripts/ci" "$2/scripts/ops/testdata" "$2/scripts/audit"
   echo '{"name":"admin","scripts":{"test":"vitest run","typecheck":"tsc"}}' > "$2/apps/admin/package.json"
   cp "$2/apps/admin/package.json" "$1/apps/admin/package.json"
   echo t > "$2/apps/admin/test/own.test.ts"
@@ -211,12 +211,13 @@ mkplan() { # ovl priv
   echo t > "$2/apps/auth-broker/test/node/config.test.ts"
   echo t > "$2/scripts/ci/hosted-release.test.ts"
   echo t > "$2/scripts/ops/platform-db.test.ts"
+  echo t > "$2/scripts/audit/audit-actions.test.ts"
   G -C "$2" init -q && G -C "$2" add -A && G -C "$2" commit -qm init
 }
 mkplan "$T/o1" "$T/q1"
 expect_exit "ci-plan succeeds" 0 "$PLAN" "$T/o1" "$T/q1" "$T/plan1"
 check "plan lists the private package" [ "$(cat "$T/plan1/packages.txt")" = apps/admin ]
-check "plan: root tests" [ "$(sort "$T/plan1/root-tests.txt" | tr '\n' ' ')" = "scripts/ci/hosted-release.test.ts scripts/ops/platform-db.test.ts " ]
+check "plan: root tests" [ "$(sort "$T/plan1/root-tests.txt" | tr '\n' ' ')" = "scripts/audit/audit-actions.test.ts scripts/ci/hosted-release.test.ts scripts/ops/platform-db.test.ts " ]
 check "plan: server test runs in its public package" grep -qxP 'apps/server\ttest/node/mcp-sdk-iserror.test.ts' "$T/plan1/public-tests.txt"
 check "plan: auth-broker workerd test" grep -qxP 'apps/auth-broker\ttest/platform-ticket.test.ts' "$T/plan1/public-tests.txt"
 check "plan: auth-broker node test" grep -qxP 'apps/auth-broker\ttest/node/config.test.ts' "$T/plan1/public-tests.txt"

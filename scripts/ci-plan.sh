@@ -8,7 +8,7 @@
 #   packages.txt      private packages: workspace dirs (apps/*, packages/*,
 #                     scripts/*, tests/*) whose package.json is in this repo.
 #                     CI builds, typechecks and tests each one.
-#   root-tests.txt    scripts/(ci|ops)/<name>.test.ts: run by the root vitest.
+#   root-tests.txt    scripts/(ci|ops|audit)/<name>.test.ts: run by the root vitest.
 #   public-tests.txt  every other *.test.ts: private tests that live inside a
 #                     public package. One line per file, "<pkg>\t<file>", the
 #                     file relative to <pkg>. CI runs each through its owning
@@ -37,7 +37,7 @@ done
 
 files=$(git -C "$PRIV" ls-files) || die "git ls-files failed in $PRIV"
 WS_PKG='^(apps|packages|scripts|tests)/[^/]+'
-ROOT_TEST='^scripts/(ci|ops)/[^/]+\.test\.ts$'
+ROOT_TEST='^scripts/(ci|ops|audit)/[^/]+\.test\.ts$'
 
 # --- Private packages, each with test and typecheck --------------------------
 pkgs=$( (grep -E "$WS_PKG/package\.json$" <<< "$files" || true) | sed 's|/package\.json$||')
