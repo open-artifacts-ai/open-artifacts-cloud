@@ -88,7 +88,10 @@ F1. So:
   carry the hand-ports and move `SYNCED_FROM` to the pin: that edit is the
   statement that the ports are in the PR. A pin bump over hosted changes
   without it is red. Once public holds none of the listed paths (after F1) the
-  check does not apply.
+  pin may still lead `SYNCED_FROM` only if public made no add or modify change
+  to the listed paths in between (a fix made before the delete); otherwise
+  bump `SYNCED_FROM` to the last commit before the delete, with the ports. The
+  port check runs in that mode too.
 
 ## Hand-porting a public fix
 
@@ -113,10 +116,16 @@ freeze). One PR here, in this order:
    the public diff `OLD..NEW` over the listed paths, with workflows renamed to
    `hosted-workflows/`, must reverse-apply (`git apply -R --check`) to this
    tree. A bump that ports nothing fails. Where CLOUD deliberately keeps its
-   own side of a changed file (the repo-name pins, keys), list that public
-   path in `port-exceptions.txt` (one path per line, the reason after `#`).
-   The exceptions file is reviewed like code: a new line there is the claim
-   that the hunk is intentionally not taken.
+   own side of a changed file (the repo-name pins, keys), add a line to
+   `port-exceptions.txt`: `<path> <new SYNCED_FROM sha> # reason`. An
+   exception counts only for the bump whose new `SYNCED_FROM` is that sha. An
+   entry for any other sha is stale and fails CI, so remove it, or state it
+   again for the new bump. The exceptions file is reviewed like code: a line
+   there is the claim that the hunk is intentionally not taken.
+   The port check runs only when CI knows the base: on `pull_request`,
+   `merge_group` and `push`. `workflow_dispatch` has no base, so `OLD` is empty
+   and there is no port check. Keep `merge_group` a required check, so the
+   `OLD` used is the queue's base and not a stale `pull_request` base sha.
 
 `SYNCED_FROM` is required. Deleting it does not turn the checks off:
 `pin-check.sh`, `equivalence.sh` and the sync refuse, and CI fails, whenever
