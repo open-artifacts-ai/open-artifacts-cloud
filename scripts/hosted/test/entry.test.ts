@@ -1,4 +1,4 @@
-// The CLI as `pnpm oa:hosted` runs it: plain node with type stripping, no
+// The CLI as `pnpm -s --filter @oa/hosted start` runs it: plain node with type stripping, no
 // bundler. Vitest resolves `./x.js` to `./x.ts`; node does not, so only a
 // real start catches a local import node can't load.
 import { execFileSync } from "node:child_process";
@@ -15,6 +15,6 @@ it("node loads src/cli.ts and prints the help", () => {
     env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
     timeout: 30_000,
   });
-  expect(out).toContain("Usage: pnpm oa:hosted");
+  expect(out).toContain("Usage: pnpm -s --filter @oa/hosted start");
   expect(out).toContain("publish-release");
 });

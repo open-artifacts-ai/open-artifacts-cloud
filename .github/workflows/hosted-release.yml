@@ -101,6 +101,17 @@ jobs:
           esac
           version=$(gh api -H "Accept: application/vnd.github.raw+json" "$P/contents/package.json?ref=$PUB_SHA" | jq -r .version)
           [ "$version" = "${TAG#v}" ] || { echo "::error::public package.json at $PUB_SHA is $version, not ${TAG#v}"; exit 1; }
+          # L5: the pinned commit is the public release commit itself: the
+          # release's target (when a SHA), and the commit where package.json's
+          # version changed versus its first parent.
+          target=$(jq -r '.target_commitish // empty' <<< "$rel")
+          if [[ "$target" =~ ^[0-9a-f]{40}$ ]] && [ "$target" != "$PUB_SHA" ]; then
+            echo "::error::public $TAG points at $PUB_SHA but its release targets $target"; exit 1
+          fi
+          parent=$(gh api "$P/commits/$PUB_SHA" -q '.parents[0].sha')
+          [[ "$parent" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not read the first parent of public $PUB_SHA"; exit 1; }
+          prev=$(gh api -H "Accept: application/vnd.github.raw+json" "$P/contents/package.json?ref=$parent" | jq -r .version)
+          [ "$prev" != "$version" ] || { echo "::error::public package.json's version did not change in $PUB_SHA; not the release commit"; exit 1; }
           # The public release run of that commit: release-please and verify-release green.
           runs=$(gh api "$P/actions/workflows/release-please.yml/runs?event=push&branch=main&head_sha=$PUB_SHA&per_page=100")
           run_id=$(jq -r --arg s "$PUB_SHA" '[.workflow_runs[] | select(.head_sha == $s and .event == "push")] | sort_by(.created_at) | last | .id // empty' <<< "$runs")

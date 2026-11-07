@@ -54,14 +54,20 @@ describe("W9b: the retired hosted writes stay retired", () => {
   // The CLI's own command lists are checked in scripts/hosted/test/cli.test.ts,
   // which moves with the CLI to the hosted repo (#1056).
 
-  it("every oa:hosted call in a workflow is a kept command", () => {
-    for (const f of workflows)
-      for (const [, cmd] of read(`.github/workflows/${f}`).matchAll(
-        /oa:hosted\s+(?:"\$\{[^}]*\}"|([a-z-]+))/g,
+  // The root `oa:hosted` script lives in the public package.json, which the
+  // split deletes (F1), and this repo ships no root package.json. The CLI is
+  // run through its workspace package, which works before and after the split.
+  it("every hosted CLI call in a workflow is a kept command, run through the workspace package", () => {
+    for (const f of workflows) {
+      const text = read(`.github/workflows/${f}`);
+      expect(text, f).not.toMatch(/\bpnpm\b[^\n]*\boa:hosted\b/);
+      for (const [, cmd] of text.matchAll(
+        /--filter @oa\/hosted start\s+(?:"\$\{[^}]*\}"|([a-z-]+))/g,
       ))
         expect(
           ["status", "publish-release", "publish-floor"],
           `${f}: ${cmd}`,
         ).toContain(cmd ?? "(argv)");
+    }
   });
 });
