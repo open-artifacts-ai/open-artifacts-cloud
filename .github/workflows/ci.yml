@@ -245,6 +245,5 @@ jobs:
           test -f pnpm-lock.yaml
           test -f .nvmrc
           test ! -e _public
-          test -d "$RUNNER_TEMP/cloud-checkout/.git"
-          test ! -e _cloud
-          test "$(git rev-parse HEAD)" = "$(sed -n 's/^sha=//p' "$RUNNER_TEMP/cloud-checkout/PUBLIC_PIN")"
+          test -d _cloud/.git
+          test "$(git rev-parse HEAD)" = "$(sed -n 's/^sha=//p' _cloud/PUBLIC_PIN)"

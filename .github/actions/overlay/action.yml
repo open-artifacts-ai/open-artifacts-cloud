@@ -6,7 +6,8 @@ description: >
   path _cloud, at the ref the job runs (main's sha or a release tag). Leaves
   the overlay tree at the root (its own .git is the public checkout), so
   later steps use the same relative paths as in the public repo. The _cloud
-  checkout moves to $RUNNER_TEMP/cloud-checkout.
+  checkout stays in place, untracked (the runner needs this action's files
+  there until the job ends).
 inputs:
   exact-tag:
     description: "Optional vX.Y.Z: fail unless _cloud is exactly this tag and clean"
@@ -45,13 +46,11 @@ runs:
         set -euo pipefail
         _cloud/scripts/overlay.sh --auto-split _public _cloud
         # The merged tree becomes the workspace root. dotglob moves .git and
-        # .nvmrc too.
+        # .nvmrc too. _cloud stays where it is: the runner reads this action's
+        # files from it again in the post-job step.
         shopt -s dotglob
         for f in _public/*; do
           [ ! -e "./${f#_public/}" ] || { echo "::error::${f#_public/} already exists in the workspace"; exit 1; }
           mv "$f" .
         done
         rmdir _public
-        # Out of the tree, so no tool that scans the workspace sees a second
-        # copy of it. This repo's files are in the root now (overlaid).
-        mv _cloud "$RUNNER_TEMP/cloud-checkout"
