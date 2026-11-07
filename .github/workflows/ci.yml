@@ -63,19 +63,10 @@ jobs:
       # overlay tree as the cut-over will. GitHub reads workflows only from
       # this repo's own root, so these copies never run. An existing target is
       # a failure, never an overwrite.
+      # The same helper equivalence.sh uses: recursive, cp -P -p, refuses a
+      # symlinked hosted-workflows and an existing target.
       - name: place parked hosted workflows in the overlay tree
-        run: |
-          set -euo pipefail
-          mkdir -p public/.github/workflows
-          n=0
-          for f in private/hosted-workflows/*; do
-            [ -f "$f" ] || continue
-            t="public/.github/workflows/$(basename "$f")"
-            if [ -e "$t" ] || [ -L "$t" ]; then echo "::error::$t already exists"; exit 1; fi
-            cp "$f" "$t"
-            n=$((n + 1))
-          done
-          echo "placed $n hosted workflow(s)"
+        run: private/scripts/place-workflows.sh private public
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
       # sync there is no SYNCED_FROM and the script skips with a message.
@@ -97,7 +88,14 @@ jobs:
           ref: ${{ steps.synced.outputs.sha }}
           path: public-synced
           persist-credentials: false
-      - name: equivalence (pre-split overlay equals public at SYNCED_FROM)
+          fetch-depth: 0   # pin-check needs SYNCED_FROM and PUBLIC_PIN in one history
+      # PUBLIC_PIN is tied to SYNCED_FROM while public holds the hosted paths:
+      # the pin may lead the sync only if public did not touch them (cloud #5).
+      - if: ${{ steps.synced.outputs.sha != '' }}
+        name: pin-check (PUBLIC_PIN is tied to SYNCED_FROM)
+        run: private/scripts/pin-check.sh public-synced private
+      - if: ${{ steps.synced.outputs.sha != '' }}
+        name: equivalence (outside the private paths, the overlay equals public at SYNCED_FROM)
         run: private/scripts/equivalence.sh public-synced private
       - uses: pnpm/action-setup@v4
         with:
