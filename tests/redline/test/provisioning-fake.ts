@@ -187,7 +187,7 @@ export const CLEAR_FLOW_COOKIE =
 
 const ACTOR = {
   kind: "oidc",
-  label: "github:open-artifacts-ai/open-artifacts",
+  label: "github:open-artifacts-ai/open-artifacts-cloud",
   tokenId: null,
 };
 const err = (status: number, code: string) =>

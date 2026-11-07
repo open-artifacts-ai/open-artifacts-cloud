@@ -14,7 +14,7 @@ const HEAD = "b".repeat(40);
 
 // gh api: the tag's commit, the runs listing, two compares, a run's jobs.
 const gh = `
-p="\${@: -1}"; p="\${p#repos/$GITHUB_REPOSITORY/}"
+p="\${@: -1}"; p="\${p#repos/${REPO}/}"
 [ -f "$STATE/fail" ] && { echo "HTTP 502" >&2; exit 1; }
 case "$p" in
   commits/*) [ -f "$STATE/fail-commit" ] && exit 1; cat "$STATE/commit.json" ;;
@@ -78,7 +78,7 @@ const gate = (
     w(`jobs-${id}.json`, typeof j === "string" ? j : { jobs: j });
   if (opts.fail) w(opts.fail, "");
   const r = sb.run(["bash", SCRIPT, opts.tag ?? TAG], {
-    env: { STATE: sb.dir, GH_TOKEN: "t", GITHUB_REPOSITORY: REPO },
+    env: { STATE: sb.dir, GH_TOKEN: "t", GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud" },
   });
   return { ...r, log: sb.log() };
 };

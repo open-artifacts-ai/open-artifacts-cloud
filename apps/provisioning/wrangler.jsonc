@@ -47,9 +47,9 @@
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
         "OIDC_AUDIENCE": "https://api.open-artifacts-staging.app",
-        "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts",
+        "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
         "OIDC_REPOSITORY_ID": "{{GITHUB_REPOSITORY_ID_STAGING}}",
-        "OIDC_JOB_WORKFLOW_REFS": "open-artifacts-ai/open-artifacts/.github/workflows/redline-staging.yml@refs/heads/main,open-artifacts-ai/open-artifacts/.github/workflows/staging-test-admin.yml@refs/heads/main,open-artifacts-ai/open-artifacts/.github/workflows/staging-test-member.yml@refs/heads/main",
+        "OIDC_JOB_WORKFLOW_REFS": "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main,open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-admin.yml@refs/heads/main,open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-member.yml@refs/heads/main",
         "OIDC_ENVIRONMENT": "redline-staging"
       },
       "d1_databases": [

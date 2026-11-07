@@ -8,7 +8,7 @@ const cfg = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as {
   main?: string;
   env: Record<string, Record<string, unknown>>;
 };
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const ref = (f: string) => `${REPO}/.github/workflows/${f}@refs/heads/main`;
 const OIDC = [
   "OIDC_AUDIENCE",

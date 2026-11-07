@@ -174,7 +174,7 @@ describe("wrangler.jsonc", () => {
               "staging-test-member.yml",
             ].map(
               (w) =>
-                `open-artifacts-ai/open-artifacts/.github/workflows/${w}@refs/heads/main`,
+                `open-artifacts-ai/open-artifacts-cloud/.github/workflows/${w}@refs/heads/main`,
             ),
           );
         }

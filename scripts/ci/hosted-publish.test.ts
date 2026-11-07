@@ -6,7 +6,7 @@ import { sandbox, script } from "./stubs.ts";
 // hosted-publish.yml's scripts (design v7 6.4): resolve what to publish
 // (hosted-publish-resolve.sh) and fetch a signed floor from a hosted-floor.yml
 // run (hosted-floor-fetch.sh). Both read only and fail closed.
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 

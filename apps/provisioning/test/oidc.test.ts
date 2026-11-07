@@ -21,7 +21,7 @@ import { fakeEnv } from "./fakes.js";
 // end to end; the clock is pinned.
 const T = 1_800_000_000_000;
 const S = T / 1000;
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const WF = `${REPO}/.github/workflows/redline-staging.yml@refs/heads/main`;
 const AUD = `https://${STAGING_API_HOST}`;
 

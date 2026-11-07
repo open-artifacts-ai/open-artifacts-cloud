@@ -34,7 +34,7 @@ const named = (n: string) => {
   if (!s) throw new Error(`no step ${n}`);
   return s;
 };
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
 const SHA = "a".repeat(40);
 const FULL =

@@ -8,7 +8,7 @@ import { sandbox, script } from "./stubs.ts";
 const SCRIPT = script("deploy-token-expiry.sh");
 const TOK = "cfut_DEPLOY_token_never_printed_0123";
 const NOW = Date.parse("2026-10-31T12:00:00Z") / 1000;
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 
 const curl = `cfg="$(cat)"
 case "$cfg" in *"$TOK_EXPECT"*) ;; *) echo '{"success":false,"errors":[{"code":1000}]}'; exit 0 ;; esac
