@@ -174,7 +174,7 @@ export function world(o: { env?: Env; ci?: boolean } = {}) {
         ? {
             CI: "true",
             GITHUB_SERVER_URL: "https://github.com",
-            GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts",
+            GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
             GITHUB_RUN_ID: "42",
           }
         : {}),

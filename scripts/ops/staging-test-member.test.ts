@@ -506,7 +506,7 @@ describe("main, with gh and fetch mocked", () => {
       "run",
       WORKFLOW,
       "-R",
-      "open-artifacts-ai/open-artifacts",
+      "open-artifacts-ai/open-artifacts-cloud",
       "--ref",
       "main",
     ]);

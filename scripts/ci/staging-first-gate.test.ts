@@ -10,7 +10,7 @@ import { sandbox, script } from "./stubs.ts";
 // redline-staged-version artifact's version.txt is the tag's version. Lookup
 // errors fail closed. The clock is pinned (GATE_NOW).
 const SCRIPT = script("staging-first-gate.sh");
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const NOW = Date.parse("2026-10-31T12:00:00Z") / 1000;
 const TAG = "v0.80.0";
 const SHA = "c".repeat(40);

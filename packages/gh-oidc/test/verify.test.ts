@@ -16,10 +16,10 @@ import {
 
 const pins: Pins = {
   audience: "https://api.open-artifacts-staging.app",
-  repository: "open-artifacts-ai/open-artifacts",
+  repository: "open-artifacts-ai/open-artifacts-cloud",
   repositoryId: "1",
   jobWorkflowRefs: [
-    "open-artifacts-ai/open-artifacts/.github/workflows/redline-staging.yml@refs/heads/main",
+    "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main",
   ],
   environment: "redline-staging",
 };
@@ -235,7 +235,7 @@ describe("verify (4.4)", () => {
       "job_workflow_ref",
       {
         job_workflow_ref:
-          "open-artifacts-ai/open-artifacts/.github/workflows/other.yml@refs/heads/main",
+          "open-artifacts-ai/open-artifacts-cloud/.github/workflows/other.yml@refs/heads/main",
       },
       "job_workflow_ref",
     ],
@@ -259,7 +259,7 @@ describe("verify (4.4)", () => {
 
   it("accepts any sub (not a 4.4 pin: a custom OIDC sub template still verifies)", async () => {
     const srv = jwksServer(() => [key.jwk]);
-    const sub = "repo:open-artifacts-ai/open-artifacts:ref:refs/heads/main";
+    const sub = "repo:open-artifacts-ai/open-artifacts-cloud:ref:refs/heads/main";
     await expect(
       verify(await sign({ ...good(), sub }), pins, opts(srv)),
     ).resolves.toMatchObject({ sub });

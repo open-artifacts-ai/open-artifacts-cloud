@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { type Exec, plan, ranArtifact, report } from "./redline-nightly.ts";
 
-const REPO = "open-artifacts-ai/open-artifacts";
+const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const NOW = Date.parse("2026-11-03T03:17:00Z");
 const hoursAgo = (h: number) => new Date(NOW - h * 3_600_000).toISOString();
 const TAG = "v0.99.0";
