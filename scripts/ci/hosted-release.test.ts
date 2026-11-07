@@ -1,6 +1,8 @@
 // T3b: the hosted release jobs in release-please.yml (guard, build, check,
 // sign and attach per env) and hosted-floor.yml. The signing key never
 // shares a job with installed code.
+
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -31,8 +33,10 @@ const stepsOf = (wf: any, job: string): Step[] => wf.jobs[job].steps;
 const steps = (job: string) => stepsOf(w, job);
 const needs = (job: string): string[] => [w.jobs[job].needs ?? []].flat();
 const runOf = (st: Step[]) => st.map((s) => s.run ?? "").join("\n");
+const APP_TOKEN =
+  "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
 const SHA_PIN =
-  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node)|pnpm\/action-setup)@[0-9a-f]{40}$/;
+  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node|create-github-app-token)|pnpm\/action-setup)@[0-9a-f]{40}$/;
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
 const GUARD_SHA = "${{ needs.hosted-guard.outputs.sha }}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
@@ -742,7 +746,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
   it("the mirror mints the release App token, only outside a dry run", () => {
     const st = allSteps("mirror");
     const app = st.find((s) => s.id === "app") as Step;
-    expect(app.uses).toBe("actions/create-github-app-token@v2");
+    expect(app.uses).toBe(APP_TOKEN);
     expect(app.with).toEqual({
       "app-id": "${{ secrets.RELEASE_APP_ID }}",
       "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
@@ -785,6 +789,90 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(run).toContain('[ "$main_sha" = "$SHA" ]');
   });
 
+  // Runs the real create step with a fake gh. A re-run after main moved must
+  // not fail (the tag cannot be changed, so a stuck release is permanent).
+  describe("create step behavior", () => {
+    const MAIN = "b".repeat(40);
+    const X = "a".repeat(40);
+    function runCreate(o: {
+      tagAt?: string;
+      main: string;
+      compare: string;
+      sha: string;
+    }) {
+      const dir = mkdtempSync(join(tmpdir(), "relcreate-"));
+      const log = join(dir, "calls.log");
+      const fake = [
+        "#!/usr/bin/env bash",
+        'echo "$*" >> "$LOG"',
+        'case "$*" in',
+        '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
+        `  "api repos/o/r/git/ref/tags/"*) [ -n "\${TAG_AT:-}" ] || exit 1; echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
+        '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
+        '  "release view"*) exit 0 ;;',
+        "  *) exit 0 ;;",
+        "esac",
+      ].join("\n");
+      writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
+      const st = allSteps("mirror").find(
+        (x) => x.name === "Create the tag and the release",
+      ) as Step;
+      const r = spawnSync("bash", ["-c", st.run], {
+        encoding: "utf8",
+        env: {
+          PATH: `${dir}:${process.env.PATH}`,
+          LOG: log,
+          MAIN: o.main,
+          COMPARE: o.compare,
+          TAG_AT: o.tagAt ?? "",
+          REPO: "o/r",
+          TAG: "v1.2.3",
+          SHA: o.sha,
+          PUBLIC_REPO: "p/p",
+        },
+      });
+      const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+      return { status: r.status, out: r.stdout + r.stderr, calls };
+    }
+    it("tag exists at SHA and main has moved: a no-op success", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain("already points at");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("tag exists at SHA but SHA left main: fails", () => {
+      const r = runCreate({
+        tagAt: X,
+        main: MAIN,
+        compare: "diverged",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("is not on main");
+    });
+    it("tag exists at another commit: fails", () => {
+      const r = runCreate({
+        tagAt: MAIN,
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("already exists and is not");
+    });
+    it("no tag and main has moved: fails, creates nothing", () => {
+      const r = runCreate({ main: MAIN, compare: "behind", sha: X });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("not the head of main");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("no tag and SHA is main's head: creates the tag", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toContain("-X POST");
+    });
+  });
+
   it("a real run needs main; the guard ties the tag, the commit and PUBLIC_PIN", () => {
     const run = runOf(allSteps("hosted-guard"));
     expect(run).toContain("refs/heads/main");
@@ -809,11 +897,10 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       });
   });
 
-  it("pins every action by SHA except the release App's", () => {
+  it("pins every action by SHA, the release App's too", () => {
     for (const j of JOBS)
       for (const s of allSteps(j)) {
         if (!s.uses) continue;
-        if (s.uses === "actions/create-github-app-token@v2") continue;
         expect(s.uses, `${j}: ${s.uses}`).toMatch(SHA_PIN);
       }
   });

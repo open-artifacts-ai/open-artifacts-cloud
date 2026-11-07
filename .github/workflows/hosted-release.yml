@@ -116,12 +116,13 @@ jobs:
         run: echo "dry run, so no tag and no release are created"
       - id: app
         if: ${{ !inputs.dry_run }}
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      # The tag is this commit, which must be main's head. An existing tag
-      # must already be this commit (a re-run); a different one stops the run.
+      # A new tag is this commit, which must be main's head. An existing tag
+      # must already be this commit (a re-run, even after main moved, as long
+      # as the commit is still on main); a different one stops the run.
       - name: Create the tag and the release
         if: ${{ !inputs.dry_run }}
         env:
@@ -132,12 +133,18 @@ jobs:
         run: |
           set -euo pipefail
           main_sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
-          [ "$main_sha" = "$SHA" ] || { echo "::error::$SHA is not the head of main ($main_sha); dispatch again from main's head"; exit 1; }
           if existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> /dev/null); then
+            # A re-run: the tag is already this commit, and main may have moved on.
             [ "$(jq -r .object.type <<< "$existing")" = commit ] && [ "$(jq -r .object.sha <<< "$existing")" = "$SHA" ] \
               || { echo "::error::tag $TAG already exists and is not $SHA"; exit 1; }
+            status=$(gh api "repos/$REPO/compare/$main_sha...$SHA" -q .status)
+            case "$status" in
+              behind|identical) ;;
+              *) echo "::error::$SHA is not on main (compare: $status)"; exit 1 ;;
+            esac
             echo "tag $TAG already points at $SHA"
           else
+            [ "$main_sha" = "$SHA" ] || { echo "::error::$SHA is not the head of main ($main_sha); dispatch again from main's head"; exit 1; }
             gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" > /dev/null
             echo "created tag $TAG at $SHA"
           fi
