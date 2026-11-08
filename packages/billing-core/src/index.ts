@@ -40,6 +40,8 @@ export {
   parseEvent,
   type PriceIds,
   pricesOf,
+  pruneStripeEvents,
+  STRIPE_EVENT_RETENTION_MS,
   type StripeEvent,
   statusFromSubscription,
   streamOf,

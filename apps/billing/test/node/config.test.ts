@@ -55,6 +55,8 @@ describe("wrangler.jsonc", () => {
       );
       // Workers Logs would record full URLs.
       expect(e.observability).toEqual({ enabled: false });
+      // One daily cron: the stripe_events prune (#1479).
+      expect(e.triggers).toEqual({ crons: ["17 3 * * *"] });
       // The env (the app domain the gate's app host must be on) and this
       // env's own price placeholders; the Stripe key is a secret, never here.
       const up = env.toUpperCase();
@@ -71,7 +73,6 @@ describe("wrangler.jsonc", () => {
         "durable_objects",
         "queues",
         "dispatch_namespaces",
-        "triggers",
       ])
         expect(e).not.toHaveProperty(k);
     }

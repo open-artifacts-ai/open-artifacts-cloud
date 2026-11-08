@@ -39,6 +39,8 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": { "enabled": false },
+      // The daily prune of stripe_events (#1479), 03:17 UTC.
+      "triggers": { "crons": ["17 3 * * *"] },
       "d1_databases": [
         {
           "binding": "BILLING_DB",
@@ -71,6 +73,8 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": { "enabled": false },
+      // The daily prune of stripe_events (#1479), 03:17 UTC.
+      "triggers": { "crons": ["17 3 * * *"] },
       "d1_databases": [
         {
           "binding": "BILLING_DB",

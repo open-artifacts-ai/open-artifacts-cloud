@@ -474,6 +474,30 @@ const ORDER_COLUMN: Record<EventStream, string> = {
   invoice: "last_invoice_created",
 };
 
+/**
+ * How long a webhook event id is kept for dedupe: Stripe retries a failed
+ * delivery for up to 3 days, and a signature older than 5 minutes is refused,
+ * so 30 days is a wide margin (#1479).
+ */
+export const STRIPE_EVENT_RETENTION_MS = 30 * 86_400_000;
+
+/**
+ * Deletes the stripe_events rows received more than STRIPE_EVENT_RETENTION_MS
+ * before `now`; answers how many. A pruned id that arrives again is handled
+ * as any event: ordered by `created` against the row, so an old event never
+ * undoes newer state, and recorded again.
+ */
+export async function pruneStripeEvents(
+  db: D1Database,
+  now: number,
+): Promise<number> {
+  const r = await db
+    .prepare("DELETE FROM stripe_events WHERE received_at < ?1")
+    .bind(now - STRIPE_EVENT_RETENTION_MS)
+    .run();
+  return r.meta.changes;
+}
+
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
   req: Request,

@@ -26,6 +26,8 @@
 // the body first. A missing STRIPE_WEBHOOK_SECRET (a Worker secret) is 500
 // config, body unread. Any other method or path stays the plain 404.
 //
+// A daily cron prunes stripe_events older than 30 days (#1479).
+//
 // Logs carry fixed categories and install ids only: never bodies, headers or
 // URLs.
 
@@ -35,6 +37,7 @@ import {
   createCustomer,
   createPortalSession,
   handleStripeWebhook,
+  pruneStripeEvents,
   StripeApiError,
   type StripeConfig,
   StripeConfigError,
@@ -595,6 +598,19 @@ export default {
       // Never the error text: it can carry a D1 message.
       console.error("billing db_error", install);
       return bad("unavailable", 503);
+    }
+  },
+  // The daily cron (wrangler.jsonc triggers): prune the webhook dedupe table
+  // (#1479). A failure is logged by category only and retried by the next run.
+  async scheduled(controller, env) {
+    try {
+      const n = await pruneStripeEvents(
+        env.BILLING_DB,
+        controller.scheduledTime,
+      );
+      console.log("billing prune stripe_events", n);
+    } catch {
+      console.error("billing prune db_error");
     }
   },
 } satisfies ExportedHandler<Env>;

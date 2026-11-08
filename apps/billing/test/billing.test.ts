@@ -770,3 +770,61 @@ describe("logs", () => {
     expect(lines).toEqual([`billing db_error ${A}`]);
   });
 });
+
+describe("scheduled: prune stripe_events (#1479)", () => {
+  const DAY = 86_400_000;
+  const run = (time: number, e: Env = env) =>
+    billing.scheduled(
+      { scheduledTime: time, cron: "17 3 * * *", noRetry() {} },
+      e,
+    );
+  const ids = async () =>
+    (
+      await db
+        .prepare("SELECT event_id FROM stripe_events ORDER BY event_id")
+        .all<{ event_id: string }>()
+    ).results.map((r) => r.event_id);
+
+  it("drops ids older than 30 days at the cron's scheduled time, keeps the rest, touches nothing else", async () => {
+    await seed([{ install: A, tier: "team", version: 3 }]);
+    await db.batch(
+      [
+        ["evt_old", NOW - 31 * DAY],
+        ["evt_keep", NOW - 29 * DAY],
+        ["evt_now", NOW],
+      ].map(([id, at]) =>
+        db
+          .prepare(
+            "INSERT INTO stripe_events (event_id, received_at) VALUES (?, ?)",
+          )
+          .bind(id, at),
+      ),
+    );
+    const before = await rowOf(A);
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    await run(NOW);
+    expect(await ids()).toEqual(["evt_keep", "evt_now"]);
+    expect(await rowOf(A)).toEqual(before);
+    expect(lines).toEqual(["billing prune stripe_events 1"]);
+  });
+
+  it("a D1 failure is logged by category only and does not throw", async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    const broken = {
+      ...env,
+      BILLING_DB: {
+        prepare: () => {
+          throw new Error("D1_ERROR: secret detail");
+        },
+      },
+    } as unknown as Env;
+    await expect(run(NOW, broken)).resolves.toBeUndefined();
+    expect(lines).toEqual(["billing prune db_error"]);
+  });
+});

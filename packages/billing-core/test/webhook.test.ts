@@ -17,6 +17,8 @@ import {
   MAX_WEBHOOK_BODY,
   parseEvent,
   parseSignatureHeader,
+  pruneStripeEvents,
+  STRIPE_EVENT_RETENTION_MS,
   STRIPE_TOLERANCE_S,
   signStripePayload,
   statusFromSubscription,
@@ -1416,5 +1418,96 @@ describe("Solo (#1568)", () => {
       { env: soloEnv },
     );
     expect(await row(A)).toMatchObject({ status: "active", grace_until: null });
+  });
+});
+
+// ---------------------------------------------------------------- prune
+
+describe("pruning stripe_events (#1479)", () => {
+  const ids = async () =>
+    (
+      await db
+        .prepare("SELECT event_id FROM stripe_events ORDER BY event_id")
+        .all<{ event_id: string }>()
+    ).results.map((r) => r.event_id);
+
+  it("deletes ids received more than 30 days ago and keeps the rest; answers how many", async () => {
+    expect(STRIPE_EVENT_RETENTION_MS).toBe(30 * 86_400_000);
+    const rows: [string, number][] = [
+      ["evt_old1", NOW - STRIPE_EVENT_RETENTION_MS - 1],
+      ["evt_old2", 0],
+      ["evt_edge", NOW - STRIPE_EVENT_RETENTION_MS],
+      ["evt_new1", NOW - 1000],
+      ["evt_new2", NOW],
+    ];
+    await db.batch(
+      rows.map(([id, at]) =>
+        db
+          .prepare(
+            "INSERT INTO stripe_events (event_id, received_at) VALUES (?, ?)",
+          )
+          .bind(id, at),
+      ),
+    );
+    expect(await pruneStripeEvents(db, NOW)).toBe(2);
+    expect(await ids()).toEqual(["evt_edge", "evt_new1", "evt_new2"]);
+    // Nothing left to prune: 0, and nothing else changes.
+    expect(await pruneStripeEvents(db, NOW)).toBe(0);
+    expect(await ids()).toEqual(["evt_edge", "evt_new1", "evt_new2"]);
+  });
+
+  it("touches no tiers row and no other table", async () => {
+    const before = await row(A);
+    await pruneStripeEvents(db, NOW + 400 * 86_400_000);
+    expect(await row(A)).toEqual(before);
+  });
+
+  it("a pruned id arriving again is handled as any event: an older one never undoes newer state", async () => {
+    await ownSub(A);
+    const active = event("customer.subscription.updated", sub(), {
+      created: T + 10,
+    });
+    await deliver(active);
+    const deleted = event("customer.subscription.deleted", sub(), {
+      created: T + 100,
+    });
+    await deliver(deleted);
+    const lapsed = await row(A);
+    expect(lapsed).toMatchObject({ status: "lapsed" });
+    // 31 days on, both ids are pruned; Stripe (or a replayer with a fresh
+    // signature) delivers the old active update again.
+    const later = NOW + 31 * 86_400_000;
+    expect(await pruneStripeEvents(db, later)).toBe(2);
+    expect(await ids()).toEqual([]);
+    const again = await deliver(active, {
+      now: later,
+      t: Math.floor(later / 1000),
+    });
+    expect(again.status).toBe(200);
+    expect(await row(A)).toEqual(lapsed);
+    // It is recorded again (as stale), so a third delivery is a plain replay.
+    expect(await ids()).toEqual([active.id]);
+    const third = await deliver(active, {
+      now: later,
+      t: Math.floor(later / 1000),
+    });
+    expect(third.status).toBe(200);
+    expect(await row(A)).toEqual(lapsed);
+  });
+
+  it("a pruned id for the newest event applies once more, harmlessly, and then dedupes", async () => {
+    await ownSub(A);
+    const failed = event("invoice.payment_failed", inv(), { created: T + 5 });
+    await deliver(failed);
+    const first = await row(A);
+    const later = NOW + 40 * 86_400_000;
+    await pruneStripeEvents(db, later);
+    const t = Math.floor(later / 1000);
+    await deliver(failed, { now: later, t });
+    // Same status and the same grace (grace is kept once set).
+    expect(await row(A)).toMatchObject({
+      status: "past_due",
+      grace_until: first.grace_until,
+    });
   });
 });
