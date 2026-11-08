@@ -519,7 +519,7 @@ describe("expireCheckoutSession (#1568)", () => {
   };
   const cfg = (f: typeof fetch) => ({ secretKey: KEY, fetch: f });
 
-  it("reads the session; an open one is expired, keyed by its id", async () => {
+  it("reads the session; an open one is expired, with no Idempotency-Key (Stripe would replay a saved 500 for 24 hours)", async () => {
     await expireCheckoutSession(
       { sessionId: "cs_test_1" },
       cfg(stripe({ get: [{ id: "cs_test_1", status: "open" }] })),
@@ -529,7 +529,7 @@ describe("expireCheckoutSession (#1568)", () => {
       {
         method: "POST",
         path: "/v1/checkout/sessions/cs_test_1/expire",
-        key: "expire-cs_test_1",
+        key: null,
       },
     ]);
   });

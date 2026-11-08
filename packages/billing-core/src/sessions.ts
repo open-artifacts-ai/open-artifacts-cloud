@@ -345,7 +345,10 @@ export async function expireCheckoutSession(
   }
   if (!open) return { id };
   try {
-    await send(cfg, "POST", `${path}/expire`, {}, `expire-${id}`);
+    // No Idempotency-Key: Stripe replays a saved 500 for 24 hours, which would
+    // block Checkout. Expiring is idempotent anyway (a second call finds it
+    // expired).
+    await send(cfg, "POST", `${path}/expire`, {}, null);
   } catch (e) {
     // Lost a race with the customer paying (or with another expire).
     if (e instanceof StripeApiError && (e.status === 400 || e.status === 404))
