@@ -1244,9 +1244,9 @@ describe("POST /solo/start (#1568)", () => {
       .run();
     const s = fakeStripe();
     const r = await call(start());
-    expect(r.status).toBe(200);
+    // Not active: no trial and no Stripe call (see the status test below).
+    expect([r.status, await r.json()]).toEqual([409, { error: "not_active" }]);
     expect(s.calls).toEqual([]);
-    expect(await r.json()).toMatchObject({ tier: "solo", status: "lapsed" });
   });
 
   it("a webhook that got there first (the id is already stored) leaves it alone: no second subscription", async () => {
@@ -1554,9 +1554,7 @@ describe("Solo Checkout during the no-card trial keeps the free days (#1568)", (
     await db.prepare("DELETE FROM tiers").run();
     await seed(A, "cus_existingA", "solo");
     await db
-      .prepare(
-        "UPDATE tiers SET solo_trial_ends_at = ?1, status = 'lapsed' WHERE install_id = ?2",
-      )
+      .prepare("UPDATE tiers SET solo_trial_ends_at = ?1 WHERE install_id = ?2")
       .bind(NOW - H, A)
       .run();
     const s = fakeStripe();
@@ -1564,7 +1562,7 @@ describe("Solo Checkout during the no-card trial keeps the free days (#1568)", (
     expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({
       tier: "solo",
-      status: "lapsed",
+      status: "active",
       soloTrialEndsAt: null,
     });
     expect(s.calls).toEqual([]);
@@ -1752,5 +1750,52 @@ describe("an open Checkout session is expired before another is made (#1568)", (
       expect(r.status).toBe(500);
     }
     expect(s.calls).toEqual([]);
+  });
+});
+
+describe("POST /solo/start only for an active row (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("lapsed, suspended and past_due rows get 409 not_active: no trial, no customer, no Stripe call, nothing written", async () => {
+    for (const status of ["lapsed", "suspended", "past_due"]) {
+      await db.prepare("DELETE FROM tiers").run();
+      await seed(A, null, "solo");
+      await db
+        .prepare("UPDATE tiers SET status = ?1 WHERE install_id = ?2")
+        .bind(status, A)
+        .run();
+      const before = await rowOf(A);
+      const s = fakeStripe();
+      const r = await call(req("/solo/start", { install: A, ts: NOW }));
+      expect([r.status, await r.json(), status]).toEqual([
+        409,
+        { error: "not_active" },
+        status,
+      ]);
+      expect(s.calls, status).toEqual([]);
+      expect(await rowOf(A), status).toEqual(before);
+    }
+  });
+
+  it("a missing row, and an active one, still start", async () => {
+    const s = fakeStripe();
+    expect(
+      (await call(req("/solo/start", { install: A, ts: NOW }))).status,
+    ).toBe(200);
+    expect(s.calls.map((c) => c.path)).toEqual([
+      CUSTOMERS,
+      "/v1/subscriptions",
+    ]);
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(B, null, "free");
+    expect(
+      (await call(req("/solo/start", { install: B, ts: NOW }, { install: B })))
+        .status,
+    ).toBe(200);
   });
 });

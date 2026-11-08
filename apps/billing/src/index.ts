@@ -162,7 +162,7 @@ const OPEN_SQL =
 const STORE_OPEN_SQL =
   "UPDATE tiers SET open_checkout_id = ?1, open_checkout_key = ?2 WHERE install_id = ?3 AND open_checkout_id IS ?4 AND open_checkout_key IS ?5 RETURNING 1 AS ok";
 const SOLO_HELD_SQL =
-  "SELECT tier, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
+  "SELECT tier, status, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
 const SOLO_TRIAL_MS = SOLO_TRIAL_DAYS * 86_400_000;
 const SOLO_START_SQL = `UPDATE tiers SET tier = 'solo', stripe_subscription_id = ?2, solo_trial_ends_at = ?3, version = version + 1, updated_at = ?4 WHERE install_id = ?1 AND tier IN ('solo', 'free') AND solo_trial_ends_at IS NULL AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?2) RETURNING ${COLS}`;
 const USAGE_SQL =
@@ -618,12 +618,19 @@ async function soloStart(
   await materialize(db, install, now);
   const held = await db.prepare(SOLO_HELD_SQL).bind(install).first<{
     tier: string | null;
+    status: string | null;
     stripe_subscription_id: string | null;
     solo_trial_ends_at: number | null;
   }>();
   if (held?.tier && held.tier !== "solo" && held.tier !== "free") {
     console.log("billing solo plan_conflict", install);
     return bad("plan_conflict", 409);
+  }
+  // A lapsed, past_due or suspended row gets no trial and no Stripe call (a
+  // missing row is an active Solo by default).
+  if (held && held.status !== "active") {
+    console.log("billing solo not_active", install);
+    return bad("not_active", 409);
   }
   const unchanged = async () => {
     const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
