@@ -2591,6 +2591,25 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
     }
   });
 
+  it("a suspended row's subscription is live too: a Solo session paid after suspension changes nothing and is queued; a Team session replaces and queues it", async () => {
+    await live("team", "suspended");
+    let s = stripe();
+    await deliver(checkout("sub_Solo1", "solo"), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "suspended",
+      stripe_subscription_id: "sub_Team1",
+    });
+    expect(s.calls).toEqual(["GET sub_Solo1", "DELETE sub_Solo1"]);
+    s = stripe();
+    await deliver(checkout("sub_Team2", "team"), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      status: "suspended",
+      stripe_subscription_id: "sub_Team2",
+    });
+    expect(s.calls).toEqual(["GET sub_Team1", "DELETE sub_Team1"]);
+  });
+
   it("a lapsed Team row that buys Solo adopts it (nothing is live to protect)", async () => {
     await live("team", "lapsed");
     const s = stripe();

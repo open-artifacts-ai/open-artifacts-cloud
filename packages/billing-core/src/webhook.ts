@@ -232,15 +232,16 @@ export function statusFromSubscription(s: unknown): TierStatus | null {
 
 const PAID = "tier IN ('solo', 'team', 'business')";
 /**
- * The row's current subscription is live: a paid tier's, active or past_due,
+ * The row's current subscription is live: a paid tier's, active, past_due or
+ * suspended (a suspension is ours and keeps the subscription billing),
  * or (during the 14-day Business trial) the Solo subscription under it, whose
  * state lives in solo_status.
  */
 const PREV_LIVE =
-  "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due'))))";
+  "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due', 'suspended'))))";
 /** The row is live on a Team or Business subscription. */
 const HOLD =
-  "(tier IN ('team', 'business') AND stripe_subscription_id IS NOT NULL AND status IN ('active', 'past_due'))";
+  "(tier IN ('team', 'business') AND stripe_subscription_id IS NOT NULL AND status IN ('active', 'past_due', 'suspended'))";
 const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/;
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
@@ -926,7 +927,9 @@ export async function handleStripeWebhook(
           : (prev.tier === "solo" ||
               prev.tier === "team" ||
               prev.tier === "business") &&
-            (prev.status === "active" || prev.status === "past_due"));
+            (prev.status === "active" ||
+              prev.status === "past_due" ||
+              prev.status === "suspended"));
       if (live)
         queue = [
           db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub, ev.id),
