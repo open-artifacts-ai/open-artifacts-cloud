@@ -28,19 +28,35 @@ const w: any = parse(text);
 const job: any = w.jobs.redline;
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const steps: Record<string, any>[] = job.steps;
+// The T19 job (#1730): beside the suite, no id-token.
+// biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+const t19Job: any = w.jobs.t19;
+// biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+const t19Steps: Record<string, any>[] = t19Job.steps;
 const SHA_PIN =
   /^(actions\/(checkout|upload-artifact|setup-node)|pnpm\/action-setup)@[0-9a-f]{40}$/;
 const SECRETS = ["REDLINE_PROD_R2_TOKEN", "REDLINE_PROD_SCRIPTS_TOKEN"];
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
-const named = (n: string): Record<string, any> => {
-  const s = steps.find((x) => x.name === n || x.id === n);
+const pick = (
+  list: Record<string, any>[],
+  n: string,
+  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+): Record<string, any> => {
+  const s = list.find((x) => x.name === n || x.id === n);
   if (!s) throw new Error(`no step ${n}`);
   return s;
 };
-const runBash = (script: string, env: Record<string, string>) =>
+const named = (n: string) => pick(steps, n);
+const t19Named = (n: string) => pick(t19Steps, n);
+const runBash = (
+  script: string,
+  env: Record<string, string>,
+  cwd?: string,
+) =>
   spawnSync("bash", ["-c", script], {
     env: { PATH: process.env.PATH, ...env },
     encoding: "utf8",
+    cwd,
   });
 
 describe("redline-staging.yml", () => {
@@ -58,9 +74,14 @@ describe("redline-staging.yml", () => {
     });
     expect(w.on.workflow_dispatch.inputs.tag.required).toBe(true);
     expect(w.permissions).toEqual({ contents: "read" });
-    expect(Object.keys(w.jobs)).toEqual(["platform-tags", "redline"]);
+    expect(Object.keys(w.jobs)).toEqual(["platform-tags", "t19", "redline"]);
     expect(job.environment).toBe("redline-staging");
-    expect(job.permissions).toEqual({ contents: "read", "id-token": "write" });
+    // `actions: read` is for the t19 hand-off (this run's artifacts and jobs).
+    expect(job.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+      actions: "read",
+    });
     expect(job["timeout-minutes"]).toBe(150);
     expect(w.concurrency).toEqual({
       group: "redline",
@@ -71,6 +92,7 @@ describe("redline-staging.yml", () => {
   it("refuses to start on a stale Worker: platform-tags (main's script, the staging deploy token) runs first (#1040)", () => {
     const pt = w.jobs["platform-tags"];
     expect(job.needs).toBe("platform-tags");
+    expect(t19Job.needs).toBe("platform-tags");
     expect(pt["runs-on"]).toBe("ubuntu-latest");
     expect(pt.environment).toBe("hosted-staging-deploy");
     expect(pt.permissions).toEqual({ contents: "read" });
@@ -111,6 +133,7 @@ describe("redline-staging.yml", () => {
       ps.filter((s) => JSON.stringify(s).includes("secrets.")),
     ).toHaveLength(1);
     expect(JSON.stringify(job)).not.toContain("CLOUDFLARE_API_TOKEN");
+    expect(JSON.stringify(t19Job)).not.toContain("CLOUDFLARE_API_TOKEN");
   });
 
   // P30 runs only with this set, and without it a dispatched run fails the
@@ -131,15 +154,17 @@ describe("redline-staging.yml", () => {
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
-    for (const s of steps)
-      if (s.uses && s.uses !== "./_cloud/.github/actions/overlay")
-        expect(s.uses).toMatch(SHA_PIN);
-    const checkouts = steps.filter((s) =>
-      String(s.uses).startsWith("actions/checkout@"),
-    );
-    expect(checkouts).toHaveLength(1);
-    expect(checkouts[0]?.with?.["persist-credentials"]).toBe(false);
-    for (const s of steps) expect(s.with?.cache).toBeUndefined();
+    for (const list of [steps, t19Steps]) {
+      for (const s of list)
+        if (s.uses && s.uses !== "./_cloud/.github/actions/overlay")
+          expect(s.uses).toMatch(SHA_PIN);
+      const checkouts = list.filter((s) =>
+        String(s.uses).startsWith("actions/checkout@"),
+      );
+      expect(checkouts).toHaveLength(1);
+      expect(checkouts[0]?.with?.["persist-credentials"]).toBe(false);
+      for (const s of list) expect(s.with?.cache).toBeUndefined();
+    }
   });
 
   it("no stored red-line or inventory key: only the prod probe's two tokens are secrets", () => {
@@ -158,6 +183,11 @@ describe("redline-staging.yml", () => {
     for (const n of SECRETS) expect(st.run).toContain(`> "$d/${n}"`);
     expect(job.env).toBeUndefined();
     expect(w.env).toBeUndefined();
+    // The t19 job references no secret and no Environment (whose secrets it
+    // would otherwise be able to reach).
+    expect(JSON.stringify(t19Job)).not.toContain("secrets.");
+    expect(t19Job.environment).toBeUndefined();
+    expect(t19Job.env).toBeUndefined();
   });
 
   it("the prod probe's files: written only when its secrets are set, both or the job fails", () => {
@@ -208,7 +238,7 @@ describe("redline-staging.yml", () => {
     expect(steps[2]?.with).toEqual({ "exact-tag": "${{ inputs.tag }}" });
     // Nothing else may check out a different ref, and the deploy logic stays
     // main's: platform-tags keeps its own checkout of the workflow's commit.
-    expect(text.match(/refs\/tags\//g)).toHaveLength(1);
+    expect(text.match(/refs\/tags\//g)).toHaveLength(2);
     expect(guard.run).not.toContain("${{");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(guard.env).toEqual({
@@ -234,9 +264,17 @@ describe("redline-staging.yml", () => {
   // A rename on main breaks every tag still in use: the workflow is main's and
   // these are the tag's. Change this list only with the tags in mind (#1137).
   it("keeps the commands main's workflow calls in a tag's checkout (#1137)", () => {
-    const CLI = ["mint-oidc", "bringup", "staged-version", "revoke"];
+    const CLI = [
+      "mint-oidc",
+      "bringup",
+      "staged-version",
+      "revoke",
+      "t19-recipient",
+      "t19-seal",
+      "t19-open",
+    ];
     const called = [
-      ...text.matchAll(/pnpm --filter @oa\/redline provisioning ([a-z-]+)/g),
+      ...text.matchAll(/pnpm --filter @oa\/redline provisioning ([a-z0-9-]+)/g),
     ].map((m) => m[1]);
     expect([...new Set(called)].sort()).toEqual([...CLI].sort());
     const cli = readFileSync(
@@ -332,7 +370,7 @@ describe("redline-staging.yml", () => {
     expect(t2.prod).toBeUndefined();
   });
 
-  it("mints the staging audiences, brings rl-a and rl-b up, mints prod's after bring-up, then the suite and T19", () => {
+  it("mints the staging audiences, brings rl-a and rl-b up, mints prod's after bring-up, then the suite", () => {
     expect(named("mint").run).toBe(
       "pnpm --filter @oa/redline provisioning mint-oidc provisioning stagingInventory",
     );
@@ -354,26 +392,9 @@ describe("redline-staging.yml", () => {
     // reads only this run's conclusion.
     expect(suite.run).not.toContain("--gate");
     expect(suite.env.REDLINE_GATE).toBe("1");
-    const t19 = named("t19");
-    expect(t19.if).toBe(
-      "${{ !cancelled() && steps.bringup.outcome == 'success' }}",
-    );
-    // #1251: the pin is the version the staged step saw (version.txt),
-    // read before Playwright starts, never a literal in env; no file fails.
-    const pin =
-      'T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/redline-staged/version.txt")"';
-    expect(t19.run).toContain(pin);
-    expect(t19.run).toContain(
-      'if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi',
-    );
-    expect(t19.run).toContain("export T19_EXPECT_VERSION");
-    expect(t19.run.indexOf(pin)).toBeLessThan(
-      t19.run.indexOf("playwright test -c playwright.staging.config.ts"),
-    );
-    expect(t19.env).not.toHaveProperty("T19_EXPECT_VERSION");
-    // leo's pin stays unset in CI until #955 keeps leo current (#1251).
-    expect(text).not.toContain("T19_EXPECT_LEO_VERSION");
-    expect(t19.run).not.toContain("No version pin");
+    // T19 is not a step of this job any more (#1730).
+    expect(JSON.stringify(job)).not.toContain("playwright test");
+    expect(JSON.stringify(job)).not.toContain("T19_EXPECT");
   });
 
   it("uploads redline-staged-version (version.txt) after bring-up, only once rl-a and rl-b /healthz report the tag", () => {
@@ -396,93 +417,389 @@ describe("redline-staging.yml", () => {
     expect(steps.indexOf(up[0] ?? {})).toBe(steps.indexOf(staged) + 1);
   });
 
-  it("T19 shares the id-token job (a recorded deviation from 4.4), so every JWT and prod file is gone before it runs", () => {
-    expect(text).toContain(
-      'Deviation from 4.4 ("id-token on the redline job only, not t19")',
-    );
-    const drop = named("Delete the JWT and prod files before T19");
-    expect(drop.if).toBe("always()");
-    expect(steps.indexOf(drop)).toBe(steps.indexOf(named("t19")) - 1);
-    expect(steps.indexOf(named("scan-suite"))).toBeLessThan(
-      steps.indexOf(drop),
-    );
-    const tmp = mkdtempSync(join(tmpdir(), "rl-drop-"));
-    try {
-      const d = join(tmp, "redline-secrets");
-      mkdirSync(d);
-      for (const f of [
-        "REDLINE_PROVISIONING_OIDC",
-        "REDLINE_STG_INVENTORY_OIDC",
-        "REDLINE_PROD_INVENTORY_OIDC",
-        "REDLINE_MINTED_OIDC",
-        "REDLINE_PROD_R2_TOKEN",
-        "REDLINE_PROD_SCRIPTS_TOKEN",
-        "REDLINE_RL_A_HOOK_KEY",
-        "REDLINE_RL_A_PAT",
-      ])
-        writeFileSync(join(d, f), "x");
-      expect(runBash(String(drop.run), { RUNNER_TEMP: tmp }).status).toBe(0);
-      expect(readdirSync(d).sort()).toEqual([
-        "REDLINE_RL_A_HOOK_KEY",
-        "REDLINE_RL_A_PAT",
-      ]);
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
-  it("T19's shell unsets the OIDC request variables and refuses to start if either survives", () => {
-    const t19 = named("t19");
-    expect(t19.env).toMatchObject({
-      ACTIONS_ID_TOKEN_REQUEST_URL: "",
-      ACTIONS_ID_TOKEN_REQUEST_TOKEN: "",
+  describe("the t19 job (#1730): beside the suite, no id-token", () => {
+    it("holds no id-token, no Environment and no secret, and runs beside the redline job, not after it", () => {
+      expect(t19Job.permissions).toEqual({
+        contents: "read",
+        actions: "read",
+      });
+      expect(JSON.stringify(t19Job)).not.toMatch(
+        /id-token|ACTIONS_ID_TOKEN|secrets\.|REDLINE_PROD|mint-oidc/,
+      );
+      // Neither job waits for the other through `needs`: they overlap.
+      expect(t19Job.needs).toBe("platform-tags");
+      expect(job.needs).toBe("platform-tags");
+      // The workflow no longer records a deviation from 4.4, and T19's shell
+      // has nothing to unset.
+      expect(text).not.toContain("Deviation from 4.4");
+      expect(text).toContain('id-token on the redline job only, not t19" holds');
+      expect(
+        steps.some((s) => /Delete the JWT and prod files/.test(s.name ?? "")),
+      ).toBe(false);
+      expect(t19Job["timeout-minutes"]).toBeLessThanOrEqual(30);
     });
-    const run = String(t19.run);
-    const pre = run.slice(0, run.indexOf("pnpm --filter @oa/dashboard"));
-    expect(pre).toContain(
-      "unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-    );
-    // The staged version the pin reads (#1251), as the staged step leaves it.
-    const temp = mkdtempSync(join(tmpdir(), "t19-pin-"));
-    mkdirSync(join(temp, "redline-staged"));
-    writeFileSync(join(temp, "redline-staged", "version.txt"), "0.97.0\n");
-    const vars = {
-      ACTIONS_ID_TOKEN_REQUEST_URL: "https://runner.example/token",
-      ACTIONS_ID_TOKEN_REQUEST_TOKEN: "tok",
-      RUNNER_TEMP: temp,
-    };
-    const r = runBash(`${pre}\nenv`, vars);
-    expect(r.status).toBe(0);
-    expect(r.stdout).not.toContain("ACTIONS_ID_TOKEN_REQUEST_");
-    // The guard itself: without the unset, a surviving variable stops T19.
-    const guard = pre.replace(/^\s*unset ACTIONS_ID_TOKEN_REQUEST_URL.*$/m, "");
-    const g = runBash(guard, vars);
-    expect(g.status).toBe(1);
-    expect(g.stdout).toContain("T19 can reach the OIDC request variables");
-    rmSync(temp, { recursive: true, force: true });
+
+    it("a failed T19 fails the run: nothing in the job is allowed to fail softly", () => {
+      expect(t19Job["continue-on-error"]).toBeUndefined();
+      expect(t19Job.if).toBeUndefined();
+      for (const s of t19Steps) expect(s["continue-on-error"]).toBeUndefined();
+      // The one soft step of the workflow is the redline job's seal, and a
+      // missing key fails the t19 job (its wait step), so the run still fails.
+      const soft = steps.filter((s) => s["continue-on-error"]);
+      expect(soft.map((s) => s.id)).toEqual(["t19-key"]);
+      const t19 = t19Named("t19");
+      // T19 itself runs only after the key was opened: no key, no T19, and
+      // the failed wait or open step already failed the job.
+      expect(t19.if).toBeUndefined();
+      expect(t19Steps.indexOf(t19)).toBeGreaterThan(
+        t19Steps.indexOf(t19Named("open")),
+      );
+    });
+
+    it("opens the same guard as the redline job before any checkout", () => {
+      expect(t19Steps[0]).toMatchObject({
+        name: "On main, for a release tag",
+        env: { TAG: "${{ inputs.tag }}", REF: "${{ github.ref }}" },
+      });
+      expect(t19Steps[0]?.run).toBe(steps[0]?.run);
+      expect(t19Steps[1]?.uses).toMatch(/^actions\/checkout@/);
+      expect(t19Steps[1]?.with).toEqual(steps[1]?.with);
+      expect(t19Steps[2]).toEqual(steps[2]);
+    });
+
+    it("keeps the pin: T19_EXPECT_VERSION is the staged version.txt handed over with the key, and no file or an empty one stops it (#1251)", () => {
+      const t19 = t19Named("t19");
+      expect(t19.env).toEqual({ T19_EXPECT_TIER: "team" });
+      const run = String(t19.run);
+      const pin =
+        'T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/t19-sealed/version.txt")"';
+      expect(run).toContain(pin);
+      expect(run).toContain(
+        'if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi',
+      );
+      expect(run).toContain("export T19_EXPECT_VERSION");
+      expect(run.indexOf(pin)).toBeLessThan(
+        run.indexOf("playwright test -c playwright.staging.config.ts"),
+      );
+      // leo's pin stays unset in CI until #955 keeps leo current (#1251).
+      expect(text).not.toContain("T19_EXPECT_LEO_VERSION");
+      const pre = run.slice(0, run.indexOf("pnpm --filter @oa/dashboard"));
+      const temp = mkdtempSync(join(tmpdir(), "t19-pin-"));
+      try {
+        mkdirSync(join(temp, "t19-sealed"));
+        writeFileSync(join(temp, "t19-sealed", "version.txt"), "0.97.0\n");
+        const ok = runBash(`${pre}\nenv`, { RUNNER_TEMP: temp });
+        expect(ok.status).toBe(0);
+        expect(ok.stdout).toMatch(/^T19_EXPECT_VERSION=0\.97\.0$/m);
+        // The OIDC request variables are not in this job at all.
+        expect(ok.stdout).not.toContain("ACTIONS_ID_TOKEN_REQUEST_");
+        rmSync(join(temp, "t19-sealed", "version.txt"));
+        expect(runBash(pre, { RUNNER_TEMP: temp }).status).not.toBe(0);
+        writeFileSync(join(temp, "t19-sealed", "version.txt"), "");
+        const empty = runBash(pre, { RUNNER_TEMP: temp });
+        expect(empty.status).toBe(1);
+        expect(empty.stdout).toContain("T19: no staged version to pin");
+      } finally {
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
+    it("the t19 job's targets: the base JSON plus its own secretsDir, nothing else", () => {
+      const st = t19Named("Set the targets");
+      expect(st.env).toEqual({ REDLINE_TARGETS_BASE: "${{ vars.REDLINE_TARGETS }}" });
+      expect(st.run).not.toContain("${{");
+      const tmp = mkdtempSync(join(tmpdir(), "t19-targets-"));
+      try {
+        const ghEnv = join(tmp, "env");
+        writeFileSync(ghEnv, "");
+        const r = runBash(String(st.run), {
+          RUNNER_TEMP: tmp,
+          GITHUB_ENV: ghEnv,
+          REDLINE_TARGETS_BASE:
+            '{"mode":"staging","a":{"name":"rl-a","installId":"i1"},"b":{"name":"rl-b","installId":"i2"}}',
+        });
+        expect(r.status).toBe(0);
+        const line = readFileSync(ghEnv, "utf8").trim();
+        const t = JSON.parse(line.slice("REDLINE_TARGETS=".length));
+        expect(t.secretsDir).toBe(join(tmp, "redline-secrets"));
+        expect(t.a.name).toBe("rl-a");
+        expect(t.prod).toBeUndefined();
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 
-  it("T19 exports the staged version as its pin, and stops when there is none (#1251)", () => {
-    const run = String(named("t19").run);
-    const pre = run.slice(0, run.indexOf("pnpm --filter @oa/dashboard"));
-    const temp = mkdtempSync(join(tmpdir(), "t19-pin-"));
-    try {
-      mkdirSync(join(temp, "redline-staged"));
-      writeFileSync(join(temp, "redline-staged", "version.txt"), "0.97.0\n");
-      const ok = runBash(`${pre}\nenv`, { RUNNER_TEMP: temp });
-      expect(ok.status).toBe(0);
-      expect(ok.stdout).toMatch(/^T19_EXPECT_VERSION=0\.97\.0$/m);
-      // No file: staging didn't take the tag, so T19 never runs unpinned.
-      rmSync(join(temp, "redline-staged", "version.txt"));
-      expect(runBash(pre, { RUNNER_TEMP: temp }).status).not.toBe(0);
-      // An empty file stops it too, with its own line.
-      writeFileSync(join(temp, "redline-staged", "version.txt"), "");
-      const empty = runBash(pre, { RUNNER_TEMP: temp });
-      expect(empty.status).toBe(1);
-      expect(empty.stdout).toContain("T19: no staged version to pin");
-    } finally {
-      rmSync(temp, { recursive: true, force: true });
+  describe("the hook key hand-off: per run, sealed only, the private key stays", () => {
+    const uploads = (list: Record<string, any>[]) =>
+      list.filter((s) => String(s.uses ?? "").startsWith("actions/upload-artifact"));
+
+    it("the artifacts are named per run and attempt, and carry only the public key, the sealed key and the version", () => {
+      const names = (list: Record<string, any>[]) =>
+        uploads(list).map((u) => String(u.with.name));
+      const per = "${{ github.run_id }}-${{ github.run_attempt }}";
+      expect(names(t19Steps)).toEqual([
+        `t19-recipient-${per}`,
+        "t19-report",
+      ]);
+      expect(names(steps)).toEqual([
+        "redline-staged-version",
+        `t19-handoff-${per}`,
+        `t19-handoff-${per}`,
+        "redline-report",
+      ]);
+      const pub = uploads(t19Steps)[0];
+      expect(pub?.with.path).toBe("${{ runner.temp }}/t19-recipient/public-key");
+      // Never the private key, the recipient directory, or a secrets directory.
+      const all = JSON.stringify([...uploads(steps), ...uploads(t19Steps)]);
+      expect(all).not.toMatch(/private-key|redline-secrets|HOOK_KEY/);
+      expect(all).not.toMatch(/t19-recipient"|t19-recipient\/?"/);
+      const handoff = uploads(steps).filter((u) =>
+        String(u.with.name).startsWith("t19-handoff-"),
+      );
+      expect(handoff.map((u) => u.with.path)).toEqual([
+        "${{ runner.temp }}/t19-handoff",
+        "${{ runner.temp }}/t19-nohandoff",
+      ]);
+      for (const u of [...handoff, pub]) expect(u?.with["retention-days"]).toBe(1);
+    });
+
+    it("the redline job seals only after rl-a and rl-b report the tag, to the public key the t19 job uploaded", () => {
+      const key = named("t19-key");
+      expect(key.if).toBe("steps.staged.outcome == 'success'");
+      expect(steps.indexOf(key)).toBeGreaterThan(
+        steps.indexOf(named("staged")),
+      );
+      expect(key.run).toContain(
+        'pnpm --filter @oa/redline provisioning t19-seal "$pub/public-key" "$out/sealed"',
+      );
+      expect(key.run).toContain(
+        't19-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}',
+      );
+      expect(key.run).toContain('cp "$RUNNER_TEMP/redline-staged/version.txt" "$out/version.txt"');
+      expect(key.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
+    });
+
+    /** A fake `gh`: each `gh run download` and `gh api` answers from a script of files. */
+    function sandbox() {
+      const dir = mkdtempSync(join(tmpdir(), "t19-gh-"));
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      // download: fails until FAIL_N calls were made, then writes FILES into -D.
+      // api: prints the n-th line of $STATUSES through the real jq filter.
+      writeFileSync(
+        join(bin, "gh"),
+        `#!/usr/bin/env bash
+n=$(( $(cat "$GH_STATE/calls" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$GH_STATE/calls"
+echo "$*" >> "$GH_STATE/log"
+if [ "$1" = run ] && [ "$2" = download ]; then
+  [ "$n" -gt "\${FAIL_N:-0}" ] || exit 1
+  d=""; prev=""
+  for a in "$@"; do [ "$prev" = -D ] && d="$a"; prev="$a"; done
+  mkdir -p "$d"
+  for f in $FILES; do echo "content-of-$f" > "$d/$f"; done
+  exit 0
+fi
+if [ "$1" = api ]; then
+  line=$(sed -n "\${n}p" "$GH_STATE/statuses"); [ -n "$line" ] || line=$(tail -n 1 "$GH_STATE/statuses")
+  [ "$line" != ERROR ] || exit 1
+  expr=""; prev=""
+  for a in "$@"; do [ "$prev" = --jq ] && expr="$a"; prev="$a"; done
+  jq -r "$expr" <<< "$line"
+  exit 0
+fi
+exit 2
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        join(bin, "pnpm"),
+        `#!/usr/bin/env bash
+echo "$*" >> "$GH_STATE/pnpm"
+for last; do :; done
+case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
+`,
+        { mode: 0o755 },
+      );
+      const state = join(dir, "state");
+      mkdirSync(state);
+      const temp = join(dir, "temp");
+      mkdirSync(temp);
+      const env = (extra: Record<string, string> = {}) => ({
+        PATH: `${bin}:${process.env.PATH}`,
+        RUNNER_TEMP: temp,
+        GH_STATE: state,
+        GITHUB_RUN_ID: "42",
+        GITHUB_RUN_ATTEMPT: "2",
+        GITHUB_REPOSITORY: "o/r",
+        POLL_S: "0",
+        ...extra,
+      });
+      const read = (f: string) =>
+        existsSync(join(state, f)) ? readFileSync(join(state, f), "utf8") : "";
+      return { dir, temp, state, env, read };
     }
+
+    it("t19 waits for the sealed key, opens nothing until it has it, and fails for a marker or a timeout", () => {
+      const wait = t19Named("wait");
+      const sb = sandbox();
+      try {
+        // Available after two failed tries: the wait polls, then stops.
+        const ok = runBash(String(wait.run), sb.env({ FAIL_N: "2", FILES: "sealed version.txt" }));
+        expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+        expect(sb.read("log").split("\n").filter(Boolean)).toHaveLength(3);
+        expect(sb.read("log")).toContain(
+          "run download 42 -R o/r -n t19-handoff-42-2 -D " + join(sb.temp, "t19-sealed"),
+        );
+        expect(existsSync(join(sb.temp, "t19-sealed", "sealed"))).toBe(true);
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+      // The redline job's marker (no `sealed`): fails at once, says why.
+      const sb2 = sandbox();
+      try {
+        const none = runBash(String(wait.run), sb2.env({ FILES: "none" }));
+        expect(none.status).toBe(1);
+        expect(none.stdout).toContain("handed over no key");
+      } finally {
+        rmSync(sb2.dir, { recursive: true, force: true });
+      }
+      // Nothing ever arrives: the deadline fails it.
+      const sb3 = sandbox();
+      try {
+        const late = runBash(String(wait.run), sb3.env({ FAIL_N: "999", WAIT_S: "0" }));
+        expect(late.status).toBe(1);
+        expect(late.stdout).toContain("no hand-off from the redline job within 0 s");
+      } finally {
+        rmSync(sb3.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("the redline job seals to the downloaded public key and copies the staged version; no public key fails the step", () => {
+      const key = named("t19-key");
+      const sb = sandbox();
+      try {
+        mkdirSync(join(sb.temp, "redline-staged"));
+        writeFileSync(join(sb.temp, "redline-staged", "version.txt"), "0.97.0\n");
+        const ok = runBash(
+          String(key.run),
+          sb.env({ FAIL_N: "1", FILES: "public-key" }),
+        );
+        expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+        const out = join(sb.temp, "t19-handoff");
+        expect(readdirSync(out).sort()).toEqual(["sealed", "version.txt"]);
+        expect(readFileSync(join(out, "version.txt"), "utf8")).toBe("0.97.0\n");
+        expect(sb.read("pnpm")).toContain(
+          `--filter @oa/redline provisioning t19-seal ${join(sb.temp, "t19-recipient-pub", "public-key")} ${join(out, "sealed")}`,
+        );
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+      const sb2 = sandbox();
+      try {
+        const late = runBash(String(key.run), sb2.env({ FAIL_N: "999", WAIT_S: "0" }));
+        expect(late.status).toBe(1);
+        expect(late.stdout).toContain("no public key from the t19 job within 0 s");
+        expect(sb2.read("pnpm")).toBe("");
+      } finally {
+        rmSync(sb2.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("when no key is handed over, the redline job uploads a marker with the same name, so t19 never waits for one", () => {
+      const [real, marker] = steps.filter((s) =>
+        String(s.with?.name ?? "").startsWith("t19-handoff-"),
+      );
+      expect(real?.id).toBe("handoff-up");
+      expect(real?.if).toBe("steps.t19-key.outcome == 'success'");
+      expect(marker?.if).toBe("always() && steps.handoff-up.outcome != 'success'");
+      expect(real?.with.name).toBe(marker?.with.name);
+      const mk = named("Tell the t19 job no key is coming");
+      expect(mk.if).toBe(marker?.if);
+      expect(steps.indexOf(mk)).toBe(steps.indexOf(marker ?? {}) - 1);
+      const tmp = mkdtempSync(join(tmpdir(), "t19-marker-"));
+      try {
+        expect(runBash(String(mk.run), { RUNNER_TEMP: tmp }).status).toBe(0);
+        expect(readdirSync(join(tmp, "t19-nohandoff"))).toEqual(["none"]);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("the revoke can't cut T19 off: it comes after a wait for the t19 job, which only a finished job or the deadline ends", () => {
+      const done = named("t19-done");
+      const revoke = named("Revoke this run's R26 credentials");
+      expect(steps.indexOf(done)).toBe(steps.indexOf(revoke) - 1);
+      expect(done.if).toBe("always() && steps.handoff-up.outcome == 'success'");
+      expect(revoke.if).toBe("always() && steps.mint.outcome == 'success'");
+      // The wait outlasts the t19 job's own timeout, so only a hung API ends it first.
+      expect(Number(/WAIT_S:-(\d+)/.exec(String(done.run))?.[1])).toBeGreaterThan(
+        t19Job["timeout-minutes"] * 60,
+      );
+      const sb = sandbox();
+      try {
+        writeFileSync(
+          join(sb.state, "statuses"),
+          [
+            '{"jobs":[{"name":"platform-tags","status":"completed"},{"name":"t19","status":"queued"}]}',
+            "ERROR",
+            '{"jobs":[{"name":"t19","status":"in_progress"}]}',
+            '{"jobs":[{"name":"x / t19","status":"completed"}]}',
+          ].join("\n") + "\n",
+        );
+        const ok = runBash(String(done.run), sb.env());
+        expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+        expect(ok.stdout).toContain("the t19 job has ended");
+        // queued, an API error, in progress, then completed: four polls.
+        expect(sb.read("log").split("\n").filter(Boolean)).toHaveLength(4);
+        expect(sb.read("log")).toContain("repos/o/r/actions/runs/42/attempts/2/jobs");
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+      // Never completed, deadline reached: it warns and lets the revoke go.
+      const sb2 = sandbox();
+      try {
+        writeFileSync(
+          join(sb2.state, "statuses"),
+          '{"jobs":[{"name":"t19","status":"in_progress"}]}\n',
+        );
+        const late = runBash(String(done.run), sb2.env({ WAIT_S: "0" }));
+        expect(late.status).toBe(0);
+        expect(late.stdout).toContain("::warning::the t19 job is still in_progress after 0 s: revoking anyway");
+      } finally {
+        rmSync(sb2.dir, { recursive: true, force: true });
+      }
+      // A job whose name merely ends in t19 text elsewhere is not it.
+      const sb3 = sandbox();
+      try {
+        writeFileSync(
+          join(sb3.state, "statuses"),
+          '{"jobs":[{"name":"redline-t19x","status":"completed"}]}\n',
+        );
+        const other = runBash(String(done.run), sb3.env({ WAIT_S: "0" }));
+        expect(other.stdout).toContain("still none");
+      } finally {
+        rmSync(sb3.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("the nightly's caller grants what the called jobs need: actions read beside id-token", () => {
+      const nightly = readFileSync(
+        join(root, ".github/workflows/redline-nightly.yml"),
+        "utf8",
+      );
+      const nw = parse(nightly) as Record<string, any>;
+      expect(nw.jobs.redline.permissions).toEqual({
+        contents: "read",
+        "id-token": "write",
+        actions: "read",
+      });
+      // A called job's permissions can't exceed its caller's.
+      for (const j of [job, t19Job])
+        for (const [k, v] of Object.entries(j.permissions as object))
+          expect(nw.jobs.redline.permissions[k], k).toBe(v);
+    });
   });
 
   it("installs without lifecycle scripts: every step of the job can reach the OIDC request token", () => {
@@ -496,7 +813,7 @@ describe("redline-staging.yml", () => {
     );
   });
 
-  it("order: install, builds, secrets, targets, mint, bring-up, prod mint, suite, suite scan, drop, T19, scan, uploads, revoke, remove", () => {
+  it("order (redline job): install, builds, secrets, targets, mint, bring-up, staged, seal, hand-off upload, prod mint, suite, scan, report upload, wait for t19, revoke, remove", () => {
     const at = (pred: (s: Record<string, any>) => boolean) =>
       steps.findIndex(pred);
     const order = [
@@ -506,15 +823,16 @@ describe("redline-staging.yml", () => {
       at((s) => s.name === "Set the targets"),
       at((s) => s.id === "mint"),
       at((s) => s.id === "bringup"),
+      at((s) => s.id === "staged"),
+      at((s) => s.id === "t19-key"),
+      at((s) => s.id === "handoff-up"),
       at((s) => s.name === "Mint the prod inventory OIDC JWT"),
       at((s) => (s.run ?? "").includes("@oa/redline live")),
       at((s) => s.id === "scan-suite"),
-      at((s) => s.name === "Delete the JWT and prod files before T19"),
-      at((s) => s.id === "t19"),
-      at((s) => s.id === "scan"),
       at((s) => s.with?.name === "redline-report"),
+      at((s) => s.id === "t19-done"),
       at((s) => (s.run ?? "").includes("provisioning revoke")),
-      at((s) => (s.run ?? "").includes("rm -rf")),
+      at((s) => s.name === "Remove the secret files"),
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
@@ -528,27 +846,101 @@ describe("redline-staging.yml", () => {
     );
     expect(steps.at(-1)?.if).toBe("always()");
     expect(steps.at(-1)?.run).toBe(
-      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token"',
+      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
     );
     expect(
       steps.filter((s) => (s.run ?? "").includes("@oa/provision build")),
     ).toHaveLength(1);
   });
 
-  it("prep: Chromium installs beside the builds, and either failing fails the step", () => {
+  it("order (t19 job): install, prep, targets, key pair, public key up, wait for the sealed key, open, T19, scan, report, remove", () => {
+    const at = (pred: (s: Record<string, any>) => boolean) =>
+      t19Steps.findIndex(pred);
+    const order = [
+      at((s) => s.run === "pnpm install --frozen-lockfile --ignore-scripts"),
+      at((s) => s.id === "prep"),
+      at((s) => s.name === "Set the targets"),
+      at((s) => s.name === "Make this run's recipient key"),
+      at((s) => String(s.with?.name ?? "").startsWith("t19-recipient-")),
+      at((s) => s.id === "wait"),
+      at((s) => s.id === "open"),
+      at((s) => s.id === "t19"),
+      at((s) => s.id === "scan"),
+      at((s) => s.with?.name === "t19-report"),
+      at((s) => s.name === "Remove the hook key and the private key"),
+    ];
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect(order).toEqual(order.slice().sort((x, y) => x - y));
+    expect(t19Named("Make this run's recipient key").run).toBe(
+      "pnpm --filter @oa/redline provisioning t19-recipient",
+    );
+    expect(t19Named("open").run).toBe(
+      "pnpm --filter @oa/redline provisioning t19-open",
+    );
+    // The hook key and the private key are removed at the end, whatever happened.
+    expect(t19Steps.at(-1)?.if).toBe("always()");
+    expect(t19Steps.at(-1)?.run).toBe(
+      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/t19-recipient" "$RUNNER_TEMP/t19-sealed"',
+    );
+    // The playwright command is main's contract with the tag's config.
+    expect(String(t19Named("t19").run)).toContain(
+      "pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts",
+    );
+  });
+
+  /** A fake pnpm: logs its args, fails when they contain $FAIL. */
+  function fakePnpm(dir: string) {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "pnpm"),
+      '#!/usr/bin/env bash\necho "$*" >> "$CALLS"\ncase "$*" in *"$FAIL"*) exit 3;; esac\n',
+      { mode: 0o755 },
+    );
+    return bin;
+  }
+
+  it("prep (redline job): the two builds only, Chromium is the t19 job's", () => {
     const prep = named("prep");
+    expect(prep.if).toBeUndefined();
+    expect(prep["continue-on-error"]).toBeUndefined();
+    expect(String(prep.run)).not.toContain("playwright");
+    const dir = mkdtempSync(join(tmpdir(), "rl-prep-"));
+    try {
+      const bin = fakePnpm(dir);
+      const run = (fail: string) => {
+        const calls = join(dir, `calls-${fail || "none"}`);
+        const r = runBash(prep.run, {
+          PATH: `${bin}:${process.env.PATH}`,
+          RUNNER_TEMP: dir,
+          CALLS: calls,
+          FAIL: fail || "no-such-arg",
+        });
+        return {
+          status: r.status,
+          calls: existsSync(calls)
+            ? readFileSync(calls, "utf8").trim().split("\n")
+            : [],
+        };
+      };
+      expect(run("")).toEqual({
+        status: 0,
+        calls: ["--filter @oa/provision build", "--filter @oa/shared build"],
+      });
+      expect(run("provision").status).toBe(3);
+      expect(run("shared").status).toBe(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prep (t19 job): Chromium installs beside the builds, and either failing fails the step", () => {
+    const prep = t19Named("prep");
     expect(prep.if).toBeUndefined();
     expect(prep["continue-on-error"]).toBeUndefined();
     const dir = mkdtempSync(join(tmpdir(), "rl-prep-"));
     try {
-      // A fake pnpm: logs its args, fails when they contain $FAIL.
-      const bin = join(dir, "bin");
-      mkdirSync(bin);
-      writeFileSync(
-        join(bin, "pnpm"),
-        '#!/usr/bin/env bash\necho "$*" >> "$CALLS"\ncase "$*" in *"$FAIL"*) exit 3;; esac\n',
-        { mode: 0o755 },
-      );
+      const bin = fakePnpm(dir);
       const run = (fail: string) => {
         const calls = join(dir, `calls-${fail || "none"}`);
         const r = runBash(prep.run, {
@@ -584,37 +976,72 @@ describe("redline-staging.yml", () => {
     }
   });
 
-  it("a secret file's contents anywhere in either report fails the job and stops both uploads", () => {
-    const scan = named("scan");
+  it("the suite's report is scanned for every secret file before upload, and a hit stops the upload", () => {
+    const scan = named("scan-suite");
     expect(scan.if).toBe("always()");
     // -f: the key is read from its file, never put in argv.
+    expect(scan.run).toContain(
+      'if grep -rqF -f "$f" "$r"; then echo "secret in report: ${f##*/}"; exit 1; fi',
+    );
+    expect(scan.run).not.toContain("$(cat");
+    const up = steps.filter((s) => s.with?.name === "redline-report");
+    expect(up).toHaveLength(1);
+    expect(up[0]?.if).toBe("always() && steps.scan-suite.outcome == 'success'");
+    expect(steps.indexOf(up[0] ?? {})).toBeGreaterThan(steps.indexOf(scan));
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(up[0]?.with.path).toBe("${{ runner.temp }}/redline-report");
+  });
+
+  it("the t19 report is scanned for the hook key it holds, and a hit stops its upload; the key is deleted whatever happened", () => {
+    const scan = t19Named("scan");
+    expect(scan.if).toBe("always()");
     expect(scan.run).toContain(
       'if grep -rqF -f "$f" "${dirs[@]}"; then echo "secret in report: ${f##*/}"; exit 1; fi',
     );
     expect(scan.run).not.toContain("$(cat");
-    // The reports; redline-staged-version holds only the version.
-    const up = steps.filter(
-      (s) =>
-        String(s.uses ?? "").startsWith("actions/upload-artifact") &&
-        s.with?.name !== "redline-staged-version",
+    const up = t19Steps.filter((s) => s.with?.name === "t19-report");
+    expect(up).toHaveLength(1);
+    expect(up[0]?.if).toBe(
+      "always() && steps.scan.outcome == 'success' && steps.t19.outcome != 'skipped'",
     );
-    expect(up).toHaveLength(2);
-    for (const u of up) {
-      expect(u.if).toMatch(
-        /^always\(\) && (steps\.scan-suite\.outcome == 'success' && )?steps\.scan\.outcome == 'success'/,
+    expect(t19Steps.indexOf(up[0] ?? {})).toBeGreaterThan(
+      t19Steps.indexOf(scan),
+    );
+    expect(up[0]?.with.path).toBe("apps/dashboard/playwright-report");
+    const tmp = mkdtempSync(join(tmpdir(), "t19-scan-"));
+    try {
+      mkdirSync(join(tmp, "redline-secrets"));
+      mkdirSync(join(tmp, "work", "apps", "dashboard", "playwright-report"), {
+        recursive: true,
+      });
+      writeFileSync(
+        join(tmp, "redline-secrets", "REDLINE_RL_A_HOOK_KEY"),
+        "hk_s3cret_value",
       );
-      expect(steps.indexOf(u)).toBeGreaterThan(steps.indexOf(scan));
+      const report = join(
+        tmp,
+        "work",
+        "apps",
+        "dashboard",
+        "playwright-report",
+        "index.html",
+      );
+      const run = () =>
+        runBash(String(scan.run), { RUNNER_TEMP: tmp }, join(tmp, "work"));
+      writeFileSync(report, "all clear");
+      expect(run().status).toBe(0);
+      writeFileSync(report, "a hk_s3cret_value b");
+      const leak = run();
+      expect(leak.status).toBe(1);
+      expect(leak.stdout).toContain("secret in report: REDLINE_RL_A_HOOK_KEY");
+      expect(leak.stdout).not.toContain("hk_s3cret_value");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
     }
-    expect(up[0]?.if).toContain("steps.scan-suite.outcome == 'success'");
-    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(up.map((u) => u.with?.path)).toEqual([
-      "${{ runner.temp }}/redline-report",
-      "apps/dashboard/playwright-report",
-    ]);
   });
 
-  it("the scan step fails on a leaked key or JWT and passes a clean report", () => {
-    const scan = named("scan");
+  it("the suite scan fails on a leaked key or JWT and passes a clean report", () => {
+    const scan = named("scan-suite");
     const tmp = mkdtempSync(join(tmpdir(), "rl-scan-"));
     try {
       mkdirSync(join(tmp, "redline-secrets"));

@@ -65,9 +65,13 @@ jobs:
   redline:
     needs: pick
     if: needs.pick.outputs.run == 'true'
+    # A called workflow's jobs can't hold more than this: id-token for the
+    # redline job, `actions: read` for its t19 hand-off (the t19 job gets
+    # only contents and actions, never id-token).
     permissions:
       contents: read
       id-token: write
+      actions: read
     uses: ./.github/workflows/redline-staging.yml
     with:
       tag: ${{ needs.pick.outputs.tag }}

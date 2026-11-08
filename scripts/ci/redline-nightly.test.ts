@@ -259,7 +259,11 @@ describe("redline-nightly.yml", () => {
     expect(j.if).toBe("needs.pick.outputs.run == 'true'");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(j.with).toEqual({ tag: "${{ needs.pick.outputs.tag }}" });
-    expect(j.permissions).toEqual({ contents: "read", "id-token": "write" });
+    expect(j.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+      actions: "read",
+    });
     // The callee's Environments carry its secrets; nothing repo-level goes.
     expect(j.secrets).toBeUndefined();
   });
