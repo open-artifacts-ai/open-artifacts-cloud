@@ -423,11 +423,34 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       .filter((l) => !l.startsWith("#"));
     expect(uses.length).toBeGreaterThan(0);
     for (const l of uses) expect(l).not.toMatch(/inputs\.dry_run\s*(==|!=)/);
+    // Parsed, not matched as text: the guard's env is exactly the input.
+    const guardEnvs = stepsOf(hr, "hosted-guard")
+      .filter((st) => st.env && "DRY_RUN" in st.env)
+      .map((st) => st.env.DRY_RUN);
+    expect(guardEnvs).toEqual(["${{ inputs.dry_run }}"]);
+    // No condition compares the input the other way round ('true' == inputs.dry_run).
+    const ifs: string[] = [];
+    const collect = (o: unknown): void => {
+      if (Array.isArray(o)) o.forEach(collect);
+      else if (o && typeof o === "object")
+        for (const [k, v] of Object.entries(o)) {
+          if (k === "if" && typeof v === "string") ifs.push(v);
+          else collect(v);
+        }
+    };
+    collect(hr.jobs);
+    expect(ifs.length).toBeGreaterThan(0);
+    for (const c of ifs)
+      expect(c).not.toMatch(/['"]?true['"]?\s*[!=]=\s*inputs\.dry_run/);
     // The guard's shell test treats anything but the string true as a real run.
     expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
     // The mirror runs on a push because the ref is main.
-    expect(jobs.mirror.if).toBe("${{ inputs.dry_run || github.ref == 'refs/heads/main' }}");
-    expect(hr["run-name"]).toBe("${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}");
+    expect(jobs.mirror.if).toBe(
+      "${{ inputs.dry_run || github.ref == 'refs/heads/main' }}",
+    );
+    expect(hr["run-name"]).toBe(
+      "${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}",
+    );
   });
 
   it("names a dry run '(dry run)', the name tag-passed-checks.sh skips", () => {

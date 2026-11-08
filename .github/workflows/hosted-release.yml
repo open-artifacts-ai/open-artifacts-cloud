@@ -12,8 +12,10 @@ name: hosted-release
 #     `inputs.dry_run` or `!inputs.dry_run`, so on a push the run-name has no
 #     "(dry run)", the mirror runs on main and creates the tag and release, the
 #     prod key signs, hosted-attach-* attach, and hosted-dry-run is skipped.
-#     DRY_RUN in the guard is the empty string there, and the guard compares it
-#     with `= true`, so it is not a dry run either.
+#     DRY_RUN in the guard is the empty string there. The guard tests it against
+#     the string true (`[ "$DRY_RUN" != true ]` for the real-run checks,
+#     `[ "$DRY_RUN" = true ]` for the dry-run warning), so empty is not a dry
+#     run either.
 #   - workflow_dispatch: dry_run defaults to true, as before.
 #
 # dry_run (the default): the mirror only reads and checks; the build and the
