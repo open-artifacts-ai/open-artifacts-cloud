@@ -434,7 +434,6 @@ describe("redline-staging.yml", () => {
       expect(
         steps.some((s) => /Delete the JWT and prod files/.test(s.name ?? "")),
       ).toBe(false);
-      expect(t19Job["timeout-minutes"]).toBeLessThanOrEqual(30);
     });
 
     it("a failed T19 fails the run: nothing in the job is allowed to fail softly", () => {
@@ -502,31 +501,110 @@ describe("redline-staging.yml", () => {
       }
     });
 
-    it("the t19 job's targets: the base JSON plus its own secretsDir, nothing else", () => {
-      const st = t19Named("Set the targets");
-      expect(st.env).toEqual({
-        REDLINE_TARGETS_BASE: "${{ vars.REDLINE_TARGETS }}",
-      });
+    it("the t19 job reads no variable: REDLINE_TARGETS is an Environment variable it can't see (#1730 review)", () => {
+      expect(JSON.stringify(t19Job)).not.toMatch(/\bvars\./);
+      expect(JSON.stringify(t19Job)).not.toContain("REDLINE_TARGETS_BASE");
+      // The key pair needs no targets: it runs before any hand-off exists.
+      const recipient = t19Named("Make this run's recipient key");
+      expect(recipient.env).toBeUndefined();
+      const cli = readFileSync(
+        join(root, "tests/redline/scripts/provisioning.ts"),
+        "utf8",
+      );
+      expect(cli.indexOf('cmd === "t19-recipient"')).toBeLessThan(
+        cli.indexOf("rawTargets(env.REDLINE_TARGETS)"),
+      );
+    });
+
+    it("the t19 job's targets come from the hand-off's targets.json plus its own secretsDir, and fail without a usable one", () => {
+      const st = t19Named("Set the targets from the hand-off");
+      expect(st.env).toBeUndefined();
       expect(st.run).not.toContain("${{");
-      const tmp = mkdtempSync(join(tmpdir(), "t19-targets-"));
-      try {
-        const ghEnv = join(tmp, "env");
-        writeFileSync(ghEnv, "");
-        const r = runBash(String(st.run), {
-          RUNNER_TEMP: tmp,
-          GITHUB_ENV: ghEnv,
-          REDLINE_TARGETS_BASE:
-            '{"mode":"staging","a":{"name":"rl-a","installId":"i1"},"b":{"name":"rl-b","installId":"i2"}}',
-        });
-        expect(r.status).toBe(0);
-        const line = readFileSync(ghEnv, "utf8").trim();
-        const t = JSON.parse(line.slice("REDLINE_TARGETS=".length));
-        expect(t.secretsDir).toBe(join(tmp, "redline-secrets"));
-        expect(t.a.name).toBe("rl-a");
-        expect(t.prod).toBeUndefined();
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
+      const good = {
+        mode: "staging",
+        a: { name: "rl-a", installId: "i1", app: "https://a", testDomain: "d" },
+        b: { name: "rl-b", installId: "i2", app: "https://b" },
+      };
+      const go = (targets: unknown | null) => {
+        const tmp = mkdtempSync(join(tmpdir(), "t19-targets-"));
+        try {
+          mkdirSync(join(tmp, "t19-sealed"));
+          if (targets !== null)
+            writeFileSync(
+              join(tmp, "t19-sealed", "targets.json"),
+              JSON.stringify(targets),
+            );
+          const ghEnv = join(tmp, "env");
+          writeFileSync(ghEnv, "");
+          const r = runBash(String(st.run), {
+            RUNNER_TEMP: tmp,
+            GITHUB_ENV: ghEnv,
+          });
+          return { r, env: readFileSync(ghEnv, "utf8").trim(), tmp };
+        } finally {
+          rmSync(tmp, { recursive: true, force: true });
+        }
+      };
+      const ok = go(good);
+      expect(ok.r.status, ok.r.stdout + ok.r.stderr).toBe(0);
+      const t = JSON.parse(ok.env.slice("REDLINE_TARGETS=".length));
+      expect(t).toEqual({
+        ...good,
+        secretsDir: join(ok.tmp, "redline-secrets"),
+      });
+      // What T19 reads (targets.ts): mode, secretsDir, a.name/installId/app/testDomain.
+      for (const bad of [
+        null,
+        { ...good, mode: "local" },
+        { ...good, a: { ...good.a, testDomain: undefined } },
+        { ...good, a: { ...good.a, app: undefined } },
+        { ...good, b: undefined },
+      ]) {
+        const r = go(bad);
+        expect(r.r.status, JSON.stringify(bad)).not.toBe(0);
+        expect(r.env).toBe("");
       }
+    });
+
+    it("the timeouts fit the real worst case, in order: bring-up < key wait < t19 job < revoke wait < redline job", () => {
+      const prov = readFileSync(
+        join(root, "tests/redline/src/provisioning.ts"),
+        "utf8",
+      );
+      const jobMin = Number(/JOB_WITHIN_MS = (\d+) \* 60_000/.exec(prov)?.[1]);
+      expect(jobMin).toBe(20);
+      const sec = (list: Record<string, any>[], id: string, d: RegExp) =>
+        Number(d.exec(String(pick(list, id).run))?.[1]);
+      // Worst bring-up: per install an upgrade job then an R26 job, both
+      // installs at once; then the seal's wait for the public key.
+      const sealWait = sec(steps, "t19-key", /WAIT_S:-(\d+)/);
+      const bringup = 2 * jobMin * 60;
+      const keyWait = sec(t19Steps, "wait", /WAIT_S:-(\d+)/);
+      expect(keyWait).toBeGreaterThanOrEqual(bringup + sealWait);
+      // The t19 job: setup before the wait, the wait, T19's own bound
+      // (playwright globalTimeout 15 min) and its tail.
+      const setupMin = 10;
+      const t19Min = 15;
+      const t19Timeout = t19Job["timeout-minutes"] * 60;
+      expect(t19Timeout).toBeGreaterThanOrEqual(
+        setupMin * 60 + keyWait + (t19Min + 5) * 60,
+      );
+      const revokeWait = sec(steps, "t19-done", /WAIT_S:-(\d+)/);
+      expect(revokeWait).toBeGreaterThan(t19Timeout);
+      // The revoke wait is counted from the run's start, so it ends by then
+      // whatever the suite took, and the revoke (up to a job's 20 min) still
+      // fits inside the redline job.
+      expect(String(named("t19-done").run)).toContain("run_started_at");
+      expect(revokeWait / 60 + jobMin).toBeLessThanOrEqual(
+        job["timeout-minutes"],
+      );
+      // The playwright bound the T19 figure rests on.
+      expect(
+        readFileSync(
+          join(root, "apps/dashboard/playwright.staging.config.ts"),
+          "utf8",
+        ),
+      ).toMatch(/globalTimeout: 15 \* 60_000/);
     });
   });
 
@@ -594,6 +672,7 @@ describe("redline-staging.yml", () => {
       writeFileSync(
         join(bin, "gh"),
         `#!/usr/bin/env bash
+case "$*" in *run_started_at*) echo "\${RUN_STARTED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; exit 0;; esac
 n=$(( $(cat "$GH_STATE/calls" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$GH_STATE/calls"
 echo "$*" >> "$GH_STATE/log"
@@ -700,11 +779,50 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         );
         const ok = runBash(
           String(key.run),
-          sb.env({ FAIL_N: "1", FILES: "public-key" }),
+          sb.env({
+            FAIL_N: "1",
+            FILES: "public-key",
+            REDLINE_TARGETS: JSON.stringify({
+              mode: "staging",
+              secretsDir: "/s",
+              a: {
+                name: "rl-a",
+                installId: "i1",
+                app: "https://a",
+                content: "https://ac",
+                testDomain: "d",
+                turnstileFile: "/t",
+              },
+              b: {
+                name: "rl-b",
+                installId: "i2",
+                app: "https://b",
+                turnstileFile: "/t",
+              },
+              prod: { inventoryUrl: "https://p" },
+            }),
+          }),
         );
         expect(ok.status, ok.stdout + ok.stderr).toBe(0);
         const out = join(sb.temp, "t19-handoff");
-        expect(readdirSync(out).sort()).toEqual(["sealed", "version.txt"]);
+        expect(readdirSync(out).sort()).toEqual([
+          "sealed",
+          "targets.json",
+          "version.txt",
+        ]);
+        // Install data only: no secretsDir, prod, content or Turnstile field.
+        expect(
+          JSON.parse(readFileSync(join(out, "targets.json"), "utf8")),
+        ).toEqual({
+          mode: "staging",
+          a: {
+            name: "rl-a",
+            installId: "i1",
+            app: "https://a",
+            testDomain: "d",
+          },
+          b: { name: "rl-b", installId: "i2", app: "https://b" },
+        });
         expect(readFileSync(join(out, "version.txt"), "utf8")).toBe("0.97.0\n");
         expect(sb.read("pnpm")).toContain(
           `--filter @oa/redline provisioning t19-seal ${join(sb.temp, "t19-recipient-pub", "public-key")} ${join(out, "sealed")}`,
@@ -886,10 +1004,10 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     const order = [
       at((s) => s.run === "pnpm install --frozen-lockfile --ignore-scripts"),
       at((s) => s.id === "prep"),
-      at((s) => s.name === "Set the targets"),
       at((s) => s.name === "Make this run's recipient key"),
       at((s) => String(s.with?.name ?? "").startsWith("t19-recipient-")),
       at((s) => s.id === "wait"),
+      at((s) => s.name === "Set the targets from the hand-off"),
       at((s) => s.id === "open"),
       at((s) => s.id === "t19"),
       at((s) => s.id === "scan"),

@@ -103,8 +103,18 @@ jobs:
         run: bash scripts/ci/platform-tags.sh staging "$TAG"
   # T19 beside the suite (#1730): the dashboard against rl-a
   # (apps/dashboard/e2e/staging). No Environment and no id-token: it can't
-  # mint OIDC JWTs and can't see the Environment's secrets. `actions: read` is
-  # for downloading the hand-off artifact of this run.
+  # mint OIDC JWTs and can't see the Environment's secrets or variables (so
+  # no `vars.*` here: REDLINE_TARGETS lives on the redline-staging Environment
+  # only). The key pair needs no targets; the install data T19 reads comes in
+  # the hand-off (targets.json). `actions: read` is for downloading it.
+  #
+  # Timeouts, from the real worst case: bring-up is two chains at once, each an
+  # upgrade job and an R26 job of up to 20 min (JOB_WITHIN_MS) = 40 min, then
+  # the seal waits up to 10 min for the public key: the key wait is 55 min.
+  # The job = 10 min of setup before the wait + 55 + T19's own bound (15 min
+  # globalTimeout + 5) + 5 = 90 min. The redline job's revoke wait is longer
+  # than that (95 min from the run's start), so with a revoke of up to 20 min it
+  # ends inside the redline job's 150 min.
   t19:
     name: t19
     needs: platform-tags
@@ -112,7 +122,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: On main, for a release tag
         env:
@@ -155,16 +165,6 @@ jobs:
           rm -f "$log"
           [ "$b" -eq 0 ] || { echo "build failed: $b"; exit 1; }
           [ "$p" -eq 0 ] || { echo "playwright install failed: $p"; exit 1; }
-      - name: Set the targets
-        env:
-          REDLINE_TARGETS_BASE: ${{ vars.REDLINE_TARGETS }}
-        run: |
-          set -euo pipefail
-          umask 077
-          d="$RUNNER_TEMP/redline-secrets"
-          mkdir -p "$d"
-          targets=$(jq -c --arg d "$d" '. + {secretsDir: $d}' <<< "$REDLINE_TARGETS_BASE")
-          echo "REDLINE_TARGETS=$targets" >> "$GITHUB_ENV"
       # The private key stays in this runner's RUNNER_TEMP; only the public key goes up.
       - name: Make this run's recipient key
         run: pnpm --filter @oa/redline provisioning t19-recipient
@@ -174,8 +174,8 @@ jobs:
           path: ${{ runner.temp }}/t19-recipient/public-key
           retention-days: 1
           if-no-files-found: error
-      # Until the redline job has sealed rl-a's hook key (after bring-up, about
-      # 4 minutes; 35 at most), or said it can't (a marker file): then the run
+      # Until the redline job has sealed rl-a's hook key (after bring-up: about
+      # 4 minutes, 55 at the very worst), or said it can't (a marker file): then the run
       # fails here, never waiting for a key that isn't coming.
       - id: wait
         name: Wait for rl-a's sealed hook key
@@ -185,7 +185,7 @@ jobs:
           set -euo pipefail
           name="t19-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           dir="$RUNNER_TEMP/t19-sealed"
-          wait_s="${WAIT_S:-2100}"
+          wait_s="${WAIT_S:-3300}"
           deadline=$(( $(date +%s) + wait_s ))
           while :; do
             rm -rf "$dir"
@@ -194,6 +194,24 @@ jobs:
             sleep "${POLL_S:-10}"
           done
           [ -s "$dir/sealed" ] || { echo "t19: the redline job handed over no key (bring-up or the hand-off failed there)"; exit 1; }
+      # Everything T19 reads from REDLINE_TARGETS (mode, a's name, installId,
+      # app and testDomain) comes from the redline job's targets, handed over
+      # with the key: not from a variable this job can't see. T19 reads
+      # nothing from REDLINE_RELEASE, REDLINE_RUN_ID or the Turnstile file.
+      - name: Set the targets from the hand-off
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/redline-secrets"
+          mkdir -p "$d"
+          targets=$(jq -ce --arg d "$d" '
+            select(.mode == "staging"
+              and (.a.name | type == "string") and (.a.installId | type == "string")
+              and (.a.app | type == "string") and (.a.testDomain | type == "string")
+              and (.b.name | type == "string") and (.b.installId | type == "string")
+              and (.b.app | type == "string"))
+            | . + {secretsDir: $d}' "$RUNNER_TEMP/t19-sealed/targets.json") || { echo "t19: the hand-off has no usable targets.json"; exit 1; }
+          echo "REDLINE_TARGETS=$targets" >> "$GITHUB_ENV"
       - id: open
         name: Open the hook key (the private key is deleted)
         run: pnpm --filter @oa/redline provisioning t19-open
@@ -380,6 +398,10 @@ jobs:
           mkdir -p "$out"
           pnpm --filter @oa/redline provisioning t19-seal "$pub/public-key" "$out/sealed"
           cp "$RUNNER_TEMP/redline-staged/version.txt" "$out/version.txt"
+          # The install data T19 reads (public origins and ids, no secret, no
+          # secretsDir, no prod or Turnstile fields): the t19 job can't read
+          # the Environment's REDLINE_TARGETS variable itself.
+          jq -c '{mode, a: {name: .a.name, installId: .a.installId, app: .a.app, testDomain: .a.testDomain}, b: {name: .b.name, installId: .b.installId, app: .b.app}}' <<< "$REDLINE_TARGETS" > "$out/targets.json"
       - id: handoff-up
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.t19-key.outcome == 'success'
@@ -454,8 +476,8 @@ jobs:
       # The R26 revoke also rotates rl-a's TEST_HOOK_KEY (the key T19 holds), so
       # it must not start while T19 runs. Only when the key was handed over;
       # otherwise no T19 run holds it. The wait ends when the t19 job has
-      # completed (any result) or after 35 minutes (the t19 job's own timeout
-      # is 30), when the revoke goes ahead whatever T19 is doing.
+      # completed (any result) or 95 minutes after the run started (the t19 job's
+      # own timeout is 90), when the revoke goes ahead whatever T19 is doing.
       - id: t19-done
         name: Wait for the t19 job to end
         if: always() && steps.handoff-up.outcome == 'success'
@@ -463,8 +485,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          wait_s="${WAIT_S:-2100}"
-          deadline=$(( $(date +%s) + wait_s ))
+          wait_s="${WAIT_S:-5700}"
+          # Counted from the start of the run (the t19 job starts with it), so
+          # a long suite never pushes the revoke past the job's own timeout.
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at 2> /dev/null) || started=""
+          start=$(date -d "$started" +%s 2> /dev/null) || start=$(date +%s)
+          deadline=$(( start + wait_s ))
           while :; do
             st=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | .status] | first // "none"' 2> /dev/null) || st="unreadable"
             if [ "$st" = completed ]; then echo "the t19 job has ended"; exit 0; fi
