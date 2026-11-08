@@ -398,6 +398,16 @@ mkcloud "$T/e1" "$T/ebd"
 mkdir -p "$T/ebd/.github/ISSUE_TEMPLATE"; echo 'name: Blocker' > "$T/ebd/.github/ISSUE_TEMPLATE/blocker.yml"
 expect_exit "a blocker.yml that public lacks fails" 1 "$T/ebd/scripts/equivalence.sh" "$T/e1" "$T/ebd"
 
+# hosted-release.yml is this repo's own workflow (C3): public has none, so it is
+# an allowlisted extra. Any other new workflow still fails.
+mkdir -p "$T/ec1/.github/workflows"
+echo 'name: hosted-release' > "$T/ec1/.github/workflows/hosted-release.yml"
+expect_exit "this repo's hosted-release.yml is an allowed extra" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+echo 'name: other' > "$T/ec1/.github/workflows/other.yml"
+expect_exit "another new workflow fails" 1 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
+check "the other workflow is named" grep -q 'other.yml (only in overlay (extra))' "$T/out"
+rm "$T/ec1/.github/workflows/other.yml" "$T/ec1/.github/workflows/hosted-release.yml"
+
 # CLOUD owns the private paths: edits, deletions and additions inside them pass.
 rm "$T/ec1/apps/hosted/src/index.ts"
 expect_exit "a dropped private file passes (CLOUD-owned)" 0 "$T/ec1/scripts/equivalence.sh" "$T/e1" "$T/ec1"
@@ -432,6 +442,23 @@ mkcloud "$T/e1" "$T/ec13"
 mkdir -p "$T/ec13/apps/newapp"; echo x > "$T/ec13/apps/newapp/i.ts"
 expect_exit "a new non-private directory fails" 1 "$T/ec13/scripts/equivalence.sh" "$T/e1" "$T/ec13"
 check "new directory is named" grep -q 'DIFF: apps/newapp' "$T/out"
+
+# After the delete: public has no hosted paths and no list, so a listed path's
+# parent directory exists only in the overlay. It is CLOUD-owned if all of it is.
+mkdir -p "$T/e3/apps/server"; echo s > "$T/e3/apps/server/i.ts"
+G -C "$T/e3" init -q && G -C "$T/e3" add -A && G -C "$T/e3" commit -qm init && G -C "$T/e3" tag v1
+mkpost() { # dest
+  mkdir -p "$1/scripts" "$1/newdir/sub"; cp "$OVERLAY" "$EQUIV" "$PLACE" "$PINCHK" "$LISTED" "$1/scripts/"
+  echo 'cloud readme' > "$1/README.md"; echo x > "$1/newdir/sub/f.txt"
+  printf 'newdir/sub/f.txt\n' > "$1/private-paths.txt"
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$T/e3" rev-parse HEAD)" > "$1/PUBLIC_PIN"
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$T/e3" rev-parse HEAD)" > "$1/SYNCED_FROM"
+}
+mkpost "$T/ec14"
+expect_exit "a directory only the overlay has passes when all of it is listed" 0 "$T/ec14/scripts/equivalence.sh" "$T/e3" "$T/ec14"
+mkpost "$T/ec15"; echo y > "$T/ec15/newdir/sub/other.txt"
+expect_exit "a directory only the overlay has fails with an unlisted file in it" 1 "$T/ec15/scripts/equivalence.sh" "$T/e3" "$T/ec15"
+check "the unlisted directory is named" grep -q 'DIFF: newdir' "$T/out"
 
 mkcloud "$T/e1" "$T/ec7"
 echo 'mine' > "$T/ec7/hosted-workflows/ci.yml"
@@ -815,6 +842,20 @@ mkpub_hosted "$T/m4"; mkc "$T/m4" "$T/mc4"
 mkdir -p "$T/mc4/.github/workflows"; mv "$T/mc4/hosted-workflows/hosted.yml" "$T/mc4/.github/workflows/hosted.yml"
 rm -rf "$T/mc4/hosted-workflows"
 expect_exit "a listed workflow already placed under .github/workflows passes the existence guard" 0 "$T/mc4/scripts/equivalence.sh" "$T/m4" "$T/mc4"
+
+# N5 (moved from a test on the public ci.yml, which drops that job at the split):
+# this repo's own CI runs provision's release-t3b "real build" test and never
+# skips it. ci.yml is this repo's, never overlaid, so it is checked here.
+CI_YML="$HERE/../.github/workflows/ci.yml"
+check "N5: ci.yml's overlay job sets OA_REQUIRE_REAL_BUILD=1 (real build never skips)" \
+  grep -Eq '^      OA_REQUIRE_REAL_BUILD: "1"$' "$CI_YML"
+# shellcheck disable=SC2016
+check "N5: ci.yml runs each private package's tests, one by one" \
+  grep -qF 'pnpm --filter "./$d" run test' "$CI_YML"
+check "N5: provision holds the real-build test" \
+  grep -q 'real build' "$HERE/../packages/provision/test/release-t3b.test.ts"
+check "N5: the provision package's test script runs vitest" \
+  grep -Eq '"test": ".*vitest run' "$HERE/../packages/provision/package.json"
 
 echo "overlay tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

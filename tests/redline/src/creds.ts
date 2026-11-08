@@ -57,7 +57,11 @@ export function once<V>(...vs: V[]): () => V {
 export const REDIRECT_URI = "http://127.0.0.1/p5-redline-callback";
 
 /** POST /oauth/register: a public client for REDIRECT_URI. */
-export async function registerClient(t: Target): Promise<string> {
+export async function registerClient(
+  t: Target,
+  /** The client's name (default "P5 redline"); a unique one lets a caller find its own grant by name. */
+  clientName = "P5 redline",
+): Promise<string> {
   const res = await fetch(`${t.app}/oauth/register`, {
     method: "POST",
     redirect: "manual",
@@ -67,7 +71,7 @@ export async function registerClient(t: Target): Promise<string> {
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      client_name: "P5 redline",
+      client_name: clientName,
     }),
   });
   const text = await readBody(res);

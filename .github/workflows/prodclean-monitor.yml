@@ -19,10 +19,12 @@
 #   Environment, as 0600 files under RUNNER_TEMP, never as argv.
 name: prodclean-monitor
 
-# The hourly schedule (cron "17 * * * *") is off in this repo until the
-# cut-over step F5 (#1056): the public repo's copy still runs it, and two
-# monitors would double-run. Dispatch by hand until then.
+# The hourly schedule ("17 * * * *") runs from this repo since the cut-over
+# (#1056): prod inventory trusts this repo, and the public repo's monitor is
+# disabled, so there is one monitor. Dispatch by hand works too.
 on:
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions: {}

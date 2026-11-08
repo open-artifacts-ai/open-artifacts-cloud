@@ -52,6 +52,7 @@ import {
   MATRIX_AT_B,
   ORG_FRESH,
   type ProbeCase,
+  pickOwnGrant,
   readRepoFile,
   runRead,
   SMOKES,
@@ -1166,5 +1167,50 @@ describe("setup hooks", () => {
     await expect(
       hook(T.a, "/__test/session", {}, { setup: true }),
     ).rejects.toThrow(/^infra: setup \/__test\/session no_reason on rl-a /);
+  });
+});
+
+// #1730: the grant fallback keeps only the grant of the client just registered.
+describe("pickOwnGrant: the grant fallback", () => {
+  const own = { clientId: "cid-own", clientName: "P5 redline 0a1b2c3d" };
+  const before = new Set(["g-old"]);
+
+  it("takes the one new grant of the client, by name (the list sends no clientId) or by clientId", () => {
+    const list = [
+      { grantId: "g-old", clientName: "P5 redline 0a1b2c3d" },
+      { grantId: "g-other", clientName: "P5 redline ffffffff" },
+      { grantId: "g-mine", clientName: "P5 redline 0a1b2c3d" },
+    ];
+    expect(pickOwnGrant(list, own, before)).toBe("g-mine");
+    expect(
+      pickOwnGrant([{ grantId: "g2", clientId: "cid-own" }], own, before),
+    ).toBe("g2");
+  });
+
+  it("another client's new grant (another lane's consent) is never picked", () => {
+    expect(
+      pickOwnGrant(
+        [{ grantId: "g-other", clientName: "P5 redline ffffffff" }],
+        own,
+        before,
+      ),
+    ).toBeUndefined();
+    expect(
+      pickOwnGrant([{ grantId: "g3", clientId: "cid-else" }], own, before),
+    ).toBeUndefined();
+    expect(pickOwnGrant([], own, before)).toBeUndefined();
+  });
+
+  it("throws when more than one grant of the client remains", () => {
+    expect(() =>
+      pickOwnGrant(
+        [
+          { grantId: "g-a", clientName: own.clientName },
+          { grantId: "g-b", clientId: own.clientId },
+        ],
+        own,
+        before,
+      ),
+    ).toThrow(/2 grants for one client/);
   });
 });

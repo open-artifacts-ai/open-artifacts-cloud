@@ -1,6 +1,10 @@
-// T3b: the hosted release jobs in release-please.yml (guard, build, check,
-// sign and attach per env) and hosted-floor.yml. The signing key never
+// T3b: the hosted release jobs in this repo's hosted-release.yml (mirror,
+// guard, build, check, sign and attach per env) and hosted-floor.yml. They
+// never read the public repo's release-please.yml or ci.yml: those are public's
+// files, and the hosted jobs are gone from them after the split (#1056 F1). The signing key never
 // shares a job with installed code.
+
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,32 +15,17 @@ import { parse } from "yaml";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p: string) => readFileSync(join(root, p), "utf8");
 // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
-const w: any = parse(read(".github/workflows/release-please.yml"));
-// biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
 const fw: any = parse(read(".github/workflows/hosted-floor.yml"));
 const ENVS = ["staging", "prod"] as const;
-const HOSTED = [
-  "hosted-guard",
-  "hosted-build",
-  "hosted-check",
-  "hosted-sign-staging",
-  "hosted-sign-prod",
-  "hosted-attach-staging",
-  "hosted-attach-prod",
-];
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 type Step = Record<string, any>;
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const stepsOf = (wf: any, job: string): Step[] => wf.jobs[job].steps;
-const steps = (job: string) => stepsOf(w, job);
-const needs = (job: string): string[] => [w.jobs[job].needs ?? []].flat();
 const runOf = (st: Step[]) => st.map((s) => s.run ?? "").join("\n");
+const APP_TOKEN =
+  "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
 const SHA_PIN =
-  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node)|pnpm\/action-setup)@[0-9a-f]{40}$/;
-// biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-const GUARD_SHA = "${{ needs.hosted-guard.outputs.sha }}";
-// biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-const TAG = "${{ needs.hosted-guard.outputs.tag }}";
+  /^(actions\/(checkout|download-artifact|upload-artifact|setup-node|create-github-app-token)|pnpm\/action-setup)@[0-9a-f]{40}$/;
 // Any invocation (the lockfile path "pnpm-lock.yaml" is not one).
 const INSTALL = /(^|[\s;|&(`])(pnpm|npm|npx|corepack|yarn)(?=$|[\s;|&)`])/m;
 
@@ -124,260 +113,6 @@ function keyJobShape(job: Step, o: { download: boolean; script: string }) {
   expect(JSON.stringify(last).match(/secrets\./g)).toHaveLength(1);
   expect(JSON.stringify(st)).not.toMatch(/CLOUDFLARE_/);
 }
-
-describe("release-please.yml hosted jobs", () => {
-  it("has the hosted jobs, sign and attach split per env (no matrix merge)", () => {
-    expect(Object.keys(w.jobs)).toEqual(expect.arrayContaining(HOSTED));
-    for (const n of Object.keys(w.jobs))
-      if (n.startsWith("hosted-")) expect(HOSTED, n).toContain(n);
-    for (const n of HOSTED) expect(w.jobs[n].strategy, n).toBeUndefined();
-  });
-
-  describe("hosted-guard", () => {
-    const job = w.jobs["hosted-guard"];
-    const run = runOf(steps("hosted-guard"));
-    it("runs only on a release-please release from a push to main, or a dispatch on main", () => {
-      expect(job.if).toContain("github.ref == 'refs/heads/main'");
-      expect(job.if).toContain(
-        "github.event_name == 'push' && needs.release-please.outputs.release_created == 'true'",
-      );
-      expect(job.if).toContain("github.event_name == 'workflow_dispatch'");
-      expect(needs("hosted-guard")).toEqual(["release-please"]);
-    });
-    it("has no secrets, no checkout and read-only permissions", () => {
-      expect(JSON.stringify(job)).not.toContain("secrets.");
-      expect(JSON.stringify(job)).not.toContain("actions/checkout");
-      expect(job.permissions).toEqual({ contents: "read" });
-    });
-    it("resolves the tag to a commit once, behind or identical to main's branch SHA, matching package.json", () => {
-      expect(run.match(/git\/ref\/tags\//g)).toHaveLength(1);
-      // L4: main is read as the branch ref, never the bare (tag-shadowable) name.
-      expect(run).toContain('gh api "repos/$REPO/git/ref/heads/main"');
-      expect(run).toContain('compare/$main_sha...$sha"');
-      expect(run).not.toContain("compare/main...");
-      expect(run).toMatch(/behind\|identical|identical\|behind/);
-      expect(run).toContain("contents/package.json?ref=$sha");
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal shell expansion
-      expect(run).toContain('"${TAG#v}"');
-      expect(run).toContain("isPrerelease");
-      expect(run).not.toContain("${{");
-      expect(job.outputs.sha).toMatch(/steps\.\w+\.outputs\.sha/);
-    });
-    it("L5: the SHA is the release commit (target_commitish when a SHA, and package.json's version changed in it)", () => {
-      expect(run).toContain('releases/tags/$TAG"');
-      expect(run).toContain("target_commitish");
-      expect(run).toContain(".parents[0].sha");
-      expect(run).toContain("contents/package.json?ref=$parent");
-      expect(run).toMatch(/\[ "\$prev" != "\$version" \]/);
-    });
-  });
-
-  for (const name of HOSTED.slice(1))
-    it(`${name} needs hosted-guard and checks out exactly its SHA`, () => {
-      expect(needs(name)).toContain("hosted-guard");
-      const co = steps(name).filter((s) =>
-        String(s.uses ?? "").startsWith("actions/checkout"),
-      );
-      expect(co.length).toBeGreaterThan(0);
-      for (const c of co) {
-        expect(c.with?.ref).toBe(GUARD_SHA);
-        expect(c.with?.["persist-credentials"]).toBe(false);
-      }
-    });
-
-  it("every hosted job pins its actions by SHA", () => {
-    for (const name of HOSTED)
-      for (const s of steps(name))
-        if (s.uses) expect(s.uses, name).toMatch(SHA_PIN);
-  });
-
-  it("hosted-build and hosted-check use no dependency cache (a main-scoped store would feed the signed bytes)", () => {
-    for (const name of ["hosted-build", "hosted-check"])
-      for (const s of steps(name)) {
-        expect(s.with?.cache, `${name} ${s.uses}`).toBeUndefined();
-        expect(String(s.uses ?? ""), name).not.toMatch(/^actions\/cache/);
-      }
-  });
-
-  it("hosted-build has no secrets, contents: read, builds both variants and uploads one artifact", () => {
-    const job = w.jobs["hosted-build"];
-    expect(JSON.stringify(job)).not.toContain("secrets.");
-    expect(job.permissions).toEqual({ contents: "read" });
-    const run = runOf(steps("hosted-build"));
-    expect(run).toMatch(
-      /build-hosted-release\.ts "\$RUNNER_TEMP\/hosted" --commit "\$GUARD_SHA"/,
-    );
-    const st = steps("hosted-build").find((x) =>
-      (x.run ?? "").includes("build-hosted-release"),
-    );
-    expect(st?.env?.GUARD_SHA).toBe(GUARD_SHA);
-    const up = steps("hosted-build").filter((s) =>
-      String(s.uses ?? "").startsWith("actions/upload-artifact"),
-    );
-    expect(up).toHaveLength(1);
-    expect(up[0]?.with?.name).toBe("hosted-release");
-  });
-
-  it("hosted-build fetches the guard's tag and checks it is the guard's commit, before building", () => {
-    // emit-version reports <version> only when v<version> points at HEAD; a
-    // checkout by SHA has no tags, so without this the bundle says -dev+<sha>.
-    const st = steps("hosted-build");
-    const i = st.findIndex((x) => (x.run ?? "").includes("refs/tags/$TAG"));
-    const b = st.findIndex((x) =>
-      (x.run ?? "").includes("build-hosted-release"),
-    );
-    expect(i).toBeGreaterThan(-1);
-    expect(i).toBeLessThan(b);
-    expect(st[i]?.env?.TAG).toBe(TAG);
-    expect(st[i]?.env?.GUARD_SHA).toBe(GUARD_SHA);
-    expect(st[i]?.run).toContain(
-      'git fetch --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"',
-    );
-    expect(st[i]?.run).toContain(
-      'test "$(git rev-parse "$TAG^{commit}")" = "$GUARD_SHA"',
-    );
-  });
-
-  it("hosted-build fails unless the built server reports exactly the guard's version", () => {
-    const st = steps("hosted-build");
-    const b = st.findIndex((x) =>
-      (x.run ?? "").includes("build-hosted-release"),
-    );
-    const v = st.findIndex((x) => (x.run ?? "").includes("version.gen.ts"));
-    expect(v).toBeGreaterThan(b);
-    expect(st[v]?.env?.VERSION).toBe(
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      "${{ needs.hosted-guard.outputs.version }}",
-    );
-    expect(st[v]?.run).toContain(
-      'grep -Fqx "export const VERSION = \\"$VERSION\\";" apps/server/src/version.gen.ts',
-    );
-  });
-
-  it("hosted-check has no secrets, verifies the manifest, runs check-no-test-hooks on the artifact and outputs the hashes", () => {
-    const job = w.jobs["hosted-check"];
-    expect(JSON.stringify(job)).not.toContain("secrets.");
-    expect(job.permissions).toEqual({ contents: "read" });
-    expect(needs("hosted-check")).toContain("hosted-build");
-    const run = runOf(steps("hosted-check"));
-    expect(run).toContain("scripts/ci/check-hosted-release.ts");
-    expect(run).toMatch(
-      /pnpm check-no-test-hooks "\$RUNNER_TEMP\/hosted\/release"\n\s*pnpm check-no-fake-idp "\$RUNNER_TEMP\/hosted\/release"/,
-    );
-    expect(Object.keys(job.outputs).sort()).toEqual([
-      "bundle_sha256",
-      "manifest_sha256",
-    ]);
-  });
-
-  for (const env of ENVS)
-    describe(`hosted-sign-${env}`, () => {
-      const name = `hosted-sign-${env}`;
-      const job = w.jobs[name];
-      const st = steps(name);
-      it(`runs in environment hosted-${env}, needing build and check, read-only, serialized per tag`, () => {
-        expect(job.environment).toBe(`hosted-${env}`);
-        expect(needs(name)).toEqual(
-          expect.arrayContaining([
-            "hosted-guard",
-            "hosted-build",
-            "hosted-check",
-          ]),
-        );
-        expect(job.permissions).toEqual({ contents: "read" });
-        expect(job.concurrency).toEqual({
-          group: `hosted-sign-${env}-${TAG}`,
-          "cancel-in-progress": false,
-        });
-        expect(job.env).toBeUndefined();
-      });
-      it("has the key-job shape: checkout, setup-node 22, the v22 assert, download-artifact, sign-release.mjs", () => {
-        keyJobShape(job, { download: true, script: "sign-release.mjs" });
-      });
-      it("signs only its own env and outputs only its own names", () => {
-        const env2 = st.at(-1)?.env ?? {};
-        expect(env2.SIGN_ENV).toBe(env);
-        expect(env2.GUARD_SHA).toBe(GUARD_SHA);
-        expect(String(st.at(-1)?.run)).toContain(
-          '--commit "$GUARD_SHA" --lockfile pnpm-lock.yaml',
-        );
-        expect(env2.MANIFEST_SHA256).toBe(
-          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-          "${{ needs.hosted-check.outputs.manifest_sha256 }}",
-        );
-        expect(env2.BUNDLE_SHA256).toBe(
-          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-          "${{ needs.hosted-check.outputs.bundle_sha256 }}",
-        );
-        const variants = env === "prod" ? ["release"] : ["release", "redline"];
-        expect(Object.keys(job.outputs).sort()).toEqual(
-          [
-            `${env}_signed`,
-            ...variants.flatMap((v) =>
-              ["signature", "tar_sha256", "record_sha256"].map(
-                (k) => `${env}_${v}_${k}`,
-              ),
-            ),
-          ].sort(),
-        );
-      });
-    });
-
-  for (const env of ENVS)
-    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets`, () => {
-      const name = `hosted-attach-${env}`;
-      const job = w.jobs[name];
-      const other = env === "prod" ? "staging" : "prod";
-      expect(job.permissions).toEqual({ contents: "write" });
-      expect(JSON.stringify(job)).not.toContain("RELEASE_SIGNING_KEY");
-      expect(JSON.stringify(job)).not.toContain("secrets.");
-      expect(needs(name)).toEqual(
-        expect.arrayContaining([
-          "hosted-guard",
-          "hosted-check",
-          `hosted-sign-${env}`,
-        ]),
-      );
-      expect(needs(name)).not.toContain(`hosted-sign-${other}`);
-      // Before the key ceremony the sign job skips (no key): attach skips too.
-      expect(job.if).toContain(
-        `needs.hosted-sign-${env}.outputs.${env}_signed == 'true'`,
-      );
-      expect(JSON.stringify(job)).not.toContain(`hosted-sign-${other}`);
-      expect(job.concurrency).toEqual({
-        group: `hosted-attach-${env}-${TAG}`,
-        "cancel-in-progress": false,
-      });
-      const st = steps(name);
-      const run = runOf(st);
-      expect(run).toContain("scripts/ci/assemble-release.mjs");
-      expect(run).toContain(`--env ${env}`);
-      expect(run).toContain('--commit "$GUARD_SHA" --lockfile pnpm-lock.yaml');
-      // L8: refuses when any of this env's assets is already on the release.
-      expect(run).toContain("gh release view");
-      expect(run).toContain(`oa-release-${env}-`);
-      expect(run.indexOf("gh release view")).toBeLessThan(
-        run.indexOf("gh release upload"),
-      );
-      expect(run).toContain("gh release upload");
-      expect(run).not.toContain("--clobber");
-      const node = st.filter((x) =>
-        String(x.uses ?? "").startsWith("actions/setup-node@"),
-      );
-      expect(node).toHaveLength(1);
-    });
-
-  it("no job in the run has actions: write; every job sets permissions; only the attach jobs have contents: write", () => {
-    expect(w.permissions ?? {}).toEqual({});
-    for (const [name, job] of Object.entries(w.jobs) as [string, Step][]) {
-      expect(job.permissions, name).toBeDefined();
-      expect(job.permissions?.actions, name).not.toBe("write");
-      expect(job.permissions?.contents === "write", name).toBe(
-        name.startsWith("hosted-attach-"),
-      );
-    }
-  });
-});
 
 describe("hosted-floor.yml (H1)", () => {
   it("is dispatch-only with validated-shape inputs and no workflow-wide grant", () => {
@@ -577,8 +312,12 @@ describe("docs/ops/hosted.md first-create checklist", () => {
   });
 });
 
+// deploy-prod is a public job (release-please.yml is public's file and keeps
+// it after the split). Not a hosted job: this only reads it.
 describe("deploy-prod checks the release bundle before Upgrade", () => {
-  const st = steps("deploy-prod");
+  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+  const rp: any = parse(read(".github/workflows/release-please.yml"));
+  const st: Step[] = rp.jobs["deploy-prod"].steps;
   // Stable release, and not held by the non-additive migration guard.
   const GATE =
     "steps.guard.outputs.deploy == 'true' && steps.migration.outputs.hold == 'false'";
@@ -611,36 +350,12 @@ describe("deploy-prod checks the release bundle before Upgrade", () => {
   });
 });
 
-describe("ci.yml no-test-hooks job", () => {
-  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
-  const ci: any = parse(read(".github/workflows/ci.yml"));
-  const st: Step[] = ci.jobs["no-test-hooks"].steps;
-  it("keeps its name and behavior", () => {
-    const runs = runOf(st);
-    expect(runs).toContain(
-      'node --experimental-strip-types scripts/ci/build-release-bundle.ts "$RUNNER_TEMP/release-bundle"',
-    );
-    expect(runs).toContain(
-      'pnpm check-no-test-hooks "$RUNNER_TEMP/release-bundle"',
-    );
-    expect(runs).toContain(
-      'pnpm check-no-fake-idp "$RUNNER_TEMP/release-bundle"',
-    );
-  });
-  it("N5: runs the real-build pin test, required (never skipped), behind the same release-only gate", () => {
-    const pin = st.find((s) => (s.run ?? "").includes('-t "real build"'));
-    expect(pin?.run).toContain(
-      "pnpm --filter @oa/provision exec vitest run test/release-t3b.test.ts",
-    );
-    expect(pin?.env?.OA_REQUIRE_REAL_BUILD).toBe("1");
-    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(pin?.if).toBe("${{ steps.ro.outputs.release_only != 'true' }}");
-    const check = st.findIndex((s) =>
-      (s.run ?? "").includes("pnpm check-no-test-hooks"),
-    );
-    expect(st.indexOf(pin as Step)).toBeGreaterThan(check);
-  });
-});
+// The old "ci.yml no-test-hooks job" test read the public repo's ci.yml, which
+// drops that job at the split. Its N5 guard (the real-build pin test in
+// packages/provision/test/release-t3b.test.ts runs required, never skipped) is
+// kept in this repo's own CI: ci.yml's overlay job sets OA_REQUIRE_REAL_BUILD
+// and runs every private package's tests, provision's included. That file is
+// this repo's, never overlaid, so scripts/overlay.test.sh checks it.
 
 describe("ci.yml: no signer-node20 job (H-N22)", () => {
   // The key jobs sign on Node 22 (setup-node, .nvmrc), the same major as the
@@ -661,5 +376,711 @@ describe("build-release-bundle.ts", () => {
     expect(src).toContain("--variant");
     expect(src).toMatch(/"release"/);
     expect(src).toMatch(/"redline"/);
+  });
+});
+
+// #1056 C3: hosted-release.yml in this repo, the hosted release jobs moved out
+// of the public repo's release-please.yml. Same rules, on the overlay tree.
+describe("hosted-release.yml (the cloud repo's hosted release)", () => {
+  const src = read(".github/workflows/hosted-release.yml");
+  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+  const hr: any = parse(src);
+  const jobs: Record<string, Step> = hr.jobs;
+  const JOBS = [
+    "mirror",
+    "hosted-guard",
+    "hosted-build",
+    "hosted-check",
+    "hosted-sign-staging",
+    "hosted-sign-prod",
+    "hosted-attach-staging",
+    "hosted-attach-prod",
+    "hosted-dry-run",
+  ];
+  const needsOf = (j: string): string[] => [jobs[j].needs ?? []].flat();
+  const allSteps = (j: string): Step[] => jobs[j].steps;
+  const PUB_COMMIT = "${{ needs.hosted-guard.outputs.public_sha }}";
+
+  it("has exactly the mirror and the moved hosted jobs", () => {
+    expect(Object.keys(jobs)).toEqual(JOBS);
+  });
+
+  it("runs on a push to main that changes PUBLIC_PIN, and on dispatch with dry_run defaulting to true", () => {
+    expect(Object.keys(hr.on)).toEqual(["push", "workflow_dispatch"]);
+    expect(hr.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
+    const input = hr.on.workflow_dispatch.inputs;
+    expect(Object.keys(input)).toEqual(["dry_run"]);
+    expect(input.dry_run.type).toBe("boolean");
+    expect(input.dry_run.default).toBe(true);
+    expect(hr.permissions).toEqual({});
+  });
+
+  it("a push (no inputs, so inputs.dry_run is null) is a real run, never a dry run", () => {
+    const text = read(".github/workflows/hosted-release.yml");
+    // Every use of the input is a bare truthiness test, so null means "not a dry run".
+    const uses = [...text.matchAll(/[^\n]*inputs\.dry_run[^\n]*/g)]
+      .map((m) => m[0].trim())
+      .filter((l) => !l.startsWith("#"));
+    expect(uses.length).toBeGreaterThan(0);
+    for (const l of uses) expect(l).not.toMatch(/inputs\.dry_run\s*(==|!=)/);
+    // Parsed, not matched as text: the guard's env is exactly the input.
+    const guardEnvs = stepsOf(hr, "hosted-guard")
+      .filter((st) => st.env && "DRY_RUN" in st.env)
+      .map((st) => st.env.DRY_RUN);
+    expect(guardEnvs).toEqual(["${{ inputs.dry_run }}"]);
+    // No condition compares the input the other way round ('true' == inputs.dry_run, or false, or '').
+    const ifs: string[] = [];
+    const collect = (o: unknown): void => {
+      if (Array.isArray(o)) o.forEach(collect);
+      else if (o && typeof o === "object")
+        for (const [k, v] of Object.entries(o)) {
+          if (k === "if" && typeof v === "string") ifs.push(v);
+          else collect(v);
+        }
+    };
+    collect(hr.jobs);
+    expect(ifs.length).toBeGreaterThan(0);
+    for (const c of ifs)
+      expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
+    // The guard's shell test treats anything but the string true as a real run.
+    expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
+    // The mirror runs on a push because the ref is main.
+    expect(jobs.mirror.if).toBe(
+      "${{ inputs.dry_run || github.ref == 'refs/heads/main' }}",
+    );
+    expect(hr["run-name"]).toBe(
+      "${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}",
+    );
+  });
+
+  it("names a dry run '(dry run)', the name tag-passed-checks.sh skips", () => {
+    expect(hr["run-name"]).toContain("inputs.dry_run");
+    expect(hr["run-name"]).toContain("(dry run)");
+    expect(read("scripts/ci/tag-passed-checks.sh")).toContain('"(dry run)"');
+  });
+
+  it("job ids are the names tag-passed-checks.sh requires", () => {
+    const gate = read("scripts/ci/tag-passed-checks.sh");
+    for (const j of [
+      "mirror",
+      "hosted-guard",
+      "hosted-build",
+      "hosted-check",
+      "hosted-sign-$env",
+      "hosted-attach-$env",
+    ])
+      expect(gate).toContain(j);
+    for (const j of JOBS) expect(jobs[j].name).toBeUndefined();
+  });
+
+  it("chains guard to build to check to sign to attach, behind the mirror", () => {
+    expect(needsOf("mirror")).toEqual([]);
+    expect(needsOf("hosted-guard")).toEqual(["mirror"]);
+    expect(needsOf("hosted-build")).toEqual(["hosted-guard"]);
+    expect(needsOf("hosted-check")).toEqual(["hosted-guard", "hosted-build"]);
+    for (const e of ENVS) {
+      expect(needsOf(`hosted-sign-${e}`)).toEqual([
+        "hosted-guard",
+        "hosted-build",
+        "hosted-check",
+      ]);
+      expect(needsOf(`hosted-attach-${e}`)).toEqual([
+        "hosted-guard",
+        "hosted-build",
+        "hosted-check",
+        `hosted-sign-${e}`,
+      ]);
+    }
+  });
+
+  it("the mirror mints the release App token, only outside a dry run", () => {
+    const st = allSteps("mirror");
+    const app = st.find((s) => s.id === "app") as Step;
+    expect(app.uses).toBe(APP_TOKEN);
+    expect(app.with).toEqual({
+      "app-id": "${{ secrets.RELEASE_APP_ID }}",
+      "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+    });
+    expect(app.if).toBe("${{ !inputs.dry_run }}");
+    const create = st.find((s) => s.name === "Create the tag and the release");
+    expect(create?.if).toBe("${{ !inputs.dry_run }}");
+    expect(create?.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    // The read step uses GITHUB_TOKEN and cannot create anything.
+    const reads = st.find((s) =>
+      /published, on public main/.test(s.name ?? ""),
+    );
+    expect(reads?.env.GH_TOKEN).toBe("${{ github.token }}");
+    expect(reads?.run).not.toMatch(/-X POST|release create|--method/);
+    // Only the create step writes, and only after the checks.
+    for (const s of st)
+      if (s !== create)
+        expect(s.run ?? "").not.toMatch(/git\/refs|release create/);
+    expect(st.indexOf(create as Step)).toBeGreaterThan(
+      st.indexOf(reads as Step),
+    );
+    // A real run needs main.
+    expect(jobs.mirror.if).toContain("github.ref == 'refs/heads/main'");
+    expect(jobs.mirror.permissions).toEqual({
+      contents: "read",
+      actions: "read",
+    });
+    expect(jobs.mirror.environment).toBeUndefined();
+  });
+
+  it("the mirror checks the public release before any tag", () => {
+    const run = runOf(allSteps("mirror"));
+    expect(run).toContain("prerelease");
+    expect(run).toContain("compare/$main_sha...$PUB_SHA");
+    expect(run).toContain("release-please.yml/runs");
+    for (const j of ["release-please", "verify-release"])
+      expect(run).toContain(j);
+    expect(run).toContain("package.json?ref=$PUB_SHA");
+    // The tag it creates is this repo's commit, which must be main's head.
+    expect(run).toContain('[ "$main_sha" = "$SHA" ]');
+  });
+
+  // Runs the real create step with a fake gh. A re-run after main moved must
+  // not fail (the tag cannot be changed, so a stuck release is permanent).
+  describe("create step behavior", () => {
+    const MAIN = "b".repeat(40);
+    const X = "a".repeat(40);
+    function runCreate(o: {
+      tagAt?: string;
+      main: string;
+      compare: string;
+      sha: string;
+    }) {
+      const dir = mkdtempSync(join(tmpdir(), "relcreate-"));
+      const log = join(dir, "calls.log");
+      const fake = [
+        "#!/usr/bin/env bash",
+        'echo "$*" >> "$LOG"',
+        'case "$*" in',
+        '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
+        `  "api repos/o/r/git/ref/tags/"*) [ -n "\${TAG_AT:-}" ] || exit 1; echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
+        '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
+        '  "release view"*) exit 0 ;;',
+        "  *) exit 0 ;;",
+        "esac",
+      ].join("\n");
+      writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
+      const st = allSteps("mirror").find(
+        (x) => x.name === "Create the tag and the release",
+      ) as Step;
+      const r = spawnSync("bash", ["-c", st.run], {
+        encoding: "utf8",
+        env: {
+          PATH: `${dir}:${process.env.PATH}`,
+          LOG: log,
+          MAIN: o.main,
+          COMPARE: o.compare,
+          TAG_AT: o.tagAt ?? "",
+          REPO: "o/r",
+          TAG: "v1.2.3",
+          SHA: o.sha,
+          PUBLIC_REPO: "p/p",
+        },
+      });
+      const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+      return { status: r.status, out: r.stdout + r.stderr, calls };
+    }
+    it("tag exists at SHA and main has moved: a no-op success", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain("already points at");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("tag exists at SHA but SHA left main: fails", () => {
+      const r = runCreate({
+        tagAt: X,
+        main: MAIN,
+        compare: "diverged",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("is not on main");
+    });
+    it("tag exists at another commit: fails", () => {
+      const r = runCreate({
+        tagAt: MAIN,
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("already exists and is not");
+    });
+    it("no tag and main has moved: fails, creates nothing", () => {
+      const r = runCreate({ main: MAIN, compare: "behind", sha: X });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("not the head of main");
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("no tag and SHA is main's head: creates the tag", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toContain("-X POST");
+    });
+  });
+
+  it("a real run needs main; the guard ties the tag, the commit and PUBLIC_PIN", () => {
+    const run = runOf(allSteps("hosted-guard"));
+    expect(run).toContain("refs/heads/main");
+    expect(run).toContain("PUBLIC_PIN?ref=$sha");
+    expect(run).toContain("git/ref/tags/$TAG");
+    expect(run).toContain('"$tsha" = "$sha"');
+    expect(run).toContain("target_commitish");
+    expect(jobs["hosted-guard"].permissions).toEqual({ contents: "read" });
+  });
+
+  it("every job sets its own permissions; only attach writes contents", () => {
+    for (const j of JOBS) {
+      expect(jobs[j].permissions, j).toBeDefined();
+      const writes = Object.entries(jobs[j].permissions).filter(
+        ([, v]) => v === "write",
+      );
+      expect(writes.length, j).toBe(j.startsWith("hosted-attach-") ? 1 : 0);
+    }
+    for (const e of ENVS)
+      expect(jobs[`hosted-attach-${e}`].permissions).toEqual({
+        contents: "write",
+      });
+  });
+
+  it("pins every action by SHA, the release App's too", () => {
+    for (const j of JOBS)
+      for (const s of allSteps(j)) {
+        if (!s.uses) continue;
+        expect(s.uses, `${j}: ${s.uses}`).toMatch(SHA_PIN);
+      }
+  });
+
+  it("secrets: the App secrets only in the mirror, the key only in a sign step", () => {
+    for (const j of JOBS) {
+      const job = jobs[j];
+      const outside = JSON.stringify({ ...job, steps: undefined });
+      expect(outside, j).not.toContain("secrets.");
+      for (const s of allSteps(j)) {
+        const text = JSON.stringify(s);
+        if (j === "mirror") {
+          expect(text).not.toContain("RELEASE_SIGNING_KEY");
+          continue;
+        }
+        expect(text).not.toMatch(/RELEASE_APP_/);
+        const inSign = j.startsWith("hosted-sign-") && s.id === "sign";
+        if (!inSign) expect(text, `${j}: ${s.name}`).not.toContain("secrets.");
+      }
+    }
+    for (const e of ENVS) {
+      const sign = allSteps(`hosted-sign-${e}`).find(
+        (s) => s.id === "sign",
+      ) as Step;
+      expect(sign.env.RELEASE_SIGNING_KEY).toBe(
+        "${{ secrets.RELEASE_SIGNING_KEY }}",
+      );
+      expect(jobs[`hosted-sign-${e}`].environment).toBe(`hosted-${e}`);
+      // stdin only, not argv or the shell's history.
+      expect(sign.run).toContain(
+        "printf '%s' \"$RELEASE_SIGNING_KEY\" | node scripts/ci/sign-release.mjs",
+      );
+      expect(sign.run).not.toMatch(/--key/);
+    }
+  });
+
+  it("the key jobs install nothing and run only node", () => {
+    for (const e of ENVS) {
+      const j = `hosted-sign-${e}`;
+      const st = allSteps(j);
+      expect(runOf(st).replace(/pnpm-lock\.yaml/g, "")).not.toMatch(INSTALL);
+      expect(runOf(st)).not.toContain("strip-types");
+      expect(
+        st.map((s) => (s.uses ?? "").split("@")[0]).filter(Boolean),
+      ).toEqual([
+        "actions/checkout",
+        "actions/checkout",
+        "actions/setup-node",
+        "actions/download-artifact",
+      ]);
+      expect(st.some((s) => s.run === NODE22_ASSERT)).toBe(true);
+      for (const s of st)
+        if (s.uses?.startsWith("actions/setup-node"))
+          expect(s.with).toEqual({ "node-version-file": "public/.nvmrc" });
+      expect(jobs[j].env).toBeUndefined();
+    }
+  });
+
+  it("a dry run signs with staging only, and attaches nothing", () => {
+    expect(jobs["hosted-sign-staging"].if).not.toContain("inputs.dry_run");
+    expect(jobs["hosted-sign-prod"].if).toContain("!inputs.dry_run");
+    for (const e of ENVS)
+      expect(jobs[`hosted-attach-${e}`].if).toContain("!inputs.dry_run");
+    const dry = jobs["hosted-dry-run"];
+    expect(dry.if).toContain("inputs.dry_run");
+    expect(dry.if).not.toContain("!inputs.dry_run");
+    expect(dry.permissions).toEqual({ contents: "read" });
+    const run = runOf(dry.steps);
+    expect(run).toContain("assemble-release.mjs");
+    expect(run).not.toMatch(/gh release|gh api/);
+    const up = dry.steps.at(-1);
+    expect(up.uses).toMatch(/^actions\/upload-artifact@/);
+    expect(up.with.name).toBe("hosted-signed-staging-dry-run");
+  });
+
+  it("builds on the overlay: public at the pinned commit, this repo on top", () => {
+    for (const j of [
+      "hosted-build",
+      "hosted-check",
+      ...ENVS.flatMap((e) => [`hosted-sign-${e}`, `hosted-attach-${e}`]),
+      "hosted-dry-run",
+    ]) {
+      const st = allSteps(j);
+      const [priv, pub] = st;
+      expect(priv.uses).toMatch(/^actions\/checkout@/);
+      expect(priv.with.ref).toBe("${{ needs.hosted-guard.outputs.sha }}");
+      expect(priv.with.path).toBe("private");
+      expect(priv.with["persist-credentials"]).toBe(false);
+      expect(pub.with.repository).toBe("open-artifacts-ai/open-artifacts");
+      expect(pub.with.ref).toBe(PUB_COMMIT);
+      expect(pub.with.path).toBe("public");
+      expect(pub.with["persist-credentials"]).toBe(false);
+      expect(st[2].run).toBe(
+        "private/scripts/overlay.sh --auto-split public private",
+      );
+    }
+  });
+
+  it("records the public commit everywhere, never this repo's", () => {
+    for (const j of JOBS.filter((x) => /build|sign|attach|dry-run/.test(x))) {
+      const run = runOf(allSteps(j));
+      for (const m of run.matchAll(/--commit "\$(\w+)"/g))
+        expect(m[1], j).toBe("PUB_SHA");
+    }
+    expect(src).not.toMatch(/--commit "\$GUARD_SHA"/);
+    // The lockfile is the overlay's merged one, from public's root.
+    expect(src).toContain("--lockfile pnpm-lock.yaml");
+  });
+
+  it("attaches to this repo's release, once per env, refusing existing assets", () => {
+    for (const e of ENVS) {
+      const run = runOf(allSteps(`hosted-attach-${e}`));
+      expect(run).toContain(`grep '^oa-release-${e}-'`);
+      expect(run).toContain('gh release upload "$TAG" --repo "$REPO"');
+      expect(
+        allSteps(`hosted-attach-${e}`).some(
+          (s) => s.env?.REPO === "${{ github.repository }}",
+        ),
+      ).toBe(true);
+      expect(jobs[`hosted-attach-${e}`].concurrency.group).toContain(
+        `hosted-attach-${e}-`,
+      );
+    }
+  });
+
+  it("never writes to the public repo", () => {
+    expect(src).not.toMatch(/-R\s+\$PUBLIC_REPO|--repo\s+"?\$PUBLIC_REPO/);
+    for (const m of src.matchAll(/gh api -X (POST|PUT|PATCH|DELETE)[^\n]*/g))
+      expect(m[0]).toContain("repos/$REPO/");
+  });
+
+  // The guards that used to be asserted against the public release-please.yml's
+  // hosted-* jobs, now on this repo's own jobs. (Pre-split and strict mode alike:
+  // nothing here reads a public workflow.)
+  const SHA_OUT = "${{ needs.hosted-guard.outputs.sha }}";
+  const TAG_OUT = "${{ needs.hosted-guard.outputs.tag }}";
+  const stepKeys = (st: Step[]) =>
+    st.map((x) => Object.keys(x).sort().join(","));
+
+  it("sign and attach are split per env: no matrix, no extra hosted jobs", () => {
+    for (const n of JOBS) expect(jobs[n].strategy, n).toBeUndefined();
+    for (const n of Object.keys(jobs))
+      if (n.startsWith("hosted-")) expect(JOBS, n).toContain(n);
+  });
+
+  it("hosted-guard has no secrets, no checkout and read-only permissions", () => {
+    const job = jobs["hosted-guard"];
+    expect(JSON.stringify(job)).not.toContain("secrets.");
+    expect(JSON.stringify(job)).not.toContain("actions/checkout");
+    expect(job.permissions).toEqual({ contents: "read" });
+    expect(job.outputs.sha).toMatch(/steps\.\w+\.outputs\.sha/);
+    const run = runOf(allSteps("hosted-guard"));
+    // L4: main is read as the branch ref, never the bare (tag-shadowable) name.
+    expect(run).toContain('gh api "repos/$REPO/git/ref/heads/main"');
+    expect(run).toContain('compare/$main_sha...$sha"');
+    expect(run).not.toContain("compare/main...");
+    expect(run).toMatch(/behind\|identical/);
+    expect(run).not.toContain("${{");
+  });
+
+  // L5, moved from the public release-please hosted-guard. This repo has no
+  // package.json, so the release commit is proved where the version lives: in
+  // the public commit the pin names. The mirror checks it before any tag.
+  it("L5: the mirror proves the pinned public commit is the release commit", () => {
+    const run = runOf(allSteps("mirror"));
+    expect(run).toContain("target_commitish");
+    expect(run).toContain('"$target" != "$PUB_SHA"');
+    expect(run).toContain(".parents[0].sha");
+    expect(run).toContain("package.json?ref=$parent");
+    expect(run).toMatch(/\[ "\$prev" != "\$version" \]/);
+    // After the version check, before the release run is looked up.
+    expect(run.indexOf("package.json?ref=$PUB_SHA")).toBeLessThan(
+      run.indexOf("package.json?ref=$parent"),
+    );
+    expect(run.indexOf("package.json?ref=$parent")).toBeLessThan(
+      run.indexOf("release-please.yml/runs"),
+    );
+  });
+
+  describe("L5 behavior (the real read step, a fake gh)", () => {
+    const PUB = "c".repeat(40);
+    const PARENT = "d".repeat(40);
+    const OTHER = "e".repeat(40);
+    function runRead(o: { target: string; prev: string; version?: string }) {
+      const dir = mkdtempSync(join(tmpdir(), "relread-"));
+      const fake = [
+        "#!/usr/bin/env bash",
+        'case "$*" in',
+        '  "api repos/p/p/releases/tags/v1.2.3") echo \'{"draft":false,"prerelease":false,"published_at":"2026-01-01T00:00:00Z","target_commitish":"\'"$TARGET"\'"}\' ;;',
+        '  "api repos/p/p/git/ref/tags/v1.2.3") echo \'{"object":{"type":"commit","sha":"\'"$PUB"\'"}}\' ;;',
+        '  "api repos/p/p/git/ref/heads/main -q .object.sha") echo "$PUB" ;;',
+        '  "api repos/p/p/compare/"*) echo identical ;;',
+        '  *"package.json?ref=$PUB") echo \'{"version":"\'"$VERSION"\'"}\' ;;',
+        '  *"package.json?ref=$PARENT") echo \'{"version":"\'"$PREV"\'"}\' ;;',
+        '  "api repos/p/p/commits/$PUB -q .parents[0].sha") echo "$PARENT" ;;',
+        '  *"release-please.yml/runs"*) echo \'{"workflow_runs":[{"id":7,"head_sha":"\'"$PUB"\'","event":"push","created_at":"2026-01-01T00:00:00Z"}]}\' ;;',
+        '  *"actions/runs/7/jobs"*) echo \'{"jobs":[{"name":"release-please","conclusion":"success"},{"name":"verify-release","conclusion":"success"}]}\' ;;',
+        '  *) echo "unexpected gh call: $*" >&2; exit 1 ;;',
+        "esac",
+      ].join("\n");
+      writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
+      const st = allSteps("mirror").find((x) =>
+        /published, on public main/.test(x.name ?? ""),
+      ) as Step;
+      const r = spawnSync("bash", ["-c", st.run], {
+        encoding: "utf8",
+        env: {
+          PATH: `${dir}:${process.env.PATH}`,
+          PUBLIC_REPO: "p/p",
+          TAG: "v1.2.3",
+          PUB_SHA: PUB,
+          PUB,
+          PARENT,
+          TARGET: o.target,
+          PREV: o.prev,
+          VERSION: o.version ?? "1.2.3",
+        },
+      });
+      return { status: r.status, out: r.stdout + r.stderr };
+    }
+    it("a version bump in the pinned commit passes", () => {
+      const r = runRead({ target: PUB, prev: "1.2.2" });
+      expect(r.status, r.out).toBe(0);
+    });
+    it("a release whose target is a branch name passes too", () => {
+      const r = runRead({ target: "main", prev: "1.2.2" });
+      expect(r.status, r.out).toBe(0);
+    });
+    it("a pin on a commit that did not change the version fails", () => {
+      const r = runRead({ target: PUB, prev: "1.2.3" });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("not the release commit");
+    });
+    it("a release that targets another commit fails", () => {
+      const r = runRead({ target: OTHER, prev: "1.2.2" });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("its release targets");
+    });
+  });
+
+  it("every hosted job after the guard needs it and checks out exactly its SHA, no credentials kept", () => {
+    for (const name of JOBS.slice(2)) {
+      expect(needsOf(name), name).toContain("hosted-guard");
+      const co = allSteps(name).filter((x) =>
+        String(x.uses ?? "").startsWith("actions/checkout"),
+      );
+      expect(co.length, name).toBeGreaterThan(0);
+      for (const c of co)
+        expect(c.with?.["persist-credentials"], name).toBe(false);
+      expect(co[0]?.with?.ref, name).toBe(SHA_OUT);
+    }
+  });
+
+  it("hosted-build and hosted-check use no dependency cache (a main-scoped store would feed the signed bytes)", () => {
+    for (const name of ["hosted-build", "hosted-check"])
+      for (const x of allSteps(name)) {
+        expect(x.with?.cache, `${name} ${x.uses}`).toBeUndefined();
+        expect(String(x.uses ?? ""), name).not.toMatch(/^actions\/cache/);
+      }
+  });
+
+  it("hosted-build has no secrets, contents: read, builds both variants and uploads one artifact", () => {
+    const job = jobs["hosted-build"];
+    expect(JSON.stringify(job)).not.toContain("secrets.");
+    expect(job.permissions).toEqual({ contents: "read" });
+    const st = allSteps("hosted-build");
+    expect(runOf(st)).toMatch(
+      /build-hosted-release\.ts "\$RUNNER_TEMP\/hosted" --commit "\$PUB_SHA"/,
+    );
+    const up = st.filter((x) =>
+      String(x.uses ?? "").startsWith("actions/upload-artifact"),
+    );
+    expect(up).toHaveLength(1);
+    expect(up[0]?.with?.name).toBe("hosted-release");
+  });
+
+  it("hosted-build fetches the public tag and checks it is the public commit, before building", () => {
+    const st = allSteps("hosted-build");
+    const i = st.findIndex((x) => (x.run ?? "").includes("refs/tags/$TAG"));
+    const b = st.findIndex((x) =>
+      (x.run ?? "").includes("build-hosted-release"),
+    );
+    expect(i).toBeGreaterThan(-1);
+    expect(i).toBeLessThan(b);
+    expect(st[i]?.env?.TAG).toBe(TAG_OUT);
+    expect(st[i]?.env?.PUB_SHA).toBe(PUB_COMMIT);
+    expect(st[i]?.run).toContain(
+      'git fetch --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"',
+    );
+    expect(st[i]?.run).toContain(
+      'test "$(git rev-parse "$TAG^{commit}")" = "$PUB_SHA"',
+    );
+  });
+
+  it("hosted-build fails unless the built server reports exactly the release version", () => {
+    const st = allSteps("hosted-build");
+    const b = st.findIndex((x) =>
+      (x.run ?? "").includes("build-hosted-release"),
+    );
+    const v = st.findIndex((x) => (x.run ?? "").includes("version.gen.ts"));
+    expect(v).toBeGreaterThan(b);
+    expect(st[v]?.env?.VERSION).toBe(
+      "${{ needs.hosted-guard.outputs.version }}",
+    );
+    expect(st[v]?.run).toContain(
+      'grep -Fqx "export const VERSION = \\"$VERSION\\";" apps/server/src/version.gen.ts',
+    );
+  });
+
+  it("hosted-check has no secrets, verifies the manifest, runs the hook checks on the artifact and outputs the hashes", () => {
+    const job = jobs["hosted-check"];
+    expect(JSON.stringify(job)).not.toContain("secrets.");
+    expect(job.permissions).toEqual({ contents: "read" });
+    expect(needsOf("hosted-check")).toContain("hosted-build");
+    const run = runOf(allSteps("hosted-check"));
+    expect(run).toContain("scripts/ci/check-hosted-release.ts");
+    expect(run).toMatch(
+      /pnpm check-no-test-hooks "\$RUNNER_TEMP\/hosted\/release"\n\s*pnpm check-no-fake-idp "\$RUNNER_TEMP\/hosted\/release"/,
+    );
+    expect(Object.keys(job.outputs).sort()).toEqual([
+      "bundle_sha256",
+      "manifest_sha256",
+    ]);
+  });
+
+  for (const env of ENVS)
+    describe(`hosted-sign-${env} (key-job shape)`, () => {
+      const name = `hosted-sign-${env}`;
+      const job = jobs[name];
+      const st = allSteps(name);
+      it("runs in its environment, serialized per tag, read-only, no job-level env or defaults", () => {
+        expect(job.environment).toBe(`hosted-${env}`);
+        expect(job.permissions).toEqual({ contents: "read" });
+        expect(job.concurrency).toEqual({
+          group: `hosted-sign-${env}-${TAG_OUT}`,
+          "cancel-in-progress": false,
+        });
+        expect(job.env).toBeUndefined();
+        expect(job.defaults).toBeUndefined();
+      });
+      it("has exactly the steps: two checkouts, overlay, setup-node 22, the v22 assert, download-artifact, sign", () => {
+        expect(stepKeys(st)).toEqual([
+          "uses,with",
+          "uses,with",
+          "name,run",
+          "uses,with",
+          "name,run",
+          "uses,with",
+          "env,id,name,run,working-directory",
+        ]);
+        expect(st[3]?.with).toEqual({ "node-version-file": "public/.nvmrc" });
+        expect(st[3]?.env).toBeUndefined();
+        expect(String(st[4]?.run).trim()).toBe(NODE22_ASSERT);
+        expect(Object.keys(st[5]?.with ?? {}).sort()).toEqual(["name", "path"]);
+        expect(read(".nvmrc").trim()).toBe("22");
+      });
+      it("keeps the key to the last step's env, once, on stdin, with no cache and no install", () => {
+        const last = st.at(-1) as Step;
+        expect(JSON.stringify(st)).not.toMatch(/cache/i);
+        for (const x of st) expect(x.run ?? "").not.toMatch(INSTALL);
+        expect(
+          st.filter((x) => JSON.stringify(x).includes("RELEASE_SIGNING_KEY")),
+        ).toEqual([last]);
+        expect(JSON.stringify(st.slice(0, -1))).not.toContain("secrets.");
+        expect(JSON.stringify(last).match(/secrets\./g)).toHaveLength(1);
+        expect(String(last.run).match(/RELEASE_SIGNING_KEY/g)).toHaveLength(1);
+        expect(last.run).not.toMatch(/set -x|set -o xtrace|--key/);
+        expect(last.run).not.toContain("--experimental-strip-types");
+        expect(JSON.stringify(st)).not.toMatch(/CLOUDFLARE_/);
+      });
+      it("signs only its own env and outputs only its own names", () => {
+        const env2 = st.at(-1)?.env ?? {};
+        expect(env2.SIGN_ENV).toBe(env);
+        expect(env2.PUB_SHA).toBe(PUB_COMMIT);
+        expect(env2.MANIFEST_SHA256).toBe(
+          "${{ needs.hosted-check.outputs.manifest_sha256 }}",
+        );
+        expect(env2.BUNDLE_SHA256).toBe(
+          "${{ needs.hosted-check.outputs.bundle_sha256 }}",
+        );
+        const variants = env === "prod" ? ["release"] : ["release", "redline"];
+        expect(Object.keys(job.outputs).sort()).toEqual(
+          [
+            `${env}_signed`,
+            ...variants.flatMap((v) =>
+              ["signature", "tar_sha256", "record_sha256"].map(
+                (k) => `${env}_${v}_${k}`,
+              ),
+            ),
+          ].sort(),
+        );
+      });
+    });
+
+  for (const env of ENVS)
+    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets`, () => {
+      const name = `hosted-attach-${env}`;
+      const job = jobs[name];
+      const other = env === "prod" ? "staging" : "prod";
+      expect(job.permissions).toEqual({ contents: "write" });
+      expect(JSON.stringify(job)).not.toContain("RELEASE_SIGNING_KEY");
+      expect(JSON.stringify(job)).not.toContain("secrets.");
+      expect(needsOf(name)).not.toContain(`hosted-sign-${other}`);
+      expect(JSON.stringify(job)).not.toContain(`hosted-sign-${other}`);
+      expect(job.if).toContain(
+        `needs.hosted-sign-${env}.outputs.${env}_signed == 'true'`,
+      );
+      expect(job.concurrency).toEqual({
+        group: `hosted-attach-${env}-${TAG_OUT}`,
+        "cancel-in-progress": false,
+      });
+      const run = runOf(allSteps(name));
+      expect(run).toContain("scripts/ci/assemble-release.mjs");
+      expect(run).toContain(`--env ${env}`);
+      expect(run).toContain("gh release view");
+      expect(run).toContain(`oa-release-${env}-`);
+      expect(run.indexOf("gh release view")).toBeLessThan(
+        run.indexOf("gh release upload"),
+      );
+      expect(run).not.toContain("--clobber");
+      expect(
+        allSteps(name).filter((x) =>
+          String(x.uses ?? "").startsWith("actions/setup-node@"),
+        ),
+      ).toHaveLength(1);
+    });
+
+  it("no job has actions: write", () => {
+    expect(hr.permissions ?? {}).toEqual({});
+    for (const [n, job] of Object.entries(jobs))
+      expect(job.permissions?.actions, n).not.toBe("write");
   });
 });

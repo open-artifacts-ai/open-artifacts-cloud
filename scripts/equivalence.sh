@@ -33,8 +33,13 @@ set -uo pipefail
 # blindly: check_lock below still requires every non-private importer to match
 # public's byte for byte. The packages/snapshots sections are not compared:
 # they follow from the importers and are pnpm's to resolve.
+#
+# .github/workflows/hosted-release.yml is this repo's own workflow (#1056 C3):
+# public has no such file, so it is an extra in the overlay tree by design. It
+# is listed by exact path so that any other new workflow still fails.
 ALLOW=(
   pnpm-lock.yaml
+  .github/workflows/hosted-release.yml
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
@@ -159,6 +164,7 @@ diffs=$(cd "$T" && diff -rq --no-dereference -x .git ref work 2>&1)
 bad=0 seen=0 owned=0
 while IFS= read -r line; do
   [ -n "$line" ] || continue
+  side=
   case "$line" in
     "Only in "*)
       rest=${line#Only in }
@@ -172,6 +178,15 @@ while IFS= read -r line; do
     *) echo "equivalence: unreadable diff line: $line" >&2; bad=$((bad + 1)); continue ;;
   esac
   if is_private "$path"; then owned=$((owned + 1)); continue; fi   # CLOUD-owned
+  # A directory only the overlay has (public deleted its hosted code, so a listed
+  # path's parent is gone from public) is CLOUD-owned when every file under it is.
+  if [ "${side:-}" = work ] && [ -d "$work/$path" ] && [ ! -L "$work/$path" ]; then
+    own=1
+    while IFS= read -r f; do
+      is_private "$path/$f" || { own=0; break; }
+    done < <(cd "$work/$path" && find . \( -type f -o -type l \) -print | sed 's|^\./||')
+    if [ "$own" -eq 1 ]; then owned=$((owned + 1)); continue; fi
+  fi
   seen=$((seen + 1))
   if allowed "$path"; then
     if [ "$path" = pnpm-lock.yaml ]; then check_lock || bad=$((bad + 1)); fi

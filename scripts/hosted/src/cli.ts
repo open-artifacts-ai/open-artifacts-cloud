@@ -1,4 +1,4 @@
-// `pnpm oa:hosted <command> --env staging|prod ...` (P1 Task 8): the hosted
+// `pnpm -s --filter @oa/hosted start <command> --env staging|prod ...` (P1 Task 8): the hosted
 // control plane's CLI, read-only plus the two release publishes. Install
 // writes go through the Provisioning API (design 10.1, W9b retired them
 // here). Every command is a thin wrapper over @oa/provision (WfpProvisioner,
@@ -81,7 +81,7 @@ export const RETIRED_COMMANDS = [
 export const COMMANDS = ["status", "publish-release", "publish-floor"] as const;
 type Command = (typeof COMMANDS)[number];
 
-export const HELP = `Usage: pnpm oa:hosted <command> --env staging|prod [flags]
+export const HELP = `Usage: pnpm -s --filter @oa/hosted start <command> --env staging|prod [flags]
 
 Commands:
   status          --install <id>  (read-only)

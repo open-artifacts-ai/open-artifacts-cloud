@@ -51,11 +51,14 @@ const UPLOAD =
   "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 
 describe("prodclean-monitor.yml", () => {
-  // The hourly schedule is off in this repo until cut-over step F5 (#1056):
-  // public's copy still runs it, and two monitors would double-run. F5 puts
-  // the schedule back (one hourly cron) and this test with it.
-  it("runs on dispatch only, until F5 turns the schedule on", () => {
-    expect(Object.keys(wf.on)).toEqual(["workflow_dispatch"]);
+  it("runs hourly and on dispatch only", () => {
+    expect(Object.keys(wf.on).sort()).toEqual([
+      "schedule",
+      "workflow_dispatch",
+    ]);
+    const s = wf.on.schedule as { cron: string }[];
+    expect(s).toHaveLength(1);
+    expect(s[0]?.cron).toBe("17 * * * *");
   });
 
   it("two jobs: build has contents: read only, monitor has id-token: write only", () => {
