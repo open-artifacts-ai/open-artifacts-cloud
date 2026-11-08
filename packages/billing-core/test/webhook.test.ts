@@ -77,6 +77,7 @@ type Row = {
   updated_at: number;
   last_event_created: number | null;
   last_invoice_created: number | null;
+  last_checkout_created: number | null;
 };
 const row = async (install: string) =>
   db
@@ -130,7 +131,9 @@ const sub = (o: Record<string, unknown> = {}) => ({
 const pending = async () =>
   (
     await db
-      .prepare("SELECT subscription_id FROM pending_cancels ORDER BY subscription_id")
+      .prepare(
+        "SELECT subscription_id FROM pending_cancels ORDER BY subscription_id",
+      )
       .all<{ subscription_id: string }>()
   ).results.map((r) => r.subscription_id);
 
@@ -2221,7 +2224,9 @@ describe("pending cancels are a table, settled together (#1568)", () => {
   const KEY = "sk_test_notarealkey0000";
   const queue = (id: string, customer: string) =>
     db
-      .prepare("INSERT INTO pending_cancels (subscription_id, customer_id) VALUES (?, ?)")
+      .prepare(
+        "INSERT INTO pending_cancels (subscription_id, customer_id) VALUES (?, ?)",
+      )
       .bind(id, customer)
       .run();
   /** Stripe where the subscriptions in `fail` can't be cancelled. */
@@ -2235,7 +2240,10 @@ describe("pending cancels are a table, settled together (#1568)", () => {
         ? Response.json({ error: { type: "api_error" } }, { status: 500 })
         : Response.json({ id, status: "canceled" });
     }) as unknown as typeof fetch;
-    return { calls, e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv };
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
   };
   const ping = () => event("invoice.paid", inv());
 
@@ -2245,7 +2253,12 @@ describe("pending cancels are a table, settled together (#1568)", () => {
     await queue("sub_Q1", CUS_B);
     const s = stripe();
     expect((await deliver(ping(), { env: s.e })).status).toBe(200);
-    expect(s.calls).toEqual(["GET sub_P1", "DELETE sub_P1", "GET sub_P2", "DELETE sub_P2"]);
+    expect(s.calls).toEqual([
+      "GET sub_P1",
+      "DELETE sub_P1",
+      "GET sub_P2",
+      "DELETE sub_P2",
+    ]);
     expect(await pending()).toEqual(["sub_Q1"]);
   });
 
@@ -2256,7 +2269,11 @@ describe("pending cancels are a table, settled together (#1568)", () => {
     const bad = stripe(["sub_P2"]);
     expect((await deliver(ping(), { env: bad.e })).status).toBe(500);
     expect(await pending()).toEqual(["sub_P2"]);
-    expect(bad.calls.filter((c) => c.startsWith("DELETE"))).toEqual(["DELETE sub_P1", "DELETE sub_P2", "DELETE sub_P3"]);
+    expect(bad.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
+      "DELETE sub_P1",
+      "DELETE sub_P2",
+      "DELETE sub_P3",
+    ]);
     const good = stripe();
     expect((await deliver(ping(), { env: good.e })).status).toBe(200);
     expect(good.calls).toEqual(["GET sub_P2", "DELETE sub_P2"]);
@@ -2265,16 +2282,184 @@ describe("pending cancels are a table, settled together (#1568)", () => {
 
   it("an upgrade queues the replaced subscription in the same batch as the event; the row can never queue its own subscription", async () => {
     await db
-      .prepare("UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1' WHERE install_id = ?")
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1' WHERE install_id = ?",
+      )
       .bind(A)
       .run();
     const bad = stripe(["sub_Old1"]);
     const r = await deliver(
-      event("checkout.session.completed", { customer: CUS_A, subscription: "sub_New1", payment_status: "paid", metadata: { tier: "team" } }),
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: "sub_New1",
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      }),
       { env: bad.e },
     );
     expect(r.status).toBe(500);
     expect(await pending()).toEqual(["sub_Old1"]);
-    expect(await row(A)).toMatchObject({ tier: "team", stripe_subscription_id: "sub_New1" });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_New1",
+    });
+  });
+});
+
+// ------------------------------------------------- checkout has its own order key
+
+describe("a delayed upgrade Checkout is ordered against other Checkouts only (#1568)", () => {
+  const OLD = "sub_Old1";
+  const KEY = "sk_test_notarealkey0000";
+  const soloPrice = {
+    items: { data: [{ price: { id: "p", metadata: { tier: "solo" } } }] },
+  };
+  const teamPrice = {
+    items: { data: [{ price: { id: "q", lookup_key: "team" } }] },
+  };
+  const solo = () =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', grace_until = NULL, trial_ends_at = NULL, stripe_subscription_id = ?, last_event_created = NULL, last_invoice_created = NULL, last_checkout_created = NULL WHERE install_id = ?",
+      )
+      .bind(OLD, A)
+      .run();
+  const stripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const id = new URL(url).pathname.split("/").pop() as string;
+      calls.push(`${init.method} ${id}`);
+      return Response.json({
+        id,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+  const checkout = (
+    sub: string,
+    created: number,
+    o: Record<string, unknown> = {},
+  ) =>
+    event(
+      "checkout.session.completed",
+      {
+        customer: CUS_A,
+        subscription: sub,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+        ...o,
+      },
+      { created },
+    );
+
+  it("a newer event for the old subscription delivered first does not make the Checkout stale: it applies, and the old one is cancelled", async () => {
+    await solo();
+    const s = stripe();
+    // Real order state: the old Solo's own update at T+50 is applied first.
+    await deliver(
+      event("customer.subscription.updated", sub({ id: OLD, ...soloPrice }), {
+        created: T + 50,
+      }),
+      { env: s.e },
+    );
+    expect((await row(A)).last_event_created).toBe(T + 50);
+    // The upgrade Checkout was made at T+10 and arrives late.
+    const r = await deliver(checkout("sub_New1", T + 10), { env: s.e });
+    expect(r.status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: "sub_New1",
+    });
+    expect(s.calls).toEqual([`GET ${OLD}`, `DELETE ${OLD}`]);
+  });
+
+  it("the new subscription's later events then apply: the old subscription's order keys do not hold them back", async () => {
+    await solo();
+    const s = stripe();
+    await deliver(
+      event("customer.subscription.updated", sub({ id: OLD, ...soloPrice }), {
+        created: T + 50,
+      }),
+      { env: s.e },
+    );
+    await deliver(
+      event("invoice.payment_failed", inv({ subscription: OLD }), {
+        created: T + 40,
+      }),
+      { env: s.e },
+    );
+    await deliver(checkout("sub_New1", T + 10), { env: s.e });
+    // After the Checkout (T+10) but before the old subscription's last event (T+50).
+    const failed = event(
+      "invoice.payment_failed",
+      inv({ subscription: "sub_New1" }),
+      { created: T + 20 },
+    );
+    await deliver(failed, { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "past_due",
+      grace_until: failed.created * 1000 + GRACE_MS,
+    });
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({ id: "sub_New1", ...teamPrice, status: "active" }),
+        { created: T + 30 },
+      ),
+      { env: s.e },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      grace_until: null,
+    });
+  });
+
+  it("an older Checkout never replaces a newer one", async () => {
+    await solo();
+    const s = stripe();
+    await deliver(checkout("sub_New2", T + 60), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_New2",
+    });
+    // The earlier session's Checkout arrives late.
+    await deliver(
+      checkout("sub_New1", T + 10, { metadata: { tier: "business" } }),
+      { env: s.e },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: "sub_New2",
+    });
+  });
+
+  it("a retried Checkout of the current subscription, or of one the row left, never revives a lapse (N6 still holds)", async () => {
+    await solo();
+    const s = stripe();
+    const c = checkout("sub_New1", T + 10);
+    await deliver(c, { env: s.e });
+    await deliver(
+      event(
+        "customer.subscription.deleted",
+        sub({ id: "sub_New1", ...teamPrice, status: "canceled" }),
+        { created: T + 100 },
+      ),
+      { env: s.e },
+    );
+    expect((await row(A)).status).toBe("lapsed");
+    await deliver(c, { env: s.e });
+    await deliver({ ...c, id: "evt_fresh_retry" }, { env: s.e });
+    expect(await row(A)).toMatchObject({
+      status: "lapsed",
+      stripe_subscription_id: "sub_New1",
+    });
   });
 });

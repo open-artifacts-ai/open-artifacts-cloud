@@ -135,6 +135,7 @@ describe("migrations", () => {
     // never been deployed).
     expect(cols(tiers(sql.replace("tiers_new", "tiers")))).toEqual([
       ...cols(tiers(init)),
+      "last_checkout_created",
       "solo_trial_ends_at",
       "solo_status",
       "solo_grace_until",
@@ -173,7 +174,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 50 KB per env", () => {
+  it("wrangler deploy --dry-run is under 64 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -181,7 +182,8 @@ describe("bundle", () => {
         .filter((f) => f.endsWith(".js"))
         .reduce((n, f) => n + statSync(join(out, f)).size, 0);
       expect(bytes).toBeGreaterThan(0);
-      expect(bytes).toBeLessThan(50 * 1024);
+      // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths.
+      expect(bytes).toBeLessThan(64 * 1024);
     }
   });
 });

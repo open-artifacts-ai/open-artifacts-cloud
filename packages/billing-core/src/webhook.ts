@@ -311,6 +311,24 @@ export function changeFor(
         o.payment_status === "paid" ||
         o.payment_status === "no_payment_required";
       if (sub) {
+        // The row adopts this subscription: its order keys belong to the one
+        // it replaced, and must not hold the new one's events back. An
+        // unpaid checkout that leaves a live subscription in place resets
+        // nothing.
+        const adopts = payNow
+          ? "1"
+          : `NOT (${PREV_LIVE} AND stripe_subscription_id != ?)`;
+        const adoptArgs = payNow ? [] : [sub];
+        sets.push(
+          {
+            sql: `last_event_created = CASE WHEN ${adopts} THEN ? ELSE last_event_created END`,
+            args: [...adoptArgs, ev.created],
+          },
+          {
+            sql: `last_invoice_created = CASE WHEN ${adopts} AND stripe_subscription_id IS NOT ? THEN NULL ELSE last_invoice_created END`,
+            args: [...adoptArgs, sub],
+          },
+        );
         // An unpaid checkout (a payment still pending) never takes the row's
         // live subscription from it: the row switches when the payment
         // succeeds (async_payment_succeeded). With no live one it records
@@ -583,9 +601,13 @@ const KNOWN =
  * (last_invoice_created), so an invoice never advances the subscription's
  * key and never blocks a later-arriving genuine tier change.
  */
-export type EventStream = "subscription" | "invoice";
+export type EventStream = "subscription" | "invoice" | "checkout";
 export const streamOf = (type: string): EventStream =>
-  type.startsWith("invoice.") ? "invoice" : "subscription";
+  type.startsWith("invoice.")
+    ? "invoice"
+    : type.startsWith("checkout.session.")
+      ? "checkout"
+      : "subscription";
 
 /**
  * Subscription: newer than its last applied event; at the same second,
@@ -593,15 +615,26 @@ export const streamOf = (type: string): EventStream =>
  * it). Invoice: not older than the last invoice applied, nor than the
  * subscription's state (a delayed invoice never undoes a newer change).
  */
-const IN_ORDER: Record<EventStream, string> = {
+const IN_ORDER: Record<Exclude<EventStream, "checkout">, string> = {
   subscription:
     "(?1 > coalesce(last_event_created, 0) OR (?1 = coalesce(last_event_created, 0) AND status IS NOT 'lapsed'))",
   invoice:
     "(?1 >= coalesce(last_invoice_created, 0) AND ?1 >= coalesce(last_event_created, 0))",
 };
+/**
+ * A checkout is ordered against other checkouts only (last_checkout_created):
+ * a newer event for the row's old subscription must not make a delayed
+ * upgrade Checkout stale, or the row never recovers and both subscriptions
+ * bill. An older Checkout still never replaces a newer one. The
+ * subscription-stream rule is kept for a Checkout of the row's own current
+ * subscription (a retry or async_payment_succeeded): it can't revive a lapse.
+ * See handleStripeWebhook for the combined condition.
+ */
+const IN_ORDER_CHECKOUT = "(?1 >= coalesce(last_checkout_created, 0))";
 const ORDER_COLUMN: Record<EventStream, string> = {
   subscription: "last_event_created",
   invoice: "last_invoice_created",
+  checkout: "last_checkout_created",
 };
 
 /**
@@ -642,7 +675,9 @@ async function settleCancels(
   env: WebhookEnv,
 ): Promise<boolean> {
   const { results } = await db
-    .prepare("SELECT subscription_id FROM pending_cancels WHERE customer_id = ?")
+    .prepare(
+      "SELECT subscription_id FROM pending_cancels WHERE customer_id = ?",
+    )
     .bind(customer)
     .all<{ subscription_id: string }>();
   if (results.length === 0) return true;
@@ -756,12 +791,21 @@ export async function handleStripeWebhook(
         ? ev.object.subscription
         : null
       : subscriptionOf(ev);
-    let order = IN_ORDER[stream].replaceAll("?1", `?${n + 3}`);
-    // A resubscribe's checkout is never "the old subscription revived": in
-    // the same second as the old one's deletion it still applies when its
-    // subscription differs from the row's.
-    if (isCheckout && eventSub)
-      order = `(${order} OR (?${n + 3} = coalesce(last_event_created, 0) AND stripe_subscription_id IS NOT ?${n + 2}))`;
+    const at = `?${n + 3}`;
+    const subOrder = IN_ORDER.subscription.replaceAll("?1", at);
+    const order =
+      stream === "invoice"
+        ? IN_ORDER.invoice.replaceAll("?1", at)
+        : stream === "subscription"
+          ? subOrder
+          : // A Checkout: for another subscription than the row's, only
+            // against other Checkouts (so a resubscribe or a delayed upgrade
+            // applies, an older one never replaces a newer); for the row's
+            // own subscription also the subscription order, so a retried
+            // Checkout can't revive a deleted subscription.
+            eventSub
+            ? `(${IN_ORDER_CHECKOUT.replaceAll("?1", at)} AND (stripe_subscription_id IS NOT ?${n + 2} OR ${subOrder}))`
+            : subOrder;
     // Subscription and invoice events apply only to the row's own
     // subscription (or while it has none: checkout sets it). An invoice
     // naming no subscription (a one-off) never moves the row.
@@ -813,11 +857,7 @@ export async function handleStripeWebhook(
               prev.tier === "business") &&
             (prev.status === "active" || prev.status === "past_due"));
       if (live)
-        queue = [
-          db
-            .prepare(QUEUE_PREVIOUS)
-            .bind(prev.id, customer, paidSub),
-        ];
+        queue = [db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub)];
     }
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
