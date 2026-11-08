@@ -159,7 +159,7 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
       }
   });
 
-  it("the suite reads rl-a's lists only as users of its own: the one whole member-list read is credentials', on rl-b", () => {
+  it("the suite's whole member-list reads: credentials' compare on rl-b, and surfaces' memberId, which .finds its own address on whichever side it is given (rl-a too)", () => {
     const hits: string[] = [];
     for (const d of ["src", "live"])
       for (const f of readdirSync(join(root, "tests/redline", d))) {
@@ -167,14 +167,25 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
         const t = read(`tests/redline/${d}/${f}`);
         if (/["'`]\/api\/v1\/members["'`]/.test(t)) hits.push(`${d}/${f}`);
       }
-    // surfaces.ts only names routes (a status is judged, never a body).
     expect(hits.sort()).toEqual([
       "live/credentials.test.ts",
       "src/surfaces.ts",
     ]);
+    // credentials compares the whole list, before and after: rl-b only.
     const c = read("tests/redline/live/credentials.test.ts");
     expect(c).toMatch(/getJson\(T\.b, "\/api\/v1\/members"/);
     expect(c).not.toMatch(/getJson\(T\.a, "\/api\/v1\/members"/);
+    // surfaces reads the whole list of the side it is given (rl-a included),
+    // but only to find its own redline-<who>@ address: members T19 adds
+    // (t19-<run>-*) can't change what it finds.
+    const sf = read("tests/redline/src/surfaces.ts");
+    expect(sf).toMatch(
+      /const email = `redline-\$\{who\}@\$\{t\.testDomain\}`;/,
+    );
+    expect(sf).toMatch(/api\(t, pat, "GET", "\/api\/v1\/members"\)/);
+    expect(sf).toMatch(/members\.find\(\(x\) => x\.email === email\)/);
+    // And it uses nothing of the list but that one row's id.
+    expect(sf).not.toMatch(/members\.(length|map|filter|every|some)\b/);
   });
 
   it("the hook audit log: T19's rows can't push a red-line case's row out of the newest 200", () => {
@@ -198,11 +209,12 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     expect(t19Rows + suiteRows).toBeLessThan(limit);
   });
 
-  it("T19's own hook budget is its runner's: the ledger is per runner (tmpdir), so the suite's calls never fill it", () => {
+  it("T19's own hook budget is its runner's: the ledger is per runner (tmpdir), so the suite's ledger never counts T19's calls (the two runners' IPs differing is an assumption: the guard's wrong-key case no longer relies on it)", () => {
     const ledger = read(`${dir}/hook-ledger.ts`);
     expect(ledger).toMatch(/import \{ tmpdir \} from "node:os"/);
     expect(ledger).toMatch(/root: string = tmpdir\(\)/);
-    // And rl-a's bucket is the server's, per IP: another runner, another bucket.
+    // And rl-a's bucket is the server's, per IP: another runner is another
+    // bucket only if its IP differs (assumed, not verified here).
     expect(read(`${dir}/rl-a/guard.setup.ts`)).toMatch(/clearT19HookWindow/);
   });
 });

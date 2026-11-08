@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   claimHookSlot,
   HOOK_LIMIT,
@@ -520,6 +520,29 @@ describe("wait budget follow-ups (cloud #24)", () => {
           hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
         ).toBe(1);
       } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("1b. an aborted claim leaves no timer armed", () => {
+    it("the claim's own sleep timer is cleared on abort", async () => {
+      const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const now = () => 1_000_000;
+        for (let i = 0; i < HOOK_LIMIT; i++)
+          await claimHookSlot("rl-anon/tok:ip", { root, now });
+        // No sleep seam: the default timer, which has to be cleared.
+        const claim = ledgerClaimWith({ root, now });
+        const c = new AbortController();
+        const pending = claim("tok:ip", c.signal);
+        expect(vi.getTimerCount()).toBe(1);
+        c.abort();
+        await expect(pending).rejects.toThrow(/aborted before a slot/);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
         rmSync(root, { recursive: true, force: true });
       }
     });

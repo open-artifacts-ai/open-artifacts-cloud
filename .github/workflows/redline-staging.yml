@@ -23,11 +23,17 @@
 #      scans its report for the key and deletes the key, whatever happened.
 # Why T19 may run beside the suite (it once ran after it, "both write to rl-a
 # through its hooks"): the hook rate limit, the code caps and every RL_ANON key
-# are per IP, per user or per client, and the t19 job is another runner
-# with its own IP, its own hook ledger and its own users (t19-<run>-*). What
-# the two share on rl-a is the hook audit log, which the red-line cases read
-# for their own unique user in the newest 200 rows; T19's calls add at most one
-# row per 2.4 s. tests/redline/test/t19-isolation.test.ts pins each of these.
+# are per IP, per user or per client, and the t19 job is another runner with
+# its own hook ledger and its own users (t19-<run>-*). That it also has its own
+# IP is ASSUMED (separate GitHub-hosted VMs), not verified. If the two runners
+# did share an IP, the hook bucket (30 a minute) would be spent by both ledgers
+# (25 each) and a hook call could get RL_ANON's bare 404; T19's code-caps reset
+# could clear the suite's per-IP caps. Cases then fail, never pass wrongly: the
+# guard's wrong-key case no longer takes a 404 for the key check, it needs the
+# `denied` audit row. What the two share on rl-a regardless is the hook audit
+# log, which the red-line cases read for their own unique user in the newest 200
+# rows; T19's calls add at most one row per 2.4 s.
+# tests/redline/test/t19-isolation.test.ts pins each of these.
 #
 # The R26 revoke rotates rl-a's TEST_HOOK_KEY as well as revoking the PATs
 # (apps/provisioner/src/redline.ts revokeAll), so it would cut T19 off mid-run:
@@ -108,13 +114,17 @@ jobs:
   # only). The key pair needs no targets; the install data T19 reads comes in
   # the hand-off (targets.json). `actions: read` is for downloading it.
   #
-  # Timeouts, from the real worst case: bring-up is two chains at once, each an
-  # upgrade job and an R26 job of up to 20 min (JOB_WITHIN_MS) = 40 min, then
-  # the seal waits up to 10 min for the public key: the key wait is 55 min.
-  # The job = 10 min of setup before the wait + 55 + T19's own bound (15 min
-  # globalTimeout + 5) + 5 = 90 min. The redline job's revoke wait is longer
-  # than that (95 min from the run's start), so with a revoke of up to 20 min it
-  # ends inside the redline job's 150 min.
+  # Timeouts, from the real worst case. One bring-up chain is an upgrade job
+  # (up to 20 min, JOB_WITHIN_MS) and an R26 job that waits twice (up to 40
+  # min): 60 min, the two installs at once. The seal then waits up to 10 min
+  # for the public key, so the key wait is 75 min. The job = 10 min of setup
+  # before the wait + 75 + T19's own bound (15 min globalTimeout + 5) + 5 =
+  # 110 min. The redline job waits for it up to 115 min after the t19 job's own
+  # start, but never past 110 min after the run's start: the revoke (up to 40
+  # min itself) has to end inside the redline job's 150 min. T19 holds the key
+  # at the latest at 5 + 60 + 10 + 20 = 95 min after the run's start, under that
+  # cap. Only a t19 job that starts more than 15 min late AND a worst-case
+  # bring-up could be cut off by the revoke; nothing fits that inside 150 min.
   t19:
     name: t19
     needs: platform-tags
@@ -122,7 +132,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 90
+    timeout-minutes: 110
     steps:
       - name: On main, for a release tag
         env:
@@ -175,8 +185,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       # Until the redline job has sealed rl-a's hook key (after bring-up: about
-      # 4 minutes, 55 at the very worst), or said it can't (a marker file): then the run
-      # fails here, never waiting for a key that isn't coming.
+      # 4 minutes, 75 at the very worst), or said it can't (a marker file): then
+      # the run fails here, never waiting for a key that isn't coming. A re-run
+      # of only this job has no redline job in the attempt: fails at once.
       - id: wait
         name: Wait for rl-a's sealed hook key
         env:
@@ -185,8 +196,10 @@ jobs:
           set -euo pipefail
           name="t19-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           dir="$RUNNER_TEMP/t19-sealed"
-          wait_s="${WAIT_S:-3300}"
+          wait_s="${WAIT_S:-4500}"
           deadline=$(( $(date +%s) + wait_s ))
+          redline=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )redline$"))] | length' 2> /dev/null) || redline=""
+          if [ "$redline" = 0 ]; then echo "t19: the redline job is not part of this attempt (a partial re-run): re-run all jobs"; exit 1; fi
           while :; do
             rm -rf "$dir"
             if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$dir" > /dev/null 2>&1; then break; fi
@@ -372,8 +385,9 @@ jobs:
       # The t19 hand-off (header comment): waits for the t19 job's public key
       # (it is normally up long before bring-up ends), seals rl-a's hook key to
       # it and uploads it with the staged version. Only after rl-a and rl-b
-      # report the tag. A failure here doesn't stop the suite (its results are
-      # still wanted); the t19 job fails the run when no key arrives.
+      # report the tag. A failure here (the seal, or its upload) doesn't stop
+      # the suite (its results are still wanted), but the job's last step fails
+      # it: a run whose T19 never got its key is never green.
       - id: t19-key
         name: Seal rl-a's hook key for the t19 job
         if: steps.staged.outcome == 'success'
@@ -387,6 +401,10 @@ jobs:
           out="$RUNNER_TEMP/t19-handoff"
           wait_s="${WAIT_S:-600}"
           deadline=$(( $(date +%s) + wait_s ))
+          # A re-run of only this job has no t19 job in the attempt, so no
+          # public key will ever come: stop at once, not after the wait.
+          t19=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$"))] | length' 2> /dev/null) || t19=""
+          if [ "$t19" = 0 ]; then echo "the t19 job is not part of this attempt (a partial re-run): re-run all jobs"; exit 1; fi
           while :; do
             rm -rf "$pub"
             if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$pub" > /dev/null 2>&1; then break; fi
@@ -405,6 +423,7 @@ jobs:
       - id: handoff-up
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.t19-key.outcome == 'success'
+        continue-on-error: true
         with:
           name: t19-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/t19-handoff
@@ -418,8 +437,10 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/t19-nohandoff"
           echo "no key was handed over" > "$RUNNER_TEMP/t19-nohandoff/none"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - id: marker-up
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && steps.handoff-up.outcome != 'success'
+        continue-on-error: true
         with:
           name: t19-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/t19-nohandoff
@@ -476,8 +497,10 @@ jobs:
       # The R26 revoke also rotates rl-a's TEST_HOOK_KEY (the key T19 holds), so
       # it must not start while T19 runs. Only when the key was handed over;
       # otherwise no T19 run holds it. The wait ends when the t19 job has
-      # completed (any result) or 95 minutes after the run started (the t19 job's
-      # own timeout is 90), when the revoke goes ahead whatever T19 is doing.
+      # completed (any result), 115 minutes after the t19 job's own start (its
+      # timeout is 110), or 110 minutes after the run's start, whichever is
+      # first: the revoke itself can take up to 40 minutes and must fit in this
+      # job's 150. Then the revoke goes ahead whatever T19 is doing.
       - id: t19-done
         name: Wait for the t19 job to end
         if: always() && steps.handoff-up.outcome == 'success'
@@ -485,16 +508,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          wait_s="${WAIT_S:-5700}"
-          # Counted from the start of the run (the t19 job starts with it), so
-          # a long suite never pushes the revoke past the job's own timeout.
-          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at 2> /dev/null) || started=""
-          start=$(date -d "$started" +%s 2> /dev/null) || start=$(date +%s)
-          deadline=$(( start + wait_s ))
+          wait_s="${WAIT_S:-6900}"
+          cap_s="${CAP_S:-6600}"
+          now=$(date +%s)
+          # An unreadable or empty start is the step's own start, never midnight.
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.run_started_at // ""' 2> /dev/null) || started=""
+          if [ -n "$started" ]; then run_start=$(date -d "$started" +%s 2> /dev/null) || run_start=$now; else run_start=$now; fi
           while :; do
-            st=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | .status] | first // "none"' 2> /dev/null) || st="unreadable"
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | "\(.status) \(.started_at // "")"] | first // "none "' 2> /dev/null) || row="unreadable "
+            st="${row%% *}"
+            ts="${row#* }"
             if [ "$st" = completed ]; then echo "the t19 job has ended"; exit 0; fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then echo "::warning::the t19 job is still $st after ${wait_s} s: revoking anyway"; exit 0; fi
+            t19_start=$(date +%s)
+            if [ -n "$ts" ]; then t19_start=$(date -d "$ts" +%s 2> /dev/null) || t19_start=$(date +%s); fi
+            deadline=$(( t19_start + wait_s ))
+            [ "$deadline" -le $(( run_start + cap_s )) ] || deadline=$(( run_start + cap_s ))
+            if [ "$(date +%s)" -ge "$deadline" ]; then echo "::warning::the t19 job is still $st at its wait limit: revoking anyway"; exit 0; fi
             sleep "${POLL_S:-10}"
           done
       # R26 revoke (10.1): this run's PATs on rl-a and rl-b, then each must be
@@ -505,3 +534,11 @@ jobs:
       - name: Remove the secret files
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
+      # The last step, so the revoke and the file removal above have run. A run
+      # whose key was never handed over (a partial re-run of only this job, a
+      # seal or upload that failed) has no T19 result: it is never green.
+      - name: Fail when the t19 hand-off did not happen
+        if: always() && steps.staged.outcome == 'success' && steps.handoff-up.outcome != 'success'
+        run: |
+          echo "the t19 job got no key from this attempt, so T19 did not run against this release: re-run all jobs, not only the failed ones"
+          exit 1

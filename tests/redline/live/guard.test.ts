@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { auditCheck } from "../src/audit.ts";
+import {
+  AUDIT_SINCE_SKEW_MS,
+  assertKeyCheckDenied,
+  auditCheck,
+  deniedSessionRows,
+} from "../src/audit.ts";
 import {
   type Cred,
   describeRes,
@@ -78,6 +83,8 @@ describe("hooks", () => {
       // 404 here would take at least 6 unpaced calls inside the window; none exist
       // (#1254). The audit row would prove it outright: a key-check 404
       // writes test_hook.session "denied", a limited one writes nothing.
+      const since = Math.max(0, Date.now() - AUDIT_SINCE_SKEW_MS);
+      const deniedBefore = await deniedSessionRows(t, since);
       await paceHook(t, { reserve: 1 });
       const res = await fetch(`${t.app}/__test/session`, {
         method: "POST",
@@ -94,6 +101,12 @@ describe("hooks", () => {
       const body = await readBody(res);
       if (res.status !== 404)
         throw new Error(`wrong key: ${describeRes(res, body)}`);
+      // The audit row proves the 404 is the key check's: a call RL_ANON
+      // limited writes nothing. Matters when this runner shares its IP with
+      // another one (the t19 job's runner): then the 404 alone could be the
+      // limiter's, and the case would pass without reaching the key check.
+      const deniedAfter = await deniedSessionRows(t, since);
+      assertKeyCheckDenied(t.name, deniedBefore, deniedAfter);
     });
 
     it(`${k}: the content host is served by the content app`, async () => {

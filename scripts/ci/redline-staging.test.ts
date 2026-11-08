@@ -446,10 +446,15 @@ describe("redline-staging.yml", () => {
       expect(t19Job["continue-on-error"]).toBeUndefined();
       expect(t19Job.if).toBeUndefined();
       for (const s of t19Steps) expect(s["continue-on-error"]).toBeUndefined();
-      // The one soft step of the workflow is the redline job's seal, and a
-      // missing key fails the t19 job (its wait step), so the run still fails.
+      // The soft steps of the workflow are the redline job's seal and its two
+      // uploads; a missing key fails the t19 job (its wait step) AND the redline
+      // job's last step, so the run still fails.
       const soft = steps.filter((s) => s["continue-on-error"]);
-      expect(soft.map((s) => s.id)).toEqual(["t19-key"]);
+      expect(soft.map((s) => s.id)).toEqual([
+        "t19-key",
+        "handoff-up",
+        "marker-up",
+      ]);
       const t19 = t19Named("t19");
       // T19 itself runs only after the key was opened: no key, no T19, and
       // the failed wait or open step already failed the job.
@@ -572,45 +577,64 @@ describe("redline-staging.yml", () => {
       }
     });
 
-    it("the timeouts fit the real worst case, in order: bring-up < key wait < t19 job < revoke wait < redline job", () => {
+    it("the timeouts fit the real worst case, in order: chain < key wait < t19 job < revoke wait; the cap and the revoke fit the redline job", () => {
       const prov = readFileSync(
         join(root, "tests/redline/src/provisioning.ts"),
         "utf8",
       );
       const jobMin = Number(/JOB_WITHIN_MS = (\d+) \* 60_000/.exec(prov)?.[1]);
       expect(jobMin).toBe(20);
+      // One bring-up chain: the upgrade (one window) then the R26 mint (two
+      // windows: the wait for the sealed value, then the wait for done).
+      const slice = (from: string, to: string) =>
+        prov.slice(prov.indexOf(from), prov.indexOf(to));
+      const windows = (src: string) =>
+        (src.match(/\brun\.(waitJob|done)\(/g) ?? []).length;
+      const upgradeWindows = windows(
+        slice(
+          "export async function bringUpgrade",
+          "export async function stagedVersion",
+        ),
+      );
+      const mintWindows = windows(
+        slice("export async function mintCreds", "export function failText"),
+      );
+      expect([upgradeWindows, mintWindows]).toEqual([1, 2]);
+      const chainMin = jobMin * (upgradeWindows + mintWindows);
       const sec = (list: Record<string, any>[], id: string, d: RegExp) =>
         Number(d.exec(String(pick(list, id).run))?.[1]);
-      // Worst bring-up: per install an upgrade job then an R26 job, both
-      // installs at once; then the seal's wait for the public key.
-      const sealWait = sec(steps, "t19-key", /WAIT_S:-(\d+)/);
-      const bringup = 2 * jobMin * 60;
-      const keyWait = sec(t19Steps, "wait", /WAIT_S:-(\d+)/);
-      expect(keyWait).toBeGreaterThanOrEqual(bringup + sealWait);
+      const sealMin = sec(steps, "t19-key", /WAIT_S:-(\d+)/) / 60;
+      const keyMin = sec(t19Steps, "wait", /WAIT_S:-(\d+)/) / 60;
+      expect(chainMin).toBe(60);
+      // The key arrives after the chain, then the seal's wait (5 min margin).
+      expect(keyMin).toBeGreaterThanOrEqual(chainMin + sealMin + 5);
       // The t19 job: setup before the wait, the wait, T19's own bound
       // (playwright globalTimeout 15 min) and its tail.
-      const setupMin = 10;
-      const t19Min = 15;
-      const t19Timeout = t19Job["timeout-minutes"] * 60;
-      expect(t19Timeout).toBeGreaterThanOrEqual(
-        setupMin * 60 + keyWait + (t19Min + 5) * 60,
-      );
-      const revokeWait = sec(steps, "t19-done", /WAIT_S:-(\d+)/);
-      expect(revokeWait).toBeGreaterThan(t19Timeout);
-      // The revoke wait is counted from the run's start, so it ends by then
-      // whatever the suite took, and the revoke (up to a job's 20 min) still
-      // fits inside the redline job.
-      expect(String(named("t19-done").run)).toContain("run_started_at");
-      expect(revokeWait / 60 + jobMin).toBeLessThanOrEqual(
-        job["timeout-minutes"],
-      );
-      // The playwright bound the T19 figure rests on.
       expect(
         readFileSync(
           join(root, "apps/dashboard/playwright.staging.config.ts"),
           "utf8",
         ),
       ).toMatch(/globalTimeout: 15 \* 60_000/);
+      const setupMin = 10;
+      const t19Min = 15 + 5;
+      expect(t19Job["timeout-minutes"]).toBeGreaterThanOrEqual(
+        setupMin + keyMin + t19Min + 5,
+      );
+      // The revoke wait: from the t19 job's own start, longer than its timeout;
+      // and capped from the run's start so the revoke (two windows of its own
+      // at worst) ends inside the redline job.
+      const done = String(named("t19-done").run);
+      const waitMin = Number(/WAIT_S:-(\d+)/.exec(done)?.[1]) / 60;
+      const capMin = Number(/CAP_S:-(\d+)/.exec(done)?.[1]) / 60;
+      expect(waitMin).toBeGreaterThan(t19Job["timeout-minutes"]);
+      expect(capMin + 2 * jobMin).toBeLessThanOrEqual(job["timeout-minutes"]);
+      // T19 holds the key at the latest 5 + chain + seal wait + T19's bound
+      // after the run's start; the cap is after that.
+      expect(5 + chainMin + sealMin + t19Min).toBeLessThanOrEqual(capMin);
+      expect(capMin).toBeLessThanOrEqual(waitMin);
+      expect(done).toContain("run_started_at");
+      expect(done).toContain("started_at");
     });
   });
 
@@ -678,9 +702,12 @@ describe("redline-staging.yml", () => {
       writeFileSync(
         join(bin, "gh"),
         `#!/usr/bin/env bash
-case "$*" in *run_started_at*) echo "\${RUN_STARTED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; exit 0;; esac
-n=$(( $(cat "$GH_STATE/calls" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$GH_STATE/calls"
+case "$*" in *run_started_at*)
+  case "\${RUN_STARTED_MODE:-}" in fail) exit 1;; empty) echo ""; exit 0;; esac
+  echo "\${RUN_STARTED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; exit 0;; esac
+kind=api; [ "$1" = run ] && kind=download
+n=$(( $(cat "$GH_STATE/calls.$kind" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$GH_STATE/calls.$kind"
 echo "$*" >> "$GH_STATE/log"
 if [ "$1" = run ] && [ "$2" = download ]; then
   [ "$n" -gt "\${FAIL_N:-0}" ] || exit 1
@@ -740,7 +767,12 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
           sb.env({ FAIL_N: "2", FILES: "sealed version.txt" }),
         );
         expect(ok.status, ok.stdout + ok.stderr).toBe(0);
-        expect(sb.read("log").split("\n").filter(Boolean)).toHaveLength(3);
+        expect(
+          sb
+            .read("log")
+            .split("\n")
+            .filter((l) => l.startsWith("run download")),
+        ).toHaveLength(3);
         expect(sb.read("log")).toContain(
           "run download 42 -R o/r -n t19-handoff-42-2 -D " +
             join(sb.temp, "t19-sealed"),
@@ -772,6 +804,99 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       } finally {
         rmSync(sb3.dir, { recursive: true, force: true });
       }
+    });
+
+    it("a partial re-run (only one of the two jobs in the attempt) fails fast on both sides, never waiting", () => {
+      const only = (name: string) =>
+        `{"jobs":[{"name":"${name}","status":"in_progress"}]}\n`;
+      // t19 re-run alone: no redline job in the attempt.
+      const sb = sandbox();
+      try {
+        writeFileSync(join(sb.state, "statuses"), only("t19"));
+        const r = runBash(
+          String(t19Named("wait").run),
+          sb.env({ FAIL_N: "999" }),
+          undefined,
+          8000,
+        );
+        expect(r.status).toBe(1);
+        expect(r.stdout).toContain("re-run all jobs");
+        expect(sb.read("log")).not.toContain("run download");
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+      // redline re-run alone: no t19 job in the attempt (a nightly's names too).
+      for (const name of ["redline", "redline / redline"]) {
+        const sb2 = sandbox();
+        try {
+          mkdirSync(join(sb2.temp, "redline-staged"));
+          writeFileSync(
+            join(sb2.temp, "redline-staged", "version.txt"),
+            "1.2.3\n",
+          );
+          writeFileSync(join(sb2.state, "statuses"), only(name));
+          const r = runBash(
+            String(named("t19-key").run),
+            sb2.env({ FAIL_N: "999" }),
+            undefined,
+            8000,
+          );
+          expect(r.status, name).toBe(1);
+          expect(r.stdout).toContain("re-run all jobs");
+          expect(sb2.read("log")).not.toContain("run download");
+          expect(sb2.read("pnpm")).toBe("");
+        } finally {
+          rmSync(sb2.dir, { recursive: true, force: true });
+        }
+      }
+      // Both jobs present (a full run, or a nightly's names): it goes on to wait.
+      for (const [t, r] of [
+        ["t19", "redline"],
+        ["redline / t19", "redline / redline"],
+      ] as const) {
+        const sb3 = sandbox();
+        try {
+          writeFileSync(
+            join(sb3.state, "statuses"),
+            `{"jobs":[{"name":"${t}","status":"in_progress"},{"name":"${r}","status":"in_progress"}]}\n`,
+          );
+          const w = runBash(
+            String(t19Named("wait").run),
+            sb3.env({ FILES: "sealed version.txt targets.json" }),
+            undefined,
+            8000,
+          );
+          expect(w.status, t).toBe(0);
+        } finally {
+          rmSync(sb3.dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it("the redline job's last step fails the job when the hand-off did not happen, after the revoke and the file removal", () => {
+      const last = steps.at(-1) ?? {};
+      expect(last.name).toBe("Fail when the t19 hand-off did not happen");
+      expect(last.if).toBe(
+        "always() && steps.staged.outcome == 'success' && steps.handoff-up.outcome != 'success'",
+      );
+      expect(steps.indexOf(last)).toBeGreaterThan(
+        steps.indexOf(named("Revoke this run's R26 credentials")),
+      );
+      expect(steps.indexOf(last)).toBeGreaterThan(
+        steps.indexOf(named("Remove the secret files")),
+      );
+      const r = runBash(String(last.run), {});
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain("re-run all jobs");
+      // The partial re-run shape: staged passed, the seal failed (no t19 job),
+      // so handoff-up was skipped: the condition holds and the job fails.
+      const holds = (staged: string, handoff: string) =>
+        staged === "success" && handoff !== "success";
+      expect(holds("success", "skipped")).toBe(true);
+      expect(holds("success", "failure")).toBe(true);
+      // Bring-up failed (job already red) or the hand-off worked: nothing to add.
+      expect(holds("skipped", "skipped")).toBe(false);
+      expect(holds("success", "success")).toBe(false);
     });
 
     it("the redline job seals to the downloaded public key and copies the staged version; no public key fails the step", () => {
@@ -880,10 +1005,6 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       expect(steps.indexOf(done)).toBe(steps.indexOf(revoke) - 1);
       expect(done.if).toBe("always() && steps.handoff-up.outcome == 'success'");
       expect(revoke.if).toBe("always() && steps.mint.outcome == 'success'");
-      // The wait outlasts the t19 job's own timeout, so only a hung API ends it first.
-      expect(
-        Number(/WAIT_S:-(\d+)/.exec(String(done.run))?.[1]),
-      ).toBeGreaterThan(t19Job["timeout-minutes"] * 60);
       const sb = sandbox();
       try {
         writeFileSync(
@@ -916,7 +1037,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         const late = runBash(String(done.run), sb2.env({ WAIT_S: "0" }));
         expect(late.status).toBe(0);
         expect(late.stdout).toContain(
-          "::warning::the t19 job is still in_progress after 0 s: revoking anyway",
+          "::warning::the t19 job is still in_progress at its wait limit: revoking anyway",
         );
       } finally {
         rmSync(sb2.dir, { recursive: true, force: true });
@@ -940,6 +1061,73 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       } finally {
         rmSync(sb4.dir, { recursive: true, force: true });
       }
+      const iso = (minAgo: number) =>
+        new Date(Date.now() - minAgo * 60_000).toISOString();
+      const running = (startedAt: string) =>
+        `{"jobs":[{"name":"t19","status":"in_progress","started_at":"${startedAt}"}]}`;
+      const completedSoon = [
+        running(iso(1)),
+        running(iso(1)),
+        '{"jobs":[{"name":"t19","status":"completed"}]}',
+      ];
+      const scenario = (
+        lines: string[],
+        env: Record<string, string>,
+      ): { out: string; status: number | null; polls: number } => {
+        const sbx = sandbox();
+        try {
+          writeFileSync(join(sbx.state, "statuses"), `${lines.join("\n")}\n`);
+          const r = runBash(String(done.run), sbx.env(env), undefined, 8000);
+          return {
+            out: r.stdout,
+            status: r.status,
+            polls: sbx
+              .read("log")
+              .split("\n")
+              .filter((l) => /attempts/.test(l)).length,
+          };
+        } finally {
+          rmSync(sbx.dir, { recursive: true, force: true });
+        }
+      };
+      // A failed or empty run_started_at is the step's own start, never
+      // midnight 1970: the wait goes on until the t19 job ends.
+      for (const mode of ["fail", "empty"]) {
+        const r = scenario(completedSoon, { RUN_STARTED_MODE: mode });
+        expect(r.status, mode).toBe(0);
+        expect(r.out, mode).toContain("the t19 job has ended");
+        expect(r.out, mode).not.toContain("revoking anyway");
+        expect(r.polls, mode).toBe(3);
+      }
+      // From the t19 job's own start, not the run's: a t19 job that started
+      // long ago has used its wait, though the run is young.
+      const own = scenario([running(iso(130))], {});
+      expect(own.status).toBe(0);
+      expect(own.out).toContain("revoking anyway");
+      // A t19 job that started late is not cut off at the run's wait: the run
+      // is 100 min old, the t19 job 5 min.
+      const late = scenario(
+        completedSoon.map((l, i) => (i < 2 ? running(iso(5)) : l)),
+        {
+          RUN_STARTED: iso(100),
+        },
+      );
+      expect(late.out).toContain("the t19 job has ended");
+      expect(late.polls).toBe(3);
+      // The cap from the run's start: a run 120 min old goes ahead at once
+      // even though the t19 job started just now (the revoke must still fit).
+      const capped = scenario([running(iso(1))], { RUN_STARTED: iso(120) });
+      expect(capped.status).toBe(0);
+      expect(capped.out).toContain("revoking anyway");
+      // A queued t19 job (no started_at) counts from now, so its wait is not over.
+      const queued = scenario(
+        [
+          '{"jobs":[{"name":"t19","status":"queued","started_at":null}]}',
+          '{"jobs":[{"name":"t19","status":"completed"}]}',
+        ],
+        {},
+      );
+      expect(queued.out).toContain("the t19 job has ended");
       // A job whose name merely ends in t19 text elsewhere is not it.
       const sb3 = sandbox();
       try {
@@ -1006,16 +1194,18 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
-    // The job ends with the revoke and the file removal, both always.
-    expect(steps.slice(-2).map((s) => s.name)).toEqual([
+    // The job ends with the revoke and the file removal, both always, then the
+    // check that the hand-off happened (so neither is skipped by its failure).
+    expect(steps.slice(-3).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
       "Remove the secret files",
+      "Fail when the t19 hand-off did not happen",
     ]);
-    expect(steps.at(-2)?.if).toBe(
+    expect(steps.at(-3)?.if).toBe(
       "always() && steps.mint.outcome == 'success'",
     );
-    expect(steps.at(-1)?.if).toBe("always()");
-    expect(steps.at(-1)?.run).toBe(
+    expect(steps.at(-2)?.if).toBe("always()");
+    expect(steps.at(-2)?.run).toBe(
       'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
     );
     expect(

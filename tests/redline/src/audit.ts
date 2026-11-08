@@ -84,3 +84,46 @@ export async function auditCheck(t: Target): Promise<AuditResult> {
     );
   return { level: "pass", via: "hook" };
 }
+
+/**
+ * How many `test_hook.session` rows with outcome "denied" the install's audit
+ * log holds since `since` (ms). A wrong hook key is answered by the key check,
+ * which writes one such row; RL_ANON's own bare 404 writes nothing. So a 404
+ * for a wrong key counts as the key check's only when this grows by the call
+ * (guard's "a wrong hook key gets the 404", which has no other way to tell
+ * the two apart). Throws, never guesses, when the audit hook is absent (404)
+ * or answers no events array.
+ */
+export async function deniedSessionRows(
+  t: Target,
+  since: number,
+  call: (t: Target, path: string, body?: unknown) => Promise<unknown> = hook,
+): Promise<number> {
+  const out = (await call(t, AUDIT_HOOK, { since })) as {
+    events?: unknown;
+  } | null;
+  const events = out?.events;
+  if (!Array.isArray(events))
+    throw new Error(`${t.name} audit hook: no events array`);
+  return (events as { action?: unknown; detail?: unknown }[]).filter(
+    (e) =>
+      e?.action === "test_hook.session" &&
+      (e.detail as { outcome?: unknown } | null | undefined)?.outcome ===
+        "denied",
+  ).length;
+}
+
+/** The skew allowance `deniedSessionRows` callers use for `since`. */
+export const AUDIT_SINCE_SKEW_MS = SKEW_MS;
+
+/** Throws unless the wrong key's 404 grew the "denied" rows: see deniedSessionRows. */
+export function assertKeyCheckDenied(
+  name: string,
+  before: number,
+  after: number,
+): void {
+  if (after > before) return;
+  throw new Error(
+    `${name}: the wrong key's 404 left no test_hook.session "denied" audit row (${before} before, ${after} after): it may be the rate limit's 404, not the key check's`,
+  );
+}

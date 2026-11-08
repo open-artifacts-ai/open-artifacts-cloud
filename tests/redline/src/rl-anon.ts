@@ -221,31 +221,35 @@ class PacingAborted extends Error {
   }
 }
 
-/** `sleep` that rejects when `signal` aborts, so a claim never wakes up to take a slot. */
+/**
+ * `sleep` that rejects when `signal` aborts, so a claim never wakes up to take
+ * a slot, and whose own timer is cleared then (an aborted wait leaves nothing
+ * armed behind it). `sleep` is a test seam; without it a timer is used.
+ */
 const abortableSleep =
   (
-    sleep: (ms: number) => Promise<void>,
+    sleep: ((ms: number) => Promise<void>) | undefined,
     signal: AbortSignal | undefined,
   ): ((ms: number) => Promise<void>) =>
   (ms) =>
     new Promise<void>((resolve, reject) => {
-      if (!signal) return void sleep(ms).then(resolve, reject);
-      if (signal.aborted) return reject(new PacingAborted());
-      const stop = () => reject(new PacingAborted());
-      signal.addEventListener("abort", stop, { once: true });
-      sleep(ms).then(
-        () => {
-          signal.removeEventListener("abort", stop);
-          resolve();
-        },
-        (e) => {
-          signal.removeEventListener("abort", stop);
-          reject(e);
-        },
-      );
+      if (signal?.aborted) return reject(new PacingAborted());
+      let timer: NodeJS.Timeout | undefined;
+      const stop = () => {
+        clearTimeout(timer);
+        reject(new PacingAborted());
+      };
+      signal?.addEventListener("abort", stop, { once: true });
+      const end =
+        <T>(f: (v: T) => void) =>
+        (v: T) => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", stop);
+          f(v);
+        };
+      if (sleep) sleep(ms).then(end(resolve), end(reject));
+      else timer = setTimeout(end(resolve), ms);
     });
-
-const timerSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * The public ledger claim for one key, one ledger per key (#24: a claim told
@@ -258,7 +262,7 @@ export const ledgerClaimWith =
     if (signal?.aborted) return Promise.reject(new PacingAborted());
     return claimHookSlot(`rl-anon/${key}`, {
       ...o,
-      sleep: abortableSleep(o.sleep ?? timerSleep, signal),
+      sleep: abortableSleep(o.sleep, signal),
     });
   };
 export const ledgerClaim: Claim = ledgerClaimWith();
