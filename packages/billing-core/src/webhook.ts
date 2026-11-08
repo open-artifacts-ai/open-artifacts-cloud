@@ -495,8 +495,8 @@ export function changeFor(
         // went live, once. Also what says a Solo subscription id is a live
         // one, not a pending first payment (/trial/start snapshots only those).
         sets.push({
-          sql: "solo_trial_ends_at = coalesce(solo_trial_ends_at, ?)",
-          args: [ev.created * 1000],
+          sql: "solo_trial_ends_at = CASE WHEN solo_trial_ends_at IS NULL OR solo_trial_ends_at > ? THEN ? ELSE solo_trial_ends_at END",
+          args: [ev.created * 1000, ev.created * 1000],
         });
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)

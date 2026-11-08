@@ -2719,6 +2719,34 @@ describe("Solo bookkeeping (#1568)", () => {
     });
   });
 
+  it("a Solo active event caps the trial end at its own time: a trial ended early in Stripe keeps no free days", async () => {
+    await base(
+      "tier = 'solo', stripe_subscription_id = 'sub_Test1', solo_trial_ends_at = ?",
+      (T + 20 * 86_400) * 1000,
+    );
+    const early = event(
+      "customer.subscription.updated",
+      sub({ id: "sub_Test1", ...soloPrice, status: "active" }),
+      { created: T + 5 * 86_400 },
+    );
+    await deliver(early);
+    expect(await row(A)).toMatchObject({
+      solo_trial_ends_at: early.created * 1000,
+    });
+    // An end already in the past stays (the minimum).
+    await base("solo_trial_ends_at = ?", (T - 86_400) * 1000);
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({ id: "sub_Test1", ...soloPrice, status: "active" }),
+        { created: T + 6 * 86_400 },
+      ),
+    );
+    expect(await row(A)).toMatchObject({
+      solo_trial_ends_at: (T - 86_400) * 1000,
+    });
+  });
+
   it("a Solo subscription that is active (not trialing) records when it went live, once; a trialing one records its end", async () => {
     await base(
       "tier = 'solo', stripe_subscription_id = NULL, solo_trial_ends_at = NULL",
