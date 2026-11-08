@@ -3,6 +3,8 @@ import {
   createCheckoutSession,
   createCustomer,
   createPortalSession,
+  createSoloTrialSubscription,
+  SOLO_TRIAL_DAYS,
   StripeApiError,
   StripeConfigError,
 } from "../src/index.js";
@@ -233,5 +235,100 @@ describe("createCustomer", () => {
     expect(e).toBeInstanceOf(StripeApiError);
     expect([e.status, e.type]).toEqual([400, "idempotency_error"]);
     expect(String(e.message)).toBe("stripe 400 idempotency_error");
+  });
+});
+
+describe("Solo (#1568)", () => {
+  it("a Solo Checkout is a plain subscription session tagged tier solo", async () => {
+    const { seen, f } = fake({
+      id: "cs_test_9",
+      url: "https://checkout.stripe.com/c/pay/cs_test_9",
+    });
+    await createCheckoutSession(
+      { ...checkout, tier: "solo", priceId: "price_Solo1" },
+      { secretKey: KEY, fetch: f },
+    );
+    const body = form(seen[0] as Seen);
+    expect(body["line_items[0][price]"]).toBe("price_Solo1");
+    expect(body["metadata[tier]"]).toBe("solo");
+    expect(body["subscription_data[metadata][tier]"]).toBe("solo");
+    expect(body["line_items[0][quantity]"]).toBe("1");
+    // No trial through Checkout: the no-card trial is made through the API.
+    expect(Object.keys(body).filter((k) => /trial/.test(k))).toEqual([]);
+  });
+
+  const trial = {
+    customerId: "cus_Test1",
+    priceId: "price_SoloM1",
+    idempotencyKey: "solo-trial-iabc123def45",
+  };
+
+  it("the no-card trial: 30 days, canceled if no card is added, keyed, tagged solo", async () => {
+    const { seen, f } = fake({ id: "sub_Test1", object: "subscription" });
+    expect(
+      await createSoloTrialSubscription(trial, { secretKey: KEY, fetch: f }),
+    ).toEqual({ id: "sub_Test1" });
+    expect(SOLO_TRIAL_DAYS).toBe(30);
+    expect(seen).toHaveLength(1);
+    const s = seen[0] as Seen;
+    expect(s.url).toBe("https://api.stripe.com/v1/subscriptions");
+    expect(s.init.method).toBe("POST");
+    expect(header(s, "idempotency-key")).toBe(trial.idempotencyKey);
+    expect(header(s, "authorization")).toBe(`Bearer ${KEY}`);
+    expect(form(s)).toEqual({
+      customer: "cus_Test1",
+      "items[0][price]": "price_SoloM1",
+      trial_period_days: "30",
+      "trial_settings[end_behavior][missing_payment_method]": "cancel",
+      "metadata[tier]": "solo",
+    });
+  });
+
+  it("refuses a live key, a bad customer, price or key before any call", async () => {
+    const { seen, f } = fake({ id: "sub_Test1" });
+    const bad = [
+      [trial, "sk_live_abcdefghij", "secretKey"],
+      [trial, "rk_live_abcdefghij", "secretKey"],
+      [
+        { ...trial, customerId: "cus_x&trial_period_days=0" },
+        KEY,
+        "customerId",
+      ],
+      [{ ...trial, priceId: "prod_1" }, KEY, "priceId"],
+      [{ ...trial, priceId: "price_1&x=1" }, KEY, "priceId"],
+      [{ ...trial, idempotencyKey: "short" }, KEY, "idempotencyKey"],
+    ] as const;
+    for (const [i, secretKey, field] of bad) {
+      const e = await createSoloTrialSubscription(i, {
+        secretKey,
+        fetch: f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it("an answer without a sub_ id is bad_answer; a Stripe error keeps status and type only", async () => {
+    for (const answer of [{ id: "cus_1" }, {}, { id: 7 }]) {
+      const e = await createSoloTrialSubscription(trial, {
+        secretKey: KEY,
+        fetch: fake(answer).f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeApiError);
+      expect([e.status, e.type]).toEqual([200, "bad_answer"]);
+    }
+    const e = await createSoloTrialSubscription(trial, {
+      secretKey: KEY,
+      fetch: fake(
+        { error: { type: "invalid_request_error", message: "cus_Test1" } },
+        400,
+      ).f,
+    }).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      400,
+      "invalid_request_error",
+      "stripe 400 invalid_request_error",
+    ]);
   });
 });

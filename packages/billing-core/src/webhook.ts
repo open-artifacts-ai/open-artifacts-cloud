@@ -43,14 +43,33 @@ export interface WebhookEnv {
   /** The Stripe price ids billing sells (optional): a price id matching one names the tier. */
   STRIPE_PRICE_TEAM?: string;
   STRIPE_PRICE_BUSINESS?: string;
+  /** Solo's two prices (#1568); either one names the tier solo. */
+  STRIPE_PRICE_SOLO_MONTHLY?: string;
+  STRIPE_PRICE_SOLO_YEARLY?: string;
 }
 
 /** The price ids that name a tier (from the webhook env, when it has them). */
-export type PriceIds = { team?: string; business?: string };
+export type PriceIds = {
+  team?: string;
+  business?: string;
+  soloMonthly?: string;
+  soloYearly?: string;
+};
+
+/** The price ids of a webhook env, in PriceIds' shape. */
+export const pricesOf = (env: WebhookEnv): PriceIds => ({
+  team: env.STRIPE_PRICE_TEAM,
+  business: env.STRIPE_PRICE_BUSINESS,
+  soloMonthly: env.STRIPE_PRICE_SOLO_MONTHLY,
+  soloYearly: env.STRIPE_PRICE_SOLO_YEARLY,
+});
+
+const anyConfigured = (p: PriceIds): boolean =>
+  Boolean(p.team || p.business || p.soloMonthly || p.soloYearly);
 
 import { verifyStripeSignature } from "./signature.js";
 
-export type PaidTier = "team" | "business";
+export type PaidTier = "solo" | "team" | "business";
 export type TierStatus = "active" | "past_due" | "lapsed" | "suspended";
 
 /** The event fields we act on; anything else in Stripe's payload is ignored. */
@@ -110,7 +129,7 @@ export function customerOf(o: Record<string, unknown>): string | null {
 }
 
 const asTier = (v: unknown): PaidTier | null =>
-  v === "team" || v === "business" ? v : null;
+  v === "solo" || v === "team" || v === "business" ? v : null;
 
 /**
  * A subscription's paid tier, from its current price first, so a plan
@@ -126,7 +145,7 @@ export function tierFromSubscription(
 ): PaidTier | null {
   const items =
     isObj(sub.items) && Array.isArray(sub.items.data) ? sub.items.data : [];
-  const configured = Boolean(prices.team || prices.business);
+  const configured = anyConfigured(prices);
   for (const item of items) {
     if (!isObj(item) || !isObj(item.price)) continue;
     const p = item.price;
@@ -136,7 +155,9 @@ export function tierFromSubscription(
           ? "team"
           : p.id === prices.business
             ? "business"
-            : null
+            : p.id === prices.soloMonthly || p.id === prices.soloYearly
+              ? "solo"
+              : null
         : null;
     // With the configured price ids, only they name a tier; an unknown
     // price falls through to the subscription's metadata.
@@ -158,7 +179,7 @@ export function unknownPrice(
   sub: Record<string, unknown>,
   prices: PriceIds,
 ): boolean {
-  if (!prices.team && !prices.business) return false;
+  if (!anyConfigured(prices)) return false;
   const items =
     isObj(sub.items) && Array.isArray(sub.items.data) ? sub.items.data : [];
   const ids = items.flatMap((i) =>
@@ -168,7 +189,13 @@ export function unknownPrice(
   );
   return (
     ids.length > 0 &&
-    !ids.some((id) => id === prices.team || id === prices.business)
+    !ids.some(
+      (id) =>
+        id === prices.team ||
+        id === prices.business ||
+        id === prices.soloMonthly ||
+        id === prices.soloYearly,
+    )
   );
 }
 
@@ -191,8 +218,8 @@ export function statusFromSubscription(s: unknown): TierStatus | null {
   }
 }
 
-const PAID = "tier IN ('team', 'business')";
-const NOT_PAID = "coalesce(tier, '') NOT IN ('team', 'business')";
+const PAID = "tier IN ('solo', 'team', 'business')";
+const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
 /** One column assignment in the row update: SQL and its binds. */
 type Set = { sql: string; args: unknown[] };
@@ -290,8 +317,15 @@ export function changeFor(
           guarded("status", "'lapsed'", [], { paid: true, stale: true }),
           guarded("grace_until", "NULL", [], { paid: true, stale: true }),
         );
-      // Stripe's own trial (trialing), when one runs: its end.
-      if (o.status === "trialing" && typeof o.trial_end === "number")
+      // Stripe's own trial (trialing), when one runs: its end. Not Solo's:
+      // its 30-day no-card trial must leave trial_ends_at null, or the first
+      // invite could never start the 14-day Business trial (billing's
+      // TRIAL_SQL needs it unset); the Solo trial ends by cancel (lapsed).
+      if (
+        o.status === "trialing" &&
+        typeof o.trial_end === "number" &&
+        tierFromSubscription(o, prices) !== "solo"
+      )
         sets.push({ sql: "trial_ends_at = ?", args: [o.trial_end * 1000] });
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
@@ -476,10 +510,7 @@ export async function handleStripeWebhook(
     log("livemode_ignored");
     return json({ received: true });
   }
-  const change = changeFor(ev, {
-    team: env.STRIPE_PRICE_TEAM,
-    business: env.STRIPE_PRICE_BUSINESS,
-  });
+  const change = changeFor(ev, pricesOf(env));
   const customer = customerOf(ev.object);
   try {
     const db = env.BILLING_DB;
@@ -492,10 +523,7 @@ export async function handleStripeWebhook(
     if (
       (ev.type === "customer.subscription.created" ||
         ev.type === "customer.subscription.updated") &&
-      unknownPrice(ev.object, {
-        team: env.STRIPE_PRICE_TEAM,
-        business: env.STRIPE_PRICE_BUSINESS,
-      })
+      unknownPrice(ev.object, pricesOf(env))
     )
       log("unknown_price");
     const stream = streamOf(ev.type);

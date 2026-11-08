@@ -19,7 +19,7 @@ export interface StripeConfig {
   apiBase?: string;
 }
 
-export type CheckoutTier = "team" | "business";
+export type CheckoutTier = "solo" | "team" | "business";
 
 export interface CheckoutInput {
   customerId: string;
@@ -75,6 +75,7 @@ const CUSTOMER = /^cus_[A-Za-z0-9]{1,255}$/;
 const PRICE = /^price_[A-Za-z0-9]{1,255}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9_:.-]{8,255}$/;
 const INSTALL = /^i[a-z0-9]{11}$/;
+const SUBSCRIPTION = /^sub_[A-Za-z0-9]{1,255}$/;
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
 const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
 
@@ -158,7 +159,11 @@ export function createCheckoutSession(
   const quantity = input.quantity ?? 1;
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
     throw new StripeConfigError("quantity");
-  if (input.tier !== "team" && input.tier !== "business")
+  if (
+    input.tier !== "solo" &&
+    input.tier !== "team" &&
+    input.tier !== "business"
+  )
     throw new StripeConfigError("tier");
   return session(
     post(
@@ -217,6 +222,46 @@ export async function createCustomer(
   );
   const id = out?.id;
   if (typeof id !== "string" || !CUSTOMER.test(id))
+    throw new StripeApiError(status, "bad_answer");
+  return { id };
+}
+
+/** Solo's trial: 30 days, no card (#1568). */
+export const SOLO_TRIAL_DAYS = 30;
+
+export interface SoloTrialInput {
+  customerId: string;
+  /** The Solo price (monthly or yearly): the plan the trial converts to. */
+  priceId: string;
+  /** Billing's key for this install, e.g. solo-trial-<installId>: a retry is one subscription. */
+  idempotencyKey: string;
+}
+
+/**
+ * Solo's no-card trial, through the API (no Checkout visit): a subscription
+ * with trial_period_days 30 and no payment method on file. When the trial
+ * ends with none, Stripe cancels it (missing_payment_method=cancel), which
+ * the webhook records as a lapsed Solo; adding a card before then (Portal or
+ * Checkout) keeps it. Answers the sub_ id only.
+ */
+export async function createSoloTrialSubscription(
+  input: SoloTrialInput,
+  cfg: StripeConfig,
+): Promise<{ id: string }> {
+  const { status, out } = await post(
+    cfg,
+    "/v1/subscriptions",
+    {
+      customer: check(CUSTOMER, "customerId", input.customerId),
+      "items[0][price]": check(PRICE, "priceId", input.priceId),
+      trial_period_days: String(SOLO_TRIAL_DAYS),
+      "trial_settings[end_behavior][missing_payment_method]": "cancel",
+      "metadata[tier]": "solo",
+    },
+    input.idempotencyKey,
+  );
+  const id = out?.id;
+  if (typeof id !== "string" || !SUBSCRIPTION.test(id))
     throw new StripeApiError(status, "bad_answer");
   return { id };
 }

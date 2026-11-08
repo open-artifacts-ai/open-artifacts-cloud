@@ -68,7 +68,7 @@ async function seed(rows: Row[]) {
         )
         .bind(
           r.install,
-          r.tier ?? "free",
+          r.tier ?? "solo",
           r.status ?? "active",
           r.trialEndsAt ?? null,
           `cus_${r.install}`,
@@ -267,7 +267,7 @@ describe("the install id comes only from x-oa-gate-install", () => {
         headers: { "x-oa-gate-install": A },
       }),
     );
-    expect(((await r.json()) as { tier: string }).tier).toBe("free");
+    expect(((await r.json()) as { tier: string }).tier).toBe("solo");
     expect((await rowOf(A))?.last_read_at).toBe(NOW);
     expect((await rowOf(B))?.last_read_at).toBeNull();
 
@@ -298,7 +298,7 @@ describe("the POSTs carry the gate install's signature", () => {
 
   /** Nothing was written for A or B, and B's row is as seeded. */
   async function nothingWritten() {
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
     expect(await rowOf(B)).toMatchObject({ tier: "team", version: 1 });
     expect(await usageOf(A)).toEqual([]);
     expect(await usageOf(B)).toEqual([]);
@@ -481,11 +481,11 @@ describe("GET /tier", () => {
     expect((await rowOf(B))?.last_read_at).toBeNull();
   });
 
-  it("a missing row is free/active at version 0, and nothing is written", async () => {
+  it("a missing row is solo/active at version 0, and nothing is written", async () => {
     at();
     const r = await call(gated("GET", "/tier"));
     expect(await r.json()).toEqual({
-      tier: "free",
+      tier: "solo",
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
@@ -512,7 +512,7 @@ describe("trial/start and usage take the body's own fields only, like /checkout 
       const r = await call(gated("POST", path, body));
       expect([r.status, await r.json()]).toEqual([400, { error: "bad_body" }]);
     }
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
     expect(await usageOf(A)).toEqual([]);
     // The exact fields still work.
     expect(
@@ -522,7 +522,7 @@ describe("trial/start and usage take the body's own fields only, like /checkout 
 });
 
 describe("POST /trial/start", () => {
-  it("from free/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
+  it("from solo/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
     at();
     await seed([{ install: A, version: 4 }, { install: B }]);
     const r = await call(gated("POST", "/trial/start", { install: A }));
@@ -544,26 +544,41 @@ describe("POST /trial/start", () => {
       trialEndsAt: NOW + TRIAL_MS,
       version: 5,
     });
-    expect(await rowOf(B)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(B)).toMatchObject({ tier: "solo", version: 1 });
   });
 
-  it("never twice: back on free after a trial, it doesn't start again", async () => {
-    await seed([
-      { install: A, tier: "free", trialEndsAt: NOW - 1, version: 7 },
-    ]);
+  it("a row made before Solo (tier free) starts the trial too, once", async () => {
+    at();
+    await seed([{ install: A, tier: "free", version: 4 }]);
     const r = await call(gated("POST", "/trial/start", { install: A }));
-    expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({
-      tier: "free",
-      version: 7,
-      trialEndsAt: NOW - 1,
+      tier: "trial",
+      trialEndsAt: NOW + TRIAL_MS,
+      version: 5,
     });
+  });
+
+  it("never twice: back on solo after a trial, it doesn't start again", async () => {
+    for (const tier of ["solo", "free"]) {
+      await db.prepare("DELETE FROM tiers").run();
+      await seed([{ install: A, tier, trialEndsAt: NOW - 1, version: 7 }]);
+      const r = await call(gated("POST", "/trial/start", { install: A }));
+      expect(r.status).toBe(200);
+      expect(await r.json()).toMatchObject({
+        tier,
+        version: 7,
+        trialEndsAt: NOW - 1,
+      });
+    }
   });
 
   it("any other state: 200 with the unchanged row", async () => {
     for (const [tier, status] of [
       ["team", "active"],
       ["business", "past_due"],
+      ["solo", "lapsed"],
+      ["solo", "past_due"],
+      ["solo", "suspended"],
       ["free", "lapsed"],
       ["free", "suspended"],
       ["trial", "active"],
@@ -610,7 +625,7 @@ describe("POST /trial/start", () => {
       const r = await call(gated("POST", "/trial/start", b));
       expect(r.status).toBe(400);
     }
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
   });
 });
 

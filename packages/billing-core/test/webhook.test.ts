@@ -125,7 +125,13 @@ const sub = (o: Record<string, unknown> = {}) => ({
 
 async function deliver(
   body: unknown,
-  o: { t?: number; secret?: string; text?: string; now?: number } = {},
+  o: {
+    t?: number;
+    secret?: string;
+    text?: string;
+    now?: number;
+    env?: WebhookEnv;
+  } = {},
 ) {
   const text = o.text ?? JSON.stringify(body);
   const sig = await signStripePayload(text, o.secret ?? SECRET, o.t ?? T);
@@ -135,7 +141,7 @@ async function deliver(
       headers: { "content-type": "application/json", "stripe-signature": sig },
       body: text,
     }),
-    env,
+    o.env ?? env,
     o.now ?? NOW,
   );
 }
@@ -1152,5 +1158,185 @@ describe("handleStripeWebhook", () => {
       "price_Team",
     ])
       expect(all).not.toContain(s);
+  });
+});
+
+// ---------------------------------------------------------------- Solo
+
+describe("Solo (#1568)", () => {
+  const SOLO_M = "price_SoloMonth1";
+  const SOLO_Y = "price_SoloYear1";
+  const soloEnv: WebhookEnv = {
+    ...env,
+    STRIPE_PRICE_TEAM: "price_T",
+    STRIPE_PRICE_BUSINESS: "price_B",
+    STRIPE_PRICE_SOLO_MONTHLY: SOLO_M,
+    STRIPE_PRICE_SOLO_YEARLY: SOLO_Y,
+  };
+  const prices = {
+    team: "price_T",
+    business: "price_B",
+    soloMonthly: SOLO_M,
+    soloYearly: SOLO_Y,
+  };
+  const soloSub = (o: Record<string, unknown> = {}, price = SOLO_M) =>
+    sub({ items: { data: [{ price: { id: price } }] }, ...o });
+  const asSolo = () =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Test1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+
+  it("either Solo price names the tier solo; an unknown price does not", () => {
+    expect(tierFromSubscription(soloSub(), prices)).toBe("solo");
+    expect(tierFromSubscription(soloSub({}, SOLO_Y), prices)).toBe("solo");
+    expect(
+      tierFromSubscription(
+        sub({
+          items: { data: [{ price: { id: "price_X", lookup_key: "solo" } }] },
+        }),
+        prices,
+      ),
+    ).toBeNull();
+    // Team and Business still map by their own ids.
+    expect(
+      tierFromSubscription(
+        sub({ items: { data: [{ price: { id: "price_T" } }] } }),
+        prices,
+      ),
+    ).toBe("team");
+    // Without the ids: price metadata or the subscription's metadata.
+    expect(
+      tierFromSubscription(
+        sub({
+          items: {
+            data: [{ price: { id: "price_X", metadata: { tier: "solo" } } }],
+          },
+        }),
+      ),
+    ).toBe("solo");
+  });
+
+  it("a no-card Solo trial: tier solo and active, the subscription kept, trial_ends_at left for the Business trial", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', stripe_subscription_id = NULL WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const r = await deliver(
+      event(
+        "customer.subscription.created",
+        soloSub({ status: "trialing", trial_end: T + 30 * 86_400 }),
+      ),
+      { env: soloEnv },
+    );
+    expect(r.status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      grace_until: null,
+      stripe_subscription_id: "sub_Test1",
+      // Solo's 30-day trial end is not the 14-day Business trial's: a set
+      // trial_ends_at would end the first invite's trial for good.
+      trial_ends_at: null,
+    });
+  });
+
+  it("the Solo trial ends with no card: the subscription is canceled and the row is lapsed", async () => {
+    await asSolo();
+    await deliver(
+      event("customer.subscription.deleted", soloSub({ status: "canceled" })),
+      { env: soloEnv },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "lapsed",
+      grace_until: null,
+    });
+    // Buying again (a new Checkout) revives it.
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: "sub_Test2",
+        payment_status: "paid",
+        metadata: { tier: "solo" },
+      }),
+      { env: soloEnv },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: "sub_Test2",
+    });
+  });
+
+  it("the paid-tier invariant covers solo: a failed payment starts grace once, paid ends it", async () => {
+    await asSolo();
+    const failed = event("invoice.payment_failed", inv());
+    await deliver(failed, { env: soloEnv });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "past_due",
+      grace_until: failed.created * 1000 + GRACE_MS,
+    });
+    await deliver(event("invoice.paid", inv()), { env: soloEnv });
+    expect(await row(A)).toMatchObject({ status: "active", grace_until: null });
+    const failing = event(
+      "customer.subscription.updated",
+      soloSub({ status: "past_due" }),
+    );
+    await deliver(failing, { env: soloEnv });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "past_due",
+      grace_until: failing.created * 1000 + GRACE_MS,
+    });
+  });
+
+  it("a checkout for a Solo price completes into tier solo", async () => {
+    await db
+      .prepare("UPDATE tiers SET tier = 'solo' WHERE install_id = ?")
+      .bind(A)
+      .run();
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: "sub_Test1",
+        payment_status: "paid",
+        metadata: { tier: "solo" },
+      }),
+      { env: soloEnv },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: "sub_Test1",
+    });
+  });
+
+  it("a trial or free row (no live subscription) still never moves: solo does not widen the invariant", async () => {
+    for (const tier of ["trial", "free"]) {
+      await db
+        .prepare(
+          "UPDATE tiers SET tier = ?, status = 'active', grace_until = NULL, stripe_subscription_id = NULL WHERE install_id = ?",
+        )
+        .bind(tier, A)
+        .run();
+      for (const e of [
+        event("invoice.payment_failed", inv()),
+        event("customer.subscription.updated", soloSub({ status: "canceled" })),
+        event("customer.subscription.deleted", soloSub()),
+      ]) {
+        await deliver(e, { env: soloEnv });
+        expect(await row(A), `${tier} after ${e.type}`).toMatchObject({
+          tier,
+          status: "active",
+          grace_until: null,
+        });
+      }
+    }
   });
 });

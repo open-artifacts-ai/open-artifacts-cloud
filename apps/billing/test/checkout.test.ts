@@ -31,6 +31,8 @@ const baseEnv = (): Env => ({
   STRIPE_SECRET_KEY: SECRET,
   STRIPE_PRICE_TEAM: "price_team1",
   STRIPE_PRICE_BUSINESS: "price_business1",
+  STRIPE_PRICE_SOLO_MONTHLY: "price_soloM1",
+  STRIPE_PRICE_SOLO_YEARLY: "price_soloY1",
 });
 let env = baseEnv();
 
@@ -220,7 +222,7 @@ const CUSTOMERS = "/v1/customers";
 // ------------------------------------------------------------ tests
 
 describe("POST /checkout", () => {
-  it("no row: makes the free row, creates and maps the customer, then the session; answers {url} only", async () => {
+  it("no row: makes the solo row, creates and maps the customer, then the session; answers {url} only", async () => {
     const s = fakeStripe();
     const ts = Date.now();
     const r = await call(req("/checkout", { install: A, ts, plan: "team" }));
@@ -244,7 +246,7 @@ describe("POST /checkout", () => {
     });
     for (const c of s.calls) expect(c.auth).toBe(`Bearer ${SECRET}`);
     expect(await rowOf(A)).toMatchObject({
-      tier: "free",
+      tier: "solo",
       status: "active",
       version: 0,
       stripe_customer_id: "cus_fake1",
@@ -561,6 +563,15 @@ describe("POST /checkout", () => {
       [{ install: A, plan: "free" }, 400, "bad_plan"],
       [{ install: A, plan: "trial" }, 400, "bad_plan"],
       [{ install: A }, 400, "bad_plan"],
+      // Solo names its interval; no other plan takes one.
+      [{ install: A, plan: "solo" }, 400, "bad_plan"],
+      [{ install: A, plan: "solo", interval: "week" }, 400, "bad_plan"],
+      [
+        { install: A, plan: "solo", interval: "month", extra: 1 },
+        400,
+        "bad_body",
+      ],
+      [{ install: A, plan: "team", interval: "month" }, 400, "bad_plan"],
       [{ install: A, plan: "team", ts: Date.now() + 0.5 }, 400, "bad_body"],
       [{ plan: "team" }, 403, "install_mismatch"],
       [{ install: B, plan: "team" }, 403, "install_mismatch"],
@@ -570,6 +581,162 @@ describe("POST /checkout", () => {
     }
     expect(s.calls).toEqual([]);
     expect(await rowOf(A)).toBeNull();
+  });
+});
+
+describe("POST /checkout, Solo (#1568)", () => {
+  it("solo month and year use their own prices, tag tier solo, and key the session by interval", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    for (const [interval, price] of [
+      ["month", "price_soloM1"],
+      ["year", "price_soloY1"],
+    ] as const) {
+      const r = await call(
+        req("/checkout", { install: A, ts, plan: "solo", interval }),
+      );
+      expect(r.status, interval).toBe(200);
+      const c = s.calls.filter((x) => x.path === CHECKOUT).at(-1);
+      expect(c?.form["line_items[0][price]"]).toBe(price);
+      expect(c?.form["metadata[tier]"]).toBe("solo");
+      expect(c?.form["subscription_data[metadata][tier]"]).toBe("solo");
+      expect(c?.form["line_items[0][quantity]"]).toBe("1");
+      expect(c?.key).toBe(`checkout-${A}-solo-${interval}-${ts}`);
+    }
+    // Same ts, two intervals: two keys, so never Stripe's 400 for a reused key.
+    expect(
+      new Set(s.calls.filter((x) => x.path === CHECKOUT).map((x) => x.key))
+        .size,
+    ).toBe(2);
+  });
+
+  it("an unfilled or malformed Solo price: 500 config before any customer; the other plans' prices are not asked", async () => {
+    for (const [interval, e] of [
+      [
+        "month",
+        { STRIPE_PRICE_SOLO_MONTHLY: "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}" },
+      ],
+      ["month", { STRIPE_PRICE_SOLO_MONTHLY: undefined }],
+      ["year", { STRIPE_PRICE_SOLO_YEARLY: "prod_1abc" }],
+    ] as const) {
+      const s = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval }),
+        { ...baseEnv(), ...e } as Env,
+      );
+      expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+      expect(s.calls).toEqual([]);
+      expect(await rowOf(A)).toBeNull();
+      vi.restoreAllMocks();
+    }
+    // The yearly price being unfilled does not stop a monthly checkout.
+    fakeStripe();
+    const ok = await call(
+      req("/checkout", { install: A, plan: "solo", interval: "month" }),
+      { ...baseEnv(), STRIPE_PRICE_SOLO_YEARLY: "{{x}}" },
+    );
+    expect(ok.status).toBe(200);
+  });
+
+  it("a live Stripe key or no key is 500 config for Solo too, with no Stripe call", async () => {
+    await seed(A, "cus_existingA", "solo");
+    const s = fakeStripe();
+    for (const e of [
+      { STRIPE_SECRET_KEY: undefined },
+      { STRIPE_SECRET_KEY: "sk_live_abcdefgh12345678" },
+      { STRIPE_SECRET_KEY: "rk_live_abcdefgh12345678" },
+    ]) {
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval: "year" }),
+        { ...baseEnv(), ...e },
+      );
+      expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+    }
+    expect(s.calls).toEqual([]);
+  });
+
+  it("a live subscription refuses every plan, Solo included: 409 subscription_exists, no Stripe call", async () => {
+    for (const status of ["active", "past_due"]) {
+      for (const plan of ["solo", "team"] as const) {
+        await seed(A, "cus_existingA", "solo");
+        await db
+          .prepare(
+            "UPDATE tiers SET stripe_subscription_id = 'sub_live1', status = ?1 WHERE install_id = ?2",
+          )
+          .bind(status, A)
+          .run();
+        const s = fakeStripe();
+        const body =
+          plan === "solo"
+            ? { install: A, plan, interval: "month" }
+            : { install: A, plan };
+        const r = await call(req("/checkout", body));
+        expect([r.status, await r.json()], `${status} ${plan}`).toEqual([
+          409,
+          { error: "subscription_exists" },
+        ]);
+        expect(s.calls).toEqual([]);
+        s.spy.mockRestore();
+        await db.prepare("DELETE FROM tiers").run();
+      }
+    }
+  });
+
+  it("a lapsed Solo (its trial ended with no card) can buy again; a Solo row with no subscription can too", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_old1', status = 'lapsed' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    fakeStripe();
+    expect(
+      (
+        await call(
+          req("/checkout", { install: A, plan: "solo", interval: "month" }),
+        )
+      ).status,
+    ).toBe(200);
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "free");
+    expect(
+      (
+        await call(
+          req("/checkout", { install: A, plan: "solo", interval: "year" }),
+        )
+      ).status,
+    ).toBe(200);
+  });
+
+  it("Solo is bought on a solo, free or trial row only: a Team or Business row is 409 plan_conflict, no Stripe call", async () => {
+    for (const tier of ["team", "business"]) {
+      await seed(A, "cus_existingA", tier);
+      const s = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval: "month" }),
+      );
+      expect([r.status, await r.json()], tier).toEqual([
+        409,
+        { error: "plan_conflict" },
+      ]);
+      expect(s.calls).toEqual([]);
+      s.spy.mockRestore();
+      await db.prepare("DELETE FROM tiers").run();
+    }
+    fakeStripe();
+    for (const tier of ["solo", "free", "trial"]) {
+      await seed(A, "cus_existingA", tier);
+      expect(
+        (
+          await call(
+            req("/checkout", { install: A, plan: "solo", interval: "month" }),
+          )
+        ).status,
+        tier,
+      ).toBe(200);
+      await db.prepare("DELETE FROM tiers").run();
+    }
   });
 });
 

@@ -63,6 +63,9 @@ export interface Env {
   /** The env's Stripe price ids, one per paid plan (placeholders, filled at deploy). */
   STRIPE_PRICE_TEAM: string;
   STRIPE_PRICE_BUSINESS: string;
+  /** Solo's two prices (#1568): $1/month and $12/year, one per interval. */
+  STRIPE_PRICE_SOLO_MONTHLY: string;
+  STRIPE_PRICE_SOLO_YEARLY: string;
 }
 
 export { TRIAL_MS };
@@ -95,7 +98,7 @@ interface TierRow {
 function view(r: TierRow | null, now: number) {
   if (!r)
     return {
-      tier: "free",
+      tier: "solo",
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
@@ -117,11 +120,13 @@ const COLS = "tier, status, trial_ends_at, grace_until, version";
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;
 const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
-// Only free/active with no trial before: a trial never starts twice.
-// No row is the free/active default, so a trial can start from it too (an
-// install made before create writes rows); an existing row moves only from
-// free/active, and only once (trial_ends_at stays set after).
-const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier = 'free' AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+// Only solo/active (or free, the pre-Solo value) with no trial before: the
+// 14-day Business trial never starts twice. No row is the solo/active default,
+// so a trial can start from it too (an install made before create writes
+// rows); an existing row moves only from solo/free and active, and only once
+// (trial_ends_at stays set after). Solo's own 30-day no-card trial is a Stripe
+// subscription and never sets trial_ends_at, so it doesn't use this up.
+const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
 const USAGE_SQL =
   "INSERT INTO usage (install_id, month, creators_json, count, received_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (install_id, month) DO UPDATE SET creators_json = excluded.creators_json, count = excluded.count, received_at = excluded.received_at";
 
@@ -204,7 +209,7 @@ const mismatched = (body: Record<string, unknown>, install: string) =>
 
 /** Each signed POST's allowed body keys; any other field is 400 bad_body. */
 const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
-  "/checkout": ["install", "ts", "plan"],
+  "/checkout": ["install", "ts", "plan", "interval"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
@@ -215,10 +220,10 @@ const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
 /** billing-core's price id shape; checked before any customer is made. */
 const PRICE_ID = /^price_[A-Za-z0-9]{1,255}$/;
 
-// The free/active row, created first when missing (as /trial/start does).
+// The solo/active row, created first when missing (as /trial/start does).
 // Version 0 is what GET /tier shows for no row, so the view is unchanged.
 const ENSURE_ROW_SQL =
-  "INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, 'free', 'active', 0, ?2) ON CONFLICT (install_id) DO NOTHING";
+  "INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, 'solo', 'active', 0, ?2) ON CONFLICT (install_id) DO NOTHING";
 const CUSTOMER_SQL =
   "SELECT stripe_customer_id FROM tiers WHERE install_id = ?1";
 const SUBSCRIPTION_SQL =
@@ -320,11 +325,26 @@ async function checkout(
   appHost: string,
   body: Record<string, unknown>,
 ) {
-  const { plan } = body;
-  if (plan !== "team" && plan !== "business") return bad("bad_plan");
+  const { plan, interval } = body;
+  if (plan !== "solo" && plan !== "team" && plan !== "business")
+    return bad("bad_plan");
+  // Solo names its billing interval; no other plan takes one (the shared
+  // BillingCheckoutInput contract).
+  if (
+    plan === "solo"
+      ? interval !== "month" && interval !== "year"
+      : interval !== undefined
+  )
+    return bad("bad_plan");
   const tier: CheckoutTier = plan;
   const priceId =
-    tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
+    plan === "solo"
+      ? interval === "month"
+        ? env.STRIPE_PRICE_SOLO_MONTHLY
+        : env.STRIPE_PRICE_SOLO_YEARLY
+      : plan === "team"
+        ? env.STRIPE_PRICE_TEAM
+        : env.STRIPE_PRICE_BUSINESS;
   // An unfilled or malformed price never gets as far as a customer.
   if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
     console.error("billing stripe config", install);
@@ -340,15 +360,32 @@ async function checkout(
       tier: string | null;
     }>();
   // A live paid subscription (a trial or free row with an id is an
-  // unfinished first payment: it may retry), or a suspended one.
+  // unfinished first payment: it may retry), or a suspended one. Solo counts
+  // as paid: its no-card trial is a live subscription too, and a card is
+  // added in the Portal.
   if (
     held?.stripe_subscription_id &&
     (held.status === "suspended" ||
-      ((held.tier === "team" || held.tier === "business") &&
+      ((held.tier === "solo" ||
+        held.tier === "team" ||
+        held.tier === "business") &&
         (held.status === "active" || held.status === "past_due")))
   ) {
     console.log("billing checkout subscription_exists", install);
     return bad("subscription_exists", 409);
+  }
+  // Solo's prices are for a Solo (or pre-Solo free, or trial) instance: the
+  // server checks this first; billing keeps it too, so a Team or Business
+  // row never gets a Solo session.
+  if (
+    plan === "solo" &&
+    held?.tier &&
+    held.tier !== "solo" &&
+    held.tier !== "free" &&
+    held.tier !== "trial"
+  ) {
+    console.log("billing checkout plan_conflict", install);
+    return bad("plan_conflict", 409);
   }
   const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
   const customerId = await customerFor(
@@ -366,9 +403,13 @@ async function checkout(
         tier,
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
-        // Plan in the key: the same ts with another plan is a new session,
-        // never Stripe's 400 for a reused key with other params.
-        idempotencyKey: `checkout-${install}-${tier}-${body.ts}`,
+        // Plan (and Solo's interval) in the key: the same ts with another
+        // plan is a new session, never Stripe's 400 for a reused key with
+        // other params.
+        idempotencyKey:
+          plan === "solo"
+            ? `checkout-${install}-solo-${interval}-${body.ts}`
+            : `checkout-${install}-${tier}-${body.ts}`,
       },
       cfg,
     ),
@@ -501,6 +542,8 @@ export default {
           STRIPE_WEBHOOK_SECRET: secret,
           STRIPE_PRICE_TEAM: env.STRIPE_PRICE_TEAM,
           STRIPE_PRICE_BUSINESS: env.STRIPE_PRICE_BUSINESS,
+          STRIPE_PRICE_SOLO_MONTHLY: env.STRIPE_PRICE_SOLO_MONTHLY,
+          STRIPE_PRICE_SOLO_YEARLY: env.STRIPE_PRICE_SOLO_YEARLY,
         },
         Date.now(),
       );

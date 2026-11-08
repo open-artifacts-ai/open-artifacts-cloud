@@ -253,3 +253,103 @@ describe("POST /stripe/webhook", () => {
       expect(all).not.toContain(bad);
   });
 });
+
+describe("Solo prices (#1568)", () => {
+  const priced = {
+    ...env,
+    STRIPE_PRICE_TEAM: "price_team1",
+    STRIPE_PRICE_BUSINESS: "price_business1",
+    STRIPE_PRICE_SOLO_MONTHLY: "price_soloM1",
+    STRIPE_PRICE_SOLO_YEARLY: "price_soloY1",
+  } as Env;
+  const solo = (id: string, type: string, status: string, price: string) =>
+    JSON.stringify({
+      id,
+      object: "event",
+      type,
+      livemode: false,
+      created: T,
+      data: {
+        object: {
+          id: "sub_TestA0001",
+          object: "subscription",
+          customer: CUS_A,
+          status,
+          items: { data: [{ price: { id: price } }] },
+        },
+      },
+    });
+  const tierOf = () => rowOf(A);
+  const read = async () =>
+    (
+      await billing.fetch(
+        new Request(`${ORIGIN}/tier`, {
+          headers: { "x-oa-gate-install": A },
+        }) as Parameters<typeof billing.fetch>[0],
+        priced,
+      )
+    ).json();
+
+  it("the env's two Solo prices reach the webhook: either one makes the row solo", async () => {
+    for (const [i, price] of ["price_soloM1", "price_soloY1"].entries()) {
+      await db
+        .prepare(
+          "UPDATE tiers SET tier = 'trial', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?1",
+        )
+        .bind(A)
+        .run();
+      const r = await call(
+        await hook(
+          solo(
+            `evt_Solo${i}x1`,
+            "customer.subscription.updated",
+            "active",
+            price,
+          ),
+        ),
+        priced,
+      );
+      expect(r.status).toBe(200);
+      expect(await tierOf(), price).toMatchObject({
+        tier: "solo",
+        status: "active",
+      });
+    }
+  });
+
+  it("a Solo whose no-card trial ended (canceled) is reported as lapsed, and a failed payment is past_due with grace", async () => {
+    await call(
+      await hook(
+        solo(
+          "evt_SoloTr1",
+          "customer.subscription.created",
+          "trialing",
+          "price_soloM1",
+        ),
+      ),
+      priced,
+    );
+    expect(await read()).toMatchObject({
+      tier: "solo",
+      status: "active",
+      trialEndsAt: null,
+    });
+    const r = await call(
+      await hook(
+        solo(
+          "evt_SoloDel1",
+          "customer.subscription.deleted",
+          "canceled",
+          "price_soloM1",
+        ),
+      ),
+      priced,
+    );
+    expect(r.status).toBe(200);
+    expect(await read()).toMatchObject({
+      tier: "solo",
+      status: "lapsed",
+      graceUntil: null,
+    });
+  });
+});
