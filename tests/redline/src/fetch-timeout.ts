@@ -21,6 +21,8 @@ export const SETUP_PUBLISH_MS = 60_000;
 
 /** The fetch a boundFetch wraps (setupFetch sets its own, longer bound). */
 const INNER = Symbol.for("redline.boundFetch.inner");
+/** The symbol under which a fetch wrapper names the fetch `unbound()` returns for it. */
+export const INNER_KEY: symbol = INNER;
 type Wrapped = typeof fetch & { [INNER]?: typeof fetch };
 
 /** `inner` with a timeout signal added to every call, joined with the caller's. */

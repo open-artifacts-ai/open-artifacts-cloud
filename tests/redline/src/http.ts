@@ -12,6 +12,7 @@ import {
   setupFetch,
 } from "./fetch-timeout.ts";
 import { note } from "./notes.ts";
+import { countHook } from "./rl-anon.ts";
 import { secretsOf, setPat, type Target } from "./targets.ts";
 
 // Fetch helpers. Every request uses redirect: "manual" (a 3xx is judged, never
@@ -199,8 +200,12 @@ export class HttpError extends Error {
  * /__test/* path counts (the server charges the bucket before the key), so
  * a raw probe there paces through this too. Returns the calls in the window.
  */
-export const paceHook = (t: Target, o: PaceOpts = {}): Promise<number> =>
-  claimHookSlot(t.app, o);
+export async function paceHook(t: Target, o: PaceOpts = {}): Promise<number> {
+  const t0 = Date.now();
+  const n = await claimHookSlot(t.app, o);
+  countHook(Date.now() - t0);
+  return n;
+}
 
 // Why a hook refused after its key verified: the 404 body's
 // error.details.reason, a fixed enum (keep in sync with @oa/shared

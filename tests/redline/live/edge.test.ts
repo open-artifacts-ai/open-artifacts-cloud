@@ -59,9 +59,43 @@ beforeAll(async () => {
 
 afterAll(async () => {
   let bad = 0;
+  // csrfWrites' actors (W2): their throwaways go with their own PAT, then the
+  // PAT itself is revoked, with the cookie it was minted with.
+  for (const a of actors.values()) {
+    bad += await deleteThrowaways(a.t, a.pat, a.made);
+    try {
+      const r = await fetchT(
+        `${a.t.app}/api/v1/tokens/${encodeURIComponent(a.tokenId)}`,
+        withCred(a.cookie, {
+          method: "DELETE",
+          headers: { "x-oa-request": "1" },
+        }),
+      );
+      await readBody(r);
+      if (r.status < 200 || r.status > 299) bad++;
+    } catch {
+      bad++;
+    }
+  }
   for (const [s, ids] of made) bad += await deleteThrowaways(s.t, s.pat, ids);
   if (bad) throw new Error(`${bad} throwaway artifacts were not deleted`);
 });
+
+/**
+ * What csrfWrites acts as (W2, #1730): a fixed member of its own,
+ * redline-csrf@<testDomain>, so the whole-list snapshots it takes (the token
+ * list above all) are of a user no other lane touches, instead of the admin's,
+ * whose PAT every lane uses.
+ */
+interface Actor {
+  t: Target;
+  cookie: Cred;
+  pat: Cred;
+  tokenId: string;
+  /** Artifacts it made: deleted in afterAll with its own PAT. */
+  made: string[];
+}
+const actors = new Map<Side, Actor>();
 
 /** Per-request bound: a timeout is a FAIL (an abort error), never a refusal. */
 const TIMEOUT_MS = 15_000;
@@ -69,6 +103,43 @@ const send = (r: Request) =>
   httpSend(new Request(r, { signal: AbortSignal.timeout(TIMEOUT_MS) }));
 const fetchT = (url: string, init: RequestInit = {}) =>
   fetch(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) });
+
+/** The actor for `s`: its session (the hook), and a PAT minted with the cookie. */
+async function csrfActor(s: Side): Promise<Actor> {
+  const have = actors.get(s);
+  if (have) return have;
+  const t = s.t;
+  const cookie = await sessionCred(t, `redline-csrf@${t.testDomain}`, "member");
+  // PATs can't mint PATs: the member's session, as the app sends it.
+  const r = await send(
+    new Request(
+      `${t.app}/api/v1/tokens`,
+      withCred(cookie, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-oa-request": "1" },
+        body: JSON.stringify({ label: "redline-csrf-actor" }),
+      }),
+    ),
+  );
+  const text = await readBody(r);
+  if (r.status !== 201)
+    throw new Error(`${t.name} csrf actor PAT: ${describeRes(r, text)}`);
+  const v = parseJson(r, text, `${t.name} csrf actor PAT`) as {
+    id?: unknown;
+    token?: unknown;
+  };
+  if (typeof v.id !== "string" || typeof v.token !== "string" || !v.token)
+    throw new Error(`${t.name} csrf actor PAT: no id or token`);
+  const a: Actor = {
+    t,
+    cookie,
+    pat: { kind: "pat", token: v.token },
+    tokenId: v.id,
+    made: [],
+  };
+  actors.set(s, a);
+  return a;
+}
 
 const sideOf = (k: "a" | "b") => (k === "a" ? A : B);
 const hashOf = (s: string) =>
@@ -579,16 +650,17 @@ describe("cross-site isolation", () => {
 
   it("state-changing app requests without X-OA-Request are refused, and accepted with it", async () => {
     for (const s of [A, B]) {
+      const a = await csrfActor(s);
       let failure: unknown = null;
       try {
-        await csrfWrites(s);
+        await csrfWrites(a);
       } catch (e) {
         failure = e;
       }
       // Always revoke the PAT minted by the tokens write; a live one left
       // behind fails the case.
       try {
-        await revokeTokens(s, "redline-csrf");
+        await revokeTokens(a, "redline-csrf");
       } catch (e) {
         failure ??= e;
       }
@@ -597,10 +669,10 @@ describe("cross-site isolation", () => {
   });
 });
 
-async function csrfWrites(s: Side): Promise<void> {
+async function csrfWrites(s: Actor): Promise<void> {
   const t = s.t;
   const w = await createThrowaway(t, s.pat, { capabilities: { db: true } });
-  made.set(s, [...(made.get(s) ?? []), w.id]);
+  s.made.push(w.id);
   const art = `/api/v1/artifacts/${encodeURIComponent(w.id)}`;
   const read = async (path: string) => {
     const r = await send(apiReq(t, s.pat, "GET", path));
@@ -677,13 +749,16 @@ async function csrfWrites(s: Side): Promise<void> {
       );
     if (wr.method === "POST" && wr.path === "/api/v1/artifacts") {
       const id = (JSON.parse(ob) as { id?: unknown }).id;
-      if (typeof id === "string") made.set(s, [...(made.get(s) ?? []), id]);
+      if (typeof id === "string") s.made.push(id);
     }
   }
 }
 
 /** Revokes every token of `s`'s user labelled `label`; throws unless all are gone. */
-async function revokeTokens(s: Side, label: string): Promise<void> {
+async function revokeTokens(
+  s: Pick<Side, "t" | "pat">,
+  label: string,
+): Promise<void> {
   const t = s.t;
   const list = async () => {
     const r = await send(apiReq(t, s.pat, "GET", "/api/v1/tokens"));

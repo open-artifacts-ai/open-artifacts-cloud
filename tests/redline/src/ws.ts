@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { paceAnon, targetsFromEnv, tripwire } from "./rl-anon.ts";
 
 // WebSocket handshakes and raw-Host requests over node:http(s). fetch can't
 // send Upgrade or a Host that differs from the URL. Both resolve to a
@@ -109,7 +110,17 @@ export function rawRequest(o: RawOpts): Promise<Response> {
  * The WebSocket handshake for `req` (its URL and headers, plus Upgrade). 101
  * when the server upgraded; the socket is closed straight away.
  */
-export function wsHandshake(req: Request): Promise<Response> {
+export async function wsHandshake(req: Request): Promise<Response> {
+  // An anonymous upgrade spends RL_ANON (`ev:ip:`, `sub:ip:`): paced like the
+  // fetches in live/setup.ts, before the request's own timeout starts.
+  const targets = targetsFromEnv();
+  if (targets.length) await paceAnon(req, targets);
+  const res = await upgrade(req);
+  if (targets.length) tripwire(req, res.status, targets);
+  return res;
+}
+
+function upgrade(req: Request): Promise<Response> {
   const headers = new Headers(req.headers);
   headers.set("connection", "Upgrade");
   headers.set("upgrade", "websocket");

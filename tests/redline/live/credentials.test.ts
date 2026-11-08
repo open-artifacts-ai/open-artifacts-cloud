@@ -30,6 +30,7 @@ import {
   sessionCred,
   withCred,
 } from "../src/http.ts";
+import { withLock } from "../src/locks.ts";
 import { note } from "../src/notes.ts";
 import {
   allMarkers,
@@ -39,6 +40,7 @@ import {
   type Side,
 } from "../src/refused.ts";
 import { label, proof } from "../src/report.ts";
+import { MEMBERS_LOCK } from "../src/rl-anon.ts";
 import { loadTargets, type Target, type Targets } from "../src/targets.ts";
 
 // P5 Task 4: A's real credentials don't work at B. Every case goes through
@@ -576,88 +578,94 @@ describe("credentials", () => {
         .map((m) => `${m.email}:${m.role}`)
         .sort();
 
-    it("A's invite link opened at B by a B member: no membership on B", async () => {
-      // The invitee row an invite inserts, made through the hook (no email
-      // is sent). The invite link is A's /sign-in.
-      const invitee = `redline-invitee-${randomBytes(6).toString("hex")}@${T.a.testDomain}`;
-      const inviteeA = await sessionCred(T.a, invitee, "member");
-      const before = await memberList();
-      const meB = await getJson(T.b, "/api/v1/me", opener.get(T.b) as Cred);
-      // A's invitee is refused at B.
-      await crossCheck(me, pair(inviteeA, opener.get(T.b) as Cred));
-      // The link's path, opened at B by the B member.
-      const r = await fetch(
-        `${T.b.app}/sign-in`,
-        withCred(opener.get(T.b) as Cred),
-      );
-      const text = await readBody(r);
-      for (const m of allMarkers()) expect(text.includes(m)).toBe(false);
-      expect(
-        r.headers
-          .getSetCookie()
-          .some((l) => /^(__Host-)?oa_session=[^;]+/.test(l)),
-      ).toBe(false);
-      const after = await memberList();
-      expect(after).toEqual(before);
-      expect(after.some((m) => m.startsWith(`${invitee}:`))).toBe(false);
-      expect(await getJson(T.b, "/api/v1/me", opener.get(T.b) as Cred)).toEqual(
-        meB,
-      );
-    });
-
-    it("A's share email link opened at B by a B member: no share on B", async () => {
-      // Each side shares its marker with its own member (members get no
-      // email). The share link is <app>/a/<id>.
-      for (const t of [T.a, T.b]) {
+    it("A's invite link opened at B by a B member: no membership on B", () =>
+      // The before and after snapshots of rl-b's whole member list need no
+      // other lane to add a member in between (#1730): exclusive.
+      withLock(MEMBERS_LOCK, "exclusive", async () => {
+        // The invitee row an invite inserts, made through the hook (no email
+        // is sent). The invite link is A's /sign-in.
+        const invitee = `redline-invitee-${randomBytes(6).toString("hex")}@${T.a.testDomain}`;
+        const inviteeA = await sessionCred(T.a, invitee, "member");
+        const before = await memberList();
+        const meB = await getJson(T.b, "/api/v1/me", opener.get(T.b) as Cred);
+        // A's invitee is refused at B.
+        await crossCheck(me, pair(inviteeA, opener.get(T.b) as Cred));
+        // The link's path, opened at B by the B member.
         const r = await fetch(
-          `${t.app}/api/v1/artifacts/${encodeURIComponent(side(t).markerId)}/shares`,
-          withCred(side(t).pat, {
-            method: "PUT",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ email: openerEmail(t), role: "viewer" }),
-          }),
+          `${T.b.app}/sign-in`,
+          withCred(opener.get(T.b) as Cred),
         );
         const text = await readBody(r);
-        if (r.status !== 200) throw new HttpError(`${t.name} share`, r, text);
-      }
-      const sharesB = () =>
-        getJson(
-          T.b,
-          `/api/v1/artifacts/${encodeURIComponent(B.markerId)}/shares`,
-          B.pat,
-        ).then(emails);
-      const listB = () =>
-        getJson(T.b, "/api/v1/artifacts", opener.get(T.b) as Cred).then(
-          itemIds,
+        for (const m of allMarkers()) expect(text.includes(m)).toBe(false);
+        expect(
+          r.headers
+            .getSetCookie()
+            .some((l) => /^(__Host-)?oa_session=[^;]+/.test(l)),
+        ).toBe(false);
+        const after = await memberList();
+        expect(after).toEqual(before);
+        expect(after.some((m) => m.startsWith(`${invitee}:`))).toBe(false);
+        expect(
+          await getJson(T.b, "/api/v1/me", opener.get(T.b) as Cred),
+        ).toEqual(meB);
+      }));
+
+    it("A's share email link opened at B by a B member: no share on B", () =>
+      // The member list and the member's shares and artifacts compared
+      // whole: exclusive, like the invite case (#1730).
+      withLock(MEMBERS_LOCK, "exclusive", async () => {
+        // Each side shares its marker with its own member (members get no
+        // email). The share link is <app>/a/<id>.
+        for (const t of [T.a, T.b]) {
+          const r = await fetch(
+            `${t.app}/api/v1/artifacts/${encodeURIComponent(side(t).markerId)}/shares`,
+            withCred(side(t).pat, {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ email: openerEmail(t), role: "viewer" }),
+            }),
+          );
+          const text = await readBody(r);
+          if (r.status !== 200) throw new HttpError(`${t.name} share`, r, text);
+        }
+        const sharesB = () =>
+          getJson(
+            T.b,
+            `/api/v1/artifacts/${encodeURIComponent(B.markerId)}/shares`,
+            B.pat,
+          ).then(emails);
+        const listB = () =>
+          getJson(T.b, "/api/v1/artifacts", opener.get(T.b) as Cred).then(
+            itemIds,
+          );
+        const [shares0, list0, members0] = [
+          await sharesB(),
+          await listB(),
+          await memberList(),
+        ];
+        // The link's artifact, read by each host's own member.
+        const req = (c: Cred, t: Target) =>
+          new Request(
+            `${t.app}/api/v1/artifacts/${encodeURIComponent(slotValue<string>(c, t))}`,
+            withCred(opener.get(t) as Cred),
+          );
+        await crossCheck(
+          req,
+          pair(
+            slot(() => A.markerId),
+            slot(() => B.markerId),
+          ),
         );
-      const [shares0, list0, members0] = [
-        await sharesB(),
-        await listB(),
-        await memberList(),
-      ];
-      // The link's artifact, read by each host's own member.
-      const req = (c: Cred, t: Target) =>
-        new Request(
-          `${t.app}/api/v1/artifacts/${encodeURIComponent(slotValue<string>(c, t))}`,
-          withCred(opener.get(t) as Cred),
+        // The viewer page itself at B: whatever it serves, none of A's data.
+        const v = await fetch(
+          `${T.b.app}/a/${encodeURIComponent(A.markerId)}`,
+          withCred(opener.get(T.b) as Cred),
         );
-      await crossCheck(
-        req,
-        pair(
-          slot(() => A.markerId),
-          slot(() => B.markerId),
-        ),
-      );
-      // The viewer page itself at B: whatever it serves, none of A's data.
-      const v = await fetch(
-        `${T.b.app}/a/${encodeURIComponent(A.markerId)}`,
-        withCred(opener.get(T.b) as Cred),
-      );
-      const vt = await readBody(v);
-      for (const m of allMarkers()) expect(vt.includes(m)).toBe(false);
-      expect(await sharesB()).toEqual(shares0);
-      expect(await listB()).toEqual(list0);
-      expect(await memberList()).toEqual(members0);
-    });
+        const vt = await readBody(v);
+        for (const m of allMarkers()) expect(vt.includes(m)).toBe(false);
+        expect(await sharesB()).toEqual(shares0);
+        expect(await listB()).toEqual(list0);
+        expect(await memberList()).toEqual(members0);
+      }));
   });
 });

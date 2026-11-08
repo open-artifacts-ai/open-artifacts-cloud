@@ -8,6 +8,7 @@ import {
   type Release,
   TOKEN_SCOPES,
 } from "@oa/provisioning-contract";
+import { waitFor } from "./barrier.ts";
 import {
   InfraError,
   isNetworkError,
@@ -2369,6 +2370,11 @@ export const PROBES: readonly Probe[] = [
     title:
       "400 unsigned broker authorize for i000000admin: 404s (429 past the IP limit); /auth/start still reaches Google",
     run: async (run) => {
+      // The flood spends RL_BROKER_IP past its limit on purpose, and signin's
+      // broker cases spend the same bucket from this IP: wait for signin to
+      // finish them (src/barrier.ts). Off unless the lanes' runner set it; a
+      // deadline overrun is an InfraError, never a verdict.
+      await waitFor("broker-done", { orLaneExit: "front" });
       const authorize = () =>
         run.raw(
           `${run.c.broker}/google/authorize?install=i000000admin&state=${randomBytes(12).toString("base64url")}&nonce=${randomBytes(12).toString("base64url")}&code_challenge=${randomBytes(32).toString("base64url")}`,
