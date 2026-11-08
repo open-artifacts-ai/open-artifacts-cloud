@@ -51,6 +51,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM stripe_events"),
+    db.prepare("DELETE FROM pending_cancels"),
   ]);
   await seed(A, CUS_A, "trial");
   await seed(B, CUS_B, "team");
@@ -124,6 +125,14 @@ const sub = (o: Record<string, unknown> = {}) => ({
   items: { data: [{ price: { id: "price_Team", lookup_key: "team" } }] },
   ...o,
 });
+
+/** The subscriptions queued for cancel (pending_cancels), oldest id first. */
+const pending = async () =>
+  (
+    await db
+      .prepare("SELECT subscription_id FROM pending_cancels ORDER BY subscription_id")
+      .all<{ subscription_id: string }>()
+  ).results.map((r) => r.subscription_id);
 
 async function deliver(
   body: unknown,
@@ -1566,10 +1575,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
       "GET /v1/subscriptions/sub_Old1",
       "DELETE /v1/subscriptions/sub_Old1",
     ]);
-    expect(
-      ((await row(A)) as unknown as { cancel_sub_id: string | null })
-        .cancel_sub_id,
-    ).toBeNull();
+    expect(await pending()).toEqual([]);
   });
 
   it("the cancel fails: the webhook answers 500, the intent is kept, and Stripe's retry finishes it once", async () => {
@@ -1583,9 +1589,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
       tier: "team",
       stripe_subscription_id: "sub_New1",
     });
-    expect(
-      ((await row(A)) as unknown as { cancel_sub_id: string }).cancel_sub_id,
-    ).toBe("sub_Old1");
+    expect(await pending()).toEqual(["sub_Old1"]);
     // Stripe retries the same event id: a replay, which still settles the cancel.
     const good = stripe();
     const retry = await deliver(ev, { env: good.e });
@@ -1594,10 +1598,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
       "GET /v1/subscriptions/sub_Old1",
       "DELETE /v1/subscriptions/sub_Old1",
     ]);
-    expect(
-      ((await row(A)) as unknown as { cancel_sub_id: string | null })
-        .cancel_sub_id,
-    ).toBeNull();
+    expect(await pending()).toEqual([]);
     // A third delivery cancels nothing more.
     const again = stripe();
     expect((await deliver(ev, { env: again.e })).status).toBe(200);
@@ -1636,8 +1637,8 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     ]) {
       await soloLive();
       await db
-        .prepare("UPDATE tiers SET cancel_sub_id = NULL WHERE install_id = ?")
-        .bind(A)
+        .prepare("DELETE FROM pending_cancels WHERE customer_id = ?")
+        .bind(CUS_A)
         .run();
       const s = stripe();
       const r = await deliver(completed("sub_New1"), {
@@ -1645,9 +1646,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
       });
       expect(r.status, String(key)).toBe(500);
       expect(s.calls).toEqual([]);
-      expect(
-        ((await row(A)) as unknown as { cancel_sub_id: string }).cancel_sub_id,
-      ).toBe("sub_Old1");
+      expect(await pending()).toEqual(["sub_Old1"]);
     }
   });
 
@@ -1693,7 +1692,7 @@ describe("subscription events apply only to the row's current subscription (#156
   const solo = (id: string | null) =>
     db
       .prepare(
-        "UPDATE tiers SET tier = 'solo', status = 'active', grace_until = NULL, stripe_subscription_id = ?, last_event_created = NULL, last_invoice_created = NULL, cancel_sub_id = NULL WHERE install_id = ?",
+        "UPDATE tiers SET tier = 'solo', status = 'active', grace_until = NULL, stripe_subscription_id = ?, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
       )
       .bind(id, A)
       .run();
@@ -1915,7 +1914,7 @@ describe("the Business trial on top of a Solo subscription (#1568)", () => {
   const trialOverSolo = (solo: string | null = "active") =>
     db
       .prepare(
-        "UPDATE tiers SET tier = 'trial', status = 'active', grace_until = NULL, trial_ends_at = ?, stripe_subscription_id = ?, solo_status = ?, solo_grace_until = NULL, solo_trial_ends_at = ?, cancel_sub_id = NULL, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
+        "UPDATE tiers SET tier = 'trial', status = 'active', grace_until = NULL, trial_ends_at = ?, stripe_subscription_id = ?, solo_status = ?, solo_grace_until = NULL, solo_trial_ends_at = ?, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
       )
       .bind(TRIAL_END, solo === null ? null : OLD, solo, SOLO_END, A)
       .run();
@@ -1923,7 +1922,6 @@ describe("the Business trial on top of a Solo subscription (#1568)", () => {
     solo_status: string | null;
     solo_grace_until: number | null;
     solo_trial_ends_at: number | null;
-    cancel_sub_id: string | null;
   };
   const r = () => row(A) as Promise<R>;
   const stays = {
@@ -2107,7 +2105,7 @@ describe("a Solo checkout during the no-card trial (#1568)", () => {
   const trialing = () =>
     db
       .prepare(
-        "UPDATE tiers SET tier = 'solo', status = 'active', trial_ends_at = NULL, stripe_subscription_id = ?, solo_trial_ends_at = ?, cancel_sub_id = NULL, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
+        "UPDATE tiers SET tier = 'solo', status = 'active', trial_ends_at = NULL, stripe_subscription_id = ?, solo_trial_ends_at = ?, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
       )
       .bind(OLD, ENDS, A)
       .run();
@@ -2216,5 +2214,67 @@ describe("a Solo checkout during the no-card trial (#1568)", () => {
       tier: "team",
       solo_trial_ends_at: ENDS,
     });
+  });
+});
+
+describe("pending cancels are a table, settled together (#1568)", () => {
+  const KEY = "sk_test_notarealkey0000";
+  const queue = (id: string, customer: string) =>
+    db
+      .prepare("INSERT INTO pending_cancels (subscription_id, customer_id) VALUES (?, ?)")
+      .bind(id, customer)
+      .run();
+  /** Stripe where the subscriptions in `fail` can't be cancelled. */
+  const stripe = (fail: string[] = []) => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const id = new URL(url).pathname.split("/").pop() as string;
+      calls.push(`${init.method} ${id}`);
+      if (init.method === "GET") return Response.json({ id, status: "active" });
+      return fail.includes(id)
+        ? Response.json({ error: { type: "api_error" } }, { status: 500 })
+        : Response.json({ id, status: "canceled" });
+    }) as unknown as typeof fetch;
+    return { calls, e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv };
+  };
+  const ping = () => event("invoice.paid", inv());
+
+  it("every webhook for the customer settles all of its pending cancels, and only its own", async () => {
+    await queue("sub_P1", CUS_A);
+    await queue("sub_P2", CUS_A);
+    await queue("sub_Q1", CUS_B);
+    const s = stripe();
+    expect((await deliver(ping(), { env: s.e })).status).toBe(200);
+    expect(s.calls).toEqual(["GET sub_P1", "DELETE sub_P1", "GET sub_P2", "DELETE sub_P2"]);
+    expect(await pending()).toEqual(["sub_Q1"]);
+  });
+
+  it("a failure keeps that one and the rest still run; the answer is 500; a retry finishes only what is left", async () => {
+    await queue("sub_P1", CUS_A);
+    await queue("sub_P2", CUS_A);
+    await queue("sub_P3", CUS_A);
+    const bad = stripe(["sub_P2"]);
+    expect((await deliver(ping(), { env: bad.e })).status).toBe(500);
+    expect(await pending()).toEqual(["sub_P2"]);
+    expect(bad.calls.filter((c) => c.startsWith("DELETE"))).toEqual(["DELETE sub_P1", "DELETE sub_P2", "DELETE sub_P3"]);
+    const good = stripe();
+    expect((await deliver(ping(), { env: good.e })).status).toBe(200);
+    expect(good.calls).toEqual(["GET sub_P2", "DELETE sub_P2"]);
+    expect(await pending()).toEqual([]);
+  });
+
+  it("an upgrade queues the replaced subscription in the same batch as the event; the row can never queue its own subscription", async () => {
+    await db
+      .prepare("UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1' WHERE install_id = ?")
+      .bind(A)
+      .run();
+    const bad = stripe(["sub_Old1"]);
+    const r = await deliver(
+      event("checkout.session.completed", { customer: CUS_A, subscription: "sub_New1", payment_status: "paid", metadata: { tier: "team" } }),
+      { env: bad.e },
+    );
+    expect(r.status).toBe(500);
+    expect(await pending()).toEqual(["sub_Old1"]);
+    expect(await row(A)).toMatchObject({ tier: "team", stripe_subscription_id: "sub_New1" });
   });
 });

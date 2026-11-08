@@ -23,10 +23,7 @@ CREATE TABLE tiers_new (
   -- and this is what the row becomes when the trial ends (null: no Solo
   -- subscription, so lapsed). Only meaningful while tier is trial.
   solo_status TEXT CHECK (solo_status IN ('active', 'past_due', 'lapsed')),
-  solo_grace_until INTEGER,
-  -- A subscription an upgrade replaced and the webhook still has to cancel
-  -- (cleared once Stripe has cancelled it; a failed cancel retries).
-  cancel_sub_id TEXT
+  solo_grace_until INTEGER
 );
 
 INSERT INTO tiers_new (
@@ -41,3 +38,13 @@ FROM tiers;
 
 DROP TABLE tiers;
 ALTER TABLE tiers_new RENAME TO tiers;
+
+-- Subscriptions the webhook still has to cancel in Stripe: the one an upgrade
+-- replaced, or a paid subscription the row did not adopt. Written in the same
+-- batch as the event that caused it; every webhook for the customer settles
+-- all of them, and a row goes only after its own cancel succeeded.
+CREATE TABLE pending_cancels (
+  subscription_id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL
+);
+CREATE INDEX pending_cancels_customer ON pending_cancels (customer_id);

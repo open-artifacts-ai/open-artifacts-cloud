@@ -138,7 +138,6 @@ describe("migrations", () => {
       "solo_trial_ends_at",
       "solo_status",
       "solo_grace_until",
-      "cancel_sub_id",
     ]);
     expect(sql).toMatch(
       /DROP TABLE tiers;\nALTER TABLE tiers_new RENAME TO tiers;/,
