@@ -449,3 +449,49 @@ describe("cancelSubscription (#1568)", () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe("createCheckoutSession trialEnd (#1568)", () => {
+  const solo = { ...checkout, tier: "solo" as const, priceId: "price_Solo1" };
+  const out = {
+    id: "cs_test_1",
+    url: "https://checkout.stripe.com/c/pay/cs_test_1",
+  };
+
+  it("trialEnd (epoch seconds) becomes subscription_data[trial_end]; collection stays at its default", async () => {
+    const { seen, f } = fake(out);
+    await createCheckoutSession(
+      { ...solo, trialEnd: 1_800_000_000 },
+      { secretKey: KEY, fetch: f },
+    );
+    const body = form(seen[0] as Seen);
+    expect(body["subscription_data[trial_end]"]).toBe("1800000000");
+    expect(
+      Object.keys(body).filter((k) => /payment_method_collection/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("without it the session carries no trial at all", async () => {
+    const { seen, f } = fake(out);
+    await createCheckoutSession(solo, { secretKey: KEY, fetch: f });
+    expect(
+      Object.keys(form(seen[0] as Seen)).filter((k) => /trial/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("refuses a non-integer, zero, negative or non-finite trialEnd before any call", () => {
+    const { seen, f } = fake(out);
+    for (const trialEnd of [0, -5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      let e: unknown;
+      try {
+        createCheckoutSession(
+          { ...solo, trialEnd },
+          { secretKey: KEY, fetch: f },
+        );
+      } catch (x) {
+        e = x;
+      }
+      expect((e as StripeConfigError).field, String(trialEnd)).toBe("trialEnd");
+    }
+    expect(seen).toEqual([]);
+  });
+});

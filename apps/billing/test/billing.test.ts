@@ -1015,3 +1015,33 @@ describe("the Business trial over a Solo subscription (#1568)", () => {
     expect(await rowOf(B)).toMatchObject({ tier: "team", version: 9 });
   });
 });
+
+describe("soloTrialEndsAt is answered only while it is in the future (#1568)", () => {
+  it("a Solo trial end in the past is null; one still ahead is the date", async () => {
+    at();
+    await seed([{ install: A, tier: "solo" }]);
+    const set = (v: number) =>
+      db
+        .prepare(
+          "UPDATE tiers SET solo_trial_ends_at = ?1 WHERE install_id = ?2",
+        )
+        .bind(v, A)
+        .run();
+    await set(NOW - 1);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: null,
+    });
+    await set(NOW);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: null,
+    });
+    await set(NOW + 1);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: NOW + 1,
+    });
+    // The column keeps the history: only the answer hides it.
+    await set(NOW - 5);
+    await call(gated("GET", "/tier"));
+    expect(await rowOf(A)).toMatchObject({ solo_trial_ends_at: NOW - 5 });
+  });
+});

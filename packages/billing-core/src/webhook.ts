@@ -352,6 +352,15 @@ export function changeFor(
             shadow("solo_status", "'active'"),
             shadow("solo_grace_until", "NULL"),
           );
+        // A Solo checkout that charged now (paid, no trial end passed) ends
+        // the Solo trial then. One that kept the free days
+        // (no_payment_required) keeps it: the new subscription's trialing
+        // event sets the same end.
+        if (tier === "solo" && o.payment_status === "paid")
+          sets.push({
+            sql: "solo_trial_ends_at = ?",
+            args: [ev.created * 1000],
+          });
       }
       return sets.length ? sets : null;
     }

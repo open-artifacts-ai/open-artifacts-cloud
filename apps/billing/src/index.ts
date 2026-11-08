@@ -119,7 +119,11 @@ function view(r: TierRow | null, now: number) {
     graceUntil: r.grace_until,
     // The Solo subscription's own trial end. trialEndsAt stays the 14-day
     // Business trial's: the server's trial eligibility is trialEndsAt === null.
-    soloTrialEndsAt: r.solo_trial_ends_at,
+    // Only while it is still ahead: once past it is null (the column keeps it).
+    soloTrialEndsAt:
+      r.solo_trial_ends_at !== null && r.solo_trial_ends_at > now
+        ? r.solo_trial_ends_at
+        : null,
     version: r.version,
     asOf: now,
   };
@@ -243,6 +247,8 @@ const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
 /** Only a Stripe-hosted page is ever passed back. */
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
 const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
+/** Stripe: a Checkout trial_end must be 48 hours out; plus a safety hour. */
+const MIN_TRIAL_END_MS = 49 * 3_600_000;
 /** billing-core's price id shape; checked before any customer is made. */
 const PRICE_ID = /^price_[A-Za-z0-9]{1,255}$/;
 
@@ -437,12 +443,26 @@ async function checkout(
     Date.now(),
   );
   const base = `https://${appHost}/settings/billing`;
+  // Paying during the no-card Solo trial keeps the free days: the new
+  // subscription's trial ends where the old one's does, so no money moves
+  // until then and the card is collected. Stripe needs trial_end at least 48
+  // hours ahead (checked here with a safety hour for the time it takes to
+  // arrive); with less left the Checkout charges now.
+  const now = Date.now();
+  const trialEnd =
+    plan === "solo" &&
+    inSoloTrial &&
+    held?.solo_trial_ends_at != null &&
+    held.solo_trial_ends_at - now >= MIN_TRIAL_END_MS
+      ? Math.floor(held.solo_trial_ends_at / 1000)
+      : undefined;
   const s = await stripe(install, () =>
     createCheckoutSession(
       {
         customerId,
         priceId,
         tier,
+        ...(trialEnd === undefined ? {} : { trialEnd }),
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
         // Plan (and Solo's interval) in the key: the same ts with another
@@ -450,7 +470,7 @@ async function checkout(
         // other params.
         idempotencyKey:
           plan === "solo"
-            ? `checkout-${install}-solo-${interval}-${body.ts}`
+            ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
             : `checkout-${install}-${tier}-${body.ts}`,
       },
       cfg,

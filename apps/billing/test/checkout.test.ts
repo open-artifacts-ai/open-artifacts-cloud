@@ -1436,3 +1436,115 @@ describe("POST /checkout on a row in its Business trial over a Solo subscription
     }
   });
 });
+
+describe("Solo Checkout during the no-card trial keeps the free days (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const H = 3_600_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const inTrial = async (ends: number) => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_trial1', solo_trial_ends_at = ?1 WHERE install_id = ?2",
+      )
+      .bind(ends, A)
+      .run();
+  };
+  const session = async (plan: string, interval?: string) => {
+    const s = fakeStripe();
+    const r = await call(
+      req("/checkout", {
+        install: A,
+        ts: NOW,
+        plan,
+        ...(interval ? { interval } : {}),
+      }),
+    );
+    expect(r.status).toBe(200);
+    const c = s.calls.find((x) => x.path === CHECKOUT);
+    s.spy.mockRestore();
+    return c as StripeCall;
+  };
+
+  it("passes the trial's end (seconds) as subscription_data[trial_end]: no money moves until the free days end, the card is collected", async () => {
+    const ends = NOW + 10 * 24 * H + 123;
+    await inTrial(ends);
+    for (const interval of ["month", "year"]) {
+      const c = await session("solo", interval);
+      expect(c.form["subscription_data[trial_end]"]).toBe(
+        String(Math.floor(ends / 1000)),
+      );
+      // Collection stays at Stripe's default (always): the card is taken.
+      expect(
+        Object.keys(c.form).filter((k) => /payment_method_collection/.test(k)),
+      ).toEqual([]);
+    }
+  });
+
+  it("Stripe wants trial_end at least 48 hours out: from 49 hours (a safety hour) it is passed, under that it is omitted and the Checkout charges now", async () => {
+    await inTrial(NOW + 49 * H);
+    expect(
+      (await session("solo", "month")).form["subscription_data[trial_end]"],
+    ).toBe(String(Math.floor((NOW + 49 * H) / 1000)));
+    for (const ends of [
+      NOW + 49 * H - 1,
+      NOW + 48 * H,
+      NOW + 24 * H,
+      NOW + 1000,
+    ]) {
+      await inTrial(ends);
+      const c = await session("solo", "month");
+      expect(
+        Object.keys(c.form).filter((k) => /trial/.test(k)),
+        String(ends - NOW),
+      ).toEqual([]);
+    }
+  });
+
+  it("a Checkout that is not Solo-in-trial never carries a trial: a fresh Solo, a Team upgrade", async () => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "solo");
+    expect(
+      Object.keys((await session("solo", "month")).form).filter((k) =>
+        /trial/.test(k),
+      ),
+    ).toEqual([]);
+    await inTrial(NOW + 10 * 24 * H);
+    expect(
+      Object.keys((await session("team")).form).filter((k) => /trial/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("the session key differs with and without a trial end, so a retry never reuses a key with other params", async () => {
+    await inTrial(NOW + 10 * 24 * H);
+    const withEnd = await session("solo", "month");
+    await inTrial(NOW + 24 * H);
+    const without = await session("solo", "month");
+    expect(withEnd.key).not.toBe(without.key);
+  });
+
+  it("a past Solo trial cannot start again through /solo/start", async () => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET solo_trial_ends_at = ?1, status = 'lapsed' WHERE install_id = ?2",
+      )
+      .bind(NOW - H, A)
+      .run();
+    const s = fakeStripe();
+    const r = await call(req("/solo/start", { install: A, ts: NOW }));
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({
+      tier: "solo",
+      status: "lapsed",
+      soloTrialEndsAt: null,
+    });
+    expect(s.calls).toEqual([]);
+  });
+});

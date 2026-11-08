@@ -34,6 +34,14 @@ export interface CheckoutInput {
   idempotencyKey: string;
   /** Seats at checkout (the creator count follows on each report). Default 1. */
   quantity?: number;
+  /**
+   * End of a free period (epoch seconds), sent as
+   * subscription_data[trial_end]: nothing is charged until then, and the card
+   * is still collected (payment_method_collection stays at its default).
+   * Solo paying during its no-card trial keeps the free days with it. Stripe
+   * needs it at least 48 hours ahead: the caller checks.
+   */
+  trialEnd?: number;
 }
 
 export interface PortalInput {
@@ -177,6 +185,11 @@ export function createCheckoutSession(
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
     throw new StripeConfigError("quantity");
   if (
+    input.trialEnd !== undefined &&
+    !(Number.isSafeInteger(input.trialEnd) && input.trialEnd > 0)
+  )
+    throw new StripeConfigError("trialEnd");
+  if (
     input.tier !== "solo" &&
     input.tier !== "team" &&
     input.tier !== "business"
@@ -195,6 +208,9 @@ export function createCheckoutSession(
         cancel_url: https("cancelUrl", input.cancelUrl),
         "metadata[tier]": input.tier,
         "subscription_data[metadata][tier]": input.tier,
+        ...(input.trialEnd === undefined
+          ? {}
+          : { "subscription_data[trial_end]": String(input.trialEnd) }),
       },
       input.idempotencyKey,
     ),

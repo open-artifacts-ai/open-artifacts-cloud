@@ -2096,3 +2096,125 @@ describe("the Business trial on top of a Solo subscription (#1568)", () => {
     });
   });
 });
+
+// ------------------------------------------------- paying during the Solo trial
+
+describe("a Solo checkout during the no-card trial (#1568)", () => {
+  const OLD = "sub_Old1";
+  const NEW = "sub_New1";
+  const KEY = "sk_test_notarealkey0000";
+  const ENDS = (T + 10 * 86_400) * 1000;
+  const trialing = () =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', trial_ends_at = NULL, stripe_subscription_id = ?, solo_trial_ends_at = ?, cancel_sub_id = NULL, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
+      )
+      .bind(OLD, ENDS, A)
+      .run();
+  const stripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${new URL(url).pathname}`);
+      return Response.json({
+        id: OLD,
+        status: init.method === "GET" ? "trialing" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+  const completed = (payment_status: string) =>
+    event("checkout.session.completed", {
+      customer: CUS_A,
+      subscription: NEW,
+      payment_status,
+      metadata: { tier: "solo" },
+    });
+
+  it("a Checkout that kept the free days (no_payment_required) keeps the trial end and cancels only the trialing subscription", async () => {
+    await trialing();
+    const s = stripe();
+    await deliver(completed("no_payment_required"), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: NEW,
+      solo_trial_ends_at: ENDS,
+    });
+    // Only the trialing Solo is touched: no other Stripe call moves money.
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+    // The new subscription's own trialing event sets the same end.
+    await deliver(
+      event(
+        "customer.subscription.created",
+        sub({
+          id: NEW,
+          status: "trialing",
+          trial_end: ENDS / 1000,
+          items: { data: [{ price: { id: "p", metadata: { tier: "solo" } } }] },
+        }),
+      ),
+      { env: s.e },
+    );
+    expect(await row(A)).toMatchObject({
+      solo_trial_ends_at: ENDS,
+      stripe_subscription_id: NEW,
+    });
+  });
+
+  it("a Checkout that charged now (paid) ends the Solo trial at the event time", async () => {
+    await trialing();
+    const s = stripe();
+    const ev = completed("paid");
+    await deliver(ev, { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: NEW,
+      solo_trial_ends_at: ev.created * 1000,
+    });
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+  });
+
+  it("a paid Solo during the Business trial ends the Solo trial too, and the Business trial runs on", async () => {
+    await trialing();
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'trial', trial_ends_at = ?, solo_status = 'active' WHERE install_id = ?",
+      )
+      .bind(ENDS, A)
+      .run();
+    const ev = completed("paid");
+    await deliver(ev, { env: stripe().e });
+    expect(await row(A)).toMatchObject({
+      tier: "trial",
+      trial_ends_at: ENDS,
+      solo_trial_ends_at: ev.created * 1000,
+    });
+  });
+
+  it("a Team or Business checkout never touches solo_trial_ends_at", async () => {
+    await trialing();
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: NEW,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      }),
+      { env: stripe().e },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      solo_trial_ends_at: ENDS,
+    });
+  });
+});
