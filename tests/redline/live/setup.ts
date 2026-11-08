@@ -1,4 +1,4 @@
-import { afterAll } from "vitest";
+import { afterAll, afterEach, beforeAll } from "vitest";
 import { getCurrentTest } from "vitest/suite";
 import { boundFetch, INNER_KEY, unbound } from "../src/fetch-timeout.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
@@ -7,6 +7,7 @@ import {
   guardedFetch,
   liveTargetsFromEnv,
   pacingNote,
+  phaseScopes,
 } from "../src/rl-anon.ts";
 import { transportFetch } from "../src/transport.ts";
 
@@ -28,8 +29,19 @@ const bound = boundFetch(transportFetch(globalThis.fetch, resets));
 // same rules around the raw fetch.
 // Fails closed: a live run never loses its pacing, lock or tripwire silently.
 const targets = liveTargetsFromEnv();
+// The wait budget is per case (#24). Code outside a case (beforeAll and
+// afterAll hooks) gets one per phase: the hooks before the first test share
+// one, and each test's end starts a new one for what follows (the next test's
+// own scope is its case; the afterAll hooks get the last one). A file's hooks
+// never share a single 120 s budget with each other's phase.
+const phase = phaseScopes();
+beforeAll(() => phase.reset());
+afterEach(() => phase.reset());
 const rules = (f: typeof fetch) =>
-  guardedFetch(f, { targets, scope: () => getCurrentTest() });
+  guardedFetch(f, {
+    targets,
+    scope: () => getCurrentTest() ?? phase.current(),
+  });
 const guarded = rules(bound);
 (guarded as unknown as Record<symbol, unknown>)[INNER_KEY] = rules(
   unbound(bound),
