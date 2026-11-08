@@ -78,6 +78,8 @@ type Row = {
   last_event_created: number | null;
   last_invoice_created: number | null;
   last_checkout_created: number | null;
+  open_checkout_id: string | null;
+  open_checkout_key: string | null;
 };
 const row = async (install: string) =>
   db
@@ -2460,6 +2462,165 @@ describe("a delayed upgrade Checkout is ordered against other Checkouts only (#1
     expect(await row(A)).toMatchObject({
       status: "lapsed",
       stripe_subscription_id: "sub_New1",
+    });
+  });
+});
+
+// ------------------------------------------------- Solo never replaces a live Team; later session wins
+
+describe("a Solo Checkout never replaces a live Team or Business subscription (#1568)", () => {
+  const KEY = "sk_test_notarealkey0000";
+  const live = (tier: string, status = "active") =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = ?, status = ?, grace_until = NULL, trial_ends_at = NULL, stripe_subscription_id = 'sub_Team1', solo_status = NULL, last_event_created = NULL, last_invoice_created = NULL, last_checkout_created = NULL WHERE install_id = ?",
+      )
+      .bind(tier, status, A)
+      .run();
+  const stripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const id = new URL(url).pathname.split("/").pop() as string;
+      calls.push(`${init.method} ${id}`);
+      return Response.json({
+        id,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+  const checkout = (
+    sub: string,
+    tierName: string,
+    o: Record<string, unknown> = {},
+    created?: number,
+  ) =>
+    event(
+      "checkout.session.completed",
+      {
+        customer: CUS_A,
+        subscription: sub,
+        payment_status: "paid",
+        metadata: { tier: tierName },
+        ...o,
+      },
+      created === undefined ? {} : { created },
+    );
+
+  it("a Solo checkout on a live Team or Business row keeps the row and queues the NEW subscription for cancel", async () => {
+    for (const [tier, status] of [
+      ["team", "active"],
+      ["business", "active"],
+      ["team", "past_due"],
+    ]) {
+      await live(tier as string, status as string);
+      await db
+        .prepare("UPDATE tiers SET grace_until = ? WHERE install_id = ?")
+        .bind(status === "past_due" ? 123 : null, A)
+        .run();
+      await db.prepare("DELETE FROM pending_cancels").run();
+      const s = stripe();
+      const before = await row(A);
+      const r = await deliver(checkout("sub_Solo1", "solo"), { env: s.e });
+      expect(r.status, `${tier} ${status}`).toBe(200);
+      expect(await row(A), `${tier} ${status}`).toMatchObject({
+        tier,
+        status,
+        grace_until: before.grace_until,
+        stripe_subscription_id: "sub_Team1",
+        trial_ends_at: null,
+      });
+      // The Solo is what is cancelled: never the live Team.
+      expect(s.calls).toEqual(["GET sub_Solo1", "DELETE sub_Solo1"]);
+      expect(await pending()).toEqual([]);
+    }
+  });
+
+  it("a lapsed Team row that buys Solo adopts it (nothing is live to protect)", async () => {
+    await live("team", "lapsed");
+    const s = stripe();
+    await deliver(checkout("sub_Solo1", "solo"), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: "sub_Solo1",
+    });
+    expect(s.calls).toEqual([]);
+  });
+
+  it("two paid Team sessions: the later wins and the earlier is cancelled, in either arrival order", async () => {
+    await live("solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_Old1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const s = stripe();
+    await deliver(checkout("sub_T1", "team", {}, T + 10), { env: s.e });
+    await deliver(checkout("sub_T2", "business", {}, T + 20), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "business",
+      stripe_subscription_id: "sub_T2",
+    });
+    expect(s.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
+      "DELETE sub_Old1",
+      "DELETE sub_T1",
+    ]);
+    // Reversed arrival: the newer first, then the older one is not adopted and is cancelled.
+    await live("solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_Old1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const r = stripe();
+    await deliver(checkout("sub_T4", "business", {}, T + 40), { env: r.e });
+    await deliver(checkout("sub_T3", "team", {}, T + 30), { env: r.e });
+    expect(await row(A)).toMatchObject({
+      tier: "business",
+      stripe_subscription_id: "sub_T4",
+    });
+    expect(r.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
+      "DELETE sub_Old1",
+      "DELETE sub_T3",
+    ]);
+  });
+
+  it("an unpaid checkout is never queued; the row's own subscription's checkout replay queues nothing", async () => {
+    await live("team");
+    const s = stripe();
+    await deliver(
+      checkout("sub_Unpaid1", "team", { payment_status: "unpaid" }),
+      { env: s.e },
+    );
+    await deliver(checkout("sub_Team1", "team"), { env: s.e });
+    expect(s.calls).toEqual([]);
+    expect(await pending()).toEqual([]);
+  });
+
+  it("completing a session clears it from the row's open session", async () => {
+    await live("solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open1', open_checkout_key = 'k' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    await deliver(checkout("sub_Solo1", "solo", { id: "cs_test_other" }), {
+      env: stripe().e,
+    });
+    expect(await row(A)).toMatchObject({ open_checkout_id: "cs_test_open1" });
+    await deliver(checkout("sub_Solo1", "solo", { id: "cs_test_open1" }), {
+      env: stripe().e,
+    });
+    expect(await row(A)).toMatchObject({
+      open_checkout_id: null,
+      open_checkout_key: null,
     });
   });
 });

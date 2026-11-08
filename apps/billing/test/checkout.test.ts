@@ -51,6 +51,7 @@ beforeAll(async () => {
 // ------------------------------------------------------------ fake Stripe
 
 type StripeCall = {
+  method: string;
   path: string;
   key: string | null;
   auth: string | null;
@@ -81,6 +82,7 @@ function fakeStripe(override?: Override) {
         throw new Error(`unexpected fetch ${url.origin}`);
       const h = new Headers(init?.headers);
       const c: StripeCall = {
+        method: String(init?.method),
         path: url.pathname,
         key: h.get("idempotency-key"),
         auth: h.get("authorization"),
@@ -89,6 +91,17 @@ function fakeStripe(override?: Override) {
       calls.push(c);
       const o = await override?.(c);
       if (o) return o;
+      // A Checkout session read or expire (an open session is expired before
+      // another is made).
+      const sess =
+        /^\/v1\/checkout\/sessions\/(cs_[A-Za-z0-9_]+)(\/expire)?$/.exec(
+          c.path,
+        );
+      if (sess)
+        return Response.json({
+          id: sess[1],
+          status: sess[2] ? "expired" : "open",
+        });
       const k = `${c.path} ${c.key}`;
       if (!replay.has(k)) {
         n++;
@@ -509,7 +522,11 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now, plan: "team" })),
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
-    expect(rs.map((r) => r.status)).toEqual([200, 200]);
+    // Two Checkouts at once leave one open session: the later store wins and
+    // the other answers 503 retry (#1568); neither fails otherwise.
+    const codes = rs.map((r) => r.status);
+    expect(codes).toContain(200);
+    for (const c of codes) expect([200, 503]).toContain(c);
     const cust = s.calls.filter((c) => c.path === CUSTOMERS);
     expect(new Set(cust.map((c) => c.key))).toEqual(new Set([`cust-${A}`]));
     const mapped = await customerOf(A);
@@ -538,7 +555,11 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now, plan: "team" })),
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
-    expect(rs.map((r) => r.status)).toEqual([200, 200]);
+    // Two Checkouts at once leave one open session: the later store wins and
+    // the other answers 503 retry (#1568); neither fails otherwise.
+    const codes = rs.map((r) => r.status);
+    expect(codes).toContain(200);
+    for (const c of codes) expect([200, 503]).toContain(c);
     const mapped = await customerOf(A);
     expect(mapped).toMatch(/^cus_race[12]$/);
     expect(
@@ -770,6 +791,7 @@ describe("POST /portal", () => {
     });
     expect(s.calls).toEqual([
       {
+        method: "POST",
         path: PORTAL,
         key: `portal-${A}-${ts}`,
         auth: `Bearer ${SECRET}`,
@@ -1545,6 +1567,190 @@ describe("Solo Checkout during the no-card trial keeps the free days (#1568)", (
       status: "lapsed",
       soloTrialEndsAt: null,
     });
+    expect(s.calls).toEqual([]);
+  });
+});
+
+describe("an open Checkout session is expired before another is made (#1568)", () => {
+  const sessions = (s: ReturnType<typeof fakeStripe>) =>
+    s.calls.filter((c) => c.path.startsWith("/v1/checkout/sessions"));
+  const buy = (ts: number, plan = "team") =>
+    call(req("/checkout", { install: A, ts, plan }));
+
+  it("no open session on the row: nothing to expire; the new session's id and key are stored", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    const r = await buy(ts);
+    expect(r.status).toBe(200);
+    expect(sessions(s).map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /v1/checkout/sessions",
+    ]);
+    expect(await rowOf(A)).toMatchObject({
+      open_checkout_id: "cs_test_2",
+      open_checkout_key: `checkout-${A}-team-${ts}`,
+    });
+  });
+
+  it("another Checkout expires the first one's session, before it creates its own; the new one is stored", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    await buy(ts);
+    await buy(ts + 1);
+    expect(sessions(s).map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /v1/checkout/sessions",
+      "GET /v1/checkout/sessions/cs_test_2",
+      "POST /v1/checkout/sessions/cs_test_2/expire",
+      "POST /v1/checkout/sessions",
+    ]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_3");
+  });
+
+  it("the same request again (the same key) expires nothing: Stripe replays the same session", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    await buy(ts);
+    await buy(ts);
+    expect(
+      sessions(s).filter(
+        (c) => c.path.includes("expire") || c.method === "GET",
+      ),
+    ).toEqual([]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_2");
+  });
+
+  it("a session that already completed or expired is left alone, and the new one is made", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_done', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    for (const status of ["complete", "expired"]) {
+      const s = fakeStripe((c) =>
+        c.method === "GET" && c.path.endsWith("cs_test_done")
+          ? Response.json({ id: "cs_test_done", status })
+          : undefined,
+      );
+      expect((await buy(Date.now())).status).toBe(200);
+      expect(
+        sessions(s).some((c) => c.path.endsWith("/expire")),
+        status,
+      ).toBe(false);
+      await db
+        .prepare(
+          "UPDATE tiers SET open_checkout_id = 'cs_test_done', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+        )
+        .bind(A)
+        .run();
+      s.spy.mockRestore();
+    }
+  });
+
+  it("an expire that fails stops the Checkout: 502, no new session, the stored one kept", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const s = fakeStripe((c) =>
+      c.path.endsWith("/expire")
+        ? Response.json({ error: { type: "api_error" } }, { status: 500 })
+        : undefined,
+    );
+    const r = await buy(Date.now());
+    expect([r.status, await r.json()]).toEqual([502, { error: "upstream" }]);
+    expect(
+      s.calls.some(
+        (c) => c.method === "POST" && c.path === "/v1/checkout/sessions",
+      ),
+    ).toBe(false);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_open");
+  });
+
+  it("a crash between the expire and the create leaves nothing open: the next try finds it expired and makes one session", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    let expired = false;
+    let failed = false;
+    const s = fakeStripe((c) => {
+      if (c.path.endsWith("/expire")) expired = true;
+      if (c.method === "GET" && c.path.endsWith("cs_test_open"))
+        return Response.json({
+          id: "cs_test_open",
+          status: expired ? "expired" : "open",
+        });
+      // The create fails once (the Worker "crashes" after the expire).
+      if (
+        c.method === "POST" &&
+        c.path === "/v1/checkout/sessions" &&
+        expired &&
+        !failed
+      ) {
+        failed = true;
+        return Response.json({ error: { type: "api_error" } }, { status: 500 });
+      }
+      return undefined;
+    });
+    expect((await buy(Date.now())).status).toBe(502);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_open");
+    s.calls.length = 0;
+    expect((await buy(Date.now() + 1)).status).toBe(200);
+    // Found expired: no second expire; one session created and stored.
+    expect(
+      sessions(s).map((c) => `${c.method} ${c.path.replace(/cs_\w+/, "cs_x")}`),
+    ).toEqual(["GET /v1/checkout/sessions/cs_x", "POST /v1/checkout/sessions"]);
+    expect((await rowOf(A))?.open_checkout_id).not.toBe("cs_test_open");
+  });
+
+  it("two Checkouts racing: the one that loses the store expires its own session and answers 503 retry", async () => {
+    await seed(A, "cus_existingA", "solo");
+    const s = fakeStripe((c) => {
+      // While this call's session is being created, another call stores its own.
+      if (c.method === "POST" && c.path === "/v1/checkout/sessions")
+        return db
+          .prepare(
+            "UPDATE tiers SET open_checkout_id = 'cs_test_winner', open_checkout_key = 'winner-key-1234' WHERE install_id = ?1",
+          )
+          .bind(A)
+          .run()
+          .then(() => undefined);
+      return undefined;
+    });
+    const r = await buy(Date.now());
+    expect([r.status, await r.json()]).toEqual([503, { error: "retry" }]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_winner");
+    // Its own, orphaned session was expired.
+    expect(
+      sessions(s).some(
+        (c) => c.method === "POST" && c.path.endsWith("/expire"),
+      ),
+    ).toBe(true);
+  });
+
+  it("no Stripe key or a live one: 500 config before anything is expired or created", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const s = fakeStripe();
+    for (const key of [undefined, "sk_live_abcdefgh12345678"]) {
+      const r = await call(req("/checkout", { install: A, plan: "team" }), {
+        ...baseEnv(),
+        STRIPE_SECRET_KEY: key,
+      });
+      expect(r.status).toBe(500);
+    }
     expect(s.calls).toEqual([]);
   });
 });

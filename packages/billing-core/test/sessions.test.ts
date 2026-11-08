@@ -5,6 +5,7 @@ import {
   createPortalSession,
   cancelSubscription,
   createSoloTrialSubscription,
+  expireCheckoutSession,
   SOLO_TRIAL_DAYS,
   StripeApiError,
   StripeConfigError,
@@ -493,5 +494,105 @@ describe("createCheckoutSession trialEnd (#1568)", () => {
       expect((e as StripeConfigError).field, String(trialEnd)).toBe("trialEnd");
     }
     expect(seen).toEqual([]);
+  });
+});
+
+describe("expireCheckoutSession (#1568)", () => {
+  const calls: { method: string; path: string; key: string | null }[] = [];
+  const stripe = (o: {
+    get?: [unknown, number?];
+    post?: [unknown, number?];
+  }) => {
+    calls.length = 0;
+    return (async (url: string, init: RequestInit) => {
+      const method = String(init.method);
+      calls.push({
+        method,
+        path: new URL(url).pathname,
+        key: new Headers(init.headers).get("idempotency-key"),
+      });
+      const [b, st] = (method === "GET" ? o.get : o.post) ?? [
+        { id: "cs_test_1" },
+      ];
+      return Response.json(b, { status: st ?? 200 });
+    }) as unknown as typeof fetch;
+  };
+  const cfg = (f: typeof fetch) => ({ secretKey: KEY, fetch: f });
+
+  it("reads the session; an open one is expired, keyed by its id", async () => {
+    await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(stripe({ get: [{ id: "cs_test_1", status: "open" }] })),
+    );
+    expect(calls).toEqual([
+      { method: "GET", path: "/v1/checkout/sessions/cs_test_1", key: null },
+      {
+        method: "POST",
+        path: "/v1/checkout/sessions/cs_test_1/expire",
+        key: "expire-cs_test_1",
+      },
+    ]);
+  });
+
+  it("a session that is complete or expired already, or gone, is left alone", async () => {
+    for (const status of ["complete", "expired"]) {
+      await expireCheckoutSession(
+        { sessionId: "cs_test_1" },
+        cfg(stripe({ get: [{ id: "cs_test_1", status }] })),
+      );
+      expect(
+        calls.map((c) => c.method),
+        status,
+      ).toEqual(["GET"]);
+    }
+    await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(stripe({ get: [{ error: { type: "invalid_request_error" } }, 404] })),
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("an expire that loses a race (400 or 404 after the read) is fine; any other error keeps status and type only", async () => {
+    for (const st of [400, 404])
+      await expireCheckoutSession(
+        { sessionId: "cs_test_1" },
+        cfg(
+          stripe({
+            get: [{ id: "cs_test_1", status: "open" }],
+            post: [{ error: { type: "invalid_request_error" } }, st],
+          }),
+        ),
+      );
+    const e = await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(
+        stripe({
+          get: [{ id: "cs_test_1", status: "open" }],
+          post: [{ error: { type: "api_error", message: "cs_test_1" } }, 500],
+        }),
+      ),
+    ).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      500,
+      "api_error",
+      "stripe 500 api_error",
+    ]);
+  });
+
+  it("refuses a live key or a bad id before any call", async () => {
+    const f = stripe({});
+    for (const [id, key, field] of [
+      ["cs_test_1", "sk_live_abcdefghij", "secretKey"],
+      ["cs_test_1", "rk_live_abcdefghij", "secretKey"],
+      ["cs_test_1/expire", KEY, "sessionId"],
+      ["sub_1", KEY, "sessionId"],
+    ] as const) {
+      const e = await expireCheckoutSession(
+        { sessionId: id },
+        { secretKey: key, fetch: f },
+      ).catch((x) => x);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(calls).toEqual([]);
   });
 });

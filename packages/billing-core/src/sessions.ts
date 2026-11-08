@@ -83,6 +83,7 @@ const CUSTOMER = /^cus_[A-Za-z0-9]{1,255}$/;
 const PRICE = /^price_[A-Za-z0-9]{1,255}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9_:.-]{8,255}$/;
 const INSTALL = /^i[a-z0-9]{11}$/;
+const CHECKOUT_SESSION = /^cs_[A-Za-z0-9_]{1,255}$/;
 const SUBSCRIPTION = /^sub_[A-Za-z0-9]{1,255}$/;
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
 const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
@@ -317,6 +318,38 @@ export async function cancelSubscription(
     await send(cfg, "DELETE", path, null, null);
   } catch (e) {
     if (e instanceof StripeApiError && e.status === 404) return { id };
+    throw e;
+  }
+  return { id };
+}
+
+/**
+ * Expires an open Checkout session, so only the newest one can be paid
+ * (#1568). Safe to repeat and to race: it reads the session first and leaves
+ * one that is not open (complete, expired) or gone (404) alone; an expire that
+ * loses a race with the customer paying (400 or 404 after the read) is fine.
+ * Any other Stripe error is thrown (status and type only).
+ */
+export async function expireCheckoutSession(
+  input: { sessionId: string },
+  cfg: StripeConfig,
+): Promise<{ id: string }> {
+  const id = check(CHECKOUT_SESSION, "sessionId", input.sessionId);
+  const path = `/v1/checkout/sessions/${id}`;
+  let open: boolean;
+  try {
+    open = (await send(cfg, "GET", path, null, null)).out?.status === "open";
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404) return { id };
+    throw e;
+  }
+  if (!open) return { id };
+  try {
+    await send(cfg, "POST", `${path}/expire`, {}, `expire-${id}`);
+  } catch (e) {
+    // Lost a race with the customer paying (or with another expire).
+    if (e instanceof StripeApiError && (e.status === 400 || e.status === 404))
+      return { id };
     throw e;
   }
   return { id };

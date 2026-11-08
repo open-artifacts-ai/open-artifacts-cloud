@@ -37,6 +37,7 @@ import {
   createCustomer,
   createPortalSession,
   createSoloTrialSubscription,
+  expireCheckoutSession,
   handleStripeWebhook,
   pruneStripeEvents,
   SOLO_TRIAL_DAYS,
@@ -152,6 +153,10 @@ const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, v
 const MATERIALIZE_SQL = `UPDATE tiers SET tier = 'solo', status = CASE WHEN status = 'suspended' THEN status WHEN solo_status IN ('active', 'past_due') THEN solo_status ELSE 'lapsed' END, grace_until = CASE WHEN status = 'suspended' THEN grace_until WHEN solo_status = 'past_due' THEN solo_grace_until END, version = version + 1, updated_at = ?2 WHERE install_id = ?1 AND tier = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at <= ?2`;
 const materialize = (db: D1Database, install: string, now: number) =>
   db.prepare(MATERIALIZE_SQL).bind(install, now).run();
+const OPEN_SQL =
+  "SELECT open_checkout_id, open_checkout_key FROM tiers WHERE install_id = ?1";
+const STORE_OPEN_SQL =
+  "UPDATE tiers SET open_checkout_id = ?1, open_checkout_key = ?2 WHERE install_id = ?3 AND open_checkout_id IS ?4 AND open_checkout_key IS ?5 RETURNING 1 AS ok";
 const SOLO_HELD_SQL =
   "SELECT tier, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
 const SOLO_TRIAL_MS = SOLO_TRIAL_DAYS * 86_400_000;
@@ -456,6 +461,27 @@ async function checkout(
     held.solo_trial_ends_at - now >= MIN_TRIAL_END_MS
       ? Math.floor(held.solo_trial_ends_at / 1000)
       : undefined;
+  // Plan (and Solo's interval) in the key: the same ts with another plan is a
+  // new session, never Stripe's 400 for a reused key with other params.
+  const idempotencyKey =
+    plan === "solo"
+      ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
+      : `checkout-${install}-${tier}-${body.ts}`;
+  // Only the newest Checkout can be paid: the install's open session (kept
+  // below) is expired first. A retry with the same key is the same session
+  // (Stripe replays it), so it is not expired. Order matters for a crash: the
+  // expire comes first, so a crash after it leaves nothing open (the next
+  // try finds it expired and makes one); a crash after the create but before
+  // the id is stored leaves one unknown open session, which the webhook
+  // still handles (the later paid session wins, the earlier is cancelled).
+  const open = await env.BILLING_DB.prepare(OPEN_SQL).bind(install).first<{
+    open_checkout_id: string | null;
+    open_checkout_key: string | null;
+  }>();
+  if (open?.open_checkout_id && open.open_checkout_key !== idempotencyKey) {
+    const sessionId = open.open_checkout_id;
+    await stripe(install, () => expireCheckoutSession({ sessionId }, cfg));
+  }
   const s = await stripe(install, () =>
     createCheckoutSession(
       {
@@ -465,17 +491,35 @@ async function checkout(
         ...(trialEnd === undefined ? {} : { trialEnd }),
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
-        // Plan (and Solo's interval) in the key: the same ts with another
-        // plan is a new session, never Stripe's 400 for a reused key with
-        // other params.
-        idempotencyKey:
-          plan === "solo"
-            ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
-            : `checkout-${install}-${tier}-${body.ts}`,
+        idempotencyKey,
       },
       cfg,
     ),
   );
+  // Store it, only if no other call stored its own meanwhile; the loser
+  // expires its session and asks the caller to retry (the winner is then the
+  // one that gets expired: the later call wins).
+  const stored = await env.BILLING_DB.prepare(STORE_OPEN_SQL)
+    .bind(
+      s.id,
+      idempotencyKey,
+      install,
+      open?.open_checkout_id ?? null,
+      open?.open_checkout_key ?? null,
+    )
+    .first();
+  if (!stored) {
+    const now2 = await env.BILLING_DB.prepare(OPEN_SQL)
+      .bind(install)
+      .first<{ open_checkout_id: string | null }>();
+    if (now2?.open_checkout_id !== s.id) {
+      await stripe(install, () =>
+        expireCheckoutSession({ sessionId: s.id }, cfg),
+      ).catch(() => undefined);
+      console.log("billing checkout lost_race", install);
+      return bad("retry", 503);
+    }
+  }
   return answer(install, "checkout", s.url, CHECKOUT_URL);
 }
 

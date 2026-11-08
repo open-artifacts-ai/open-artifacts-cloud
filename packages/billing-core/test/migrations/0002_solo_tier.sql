@@ -26,7 +26,12 @@ CREATE TABLE tiers_new (
   -- and this is what the row becomes when the trial ends (null: no Solo
   -- subscription, so lapsed). Only meaningful while tier is trial.
   solo_status TEXT CHECK (solo_status IN ('active', 'past_due', 'lapsed')),
-  solo_grace_until INTEGER
+  solo_grace_until INTEGER,
+  -- The install's open Checkout session (cs_ id) and the idempotency key it
+  -- was made with: expired before another is created, so two paid sessions
+  -- are nearly impossible.
+  open_checkout_id TEXT,
+  open_checkout_key TEXT
 );
 
 INSERT INTO tiers_new (

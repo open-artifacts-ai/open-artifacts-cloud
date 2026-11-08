@@ -238,6 +238,10 @@ const PAID = "tier IN ('solo', 'team', 'business')";
  */
 const PREV_LIVE =
   "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due'))))";
+/** The row is live on a Team or Business subscription. */
+const HOLD =
+  "(tier IN ('team', 'business') AND stripe_subscription_id IS NOT NULL AND status IN ('active', 'past_due'))";
+const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/;
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
 /** One column assignment in the row update: SQL and its binds. */
@@ -370,7 +374,36 @@ export function changeFor(
             args: [ev.created * 1000],
           });
       }
-      return sets.length ? sets : null;
+      // This checkout's session is no longer open.
+      if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
+        sets.push({
+          sql: "open_checkout_id = CASE WHEN open_checkout_id = ? THEN NULL ELSE open_checkout_id END",
+          args: [o.id],
+        });
+      if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
+        sets.push({
+          sql: "open_checkout_key = CASE WHEN open_checkout_id = ? THEN NULL ELSE open_checkout_key END",
+          args: [o.id],
+        });
+      // A Solo checkout that completes on a row live on Team or Business
+      // (two sessions open at once) never replaces it: the row keeps its
+      // subscription, tier and status, and the NEW subscription is queued
+      // for cancel (handleStripeWebhook). The Solo can't downgrade a paying
+      // Team.
+      const soloPaid =
+        payNow && isObj(o.metadata) && asTier(o.metadata.tier) === "solo";
+      return sets.length
+        ? soloPaid
+          ? sets.map((set) => {
+              const at = set.sql.indexOf(" = ");
+              const col = set.sql.slice(0, at);
+              return {
+                sql: `${col} = CASE WHEN ${HOLD} THEN ${col} ELSE ${set.sql.slice(at + 3)} END`,
+                args: set.args,
+              };
+            })
+          : sets
+        : null;
     }
     case "customer.subscription.created":
     case "customer.subscription.updated": {
@@ -713,6 +746,9 @@ async function settleCancels(
 const QUEUE_PREVIOUS =
   "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id = ?3 AND stripe_subscription_id != ?1)";
 
+const QUEUE_UNADOPTED =
+  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
+
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
   req: Request,
@@ -859,6 +895,11 @@ export async function handleStripeWebhook(
       if (live)
         queue = [db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub)];
     }
+    // A paid subscription the row did not adopt (an older Checkout, or a Solo
+    // on a live Team) is queued for cancel, in the same batch: never one the
+    // row holds. Runs on a replay too, so a lost queue can't stay lost.
+    if (paidSub)
+      queue.push(db.prepare(QUEUE_UNADOPTED).bind(paidSub, customer));
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
       db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),

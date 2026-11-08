@@ -13,6 +13,7 @@ export {
   createCustomer,
   createPortalSession,
   createSoloTrialSubscription,
+  expireCheckoutSession,
   type PortalInput,
   SOLO_TRIAL_DAYS,
   type SoloTrialInput,
