@@ -501,8 +501,8 @@ async function checkout(
     ),
   );
   // Store it, only if no other call stored its own meanwhile; the loser
-  // expires its session and asks the caller to retry (the winner is then the
-  // one that gets expired: the later call wins).
+  // expires its session and answers 409 checkout_in_progress (a new request
+  // then expires the winner's: the later call wins).
   const stored = await env.BILLING_DB.prepare(STORE_OPEN_SQL)
     .bind(
       s.id,
@@ -521,7 +521,9 @@ async function checkout(
         expireCheckoutSession({ sessionId: s.id }, cfg),
       ).catch(() => undefined);
       console.log("billing checkout lost_race", install);
-      return bad("retry", 503);
+      // 409, not 503: the server retries a 503 automatically with the same
+      // request (the same key), which would return this dead session's URL.
+      return bad("checkout_in_progress", 409);
     }
   }
   return answer(install, "checkout", s.url, CHECKOUT_URL);

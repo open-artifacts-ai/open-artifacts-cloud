@@ -523,10 +523,10 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
     // Two Checkouts at once leave one open session: the later store wins and
-    // the other answers 503 retry (#1568); neither fails otherwise.
+    // the other answers 409 checkout_in_progress (#1568); neither fails otherwise.
     const codes = rs.map((r) => r.status);
     expect(codes).toContain(200);
-    for (const c of codes) expect([200, 503]).toContain(c);
+    for (const c of codes) expect([200, 409]).toContain(c);
     const cust = s.calls.filter((c) => c.path === CUSTOMERS);
     expect(new Set(cust.map((c) => c.key))).toEqual(new Set([`cust-${A}`]));
     const mapped = await customerOf(A);
@@ -556,10 +556,10 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
     // Two Checkouts at once leave one open session: the later store wins and
-    // the other answers 503 retry (#1568); neither fails otherwise.
+    // the other answers 409 checkout_in_progress (#1568); neither fails otherwise.
     const codes = rs.map((r) => r.status);
     expect(codes).toContain(200);
-    for (const c of codes) expect([200, 503]).toContain(c);
+    for (const c of codes) expect([200, 409]).toContain(c);
     const mapped = await customerOf(A);
     expect(mapped).toMatch(/^cus_race[12]$/);
     expect(
@@ -1708,7 +1708,7 @@ describe("an open Checkout session is expired before another is made (#1568)", (
     expect((await rowOf(A))?.open_checkout_id).not.toBe("cs_test_open");
   });
 
-  it("two Checkouts racing: the one that loses the store expires its own session and answers 503 retry", async () => {
+  it("two Checkouts racing: the one that loses the store expires its own session and answers 409 checkout_in_progress", async () => {
     await seed(A, "cus_existingA", "solo");
     const s = fakeStripe((c) => {
       // While this call's session is being created, another call stores its own.
@@ -1723,7 +1723,12 @@ describe("an open Checkout session is expired before another is made (#1568)", (
       return undefined;
     });
     const r = await buy(Date.now());
-    expect([r.status, await r.json()]).toEqual([503, { error: "retry" }]);
+    // 409, not 503: the server's automatic retry of a 503 reuses the same
+    // request (the same key) and would get the dead session's URL back.
+    expect([r.status, await r.json()]).toEqual([
+      409,
+      { error: "checkout_in_progress" },
+    ]);
     expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_winner");
     // Its own, orphaned session was expired.
     expect(
