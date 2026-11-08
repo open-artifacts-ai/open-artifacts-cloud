@@ -715,28 +715,33 @@ export async function pruneStripeEvents(
  * Cancels every subscription queued for this customer (pending_cancels: the
  * one an upgrade replaced, or a paid one the row did not adopt) and removes
  * each only after its own cancel succeeded. Idempotent: the cancel repeats
- * safely. False when any could not (no or live key, Stripe down): the rest
- * are kept, the webhook answers 500, and Stripe's retry (a replay of the
- * recorded event) runs this again.
+ * safely. Answers the ids it could not cancel (no or live key, Stripe down):
+ * they are kept, and the webhook answers 500 only when the event itself queued
+ * one of them (Stripe's retry, a replay of the recorded event, runs this
+ * again); any other event still tries and answers 200.
  */
 async function settleCancels(
   db: D1Database,
   customer: string,
   env: WebhookEnv,
-): Promise<boolean> {
+): Promise<{ id: string; event: string | null }[]> {
   const { results } = await db
     .prepare(
-      "SELECT p.subscription_id, t.stripe_subscription_id AS current_id FROM pending_cancels p LEFT JOIN tiers t ON t.stripe_customer_id = p.customer_id WHERE p.customer_id = ?",
+      "SELECT p.subscription_id, p.event_id, t.stripe_subscription_id AS current_id FROM pending_cancels p LEFT JOIN tiers t ON t.stripe_customer_id = p.customer_id WHERE p.customer_id = ?",
     )
     .bind(customer)
-    .all<{ subscription_id: string; current_id: string | null }>();
-  if (results.length === 0) return true;
+    .all<{
+      subscription_id: string;
+      event_id: string | null;
+      current_id: string | null;
+    }>();
+  if (results.length === 0) return [];
   const cfg: StripeConfig = {
     secretKey: env.STRIPE_SECRET_KEY ?? "",
     ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
   };
-  let ok = true;
-  for (const { subscription_id: id, current_id } of results) {
+  const failed: { id: string; event: string | null }[] = [];
+  for (const { subscription_id: id, event_id, current_id } of results) {
     // Never the row's own subscription: dropped without a Stripe call (a
     // queued id can end up current, e.g. a stale queue meeting a later
     // adoption).
@@ -754,7 +759,7 @@ async function settleCancels(
       await cancelSubscription({ subscriptionId: id }, cfg);
     } catch {
       log("cancel_failed");
-      ok = false;
+      failed.push({ id, event: event_id });
       continue;
     }
     await db
@@ -765,7 +770,7 @@ async function settleCancels(
       .run();
     log("subscription_canceled");
   }
-  return ok;
+  return failed;
 }
 
 /**
@@ -774,10 +779,10 @@ async function settleCancels(
  * Never the row's current subscription.
  */
 const QUEUE_PREVIOUS =
-  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id = ?3 AND stripe_subscription_id != ?1)";
+  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?4 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id = ?3 AND stripe_subscription_id != ?1)";
 
 const QUEUE_UNADOPTED =
-  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
+  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
 
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
@@ -923,13 +928,15 @@ export async function handleStripeWebhook(
               prev.tier === "business") &&
             (prev.status === "active" || prev.status === "past_due"));
       if (live)
-        queue = [db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub)];
+        queue = [
+          db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub, ev.id),
+        ];
     }
     // A paid subscription the row did not adopt (an older Checkout, or a Solo
     // on a live Team) is queued for cancel, in the same batch: never one the
     // row holds. Runs on a replay too, so a lost queue can't stay lost.
     if (paidSub)
-      queue.push(db.prepare(QUEUE_UNADOPTED).bind(paidSub, customer));
+      queue.push(db.prepare(QUEUE_UNADOPTED).bind(paidSub, customer, ev.id));
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
       db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
@@ -953,7 +960,10 @@ export async function handleStripeWebhook(
       log("unknown_customer");
       return json({ received: true });
     }
-    const settled = await settleCancels(db, customer, env);
+    const failed = await settleCancels(db, customer, env);
+    // Only the event's own queued cancels fail it: the replaced subscription
+    // and the paid one the row did not adopt.
+    const settled = !failed.some((f) => f.event === ev.id);
     if ((res[1]?.meta.changes ?? 0) === 0) {
       log("replay");
       return settled

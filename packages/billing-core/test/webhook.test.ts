@@ -2264,12 +2264,13 @@ describe("pending cancels are a table, settled together (#1568)", () => {
     expect(await pending()).toEqual(["sub_Q1"]);
   });
 
-  it("a failure keeps that one and the rest still run; the answer is 500; a retry finishes only what is left", async () => {
+  it("a failure keeps that one and the rest still run; a later event finishes only what is left", async () => {
     await queue("sub_P1", CUS_A);
     await queue("sub_P2", CUS_A);
     await queue("sub_P3", CUS_A);
     const bad = stripe(["sub_P2"]);
-    expect((await deliver(ping(), { env: bad.e })).status).toBe(500);
+    // A plain event did not queue them: it still tries, and answers 200.
+    expect((await deliver(ping(), { env: bad.e })).status).toBe(200);
     expect(await pending()).toEqual(["sub_P2"]);
     expect(bad.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
       "DELETE sub_P1",
@@ -2280,6 +2281,38 @@ describe("pending cancels are a table, settled together (#1568)", () => {
     expect((await deliver(ping(), { env: good.e })).status).toBe(200);
     expect(good.calls).toEqual(["GET sub_P2", "DELETE sub_P2"]);
     expect(await pending()).toEqual([]);
+  });
+
+  it("a webhook answers 500 only when the event itself queued the failed cancel; other events still settle and answer 200", async () => {
+    // A cancel left over from an earlier event keeps failing.
+    await queue("sub_Left1", CUS_A);
+    const bad = stripe(["sub_Left1"]);
+    const other = await deliver(ping(), { env: bad.e });
+    expect(other.status).toBe(200);
+    expect(bad.calls).toContain("DELETE sub_Left1");
+    expect(await pending()).toEqual(["sub_Left1"]);
+    // An upgrade whose own queued cancel fails: 500 (Stripe retries it) ...
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const worse = stripe(["sub_Left1", "sub_Old1"]);
+    const ev = event("checkout.session.completed", {
+      customer: CUS_A,
+      subscription: "sub_New1",
+      payment_status: "paid",
+      metadata: { tier: "team" },
+    });
+    expect((await deliver(ev, { env: worse.e })).status).toBe(500);
+    // ... and so does its replay while it still fails.
+    expect((await deliver(ev, { env: worse.e })).status).toBe(500);
+    // Once it can be cancelled the replay settles it: 200.
+    expect((await deliver(ev, { env: stripe(["sub_Left1"]).e })).status).toBe(
+      200,
+    );
+    expect(await pending()).toEqual(["sub_Left1"]);
   });
 
   it("a queued id equal to the row's current subscription is dropped without any Stripe call: the row's own is never cancelled", async () => {

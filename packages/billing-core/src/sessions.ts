@@ -314,7 +314,9 @@ export async function cancelSubscription(
   const path = `/v1/subscriptions/${id}`;
   try {
     const { out } = await send(cfg, "GET", path, null, null);
-    if (out?.status === "canceled") return { id };
+    // incomplete_expired: the first payment never completed; nothing to cancel.
+    if (out?.status === "canceled" || out?.status === "incomplete_expired")
+      return { id };
     await send(cfg, "DELETE", path, null, null);
   } catch (e) {
     if (e instanceof StripeApiError && e.status === 404) return { id };

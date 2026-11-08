@@ -53,6 +53,9 @@ ALTER TABLE tiers_new RENAME TO tiers;
 -- all of them, and a row goes only after its own cancel succeeded.
 CREATE TABLE pending_cancels (
   subscription_id TEXT PRIMARY KEY,
-  customer_id TEXT NOT NULL
+  customer_id TEXT NOT NULL,
+  -- The Stripe event that queued it: only that event (and its replays) answers
+  -- 500 while the cancel keeps failing.
+  event_id TEXT
 );
 CREATE INDEX pending_cancels_customer ON pending_cancels (customer_id);

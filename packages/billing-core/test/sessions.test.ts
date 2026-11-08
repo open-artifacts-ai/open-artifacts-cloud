@@ -411,6 +411,19 @@ describe("cancelSubscription (#1568)", () => {
     expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE"]);
   });
 
+  it("an incomplete_expired subscription is done too: it can't be cancelled and bills nothing", async () => {
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "incomplete_expired" }],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
   it("another Stripe error keeps status and type only", async () => {
     const e = await cancelSubscription(
       { subscriptionId: "sub_Old1" },
