@@ -1390,4 +1390,31 @@ describe("Solo (#1568)", () => {
       }
     }
   });
+
+  it("a delayed active update after a payment failure leaves grace_until unchanged (#862)", async () => {
+    await asSolo();
+    const failed = event("invoice.payment_failed", inv(), { created: T + 100 });
+    await deliver(failed, { env: soloEnv });
+    const graced = await row(A);
+    expect(graced.grace_until).toBe((T + 100) * 1000 + GRACE_MS);
+    // The update was made before the failure (T+50) and arrives after it.
+    await deliver(
+      event("customer.subscription.updated", soloSub({ status: "active" }), {
+        created: T + 50,
+      }),
+      { env: soloEnv },
+    );
+    expect(await row(A)).toMatchObject({
+      status: "past_due",
+      grace_until: graced.grace_until,
+    });
+    // A genuinely newer active update does end the grace.
+    await deliver(
+      event("customer.subscription.updated", soloSub({ status: "active" }), {
+        created: T + 200,
+      }),
+      { env: soloEnv },
+    );
+    expect(await row(A)).toMatchObject({ status: "active", grace_until: null });
+  });
 });
