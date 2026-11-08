@@ -48,11 +48,17 @@ const pick = (
 };
 const named = (n: string) => pick(steps, n);
 const t19Named = (n: string) => pick(t19Steps, n);
-const runBash = (script: string, env: Record<string, string>, cwd?: string) =>
+const runBash = (
+  script: string,
+  env: Record<string, string>,
+  cwd?: string,
+  timeout?: number,
+) =>
   spawnSync("bash", ["-c", script], {
     env: { PATH: process.env.PATH, ...env },
     encoding: "utf8",
     cwd,
+    timeout,
   });
 
 describe("redline-staging.yml", () => {
@@ -914,6 +920,25 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         );
       } finally {
         rmSync(sb2.dir, { recursive: true, force: true });
+      }
+      // The deadline is counted from the run's start, not from this step: a
+      // run that started long ago has none of the wait left, and the revoke goes.
+      const sb4 = sandbox();
+      try {
+        writeFileSync(
+          join(sb4.state, "statuses"),
+          '{"jobs":[{"name":"t19","status":"in_progress"}]}\n',
+        );
+        const old = runBash(
+          String(done.run),
+          sb4.env({ RUN_STARTED: "2000-01-01T00:00:00Z" }),
+          undefined,
+          5000,
+        );
+        expect(old.status).toBe(0);
+        expect(old.stdout).toContain("revoking anyway");
+      } finally {
+        rmSync(sb4.dir, { recursive: true, force: true });
       }
       // A job whose name merely ends in t19 text elsewhere is not it.
       const sb3 = sandbox();
