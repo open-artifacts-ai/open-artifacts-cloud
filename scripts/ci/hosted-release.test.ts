@@ -405,13 +405,29 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(Object.keys(jobs)).toEqual(JOBS);
   });
 
-  it("is dispatch only, with dry_run a boolean defaulting to true (the push trigger is F2)", () => {
-    expect(Object.keys(hr.on)).toEqual(["workflow_dispatch"]);
+  it("runs on a push to main that changes PUBLIC_PIN, and on dispatch with dry_run defaulting to true", () => {
+    expect(Object.keys(hr.on)).toEqual(["push", "workflow_dispatch"]);
+    expect(hr.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
     const input = hr.on.workflow_dispatch.inputs;
     expect(Object.keys(input)).toEqual(["dry_run"]);
     expect(input.dry_run.type).toBe("boolean");
     expect(input.dry_run.default).toBe(true);
     expect(hr.permissions).toEqual({});
+  });
+
+  it("a push (no inputs, so inputs.dry_run is null) is a real run, never a dry run", () => {
+    const text = read(".github/workflows/hosted-release.yml");
+    // Every use of the input is a bare truthiness test, so null means "not a dry run".
+    const uses = [...text.matchAll(/[^\n]*inputs\.dry_run[^\n]*/g)]
+      .map((m) => m[0].trim())
+      .filter((l) => !l.startsWith("#"));
+    expect(uses.length).toBeGreaterThan(0);
+    for (const l of uses) expect(l).not.toMatch(/inputs\.dry_run\s*(==|!=)/);
+    // The guard's shell test treats anything but the string true as a real run.
+    expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
+    // The mirror runs on a push because the ref is main.
+    expect(jobs.mirror.if).toBe("${{ inputs.dry_run || github.ref == 'refs/heads/main' }}");
+    expect(hr["run-name"]).toBe("${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}");
   });
 
   it("names a dry run '(dry run)', the name tag-passed-checks.sh skips", () => {

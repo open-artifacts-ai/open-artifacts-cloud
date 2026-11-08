@@ -6,8 +6,15 @@ name: hosted-release
 # is the overlay (public at PUBLIC_PIN, this repo on top) and the files are
 # attached to this repo's release.
 #
-# Trigger: workflow_dispatch only, for now. The push-on-PUBLIC_PIN trigger
-# comes at cut-over step F2, with the first real release from here.
+# Triggers (cut-over step F2, #1056):
+#   - push to main that changes PUBLIC_PIN: a real run. A push has no inputs, so
+#     `inputs.dry_run` is null, which is falsy. Every dry-run test below is
+#     `inputs.dry_run` or `!inputs.dry_run`, so on a push the run-name has no
+#     "(dry run)", the mirror runs on main and creates the tag and release, the
+#     prod key signs, hosted-attach-* attach, and hosted-dry-run is skipped.
+#     DRY_RUN in the guard is the empty string there, and the guard compares it
+#     with `= true`, so it is not a dry run either.
+#   - workflow_dispatch: dry_run defaults to true, as before.
 #
 # dry_run (the default): the mirror only reads and checks; the build and the
 # staging signing run; the prod key is never touched; nothing creates a tag or
@@ -18,6 +25,9 @@ name: hosted-release
 # dry_run=false needs main and creates the tag and the release.
 run-name: ${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}
 on:
+  push:
+    branches: [main]
+    paths: [PUBLIC_PIN]
   workflow_dispatch:
     inputs:
       dry_run:
