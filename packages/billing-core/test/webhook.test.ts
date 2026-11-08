@@ -602,7 +602,6 @@ describe("handleStripeWebhook", () => {
       event("customer.subscription.created", sub({ status: "incomplete" })),
       event("invoice.payment_failed", inv()),
       event("invoice.paid", inv()),
-      event("customer.subscription.updated", sub({ status: "past_due" })),
       event("customer.subscription.updated", sub({ status: "canceled" })),
       event("customer.subscription.deleted", sub()),
       event(
@@ -614,8 +613,8 @@ describe("handleStripeWebhook", () => {
     ];
     const orders: ((i: number) => number)[] = [
       (i) => i,
-      (i) => 8 - i,
-      (i) => (i * 4) % 9,
+      (i) => 7 - i,
+      (i) => (i * 3) % 8,
     ];
     for (const tier of ["trial", "free"])
       for (const order of orders) {
@@ -1158,6 +1157,58 @@ describe("handleStripeWebhook", () => {
       "price_Team",
     ])
       expect(all).not.toContain(s);
+  });
+
+  it("a past_due update sets the tier but never a free or trial row's status or grace (#1487, B3/B4)", async () => {
+    for (const tier of ["trial", "free"]) {
+      await db
+        .prepare(
+          "UPDATE tiers SET tier = ?, status = 'active', grace_until = NULL, stripe_subscription_id = NULL WHERE install_id = ?",
+        )
+        .bind(tier, A)
+        .run();
+      await deliver(
+        event("customer.subscription.updated", sub({ status: "past_due" })),
+      );
+      // B4: the activating events were reordered behind this one; the row
+      // no longer waits on a later active update for its tier.
+      expect(await row(A), tier).toMatchObject({
+        tier: "team",
+        status: "active",
+        grace_until: null,
+        stripe_subscription_id: "sub_Test1",
+      });
+    }
+  });
+
+  it("a past_due Business row downgraded to Team in the Portal takes the Team tier (#1487, B3)", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'business', stripe_subscription_id = 'sub_Test1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const failed = event("invoice.payment_failed", inv());
+    await deliver(failed);
+    expect((await row(A)).status).toBe("past_due");
+    await deliver(
+      event("customer.subscription.updated", sub({ status: "past_due" })),
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "past_due",
+      grace_until: failed.created * 1000 + GRACE_MS,
+    });
+  });
+
+  it("an unfinished first payment still never sets a tier (incomplete, #1487)", async () => {
+    await deliver(
+      event(
+        "customer.subscription.created",
+        sub({ status: "incomplete", metadata: { tier: "business" } }),
+      ),
+    );
+    expect(await row(A)).toMatchObject({ tier: "trial", status: "active" });
   });
 });
 

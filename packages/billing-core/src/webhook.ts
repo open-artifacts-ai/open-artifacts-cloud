@@ -296,8 +296,14 @@ export function changeFor(
             ]
           : null;
       }
-      // Only a subscription going live (active) sets the tier.
-      const tier = status === "active" ? tierFromSubscription(o, prices) : null;
+      // A subscription that is or was live sets the tier: active, or past_due
+      // (it has been live; incomplete never reaches past_due) so a reordered
+      // or Portal-changed past_due update isn't left on the old tier (#1487).
+      // Status and grace stay under their own guards.
+      const tier =
+        status === "active" || status === "past_due"
+          ? tierFromSubscription(o, prices)
+          : null;
       if (tier) sets.push({ sql: "tier = ?", args: [tier] });
       if (status === "active")
         sets.push(
