@@ -473,6 +473,7 @@ describe("GET /tier", () => {
       status: "active",
       trialEndsAt: NOW + 5,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 3,
       asOf: NOW,
     });
@@ -489,6 +490,7 @@ describe("GET /tier", () => {
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 0,
       asOf: NOW,
     });
@@ -532,6 +534,7 @@ describe("POST /trial/start", () => {
       status: "active",
       trialEndsAt: NOW + TRIAL_MS,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 5,
       asOf: NOW,
     });
@@ -826,5 +829,29 @@ describe("scheduled: prune stripe_events (#1479)", () => {
     } as unknown as Env;
     await expect(run(NOW, broken)).resolves.toBeUndefined();
     expect(lines).toEqual(["billing prune db_error"]);
+  });
+});
+
+describe("soloTrialEndsAt (#1568)", () => {
+  it("GET /tier and /trial/start carry the Solo trial's end beside the Business trial's, never merged", async () => {
+    at();
+    await seed([{ install: A, tier: "solo", version: 2 }]);
+    await db
+      .prepare("UPDATE tiers SET solo_trial_ends_at = ?1 WHERE install_id = ?2")
+      .bind(NOW + 30 * 86_400_000, A)
+      .run();
+    const r = await call(gated("GET", "/tier"));
+    expect(await r.json()).toMatchObject({
+      tier: "solo",
+      trialEndsAt: null,
+      soloTrialEndsAt: NOW + 30 * 86_400_000,
+    });
+    // The first invite starts the Business trial; both ends are reported.
+    const t = await call(gated("POST", "/trial/start", { install: A }));
+    expect(await t.json()).toMatchObject({
+      tier: "trial",
+      trialEndsAt: NOW + TRIAL_MS,
+      soloTrialEndsAt: NOW + 30 * 86_400_000,
+    });
   });
 });

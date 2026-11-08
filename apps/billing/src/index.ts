@@ -96,6 +96,7 @@ interface TierRow {
   status: string | null;
   trial_ends_at: number | null;
   grace_until: number | null;
+  solo_trial_ends_at: number | null;
   version: number;
 }
 
@@ -107,6 +108,7 @@ function view(r: TierRow | null, now: number) {
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 0,
       asOf: now,
     };
@@ -115,12 +117,16 @@ function view(r: TierRow | null, now: number) {
     status: r.status,
     trialEndsAt: r.trial_ends_at,
     graceUntil: r.grace_until,
+    // The Solo subscription's own trial end. trialEndsAt stays the 14-day
+    // Business trial's: the server's trial eligibility is trialEndsAt === null.
+    soloTrialEndsAt: r.solo_trial_ends_at,
     version: r.version,
     asOf: now,
   };
 }
 
-const COLS = "tier, status, trial_ends_at, grace_until, version";
+const COLS =
+  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, version";
 // The read records last_read_at on the install's own row and writes nothing
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;
