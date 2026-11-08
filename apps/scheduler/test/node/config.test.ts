@@ -205,3 +205,32 @@ describe("bundle", () => {
     }
   });
 });
+
+// #1514: the server treats a call without the BILLING gate as having no plan,
+// and the directory sync's pause flag is last-writer-wins across calls. So a
+// platform that binds BILLING on dispatch (every fetch and MCP request) but
+// not on the scheduler (every cron call), or the reverse, would flap the sync
+// during a lock. Both Workers bind it, or neither, in each env.
+describe("BILLING is bound on dispatch and the scheduler together (#1514)", () => {
+  // biome-ignore lint/suspicious/noExplicitAny: untyped wrangler config
+  const dispatch: any = JSON.parse(
+    strip(readFileSync(join(app, "../dispatch/wrangler.jsonc"), "utf8")),
+  );
+  for (const env of ENVS)
+    it(`${env}: both Workers bind this env's billing Worker as BILLING, or neither does`, () => {
+      const bound = (c: { env: Record<string, { services?: unknown }> }) =>
+        // biome-ignore lint/suspicious/noExplicitAny: untyped wrangler config
+        ((c.env[env]?.services ?? []) as any[]).filter(
+          (x) => x.binding === "BILLING",
+        );
+      const d = bound(dispatch);
+      const s = bound(cfg);
+      expect(d).toEqual(s);
+      expect(d.length).toBeLessThanOrEqual(1);
+      for (const b of [...d, ...s])
+        expect(b).toEqual({
+          binding: "BILLING",
+          service: platformNames(env).billing,
+        });
+    });
+});
