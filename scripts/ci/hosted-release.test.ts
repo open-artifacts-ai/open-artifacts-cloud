@@ -428,7 +428,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       .filter((st) => st.env && "DRY_RUN" in st.env)
       .map((st) => st.env.DRY_RUN);
     expect(guardEnvs).toEqual(["${{ inputs.dry_run }}"]);
-    // No condition compares the input the other way round ('true' == inputs.dry_run).
+    // No condition compares the input the other way round ('true' == inputs.dry_run, or false, or '').
     const ifs: string[] = [];
     const collect = (o: unknown): void => {
       if (Array.isArray(o)) o.forEach(collect);
@@ -441,7 +441,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     collect(hr.jobs);
     expect(ifs.length).toBeGreaterThan(0);
     for (const c of ifs)
-      expect(c).not.toMatch(/['"]?true['"]?\s*[!=]=\s*inputs\.dry_run/);
+      expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
     // The guard's shell test treats anything but the string true as a real run.
     expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
     // The mirror runs on a push because the ref is main.

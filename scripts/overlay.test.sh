@@ -416,6 +416,23 @@ mkdir -p "$T/ec13/apps/newapp"; echo x > "$T/ec13/apps/newapp/i.ts"
 expect_exit "a new non-private directory fails" 1 "$T/ec13/scripts/equivalence.sh" "$T/e1" "$T/ec13"
 check "new directory is named" grep -q 'DIFF: apps/newapp' "$T/out"
 
+# After the delete: public has no hosted paths and no list, so a listed path's
+# parent directory exists only in the overlay. It is CLOUD-owned if all of it is.
+mkdir -p "$T/e3/apps/server"; echo s > "$T/e3/apps/server/i.ts"
+G -C "$T/e3" init -q && G -C "$T/e3" add -A && G -C "$T/e3" commit -qm init && G -C "$T/e3" tag v1
+mkpost() { # dest
+  mkdir -p "$1/scripts" "$1/newdir/sub"; cp "$OVERLAY" "$EQUIV" "$PLACE" "$PINCHK" "$LISTED" "$1/scripts/"
+  echo 'cloud readme' > "$1/README.md"; echo x > "$1/newdir/sub/f.txt"
+  printf 'newdir/sub/f.txt\n' > "$1/private-paths.txt"
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$T/e3" rev-parse HEAD)" > "$1/PUBLIC_PIN"
+  printf 'tag=v1\nsha=%s\n' "$(git -C "$T/e3" rev-parse HEAD)" > "$1/SYNCED_FROM"
+}
+mkpost "$T/ec14"
+expect_exit "a directory only the overlay has passes when all of it is listed" 0 "$T/ec14/scripts/equivalence.sh" "$T/e3" "$T/ec14"
+mkpost "$T/ec15"; echo y > "$T/ec15/newdir/sub/other.txt"
+expect_exit "a directory only the overlay has fails with an unlisted file in it" 1 "$T/ec15/scripts/equivalence.sh" "$T/e3" "$T/ec15"
+check "the unlisted directory is named" grep -q 'DIFF: newdir' "$T/out"
+
 mkcloud "$T/e1" "$T/ec7"
 echo 'mine' > "$T/ec7/hosted-workflows/ci.yml"
 expect_exit "a hosted-workflows file whose target exists fails" 1 "$T/ec7/scripts/equivalence.sh" "$T/e1" "$T/ec7"

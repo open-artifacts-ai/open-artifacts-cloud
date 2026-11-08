@@ -10,7 +10,7 @@ This repo is not a standalone workspace. It is an **overlay**: it builds on a
 pinned public release, with this tree copied on top.
 
 > Status: post-split. Public deleted its hosted code at F1 and `PUBLIC_PIN` is
-> the first release without it (v0.136.0, step F2), so the overlay is strict:
+> the first release without it (v0.136.1, step F2), so the overlay is strict, and `SYNCED_FROM` moved to the same release because the lockfile's public importers changed (the equivalence check compares them at `SYNCED_FROM`):
 > `--auto-split` finds none of the listed paths in public and a collision
 > fails. `--pre-split` stays only for tags older than the delete.
 >
