@@ -9,7 +9,12 @@ Issue #1056 tracks the move.
 This repo is not a standalone workspace. It is an **overlay**: it builds on a
 pinned public release, with this tree copied on top.
 
-> Status: the private paths were copied in once (the B1 sync, recorded in
+> Status: post-split. Public deleted its hosted code at F1 and `PUBLIC_PIN` is
+> the first release without it (v0.136.1, step F2), so the overlay is strict, and `SYNCED_FROM` moved to the same release because the lockfile's public importers changed (the equivalence check compares them at `SYNCED_FROM`):
+> `--auto-split` finds none of the listed paths in public and a collision
+> fails. `--pre-split` stays only for tags older than the delete.
+>
+> History: the private paths were copied in once (the B1 sync, recorded in
 > SYNCED_FROM). From now on this repo owns them; see "CLOUD owns the private
 > paths". Secrets, environments and deploy jobs arrive at the cut-over.
 
@@ -31,7 +36,7 @@ pinned public release, with this tree copied on top.
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
 | `hosted-workflows/` | Where the sync parks public's copies of the hosted workflows (it never writes under `.github/workflows/`). Empty since C2: the live workflows are in `.github/workflows/`, edited for this repo, and a re-sync's changes are hand-ported into them. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
-| `.github/workflows/hosted-release.yml` | Mirrors the public release at `PUBLIC_PIN` into this repo (tag and release, by the release App), then builds, signs and attaches the hosted release files (cut-over step C3, #1056). `workflow_dispatch` only until step F2; `dry_run` (the default) builds and signs with the staging key and stops before the tag and the attach. |
+| `.github/workflows/hosted-release.yml` | Mirrors the public release at `PUBLIC_PIN` into this repo (tag and release, by the release App), then builds, signs and attaches the hosted release files (cut-over step C3, #1056). Runs for real on a push to `main` that changes `PUBLIC_PIN` (step F2): a push has no inputs, so `inputs.dry_run` is null and every dry-run test treats it as not a dry run. `workflow_dispatch` keeps `dry_run` (the default), which builds and signs with the staging key and stops before the tag and the attach. |
 | `.github/workflows/<hosted>.yml` | The hosted workflows (deploy, publish, floor, red-line, monitors, token pings), live since C2 (#1056). Dispatch only, plus `hosted-publish`'s `workflow_run` on `hosted-release` (C3). `prodclean-monitor` runs hourly from here; the `redline-nightly` schedule stays off until cut-over step F5. `PROD_RELEASE_CHAIN` stays unset. |
 | `.github/actions/overlay/` | The overlay prelude every hosted job that installs or builds uses: check this repo out at `_cloud`, then this action puts public at the `PUBLIC_PIN` of that checkout with this repo on top, at the workspace root. |
 | `.nvmrc` | Node version for jobs that check out only this repo (scripts, no install). CI fails if it differs from public's at the pin. |
@@ -188,8 +193,9 @@ owning package's vitest, under whichever of that package's test configs
 include it. A test with no owning package, or one no config includes, fails
 CI. So does an empty tree once SYNCED_FROM exists.
 
-Until the public repo deletes its hosted code, the pinned tag still contains
-every private path, so a plain overlay on that tag collides on purpose. CI
+Public has deleted its hosted code (F1), and the pin is a release without it,
+so a plain overlay is strict. A tag from before the delete still contains
+every private path and would collide on purpose. CI
 uses `--auto-split`, which removes the listed paths from the pinned tree while
 they are all there and is strict once none are. The order is: public untangle,
 sync, public delete, then a pin bump to the release with the delete.
