@@ -140,9 +140,13 @@ const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // 14-day Business trial never starts twice. No row is the solo/active default,
 // so a trial can start from it too (an install made before create writes
 // rows); an existing row moves only from solo/free and active, and only once
-// (trial_ends_at stays set after). Solo's own 30-day no-card trial is a Stripe
+// (trial_ends_at stays set after). The Solo subscription under it is kept as
+// solo_status active only when it is known live: a stored id plus
+// solo_trial_ends_at (set by /solo/start, a Solo trialing or active event, or a
+// paid Solo checkout); an id with none is a pending first payment. Solo's own
+// 30-day no-card trial is a Stripe
 // subscription and never sets trial_ends_at, so it doesn't use this up.
-const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, solo_status = CASE WHEN tiers.stripe_subscription_id IS NOT NULL THEN 'active' END, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, solo_status = CASE WHEN tiers.stripe_subscription_id IS NOT NULL AND tiers.solo_trial_ends_at IS NOT NULL THEN 'active' END, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
 // The 14-day Business trial ended (trial_ends_at, set once, stays set so it
 // never restarts): the row is Solo again, active while the Solo subscription
 // it kept (solo_status, recorded by the webhook while the trial ran) is

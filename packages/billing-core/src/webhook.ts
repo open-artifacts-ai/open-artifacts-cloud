@@ -419,6 +419,15 @@ export function changeFor(
                 sql: "stripe_subscription_id = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE stripe_subscription_id END",
                 args: [subId],
               },
+              // Its Solo state (kept under a Business trial) goes with it.
+              {
+                sql: "solo_status = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE solo_status END",
+                args: [subId],
+              },
+              {
+                sql: "solo_grace_until = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE solo_grace_until END",
+                args: [subId],
+              },
             ]
           : null;
       }
@@ -480,6 +489,14 @@ export function changeFor(
         sets.push({
           sql: isSolo ? "solo_trial_ends_at = ?" : "trial_ends_at = ?",
           args: [o.trial_end * 1000],
+        });
+      else if (isSolo && status === "active")
+        // A Solo subscription that is live and not trialing (paid): when it
+        // went live, once. Also what says a Solo subscription id is a live
+        // one, not a pending first payment (/trial/start snapshots only those).
+        sets.push({
+          sql: "solo_trial_ends_at = coalesce(solo_trial_ends_at, ?)",
+          args: [ev.created * 1000],
         });
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)

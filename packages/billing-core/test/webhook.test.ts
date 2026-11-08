@@ -2624,3 +2624,83 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
     });
   });
 });
+
+// ------------------------------------------------- Solo bookkeeping edges
+
+describe("Solo bookkeeping (#1568)", () => {
+  const soloPrice = {
+    items: { data: [{ price: { id: "p", metadata: { tier: "solo" } } }] },
+  };
+  const base = (set: string, ...binds: unknown[]) =>
+    db
+      .prepare(
+        `UPDATE tiers SET ${set}, last_event_created = NULL, last_invoice_created = NULL, last_checkout_created = NULL WHERE install_id = ?`,
+      )
+      .bind(...binds, A)
+      .run();
+
+  it("incomplete_expired drops the subscription and its Solo state together, only when it is the row's", async () => {
+    await base(
+      "tier = 'trial', stripe_subscription_id = 'sub_Test1', solo_status = 'past_due', solo_grace_until = 99",
+    );
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({ id: "sub_Other1", status: "incomplete_expired" }),
+      ),
+    );
+    expect(await row(A)).toMatchObject({
+      stripe_subscription_id: "sub_Test1",
+      solo_status: "past_due",
+      solo_grace_until: 99,
+    });
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({ id: "sub_Test1", status: "incomplete_expired" }),
+      ),
+    );
+    expect(await row(A)).toMatchObject({
+      stripe_subscription_id: null,
+      solo_status: null,
+      solo_grace_until: null,
+    });
+  });
+
+  it("a Solo subscription that is active (not trialing) records when it went live, once; a trialing one records its end", async () => {
+    await base(
+      "tier = 'solo', stripe_subscription_id = NULL, solo_trial_ends_at = NULL",
+    );
+    const e = event(
+      "customer.subscription.created",
+      sub({ id: "sub_Test1", ...soloPrice, status: "active" }),
+    );
+    await deliver(e);
+    expect(await row(A)).toMatchObject({
+      solo_trial_ends_at: e.created * 1000,
+    });
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({ id: "sub_Test1", ...soloPrice, status: "active" }),
+        { created: T + 500 },
+      ),
+    );
+    expect(await row(A)).toMatchObject({
+      solo_trial_ends_at: e.created * 1000,
+    });
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        sub({
+          id: "sub_Test1",
+          ...soloPrice,
+          status: "trialing",
+          trial_end: T + 99,
+        }),
+        { created: T + 600 },
+      ),
+    );
+    expect(await row(A)).toMatchObject({ solo_trial_ends_at: (T + 99) * 1000 });
+  });
+});

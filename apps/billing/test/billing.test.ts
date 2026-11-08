@@ -901,9 +901,9 @@ describe("the Business trial over a Solo subscription (#1568)", () => {
     ]);
     await db
       .prepare(
-        "UPDATE tiers SET stripe_subscription_id = 'sub_A1' WHERE install_id = ?1",
+        "UPDATE tiers SET stripe_subscription_id = 'sub_A1', solo_trial_ends_at = ?2 WHERE install_id = ?1",
       )
-      .bind(A)
+      .bind(A, NOW + 30 * 86_400_000)
       .run();
     await db
       .prepare(
@@ -1043,5 +1043,20 @@ describe("soloTrialEndsAt is answered only while it is in the future (#1568)", (
     await set(NOW - 5);
     await call(gated("GET", "/tier"));
     expect(await rowOf(A)).toMatchObject({ solo_trial_ends_at: NOW - 5 });
+  });
+});
+
+describe("the Business trial snapshots a Solo only when it is known live (#1568)", () => {
+  it("a subscription id with no live evidence (an unfinished first payment: no solo_trial_ends_at) snapshots nothing", async () => {
+    at();
+    await seed([{ install: A, tier: "solo" }]);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_pending1', solo_trial_ends_at = NULL WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    await call(gated("POST", "/trial/start", { install: A }));
+    expect(await rowOf(A)).toMatchObject({ tier: "trial", solo_status: null });
   });
 });
