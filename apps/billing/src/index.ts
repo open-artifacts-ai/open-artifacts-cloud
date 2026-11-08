@@ -243,7 +243,7 @@ const ENSURE_ROW_SQL =
 const CUSTOMER_SQL =
   "SELECT stripe_customer_id FROM tiers WHERE install_id = ?1";
 const SUBSCRIPTION_SQL =
-  "SELECT stripe_subscription_id, status, tier FROM tiers WHERE install_id = ?1";
+  "SELECT stripe_subscription_id, status, tier, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
 // Only where none is mapped yet: a concurrent winner's id is kept.
 const MAP_CUSTOMER_SQL =
   "UPDATE tiers SET stripe_customer_id = ? WHERE install_id = ? AND stripe_customer_id IS NULL";
@@ -374,18 +374,28 @@ async function checkout(
       stripe_subscription_id: string | null;
       status: string;
       tier: string | null;
+      solo_trial_ends_at: number | null;
     }>();
   // A live paid subscription (a trial or free row with an id is an
   // unfinished first payment: it may retry), or a suspended one. Solo counts
   // as paid: its no-card trial is a live subscription too, and a card is
   // added in the Portal.
+  // The one exception: a Solo subscription that is still the no-card trial
+  // (active, inside solo_trial_ends_at) may be bought through Checkout, which
+  // is how its card is added (#1568). A Solo that has paid keeps the 409.
+  const inSoloTrial =
+    held?.tier === "solo" &&
+    held.status === "active" &&
+    held.solo_trial_ends_at !== null &&
+    held.solo_trial_ends_at > Date.now();
   if (
     held?.stripe_subscription_id &&
     (held.status === "suspended" ||
       ((held.tier === "solo" ||
         held.tier === "team" ||
         held.tier === "business") &&
-        (held.status === "active" || held.status === "past_due")))
+        (held.status === "active" || held.status === "past_due") &&
+        !(plan === "solo" && inSoloTrial)))
   ) {
     console.log("billing checkout subscription_exists", install);
     return bad("subscription_exists", 409);

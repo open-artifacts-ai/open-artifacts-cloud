@@ -1290,3 +1290,72 @@ describe("POST /solo/start (#1568)", () => {
     expect(s.calls).toEqual([]);
   });
 });
+
+describe("POST /checkout, Solo in its no-card trial (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const DAY = 86_400_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const solo = async (set: string, ...binds: unknown[]) => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        `UPDATE tiers SET stripe_subscription_id = 'sub_trial1', ${set} WHERE install_id = ?${binds.length + 1}`,
+      )
+      .bind(...binds, A)
+      .run();
+  };
+  const buy = (interval: "month" | "year" = "month") =>
+    call(req("/checkout", { install: A, plan: "solo", interval }));
+
+  it("while the Solo subscription is the no-card trial, Solo Checkout is allowed (the card is added through it)", async () => {
+    await solo("solo_trial_ends_at = ?1", NOW + 10 * DAY);
+    const s = fakeStripe();
+    for (const interval of ["month", "year"] as const) {
+      const r = await buy(interval);
+      expect([r.status, interval]).toEqual([200, interval]);
+    }
+    expect(s.calls.filter((c) => c.path === CHECKOUT)).toHaveLength(2);
+    // The trial's row is untouched by starting a Checkout.
+    expect(await rowOf(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: "sub_trial1",
+    });
+  });
+
+  it("a Solo that has paid keeps 409: its trial is over, or it never had one", async () => {
+    for (const [why, set, bind] of [
+      ["trial ended", "solo_trial_ends_at = ?1", NOW - DAY],
+      ["bought through Checkout, no trial", "version = ?1", 3],
+      [
+        "trial window but past_due",
+        "solo_trial_ends_at = ?1, status = 'past_due'",
+        NOW + DAY,
+      ],
+    ] as const) {
+      await db.prepare("DELETE FROM tiers").run();
+      await solo(set, bind);
+      const s = fakeStripe();
+      const r = await buy();
+      expect([r.status, await r.json(), why]).toEqual([
+        409,
+        { error: "subscription_exists" },
+        why,
+      ]);
+      expect(s.calls).toEqual([]);
+      s.spy.mockRestore();
+    }
+  });
+
+  it("team and business Checkout still refuse a live Solo (the Upgrade buttons arrive with item 3)", async () => {
+    await solo("solo_trial_ends_at = ?1", NOW + 10 * DAY);
+    const s = fakeStripe();
+    const r = await call(req("/checkout", { install: A, plan: "team" }));
+    expect(r.status).toBe(409);
+    expect(s.calls).toEqual([]);
+  });
+});
