@@ -136,6 +136,38 @@ describe("levelOf", () => {
     expect(exitCode(r, false)).toBe(1);
   });
 
+  it("a pacing wait that overran the case budget is infra, and every other case passing still fails the gate", async () => {
+    const { guardedFetch } = await import("../src/rl-anon.ts");
+    const f = guardedFetch((async () => new Response("ok")) as typeof fetch, {
+      targets: [
+        {
+          name: "rl-a",
+          installId: "iaaaaaaaaaaa",
+          app: "https://rl-a.open-artifacts-staging.app",
+          content: "https://rl-a.open-artifacts-staging.page",
+        },
+      ],
+      claim: () => new Promise<void>(() => {}),
+      waitBudgetMs: 20,
+    });
+    const err = await f("https://rl-a.open-artifacts-staging.app/oauth/token", {
+      method: "POST",
+    }).then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/^infra: pacing: this case has waited/);
+    const { level, reason } = levelOf("failed", {}, [err as Error]);
+    expect(level).toBe("infra");
+    const cases = [c("a", "pass"), c("b", "pass"), c("w", level, reason)];
+    expect(gatePasses(cases)).toBe(false);
+    const r = buildReport(cases);
+    expect(r.gate.passed).toBe(false);
+    expect(r.counts.infra).toBe(1);
+    expect(exitCode(r, true)).toBe(1);
+    expect(exitCode(r, false)).toBe(1);
+  });
+
   it("proof() writes the mark on the task meta", () => {
     const ctx = {
       task: {

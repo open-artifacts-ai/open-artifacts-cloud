@@ -1,4 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// The setup file fails closed without live targets (src/rl-anon.ts): name a
+// local pair, which paces nothing, before it loads.
+vi.hoisted(() => {
+  process.env.REDLINE_TARGETS = JSON.stringify({ mode: "local" });
+});
+
 import "../live/setup.ts";
 import { note, takeFileNotes } from "../src/notes.ts";
 

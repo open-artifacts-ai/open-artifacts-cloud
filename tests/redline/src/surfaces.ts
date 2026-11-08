@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -1643,18 +1643,26 @@ export async function throwaway(
   if (fresh === "grant") {
     // The consent flow, as the admin (the code names the grant). Listed
     // before and after, so a code without one still finds the grant and
-    // dispose always revokes it.
+    // dispose always revokes it. The fallback keeps only grants of the client
+    // registered here (#1730): another lane's consent, or an earlier run's
+    // grant, can't be mistaken for this one. More than one left is no
+    // answer: it throws rather than pick.
     const before = new Set(await grantIds(side));
+    // A name of its own: the grants list (GET R.oauthClients) shows a grant's
+    // clientName and no clientId, so the name is how this client's grant is
+    // told from any other.
+    const clientName = `P5 redline ${randomBytes(4).toString("hex")}`;
+    const client = await registerClient(t, clientName);
     const code = await authorizeCode(
       t,
       side.cookie,
-      await registerClient(t),
+      client,
       pkce(),
       mcpResource(t),
     );
     const grantId =
       code.split(":")[1] ||
-      (await grantIds(side)).find((id) => !before.has(id));
+      (await ownGrantId(side, { clientId: client, clientName }, before));
     if (!grantId) throw new Error(`${t.name}: the consent made no grant`);
     x.grantId = grantId;
     return x;
@@ -1773,12 +1781,55 @@ async function grantSnapshot(side: Side, id: string): Promise<string> {
   return entry(side, "/api/v1/oauth-clients", id, { ms: GRANT_LIST_MS });
 }
 
+/** A grant as GET R.oauthClients lists it: the client's name (the server sends no clientId; a fake may). */
+export interface GrantRow {
+  grantId: string;
+  clientName?: string;
+  clientId?: string;
+}
+
+/** The admin's grants (GET R.oauthClients). */
+async function grantList(side: Side): Promise<GrantRow[]> {
+  const v = (await api(side.t, side.pat, "GET", "/api/v1/oauth-clients")) as
+    | GrantRow[]
+    | { items?: GrantRow[] };
+  return Array.isArray(v) ? v : (v.items ?? []);
+}
+
 /** The admin's grant ids (GET R.oauthClients). */
 async function grantIds(side: Side): Promise<string[]> {
-  const v = (await api(side.t, side.pat, "GET", "/api/v1/oauth-clients")) as
-    | { grantId: string }[]
-    | { items?: { grantId: string }[] };
-  return (Array.isArray(v) ? v : (v.items ?? [])).map((g) => g.grantId);
+  return (await grantList(side)).map((g) => g.grantId);
+}
+
+/**
+ * The new grant of the client just registered, when the consent's code did not
+ * name it: the grants not in `before` that belong to that client (its
+ * clientId where the list gives one, else its unique clientName). Undefined
+ * when there is none yet; throws when more than one remains (#1730).
+ */
+export function pickOwnGrant(
+  list: readonly GrantRow[],
+  own: { clientId: string; clientName: string },
+  before: ReadonlySet<string>,
+): string | undefined {
+  const mine = list.filter(
+    (g) =>
+      !before.has(g.grantId) &&
+      (g.clientId === own.clientId || g.clientName === own.clientName),
+  );
+  if (mine.length > 1)
+    throw new Error(
+      `the consent made ${mine.length} grants for one client; refusing to pick`,
+    );
+  return mine[0]?.grantId;
+}
+
+async function ownGrantId(
+  side: Side,
+  own: { clientId: string; clientName: string },
+  before: ReadonlySet<string>,
+): Promise<string | undefined> {
+  return pickOwnGrant(await grantList(side), own, before);
 }
 
 /**

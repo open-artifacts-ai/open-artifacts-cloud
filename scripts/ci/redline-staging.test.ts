@@ -44,6 +44,12 @@ const runBash = (script: string, env: Record<string, string>) =>
   });
 
 describe("redline-staging.yml", () => {
+  it("passes the REDLINE_PLAN repository variable to the suite, so serial is a settings flip", () => {
+    expect(named("Run the suite").env.REDLINE_PLAN).toBe(
+      "${{ vars.REDLINE_PLAN }}",
+    );
+  });
+
   it("runs only on demand for a tag, in the redline-staging Environment, bounded; id-token on the job only", () => {
     expect(Object.keys(w.on)).toEqual(["workflow_dispatch", "workflow_call"]);
     expect(w.on.workflow_call.inputs.tag).toEqual({
