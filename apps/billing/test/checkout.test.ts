@@ -657,10 +657,15 @@ describe("POST /checkout, Solo (#1568)", () => {
     expect(s.calls).toEqual([]);
   });
 
-  it("a live subscription refuses every plan, Solo included: 409 subscription_exists, no Stripe call", async () => {
+  it("a live subscription refuses a second one: Solo on Solo, anything on Team or Business: 409 subscription_exists, no Stripe call", async () => {
     for (const status of ["active", "past_due"]) {
-      for (const plan of ["solo", "team"] as const) {
-        await seed(A, "cus_existingA", "solo");
+      for (const [held, plan] of [
+        ["solo", "solo"],
+        ["team", "team"],
+        ["team", "solo"],
+        ["business", "team"],
+      ] as const) {
+        await seed(A, "cus_existingA", held);
         await db
           .prepare(
             "UPDATE tiers SET stripe_subscription_id = 'sub_live1', status = ?1 WHERE install_id = ?2",
@@ -1351,11 +1356,28 @@ describe("POST /checkout, Solo in its no-card trial (#1568)", () => {
     }
   });
 
-  it("team and business Checkout still refuse a live Solo (the Upgrade buttons arrive with item 3)", async () => {
-    await solo("solo_trial_ends_at = ?1", NOW + 10 * DAY);
-    const s = fakeStripe();
-    const r = await call(req("/checkout", { install: A, plan: "team" }));
-    expect(r.status).toBe(409);
-    expect(s.calls).toEqual([]);
+  it("team and business Checkout are allowed while the Solo subscription is live, trial or paid or past_due (the upgrade)", async () => {
+    for (const [why, set, bind] of [
+      ["no-card trial", "solo_trial_ends_at = ?1", NOW + 10 * DAY],
+      ["paid", "solo_trial_ends_at = ?1", NOW - DAY],
+      ["past_due", "status = 'past_due'", 0],
+    ] as const) {
+      for (const plan of ["team", "business"] as const) {
+        await db.prepare("DELETE FROM tiers").run();
+        await solo(set, bind);
+        const s = fakeStripe();
+        const r = await call(req("/checkout", { install: A, plan }));
+        expect([r.status, why, plan]).toEqual([200, why, plan]);
+        expect(
+          s.calls.filter((c) => c.path === CHECKOUT)[0]?.form["metadata[tier]"],
+        ).toBe(plan);
+        // Starting Checkout changes nothing: the Solo subscription is still the row's.
+        expect(await rowOf(A)).toMatchObject({
+          tier: "solo",
+          stripe_subscription_id: "sub_trial1",
+        });
+        s.spy.mockRestore();
+      }
+    }
   });
 });

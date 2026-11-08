@@ -46,6 +46,14 @@ export interface WebhookEnv {
   /** Solo's two prices (#1568); either one names the tier solo. */
   STRIPE_PRICE_SOLO_MONTHLY?: string;
   STRIPE_PRICE_SOLO_YEARLY?: string;
+  /**
+   * Stripe test-mode key (a Worker secret), only for cancelling the
+   * subscription an upgrade replaces. Without it (or with a live key) that
+   * cancel can't run: the webhook answers 500 and keeps the intent.
+   */
+  STRIPE_SECRET_KEY?: string;
+  /** Test seam for that cancel; defaults to the global fetch. */
+  stripeFetch?: typeof fetch;
 }
 
 /** The price ids that name a tier (from the webhook env, when it has them). */
@@ -67,6 +75,7 @@ export const pricesOf = (env: WebhookEnv): PriceIds => ({
 const anyConfigured = (p: PriceIds): boolean =>
   Boolean(p.team || p.business || p.soloMonthly || p.soloYearly);
 
+import { cancelSubscription, type StripeConfig } from "./sessions.js";
 import { verifyStripeSignature } from "./signature.js";
 
 export type PaidTier = "solo" | "team" | "business";
@@ -219,6 +228,9 @@ export function statusFromSubscription(s: unknown): TierStatus | null {
 }
 
 const PAID = "tier IN ('solo', 'team', 'business')";
+/** The row's current subscription is live (a paid tier, active or past_due). */
+const PREV_LIVE =
+  "(stripe_subscription_id IS NOT NULL AND tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due'))";
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
 /** One column assignment in the row update: SQL and its binds. */
@@ -262,7 +274,22 @@ export function changeFor(
           ? o.subscription
           : null;
       const sets: Set[] = [];
-      if (sub) sets.push({ sql: "stripe_subscription_id = ?", args: [sub] });
+      if (sub) {
+        sets.push({ sql: "stripe_subscription_id = ?", args: [sub] });
+        // A paid checkout for another subscription replaces the live one
+        // (Solo upgraded to Team or Business): remember it, and the webhook
+        // cancels it after this update (settleCancel), so it is never billed
+        // alongside. Once the row holds the new id the old one's own events
+        // no longer apply to it. Kept if an earlier intent is still pending.
+        if (
+          o.payment_status === "paid" ||
+          o.payment_status === "no_payment_required"
+        )
+          sets.push({
+            sql: `cancel_sub_id = CASE WHEN cancel_sub_id IS NULL AND ${PREV_LIVE} AND stripe_subscription_id != ? THEN stripe_subscription_id ELSE cancel_sub_id END`,
+            args: [sub],
+          });
+      }
       // Paid (or nothing to pay): active at its tier. Otherwise (an async
       // payment still pending) the status and tier wait for the invoice and
       // subscription events.
@@ -498,6 +525,44 @@ export async function pruneStripeEvents(
   return r.meta.changes;
 }
 
+/**
+ * Cancels the subscription an upgrade replaced (tiers.cancel_sub_id, set in
+ * the same update as the switch) and clears the intent. Idempotent: the
+ * cancel repeats safely, and the clear is conditional on that id. False when
+ * it could not (no or live key, Stripe down): the webhook answers 500, and
+ * Stripe's retry (a replay of the recorded event) runs this again.
+ */
+async function settleCancel(
+  db: D1Database,
+  customer: string,
+  env: WebhookEnv,
+): Promise<boolean> {
+  const r = await db
+    .prepare("SELECT cancel_sub_id FROM tiers WHERE stripe_customer_id = ?")
+    .bind(customer)
+    .first<{ cancel_sub_id: string | null }>();
+  const id = r?.cancel_sub_id;
+  if (!id) return true;
+  const cfg: StripeConfig = {
+    secretKey: env.STRIPE_SECRET_KEY ?? "",
+    ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+  };
+  try {
+    await cancelSubscription({ subscriptionId: id }, cfg);
+  } catch {
+    log("cancel_failed");
+    return false;
+  }
+  await db
+    .prepare(
+      "UPDATE tiers SET cancel_sub_id = NULL WHERE stripe_customer_id = ? AND cancel_sub_id = ?",
+    )
+    .bind(customer, id)
+    .run();
+  log("old_subscription_canceled");
+  return true;
+}
+
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
   req: Request,
@@ -614,13 +679,18 @@ export async function handleStripeWebhook(
       log("unknown_customer");
       return json({ received: true });
     }
+    const settled = await settleCancel(db, customer, env);
     if ((res[1]?.meta.changes ?? 0) === 0) {
       log("replay");
-      return json({ received: true });
+      return settled
+        ? json({ received: true })
+        : json({ error: "unavailable" }, 500);
     }
     const install = res[2]?.results[0]?.install_id ?? null;
     log(install ? "applied" : "stale", install);
-    return json({ received: true });
+    return settled
+      ? json({ received: true })
+      : json({ error: "unavailable" }, 500);
   } catch {
     // Never the error text: it can carry a D1 message.
     log("db_error");

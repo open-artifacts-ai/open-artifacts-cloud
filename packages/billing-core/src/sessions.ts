@@ -96,25 +96,34 @@ function check(re: RegExp, field: string, v: string): string {
   return v;
 }
 
-/** One form POST; Stripe's JSON answer (an error keeps status and type only). */
-async function post(
+/**
+ * One call; Stripe's JSON answer (an error keeps status and type only). A
+ * POST is form-encoded with an Idempotency-Key; a GET or DELETE has no body.
+ */
+async function send(
   cfg: StripeConfig,
+  method: "POST" | "GET" | "DELETE",
   path: string,
-  form: Record<string, string>,
-  idempotencyKey: string,
+  form: Record<string, string> | null,
+  idempotencyKey: string | null,
 ): Promise<{ status: number; out: Record<string, unknown> | null }> {
   check(TEST_KEY, "secretKey", cfg.secretKey);
-  check(IDEMPOTENCY, "idempotencyKey", idempotencyKey);
+  if (idempotencyKey !== null)
+    check(IDEMPOTENCY, "idempotencyKey", idempotencyKey);
   const res = await (cfg.fetch ?? fetch)(
     `${cfg.apiBase ?? STRIPE_API}${path}`,
     {
-      method: "POST",
+      method,
       headers: {
         authorization: `Bearer ${cfg.secretKey}`,
-        "content-type": "application/x-www-form-urlencoded",
-        "idempotency-key": idempotencyKey,
+        ...(form === null
+          ? {}
+          : { "content-type": "application/x-www-form-urlencoded" }),
+        ...(idempotencyKey === null
+          ? {}
+          : { "idempotency-key": idempotencyKey }),
       },
-      body: new URLSearchParams(form).toString(),
+      ...(form === null ? {} : { body: new URLSearchParams(form).toString() }),
       redirect: "manual",
     },
   );
@@ -137,6 +146,14 @@ async function post(
   }
   return { status: res.status, out };
 }
+
+/** One form POST with an Idempotency-Key. */
+const post = (
+  cfg: StripeConfig,
+  path: string,
+  form: Record<string, string>,
+  idempotencyKey: string,
+) => send(cfg, "POST", path, form, idempotencyKey);
 
 /** A session answer: its id and a Stripe-hosted URL, else bad_answer. */
 async function session(
@@ -263,5 +280,28 @@ export async function createSoloTrialSubscription(
   const id = out?.id;
   if (typeof id !== "string" || !SUBSCRIPTION.test(id))
     throw new StripeApiError(status, "bad_answer");
+  return { id };
+}
+
+/**
+ * Cancels a subscription (an upgrade replaces the Solo one; #1568). Safe to
+ * repeat: it reads the subscription first and does nothing for one already
+ * canceled or gone (404), so a webhook retry can run it again. No proration
+ * or refund is asked for. Answers the sub_ id.
+ */
+export async function cancelSubscription(
+  input: { subscriptionId: string },
+  cfg: StripeConfig,
+): Promise<{ id: string }> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const path = `/v1/subscriptions/${id}`;
+  try {
+    const { out } = await send(cfg, "GET", path, null, null);
+    if (out?.status === "canceled") return { id };
+    await send(cfg, "DELETE", path, null, null);
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404) return { id };
+    throw e;
+  }
   return { id };
 }

@@ -1511,3 +1511,160 @@ describe("pruning stripe_events (#1479)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------- upgrade
+
+describe("Solo to Team or Business through Checkout (#1568)", () => {
+  const KEY = "sk_test_notarealkey0000";
+  const soloLive = () =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1', last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+  const completed = (sub: string, o: Record<string, unknown> = {}) =>
+    event("checkout.session.completed", {
+      customer: CUS_A,
+      subscription: sub,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+      ...o,
+    });
+  /** Stripe as the cancel uses it: reads, then deletes; `del` can fail. */
+  function stripe(o: { del?: number; state?: string } = {}) {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const m = String(init.method);
+      calls.push(`${m} ${new URL(url).pathname}`);
+      if (m === "GET")
+        return Response.json({ id: "sub_Old1", status: o.state ?? "active" });
+      return o.del
+        ? Response.json({ error: { type: "api_error" } }, { status: o.del })
+        : Response.json({ id: "sub_Old1", status: "canceled" });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  }
+
+  it("a paid checkout for another subscription switches the row, then cancels the previous one", async () => {
+    await soloLive();
+    const s = stripe();
+    const r = await deliver(completed("sub_New1"), { env: s.e });
+    expect(r.status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: "sub_New1",
+    });
+    expect(s.calls).toEqual([
+      "GET /v1/subscriptions/sub_Old1",
+      "DELETE /v1/subscriptions/sub_Old1",
+    ]);
+    expect(
+      ((await row(A)) as unknown as { cancel_sub_id: string | null })
+        .cancel_sub_id,
+    ).toBeNull();
+  });
+
+  it("the cancel fails: the webhook answers 500, the intent is kept, and Stripe's retry finishes it once", async () => {
+    await soloLive();
+    const bad = stripe({ del: 500 });
+    const ev = completed("sub_New1");
+    const first = await deliver(ev, { env: bad.e });
+    expect(first.status).toBe(500);
+    // The row moved on, so the old subscription's own events can't touch it.
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_New1",
+    });
+    expect(
+      ((await row(A)) as unknown as { cancel_sub_id: string }).cancel_sub_id,
+    ).toBe("sub_Old1");
+    // Stripe retries the same event id: a replay, which still settles the cancel.
+    const good = stripe();
+    const retry = await deliver(ev, { env: good.e });
+    expect(retry.status).toBe(200);
+    expect(good.calls).toEqual([
+      "GET /v1/subscriptions/sub_Old1",
+      "DELETE /v1/subscriptions/sub_Old1",
+    ]);
+    expect(
+      ((await row(A)) as unknown as { cancel_sub_id: string | null })
+        .cancel_sub_id,
+    ).toBeNull();
+    // A third delivery cancels nothing more.
+    const again = stripe();
+    expect((await deliver(ev, { env: again.e })).status).toBe(200);
+    expect(again.calls).toEqual([]);
+  });
+
+  it("no cancel when the previous subscription is dead or is the same one, and not for an unpaid checkout", async () => {
+    // Same subscription.
+    await soloLive();
+    let s = stripe();
+    await deliver(completed("sub_Old1"), { env: s.e });
+    expect(s.calls).toEqual([]);
+    // Previous lapsed: nothing left to cancel.
+    await soloLive();
+    await db
+      .prepare("UPDATE tiers SET status = 'lapsed' WHERE install_id = ?")
+      .bind(A)
+      .run();
+    s = stripe();
+    await deliver(completed("sub_New2"), { env: s.e });
+    expect(s.calls).toEqual([]);
+    // Unpaid (async payment pending): the old one is kept.
+    await soloLive();
+    s = stripe();
+    await deliver(completed("sub_New3", { payment_status: "unpaid" }), {
+      env: s.e,
+    });
+    expect(s.calls).toEqual([]);
+  });
+
+  it("a live Stripe key or no key never reaches Stripe: 500, the intent kept for a later retry", async () => {
+    for (const key of [
+      "sk_live_abcdefgh12345678",
+      "rk_live_abcdefgh12345678",
+      undefined,
+    ]) {
+      await soloLive();
+      await db
+        .prepare("UPDATE tiers SET cancel_sub_id = NULL WHERE install_id = ?")
+        .bind(A)
+        .run();
+      const s = stripe();
+      const r = await deliver(completed("sub_New1"), {
+        env: { ...s.e, STRIPE_SECRET_KEY: key },
+      });
+      expect(r.status, String(key)).toBe(500);
+      expect(s.calls).toEqual([]);
+      expect(
+        ((await row(A)) as unknown as { cancel_sub_id: string }).cancel_sub_id,
+      ).toBe("sub_Old1");
+    }
+  });
+
+  it("a pruned id arriving again settles nothing new and never cancels the current subscription", async () => {
+    await soloLive();
+    const s = stripe();
+    const ev = completed("sub_New1");
+    await deliver(ev, { env: s.e });
+    await pruneStripeEvents(db, NOW + 40 * 86_400_000);
+    const later = NOW + 40 * 86_400_000;
+    const again = stripe();
+    await deliver(ev, {
+      env: again.e,
+      now: later,
+      t: Math.floor(later / 1000),
+    });
+    expect(again.calls).toEqual([]);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_New1",
+    });
+  });
+});

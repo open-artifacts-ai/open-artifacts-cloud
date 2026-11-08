@@ -395,7 +395,11 @@ async function checkout(
         held.tier === "team" ||
         held.tier === "business") &&
         (held.status === "active" || held.status === "past_due") &&
-        !(plan === "solo" && inSoloTrial)))
+        !(plan === "solo" && inSoloTrial) &&
+        // Solo upgrades to Team or Business through Checkout, trial or
+        // paid: the webhook cancels the Solo subscription once the new one
+        // is paid, so there is never a double bill.
+        !(plan !== "solo" && held.tier === "solo")))
   ) {
     console.log("billing checkout subscription_exists", install);
     return bad("subscription_exists", 409);
@@ -631,6 +635,7 @@ export default {
           STRIPE_PRICE_BUSINESS: env.STRIPE_PRICE_BUSINESS,
           STRIPE_PRICE_SOLO_MONTHLY: env.STRIPE_PRICE_SOLO_MONTHLY,
           STRIPE_PRICE_SOLO_YEARLY: env.STRIPE_PRICE_SOLO_YEARLY,
+          STRIPE_SECRET_KEY: env.STRIPE_SECRET_KEY,
         },
         Date.now(),
       );

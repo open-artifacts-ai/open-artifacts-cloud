@@ -353,3 +353,54 @@ describe("Solo prices (#1568)", () => {
     });
   });
 });
+
+describe("the upgrade's cancel goes through the Worker's Stripe key (#1568)", () => {
+  const evCompleted = JSON.stringify({
+    id: "evt_Upg00001",
+    object: "event",
+    type: "checkout.session.completed",
+    livemode: false,
+    created: T,
+    data: {
+      object: {
+        customer: CUS_A,
+        subscription: "sub_NewA0001",
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      },
+    },
+  });
+  it("cancels the previous Solo subscription with STRIPE_SECRET_KEY, never a live key", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', stripe_subscription_id = 'sub_OldA0001' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const seen: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      seen.push(
+        `${init?.method} ${new URL(String(input)).pathname} ${new Headers(init?.headers).get("authorization")}`,
+      );
+      return Response.json(
+        init?.method === "GET"
+          ? { id: "sub_OldA0001", status: "active" }
+          : { id: "sub_OldA0001", status: "canceled" },
+      );
+    });
+    const key = "sk_test_FAKEfakeFAKEfake0123456789";
+    const r = await call(await hook(evCompleted), {
+      ...env,
+      STRIPE_SECRET_KEY: key,
+    } as Env);
+    expect(r.status).toBe(200);
+    expect(seen).toEqual([
+      `GET /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
+      `DELETE /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
+    ]);
+    expect(await rowOf(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_NewA0001",
+    });
+  });
+});

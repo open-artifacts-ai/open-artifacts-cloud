@@ -3,6 +3,7 @@ import {
   createCheckoutSession,
   createCustomer,
   createPortalSession,
+  cancelSubscription,
   createSoloTrialSubscription,
   SOLO_TRIAL_DAYS,
   StripeApiError,
@@ -330,5 +331,121 @@ describe("Solo (#1568)", () => {
       "invalid_request_error",
       "stripe 400 invalid_request_error",
     ]);
+  });
+});
+
+describe("cancelSubscription (#1568)", () => {
+  const calls: {
+    method: string;
+    url: string;
+    auth: string | null;
+    body: unknown;
+  }[] = [];
+  /** A fetch that answers per method: the subscription's state, then the delete. */
+  const stripe = (o: {
+    get?: [unknown, number?];
+    del?: [unknown, number?];
+  }) => {
+    calls.length = 0;
+    return (async (url: string, init: RequestInit) => {
+      const method = String(init.method);
+      calls.push({
+        method,
+        url,
+        auth: new Headers(init.headers).get("authorization"),
+        body: init.body,
+      });
+      const [b, st] = (method === "GET" ? o.get : o.del) ?? [{ id: "sub_X1" }];
+      return Response.json(b, { status: st ?? 200 });
+    }) as unknown as typeof fetch;
+  };
+
+  it("reads the subscription, then cancels it when it is not canceled yet", async () => {
+    const f = stripe({ get: [{ id: "sub_Old1", status: "active" }] });
+    expect(
+      await cancelSubscription(
+        { subscriptionId: "sub_Old1" },
+        { secretKey: KEY, fetch: f },
+      ),
+    ).toEqual({ id: "sub_Old1" });
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ["GET", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
+      ["DELETE", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
+    ]);
+    for (const c of calls) {
+      expect(c.auth).toBe(`Bearer ${KEY}`);
+      expect(c.body).toBeUndefined();
+    }
+  });
+
+  it("already canceled, or gone (404 on either call): done, and no second delete", async () => {
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({ get: [{ id: "sub_Old1", status: "canceled" }] }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ error: { type: "invalid_request_error" } }, 404],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "active" }],
+          del: [{ error: { type: "invalid_request_error" } }, 404],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE"]);
+  });
+
+  it("another Stripe error keeps status and type only", async () => {
+    const e = await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "active" }],
+          del: [
+            { error: { type: "api_error", message: "sub_Old1 cus_1" } },
+            500,
+          ],
+        }),
+      },
+    ).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      500,
+      "api_error",
+      "stripe 500 api_error",
+    ]);
+  });
+
+  it("refuses a live key or a bad id before any call", async () => {
+    const f = stripe({});
+    for (const [id, key, field] of [
+      ["sub_Old1", "sk_live_abcdefghij", "secretKey"],
+      ["sub_Old1", "rk_live_abcdefghij", "secretKey"],
+      ["sub_Old1/../x", KEY, "subscriptionId"],
+      ["cus_1", KEY, "subscriptionId"],
+    ] as const) {
+      const e = await cancelSubscription(
+        { subscriptionId: id },
+        { secretKey: key, fetch: f },
+      ).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(calls).toEqual([]);
   });
 });

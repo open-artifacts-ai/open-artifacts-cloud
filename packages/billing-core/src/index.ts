@@ -5,6 +5,7 @@
 // routes. No Stripe
 // SDK; Stripe test mode only.
 export {
+  cancelSubscription,
   type CheckoutInput,
   type CheckoutTier,
   type CustomerInput,

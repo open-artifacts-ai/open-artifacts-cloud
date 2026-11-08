@@ -17,7 +17,10 @@ CREATE TABLE tiers_new (
   last_invoice_created INTEGER,
   -- Solo's 30-day no-card trial end (ms): the Solo subscription's own trial,
   -- never the 14-day Business trial's trial_ends_at.
-  solo_trial_ends_at INTEGER
+  solo_trial_ends_at INTEGER,
+  -- A subscription an upgrade replaced and the webhook still has to cancel
+  -- (cleared once Stripe has cancelled it; a failed cancel retries).
+  cancel_sub_id TEXT
 );
 
 INSERT INTO tiers_new (
