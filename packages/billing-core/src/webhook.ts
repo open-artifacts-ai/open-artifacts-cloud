@@ -94,6 +94,9 @@ export type StripeEvent = {
 
 export const HANDLED = [
   "checkout.session.completed",
+  // A delayed payment method's checkout paid later (#1568): the same change
+  // as a paid completed.
+  "checkout.session.async_payment_succeeded",
   "customer.subscription.created",
   "customer.subscription.updated",
   "customer.subscription.deleted",
@@ -268,23 +271,35 @@ export function changeFor(
     args: o.stale ? [ev.created, ...args] : args,
   });
   switch (ev.type) {
-    case "checkout.session.completed": {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded": {
       const sub =
         typeof o.subscription === "string" && SUB_ID.test(o.subscription)
           ? o.subscription
           : null;
       const sets: Set[] = [];
+      const payNow =
+        o.payment_status === "paid" ||
+        o.payment_status === "no_payment_required";
       if (sub) {
-        sets.push({ sql: "stripe_subscription_id = ?", args: [sub] });
+        // An unpaid checkout (a payment still pending) never takes the row's
+        // live subscription from it: the row switches when the payment
+        // succeeds (async_payment_succeeded). With no live one it records
+        // the pending id, so that subscription's invoices apply (N9c).
+        sets.push(
+          payNow
+            ? { sql: "stripe_subscription_id = ?", args: [sub] }
+            : {
+                sql: `stripe_subscription_id = CASE WHEN ${PREV_LIVE} AND stripe_subscription_id != ? THEN stripe_subscription_id ELSE ? END`,
+                args: [sub, sub],
+              },
+        );
         // A paid checkout for another subscription replaces the live one
         // (Solo upgraded to Team or Business): remember it, and the webhook
         // cancels it after this update (settleCancel), so it is never billed
         // alongside. Once the row holds the new id the old one's own events
         // no longer apply to it. Kept if an earlier intent is still pending.
-        if (
-          o.payment_status === "paid" ||
-          o.payment_status === "no_payment_required"
-        )
+        if (payNow)
           sets.push({
             sql: `cancel_sub_id = CASE WHEN cancel_sub_id IS NULL AND ${PREV_LIVE} AND stripe_subscription_id != ? THEN stripe_subscription_id ELSE cancel_sub_id END`,
             args: [sub],
@@ -421,6 +436,13 @@ export function subscriptionOf(ev: StripeEvent): string | null {
   }
   return typeof v === "string" && SUB_ID.test(v) ? v : null;
 }
+
+/** A subscription event that ends or lapses the subscription (never takes a first one). */
+const lapses = (ev: StripeEvent): boolean =>
+  ev.type === "customer.subscription.deleted" ||
+  ((ev.type === "customer.subscription.created" ||
+    ev.type === "customer.subscription.updated") &&
+    statusFromSubscription(ev.object.status) === "lapsed");
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 
@@ -630,7 +652,9 @@ export async function handleStripeWebhook(
     ];
     // The sets use plain `?`; the WHERE binds by number after them.
     const n = sets.reduce((k, s) => k + s.args.length, 0);
-    const isCheckout = ev.type === "checkout.session.completed";
+    const isCheckout =
+      ev.type === "checkout.session.completed" ||
+      ev.type === "checkout.session.async_payment_succeeded";
     // Checkout names the subscription it sets (?n+2); the other events the
     // one they are about.
     const eventSub = isCheckout
@@ -656,7 +680,12 @@ export async function handleStripeWebhook(
           eventSub
           ? ` AND stripe_subscription_id = ?${n + 2}`
           : " AND 0"
-        : ` AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?${n + 2})`;
+        : // A lapse (deleted, canceled) must be the row's own subscription: a
+          // row with none is never lapsed by a stray one. Anything else may
+          // also take the first live subscription of a row that has none.
+          lapses(ev)
+          ? ` AND stripe_subscription_id = ?${n + 2}`
+          : ` AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?${n + 2})`;
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
       db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),

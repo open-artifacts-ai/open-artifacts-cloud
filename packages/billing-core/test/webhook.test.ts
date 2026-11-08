@@ -792,7 +792,10 @@ describe("handleStripeWebhook", () => {
       }),
     );
     expect(await row(B)).toEqual(before);
-    expect((await row(A)).version).toBe(4);
+    // The canceled update names no subscription the row holds, so it no longer
+    // applies (a lapse needs its own subscription, #1568); the invoice never
+    // did: only the checkout moved A.
+    expect((await row(A)).version).toBe(2);
   });
 
   it("an unknown customer is 409 and its event id is not recorded, so Stripe retries", async () => {
@@ -1665,6 +1668,230 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     expect(await row(A)).toMatchObject({
       tier: "team",
       stripe_subscription_id: "sub_New1",
+    });
+  });
+});
+
+// ------------------------------------------------- the current subscription only
+
+describe("subscription events apply only to the row's current subscription (#1568)", () => {
+  const OLD = "sub_Old1";
+  const NEW = "sub_New1";
+  const KEY = "sk_test_notarealkey0000";
+  const teamPrice = {
+    items: { data: [{ price: { id: "price_Team", lookup_key: "team" } }] },
+  };
+  const soloPrice = {
+    items: {
+      data: [{ price: { id: "price_SoloX", metadata: { tier: "solo" } } }],
+    },
+  };
+  const subOf = (id: string, o: Record<string, unknown> = {}) =>
+    sub({ id, ...teamPrice, ...o });
+  const soloOf = (id: string, o: Record<string, unknown> = {}) =>
+    sub({ id, ...soloPrice, ...o });
+  const solo = (id: string | null) =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', grace_until = NULL, stripe_subscription_id = ?, last_event_created = NULL, last_invoice_created = NULL, cancel_sub_id = NULL WHERE install_id = ?",
+      )
+      .bind(id, A)
+      .run();
+  const paidCheckout = (sub: string, o: Record<string, unknown> = {}) =>
+    event("checkout.session.completed", {
+      customer: CUS_A,
+      subscription: sub,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+      ...o,
+    });
+  const okStripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${new URL(url).pathname}`);
+      return Response.json({
+        id: OLD,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+
+  it("after the upgrade, the old Solo subscription's deleted, canceled, past_due and active events change nothing", async () => {
+    await solo(OLD);
+    const s = okStripe();
+    await deliver(paidCheckout(NEW), { env: s.e });
+    const upgraded = await row(A);
+    expect(upgraded).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: NEW,
+    });
+    for (const e of [
+      event(
+        "customer.subscription.deleted",
+        soloOf(OLD, { status: "canceled" }),
+      ),
+      event(
+        "customer.subscription.updated",
+        soloOf(OLD, { status: "canceled" }),
+      ),
+      event(
+        "customer.subscription.updated",
+        soloOf(OLD, { status: "past_due" }),
+      ),
+      event("customer.subscription.updated", soloOf(OLD, { status: "active" })),
+      event("invoice.payment_failed", inv({ subscription: OLD })),
+      event("invoice.paid", inv({ subscription: OLD })),
+    ]) {
+      await deliver(e, { env: s.e });
+      const now = await row(A);
+      expect(now, e.type).toMatchObject({
+        tier: "team",
+        status: "active",
+        grace_until: null,
+        stripe_subscription_id: NEW,
+      });
+    }
+  });
+
+  it("the new subscription's events arriving before checkout.session.completed are ignored, then the checkout applies", async () => {
+    await solo(OLD);
+    const s = okStripe();
+    for (const e of [
+      event("customer.subscription.created", subOf(NEW, { status: "active" })),
+      event(
+        "customer.subscription.updated",
+        subOf(NEW, { status: "past_due" }),
+      ),
+      event("invoice.paid", inv({ subscription: NEW })),
+    ])
+      await deliver(e, { env: s.e });
+    // The row is still the Solo's: nothing from the unconfirmed subscription.
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      grace_until: null,
+      stripe_subscription_id: OLD,
+    });
+    expect(s.calls).toEqual([]);
+    await deliver(paidCheckout(NEW), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: NEW,
+    });
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+  });
+
+  it("a row with no subscription takes the first live one in any order; a lapse needs its own subscription", async () => {
+    await solo(null);
+    await deliver(
+      event(
+        "customer.subscription.deleted",
+        subOf(NEW, { status: "canceled" }),
+      ),
+    );
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        subOf(NEW, { status: "canceled" }),
+      ),
+    );
+    // A stray lapse never moves a row that holds no subscription.
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: null,
+    });
+    await deliver(
+      event("customer.subscription.updated", subOf(NEW, { status: "active" })),
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: NEW,
+    });
+    // The checkout for the same subscription then finds nothing to cancel.
+    const s = okStripe();
+    await deliver(paidCheckout(NEW), { env: s.e });
+    expect(s.calls).toEqual([]);
+    // A comped paid row without a subscription is not lapsed by a stray delete.
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'team', status = 'active', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    await deliver(event("customer.subscription.deleted", subOf("sub_Stray1")));
+    expect(await row(A)).toMatchObject({ tier: "team", status: "active" });
+  });
+
+  it("async payment: an unpaid checkout leaves the live Solo as it is; its events are ignored; async_payment_succeeded then upgrades and cancels", async () => {
+    await solo(OLD);
+    const s = okStripe();
+    await deliver(paidCheckout(NEW, { payment_status: "unpaid" }), {
+      env: s.e,
+    });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: OLD,
+    });
+    for (const e of [
+      event(
+        "customer.subscription.updated",
+        subOf(NEW, { status: "incomplete" }),
+      ),
+      event("invoice.payment_failed", inv({ subscription: NEW })),
+      event("customer.subscription.updated", subOf(NEW, { status: "active" })),
+      event("checkout.session.async_payment_failed", {
+        customer: CUS_A,
+        subscription: NEW,
+      }),
+    ])
+      await deliver(e, { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      grace_until: null,
+      stripe_subscription_id: OLD,
+    });
+    expect(s.calls).toEqual([]);
+    const ok = await deliver(
+      event("checkout.session.async_payment_succeeded", {
+        customer: CUS_A,
+        subscription: NEW,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      }),
+      { env: s.e },
+    );
+    expect(ok.status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: NEW,
+    });
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+  });
+
+  it("async payment on a row with no live subscription still records the pending one, so its invoices apply (N9c)", async () => {
+    await solo(null);
+    await deliver(paidCheckout(NEW, { payment_status: "unpaid" }));
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: NEW,
     });
   });
 });
