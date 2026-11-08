@@ -364,7 +364,7 @@ describe("waits stay under the case timeout", () => {
       waitBudgetMs: 30,
     });
     await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
-      /infra: pacing: waited/,
+      /infra: pacing: this case has waited/,
     );
   });
   it("waits already spent in a case use up its budget", async () => {
@@ -377,7 +377,7 @@ describe("waits stay under the case timeout", () => {
     });
     await f(`${A.app}/oauth/token`, { method: "POST" });
     await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
-      /infra: /,
+      /infra: pacing: this case has waited/,
     );
     await expect(f(`${A.app}/oauth/token`, { method: "POST" })).rejects.toThrow(
       /infra: pacing: this case has waited/,

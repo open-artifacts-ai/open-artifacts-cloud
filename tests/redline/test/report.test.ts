@@ -156,7 +156,7 @@ describe("levelOf", () => {
       () => undefined,
       (e: Error) => e,
     );
-    expect(err?.message).toMatch(/^infra: pacing: waited/);
+    expect(err?.message).toMatch(/^infra: pacing: this case has waited/);
     const { level, reason } = levelOf("failed", {}, [err as Error]);
     expect(level).toBe("infra");
     const cases = [c("a", "pass"), c("b", "pass"), c("w", level, reason)];

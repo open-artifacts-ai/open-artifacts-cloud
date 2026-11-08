@@ -365,7 +365,7 @@ export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
             () =>
               rej(
                 new InfraError(
-                  `pacing: waited ${budget / 1000} s in this case, which would run it past its timeout`,
+                  `pacing: this case has waited ${budget / 1000} s on pacing and locks, which would run it past its timeout`,
                 ),
               ),
             ms,
