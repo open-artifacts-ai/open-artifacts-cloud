@@ -729,6 +729,21 @@ exit 2
 `,
         { mode: 0o755 },
       );
+      // `date -d ""` is midnight today in GNU date, which is only "long ago"
+      // after the first minutes of the day: a stand-in that answers 5 hours
+      // ago keeps the empty-start test independent of the time it runs at.
+      writeFileSync(
+        join(bin, "date"),
+        `#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+  if [ "$prev" = -d ] && [ -z "$a" ]; then echo $(( $(/usr/bin/date +%s) - 18000 )); exit 0; fi
+  prev="$a"
+done
+exec /usr/bin/date "$@"
+`,
+        { mode: 0o755 },
+      );
       writeFileSync(
         join(bin, "pnpm"),
         `#!/usr/bin/env bash
