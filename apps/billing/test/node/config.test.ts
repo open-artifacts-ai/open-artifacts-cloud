@@ -136,6 +136,8 @@ describe("migrations", () => {
     expect(cols(tiers(sql.replace("tiers_new", "tiers")))).toEqual([
       ...cols(tiers(init)),
       "solo_trial_ends_at",
+      "solo_status",
+      "solo_grace_until",
       "cancel_sub_id",
     ]);
     expect(sql).toMatch(

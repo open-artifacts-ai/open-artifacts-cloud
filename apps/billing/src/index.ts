@@ -137,7 +137,17 @@ const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // rows); an existing row moves only from solo/free and active, and only once
 // (trial_ends_at stays set after). Solo's own 30-day no-card trial is a Stripe
 // subscription and never sets trial_ends_at, so it doesn't use this up.
-const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, solo_status = CASE WHEN tiers.stripe_subscription_id IS NOT NULL THEN 'active' END, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+// The 14-day Business trial ended (trial_ends_at, set once, stays set so it
+// never restarts): the row is Solo again, active while the Solo subscription
+// it kept (solo_status, recorded by the webhook while the trial ran) is
+// alive, lapsed if not or if there never was one. A change made only by time
+// passing, so it bumps version here: the install stores an answer only when
+// its version is higher. One UPDATE, idempotent (it needs tier trial), run at
+// the start of every read and answer. A suspended row stays suspended.
+const MATERIALIZE_SQL = `UPDATE tiers SET tier = 'solo', status = CASE WHEN status = 'suspended' THEN status WHEN solo_status IN ('active', 'past_due') THEN solo_status ELSE 'lapsed' END, grace_until = CASE WHEN status = 'suspended' THEN grace_until WHEN solo_status = 'past_due' THEN solo_grace_until END, version = version + 1, updated_at = ?2 WHERE install_id = ?1 AND tier = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at <= ?2`;
+const materialize = (db: D1Database, install: string, now: number) =>
+  db.prepare(MATERIALIZE_SQL).bind(install, now).run();
 const SOLO_HELD_SQL =
   "SELECT tier, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
 const SOLO_TRIAL_MS = SOLO_TRIAL_DAYS * 86_400_000;
@@ -243,7 +253,7 @@ const ENSURE_ROW_SQL =
 const CUSTOMER_SQL =
   "SELECT stripe_customer_id FROM tiers WHERE install_id = ?1";
 const SUBSCRIPTION_SQL =
-  "SELECT stripe_subscription_id, status, tier, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
+  "SELECT stripe_subscription_id, status, tier, solo_trial_ends_at, solo_status FROM tiers WHERE install_id = ?1";
 // Only where none is mapped yet: a concurrent winner's id is kept.
 const MAP_CUSTOMER_SQL =
   "UPDATE tiers SET stripe_customer_id = ? WHERE install_id = ? AND stripe_customer_id IS NULL";
@@ -375,31 +385,33 @@ async function checkout(
       status: string;
       tier: string | null;
       solo_trial_ends_at: number | null;
+      solo_status: string | null;
     }>();
-  // A live paid subscription (a trial or free row with an id is an
-  // unfinished first payment: it may retry), or a suspended one. Solo counts
-  // as paid: its no-card trial is a live subscription too, and a card is
-  // added in the Portal.
-  // The one exception: a Solo subscription that is still the no-card trial
-  // (active, inside solo_trial_ends_at) may be bought through Checkout, which
-  // is how its card is added (#1568). A Solo that has paid keeps the 409.
+  // A live Team or Business subscription is changed in the Portal, and so is
+  // a suspended one. A live Solo subscription (its own row's, or, during the
+  // 14-day Business trial, the one kept in solo_status) refuses a second Solo
+  // (a card is added through Checkout only while it is still the no-card
+  // trial, #1568) but is upgraded through Checkout: the webhook cancels it
+  // once the Team or Business subscription is paid, so there is never a
+  // double bill. A trial or free row whose id is an unfinished first payment
+  // may retry.
+  const heldSolo = held?.tier === "solo" || held?.tier === "trial";
+  const soloState = held?.tier === "trial" ? held.solo_status : held?.status;
+  const soloLive =
+    Boolean(held?.stripe_subscription_id) &&
+    heldSolo &&
+    (soloState === "active" || soloState === "past_due");
   const inSoloTrial =
-    held?.tier === "solo" &&
-    held.status === "active" &&
-    held.solo_trial_ends_at !== null &&
+    soloLive &&
+    soloState === "active" &&
+    held?.solo_trial_ends_at != null &&
     held.solo_trial_ends_at > Date.now();
   if (
     held?.stripe_subscription_id &&
     (held.status === "suspended" ||
-      ((held.tier === "solo" ||
-        held.tier === "team" ||
-        held.tier === "business") &&
-        (held.status === "active" || held.status === "past_due") &&
-        !(plan === "solo" && inSoloTrial) &&
-        // Solo upgrades to Team or Business through Checkout, trial or
-        // paid: the webhook cancels the Solo subscription once the new one
-        // is paid, so there is never a double bill.
-        !(plan !== "solo" && held.tier === "solo")))
+      ((held.tier === "team" || held.tier === "business") &&
+        (held.status === "active" || held.status === "past_due")) ||
+      (plan === "solo" && soloLive && !inSoloTrial))
   ) {
     console.log("billing checkout subscription_exists", install);
     return bad("subscription_exists", 409);
@@ -486,6 +498,7 @@ function answer(install: string, route: string, url: string, host: RegExp) {
 }
 
 async function tier(db: D1Database, install: string, now: number) {
+  await materialize(db, install, now);
   const r = await db.prepare(READ_SQL).bind(install, now).first<TierRow>();
   console.log("billing tier", r ? "row" : "default", install);
   return Response.json(view(r, now));
@@ -498,6 +511,7 @@ async function trialStart(
   now: number,
 ) {
   if (mismatched(body, install)) return bad("install_mismatch", 403);
+  await materialize(db, install, now);
   const started = await db
     .prepare(TRIAL_SQL)
     .bind(install, now + TRIAL_MS, now)
@@ -533,6 +547,7 @@ async function soloStart(
     return bad("config", 500);
   }
   const db = env.BILLING_DB;
+  await materialize(db, install, now);
   const held = await db.prepare(SOLO_HELD_SQL).bind(install).first<{
     tier: string | null;
     stripe_subscription_id: string | null;

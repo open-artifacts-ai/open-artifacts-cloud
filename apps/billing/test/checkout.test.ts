@@ -1381,3 +1381,58 @@ describe("POST /checkout, Solo in its no-card trial (#1568)", () => {
     }
   });
 });
+
+describe("POST /checkout on a row in its Business trial over a Solo subscription (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const DAY = 86_400_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const trial = async (soloStatus: string | null, soloEnd: number | null) => {
+    await seed(A, "cus_existingA", "trial");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_solo1', solo_status = ?1, solo_trial_ends_at = ?2, trial_ends_at = ?3 WHERE install_id = ?4",
+      )
+      .bind(soloStatus, soloEnd, NOW + 5 * DAY, A)
+      .run();
+  };
+  const buy = (plan: string, interval?: string) =>
+    call(
+      req("/checkout", { install: A, plan, ...(interval ? { interval } : {}) }),
+    );
+
+  it("team and business are allowed (the upgrade); Solo only while the Solo subscription is its no-card trial", async () => {
+    await trial("active", NOW + 10 * DAY);
+    fakeStripe();
+    for (const [plan, interval] of [
+      ["team"],
+      ["business"],
+      ["solo", "month"],
+    ] as const)
+      expect((await buy(plan, interval)).status, plan).toBe(200);
+    // A Solo that has paid: Solo again is 409, the upgrade is not.
+    await db.prepare("DELETE FROM tiers").run();
+    await trial("active", NOW - DAY);
+    const s = fakeStripe();
+    const r = await buy("solo", "month");
+    expect([r.status, await r.json()]).toEqual([
+      409,
+      { error: "subscription_exists" },
+    ]);
+    expect((await buy("team")).status).toBe(200);
+    expect(s.calls.filter((c) => c.path === CHECKOUT)).toHaveLength(1);
+  });
+
+  it("a trial row whose Solo subscription is dead or was never live may buy anything (N9c)", async () => {
+    for (const solo of [null, "lapsed"]) {
+      await db.prepare("DELETE FROM tiers").run();
+      await trial(solo, NOW - DAY);
+      fakeStripe();
+      for (const [plan, interval] of [["team"], ["solo", "year"]] as const)
+        expect((await buy(plan, interval)).status, `${solo} ${plan}`).toBe(200);
+    }
+  });
+});

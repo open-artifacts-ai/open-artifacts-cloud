@@ -231,9 +231,13 @@ export function statusFromSubscription(s: unknown): TierStatus | null {
 }
 
 const PAID = "tier IN ('solo', 'team', 'business')";
-/** The row's current subscription is live (a paid tier, active or past_due). */
+/**
+ * The row's current subscription is live: a paid tier's, active or past_due,
+ * or (during the 14-day Business trial) the Solo subscription under it, whose
+ * state lives in solo_status.
+ */
 const PREV_LIVE =
-  "(stripe_subscription_id IS NOT NULL AND tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due'))";
+  "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due'))))";
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
 /** One column assignment in the row update: SQL and its binds. */
@@ -270,6 +274,31 @@ export function changeFor(
     sql: `${col} = CASE WHEN status = 'suspended'${o.paid ? ` OR ${NOT_PAID}` : ""}${o.stale ? " OR ? < coalesce(last_invoice_created, 0)" : ""} THEN ${col} ELSE ${value} END`,
     args: o.stale ? [ev.created, ...args] : args,
   });
+  /**
+   * The Solo subscription's state while the Business trial runs over it
+   * (tier trial): recorded in solo_status and solo_grace_until, so the row
+   * can become Solo when the trial ends. Other rows leave them alone. A
+   * suspended row, or an event older than the last invoice (`stale`), too.
+   */
+  const shadow = (
+    col: string,
+    value: string,
+    args: unknown[] = [],
+    stale = false,
+  ): Set => ({
+    sql: `${col} = CASE WHEN tier = 'trial' AND status IS NOT 'suspended'${stale ? " AND NOT (? < coalesce(last_invoice_created, 0))" : ""} THEN ${value} ELSE ${col} END`,
+    args: stale ? [ev.created, ...args] : args,
+  });
+  /**
+   * A Solo-priced event sets tier solo, except on a row in its Business
+   * trial: that trial is the row's tier until trial_ends_at passes (read
+   * time), and a Solo event never ends it early.
+   */
+  const SOLO_TIER = "tier = CASE WHEN tier = 'trial' THEN tier ELSE 'solo' END";
+  const setTier = (t: PaidTier): Set =>
+    t === "solo"
+      ? { sql: SOLO_TIER, args: [] }
+      : { sql: "tier = ?", args: [t] };
   switch (ev.type) {
     case "checkout.session.completed":
     case "checkout.session.async_payment_succeeded": {
@@ -317,7 +346,12 @@ export function changeFor(
           guarded("grace_until", "NULL"),
         );
         const tier = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
-        if (tier) sets.push({ sql: "tier = ?", args: [tier] });
+        if (tier) sets.push(setTier(tier));
+        if (tier === "solo")
+          sets.push(
+            shadow("solo_status", "'active'"),
+            shadow("solo_grace_until", "NULL"),
+          );
       }
       return sets.length ? sets : null;
     }
@@ -346,7 +380,30 @@ export function changeFor(
         status === "active" || status === "past_due"
           ? tierFromSubscription(o, prices)
           : null;
-      if (tier) sets.push({ sql: "tier = ?", args: [tier] });
+      if (tier) sets.push(setTier(tier));
+      const isSolo = tierFromSubscription(o, prices) === "solo";
+      if (isSolo) {
+        if (status === "active")
+          sets.push(
+            shadow("solo_status", "'active'", [], true),
+            shadow("solo_grace_until", "NULL", [], true),
+          );
+        else if (status === "past_due")
+          sets.push(
+            shadow("solo_status", "'past_due'", [], true),
+            shadow(
+              "solo_grace_until",
+              "coalesce(solo_grace_until, ?)",
+              [graceEnd],
+              true,
+            ),
+          );
+        else if (status === "lapsed")
+          sets.push(
+            shadow("solo_status", "'lapsed'", [], true),
+            shadow("solo_grace_until", "NULL", [], true),
+          );
+      }
       if (status === "active")
         sets.push(
           guarded("status", "'active'", [], { stale: true }),
@@ -369,22 +426,29 @@ export function changeFor(
       // its 30-day no-card trial must leave trial_ends_at null, or the first
       // invite could never start the 14-day Business trial (billing's
       // TRIAL_SQL needs it unset); the Solo trial ends by cancel (lapsed).
-      if (
-        o.status === "trialing" &&
-        typeof o.trial_end === "number" &&
-        tierFromSubscription(o, prices) !== "solo"
-      )
-        sets.push({ sql: "trial_ends_at = ?", args: [o.trial_end * 1000] });
+      if (o.status === "trialing" && typeof o.trial_end === "number")
+        sets.push({
+          sql: isSolo ? "solo_trial_ends_at = ?" : "trial_ends_at = ?",
+          args: [o.trial_end * 1000],
+        });
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
         sets.push({ sql: "stripe_subscription_id = ?", args: [subId] });
       return sets.length ? sets : null;
     }
     case "customer.subscription.deleted":
-      // Ended: read-only on the install at once; nothing is deleted.
+      // Ended: read-only on the install at once; nothing is deleted. A Solo
+      // subscription that ends under a running Business trial is recorded
+      // for when the trial ends.
       return [
         guarded("status", "'lapsed'", [], { paid: true }),
         guarded("grace_until", "NULL", [], { paid: true }),
+        ...(tierFromSubscription(o, prices) === "solo"
+          ? [
+              shadow("solo_status", "'lapsed'"),
+              shadow("solo_grace_until", "NULL"),
+            ]
+          : []),
       ];
     case "invoice.payment_failed":
       // Grace from the first failure; a suspended or lapsed row stays so.
@@ -397,6 +461,16 @@ export function changeFor(
           sql: `grace_until = CASE WHEN status IN ('active', 'past_due') AND ${PAID} THEN coalesce(grace_until, ?) ELSE grace_until END`,
           args: [graceEnd],
         },
+        // Under a running Business trial: the Solo subscription's own state.
+        shadow(
+          "solo_status",
+          "CASE WHEN solo_status IN ('active', 'past_due') THEN 'past_due' ELSE solo_status END",
+        ),
+        shadow(
+          "solo_grace_until",
+          "CASE WHEN solo_status IN ('active', 'past_due') THEN coalesce(solo_grace_until, ?) ELSE solo_grace_until END",
+          [graceEnd],
+        ),
       ];
     case "invoice.paid":
       // Only a past_due row comes back: an old invoice never revives a
@@ -410,6 +484,14 @@ export function changeFor(
           sql: `grace_until = CASE WHEN status = 'past_due' AND ${PAID} THEN NULL ELSE grace_until END`,
           args: [],
         },
+        shadow(
+          "solo_status",
+          "CASE WHEN solo_status = 'past_due' THEN 'active' ELSE solo_status END",
+        ),
+        shadow(
+          "solo_grace_until",
+          "CASE WHEN solo_status = 'past_due' THEN NULL ELSE solo_grace_until END",
+        ),
       ];
     default:
       return null;

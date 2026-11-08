@@ -294,7 +294,7 @@ describe("Solo prices (#1568)", () => {
     for (const [i, price] of ["price_soloM1", "price_soloY1"].entries()) {
       await db
         .prepare(
-          "UPDATE tiers SET tier = 'trial', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?1",
+          "UPDATE tiers SET tier = 'free', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?1",
         )
         .bind(A)
         .run();

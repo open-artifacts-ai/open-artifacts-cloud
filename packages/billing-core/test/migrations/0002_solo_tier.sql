@@ -18,6 +18,12 @@ CREATE TABLE tiers_new (
   -- Solo's 30-day no-card trial end (ms): the Solo subscription's own trial,
   -- never the 14-day Business trial's trial_ends_at.
   solo_trial_ends_at INTEGER,
+  -- The Solo subscription's state while the 14-day Business trial runs over
+  -- it (tier trial): the trial's own tier, status and dates stay the row's,
+  -- and this is what the row becomes when the trial ends (null: no Solo
+  -- subscription, so lapsed). Only meaningful while tier is trial.
+  solo_status TEXT CHECK (solo_status IN ('active', 'past_due', 'lapsed')),
+  solo_grace_until INTEGER,
   -- A subscription an upgrade replaced and the webhook still has to cancel
   -- (cleared once Stripe has cancelled it; a failed cancel retries).
   cancel_sub_id TEXT

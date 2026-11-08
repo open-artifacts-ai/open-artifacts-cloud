@@ -1895,3 +1895,204 @@ describe("subscription events apply only to the row's current subscription (#156
     });
   });
 });
+
+// ------------------------------------------------- Business trial over a Solo subscription
+
+describe("the Business trial on top of a Solo subscription (#1568)", () => {
+  const OLD = "sub_Old1";
+  const NEW = "sub_New1";
+  const KEY = "sk_test_notarealkey0000";
+  const SOLO_END = (T + 20 * 86_400) * 1000;
+  const TRIAL_END = (T + 10 * 86_400) * 1000;
+  const soloPrice = {
+    items: {
+      data: [{ price: { id: "price_SoloX", metadata: { tier: "solo" } } }],
+    },
+  };
+  const soloOf = (o: Record<string, unknown> = {}) =>
+    sub({ id: OLD, ...soloPrice, ...o });
+  /** A row in its 14-day Business trial that still holds a live Solo subscription. */
+  const trialOverSolo = (solo: string | null = "active") =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'trial', status = 'active', grace_until = NULL, trial_ends_at = ?, stripe_subscription_id = ?, solo_status = ?, solo_grace_until = NULL, solo_trial_ends_at = ?, cancel_sub_id = NULL, last_event_created = NULL, last_invoice_created = NULL WHERE install_id = ?",
+      )
+      .bind(TRIAL_END, solo === null ? null : OLD, solo, SOLO_END, A)
+      .run();
+  type R = Row & {
+    solo_status: string | null;
+    solo_grace_until: number | null;
+    solo_trial_ends_at: number | null;
+    cancel_sub_id: string | null;
+  };
+  const r = () => row(A) as Promise<R>;
+  const stays = {
+    tier: "trial",
+    status: "active",
+    grace_until: null,
+    trial_ends_at: TRIAL_END,
+  };
+  const okStripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${new URL(url).pathname}`);
+      return Response.json({
+        id: OLD,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+
+  it("Solo-priced events never end the trial or touch its dates; the Solo state is recorded beside it", async () => {
+    await trialOverSolo();
+    // Active, trialing with a new end, past due, then paid again, then canceled.
+    await deliver(
+      event(
+        "customer.subscription.updated",
+        soloOf({ status: "trialing", trial_end: T + 25 * 86_400 }),
+      ),
+    );
+    expect(await r()).toMatchObject({
+      ...stays,
+      solo_status: "active",
+      solo_trial_ends_at: (T + 25 * 86_400) * 1000,
+      stripe_subscription_id: OLD,
+    });
+    const failing = event(
+      "customer.subscription.updated",
+      soloOf({ status: "past_due" }),
+    );
+    await deliver(failing);
+    expect(await r()).toMatchObject({
+      ...stays,
+      solo_status: "past_due",
+      solo_grace_until: failing.created * 1000 + GRACE_MS,
+    });
+    await deliver(
+      event("customer.subscription.updated", soloOf({ status: "active" })),
+    );
+    expect(await r()).toMatchObject({
+      ...stays,
+      solo_status: "active",
+      solo_grace_until: null,
+    });
+    await deliver(
+      event("customer.subscription.deleted", soloOf({ status: "canceled" })),
+    );
+    // A lapse during the trial is recorded, not dropped: the trial still runs.
+    expect(await r()).toMatchObject({ ...stays, solo_status: "lapsed" });
+  });
+
+  it("invoices of the Solo subscription during the trial are recorded the same way", async () => {
+    await trialOverSolo();
+    const failed = event("invoice.payment_failed", inv({ subscription: OLD }));
+    await deliver(failed);
+    expect(await r()).toMatchObject({
+      ...stays,
+      solo_status: "past_due",
+      solo_grace_until: failed.created * 1000 + GRACE_MS,
+    });
+    await deliver(event("invoice.paid", inv({ subscription: OLD })));
+    expect(await r()).toMatchObject({
+      ...stays,
+      solo_status: "active",
+      solo_grace_until: null,
+    });
+    // No Solo subscription, no record: an unfinished first payment changes nothing (N9c).
+    await trialOverSolo(null);
+    await deliver(event("invoice.payment_failed", inv({ subscription: OLD })));
+    expect(await r()).toMatchObject({ ...stays, solo_status: null });
+  });
+
+  it("a paid Solo checkout during the trial keeps the trial, records the new Solo, and cancels the old one", async () => {
+    await trialOverSolo();
+    const s = okStripe();
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: NEW,
+        payment_status: "paid",
+        metadata: { tier: "solo" },
+      }),
+      { env: s.e },
+    );
+    expect(await r()).toMatchObject({
+      ...stays,
+      stripe_subscription_id: NEW,
+      solo_status: "active",
+    });
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+  });
+
+  it("a Team checkout during the trial ends it for the paid plan and cancels the live Solo", async () => {
+    await trialOverSolo();
+    const s = okStripe();
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: NEW,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      }),
+      { env: s.e },
+    );
+    expect(await r()).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: NEW,
+      trial_ends_at: TRIAL_END,
+    });
+    expect(s.calls).toEqual([
+      `GET /v1/subscriptions/${OLD}`,
+      `DELETE /v1/subscriptions/${OLD}`,
+    ]);
+  });
+
+  it("a trial row with no live Solo (an unfinished first payment) cancels nothing on a later checkout", async () => {
+    await trialOverSolo(null);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_Unpaid1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const s = okStripe();
+    await deliver(
+      event("checkout.session.completed", {
+        customer: CUS_A,
+        subscription: NEW,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      }),
+      { env: s.e },
+    );
+    expect(s.calls).toEqual([]);
+  });
+
+  it("outside the trial a Solo event still moves the row as before (solo tier, status, grace)", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', trial_ends_at = ?, stripe_subscription_id = ?, solo_status = NULL, last_event_created = NULL WHERE install_id = ?",
+      )
+      .bind(TRIAL_END - 99 * 86_400_000, OLD, A)
+      .run();
+    const e = event(
+      "customer.subscription.updated",
+      soloOf({ status: "past_due" }),
+    );
+    await deliver(e);
+    expect(await r()).toMatchObject({
+      tier: "solo",
+      status: "past_due",
+      grace_until: e.created * 1000 + GRACE_MS,
+      solo_status: null,
+    });
+  });
+});
