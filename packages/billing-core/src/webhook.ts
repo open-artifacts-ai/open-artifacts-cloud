@@ -375,6 +375,15 @@ export function changeFor(
             args: [ev.created * 1000],
           });
       }
+      // Only a paid Checkout that adopts its subscription advances the
+      // Checkout order key: an unpaid one (async) or a Solo held by a live
+      // Team leaves the row as it was, and must not make a delayed paid
+      // Checkout look out of order (its subscription would be cancelled).
+      if (payNow && sub)
+        sets.push({
+          sql: "last_checkout_created = ?",
+          args: [ev.created],
+        });
       // This checkout's session is no longer open.
       if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
         sets.push({
@@ -846,7 +855,10 @@ export async function handleStripeWebhook(
     const stream = streamOf(ev.type);
     const sets = [
       ...change,
-      { sql: `${ORDER_COLUMN[stream]} = ?`, args: [ev.created] },
+      // A checkout sets its own key in changeFor (only when it adopts).
+      ...(stream === "checkout"
+        ? []
+        : [{ sql: `${ORDER_COLUMN[stream]} = ?`, args: [ev.created] }]),
       { sql: "version = version + 1", args: [] },
       { sql: "updated_at = ?", args: [now] },
     ];

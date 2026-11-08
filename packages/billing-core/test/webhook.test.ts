@@ -2803,3 +2803,107 @@ describe("Solo bookkeeping (#1568)", () => {
     expect(await row(A)).toMatchObject({ solo_trial_ends_at: (T + 99) * 1000 });
   });
 });
+
+// ------------------------------------------------- only an adopted Checkout advances the key
+
+describe("last_checkout_created moves only when a Checkout adopts its subscription (#1568)", () => {
+  const KEY = "sk_test_notarealkey0000";
+  const solo = () =>
+    db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', grace_until = NULL, trial_ends_at = NULL, stripe_subscription_id = 'sub_Old1', solo_status = NULL, last_event_created = NULL, last_invoice_created = NULL, last_checkout_created = NULL WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+  const stripe = () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const id = new URL(url).pathname.split("/").pop() as string;
+      calls.push(`${init.method} ${id}`);
+      return Response.json({
+        id,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    return {
+      calls,
+      e: { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv,
+    };
+  };
+  const checkout = (
+    sub: string,
+    created: number,
+    o: Record<string, unknown> = {},
+  ) =>
+    event(
+      "checkout.session.completed",
+      {
+        customer: CUS_A,
+        subscription: sub,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+        ...o,
+      },
+      { created },
+    );
+
+  it("an unpaid async Checkout that leaves the row on Solo does not make a delayed paid Team Checkout stale", async () => {
+    await solo();
+    const s = stripe();
+    await deliver(
+      checkout("sub_Async1", T + 20, { payment_status: "unpaid" }),
+      { env: s.e },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      stripe_subscription_id: "sub_Old1",
+      last_checkout_created: null,
+    });
+    await deliver(checkout("sub_Paid1", T + 10), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: "sub_Paid1",
+      last_checkout_created: T + 10,
+    });
+    // The paid Team is never the one cancelled; the replaced Solo is.
+    expect(s.calls).toEqual(["GET sub_Old1", "DELETE sub_Old1"]);
+  });
+
+  it("a Solo Checkout held by a live Team does not advance it either: an older paid Team Checkout still applies", async () => {
+    await solo();
+    const s = stripe();
+    await deliver(checkout("sub_T1", T + 10), { env: s.e });
+    expect((await row(A)).last_checkout_created).toBe(T + 10);
+    await deliver(
+      checkout("sub_Solo1", T + 40, { metadata: { tier: "solo" } }),
+      { env: s.e },
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_T1",
+      last_checkout_created: T + 10,
+    });
+    await deliver(checkout("sub_T2", T + 20), { env: s.e });
+    expect(await row(A)).toMatchObject({
+      stripe_subscription_id: "sub_T2",
+      last_checkout_created: T + 20,
+    });
+  });
+
+  it("an unpaid Checkout that records a pending id on a row with nothing live does not advance it", async () => {
+    await solo();
+    await db
+      .prepare("UPDATE tiers SET status = 'lapsed' WHERE install_id = ?")
+      .bind(A)
+      .run();
+    await deliver(
+      checkout("sub_Async1", T + 20, { payment_status: "unpaid" }),
+      { env: stripe().e },
+    );
+    expect(await row(A)).toMatchObject({
+      stripe_subscription_id: "sub_Async1",
+      last_checkout_created: null,
+    });
+  });
+});
