@@ -726,17 +726,30 @@ async function settleCancels(
 ): Promise<boolean> {
   const { results } = await db
     .prepare(
-      "SELECT subscription_id FROM pending_cancels WHERE customer_id = ?",
+      "SELECT p.subscription_id, t.stripe_subscription_id AS current_id FROM pending_cancels p LEFT JOIN tiers t ON t.stripe_customer_id = p.customer_id WHERE p.customer_id = ?",
     )
     .bind(customer)
-    .all<{ subscription_id: string }>();
+    .all<{ subscription_id: string; current_id: string | null }>();
   if (results.length === 0) return true;
   const cfg: StripeConfig = {
     secretKey: env.STRIPE_SECRET_KEY ?? "",
     ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
   };
   let ok = true;
-  for (const { subscription_id: id } of results) {
+  for (const { subscription_id: id, current_id } of results) {
+    // Never the row's own subscription: dropped without a Stripe call (a
+    // queued id can end up current, e.g. a stale queue meeting a later
+    // adoption).
+    if (id === current_id) {
+      await db
+        .prepare(
+          "DELETE FROM pending_cancels WHERE subscription_id = ? AND customer_id = ?",
+        )
+        .bind(id, customer)
+        .run();
+      log("pending_is_current_dropped");
+      continue;
+    }
     try {
       await cancelSubscription({ subscriptionId: id }, cfg);
     } catch {

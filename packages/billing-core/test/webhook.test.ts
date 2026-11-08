@@ -2282,6 +2282,25 @@ describe("pending cancels are a table, settled together (#1568)", () => {
     expect(await pending()).toEqual([]);
   });
 
+  it("a queued id equal to the row's current subscription is dropped without any Stripe call: the row's own is never cancelled", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'team', status = 'active', stripe_subscription_id = 'sub_Cur1' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    await queue("sub_Cur1", CUS_A);
+    await queue("sub_Gone1", CUS_A);
+    const s = stripe();
+    expect((await deliver(ping(), { env: s.e })).status).toBe(200);
+    expect(s.calls).toEqual(["GET sub_Gone1", "DELETE sub_Gone1"]);
+    expect(await pending()).toEqual([]);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_Cur1",
+    });
+  });
+
   it("an upgrade queues the replaced subscription in the same batch as the event; the row can never queue its own subscription", async () => {
     await db
       .prepare(
