@@ -96,15 +96,17 @@ function fakeStripe(override?: Override) {
           k,
           c.path === "/v1/customers"
             ? { id: `cus_fake${n}` }
-            : c.path === "/v1/checkout/sessions"
-              ? {
-                  id: `cs_test_${n}`,
-                  url: `https://checkout.stripe.com/c/pay/cs_test_${n}`,
-                }
-              : {
-                  id: `bps_${n}`,
-                  url: `https://billing.stripe.com/p/session/test_${n}`,
-                },
+            : c.path === "/v1/subscriptions"
+              ? { id: `sub_fake${n}`, object: "subscription" }
+              : c.path === "/v1/checkout/sessions"
+                ? {
+                    id: `cs_test_${n}`,
+                    url: `https://checkout.stripe.com/c/pay/cs_test_${n}`,
+                  }
+                : {
+                    id: `bps_${n}`,
+                    url: `https://billing.stripe.com/p/session/test_${n}`,
+                  },
         );
       }
       return Response.json(replay.get(k));
@@ -1111,5 +1113,180 @@ describe("logs", () => {
       HOST_A,
     ])
       expect(all).not.toContain(bad);
+  });
+});
+
+// ------------------------------------------------------------ POST /solo/start
+
+describe("POST /solo/start (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const DAY = 86_400_000;
+  const SUBS = "/v1/subscriptions";
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const start = (o: Opts = {}, body: Record<string, unknown> = {}) =>
+    req("/solo/start", { install: A, ts: NOW, ...body }, o);
+
+  it("no row: makes the solo row and customer, creates the 30-day no-card subscription on the monthly price, stores its id and the trial end", async () => {
+    const s = fakeStripe();
+    const r = await call(start());
+    expect(r.status).toBe(200);
+    expect(s.calls.map((c) => [c.path, c.key])).toEqual([
+      [CUSTOMERS, `cust-${A}`],
+      [SUBS, `solo-trial-${A}`],
+    ]);
+    expect(s.calls[1]?.form).toEqual({
+      customer: "cus_fake1",
+      "items[0][price]": "price_soloM1",
+      trial_period_days: "30",
+      "trial_settings[end_behavior][missing_payment_method]": "cancel",
+      "metadata[tier]": "solo",
+    });
+    expect(await rowOf(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_customer_id: "cus_fake1",
+      stripe_subscription_id: "sub_fake2",
+      solo_trial_ends_at: NOW + 30 * DAY,
+      version: 1,
+    });
+    // The answer carries no Stripe id.
+    expect(JSON.stringify(await r.json())).not.toMatch(/cus_|sub_/);
+  });
+
+  it("twice, or concurrently: one subscription, one version bump, the same answer", async () => {
+    const s = fakeStripe();
+    const [x, y, z] = await Promise.all([
+      call(start()),
+      call(start()),
+      call(start()),
+    ]);
+    expect([x.status, y.status, z.status]).toEqual([200, 200, 200]);
+    // Racing calls share one Stripe key, so Stripe makes one subscription.
+    const subCalls = () => s.calls.filter((c) => c.path === SUBS);
+    expect(new Set(subCalls().map((c) => c.key))).toEqual(
+      new Set([`solo-trial-${A}`]),
+    );
+    const raced = subCalls().length;
+    const again = await call(start({}, { ts: NOW + 5 }));
+    expect(again.status).toBe(200);
+    // Once stored, a later start makes no call at all.
+    expect(subCalls()).toHaveLength(raced);
+    expect(await rowOf(A)).toMatchObject({
+      stripe_subscription_id: "sub_fake2",
+      version: 1,
+    });
+  });
+
+  it("a row already on team, business or trial is 409 plan_conflict, with no Stripe call and no write", async () => {
+    for (const tier of ["team", "business", "trial"]) {
+      await seed(A, "cus_existingA", tier);
+      const before = await rowOf(A);
+      const s = fakeStripe();
+      const r = await call(start());
+      expect([r.status, await r.json()], tier).toEqual([
+        409,
+        { error: "plan_conflict" },
+      ]);
+      expect(s.calls).toEqual([]);
+      expect(await rowOf(A)).toEqual(before);
+      s.spy.mockRestore();
+      await db.prepare("DELETE FROM tiers").run();
+    }
+  });
+
+  it("a legacy free row becomes solo; a row that had a subscription or a Solo trial never gets another", async () => {
+    await seed(A, "cus_existingA", "free");
+    fakeStripe();
+    await call(start());
+    expect(await rowOf(A)).toMatchObject({
+      tier: "solo",
+      stripe_subscription_id: "sub_fake1",
+    });
+    await db.prepare("DELETE FROM tiers").run();
+    // Its trial ended with no card: lapsed, id kept. No second trial.
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET status = 'lapsed', stripe_subscription_id = 'sub_old1', solo_trial_ends_at = ?1 WHERE install_id = ?2",
+      )
+      .bind(NOW - DAY, A)
+      .run();
+    const s = fakeStripe();
+    const r = await call(start());
+    expect(r.status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect(await r.json()).toMatchObject({ tier: "solo", status: "lapsed" });
+  });
+
+  it("a webhook that got there first (the id is already stored) leaves it alone: no second subscription", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_hook1' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const s = fakeStripe();
+    expect((await call(start())).status).toBe(200);
+    expect(s.calls).toEqual([]);
+  });
+
+  it("config: no key, a live key (sk or rk), an unfilled or malformed monthly price: 500 config, no Stripe call", async () => {
+    const s = fakeStripe();
+    for (const e of [
+      { STRIPE_SECRET_KEY: undefined },
+      { STRIPE_SECRET_KEY: "sk_live_abcdefgh12345678" },
+      { STRIPE_SECRET_KEY: "rk_live_abcdefgh12345678" },
+      { STRIPE_PRICE_SOLO_MONTHLY: "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}" },
+      { STRIPE_PRICE_SOLO_MONTHLY: "prod_1abc" },
+    ]) {
+      const r = await call(start(), { ...baseEnv(), ...e } as Env);
+      expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+    }
+    expect(s.calls).toEqual([]);
+    expect(await rowOf(A)).toMatchObject({ stripe_subscription_id: null });
+  });
+
+  it("signed like the other POSTs: unsigned, wrong install key or stale is 401; extra fields 400; another install's name 403; Stripe errors 502", async () => {
+    const s = fakeStripe();
+    for (const o of [
+      { unsigned: true },
+      { signer: B },
+      { signPath: "/trial/start" },
+    ] as Opts[]) {
+      const r = await call(start(o));
+      expect(r.status).toBe(401);
+    }
+    expect(
+      (await call(req("/solo/start", { install: A, ts: NOW - 3_600_000 })))
+        .status,
+    ).toBe(401);
+    expect((await call(start({}, { plan: "team" }))).status).toBe(400);
+    expect((await call(start({}, { install: B }))).status).toBe(403);
+    expect(s.calls).toEqual([]);
+    vi.restoreAllMocks();
+    fakeStripe((c) =>
+      c.path === SUBS
+        ? Response.json({ error: { type: "api_error" } }, { status: 500 })
+        : undefined,
+    );
+    const r = await call(start());
+    expect([r.status, await r.json()]).toEqual([502, { error: "upstream" }]);
+    // The customer is mapped, the subscription is not: a retry may try again.
+    expect(await rowOf(A)).toMatchObject({
+      stripe_customer_id: "cus_fake1",
+      stripe_subscription_id: null,
+    });
+  });
+
+  it("cf-connecting-ip: the plain 404", async () => {
+    const s = fakeStripe();
+    const r = await call(start({ headers: { "cf-connecting-ip": "1.2.3.4" } }));
+    expect(r.status).toBe(404);
+    expect(s.calls).toEqual([]);
   });
 });

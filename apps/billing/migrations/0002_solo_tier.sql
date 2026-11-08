@@ -14,7 +14,10 @@ CREATE TABLE tiers_new (
   last_read_at INTEGER,
   updated_at INTEGER NOT NULL,
   last_event_created INTEGER,
-  last_invoice_created INTEGER
+  last_invoice_created INTEGER,
+  -- Solo's 30-day no-card trial end (ms): the Solo subscription's own trial,
+  -- never the 14-day Business trial's trial_ends_at.
+  solo_trial_ends_at INTEGER
 );
 
 INSERT INTO tiers_new (

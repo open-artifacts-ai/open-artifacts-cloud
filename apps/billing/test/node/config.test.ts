@@ -118,7 +118,7 @@ describe("migrations", () => {
     );
   });
 
-  it("0002 rebuilds tiers with solo allowed and every other column unchanged", () => {
+  it("0002 rebuilds tiers with solo allowed and 0001's columns kept", () => {
     const sql = readFileSync(
       join(app, "migrations/0002_solo_tier.sql"),
       "utf8",
@@ -131,9 +131,12 @@ describe("migrations", () => {
     const init = readFileSync(join(app, "migrations/0001_init.sql"), "utf8");
     const tiers = (t: string) =>
       t.slice(t.indexOf("CREATE TABLE tiers"), t.indexOf(");") + 2);
-    expect(cols(tiers(sql.replace("tiers_new", "tiers")))).toEqual(
-      cols(tiers(init)),
-    );
+    // 0001's columns, then the Solo columns (0002 is not frozen: billing has
+    // never been deployed).
+    expect(cols(tiers(sql.replace("tiers_new", "tiers")))).toEqual([
+      ...cols(tiers(init)),
+      "solo_trial_ends_at",
+    ]);
     expect(sql).toMatch(
       /DROP TABLE tiers;\nALTER TABLE tiers_new RENAME TO tiers;/,
     );

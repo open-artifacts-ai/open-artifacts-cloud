@@ -36,8 +36,10 @@ import {
   createCheckoutSession,
   createCustomer,
   createPortalSession,
+  createSoloTrialSubscription,
   handleStripeWebhook,
   pruneStripeEvents,
+  SOLO_TRIAL_DAYS,
   StripeApiError,
   type StripeConfig,
   StripeConfigError,
@@ -130,6 +132,10 @@ const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // (trial_ends_at stays set after). Solo's own 30-day no-card trial is a Stripe
 // subscription and never sets trial_ends_at, so it doesn't use this up.
 const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+const SOLO_HELD_SQL =
+  "SELECT tier, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
+const SOLO_TRIAL_MS = SOLO_TRIAL_DAYS * 86_400_000;
+const SOLO_START_SQL = `UPDATE tiers SET tier = 'solo', stripe_subscription_id = ?2, solo_trial_ends_at = ?3, version = version + 1, updated_at = ?4 WHERE install_id = ?1 AND tier IN ('solo', 'free') AND solo_trial_ends_at IS NULL AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?2) RETURNING ${COLS}`;
 const USAGE_SQL =
   "INSERT INTO usage (install_id, month, creators_json, count, received_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (install_id, month) DO UPDATE SET creators_json = excluded.creators_json, count = excluded.count, received_at = excluded.received_at";
 
@@ -215,6 +221,7 @@ const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
   "/checkout": ["install", "ts", "plan", "interval"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
+  "/solo/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
 };
 /** Only a Stripe-hosted page is ever passed back. */
@@ -485,6 +492,66 @@ async function trialStart(
   return Response.json(view(r, now));
 }
 
+/**
+ * POST /solo/start: the Solo plan's 30-day no-card trial, made through the
+ * Stripe API (no Checkout visit). Idempotent per install: the subscription
+ * is keyed solo-trial-<install>, and nothing is created when the row already
+ * holds a subscription or ever had a Solo trial. A row on team, business or
+ * trial is refused. The caller is the provisioner (#1046); the gate's
+ * allowlist does not forward it for installs.
+ */
+async function soloStart(
+  env: Env,
+  install: string,
+  body: Record<string, unknown>,
+  now: number,
+) {
+  if (mismatched(body, install)) return bad("install_mismatch", 403);
+  const priceId = env.STRIPE_PRICE_SOLO_MONTHLY;
+  if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
+    console.error("billing stripe config", install);
+    return bad("config", 500);
+  }
+  const db = env.BILLING_DB;
+  const held = await db.prepare(SOLO_HELD_SQL).bind(install).first<{
+    tier: string | null;
+    stripe_subscription_id: string | null;
+    solo_trial_ends_at: number | null;
+  }>();
+  if (held?.tier && held.tier !== "solo" && held.tier !== "free") {
+    console.log("billing solo plan_conflict", install);
+    return bad("plan_conflict", 409);
+  }
+  const unchanged = async () => {
+    const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
+    console.log("billing solo unchanged", install);
+    return Response.json(view(r, now));
+  };
+  // One trial per install, and nothing beside a subscription already there.
+  if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
+    return unchanged();
+  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const customerId = await customerFor(db, install, cfg, now);
+  const sub = await stripe(install, () =>
+    createSoloTrialSubscription(
+      { customerId, priceId, idempotencyKey: `solo-trial-${install}` },
+      cfg,
+    ),
+  );
+  // Only where no subscription is stored yet (or it is this one: a webhook
+  // that got here first), and only once: concurrent starts bump the version
+  // once.
+  const started = await db
+    .prepare(SOLO_START_SQL)
+    .bind(install, sub.id, now + SOLO_TRIAL_MS, now)
+    .first<TierRow>();
+  if (started) {
+    console.log("billing solo started", install);
+    return Response.json(view(started, now));
+  }
+  return unchanged();
+}
+
 async function usage(
   db: D1Database,
   install: string,
@@ -515,6 +582,7 @@ const GATE = new Set([
   "GET /tier",
   "GET /health",
   "POST /trial/start",
+  "POST /solo/start",
   "POST /usage",
   "POST /checkout",
   "POST /portal",
@@ -593,6 +661,14 @@ export default {
       if (!strictBody(body, url.pathname)) return bad("bad_body");
       if (route === "POST /trial/start")
         return await trialStart(env.BILLING_DB, install, body, now);
+      if (route === "POST /solo/start") {
+        try {
+          return await soloStart(env, install, body, now);
+        } catch (e) {
+          if (e instanceof StripeFailure) return e.res;
+          throw e;
+        }
+      }
       return await usage(env.BILLING_DB, install, body, now);
     } catch {
       // Never the error text: it can carry a D1 message.
