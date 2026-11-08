@@ -48,7 +48,8 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
     const { f, t } = setup();
     const out = quiet();
     await bringUp({}, t, new Run(CONFIG, f.io));
-    const up = (id: string) => at(f.log, new RegExp(`/installs/${id}/upgrade$`));
+    const up = (id: string) =>
+      at(f.log, new RegExp(`/installs/${id}/upgrade$`));
     const creds = (id: string) =>
       at(f.log, new RegExp(`/installs/${id}/redline-creds$`));
     expect(up(CONFIG.rlA.id)).toBeGreaterThan(-1);
@@ -103,24 +104,24 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
   it("a failing install fails the bring-up, names itself, and the other still runs to the end", async () => {
     const { f, t } = setup();
     const out = quiet();
-    await expect(
-      bringUp({}, t, refuseUp(f, CONFIG.rlA.id)),
-    ).rejects.toThrow(/^rl-a: /);
+    await expect(bringUp({}, t, refuseUp(f, CONFIG.rlA.id))).rejects.toThrow(
+      /^rl-a: /,
+    );
     // rl-b was awaited to the end: its creds exist, rl-a has none.
     expect(existsSync(credFile(t, "b", "PAT"))).toBe(true);
     expect(existsSync(credFile(t, "b", "HOOK_KEY"))).toBe(true);
     expect(existsSync(credFile(t, "a", "PAT"))).toBe(false);
-    expect(
-      out.mock.calls.map((c) => String(c[0])).join(""),
-    ).toContain("rl-b: R26 creds written");
+    expect(out.mock.calls.map((c) => String(c[0])).join("")).toContain(
+      "rl-b: R26 creds written",
+    );
   });
 
   it("the same when rl-b is the one that fails", async () => {
     const { f, t } = setup();
     quiet();
-    await expect(
-      bringUp({}, t, refuseUp(f, CONFIG.rlB.id)),
-    ).rejects.toThrow(/^rl-b: /);
+    await expect(bringUp({}, t, refuseUp(f, CONFIG.rlB.id))).rejects.toThrow(
+      /^rl-b: /,
+    );
     expect(existsSync(credFile(t, "a", "PAT"))).toBe(true);
     expect(existsSync(credFile(t, "b", "PAT"))).toBe(false);
   });
@@ -141,8 +142,6 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
       (e: Error) => e,
     );
     expect(err?.message).toMatch(/^rl-a: /);
-    expect(
-      out.mock.calls.map((c) => String(c[0])).join(""),
-    ).toMatch(/rl-b: /);
+    expect(out.mock.calls.map((c) => String(c[0])).join("")).toMatch(/rl-b: /);
   });
 });

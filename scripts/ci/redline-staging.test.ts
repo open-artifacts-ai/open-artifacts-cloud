@@ -48,11 +48,7 @@ const pick = (
 };
 const named = (n: string) => pick(steps, n);
 const t19Named = (n: string) => pick(t19Steps, n);
-const runBash = (
-  script: string,
-  env: Record<string, string>,
-  cwd?: string,
-) =>
+const runBash = (script: string, env: Record<string, string>, cwd?: string) =>
   spawnSync("bash", ["-c", script], {
     env: { PATH: process.env.PATH, ...env },
     encoding: "utf8",
@@ -432,7 +428,9 @@ describe("redline-staging.yml", () => {
       // The workflow no longer records a deviation from 4.4, and T19's shell
       // has nothing to unset.
       expect(text).not.toContain("Deviation from 4.4");
-      expect(text).toContain('id-token on the redline job only, not t19" holds');
+      expect(text).toContain(
+        'id-token on the redline job only, not t19" holds',
+      );
       expect(
         steps.some((s) => /Delete the JWT and prod files/.test(s.name ?? "")),
       ).toBe(false);
@@ -506,7 +504,9 @@ describe("redline-staging.yml", () => {
 
     it("the t19 job's targets: the base JSON plus its own secretsDir, nothing else", () => {
       const st = t19Named("Set the targets");
-      expect(st.env).toEqual({ REDLINE_TARGETS_BASE: "${{ vars.REDLINE_TARGETS }}" });
+      expect(st.env).toEqual({
+        REDLINE_TARGETS_BASE: "${{ vars.REDLINE_TARGETS }}",
+      });
       expect(st.run).not.toContain("${{");
       const tmp = mkdtempSync(join(tmpdir(), "t19-targets-"));
       try {
@@ -532,16 +532,15 @@ describe("redline-staging.yml", () => {
 
   describe("the hook key hand-off: per run, sealed only, the private key stays", () => {
     const uploads = (list: Record<string, any>[]) =>
-      list.filter((s) => String(s.uses ?? "").startsWith("actions/upload-artifact"));
+      list.filter((s) =>
+        String(s.uses ?? "").startsWith("actions/upload-artifact"),
+      );
 
     it("the artifacts are named per run and attempt, and carry only the public key, the sealed key and the version", () => {
       const names = (list: Record<string, any>[]) =>
         uploads(list).map((u) => String(u.with.name));
       const per = "${{ github.run_id }}-${{ github.run_attempt }}";
-      expect(names(t19Steps)).toEqual([
-        `t19-recipient-${per}`,
-        "t19-report",
-      ]);
+      expect(names(t19Steps)).toEqual([`t19-recipient-${per}`, "t19-report"]);
       expect(names(steps)).toEqual([
         "redline-staged-version",
         `t19-handoff-${per}`,
@@ -549,7 +548,9 @@ describe("redline-staging.yml", () => {
         "redline-report",
       ]);
       const pub = uploads(t19Steps)[0];
-      expect(pub?.with.path).toBe("${{ runner.temp }}/t19-recipient/public-key");
+      expect(pub?.with.path).toBe(
+        "${{ runner.temp }}/t19-recipient/public-key",
+      );
       // Never the private key, the recipient directory, or a secrets directory.
       const all = JSON.stringify([...uploads(steps), ...uploads(t19Steps)]);
       expect(all).not.toMatch(/private-key|redline-secrets|HOOK_KEY/);
@@ -561,7 +562,8 @@ describe("redline-staging.yml", () => {
         "${{ runner.temp }}/t19-handoff",
         "${{ runner.temp }}/t19-nohandoff",
       ]);
-      for (const u of [...handoff, pub]) expect(u?.with["retention-days"]).toBe(1);
+      for (const u of [...handoff, pub])
+        expect(u?.with["retention-days"]).toBe(1);
     });
 
     it("the redline job seals only after rl-a and rl-b report the tag, to the public key the t19 job uploaded", () => {
@@ -574,9 +576,11 @@ describe("redline-staging.yml", () => {
         'pnpm --filter @oa/redline provisioning t19-seal "$pub/public-key" "$out/sealed"',
       );
       expect(key.run).toContain(
-        't19-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}',
+        "t19-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
       );
-      expect(key.run).toContain('cp "$RUNNER_TEMP/redline-staged/version.txt" "$out/version.txt"');
+      expect(key.run).toContain(
+        'cp "$RUNNER_TEMP/redline-staged/version.txt" "$out/version.txt"',
+      );
       expect(key.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
     });
 
@@ -646,11 +650,15 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       const sb = sandbox();
       try {
         // Available after two failed tries: the wait polls, then stops.
-        const ok = runBash(String(wait.run), sb.env({ FAIL_N: "2", FILES: "sealed version.txt" }));
+        const ok = runBash(
+          String(wait.run),
+          sb.env({ FAIL_N: "2", FILES: "sealed version.txt" }),
+        );
         expect(ok.status, ok.stdout + ok.stderr).toBe(0);
         expect(sb.read("log").split("\n").filter(Boolean)).toHaveLength(3);
         expect(sb.read("log")).toContain(
-          "run download 42 -R o/r -n t19-handoff-42-2 -D " + join(sb.temp, "t19-sealed"),
+          "run download 42 -R o/r -n t19-handoff-42-2 -D " +
+            join(sb.temp, "t19-sealed"),
         );
         expect(existsSync(join(sb.temp, "t19-sealed", "sealed"))).toBe(true);
       } finally {
@@ -668,9 +676,14 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       // Nothing ever arrives: the deadline fails it.
       const sb3 = sandbox();
       try {
-        const late = runBash(String(wait.run), sb3.env({ FAIL_N: "999", WAIT_S: "0" }));
+        const late = runBash(
+          String(wait.run),
+          sb3.env({ FAIL_N: "999", WAIT_S: "0" }),
+        );
         expect(late.status).toBe(1);
-        expect(late.stdout).toContain("no hand-off from the redline job within 0 s");
+        expect(late.stdout).toContain(
+          "no hand-off from the redline job within 0 s",
+        );
       } finally {
         rmSync(sb3.dir, { recursive: true, force: true });
       }
@@ -681,7 +694,10 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       const sb = sandbox();
       try {
         mkdirSync(join(sb.temp, "redline-staged"));
-        writeFileSync(join(sb.temp, "redline-staged", "version.txt"), "0.97.0\n");
+        writeFileSync(
+          join(sb.temp, "redline-staged", "version.txt"),
+          "0.97.0\n",
+        );
         const ok = runBash(
           String(key.run),
           sb.env({ FAIL_N: "1", FILES: "public-key" }),
@@ -698,9 +714,14 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       }
       const sb2 = sandbox();
       try {
-        const late = runBash(String(key.run), sb2.env({ FAIL_N: "999", WAIT_S: "0" }));
+        const late = runBash(
+          String(key.run),
+          sb2.env({ FAIL_N: "999", WAIT_S: "0" }),
+        );
         expect(late.status).toBe(1);
-        expect(late.stdout).toContain("no public key from the t19 job within 0 s");
+        expect(late.stdout).toContain(
+          "no public key from the t19 job within 0 s",
+        );
         expect(sb2.read("pnpm")).toBe("");
       } finally {
         rmSync(sb2.dir, { recursive: true, force: true });
@@ -713,7 +734,9 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       );
       expect(real?.id).toBe("handoff-up");
       expect(real?.if).toBe("steps.t19-key.outcome == 'success'");
-      expect(marker?.if).toBe("always() && steps.handoff-up.outcome != 'success'");
+      expect(marker?.if).toBe(
+        "always() && steps.handoff-up.outcome != 'success'",
+      );
       expect(real?.with.name).toBe(marker?.with.name);
       const mk = named("Tell the t19 job no key is coming");
       expect(mk.if).toBe(marker?.if);
@@ -734,9 +757,9 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       expect(done.if).toBe("always() && steps.handoff-up.outcome == 'success'");
       expect(revoke.if).toBe("always() && steps.mint.outcome == 'success'");
       // The wait outlasts the t19 job's own timeout, so only a hung API ends it first.
-      expect(Number(/WAIT_S:-(\d+)/.exec(String(done.run))?.[1])).toBeGreaterThan(
-        t19Job["timeout-minutes"] * 60,
-      );
+      expect(
+        Number(/WAIT_S:-(\d+)/.exec(String(done.run))?.[1]),
+      ).toBeGreaterThan(t19Job["timeout-minutes"] * 60);
       const sb = sandbox();
       try {
         writeFileSync(
@@ -753,7 +776,9 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         expect(ok.stdout).toContain("the t19 job has ended");
         // queued, an API error, in progress, then completed: four polls.
         expect(sb.read("log").split("\n").filter(Boolean)).toHaveLength(4);
-        expect(sb.read("log")).toContain("repos/o/r/actions/runs/42/attempts/2/jobs");
+        expect(sb.read("log")).toContain(
+          "repos/o/r/actions/runs/42/attempts/2/jobs",
+        );
       } finally {
         rmSync(sb.dir, { recursive: true, force: true });
       }
@@ -766,7 +791,9 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         );
         const late = runBash(String(done.run), sb2.env({ WAIT_S: "0" }));
         expect(late.status).toBe(0);
-        expect(late.stdout).toContain("::warning::the t19 job is still in_progress after 0 s: revoking anyway");
+        expect(late.stdout).toContain(
+          "::warning::the t19 job is still in_progress after 0 s: revoking anyway",
+        );
       } finally {
         rmSync(sb2.dir, { recursive: true, force: true });
       }

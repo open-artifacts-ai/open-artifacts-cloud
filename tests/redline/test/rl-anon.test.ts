@@ -11,9 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  claimHookSlot,
   HOOK_LIMIT,
   HOOK_WINDOW_MS,
-  claimHookSlot,
   hookWindowCount,
 } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { InfraError } from "../src/fetch-timeout.ts";
@@ -23,17 +23,17 @@ import {
   anonKeys,
   classify,
   guardedFetch,
+  KEY_TABLE,
   ledgerClaimWith,
   liveTargetsFromEnv,
-  phaseScopes,
-  WAIT_BUDGET_MS,
-  KEY_TABLE,
   MEMBERS_LOCK,
-  pacingNote,
   paceAnon,
+  pacingNote,
+  phaseScopes,
   resetPacingStats,
   targetsFromEnv,
   tripwire,
+  WAIT_BUDGET_MS,
 } from "../src/rl-anon.ts";
 
 const A: AnonTarget = {
@@ -444,7 +444,9 @@ describe("wait budget follow-ups (cloud #24)", () => {
           }),
         waitBudgetMs: 20,
       });
-      await expect(post(f)).rejects.toThrow(/infra: pacing: this case has waited/);
+      await expect(post(f)).rejects.toThrow(
+        /infra: pacing: this case has waited/,
+      );
       expect(seen).toBeDefined();
       expect(seen?.aborted).toBe(true);
     });
@@ -482,9 +484,9 @@ describe("wait budget follow-ups (cloud #24)", () => {
         // The ledger for tok:ip is full: a new claim has to sleep.
         for (let i = 0; i < HOOK_LIMIT; i++)
           await claimHookSlot("rl-anon/tok:ip", { root, now: () => now });
-        expect(hookWindowCount("rl-anon/tok:ip", { root, now: () => now })).toBe(
-          HOOK_LIMIT,
-        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(HOOK_LIMIT);
         let wake: () => void = () => {};
         const claim = ledgerClaimWith({
           root,
@@ -494,27 +496,29 @@ describe("wait budget follow-ups (cloud #24)", () => {
         const c = new AbortController();
         const pending = claim("tok:ip", c.signal);
         c.abort();
-        await expect(pending).rejects.toThrow(/aborted before a slot was taken/);
+        await expect(pending).rejects.toThrow(
+          /aborted before a slot was taken/,
+        );
         // The window passes and the underlying sleep ends: a claim that kept
         // going would now take a slot for the request that was never sent.
         now += HOOK_WINDOW_MS + 1_000;
         wake();
         await new Promise((r) => setImmediate(r));
-        expect(hookWindowCount("rl-anon/tok:ip", { root, now: () => now })).toBe(
-          0,
-        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
         // An already aborted signal never claims at all.
         await expect(claim("tok:ip", c.signal)).rejects.toThrow(
           /aborted before a slot was taken/,
         );
-        expect(hookWindowCount("rl-anon/tok:ip", { root, now: () => now })).toBe(
-          0,
-        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
         // And without a signal it claims as before.
         await claim("tok:ip");
-        expect(hookWindowCount("rl-anon/tok:ip", { root, now: () => now })).toBe(
-          1,
-        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(1);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -562,7 +566,9 @@ describe("wait budget follow-ups (cloud #24)", () => {
       expect(src).toMatch(/const phase = phaseScopes\(\);/);
       expect(src).toMatch(/beforeAll\(\(\) => phase\.reset\(\)\);/);
       expect(src).toMatch(/afterEach\(\(\) => phase\.reset\(\)\);/);
-      expect(src).toMatch(/scope: \(\) => getCurrentTest\(\) \?\? phase\.current\(\)/);
+      expect(src).toMatch(
+        /scope: \(\) => getCurrentTest\(\) \?\? phase\.current\(\)/,
+      );
     });
   });
 

@@ -141,7 +141,9 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
 
   it("T19's people and spaces are its own: t19-<run>-<tag> users and test-t19-* spaces; the suite makes none", () => {
     const fx = read(`${dir}/rl-a/fixtures.ts`);
-    expect(fx).toMatch(/export const email = \(tag: string\) => `t19-\$\{RUN\}-\$\{tag\}@/);
+    expect(fx).toMatch(
+      /export const email = \(tag: string\) => `t19-\$\{RUN\}-\$\{tag\}@/,
+    );
     expect(fx).toMatch(/id: "test-t19-eng"/);
     expect(fx).toMatch(/id: "test-t19-exec"/);
     // No T19 spec writes through a name outside that prefix on rl-a.
@@ -166,7 +168,10 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
         if (/["'`]\/api\/v1\/members["'`]/.test(t)) hits.push(`${d}/${f}`);
       }
     // surfaces.ts only names routes (a status is judged, never a body).
-    expect(hits.sort()).toEqual(["live/credentials.test.ts", "src/surfaces.ts"]);
+    expect(hits.sort()).toEqual([
+      "live/credentials.test.ts",
+      "src/surfaces.ts",
+    ]);
     const c = read("tests/redline/live/credentials.test.ts");
     expect(c).toMatch(/getJson\(T\.b, "\/api\/v1\/members"/);
     expect(c).not.toMatch(/getJson\(T\.a, "\/api\/v1\/members"/);

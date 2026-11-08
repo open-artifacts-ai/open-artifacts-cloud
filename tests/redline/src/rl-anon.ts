@@ -245,8 +245,7 @@ const abortableSleep =
       );
     });
 
-const timerSleep = (ms: number) =>
-  new Promise<void>((r) => setTimeout(r, ms));
+const timerSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * The public ledger claim for one key, one ledger per key (#24: a claim told
