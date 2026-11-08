@@ -2907,3 +2907,54 @@ describe("last_checkout_created moves only when a Checkout adopts its subscripti
     });
   });
 });
+
+// ------------------------------------------------- the previous subscription is read inside the batch
+
+describe("concurrent paid Checkouts cannot orphan a subscription (#1568)", () => {
+  const KEY = "sk_test_notarealkey0000";
+  it("two paid Team Checkouts racing on a Solo row: the later wins, and both others are cancelled", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', status = 'active', stripe_subscription_id = 'sub_Old1', last_event_created = NULL, last_invoice_created = NULL, last_checkout_created = NULL WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    const cancelled: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const id = new URL(url).pathname.split("/").pop() as string;
+      if (init.method === "DELETE") cancelled.push(id);
+      return Response.json({
+        id,
+        status: init.method === "GET" ? "active" : "canceled",
+      });
+    }) as unknown as typeof fetch;
+    const e = { ...env, STRIPE_SECRET_KEY: KEY, stripeFetch: f } as WebhookEnv;
+    const mk = (sub: string, created: number) =>
+      event(
+        "checkout.session.completed",
+        {
+          customer: CUS_A,
+          subscription: sub,
+          payment_status: "paid",
+          metadata: { tier: "team" },
+        },
+        { created },
+      );
+    const rs = await Promise.all([
+      deliver(mk("sub_T1", T + 10), { env: e }),
+      deliver(mk("sub_T2", T + 20), { env: e }),
+      deliver(mk("sub_T3", T + 15), { env: e }),
+    ]);
+    expect(rs.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_T2",
+    });
+    expect([...new Set(cancelled)].sort()).toEqual([
+      "sub_Old1",
+      "sub_T1",
+      "sub_T3",
+    ]);
+    expect(await pending()).toEqual([]);
+  });
+});

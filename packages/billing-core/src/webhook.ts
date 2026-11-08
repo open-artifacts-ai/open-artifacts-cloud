@@ -783,14 +783,6 @@ async function settleCancels(
   return failed;
 }
 
-/**
- * Queues the subscription a paid checkout replaced (?1), once the row holds
- * the checkout's (?3): in the same batch as the event, so it can't be lost.
- * Never the row's current subscription.
- */
-const QUEUE_PREVIOUS =
-  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?4 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id = ?3 AND stripe_subscription_id != ?1)";
-
 const QUEUE_UNADOPTED =
   "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
 
@@ -918,35 +910,27 @@ export async function handleStripeWebhook(
         ev.object.payment_status === "no_payment_required")
         ? eventSub
         : null;
-    let queue: D1PreparedStatement[] = [];
-    if (paidSub) {
-      const prev = await db
-        .prepare(
-          "SELECT stripe_subscription_id AS id, tier, status, solo_status FROM tiers WHERE stripe_customer_id = ?",
-        )
-        .bind(customer)
-        .first<{
-          id: string | null;
-          tier: string | null;
-          status: string | null;
-          solo_status: string | null;
-        }>();
-      const live =
-        prev?.id &&
-        prev.id !== paidSub &&
-        (prev.tier === "trial"
-          ? prev.solo_status === "active" || prev.solo_status === "past_due"
-          : (prev.tier === "solo" ||
-              prev.tier === "team" ||
-              prev.tier === "business") &&
-            (prev.status === "active" ||
-              prev.status === "past_due" ||
-              prev.status === "suspended"));
-      if (live)
-        queue = [
-          db.prepare(QUEUE_PREVIOUS).bind(prev.id, customer, paidSub, ev.id),
-        ];
-    }
+    const queue: D1PreparedStatement[] = [];
+    // A paid checkout replaces the row's live subscription. Which one is read
+    // INSIDE the batch, before the update and under the same order and hold
+    // conditions (never the row's current subscription, and never when the
+    // checkout won't be adopted), so concurrent checkouts can't orphan one:
+    // D1 runs a batch as one transaction. The event insert stays the statement
+    // right before the update (its changes() gates the update).
+    const preQueue: D1PreparedStatement[] = paidSub
+      ? [
+          db
+            .prepare(
+              `INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT stripe_subscription_id, stripe_customer_id, ?4 FROM tiers WHERE stripe_customer_id = ?1 AND ${PREV_LIVE} AND stripe_subscription_id != ?2 AND ${IN_ORDER_CHECKOUT.replaceAll("?1", "?3")}${
+                isObj(ev.object.metadata) &&
+                asTier(ev.object.metadata.tier) === "solo"
+                  ? ` AND NOT ${HOLD}`
+                  : ""
+              }`,
+            )
+            .bind(customer, paidSub, ev.created, ev.id),
+        ]
+      : [];
     // A paid subscription the row did not adopt (an older Checkout, or a Solo
     // on a live Team) is queued for cancel, in the same batch: never one the
     // row holds. Runs on a replay too, so a lost queue can't stay lost.
@@ -954,6 +938,7 @@ export async function handleStripeWebhook(
       queue.push(db.prepare(QUEUE_UNADOPTED).bind(paidSub, customer, ev.id));
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
+      ...preQueue,
       db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
       db
         .prepare(
@@ -979,13 +964,14 @@ export async function handleStripeWebhook(
     // Only the event's own queued cancels fail it: the replaced subscription
     // and the paid one the row did not adopt.
     const settled = !failed.some((f) => f.event === ev.id);
-    if ((res[1]?.meta.changes ?? 0) === 0) {
+    const evIdx = 1 + preQueue.length;
+    if ((res[evIdx]?.meta.changes ?? 0) === 0) {
       log("replay");
       return settled
         ? json({ received: true })
         : json({ error: "unavailable" }, 500);
     }
-    const install = res[2]?.results[0]?.install_id ?? null;
+    const install = res[evIdx + 1]?.results[0]?.install_id ?? null;
     log(install ? "applied" : "stale", install);
     return settled
       ? json({ received: true })
