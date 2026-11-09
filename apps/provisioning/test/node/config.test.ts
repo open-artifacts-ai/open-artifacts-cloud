@@ -163,6 +163,11 @@ describe("wrangler.jsonc", () => {
         for (const k of OIDC)
           if (env === "staging") expect(e.vars[k]).toBeTruthy();
           else expect(e.vars[k]).toBeUndefined();
+        // Only staging sets the session lifetime; prod has no such var, so it
+        // stays at 8 h whatever a deploy puts in its environment.
+        if (env === "staging")
+          expect(e.vars.ADMIN_SESSION_TTL_HOURS).toBe("168");
+        else expect(e.vars).not.toHaveProperty("ADMIN_SESSION_TTL_HOURS");
         if (env === "staging") {
           expect(e.vars.OIDC_AUDIENCE).toBe(`https://api.${APP.staging}`);
           // Red-line's, the test admin's (#1053) and the test member's
