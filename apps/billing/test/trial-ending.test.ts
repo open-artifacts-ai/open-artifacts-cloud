@@ -24,13 +24,26 @@ const id = (n: number) => `i${String(n).padStart(11, "0")}`;
 
 async function row(
   n: number,
-  o: { tier?: string; status?: string; ends: number | null },
+  o: {
+    tier?: string;
+    status?: string;
+    ends: number | null;
+    soloStatus?: string;
+    checkedOut?: boolean;
+  },
 ) {
   await db
     .prepare(
-      "INSERT INTO tiers (install_id, tier, status, solo_trial_ends_at, version, updated_at) VALUES (?1, ?2, ?3, ?4, 1, 0)",
+      "INSERT INTO tiers (install_id, tier, status, solo_trial_ends_at, solo_status, solo_checked_out, version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0)",
     )
-    .bind(id(n), o.tier ?? "solo", o.status ?? "active", o.ends)
+    .bind(
+      id(n),
+      o.tier ?? "solo",
+      o.status ?? "active",
+      o.ends,
+      o.soloStatus ?? null,
+      o.checkedOut ? 1 : null,
+    )
     .run();
 }
 
@@ -65,11 +78,35 @@ describe("GET /solo/trial-ending", () => {
     await row(1, { ends: NOW - DAY });
     await row(2, { ends: null });
     await row(3, { tier: "team", ends: NOW + 3 * DAY });
-    await row(4, { tier: "trial", ends: NOW + 3 * DAY });
+    await row(4, { tier: "trial", ends: NOW + 3 * DAY }); // no live Solo under it
+    await row(7, { tier: "trial", soloStatus: "lapsed", ends: NOW + 3 * DAY });
     await row(5, { status: "lapsed", ends: NOW + 3 * DAY });
     await row(6, { status: "suspended", ends: NOW + 3 * DAY });
     expect(await (await get(win())).json()).toEqual({
       installs: [],
+      next: null,
+    });
+  });
+
+  it("lists a Solo trial kept live under the Business trial", async () => {
+    await row(1, { tier: "trial", soloStatus: "active", ends: NOW + 3 * DAY });
+    expect(await (await get(win())).json()).toEqual({
+      installs: [{ installId: id(1), trialEndsAt: NOW + 3 * DAY }],
+      next: null,
+    });
+  });
+
+  it("skips an install that checked out during the trial (a card is on file)", async () => {
+    await row(1, { checkedOut: true, ends: NOW + 3 * DAY });
+    await row(2, {
+      tier: "trial",
+      soloStatus: "active",
+      checkedOut: true,
+      ends: NOW + 3 * DAY,
+    });
+    await row(3, { ends: NOW + 3 * DAY });
+    expect(await (await get(win())).json()).toEqual({
+      installs: [{ installId: id(3), trialEndsAt: NOW + 3 * DAY }],
       next: null,
     });
   });

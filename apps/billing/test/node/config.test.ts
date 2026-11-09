@@ -137,6 +137,7 @@ describe("migrations", () => {
       ...cols(tiers(init)),
       "last_checkout_created",
       "solo_trial_ends_at",
+      "solo_checked_out",
       "solo_status",
       "solo_grace_until",
       "open_checkout_id",

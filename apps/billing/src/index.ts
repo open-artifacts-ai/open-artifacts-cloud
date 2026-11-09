@@ -575,11 +575,14 @@ async function tier(db: D1Database, install: string, now: number) {
 }
 
 // Solo trials ending in (from, to], oldest install id first, after a cursor.
-// Only a live Solo row: another tier, a lapsed or suspended status, or a Solo
-// that paid (a paid checkout or live subscription sets solo_trial_ends_at to
-// the time it went live, which is past) never matches.
+// Only a live no-card Solo trial: a Solo row (or a Solo kept live under the
+// 14-day Business trial, tier trial with solo_status active), active, that
+// never checked out. Another tier, a lapsed or suspended status, a Solo that
+// paid (solo_trial_ends_at is then past) and one that checked out during the
+// trial (it keeps solo_trial_ends_at but has a card, solo_checked_out) never
+// match.
 const SOLO_ENDING_SQL =
-  "SELECT install_id, solo_trial_ends_at FROM tiers WHERE tier = 'solo' AND status = 'active' AND solo_trial_ends_at > ?1 AND solo_trial_ends_at <= ?2 AND install_id > ?3 ORDER BY install_id LIMIT ?4";
+  "SELECT install_id, solo_trial_ends_at FROM tiers WHERE ((tier = 'solo' AND status = 'active') OR (tier = 'trial' AND status = 'active' AND solo_status = 'active')) AND solo_checked_out IS NULL AND solo_trial_ends_at > ?1 AND solo_trial_ends_at <= ?2 AND install_id > ?3 ORDER BY install_id LIMIT ?4";
 const SOLO_ENDING_MAX = 200;
 
 /** GET /solo/trial-ending?from=<ms>&to=<ms>[&after=<install>][&limit=<n>]. */

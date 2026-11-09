@@ -124,6 +124,10 @@ describe("trial reminder: the due window", () => {
     expect(m.text).toContain(`https://${row.app_host}/settings/plan`);
     expect(m.html).toContain(`href="https://${row.app_host}/settings/plan"`);
     expect(m.html).toContain("v:roundrect");
+    // The copy is true only for a no-card trial: billing's list skips an
+    // install that checked out, so every recipient has no card on file.
+    expect(m.html).toContain("there is no card on file yet");
+    expect(m.text).toContain("there is no card on file yet");
     expect(m.text).not.toMatch(/—/);
     const [r] = await reminders();
     expect(r).toMatchObject({
