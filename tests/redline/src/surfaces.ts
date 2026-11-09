@@ -386,7 +386,6 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /bus/links/confirm",
   // #1346: the reach confirm page, the same kind (PUBLIC_ROUTES).
   "GET /bus/reach/confirm",
-  "POST /bus/reach/confirm/view",
   "POST /bus/reach/confirm",
   // Hosted billing: Checkout, Portal and the usage report open Stripe or
   // reach billing only for a person in a browser session (billing.ts
