@@ -37,9 +37,15 @@ set -uo pipefail
 # .github/workflows/hosted-release.yml is this repo's own workflow (#1056 C3):
 # public has no such file, so it is an extra in the overlay tree by design. It
 # is listed by exact path so that any other new workflow still fails.
+# The same holds for the pin-bump opener (cloud #20): a workflow, its script and
+# its test that public never had and the private-paths list (public's, at S)
+# does not name.
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
+  .github/workflows/pin-bump.yml
+  scripts/ci/pin-bump.ts
+  scripts/ci/pin-bump.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
