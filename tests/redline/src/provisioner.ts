@@ -1,10 +1,12 @@
-// The provisioner probes (pending/provisioner.test.ts): a signup goes in the
-// way SS4 sends one, a pending signups row and its signup_secret in platform
-// D1, then { signupId } on oa-s-signups, and the probe reads what the
-// provisioner made of it. Staging only; the config is REDLINE_STG_PROVISIONER.
+// The provisioner probes (live/provisioner.test.ts): a replayed { signupId }
+// on oa-s-signups for a standing ready signup, and a create for a taken slug
+// through R4, each checked against platform D1. Staging only; the config is
+// REDLINE_STG_PROVISIONER (the workflow builds it, tokenFile included).
 // The token never reaches a report: errors name the call and its status only.
 
-import { randomBytes } from "node:crypto";
+import { join } from "node:path";
+import { boundFetch } from "./fetch-timeout.ts";
+import { AUDIENCES, jwtSource, mask, OIDC_FILES } from "./oidc.ts";
 import { readSecretFile } from "./targets.ts";
 
 const API = "https://api.cloudflare.com/client/v4";
@@ -15,11 +17,16 @@ export interface ProvisionerProbe {
   platformDbId: string;
   /** The oa-s-signups queue id. */
   signupsQueueId: string;
-  /** A 0600 file: D1 Edit on the platform DB and Queues Write on oa-s-signups. */
+  /**
+   * A 0600 file the workflow writes from the REDLINE_STG_PROVISIONER_TOKEN
+   * secret: D1 Edit on the platform DB (the probes only SELECT) and Queues Write on oa-s-signups.
+   * The workflow sets this path itself; the variable never names it.
+   */
   tokenFile: string;
   /**
-   * A standing signup the provisioner already made ready (made once, by the
-   * enable step in docs/ops/hosted.md), replayed by every run.
+   * A standing signup the provisioner already made ready with its welcome
+   * sent (made once, per "Red-line provisioner probes" in docs/ops/hosted.md),
+   * replayed by every run.
    */
   replaySignupId: string;
 }
@@ -53,22 +60,6 @@ export function parseProvisionerProbe(
     tokenFile: field("tokenFile"),
     replaySignupId: field("replaySignupId", ULID_RE),
   };
-}
-
-const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-/** A ULID for `now` (48-bit time, 80 random bits), as SS4 mints one. */
-export function ulid(now = Date.now()): string {
-  let t = now;
-  let time = "";
-  for (let i = 0; i < 10; i++) {
-    time = CROCKFORD[t % 32] + time;
-    t = Math.floor(t / 32);
-  }
-  const r = randomBytes(16);
-  let rand = "";
-  for (let i = 0; i < 16; i++) rand += CROCKFORD[(r[i] as number) % 32];
-  return time + rand;
 }
 
 export type Row = Record<string, unknown>;
@@ -127,35 +118,6 @@ export const SIGNUP_FIELDS =
   "status, install_id, admitted_at, welcome_claimed_at, welcome_sent_at, error, updated_at";
 
 /**
- * Writes a pending signup the way SS4 does: the row, then its secret, both
- * before the message. Two statements, one per call: the REST query takes
- * params for a single statement.
- */
-export async function insertPending(
-  c: ProvisionerClient,
-  s: { signupId: string; slug: string; ownerSub: string; ownerEmail: string },
-  now = Date.now(),
-): Promise<void> {
-  await c.query(
-    "INSERT INTO signups (signup_id, owner_sub, slug, status, created_at, updated_at) VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
-    [s.signupId, s.ownerSub, s.slug, now],
-  );
-  await c.query(
-    "INSERT INTO signup_secret (signup_id, owner_email) VALUES (?1, ?2)",
-    [s.signupId, s.ownerEmail],
-  );
-}
-
-/** Removes a probe's own signup (row and secret). Never a fixture's. */
-export async function removeSignup(
-  c: ProvisionerClient,
-  signupId: string,
-): Promise<void> {
-  await c.query("DELETE FROM signup_secret WHERE signup_id = ?1", [signupId]);
-  await c.query("DELETE FROM signups WHERE signup_id = ?1", [signupId]);
-}
-
-/**
  * Polls `read` every `everyMs` until `done` holds or `ms` runs out; the last
  * value either way. The bound is the caller's, from the provisioner's own
  * limits (its retries and backoff), never a guess at "long enough".
@@ -175,4 +137,60 @@ export async function pollUntil<T>(
     if (now() >= end) return { value, met: false };
     await sleep(everyMs);
   }
+}
+
+/**
+ * R4 `POST /v1/installs` as the GitHub OIDC principal, for a slug that is
+ * taken: the status and error code the Provisioning API answers (409
+ * slug_taken by contract; the refusal happens before anything is written).
+ * Reads the JWT file in secretsDir (minting it in the job, like the other
+ * suites). The api origin is REDLINE_PROV_API, else staging's.
+ */
+export async function createTaken(
+  env: Record<string, string | undefined>,
+  body: { requestId: string; slug: string; ownerEmail: string },
+  f: typeof fetch = boundFetch(globalThis.fetch),
+): Promise<{ status: number; code: string | undefined; text: string }> {
+  let secretsDir: unknown;
+  try {
+    secretsDir = JSON.parse(env.REDLINE_TARGETS ?? "").secretsDir;
+  } catch {}
+  if (typeof secretsDir !== "string" || !secretsDir)
+    throw new Error("REDLINE_TARGETS.secretsDir is required");
+  const api = new URL(
+    env.REDLINE_PROV_API || "https://api.open-artifacts-staging.app",
+  );
+  if (api.protocol !== "https:" || api.pathname !== "/" || api.search)
+    throw new Error("REDLINE_PROV_API must be a bare https origin");
+  const jwt = await jwtSource(
+    join(secretsDir, OIDC_FILES.provisioning),
+    AUDIENCES.provisioning,
+    { env, onMint: mask(env) },
+  )();
+  const res = await f(`${api.origin}/v1/installs`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      authorization: `Bearer ${jwt}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      ...body,
+      tier: "team",
+      auth: { providers: ["email"], domains: [] },
+      testHooks: true,
+    }),
+  });
+  const text = await res.text().catch(() => "");
+  let code: string | undefined;
+  try {
+    const e = (JSON.parse(text) as { error?: unknown }).error;
+    code =
+      typeof e === "string"
+        ? e
+        : typeof (e as { code?: unknown } | null)?.code === "string"
+          ? (e as { code: string }).code
+          : undefined;
+  } catch {}
+  return { status: res.status, code, text };
 }

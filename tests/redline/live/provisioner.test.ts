@@ -1,40 +1,30 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  insertPending,
+  createTaken,
   type ProvisionerClient,
   type ProvisionerProbe,
   parseProvisionerProbe,
   pollUntil,
   provisionerClient,
-  removeSignup,
   SIGNUP_FIELDS,
-  ulid,
 } from "../src/provisioner.ts";
 import { proof } from "../src/report.ts";
 import { loadTargets, type Targets, verifyTarget } from "../src/targets.ts";
 
 // SS3 red-line cases for the hosted provisioner (staging only; #859 and its
 // leftovers). Both are listed in live/manifest.json and run in the `signup`
-// lane (src/lanes.ts). Without REDLINE_STG_PROVISIONER (set from the
-// redline-staging Environment's variable of that name once oa-s-provisioner is
-// deployed) each is unproven-live, which the gate does not accept; local mode
+// lane (src/lanes.ts). Without REDLINE_STG_PROVISIONER (the workflow builds it
+// from the Environment's variable of that name and the REDLINE_STG_PROVISIONER_TOKEN
+// secret) each is unproven-live, which the gate does not accept; local mode
 // has no provisioner and each is staging-only.
 
 let T: Targets;
 let P: ProvisionerProbe | undefined;
 let C: ProvisionerClient;
-/** Signups this run wrote, removed in afterAll (never the fixture). */
-const mine: string[] = [];
 
 const NOT_CONFIGURED =
   "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)";
 
-/**
- * How long a signup for a taken slug may take to end failed: reserve and
- * sweep, then create's check-first slug refusal, a terminal error. No resource
- * is made before that check, so minutes, not create's 45-minute attempt.
- */
-const TAKEN_BOUND_MS = 10 * 60_000;
 /**
  * How long a replay is watched. A ready row is acked on its first delivery
  * (max_batch_size 1, the default 5 s batch timeout); twice that, plus a
@@ -47,10 +37,6 @@ beforeAll(async () => {
   if (T.mode !== "staging") return;
   P = parseProvisionerProbe();
   if (P) C = provisionerClient(P);
-});
-
-afterAll(async () => {
-  for (const id of mine.splice(0)) await removeSignup(C, id);
 });
 
 describe("provisioner", () => {
@@ -97,63 +83,59 @@ describe("provisioner", () => {
     REPLAY_WATCH_MS + 60_000,
   );
 
-  it(
-    "a signup for a taken slug fails cleanly",
-    async (ctx) => {
-      if (T.mode !== "staging")
-        return proof(ctx, "staging-only", "needs the staging provisioner");
-      if (!P) return proof(ctx, "unproven-live", NOT_CONFIGURED);
-      const [owner] = await C.query(
-        "SELECT slug, state, updated_at FROM installs WHERE id = ?1",
-        [T.a.installId],
-      );
-      expect(owner?.state, `${T.a.name} is active`).toBe("active");
-      const slug = String(owner?.slug);
-      const id = ulid();
-      mine.push(id);
-      await insertPending(C, {
-        signupId: id,
-        slug,
-        ownerSub: `redline-${id}`,
-        ownerEmail: `redline-signup@${T.a.testDomain}`,
-      });
-      await C.enqueue(id);
-      const end = await pollUntil(
-        async () =>
-          (
-            await C.query(
-              `SELECT ${SIGNUP_FIELDS} FROM signups WHERE signup_id = ?1`,
-              [id],
-            )
-          )[0],
-        (r) => r?.status === "failed" || r?.status === "ready",
-        TAKEN_BOUND_MS,
-      );
-      expect(end.met, "the signup ended within the bound").toBe(true);
-      expect(end.value).toMatchObject({
-        status: "failed",
-        error: "slug_taken",
-        welcome_claimed_at: null,
-        welcome_sent_at: null,
-      });
-      // No half-made install: the slug still belongs to A alone, unchanged,
-      // and the id reserve picked was never written as an install.
-      expect(
-        await C.query(
-          "SELECT id, state, updated_at FROM installs WHERE slug = ?1",
+  it("a signup for a taken slug fails cleanly", async (ctx) => {
+    if (T.mode !== "staging")
+      return proof(ctx, "staging-only", "needs the staging provisioner");
+    if (!P) return proof(ctx, "unproven-live", NOT_CONFIGURED);
+    // The contract is the Provisioning API's (R4 createInstall: slugHeld,
+    // then onConflict, both slug_taken), not the provisioner's: a taken
+    // name is refused before anything is written.
+    const [owner] = await C.query(
+      "SELECT slug, state, updated_at FROM installs WHERE id = ?1",
+      [T.a.installId],
+    );
+    expect(owner?.state, `${T.a.name} is active`).toBe("active");
+    const slug = String(owner?.slug);
+    const requestId = `rl${process.env.REDLINE_RUN_ID ?? "x"}-taken`
+      .replace(/[^A-Za-z0-9_-]/g, "-")
+      .slice(0, 64)
+      .padEnd(16, "0");
+    const snap = async () =>
+      JSON.stringify({
+        installs: await C.query(
+          "SELECT id, state, updated_at FROM installs WHERE slug = ?1 ORDER BY id",
           [slug],
         ),
-      ).toEqual([
-        { id: T.a.installId, state: "active", updated_at: owner?.updated_at },
-      ]);
-      const reserved = end.value?.install_id;
-      if (reserved)
-        expect(
-          await C.query("SELECT id FROM installs WHERE id = ?1", [reserved]),
-        ).toEqual([]);
-      // A still serves as itself.
-      await verifyTarget(T.a);
-    },
-    TAKEN_BOUND_MS + 60_000,
-  );
+        signups: await C.query(
+          "SELECT signup_id, status, install_id, updated_at FROM signups WHERE slug = ?1 ORDER BY signup_id",
+          [slug],
+        ),
+      });
+    const before = await snap();
+    const res = await createTaken(process.env, {
+      requestId,
+      slug,
+      ownerEmail: `redline-signup@${T.a.testDomain}`,
+    });
+    expect(
+      { status: res.status, code: res.code },
+      `R4 for ${T.a.name}'s slug: ${res.status} ${res.code ?? "no code"}`,
+    ).toEqual({ status: 409, code: "slug_taken" });
+    // Nothing written for it. The job, the signup, its secret and the
+    // lifecycle row go in one D1 batch (create.ts, accept), so no jobs row
+    // for this request id means none of the others either; the slug's
+    // installs and signups are what they were; no message was sent.
+    expect(
+      await C.query("SELECT id FROM jobs WHERE request_id = ?1", [requestId]),
+      "a jobs row for the refused request",
+    ).toEqual([]);
+    expect(await snap(), "installs or signups for the slug changed").toBe(
+      before,
+    );
+    expect(JSON.parse(before).installs).toEqual([
+      { id: T.a.installId, state: "active", updated_at: owner?.updated_at },
+    ]);
+    // A still serves as itself.
+    await verifyTarget(T.a);
+  }, 90_000);
 });

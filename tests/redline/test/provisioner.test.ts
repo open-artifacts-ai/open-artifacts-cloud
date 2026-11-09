@@ -3,12 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PLAN, PLAN_SERIAL } from "../src/lanes.ts";
+import { OIDC_FILES } from "../src/oidc.ts";
 import {
+  createTaken,
   parseProvisionerProbe,
   pollUntil,
   provisionerClient,
   ULID_RE,
-  ulid,
 } from "../src/provisioner.ts";
 import { parseManifest } from "../src/report.ts";
 import liveCfg from "../vitest.live.config.ts";
@@ -25,6 +26,7 @@ const cfg = (v: unknown) => ({ REDLINE_STG_PROVISIONER: JSON.stringify(v) });
 
 describe("the provisioner cases are in the gate", () => {
   const live = readFileSync(join(root, "live/provisioner.test.ts"), "utf8");
+  const src = readFileSync(join(root, "src/provisioner.ts"), "utf8");
   const names = [
     "a replayed signup creates nothing new",
     "a signup for a taken slug fails cleanly",
@@ -57,6 +59,16 @@ describe("the provisioner cases are in the gate", () => {
       ).toHaveLength(1);
   });
 
+  it("the taken-slug case goes through R4 and asserts slug_taken with nothing written", () => {
+    expect(live).toContain("createTaken(");
+    expect(src).toContain("/v1/installs");
+    expect(live).toContain('code: "slug_taken"');
+    expect(live).toContain("FROM jobs WHERE request_id");
+    // The old route: a hand-written signups row. Never again.
+    expect(live).not.toContain("INSERT INTO");
+    expect(src).not.toContain("INSERT INTO");
+  });
+
   it("with no REDLINE_STG_PROVISIONER the cases are unproven-live, never pass", () => {
     expect(live).toContain('proof(ctx, "unproven-live", NOT_CONFIGURED)');
     expect(live).toContain('proof(ctx, "staging-only"');
@@ -84,16 +96,6 @@ describe("REDLINE_STG_PROVISIONER", () => {
     expect(() =>
       parseProvisionerProbe({ REDLINE_STG_PROVISIONER: "{" }),
     ).toThrow(/not JSON/);
-  });
-});
-
-describe("ulid", () => {
-  it("is a ULID whose time prefix sorts with now", () => {
-    const a = ulid(1_700_000_000_000);
-    const b = ulid(1_700_000_000_001);
-    expect(a).toMatch(ULID_RE);
-    expect(a.slice(0, 10) < b.slice(0, 10)).toBe(true);
-    expect(ulid(0).slice(0, 10)).toBe("0000000000");
   });
 });
 
@@ -180,5 +182,72 @@ describe("pollUntil", () => {
         () => t,
       ),
     ).toEqual({ value: 5, met: false });
+  });
+});
+
+describe("createTaken", () => {
+  const jwt = () => {
+    const b = (o: object) =>
+      Buffer.from(JSON.stringify(o)).toString("base64url");
+    return `${b({ alg: "none" })}.${b({ exp: Math.floor(Date.now() / 1000) + 3600 })}.sig`;
+  };
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), "rl-taken-"));
+    const f = join(dir, OIDC_FILES.provisioning);
+    writeFileSync(f, jwt());
+    chmodSync(f, 0o600);
+    return { REDLINE_TARGETS: JSON.stringify({ secretsDir: dir }) };
+  };
+  const body = {
+    requestId: "rl1-1-taken0000",
+    slug: "rl-a",
+    ownerEmail: "x@oa-redline-a.fyi",
+  };
+
+  it("POSTs R4 with the OIDC bearer and returns the status and error code", async () => {
+    const seen: { url: string; init: RequestInit }[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      seen.push({ url, init });
+      return new Response(
+        JSON.stringify({ error: { code: "slug_taken", message: "m" } }),
+        { status: 409 },
+      );
+    }) as unknown as typeof fetch;
+    const r = await createTaken(setup(), body, f);
+    expect(r).toMatchObject({ status: 409, code: "slug_taken" });
+    expect(seen[0]?.url).toBe(
+      "https://api.open-artifacts-staging.app/v1/installs",
+    );
+    expect(seen[0]?.init.method).toBe("POST");
+    expect(
+      (seen[0]?.init.headers as Record<string, string>).authorization,
+    ).toMatch(/^Bearer ey/);
+    expect(JSON.parse(String(seen[0]?.init.body))).toMatchObject({
+      slug: "rl-a",
+      requestId: body.requestId,
+    });
+  });
+
+  it("a 202 is not slug_taken, and a string error code reads too", async () => {
+    const ok = (async () =>
+      new Response(JSON.stringify({ job: {} }), {
+        status: 202,
+      })) as unknown as typeof fetch;
+    expect(await createTaken(setup(), body, ok)).toMatchObject({
+      status: 202,
+      code: undefined,
+    });
+    const str = (async () =>
+      new Response(JSON.stringify({ error: "slug_taken" }), {
+        status: 409,
+      })) as unknown as typeof fetch;
+    expect((await createTaken(setup(), body, str)).code).toBe("slug_taken");
+  });
+
+  it("refuses without secretsDir or with a non-origin api", async () => {
+    await expect(createTaken({}, body)).rejects.toThrow(/secretsDir/);
+    await expect(
+      createTaken({ ...setup(), REDLINE_PROV_API: "http://x" }, body),
+    ).rejects.toThrow(/bare https origin/);
   });
 });
