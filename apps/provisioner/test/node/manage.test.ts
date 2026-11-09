@@ -29,7 +29,12 @@ import {
   fleetRequestId,
 } from "../../../scheduler/src/provapi/fleet.js";
 import { JOB_ERROR_TEXT } from "../../src/errors.js";
-import { GRACE_MS, NEVER_ROUTED, runManage } from "../../src/manage.js";
+import {
+  GRACE_MS,
+  NEVER_ROUTED,
+  PURGE_STEP,
+  runManage,
+} from "../../src/manage.js";
 import {
   CLOSE_SOCKETS_FAILED,
   CLOSE_SOCKETS_JOB,
@@ -890,6 +895,31 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     expect(claim(t.sub)?.freed_at).toEqual(expect.any(Number));
     expect(await signUpAgain(t.sub as string, "signup-4")).toBe("claimed");
     expect(claim(t.sub)).toEqual({ signup_id: "signup-4", freed_at: null });
+  });
+
+  it("a purge whose delete fails for good (revoke_pending retries exhausted) leaves the claim held", async () => {
+    const s = await active({
+      slug: "stuckco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    await manage("delete", s.installId);
+    w.clock.t += GRACE_MS;
+    // The directory revoke never settles: every delete attempt ends in
+    // revoke_pending until the step's retries run out.
+    w.fake.revoker = () => {};
+    const r = await manage("purge", s.installId, { actor: "system" });
+    expect(r.error).not.toBeNull();
+    expect(r.log.filter((l) => l.name === "unroute" && l.error)).toHaveLength(
+      PURGE_STEP.retries.limit + 1,
+    );
+    expect(w.install(s.installId)?.state).toBe("deleting");
+    expect(claim(sub)).toEqual({
+      signup_id: expect.any(String),
+      freed_at: null,
+    });
+    expect(await signUpAgain(sub, "signup-6")).toBe("signup_limit");
   });
 
   it("a self-serve create that failed WITH an installs row (prod_dirty) keeps its claim until its purge frees it", async () => {
