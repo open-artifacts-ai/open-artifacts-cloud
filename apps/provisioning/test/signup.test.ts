@@ -648,6 +648,17 @@ describe("GET /api/v1/slugs/:slug and /api/v1/signup", () => {
   });
 });
 
+describe("signup_limit refusal copy", () => {
+  it("points to the published contact as a mailto link", () => {
+    expect(CLIENT_JS).toContain(
+      "You already have an Open Artifacts instance with this Google account. Need help? Email ",
+    );
+    expect(CLIENT_JS).toContain('var HELP_EMAIL = "hello@open-artifacts.com"');
+    expect(CLIENT_JS).toContain('href: "mailto:" + HELP_EMAIL');
+    expect(CLIENT_JS).toMatch(/r\.code === "signup_limit"[\s\S]*LIMIT_ERR/);
+  });
+});
+
 describe("CSP: no inline styles on the sign-up page", () => {
   it("the document, script and noscript carry no style attribute and write no .style", async () => {
     const html = await (await call(fakeEnv(), `${SIGNUP}/`)).text();

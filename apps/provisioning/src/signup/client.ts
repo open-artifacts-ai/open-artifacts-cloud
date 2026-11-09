@@ -244,7 +244,7 @@ export const CLIENT_JS = String.raw`(function () {
     var msg = S.err;
     if (S.me && !S.cfg.turnstileSiteKey) msg = "Sign-ups are temporarily unavailable. Try again later.";
     if (msg) {
-      refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, [msg]));
+      refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, typeof msg === "string" ? [msg] : msg));
     }
   }
 
@@ -277,6 +277,12 @@ export const CLIENT_JS = String.raw`(function () {
     slug_reserved: AVAIL_MSG.reserved
   };
 
+  var HELP_EMAIL = "hello@open-artifacts.com";
+  var LIMIT_ERR = [
+    "You already have an Open Artifacts instance with this Google account. Need help? Email ",
+    h("a", { href: "mailto:" + HELP_EMAIL }, [HELP_EMAIL]), "."
+  ];
+
   function create() {
     if (!canCreate()) return;
     S.busy = true; S.err = ""; paintCreate();
@@ -290,7 +296,13 @@ export const CLIENT_JS = String.raw`(function () {
       }
       resetTurnstile();
       if (r.code === "signups_closed") { S.view = "closed"; render(); return; }
-      if (r.code === "signup_limit") { loadSignup().then(route); return; }
+      if (r.code === "signup_limit") {
+        loadSignup().then(function () {
+          route();
+          if (S.view === "form") { S.err = LIMIT_ERR; paintCreate(); }
+        });
+        return;
+      }
       if (r.code === "slug_taken") { S.avail = "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
       if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
       S.err = CREATE_ERR[r.code] || (r.code === "forbidden" && r.message && r.message !== "forbidden" ? r.message : null) || "We couldn't create your instance. Try again in a few minutes.";
