@@ -301,10 +301,10 @@ export async function createSoloTrialSubscription(
 }
 
 /**
- * Cancels a subscription (an upgrade replaces the Solo one; #1568). Safe to
- * repeat: it reads the subscription first and does nothing for one already
- * canceled or gone (404), so a webhook retry can run it again. No proration
- * or refund is asked for. Answers the sub_ id.
+ * Cancels a subscription (an upgrade replaces the Solo one; #1568), with its
+ * unused time prorated onto the customer's credit balance. Safe to repeat: it
+ * reads the subscription first and does nothing for one already canceled or
+ * gone (404), so a webhook retry can run it again (and never credits twice). Answers the sub_ id.
  */
 export async function cancelSubscription(
   input: { subscriptionId: string },
@@ -317,7 +317,20 @@ export async function cancelSubscription(
     // incomplete_expired: the first payment never completed; nothing to cancel.
     if (out?.status === "canceled" || out?.status === "incomplete_expired")
       return { id };
-    await send(cfg, "DELETE", path, null, null);
+    // Cancel with a final invoice that prorates the unused time: it lands on
+    // the customer's credit balance, which Stripe applies to later invoices
+    // (what was paid for before an upgrade is not lost). A trialing
+    // subscription has nothing paid, so the proration is empty and Stripe just
+    // cancels it (no error). Parameter names are from Stripe's docs (the cancel
+    // endpoint's invoice_now and prorate); their placement in the DELETE's form
+    // body, and the trialing answer, are unverified.
+    await send(
+      cfg,
+      "DELETE",
+      path,
+      { invoice_now: "true", prorate: "true" },
+      null,
+    );
   } catch (e) {
     if (e instanceof StripeApiError && e.status === 404) return { id };
     throw e;

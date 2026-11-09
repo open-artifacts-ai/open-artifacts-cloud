@@ -374,10 +374,41 @@ describe("cancelSubscription (#1568)", () => {
       ["GET", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
       ["DELETE", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
     ]);
-    for (const c of calls) {
-      expect(c.auth).toBe(`Bearer ${KEY}`);
-      expect(c.body).toBeUndefined();
-    }
+    for (const c of calls) expect(c.auth).toBe(`Bearer ${KEY}`);
+    // The read has no body. The DELETE asks for a final invoice with the
+    // unused time prorated, which lands on the customer's credit balance.
+    expect(calls[0]?.body).toBeUndefined();
+    expect(
+      Object.fromEntries(new URLSearchParams(String(calls[1]?.body))),
+    ).toEqual({ invoice_now: "true", prorate: "true" });
+  });
+
+  it("a trialing subscription has nothing to credit: Stripe cancels it with no invoice, and that is a success, not an error", async () => {
+    // Nothing was paid, so the proration is empty; Stripe answers 200 with the
+    // canceled subscription.
+    const f = stripe({
+      get: [{ id: "sub_Old1", status: "trialing" }],
+      del: [{ id: "sub_Old1", status: "canceled" }],
+    });
+    expect(
+      await cancelSubscription(
+        { subscriptionId: "sub_Old1" },
+        { secretKey: KEY, fetch: f },
+      ),
+    ).toEqual({ id: "sub_Old1" });
+    expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE"]);
+  });
+
+  it("a repeat for an already-canceled subscription makes no DELETE (no second credit)", async () => {
+    for (let i = 0; i < 2; i++)
+      await cancelSubscription(
+        { subscriptionId: "sub_Old1" },
+        {
+          secretKey: KEY,
+          fetch: stripe({ get: [{ id: "sub_Old1", status: "canceled" }] }),
+        },
+      );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
   });
 
   it("already canceled, or gone (404 on either call): done, and no second delete", async () => {
