@@ -609,22 +609,26 @@ describe("0010_trial_reminders (cloud #39)", () => {
     expect(sql).toMatch(/^\s*CREATE TABLE IF NOT EXISTS trial_reminders /);
   });
 
-  it("holds one row per install, with no address column", () => {
+  it("holds one row per install and kind, with no address column", () => {
     const db = platformDb();
     expect(cols(db, "trial_reminders")).toEqual([
       "install_id TEXT NN PK",
+      "kind TEXT NN PK",
       "trial_ends_at INTEGER NN",
       "claimed_at INTEGER NN",
       "sent_at INTEGER",
     ]);
-    const ins = (id: string) =>
+    const ins = (id: string, kind = "week") =>
       db
         .prepare(
-          "INSERT INTO trial_reminders (install_id, trial_ends_at, claimed_at) VALUES (?, 1, 2)",
+          "INSERT INTO trial_reminders (install_id, kind, trial_ends_at, claimed_at) VALUES (?, ?, 1, 2)",
         )
-        .run(id);
+        .run(id, kind);
     ins("i1");
     expect(() => ins("i1")).toThrow(/UNIQUE|PRIMARY/);
+    ins("i1", "last_day");
+    expect(() => ins("i1", "last_day")).toThrow(/UNIQUE|PRIMARY/);
+    expect(() => ins("i1", "other")).toThrow(/CHECK/);
     ins("i2");
   });
 });

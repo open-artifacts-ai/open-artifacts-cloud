@@ -1,16 +1,20 @@
 /**
- * The self-serve trial-ending reminder (cloud #39). The welcome email says
- * "we'll remind you a week before"; this is that email.
+ * The self-serve trial-ending reminders (cloud #39, #41): one 7 days before
+ * the free month ends and one on its last day, the same copy (OA Design
+ * audit #8). The welcome email says "we'll remind you a week before".
  *
  * An hourly gate on the 2-minute tick (platform_state) asks billing for the Solo
  * trials ending in the next 7 days (GET /solo/trial-ending over the BILLING
  * binding: the trial end is billing's solo_trial_ends_at, and only a live
  * Solo row with a trial still ahead is listed, so a paid install, another
  * tier or a lapsed row never is). Of those, only a self-serve install that
- * is active, ready and not suspended and has no reminder row is mailed.
+ * is active, ready and not suspended and has no reminder row of the kind
+ * due is mailed. A trial ending within a day is due the last-day kind, any
+ * other the week kind, so one tick never sends both to an install.
  *
- * At most once: the claim is the INSERT of the install's trial_reminders row
- * (0010), before the send, like the welcome claim. A send that fails keeps its
+ * At most once per kind: the claim is the INSERT of the install's
+ * (install_id, kind) trial_reminders row (0010), before the send, like the
+ * welcome claim. A send that fails keeps its
  * claim (a timed-out send may have gone out; a second email is worse than a
  * late one), and the row with no sent_at is what the operator alert counts.
  *
@@ -30,10 +34,10 @@ import { trialReminderEmail } from "./trial-reminder-email.js";
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-/** The reminder goes out once the trial ends within this long. */
+/** The week reminder goes out once the trial ends within this long. */
 export const REMINDER_LEAD_MS = 7 * DAY;
-/** A trial ending sooner than this gets none: it would arrive too late to act on. */
-export const REMINDER_MIN_LEFT_MS = DAY;
+/** A trial ending within this long is on its last day: the last-day kind. */
+export const REMINDER_LAST_DAY_MS = DAY;
 /** platform_state: when the duty last ran (hourly). */
 export const REMINDER_GATE_KEY = "trial_reminder_checked_at";
 export const REMINDER_GATE_MS = HOUR;
@@ -57,19 +61,25 @@ const SELECT_OWNER =
   "SELECT i.id AS id, i.app_host AS app_host, i.owner_email AS owner_email FROM installs i";
 const ELIGIBLE = `JOIN signups s ON s.install_id = i.id
 WHERE s.source = 'self-serve' AND s.status = 'ready' AND i.state = 'active'
-  AND NOT EXISTS (SELECT 1 FROM install_lifecycle l WHERE l.install_id = i.id AND l.suspended_at IS NOT NULL)
-  AND NOT EXISTS (SELECT 1 FROM trial_reminders r WHERE r.install_id = i.id)`;
+  AND NOT EXISTS (SELECT 1 FROM install_lifecycle l WHERE l.install_id = i.id AND l.suspended_at IS NOT NULL)`;
+const DONE_SQL = "SELECT install_id, kind FROM trial_reminders WHERE install_id IN";
 const CLAIM_SQL =
-  "INSERT INTO trial_reminders (install_id, trial_ends_at, claimed_at) VALUES (?1, ?2, ?3) ON CONFLICT (install_id) DO NOTHING";
+  "INSERT INTO trial_reminders (install_id, kind, trial_ends_at, claimed_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id, kind) DO NOTHING";
 const SENT_SQL =
-  "UPDATE trial_reminders SET sent_at = ?2 WHERE install_id = ?1 AND sent_at IS NULL";
+  "UPDATE trial_reminders SET sent_at = ?3 WHERE install_id = ?1 AND kind = ?2 AND sent_at IS NULL";
 const UNSENT_SQL =
   "SELECT COUNT(*) AS n, MIN(claimed_at) AS since FROM trial_reminders WHERE sent_at IS NULL AND claimed_at <= ?1";
+
+export type Kind = "week" | "last_day";
 
 export interface Due {
   installId: string;
   trialEndsAt: number;
 }
+
+/** The kind due for a trial ending at trialEndsAt, seen at now. */
+export const kindFor = (trialEndsAt: number, now: number): Kind =>
+  trialEndsAt - now <= REMINDER_LAST_DAY_MS ? "last_day" : "week";
 
 /** Billing's Solo trials ending in (from, to], every page (bounded). */
 async function dueFromBilling(
@@ -118,18 +128,37 @@ async function dueFromBilling(
   return out;
 }
 
-/** The ids (of those given) that are mailable, with host and owner address. */
+/**
+ * The dues (of those given) that are mailable and have no row of their kind,
+ * with host and owner address.
+ */
 async function mailable(
   db: D1Database,
-  ids: string[],
+  dues: Due[],
+  now: number,
 ): Promise<Map<string, { appHost: string; to: string }>> {
   const out = new Map<string, { appHost: string; to: string }>();
+  const kinds = new Map(
+    dues.map((d) => [d.installId, kindFor(d.trialEndsAt, now)]),
+  );
+  const ids = dues.map((d) => d.installId);
   for (let i = 0; i < ids.length; i += 50) {
     const chunk = ids.slice(i, i + 50);
+    const marks = chunk.map((_, n) => `?${n + 1}`).join(",");
+    const done = new Set(
+      (
+        await d1(
+          db
+            .prepare(`${DONE_SQL} (${marks})`)
+            .bind(...chunk)
+            .all<{ install_id: string; kind: string }>(),
+        )
+      ).results.map((r) => `${r.install_id} ${r.kind}`),
+    );
     const { results } = await d1(
       db
         .prepare(
-          `${SELECT_OWNER} ${ELIGIBLE} AND i.id IN (${chunk.map((_, n) => `?${n + 1}`).join(",")})`,
+          `${SELECT_OWNER} ${ELIGIBLE} AND i.id IN (${marks})`,
         )
         .bind(...chunk)
         .all<Record<string, unknown>>(),
@@ -138,6 +167,7 @@ async function mailable(
       const to = ownerEmailOf(r);
       if (
         typeof r.id === "string" &&
+        !done.has(`${r.id} ${kinds.get(r.id)}`) &&
         typeof r.app_host === "string" &&
         r.app_host !== "" &&
         to !== null &&
@@ -161,10 +191,11 @@ async function remind(
   now: number,
 ): Promise<Outcome> {
   const db = env.PLATFORM_DB;
+  const kind = kindFor(d.trialEndsAt, now);
   try {
     const claim = await db
       .prepare(CLAIM_SQL)
-      .bind(d.installId, d.trialEndsAt, now)
+      .bind(d.installId, kind, d.trialEndsAt, now)
       .run();
     if (claim.meta.changes !== 1) return "raced";
   } catch {
@@ -198,11 +229,11 @@ async function remind(
     return "failed";
   }
   try {
-    await db.prepare(SENT_SQL).bind(d.installId, now).run();
+    await db.prepare(SENT_SQL).bind(d.installId, kind, now).run();
   } catch {
     console.error("provapi reminders db_error", d.installId);
   }
-  console.log("provapi reminders sent", d.installId);
+  console.log("provapi reminders sent", d.installId, kind);
   return "sent";
 }
 
@@ -227,13 +258,10 @@ export async function sendDueReminders(
   try {
     const due = await dueFromBilling(
       env.BILLING,
-      now + REMINDER_MIN_LEFT_MS,
+      now,
       now + REMINDER_LEAD_MS,
     );
-    const ok = await mailable(
-      db,
-      due.map((x) => x.installId),
-    );
+    const ok = await mailable(db, due, now);
     for (const d of due) {
       const m = ok.get(d.installId);
       if (!m) continue;

@@ -27,9 +27,10 @@ import {
   signup,
 } from "./provapi/db.js";
 
-// The self-serve trial-ending reminder: billing lists the Solo trials ending
+// The self-serve trial-ending reminders: billing lists the Solo trials ending
 // in the next 7 days; only a self-serve, active, unsuspended install with no
-// reminder row is mailed, once.
+// reminder row of the kind due ('week', or 'last_day' within a day of the
+// end) is mailed, once per kind.
 
 beforeAll(migrate);
 beforeEach(reset);
@@ -120,7 +121,11 @@ describe("trial reminder: the due window", () => {
     const m = f.mails[0] as Mail;
     expect(m.to).toBe(row.owner_email);
     expect(m.from).toBe("hello@mail.test");
-    expect(m.subject).toContain("Nov 15");
+    expect(m.subject).toBe(
+      "Your free month ends on Nov 15. Keep Solo for $1/month.",
+    );
+    expect(m.text).toContain("Add a card:");
+    expect(m.html).toContain(">Add a card</a>");
     expect(m.text).toContain(`https://${row.app_host}/settings/plan`);
     expect(m.html).toContain(`href="https://${row.app_host}/settings/plan"`);
     expect(m.html).toContain("v:roundrect");
@@ -132,30 +137,149 @@ describe("trial reminder: the due window", () => {
     const [r] = await reminders();
     expect(r).toMatchObject({
       install_id: id,
+      kind: "week",
       trial_ends_at: end,
       claimed_at: NOW,
       sent_at: NOW,
     });
   });
 
-  it("asks billing for (now + 1 day, now + 7 days]", async () => {
+  it("asks billing for (now, now + 7 days]", async () => {
     const f = fakes([]);
     await trialRemindersDue(f.env, NOW);
     expect(f.queries).toHaveLength(1);
-    expect(f.queries[0]?.get("from")).toBe(String(NOW + DAY));
+    expect(f.queries[0]?.get("from")).toBe(String(NOW));
     expect(f.queries[0]?.get("to")).toBe(String(NOW + 7 * DAY));
   });
 
-  it("does nothing for a trial more than 7 days out or under a day away", async () => {
+  it("does nothing for a trial more than 7 days out or already ended", async () => {
     const a = await selfServe();
     const b = await selfServe();
     const f = fakes([
       { installId: a.id, trialEndsAt: NOW + 7 * DAY + HOUR },
-      { installId: b.id, trialEndsAt: NOW + HOUR },
+      { installId: b.id, trialEndsAt: NOW - HOUR },
     ]);
     await trialRemindersDue(f.env, NOW);
     expect(f.mails).toEqual([]);
     expect(await reminders()).toEqual([]);
+  });
+});
+
+describe("trial reminder: the last day", () => {
+  it("mails a trial ending within a day as kind last_day, with the same copy", async () => {
+    const { id, row } = await selfServe();
+    const end = NOW + 6 * HOUR;
+    const f = fakes([{ installId: id, trialEndsAt: end }]);
+    await trialRemindersDue(f.env, NOW);
+    expect(f.mails).toHaveLength(1);
+    const m = f.mails[0] as Mail;
+    expect(m.subject).toBe(
+      "Your free month ends on Nov 9. Keep Solo for $1/month.",
+    );
+    expect(m.html).toContain(`href="https://${row.app_host}/settings/plan"`);
+    expect(m.html).toContain(">Add a card</a>");
+    expect(await reminders()).toMatchObject([
+      { install_id: id, kind: "last_day", trial_ends_at: end, sent_at: NOW },
+    ]);
+  });
+
+  it("exactly a day left is the last day; just over is the week", async () => {
+    const a = await selfServe();
+    const b = await selfServe();
+    const f = fakes([
+      { installId: a.id, trialEndsAt: NOW + DAY },
+      { installId: b.id, trialEndsAt: NOW + DAY + 1 },
+    ]);
+    await trialRemindersDue(f.env, NOW);
+    const kinds = Object.fromEntries(
+      (await reminders()).map((r) => [r.install_id, r.kind]),
+    );
+    expect(kinds).toEqual({ [a.id]: "last_day", [b.id]: "week" });
+  });
+
+  it("one install gets the week mail then the last-day mail, each once", async () => {
+    const { id } = await selfServe();
+    const end = NOW + 3 * DAY;
+    const f = fakes([{ installId: id, trialEndsAt: end }]);
+    await trialRemindersDue(f.env, NOW);
+    await trialRemindersDue(f.env, NOW + DAY);
+    expect(f.mails).toHaveLength(1);
+    await trialRemindersDue(f.env, end - 5 * HOUR);
+    expect(f.mails).toHaveLength(2);
+    await trialRemindersDue(f.env, end - 3 * HOUR);
+    await trialRemindersDue(f.env, end - HOUR);
+    expect(f.mails).toHaveLength(2);
+    expect((await reminders()).map((r) => r.kind).sort()).toEqual([
+      "last_day",
+      "week",
+    ]);
+  });
+
+  it("both windows passing in one tick (the week mail never went out) sends one mail, the last-day one", async () => {
+    const { id } = await selfServe();
+    const f = fakes([{ installId: id, trialEndsAt: NOW + 10 * HOUR }]);
+    await trialRemindersDue(f.env, NOW);
+    await db
+      .prepare("DELETE FROM platform_state WHERE key = ?1")
+      .bind(REMINDER_GATE_KEY)
+      .run();
+    await trialRemindersDue(f.env, NOW);
+    expect(f.mails).toHaveLength(1);
+    expect(await reminders()).toMatchObject([{ kind: "last_day" }]);
+  });
+
+  it("a sent week reminder does not block the last day, and a sent last day is not repeated", async () => {
+    const { id } = await selfServe();
+    await db
+      .prepare(
+        "INSERT INTO trial_reminders (install_id, kind, trial_ends_at, claimed_at, sent_at) VALUES (?1, 'week', 1, 2, 3)",
+      )
+      .bind(id)
+      .run();
+    const f = fakes([{ installId: id, trialEndsAt: NOW + 2 * HOUR }]);
+    await trialRemindersDue(f.env, NOW);
+    expect(f.mails).toHaveLength(1);
+    await trialRemindersDue(f.env, NOW + HOUR);
+    expect(f.mails).toHaveLength(1);
+  });
+
+  it("skips what the week reminder skips: not self-serve, suspended, not active", async () => {
+    const adminId = installId();
+    await install(adminId);
+    await signup({ source: "admin", install_id: adminId, status: "ready" });
+    const sus = await selfServe();
+    await lifecycle(sus.id, { suspended_at: 5 });
+    const del = await selfServe({ state: "deleting" });
+    const f = fakes(
+      [adminId, sus.id, del.id].map((installId) => ({
+        installId,
+        trialEndsAt: NOW + 4 * HOUR,
+      })),
+    );
+    await trialRemindersDue(f.env, NOW);
+    expect(f.mails).toEqual([]);
+    expect(await reminders()).toEqual([]);
+  });
+
+  it("an install that checked out is not listed by billing, so gets neither", async () => {
+    await selfServe();
+    const f = fakes([]);
+    await trialRemindersDue(f.env, NOW);
+    expect(f.mails).toEqual([]);
+  });
+
+  it("a failed last-day send keeps its claim and is not retried", async () => {
+    const { id } = await selfServe();
+    const f = fakes([{ installId: id, trialEndsAt: NOW + 4 * HOUR }], {
+      sendFails: true,
+    });
+    await trialRemindersDue(f.env, NOW);
+    expect(await reminders()).toMatchObject([
+      { kind: "last_day", sent_at: null },
+    ]);
+    const g = fakes([{ installId: id, trialEndsAt: NOW + 4 * HOUR }]);
+    await trialRemindersDue(g.env, NOW + HOUR);
+    expect(g.mails).toEqual([]);
   });
 });
 

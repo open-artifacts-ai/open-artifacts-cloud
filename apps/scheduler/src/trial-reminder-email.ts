@@ -58,13 +58,15 @@ export function trialReminderEmail(o: {
   const planUrl = `${url.origin}/settings/plan`;
   const date = `${MONTHS[end.getUTCMonth()]} ${end.getUTCDate()}`;
 
-  const title = `Your free month on ${host} ends ${date}`;
-  const intro = `Your Solo trial for ${host} ends on ${date}. After that Solo is $1/month or $12/year, and there is no card on file yet.`;
+  // The approved line (OA Design audit #8), for both the 7-day and the
+  // last-day email.
+  const title = `Your free month ends on ${date}. Keep Solo for $1/month.`;
+  const intro = `Your Solo trial for ${host} ends on ${date}, and there is no card on file yet.`;
   const consequence =
-    "Pick a plan before then to keep publishing. If you do nothing, your workspace turns read-only when the trial ends. Nothing is deleted.";
-  const button = "Choose a plan";
-  const preheader = `Your Solo trial ends ${date}. Pick a plan to keep publishing.`;
-  const why = `You got this because you created ${host}. It is the one reminder we send.`;
+    "Add a card before then to keep publishing. If you do nothing, your workspace turns read-only when the trial ends. Nothing is deleted.";
+  const button = "Add a card";
+  const preheader = `Your free month ends on ${date}. Add a card to keep Solo for $1/month.`;
+  const why = `You got this because you created ${host}. We send one a week before the free month ends and one on its last day.`;
   const to = oneLine(o.to);
 
   const text = [
