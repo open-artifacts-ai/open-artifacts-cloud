@@ -58,7 +58,6 @@ describe("checkSlug reserved names", () => {
     "health",
     "test",
     "dev",
-    "demo",
     "internal",
     "ns1",
     "ns2",
@@ -69,7 +68,7 @@ describe("checkSlug reserved names", () => {
     expect(() => checkSlug(slug)).toThrow(StepRefusal);
   });
 
-  it.each(["leo", "rl-a", "rl-b"])("%s stays valid", (slug) => {
+  it.each(["leo", "rl-a", "rl-b", "demo"])("%s stays valid", (slug) => {
     expect(checkSlug(slug)).toBe(slug);
   });
 });

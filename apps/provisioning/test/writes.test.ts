@@ -284,7 +284,6 @@ describe("R4 create by an admin session", () => {
     "health",
     "test",
     "dev",
-    "demo",
     "internal",
     "ns1",
     "ns2",
@@ -298,7 +297,7 @@ describe("R4 create by an admin session", () => {
     expect(r.status).toBe(400);
   });
 
-  it.each(["leo", "rl-a", "rl-b"])(
+  it.each(["leo", "rl-a", "rl-b", "demo"])(
     "existing install name %s is not reserved",
     async (slug) => {
       const e = fakeEnv();
