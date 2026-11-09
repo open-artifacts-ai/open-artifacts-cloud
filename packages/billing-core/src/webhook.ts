@@ -919,6 +919,12 @@ export async function handleStripeWebhook(
           log("subscription_read_failed");
           return json({ error: "unavailable" }, 500);
         }
+        // A 404 may only mean Stripe does not have it yet: like an unknown
+        // customer, retried (500) while the event is young; dead after that.
+        if (state === "missing" && now / 1000 - ev.created < UNKNOWN_RETRY_S) {
+          log("subscription_not_found");
+          return json({ error: "unavailable" }, 500);
+        }
         const live = statusFromSubscription(state);
         if (live !== "active" && live !== "past_due") {
           // Recorded, nothing applied, nothing queued.

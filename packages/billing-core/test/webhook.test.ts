@@ -3048,7 +3048,7 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
     });
   });
 
-  it("incomplete, incomplete_expired, paused and a 404 are not live either", async () => {
+  it("incomplete, incomplete_expired and paused are not live either", async () => {
     for (const state of ["incomplete", "incomplete_expired", "paused"]) {
       await solo();
       const s = stripe({ sub_Dead1: state });
@@ -3058,14 +3058,39 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
         stripe_subscription_id: "sub_Old1",
       });
     }
+  });
+
+  it("a 404 on the read is retried while the event is young (Stripe may not have the subscription yet), and counts as dead only after that", async () => {
     await solo();
-    await deliver(checkout("sub_Dead1"), {
-      env: stripe({}, { sub_Dead1: 404 }).e,
-    });
+    const ev = checkout("sub_Late1");
+    // Young: 500, nothing written, the event not recorded.
+    const young = await deliver(ev, { env: stripe({}, { sub_Late1: 404 }).e });
+    expect(young.status).toBe(500);
     expect(await row(A)).toMatchObject({
       tier: "solo",
       stripe_subscription_id: "sub_Old1",
     });
+    // The subscription shows up: the retry adopts it.
+    expect((await deliver(ev, { env: stripe().e })).status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_Late1",
+    });
+    // Old (over an hour): recorded, not adopted, the row's own kept.
+    await solo();
+    const old = checkout("sub_Gone1");
+    const later = NOW + 2 * 3_600_000;
+    const r = await deliver(old, {
+      env: stripe({}, { sub_Gone1: 404 }).e,
+      now: later,
+      t: Math.floor(later / 1000),
+    });
+    expect(r.status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      stripe_subscription_id: "sub_Old1",
+    });
+    expect(await pending()).toEqual([]);
   });
 
   it("a past_due subscription is adopted as past_due, with grace from the event, and replaces the old one", async () => {
