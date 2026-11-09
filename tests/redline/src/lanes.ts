@@ -7,7 +7,7 @@
 // time (vitest.live.config.ts keeps fileParallelism off inside each lane).
 // test/lanes.test.ts fails when two lanes of one phase claim the same thing.
 //
-// #1730: PLAN is one phase of six lanes. Where two lanes touch one thing
+// #1730: PLAN is one phase of five lanes. Where two lanes touch one thing
 // they do not just conflict: the thing is guarded by a lock (src/locks.ts),
 // paced by a ledger (hook-ledger.ts, src/rl-anon.ts), or ordered by a barrier
 // (src/barrier.ts). Each of those only adds a wait; an overrun is an

@@ -58,6 +58,9 @@ const recorded = (plan: readonly Phase[]): readonly Phase[] =>
       .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
       .filter((l) => l.files.length > 0),
   );
+// Load-bearing: isProv() is true only for a lane of provisioning.test.ts
+// alone, so without this filter the prov lane would be scaled and paced as
+// an install lane.
 const RPLAN = recorded(PLAN);
 const RSERIAL = recorded(PLAN_SERIAL);
 const wall = (f: string): number => {
@@ -172,13 +175,15 @@ describe("the provisioner file (#859, not in the recording)", () => {
     expect(l.files).toEqual(["live/provisioning.test.ts", NEW_FILE]);
   });
 
-  it("is about 3 minutes, added to the prov lane's end (the critical path)", () => {
-    // Modeled, not recorded: the first live run with it replaces this.
-    expect(NEW_FILE_MODELED_SEC).toBeLessThan(
-      wall("live/provisioning.test.ts"),
-    );
+  it("puts the plan that runs over the 600 s target: about 650 s, the prov lane last", () => {
+    // Modeled, not recorded: the first live run with it replaces this. The
+    // prov lane is the critical path and the knobs never scale it, so its
+    // ~180 s lands on the job's end under every knob. The "under 600"
+    // assertions below hold for the recorded plan (RPLAN) only; this one
+    // records that the plan CI runs breaches that target (#859, to Platform).
     const base = jobEnd(RPLAN, { t19: "job" }).end;
-    expect(base + NEW_FILE_MODELED_SEC).toBeLessThan(11 * 60);
+    near(base + NEW_FILE_MODELED_SEC, 650, 1);
+    expect(base + NEW_FILE_MODELED_SEC).toBeGreaterThan(600);
   });
 });
 
