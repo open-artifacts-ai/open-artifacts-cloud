@@ -383,20 +383,32 @@ describe("cancelSubscription (#1568)", () => {
     }
   });
 
-  it("a trialing subscription has nothing to credit: Stripe cancels it with no invoice, and that is a success, not an error", async () => {
-    // Nothing was paid, so the proration is empty; Stripe answers 200 with the
-    // canceled subscription.
-    const f = stripe({
-      get: [{ id: "sub_Old1", status: "trialing" }],
-      del: [{ id: "sub_Old1", status: "canceled" }],
-    });
-    expect(
-      await cancelSubscription(
-        { subscriptionId: "sub_Old1" },
-        { secretKey: KEY, fetch: f },
-      ),
-    ).toEqual({ id: "sub_Old1" });
-    expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE"]);
+  it("only an active subscription is prorated: trialing (nothing paid to credit) and past_due (delinquent) are cancelled plain", async () => {
+    for (const [status, query] of [
+      ["active", "?invoice_now=true&prorate=true"],
+      ["trialing", ""],
+      ["past_due", ""],
+      ["unpaid", ""],
+      ["paused", ""],
+    ] as const) {
+      const f = stripe({
+        get: [{ id: "sub_Old1", status }],
+        del: [{ id: "sub_Old1", status: "canceled" }],
+      });
+      expect(
+        await cancelSubscription(
+          { subscriptionId: "sub_Old1" },
+          { secretKey: KEY, fetch: f },
+        ),
+      ).toEqual({ id: "sub_Old1" });
+      expect(
+        calls.map((c) => c.url),
+        status,
+      ).toEqual([
+        "https://api.stripe.com/v1/subscriptions/sub_Old1",
+        `https://api.stripe.com/v1/subscriptions/sub_Old1${query}`,
+      ]);
+    }
   });
 
   it("a repeat for an already-canceled subscription makes no DELETE (no second credit)", async () => {

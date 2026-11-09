@@ -317,14 +317,18 @@ export async function cancelSubscription(
     // incomplete_expired: the first payment never completed; nothing to cancel.
     if (out?.status === "canceled" || out?.status === "incomplete_expired")
       return { id };
-    // Cancel with a final invoice that prorates the unused time: it lands on
-    // the customer's credit balance, which Stripe applies to later invoices
-    // (what was paid for before an upgrade is not lost). The parameters go in
-    // the query string with no body, as the official clients send a DELETE's.
+    // An active subscription is cancelled with a final invoice that prorates
+    // the unused time: it lands on the customer's credit balance, which Stripe
+    // applies to later invoices (what was paid for before an upgrade is not
+    // lost). Anything else is cancelled plain: a trialing one has nothing paid
+    // to credit, and a past_due or unpaid one is delinquent (Stripe advises no
+    // proration there). The parameters go in the query string with no body, as
+    // the official clients send a DELETE's.
+    const credit = out?.status === "active";
     await send(
       cfg,
       "DELETE",
-      `${path}?invoice_now=true&prorate=true`,
+      `${path}${credit ? "?invoice_now=true&prorate=true" : ""}`,
       null,
       null,
     );
