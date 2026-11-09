@@ -32,11 +32,15 @@
       "vars": {
         "OA_ENV": "staging",
         "STRIPE_PRICE_TEAM": "{{STRIPE_PRICE_TEAM_STAGING}}",
-        "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_STAGING}}"
+        "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_STAGING}}",
+        "STRIPE_PRICE_SOLO_MONTHLY": "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}",
+        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_STAGING}}"
       },
       "workers_dev": false,
       "preview_urls": false,
       "observability": { "enabled": false },
+      // The daily prune of stripe_events (#1479), 03:17 UTC.
+      "triggers": { "crons": ["17 3 * * *"] },
       "d1_databases": [
         {
           "binding": "BILLING_DB",
@@ -62,11 +66,15 @@
       "vars": {
         "OA_ENV": "prod",
         "STRIPE_PRICE_TEAM": "{{STRIPE_PRICE_TEAM_PROD}}",
-        "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_PROD}}"
+        "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_PROD}}",
+        "STRIPE_PRICE_SOLO_MONTHLY": "{{STRIPE_PRICE_SOLO_MONTHLY_PROD}}",
+        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_PROD}}"
       },
       "workers_dev": false,
       "preview_urls": false,
       "observability": { "enabled": false },
+      // The daily prune of stripe_events (#1479), 03:17 UTC.
+      "triggers": { "crons": ["17 3 * * *"] },
       "d1_databases": [
         {
           "binding": "BILLING_DB",

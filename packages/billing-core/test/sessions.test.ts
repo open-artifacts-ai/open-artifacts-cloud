@@ -3,6 +3,11 @@ import {
   createCheckoutSession,
   createCustomer,
   createPortalSession,
+  cancelSubscription,
+  retrieveSubscription,
+  createSoloTrialSubscription,
+  expireCheckoutSession,
+  SOLO_TRIAL_DAYS,
   StripeApiError,
   StripeConfigError,
 } from "../src/index.js";
@@ -233,5 +238,498 @@ describe("createCustomer", () => {
     expect(e).toBeInstanceOf(StripeApiError);
     expect([e.status, e.type]).toEqual([400, "idempotency_error"]);
     expect(String(e.message)).toBe("stripe 400 idempotency_error");
+  });
+});
+
+describe("Solo (#1568)", () => {
+  it("a Solo Checkout is a plain subscription session tagged tier solo", async () => {
+    const { seen, f } = fake({
+      id: "cs_test_9",
+      url: "https://checkout.stripe.com/c/pay/cs_test_9",
+    });
+    await createCheckoutSession(
+      { ...checkout, tier: "solo", priceId: "price_Solo1" },
+      { secretKey: KEY, fetch: f },
+    );
+    const body = form(seen[0] as Seen);
+    expect(body["line_items[0][price]"]).toBe("price_Solo1");
+    expect(body["metadata[tier]"]).toBe("solo");
+    expect(body["subscription_data[metadata][tier]"]).toBe("solo");
+    expect(body["line_items[0][quantity]"]).toBe("1");
+    // No trial through Checkout: the no-card trial is made through the API.
+    expect(Object.keys(body).filter((k) => /trial/.test(k))).toEqual([]);
+  });
+
+  const trial = {
+    customerId: "cus_Test1",
+    priceId: "price_SoloM1",
+    idempotencyKey: "solo-trial-iabc123def45",
+  };
+
+  it("the no-card trial: 30 days, canceled if no card is added, keyed, tagged solo", async () => {
+    const { seen, f } = fake({ id: "sub_Test1", object: "subscription" });
+    expect(
+      await createSoloTrialSubscription(trial, { secretKey: KEY, fetch: f }),
+    ).toEqual({ id: "sub_Test1" });
+    expect(SOLO_TRIAL_DAYS).toBe(30);
+    expect(seen).toHaveLength(1);
+    const s = seen[0] as Seen;
+    expect(s.url).toBe("https://api.stripe.com/v1/subscriptions");
+    expect(s.init.method).toBe("POST");
+    expect(header(s, "idempotency-key")).toBe(trial.idempotencyKey);
+    expect(header(s, "authorization")).toBe(`Bearer ${KEY}`);
+    expect(form(s)).toEqual({
+      customer: "cus_Test1",
+      "items[0][price]": "price_SoloM1",
+      trial_period_days: "30",
+      "trial_settings[end_behavior][missing_payment_method]": "cancel",
+      "metadata[tier]": "solo",
+    });
+  });
+
+  it("refuses a live key, a bad customer, price or key before any call", async () => {
+    const { seen, f } = fake({ id: "sub_Test1" });
+    const bad = [
+      [trial, "sk_live_abcdefghij", "secretKey"],
+      [trial, "rk_live_abcdefghij", "secretKey"],
+      [
+        { ...trial, customerId: "cus_x&trial_period_days=0" },
+        KEY,
+        "customerId",
+      ],
+      [{ ...trial, priceId: "prod_1" }, KEY, "priceId"],
+      [{ ...trial, priceId: "price_1&x=1" }, KEY, "priceId"],
+      [{ ...trial, idempotencyKey: "short" }, KEY, "idempotencyKey"],
+    ] as const;
+    for (const [i, secretKey, field] of bad) {
+      const e = await createSoloTrialSubscription(i, {
+        secretKey,
+        fetch: f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it("an answer without a sub_ id is bad_answer; a Stripe error keeps status and type only", async () => {
+    for (const answer of [{ id: "cus_1" }, {}, { id: 7 }]) {
+      const e = await createSoloTrialSubscription(trial, {
+        secretKey: KEY,
+        fetch: fake(answer).f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeApiError);
+      expect([e.status, e.type]).toEqual([200, "bad_answer"]);
+    }
+    const e = await createSoloTrialSubscription(trial, {
+      secretKey: KEY,
+      fetch: fake(
+        { error: { type: "invalid_request_error", message: "cus_Test1" } },
+        400,
+      ).f,
+    }).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      400,
+      "invalid_request_error",
+      "stripe 400 invalid_request_error",
+    ]);
+  });
+});
+
+describe("cancelSubscription (#1568)", () => {
+  const calls: {
+    method: string;
+    url: string;
+    auth: string | null;
+    body: unknown;
+  }[] = [];
+  /** A fetch that answers per method: the subscription's state, then the delete. */
+  const stripe = (o: {
+    get?: [unknown, number?];
+    del?: [unknown, number?];
+  }) => {
+    calls.length = 0;
+    return (async (url: string, init: RequestInit) => {
+      const method = String(init.method);
+      calls.push({
+        method,
+        url,
+        auth: new Headers(init.headers).get("authorization"),
+        body: init.body,
+      });
+      const [b, st] = (method === "GET" ? o.get : o.del) ?? [{ id: "sub_X1" }];
+      return Response.json(b, { status: st ?? 200 });
+    }) as unknown as typeof fetch;
+  };
+
+  it("reads the subscription, then cancels it: the DELETE carries invoice_now and prorate in the query string, no body", async () => {
+    const f = stripe({ get: [{ id: "sub_Old1", status: "active" }] });
+    expect(
+      await cancelSubscription(
+        { subscriptionId: "sub_Old1" },
+        { secretKey: KEY, fetch: f },
+      ),
+    ).toEqual({ id: "sub_Old1" });
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ["GET", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
+      [
+        "DELETE",
+        "https://api.stripe.com/v1/subscriptions/sub_Old1?invoice_now=true&prorate=true",
+      ],
+    ]);
+    for (const c of calls) {
+      expect(c.auth).toBe(`Bearer ${KEY}`);
+      expect(c.body).toBeUndefined();
+    }
+  });
+
+  it("only an active subscription is prorated: trialing (nothing paid to credit) and past_due (delinquent) are cancelled plain", async () => {
+    for (const [status, query] of [
+      ["active", "?invoice_now=true&prorate=true"],
+      ["trialing", ""],
+      ["past_due", ""],
+      ["unpaid", ""],
+      ["paused", ""],
+    ] as const) {
+      const f = stripe({
+        get: [{ id: "sub_Old1", status }],
+        del: [{ id: "sub_Old1", status: "canceled" }],
+      });
+      expect(
+        await cancelSubscription(
+          { subscriptionId: "sub_Old1" },
+          { secretKey: KEY, fetch: f },
+        ),
+      ).toEqual({ id: "sub_Old1" });
+      expect(
+        calls.map((c) => c.url),
+        status,
+      ).toEqual([
+        "https://api.stripe.com/v1/subscriptions/sub_Old1",
+        `https://api.stripe.com/v1/subscriptions/sub_Old1${query}`,
+      ]);
+    }
+  });
+
+  it("a repeat for an already-canceled subscription makes no DELETE (no second credit)", async () => {
+    for (let i = 0; i < 2; i++)
+      await cancelSubscription(
+        { subscriptionId: "sub_Old1" },
+        {
+          secretKey: KEY,
+          fetch: stripe({ get: [{ id: "sub_Old1", status: "canceled" }] }),
+        },
+      );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("already canceled, or gone (404 on either call): done, and no second delete", async () => {
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({ get: [{ id: "sub_Old1", status: "canceled" }] }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ error: { type: "invalid_request_error" } }, 404],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "active" }],
+          del: [{ error: { type: "invalid_request_error" } }, 404],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE"]);
+  });
+
+  it("an incomplete_expired subscription is done too: it can't be cancelled and bills nothing", async () => {
+    await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "incomplete_expired" }],
+        }),
+      },
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("another Stripe error keeps status and type only", async () => {
+    const e = await cancelSubscription(
+      { subscriptionId: "sub_Old1" },
+      {
+        secretKey: KEY,
+        fetch: stripe({
+          get: [{ id: "sub_Old1", status: "active" }],
+          del: [
+            { error: { type: "api_error", message: "sub_Old1 cus_1" } },
+            500,
+          ],
+        }),
+      },
+    ).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      500,
+      "api_error",
+      "stripe 500 api_error",
+    ]);
+  });
+
+  it("refuses a live key or a bad id before any call", async () => {
+    const f = stripe({});
+    for (const [id, key, field] of [
+      ["sub_Old1", "sk_live_abcdefghij", "secretKey"],
+      ["sub_Old1", "rk_live_abcdefghij", "secretKey"],
+      ["sub_Old1/../x", KEY, "subscriptionId"],
+      ["cus_1", KEY, "subscriptionId"],
+    ] as const) {
+      const e = await cancelSubscription(
+        { subscriptionId: id },
+        { secretKey: key, fetch: f },
+      ).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("createCheckoutSession trialEnd (#1568)", () => {
+  const solo = { ...checkout, tier: "solo" as const, priceId: "price_Solo1" };
+  const out = {
+    id: "cs_test_1",
+    url: "https://checkout.stripe.com/c/pay/cs_test_1",
+  };
+
+  it("trialEnd (epoch seconds) becomes subscription_data[trial_end]; collection stays at its default", async () => {
+    const { seen, f } = fake(out);
+    await createCheckoutSession(
+      { ...solo, trialEnd: 1_800_000_000 },
+      { secretKey: KEY, fetch: f },
+    );
+    const body = form(seen[0] as Seen);
+    expect(body["subscription_data[trial_end]"]).toBe("1800000000");
+    expect(
+      Object.keys(body).filter((k) => /payment_method_collection/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("without it the session carries no trial at all", async () => {
+    const { seen, f } = fake(out);
+    await createCheckoutSession(solo, { secretKey: KEY, fetch: f });
+    expect(
+      Object.keys(form(seen[0] as Seen)).filter((k) => /trial/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("refuses a non-integer, zero, negative or non-finite trialEnd before any call", () => {
+    const { seen, f } = fake(out);
+    for (const trialEnd of [0, -5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      let e: unknown;
+      try {
+        createCheckoutSession(
+          { ...solo, trialEnd },
+          { secretKey: KEY, fetch: f },
+        );
+      } catch (x) {
+        e = x;
+      }
+      expect((e as StripeConfigError).field, String(trialEnd)).toBe("trialEnd");
+    }
+    expect(seen).toEqual([]);
+  });
+});
+
+describe("expireCheckoutSession (#1568)", () => {
+  const calls: { method: string; path: string; key: string | null }[] = [];
+  const stripe = (o: {
+    get?: [unknown, number?];
+    post?: [unknown, number?];
+  }) => {
+    calls.length = 0;
+    return (async (url: string, init: RequestInit) => {
+      const method = String(init.method);
+      calls.push({
+        method,
+        path: new URL(url).pathname,
+        key: new Headers(init.headers).get("idempotency-key"),
+      });
+      const [b, st] = (method === "GET" ? o.get : o.post) ?? [
+        { id: "cs_test_1" },
+      ];
+      return Response.json(b, { status: st ?? 200 });
+    }) as unknown as typeof fetch;
+  };
+  const cfg = (f: typeof fetch) => ({ secretKey: KEY, fetch: f });
+
+  it("reads the session; an open one is expired, with no Idempotency-Key (Stripe would replay a saved 500 for 24 hours)", async () => {
+    await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(stripe({ get: [{ id: "cs_test_1", status: "open" }] })),
+    );
+    expect(calls).toEqual([
+      { method: "GET", path: "/v1/checkout/sessions/cs_test_1", key: null },
+      {
+        method: "POST",
+        path: "/v1/checkout/sessions/cs_test_1/expire",
+        key: null,
+      },
+    ]);
+  });
+
+  it("a session that is complete or expired already, or gone, is left alone", async () => {
+    for (const status of ["complete", "expired"]) {
+      await expireCheckoutSession(
+        { sessionId: "cs_test_1" },
+        cfg(stripe({ get: [{ id: "cs_test_1", status }] })),
+      );
+      expect(
+        calls.map((c) => c.method),
+        status,
+      ).toEqual(["GET"]);
+    }
+    await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(stripe({ get: [{ error: { type: "invalid_request_error" } }, 404] })),
+    );
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("an expire that loses a race (400 or 404 after the read) is fine; any other error keeps status and type only", async () => {
+    for (const st of [400, 404])
+      await expireCheckoutSession(
+        { sessionId: "cs_test_1" },
+        cfg(
+          stripe({
+            get: [{ id: "cs_test_1", status: "open" }],
+            post: [{ error: { type: "invalid_request_error" } }, st],
+          }),
+        ),
+      );
+    const e = await expireCheckoutSession(
+      { sessionId: "cs_test_1" },
+      cfg(
+        stripe({
+          get: [{ id: "cs_test_1", status: "open" }],
+          post: [{ error: { type: "api_error", message: "cs_test_1" } }, 500],
+        }),
+      ),
+    ).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      500,
+      "api_error",
+      "stripe 500 api_error",
+    ]);
+  });
+
+  it("refuses a live key or a bad id before any call", async () => {
+    const f = stripe({});
+    for (const [id, key, field] of [
+      ["cs_test_1", "sk_live_abcdefghij", "secretKey"],
+      ["cs_test_1", "rk_live_abcdefghij", "secretKey"],
+      ["cs_test_1/expire", KEY, "sessionId"],
+      ["sub_1", KEY, "sessionId"],
+    ] as const) {
+      const e = await expireCheckoutSession(
+        { sessionId: id },
+        { secretKey: key, fetch: f },
+      ).catch((x) => x);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("retrieveSubscription (#1568)", () => {
+  const seen: { method: string; url: string; body: unknown }[] = [];
+  const stripe = (b: unknown, st = 200) =>
+    (async (url: string, init: RequestInit) => {
+      seen.length = 0;
+      seen.push({ method: String(init.method), url, body: init.body });
+      return Response.json(b, { status: st });
+    }) as unknown as typeof fetch;
+
+  it("one GET; answers the id and status only", async () => {
+    expect(
+      await retrieveSubscription(
+        { subscriptionId: "sub_Test1" },
+        {
+          secretKey: KEY,
+          fetch: stripe({
+            id: "sub_Test1",
+            status: "past_due",
+            customer: "cus_1",
+            items: {},
+          }),
+        },
+      ),
+    ).toEqual({ id: "sub_Test1", status: "past_due" });
+    expect(seen).toEqual([
+      {
+        method: "GET",
+        url: "https://api.stripe.com/v1/subscriptions/sub_Test1",
+        body: undefined,
+      },
+    ]);
+  });
+
+  it("a 404 is status missing; another error keeps status and type only", async () => {
+    expect(
+      await retrieveSubscription(
+        { subscriptionId: "sub_Test1" },
+        {
+          secretKey: KEY,
+          fetch: stripe({ error: { type: "invalid_request_error" } }, 404),
+        },
+      ),
+    ).toEqual({ id: "sub_Test1", status: "missing" });
+    const e = await retrieveSubscription(
+      { subscriptionId: "sub_Test1" },
+      {
+        secretKey: KEY,
+        fetch: stripe(
+          { error: { type: "api_error", message: "sub_Test1" } },
+          500,
+        ),
+      },
+    ).catch((x) => x);
+    expect([e.status, e.type, String(e.message)]).toEqual([
+      500,
+      "api_error",
+      "stripe 500 api_error",
+    ]);
+  });
+
+  it("a live key, a bad id or an answer with no status is refused", async () => {
+    for (const [id, key, field] of [
+      ["sub_Test1", "sk_live_abcdefghij", "secretKey"],
+      ["sub_1/../x", KEY, "subscriptionId"],
+      ["cus_1", KEY, "subscriptionId"],
+    ] as const) {
+      const e = await retrieveSubscription(
+        { subscriptionId: id },
+        { secretKey: key, fetch: stripe({}) },
+      ).catch((x) => x);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    const e = await retrieveSubscription(
+      { subscriptionId: "sub_Test1" },
+      { secretKey: KEY, fetch: stripe({ id: "sub_Test1" }) },
+    ).catch((x) => x);
+    expect([e.status, e.type]).toEqual([200, "bad_answer"]);
   });
 });

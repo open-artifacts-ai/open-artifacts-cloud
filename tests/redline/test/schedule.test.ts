@@ -229,3 +229,54 @@ describe("the schedule simulation", () => {
     }
   });
 });
+
+// The model above has no upgrade in it: PRE 102 s is the bring-up of an
+// install that already runs the tag (preSec 102, bringupDoneSec 97). A real
+// candidate upgrades rl-a and rl-b first. These are the numbers the lead
+// reported for run 42436122165 (live, not committed as a fixture), and the
+// arithmetic for what #1730 PR 2 changes: the two upgrades at the same time,
+// and T19 in its own job. It does NOT reach 10 minutes with that suite wall.
+describe("a real upgrade (run 42436122165, reported figures)", () => {
+  const live = {
+    bringupSec: 232, // rl-a upgraded in ~120 s, then rl-b in ~98 s, serially
+    upgradeASec: 120,
+    upgradeBSec: 98,
+    suiteSec: 437,
+    t19Sec: 215,
+    revokeSec: 27,
+    totalSec: 996, // 16.6 min
+  };
+  // Everything else the job does (checkout, install, builds, secrets, mint,
+  // staged check, uploads, prod mint, scan).
+  const otherSec =
+    live.totalSec -
+    (live.bringupSec + live.suiteSec + live.t19Sec + live.revokeSec);
+
+  it("the reported pieces add up to the reported total", () => {
+    expect(otherSec).toBe(85);
+  });
+
+  it("serial upgrades with T19 after the suite reproduce the run: 996 s", () => {
+    expect(
+      otherSec + live.bringupSec + live.suiteSec + live.t19Sec + live.revokeSec,
+    ).toBe(996);
+  });
+
+  it("concurrent upgrades with T19 beside the suite: 683 s (11.4 min), over 10 minutes", () => {
+    // Both upgrades at once cost the longer one: at best the shorter one's
+    // time (98 s) comes off the bring-up.
+    const bringup =
+      live.bringupSec - Math.min(live.upgradeASec, live.upgradeBSec);
+    expect(bringup).toBe(134);
+    const end = otherSec + bringup + live.suiteSec + live.revokeSec;
+    expect(end).toBe(683);
+    expect(end).toBeGreaterThan(600);
+    // The t19 job starts once the key is sealed (about the end of bring-up)
+    // and ends well before the redline job, so the revoke waits for nothing.
+    const t19Start = P.mintDoneSec + bringup + 5;
+    const t19End = t19Start + live.t19Sec + P.t19TailSec + P.t19PollSec;
+    expect(t19End).toBeLessThan(otherSec + bringup + live.suiteSec);
+    // What would be needed: a suite wall of at most this.
+    expect(600 - (otherSec + bringup + live.revokeSec)).toBe(354);
+  });
+});

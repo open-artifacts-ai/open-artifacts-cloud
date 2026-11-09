@@ -9,7 +9,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  claimHookSlot,
+  HOOK_LIMIT,
+  HOOK_WINDOW_MS,
+  hookWindowCount,
+} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { LOCK_DIR_ENV, withLock } from "../src/locks.ts";
 import {
@@ -17,15 +23,17 @@ import {
   anonKeys,
   classify,
   guardedFetch,
-  liveTargetsFromEnv,
-  WAIT_BUDGET_MS,
   KEY_TABLE,
+  ledgerClaimWith,
+  liveTargetsFromEnv,
   MEMBERS_LOCK,
-  pacingNote,
   paceAnon,
+  pacingNote,
+  phaseScopes,
   resetPacingStats,
   targetsFromEnv,
   tripwire,
+  WAIT_BUDGET_MS,
 } from "../src/rl-anon.ts";
 
 const A: AnonTarget = {
@@ -415,6 +423,248 @@ describe("waits stay under the case timeout", () => {
   });
   it("the budget stays under the 180 s case timeout", () => {
     expect(WAIT_BUDGET_MS).toBeLessThan(180_000);
+  });
+});
+
+// --- cloud #24: the wait-budget follow-ups --------------------------------
+
+describe("wait budget follow-ups (cloud #24)", () => {
+  const answer = (status: number) => async () => new Response("x", { status });
+  const post = (f: typeof fetch, host = A.app) =>
+    f(`${host}/oauth/token`, { method: "POST" });
+
+  describe("1. a claim that lost the race never takes a slot", () => {
+    it("guardedFetch aborts the claim's signal when the budget runs out", async () => {
+      let seen: AbortSignal | undefined;
+      const f = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: (_k, signal) =>
+          new Promise<void>(() => {
+            seen = signal;
+          }),
+        waitBudgetMs: 20,
+      });
+      await expect(post(f)).rejects.toThrow(
+        /infra: pacing: this case has waited/,
+      );
+      expect(seen).toBeDefined();
+      expect(seen?.aborted).toBe(true);
+    });
+
+    it("paceAnon takes no further key's slot once told to stop", async () => {
+      const taken: string[] = [];
+      const c = new AbortController();
+      // A request that spends three keys; the first claim aborts the signal.
+      const r = req("POST", `${A.app}/bus/approve`, { cookie: "s=1" });
+      expect(anonKeys(r, T).length).toBeGreaterThanOrEqual(2);
+      await expect(
+        paceAnon(
+          r,
+          T,
+          async (k) => {
+            taken.push(k);
+            c.abort();
+          },
+          c.signal,
+        ),
+      ).rejects.toThrow(/aborted before a slot was taken/);
+      expect(taken).toHaveLength(1);
+      // Already aborted before the first claim: nothing is taken.
+      taken.length = 0;
+      await expect(
+        paceAnon(r, T, async (k) => void taken.push(k), c.signal),
+      ).rejects.toThrow(/aborted before a slot was taken/);
+      expect(taken).toEqual([]);
+    });
+
+    it("the ledger claim stops waiting on abort and leaves the ledger as it was", async () => {
+      const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
+      try {
+        let now = 1_000_000;
+        // The ledger for tok:ip is full: a new claim has to sleep.
+        for (let i = 0; i < HOOK_LIMIT; i++)
+          await claimHookSlot("rl-anon/tok:ip", { root, now: () => now });
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(HOOK_LIMIT);
+        let wake: () => void = () => {};
+        const claim = ledgerClaimWith({
+          root,
+          now: () => now,
+          sleep: () => new Promise<void>((r) => (wake = r)),
+        });
+        const c = new AbortController();
+        const pending = claim("tok:ip", c.signal);
+        c.abort();
+        await expect(pending).rejects.toThrow(
+          /aborted before a slot was taken/,
+        );
+        // The window passes and the underlying sleep ends: a claim that kept
+        // going would now take a slot for the request that was never sent.
+        now += HOOK_WINDOW_MS + 1_000;
+        wake();
+        await new Promise((r) => setImmediate(r));
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
+        // An already aborted signal never claims at all.
+        await expect(claim("tok:ip", c.signal)).rejects.toThrow(
+          /aborted before a slot was taken/,
+        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
+        // And without a signal it claims as before.
+        await claim("tok:ip");
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("1b. an aborted claim leaves no timer armed", () => {
+    it("the claim's own sleep timer is cleared on abort", async () => {
+      const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const now = () => 1_000_000;
+        for (let i = 0; i < HOOK_LIMIT; i++)
+          await claimHookSlot("rl-anon/tok:ip", { root, now });
+        // No sleep seam: the default timer, which has to be cleared.
+        const claim = ledgerClaimWith({ root, now });
+        const c = new AbortController();
+        const pending = claim("tok:ip", c.signal);
+        expect(vi.getTimerCount()).toBe(1);
+        c.abort();
+        await expect(pending).rejects.toThrow(/aborted before a slot/);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("2. hooks get a budget per phase, not one per file", () => {
+    it("phaseScopes hands out one scope until reset, a new one after", () => {
+      const p = phaseScopes();
+      const first = p.current();
+      expect(p.current()).toBe(first);
+      p.reset();
+      expect(p.current()).not.toBe(first);
+    });
+
+    it("two phases each spend most of a budget; one shared scope would run out", async () => {
+      const slow = () => new Promise<void>((r) => setTimeout(r, 40));
+      const phase = phaseScopes();
+      const split = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: slow,
+        waitBudgetMs: 60,
+        scope: () => phase.current(),
+      });
+      await post(split);
+      phase.reset();
+      // A fresh phase has the whole budget again.
+      expect((await post(split)).status).toBe(200);
+      // The same two requests in one scope: the second is over budget.
+      const shared = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: slow,
+        waitBudgetMs: 60,
+        scope: () => phase.current(),
+      });
+      await post(shared);
+      await expect(post(shared)).rejects.toThrow(/infra: pacing: this case/);
+    });
+
+    it("live/setup.ts scopes hooks by phase: a scope per beforeAll and per test end", () => {
+      const src = readFileSync(
+        join(import.meta.dirname, "../live/setup.ts"),
+        "utf8",
+      );
+      expect(src).toMatch(/const phase = phaseScopes\(\);/);
+      expect(src).toMatch(/beforeAll\(\(\) => phase\.reset\(\)\);/);
+      expect(src).toMatch(/afterEach\(\(\) => phase\.reset\(\)\);/);
+      expect(src).toMatch(
+        /scope: \(\) => getCurrentTest\(\) \?\? phase\.current\(\)/,
+      );
+    });
+  });
+
+  describe("3. a request's own time is never charged as wait", () => {
+    it("a lock taken at once, then a request that runs long and fails: the budget is intact", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "rl-anon-lock-"));
+      process.env[LOCK_DIR_ENV] = dir;
+      try {
+        const scope = {};
+        let calls = 0;
+        const f = guardedFetch(
+          (async () => {
+            calls++;
+            // The request itself takes longer than the whole budget, then fails.
+            await new Promise((r) => setTimeout(r, 70));
+            throw new Error("socket hang up");
+          }) as typeof fetch,
+          {
+            targets: T,
+            claim: async () => {},
+            waitBudgetMs: 50,
+            scope: () => scope,
+          },
+        );
+        const write = () => f(`${B.app}/api/v1/artifacts`, { method: "POST" });
+        await expect(write()).rejects.toThrow(/socket hang up/);
+        // Charged as wait, the 70 ms would have used up the 50 ms budget and
+        // this retry would fail as infra before it left.
+        await expect(write()).rejects.toThrow(/socket hang up/);
+        expect(calls).toBe(2);
+      } finally {
+        delete process.env[LOCK_DIR_ENV];
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("4. parallel waits are charged as wall time", () => {
+    it("two fetches that wait at the same moment spend the wait once", async () => {
+      const scope = {};
+      const f = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: () => new Promise<void>((r) => setTimeout(r, 40)),
+        waitBudgetMs: 100,
+        scope: () => scope,
+      });
+      // Together: 40 ms of wall time. Summed, 80 ms: the third fetch's own
+      // 40 ms wait would then run past the 100 ms budget.
+      await Promise.all([post(f), post(f)]);
+      expect((await post(f)).status).toBe(200);
+    });
+
+    it("waits one after another still add up", async () => {
+      const scope = {};
+      const f = guardedFetch(answer(200) as typeof fetch, {
+        targets: T,
+        claim: () => new Promise<void>((r) => setTimeout(r, 40)),
+        waitBudgetMs: 70,
+        scope: () => scope,
+      });
+      await post(f);
+      await post(f).catch(() => {});
+      await expect(post(f)).rejects.toThrow(/infra: pacing: this case/);
+    });
+
+    it("WAIT_BUDGET_MS says it is wall time per scope", () => {
+      const src = readFileSync(
+        join(import.meta.dirname, "../src/rl-anon.ts"),
+        "utf8",
+      );
+      const doc = src.slice(0, src.indexOf("export const WAIT_BUDGET_MS"));
+      expect(doc.slice(-600)).toMatch(/wall time per scope/);
+    });
   });
 });
 

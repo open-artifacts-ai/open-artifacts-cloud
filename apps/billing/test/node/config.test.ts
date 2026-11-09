@@ -55,6 +55,8 @@ describe("wrangler.jsonc", () => {
       );
       // Workers Logs would record full URLs.
       expect(e.observability).toEqual({ enabled: false });
+      // One daily cron: the stripe_events prune (#1479).
+      expect(e.triggers).toEqual({ crons: ["17 3 * * *"] });
       // The env (the app domain the gate's app host must be on) and this
       // env's own price placeholders; the Stripe key is a secret, never here.
       const up = env.toUpperCase();
@@ -62,6 +64,8 @@ describe("wrangler.jsonc", () => {
         OA_ENV: env,
         STRIPE_PRICE_TEAM: `{{STRIPE_PRICE_TEAM_${up}}}`,
         STRIPE_PRICE_BUSINESS: `{{STRIPE_PRICE_BUSINESS_${up}}}`,
+        STRIPE_PRICE_SOLO_MONTHLY: `{{STRIPE_PRICE_SOLO_MONTHLY_${up}}}`,
+        STRIPE_PRICE_SOLO_YEARLY: `{{STRIPE_PRICE_SOLO_YEARLY_${up}}}`,
       });
       for (const k of [
         "services",
@@ -69,7 +73,6 @@ describe("wrangler.jsonc", () => {
         "durable_objects",
         "queues",
         "dispatch_namespaces",
-        "triggers",
       ])
         expect(e).not.toHaveProperty(k);
     }
@@ -100,9 +103,12 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init is the only migration and creates the three tables", () => {
+  it("0001_init and 0002_solo_tier are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
-    expect(readdirSync(dir).sort()).toEqual(["0001_init.sql"]);
+    expect(readdirSync(dir).sort()).toEqual([
+      "0001_init.sql",
+      "0002_solo_tier.sql",
+    ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
       expect(sql).toMatch(new RegExp(`CREATE TABLE ${t} \\(`));
@@ -112,13 +118,43 @@ describe("migrations", () => {
     );
   });
 
-  it("is the schema @oa/billing-core tests against, byte for byte", () => {
-    expect(readFileSync(join(app, "migrations/0001_init.sql"), "utf8")).toBe(
-      readFileSync(
-        join(app, "../../packages/billing-core/test/migrations/0001_init.sql"),
-        "utf8",
-      ),
+  it("0002 rebuilds tiers with solo allowed and 0001's columns kept", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0002_solo_tier.sql"),
+      "utf8",
     );
+    expect(sql).toMatch(
+      /tier TEXT CHECK \(tier IN \('free', 'solo', 'trial', 'team', 'business'\)\)/,
+    );
+    const cols = (t: string) =>
+      [...t.matchAll(/^ {2}(\w+) [A-Z]/gm)].map((m) => m[1]);
+    const init = readFileSync(join(app, "migrations/0001_init.sql"), "utf8");
+    const tiers = (t: string) =>
+      t.slice(t.indexOf("CREATE TABLE tiers"), t.indexOf(");") + 2);
+    // 0001's columns, then the Solo columns (0002 is not frozen: billing has
+    // never been deployed).
+    expect(cols(tiers(sql.replace("tiers_new", "tiers")))).toEqual([
+      ...cols(tiers(init)),
+      "last_checkout_created",
+      "solo_trial_ends_at",
+      "solo_status",
+      "solo_grace_until",
+      "open_checkout_id",
+      "open_checkout_key",
+    ]);
+    expect(sql).toMatch(
+      /DROP TABLE tiers;\nALTER TABLE tiers_new RENAME TO tiers;/,
+    );
+  });
+
+  it("is the schema @oa/billing-core tests against, byte for byte", () => {
+    for (const f of readdirSync(join(app, "migrations")))
+      expect(readFileSync(join(app, "migrations", f), "utf8"), f).toBe(
+        readFileSync(
+          join(app, "../../packages/billing-core/test/migrations", f),
+          "utf8",
+        ),
+      );
   });
 });
 
@@ -140,7 +176,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 50 KB per env", () => {
+  it("wrangler deploy --dry-run is under 64 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -148,7 +184,8 @@ describe("bundle", () => {
         .filter((f) => f.endsWith(".js"))
         .reduce((n, f) => n + statSync(join(out, f)).size, 0);
       expect(bytes).toBeGreaterThan(0);
-      expect(bytes).toBeLessThan(50 * 1024);
+      // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths.
+      expect(bytes).toBeLessThan(64 * 1024);
     }
   });
 });

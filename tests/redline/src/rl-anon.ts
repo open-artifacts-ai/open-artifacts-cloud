@@ -14,7 +14,10 @@
 // is an InfraError naming the route, never a verdict: a key we do not pace is
 // being spent, and the table needs a row (test/rl-anon.test.ts also reads the
 // server's source for every key it limits on).
-import { claimHookSlot } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+import {
+  claimHookSlot,
+  type PaceOpts,
+} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { InfraError } from "./fetch-timeout.ts";
 import { holdsExclusive, withLock } from "./locks.ts";
 
@@ -175,7 +178,11 @@ export const anonKeys = (
   targets: readonly AnonTarget[],
 ): string[] => classify(req, targets).keys;
 
-export type Claim = (key: string) => Promise<unknown>;
+/**
+ * Claims a slot for `key`. When `signal` aborts, the claim stops waiting and
+ * rejects without taking a slot: the request it was for is never sent.
+ */
+export type Claim = (key: string, signal?: AbortSignal) => Promise<unknown>;
 
 /**
  * What this process claimed, for the part's notes (#1730: the first real run
@@ -206,19 +213,73 @@ export const resetPacingStats = (): void => {
   stats.waitedMs = 0;
 };
 
-/** The public ledger claim for one key, one ledger per key. */
-export const ledgerClaim: Claim = (key) => claimHookSlot(`rl-anon/${key}`);
+/** Thrown inside a claim that was told to stop; the guard has already failed the request. */
+class PacingAborted extends Error {
+  constructor() {
+    super("pacing: aborted before a slot was taken");
+    this.name = "PacingAborted";
+  }
+}
+
+/**
+ * `sleep` that rejects when `signal` aborts, so a claim never wakes up to take
+ * a slot, and whose own timer is cleared then (an aborted wait leaves nothing
+ * armed behind it). `sleep` is a test seam; without it a timer is used.
+ */
+const abortableSleep =
+  (
+    sleep: ((ms: number) => Promise<void>) | undefined,
+    signal: AbortSignal | undefined,
+  ): ((ms: number) => Promise<void>) =>
+  (ms) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(new PacingAborted());
+      let timer: NodeJS.Timeout | undefined;
+      const stop = () => {
+        clearTimeout(timer);
+        reject(new PacingAborted());
+      };
+      signal?.addEventListener("abort", stop, { once: true });
+      const end =
+        <T>(f: (v: T) => void) =>
+        (v: T) => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", stop);
+          f(v);
+        };
+      if (sleep) sleep(ms).then(end(resolve), end(reject));
+      else timer = setTimeout(end(resolve), ms);
+    });
+
+/**
+ * The public ledger claim for one key, one ledger per key (#24: a claim told
+ * to stop while it waits never takes the slot it was waiting for). The
+ * options are a test seam (ledger root, clock, sleep).
+ */
+export const ledgerClaimWith =
+  (o: Pick<PaceOpts, "root" | "now" | "sleep"> = {}): Claim =>
+  (key, signal) => {
+    if (signal?.aborted) return Promise.reject(new PacingAborted());
+    return claimHookSlot(`rl-anon/${key}`, {
+      ...o,
+      sleep: abortableSleep(o.sleep, signal),
+    });
+  };
+export const ledgerClaim: Claim = ledgerClaimWith();
 
 /** Waits until every key the request spends has room, recording each. */
 export async function paceAnon(
   req: ReqLike,
   targets: readonly AnonTarget[],
   claim: Claim = ledgerClaim,
+  signal?: AbortSignal,
 ): Promise<string[]> {
   const keys = anonKeys(req, targets);
   for (const k of keys) {
+    // Told to stop (the case's wait budget ran out): no further slot is taken.
+    if (signal?.aborted) throw new PacingAborted();
     const t0 = Date.now();
-    await claim(k);
+    await claim(k, signal);
     stats.waitedMs += Date.now() - t0;
     stats.anon.set(k, (stats.anon.get(k) ?? 0) + 1);
   }
@@ -299,8 +360,40 @@ export function liveTargetsFromEnv(
   return out;
 }
 
-/** Pacing and lock waits of one case may total this long: under the 180 s case timeout. */
+/**
+ * Pacing and lock waits of one case may total this long: under the 180 s case
+ * timeout. It is wall time per scope: requests of one case that wait at the
+ * same moment (parallel fetches) are charged once for the time they overlap,
+ * not once each (#24).
+ */
 export const WAIT_BUDGET_MS = 120_000;
+
+/**
+ * What a scope has spent waiting: closed intervals in `spent`, and while any
+ * wait is open (`active`) the time since the first of them began, so
+ * overlapping waits count their union, not their sum.
+ */
+interface Waited {
+  spent: number;
+  active: number;
+  since: number;
+}
+
+/**
+ * A fresh budget scope each time `reset` runs. The live setup file uses it
+ * for code that runs outside any test (beforeAll and afterAll hooks): the
+ * hooks before the first test share one scope, and each test's end starts a
+ * new one, so the afterAll hooks never draw on the beforeAll hooks' budget (#24).
+ */
+export function phaseScopes(): { current: () => object; reset: () => void } {
+  let cur: object = {};
+  return {
+    current: () => cur,
+    reset: () => {
+      cur = {};
+    },
+  };
+}
 
 export interface GuardDeps {
   targets: readonly AnonTarget[];
@@ -325,19 +418,38 @@ const READS = new Set(["GET", "HEAD", "OPTIONS"]);
 export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
   // targetsFromEnv lists a then b: b is the second.
   const budget = d.waitBudgetMs ?? WAIT_BUDGET_MS;
-  const spent = new WeakMap<object, number>();
+  const waited = new WeakMap<object, Waited>();
   const global = {};
   const key = () => d.scope?.() ?? global;
+  const state = (): Waited => {
+    let w = waited.get(key());
+    if (!w) {
+      w = { spent: 0, active: 0, since: 0 };
+      waited.set(key(), w);
+    }
+    return w;
+  };
   const left = (what: string): number => {
-    const r = budget - (spent.get(key()) ?? 0);
+    const w = state();
+    const used = w.spent + (w.active > 0 ? Date.now() - w.since : 0);
+    const r = budget - used;
     if (r <= 0)
       throw new InfraError(
         `${what}: this case has waited ${budget / 1000} s on pacing and locks, which would run it past its timeout`,
       );
     return r;
   };
-  const spend = (since: number) =>
-    spent.set(key(), (spent.get(key()) ?? 0) + Date.now() - since);
+  /** Opens a wait in the running scope; the returned function closes it (once). */
+  const wait = (): (() => void) => {
+    const w = state();
+    if (w.active++ === 0) w.since = Date.now();
+    let open = true;
+    return () => {
+      if (!open) return;
+      open = false;
+      if (--w.active === 0) w.spent += Date.now() - w.since;
+    };
+  };
   const members = d.membersOrigin ?? urlOf(d.targets[1]?.app ?? "")?.origin;
   return async (input, init) => {
     const method = (
@@ -354,27 +466,33 @@ export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
     );
     const req: ReqLike = { method, url, headers };
     if (d.targets.length === 0) return inner(input, init);
-    const t0 = Date.now();
     const ms = left("pacing");
+    const end = wait();
+    const stop = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     try {
       await Promise.race([
-        paceAnon(req, d.targets, d.claim),
+        paceAnon(req, d.targets, d.claim, stop.signal),
         new Promise<never>((_, rej) => {
-          timer = setTimeout(
-            () =>
-              rej(
-                new InfraError(
-                  `pacing: this case has waited ${budget / 1000} s on pacing and locks, which would run it past its timeout`,
-                ),
+          timer = setTimeout(() => {
+            // First tell the claim to stop, so it never takes a slot for a
+            // request that is not sent, then fail the case (#24).
+            stop.abort();
+            rej(
+              new InfraError(
+                `pacing: this case has waited ${budget / 1000} s on pacing and locks, which would run it past its timeout`,
               ),
-            ms,
-          );
+            );
+          }, ms);
         }),
       ]);
+    } catch (e) {
+      // A request that gave up never leaves a claim running behind it.
+      stop.abort();
+      throw e;
     } finally {
       clearTimeout(timer);
-      spend(t0);
+      end();
     }
     const run = async () => {
       const res = await inner(input, init);
@@ -387,22 +505,19 @@ export function guardedFetch(inner: typeof fetch, d: GuardDeps): typeof fetch {
       urlOf(url)?.origin === members &&
       !holdsExclusive(MEMBERS_LOCK)
     ) {
-      const t1 = Date.now();
       const tl = left("members lock");
-      let waited = 0;
+      // The wait ends when the lock is taken, however fast that was: the
+      // request's own time is never charged as wait (#24).
+      const endLock = wait();
       return withLock(
         MEMBERS_LOCK,
         "shared",
         () => {
-          waited = Date.now() - t1;
-          spend(t1);
+          endLock();
           return run();
         },
         { deadlineMs: tl },
-      ).catch((e) => {
-        if (!waited) spend(t1);
-        throw e;
-      });
+      ).finally(endLock);
     }
     return run();
   };

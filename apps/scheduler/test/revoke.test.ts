@@ -767,6 +767,40 @@ describe("broker gates on every install call", () => {
     },
   });
 
+  it("every kind of call the scheduler makes to an install carries its billing gate: the nightly cron, the directory sync, the directory revoke (#1514)", async () => {
+    const reseed = async () => {
+      await db.prepare("DELETE FROM install_versions").run();
+      await db.prepare("DELETE FROM install_lifecycle").run();
+      await db.prepare("DELETE FROM installs").run();
+      await seed([
+        { id: idOf(0), state: "active", revoke: null },
+        { id: idOf(1) },
+      ]);
+    };
+    const kinds: [string, string, (e: Env) => Promise<unknown>][] = [
+      ["nightly cron", idOf(0), (e) => runNightly(e, NOW, { gates })],
+      ["directory sync", idOf(0), (e) => directorySync(e, NOW, gates)],
+      ["directory revoke", idOf(1), (e) => revokeTick(e, NOW, { gates })],
+    ];
+    for (const bound of [true, false])
+      for (const [kind, id, run] of kinds) {
+        await reseed();
+        const f = fakes();
+        if (bound)
+          (f.env as { BILLING?: unknown }).BILLING = {
+            fetch: async () => Response.json({ ok: true }),
+          };
+        await run(f.env);
+        const mine = f.args.filter((a) => a.script === `oa-s-${id}`);
+        expect(mine.length, `${kind} called ${id}`).toBeGreaterThan(0);
+        for (const a of mine) {
+          const p = (a.args as { props: Record<string, unknown> }).props;
+          if (bound) expect(p.BILLING, kind).toEqual(props(id).props.BILLING);
+          else expect(Object.keys(p), kind).not.toContain("BILLING");
+        }
+      }
+  });
+
   it("the revoke call carries that install's gates, and only its own", async () => {
     await seed([{ id: idOf(0) }, { id: idOf(1) }]);
     const f = fakes();
