@@ -299,3 +299,115 @@ describe("a real upgrade (run 42436122165, reported figures)", () => {
     expect(600 - (otherSec + bringup + live.revokeSec)).toBe(354);
   });
 });
+
+// Run 42642922707 (cloud, v0.140.0, 577 s redline job): a real upgrade of
+// rl-a and rl-b, measured per step and per lane from the run's log (the
+// 121 s step, the 390 s suite, the 24 s revoke). This is #26's question: what
+// ends the job under 600 s once #34's provisioner probes join the prov lane.
+// Every figure is a measurement except PROBES_SEC, which is the model #34's
+// own schedule test uses (a 60 s replay watch, a 90 s bound, 30 s setup).
+describe("a real upgrade at v0.140.0 (run 42642922707, measured): the cost of #34's probes", () => {
+  const m = {
+    upgradeSec: 121, // "Upgrade rl-a and rl-b to the tag", both at once (#1730 PR 2)
+    // staged-version 2 + hand-off upload 1 + seal 2 + upload 1 + prod mint 1:
+    // the steps between bring-up and the suite.
+    betweenSec: 7,
+    suiteSec: 390,
+    revokeSec: 24,
+    totalSec: 577,
+    mergeSec: 2,
+    // The lanes' walls in the suite step (the longest is the suite's end
+    // less the merge: prov, 388 s, whose rl-p chain is P13 180 + P45 99 +
+    // P31 51 + P23 40 s of the provisioner's own work).
+    lanes: { prov: 388, surfaces: 320, creds: 233, guard: 184, front: 162 },
+  };
+  // Checkout, installs, builds, secrets, targets, mint, and the scan, upload
+  // and wait steps after the suite: what no lane or bring-up covers.
+  const otherSec =
+    m.totalSec - (m.upgradeSec + m.betweenSec + m.suiteSec + m.revokeSec);
+  const PROBES_SEC = 60 + 90 + 30;
+  const walls = (extra: Record<string, number> = {}) => ({
+    ...m.lanes,
+    ...extra,
+  });
+  /** The suite step's length: the latest lane end (start offset + wall), plus the merge. */
+  const suiteLen = (
+    w: Record<string, number>,
+    start: Record<string, number> = {},
+  ) =>
+    Math.max(...Object.entries(w).map(([k, s]) => (start[k] ?? 0) + s)) +
+    m.mergeSec;
+  const job = (suite: number) =>
+    otherSec + m.upgradeSec + m.betweenSec + suite + m.revokeSec;
+
+  it("the lanes named are the plan's lanes, and the pieces add up to the 577 s job", () => {
+    expect(Object.keys(m.lanes).sort()).toEqual(
+      (PLAN[0] ?? []).map((l) => l.name).sort(),
+    );
+    expect(otherSec).toBe(35);
+    expect(suiteLen(walls())).toBe(m.suiteSec);
+    expect(job(suiteLen(walls()))).toBe(577);
+  });
+
+  it("the prov lane is the critical path: every other lane ends 68 s or more before it", () => {
+    const byEnd = Object.entries(m.lanes).sort((a, b) => b[1] - a[1]);
+    expect(byEnd[0]?.[0]).toBe("prov");
+    expect(byEnd[0]?.[1]).toBe(388);
+    expect((byEnd[0]?.[1] ?? 0) - (byEnd[1]?.[1] ?? 0)).toBe(68);
+  });
+
+  it("#34's probes after provisioning in the prov lane: 757 s, 157 s over", () => {
+    const end = job(suiteLen(walls({ prov: m.lanes.prov + PROBES_SEC })));
+    expect(end).toBe(757);
+    expect(end - 600).toBe(157);
+  });
+
+  it("#34's probes in a lane of their own beside prov: 577 s, as without them", () => {
+    // The probes' bucket (RL_PV_WRITE / RL_PV_PRE_IP) needs a claim that lets
+    // the lane run beside provisioning; the file takes 180 s at most, so the
+    // suite still ends with prov.
+    const end = job(suiteLen(walls({ probes: PROBES_SEC })));
+    expect(end).toBe(577);
+    expect(PROBES_SEC).toBeLessThan(m.lanes.prov);
+  });
+
+  it("the probes behind guard instead (a lane that ends at 184 s): 577 s too", () => {
+    const end = job(suiteLen(walls({ guard: m.lanes.guard + PROBES_SEC })));
+    expect(m.lanes.guard + PROBES_SEC).toBe(364);
+    expect(end).toBe(577);
+  });
+
+  it("behind creds the probes would end at 413 s and cost 25 s: not there", () => {
+    const end = job(suiteLen(walls({ creds: m.lanes.creds + PROBES_SEC })));
+    expect(end).toBe(602);
+    expect(end).toBeGreaterThan(600);
+  });
+
+  it("the margin of the 577 s plan is 23 s: one slow create (P13 took 152 s, then 180 s) uses it", () => {
+    expect(600 - 577).toBe(23);
+    // P13 alone went from 151 s (run 42402998826) to 180 s: +28 s.
+    expect(job(suiteLen(walls({ prov: m.lanes.prov + 28 })))).toBeGreaterThan(
+      600,
+    );
+  });
+
+  it("provisioning started at the OIDC mint, before bring-up ends, frees 68 s: 509 s, with or without the probes in their own lane", () => {
+    // The lane's chain (rl-p's create, upgrade, rollback, purge) needs neither
+    // rl-a nor rl-b; only P24 and P36 read them, after bring-up. Started
+    // upgrade + between = 128 s earlier, its 388 s ends 260 s into the
+    // suite step's own clock, and surfaces (320 s) is the end.
+    const early = { prov: -(m.upgradeSec + m.betweenSec) };
+    expect(suiteLen(walls(), early)).toBe(322);
+    expect(job(suiteLen(walls(), early))).toBe(509);
+    expect(job(suiteLen(walls({ probes: PROBES_SEC }), early))).toBe(509);
+  });
+
+  it("started early with #34's probes still behind provisioning: 629 s, over; the early start alone is not enough", () => {
+    const early = { prov: -(m.upgradeSec + m.betweenSec) };
+    const end = job(
+      suiteLen(walls({ prov: m.lanes.prov + PROBES_SEC }), early),
+    );
+    expect(end).toBe(629);
+    expect(end).toBeGreaterThan(600);
+  });
+});
