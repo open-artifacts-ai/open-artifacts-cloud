@@ -1,7 +1,7 @@
-import { BUS_OFF_REASON, HOSTED_BUS_LIFTED } from "./bus-gate.ts";
+import { HOSTED_BUS_LIFTED } from "./bus-gate.ts";
 import { type Held, holdSocket } from "./ws.ts";
 
-export { BUS_OFF_REASON, HOSTED_BUS_LIFTED };
+export { HOSTED_BUS_LIFTED };
 
 // The hosted bus's red-line helpers (open-artifacts#1299, part 4). The bus
 // answers 404 on a hosted install until part 6 lifts HOSTED=1, so every case

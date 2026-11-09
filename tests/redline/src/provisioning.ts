@@ -9,7 +9,7 @@ import {
   TOKEN_SCOPES,
 } from "@oa/provisioning-contract";
 import { waitFor } from "./barrier.ts";
-import { BUS_OFF_REASON, HOSTED_BUS_LIFTED } from "./bus-gate.ts";
+import { HOSTED_BUS_LIFTED } from "./bus-gate.ts";
 import {
   InfraError,
   isNetworkError,
@@ -2011,7 +2011,7 @@ export const PROBES: readonly Probe[] = [
     // On rl-l, before P20: it suspends and resumes rl-l itself, so P20 to
     // P22 start from a serving install as ever. Needs the install's bus: on
     // a hosted install it is off (404) until the HOSTED=1 gate is lifted
-    // (#1299, part 6), and then the case is unproven, not a pass.
+    // (#1299, part 6): until then the case asserts it is off.
     run: async (run) => {
       const bus = run.io.bus;
       if (!bus)
@@ -2038,7 +2038,14 @@ export const PROBES: readonly Probe[] = [
       if (s === "off") {
         if (HOSTED_BUS_LIFTED)
           throw new ProbeFail("P51: rl-l's bus answers 404 after the lift");
-        return unproven(BUS_OFF_REASON);
+        // Before the lift the design is: the bus is off under HOSTED=1.
+        return pass("bus off before the lift (HOSTED_BUS_LIFTED is false)");
+      }
+      if (!HOSTED_BUS_LIFTED) {
+        await s.cleanup();
+        throw new ProbeFail(
+          "P51: rl-l's bus is on before the lift: HOSTED=1 should answer 404 (set HOSTED_BUS_LIFTED in src/bus-gate.ts with part 6)",
+        );
       }
       let suspended = false;
       try {

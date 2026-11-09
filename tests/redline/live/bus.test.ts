@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, it } from "vitest";
 import {
-  BUS_OFF_REASON,
   type BusSite,
   busState,
   connectRequest,
@@ -17,7 +16,6 @@ import {
   prepareSide,
   type Side,
 } from "../src/refused.ts";
-import { proof } from "../src/report.ts";
 import { loadTargets, type Targets } from "../src/targets.ts";
 import { wsHandshake } from "../src/ws.ts";
 
@@ -29,10 +27,10 @@ import { wsHandshake } from "../src/ws.ts";
 // tables are separate D1 rows, so B must find no row for A's token hash.
 //
 // The bus is off on hosted installs (404) until the HOSTED=1 gate is lifted
-// (part 6). Until then every case here reports unproven-live with
-// BUS_OFF_REASON, which the gate accepts by exact name and reason
-// (src/report.ts ACCEPTED_UNPROVEN); part 6 sets HOSTED_BUS_LIFTED and
-// removes those entries, and a bus that is off is then a failure.
+// (part 6). Until HOSTED_BUS_LIFTED (src/bus-gate.ts) is set, the case asserts
+// that: the ping answers 404 at both sides, and a bus that is on fails it.
+// After the lift the full cross-install assertions run, and a bus that is off
+// fails.
 
 const LABEL = `redline-bus-${Date.now().toString(36)}`;
 
@@ -83,12 +81,16 @@ afterAll(async () => {
 });
 
 describe("bus", () => {
-  it("A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)", async (ctx) => {
-    if (!on) {
-      if (HOSTED_BUS_LIFTED)
-        throw new Error("the bus is off on the red-line pair after the lift");
-      return proof(ctx, "unproven-live", BUS_OFF_REASON);
+  it("A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)", async () => {
+    if (!HOSTED_BUS_LIFTED) {
+      if (on)
+        throw new Error(
+          "the bus is on at the red-line pair before the lift: HOSTED=1 should answer 404 (set HOSTED_BUS_LIFTED in src/bus-gate.ts with part 6)",
+        );
+      return;
     }
+    if (!on)
+      throw new Error("the bus is off on the red-line pair after the lift");
     const tokens = new Map<string, string>();
     for (const s of [A, B]) {
       minted.push({ s, site: site(s) });

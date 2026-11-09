@@ -1,8 +1,8 @@
 // #1299 (part 4) adds two cases to main's: the bus's cross-install machine
 // token and P51. They are listed here by name so the check below still holds
 // every one of main's cases, in main's order, and nothing else is added
-// without a line here. Each is accepted-unproven only while the bus is off
-// (src/bus-gate.ts); part 6 removes those entries.
+// without a line here. Both pass or fail on a real assertion before and
+// after the lift (src/bus-gate.ts); neither is an accepted unproven.
 export const ADDED = [
   {
     file: "live/bus.test.ts",

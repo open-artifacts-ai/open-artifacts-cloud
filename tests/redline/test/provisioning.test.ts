@@ -9,8 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Job } from "@oa/provisioning-contract";
-import { afterEach, describe, expect, it } from "vitest";
-import { BUS_OFF_REASON } from "../src/bus-gate.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
@@ -155,6 +154,10 @@ const level = (o: Outcome | string | undefined) =>
       ? "infra"
       : `fail: ${o}`
     : o?.level;
+
+// P51 runs its full assertions here; the not-lifted behaviour is in
+// test/bus-gated.test.ts.
+vi.mock("../src/bus-gate.ts", () => ({ HOSTED_BUS_LIFTED: true }));
 
 describe("the probes on a conforming staging fake", () => {
   it("covers P1-P51 exactly once: a probe, or removed with the issue that says why", () => {
@@ -2520,22 +2523,11 @@ describe("the chains run at once (startChains)", () => {
       expect(f.bus.cleaned).toBe(1);
     });
 
-    it("the bus off (404): unproven-live with the fixed reason the gate accepts, and P51 suspends nothing", async () => {
+    it("the bus off (404) after the lift is a failure, and P51 suspends nothing", async () => {
       const f = fakeApi();
       f.bus.mode = "off";
       const { out } = await runChains(f);
-      expect(out.get(P51)).toEqual({
-        level: "unproven-live",
-        reason: BUS_OFF_REASON,
-      });
-      expect(
-        acceptedUnproven({
-          name: `provisioning > P51: ${PROBES.find((p) => p.id === P51)?.title}`,
-          file: "live/provisioning.test.ts",
-          ...(out.get(P51) as Outcome & { level: "unproven-live" }),
-        }),
-      ).toBeDefined();
-      // Only P20's suspend.
+      expect(out.get(P51)).toBe("P51: rl-l's bus answers 404 after the lift");
       expect(suspends(f)).toBe(1);
     });
 

@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { BUS_OFF_REASON } from "../src/bus-gate.ts";
 import { PLAN } from "../src/lanes.ts";
 import {
   ACCEPTED_UNPROVEN,
@@ -77,17 +76,15 @@ describe("the same cases", () => {
 });
 
 describe("the same pass bar", () => {
-  it("ACCEPTED_UNPROVEN is main's four entries, by name, reason and file, plus one per ADDED case (the bus is off until part 6)", () => {
-    const all = ACCEPTED_UNPROVEN.map((e) => ({
-      name: e.name,
-      reason: e.reason,
-      file: e.file,
-    }));
-    const added = (e: { name: string }) => ADDED.some((a) => a.name === e.name);
-    expect(all.filter((e) => !added(e))).toEqual(main.acceptedUnproven);
+  it("ACCEPTED_UNPROVEN is main's four entries, by name, reason and file", () => {
+    expect(
+      ACCEPTED_UNPROVEN.map((e) => ({
+        name: e.name,
+        reason: e.reason,
+        file: e.file,
+      })),
+    ).toEqual(main.acceptedUnproven);
     expect(main.acceptedUnproven).toHaveLength(4);
-    expect(all.filter(added)).toHaveLength(ADDED.length);
-    for (const e of all.filter(added)) expect(e.reason).toBe(BUS_OFF_REASON);
   });
 
   it("MAX_RETRIED_CASES is 5 and the gate is read from --gate or REDLINE_GATE=1", () => {

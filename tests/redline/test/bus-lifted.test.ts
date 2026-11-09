@@ -7,7 +7,6 @@ import { CONFIG, fakeApi } from "./provisioning-fake.ts";
 // unproven-live the gate accepts.
 vi.mock("../src/bus-gate.ts", () => ({
   HOSTED_BUS_LIFTED: true,
-  BUS_OFF_REASON: "off",
 }));
 
 describe("P51 after the lift", () => {
