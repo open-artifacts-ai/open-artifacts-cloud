@@ -11,5 +11,13 @@
       "@cloudflare/vitest-plugin/types"
     ]
   },
-  "include": [".", "../src", "../vitest.config.ts", "../vitest.node.config.ts"]
+  // build-flags.d.ts: the server sources imported by gmail-signup-owner.test.ts
+  // read the __OA_TEST_HOOKS_ALLOWED__ bundler define.
+  "include": [
+    ".",
+    "../src",
+    "../vitest.config.ts",
+    "../vitest.node.config.ts",
+    "../../server/src/build-flags.d.ts"
+  ]
 }
