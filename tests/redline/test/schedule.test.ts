@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
-import { ADDED } from "./added-cases.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
 // its per-case durations and per-file walls (test/fixtures/run-42402998826.json,
@@ -41,7 +41,7 @@ const P = fx.phases;
  * Files added after the recording (#1299's live/bus.test.ts), so no wall was
  * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
  * case that is a few requests while the bus is off). The first live run that
- * includes them replaces it; test/same-cases ADDED names what is estimated.
+ * includes them replaces it; test/cases-added.ts names what is estimated.
  */
 const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
 const wall = (f: string): number => {
@@ -117,13 +117,15 @@ describe("the recording (run 42402998826)", () => {
     );
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
-    // The recording is of a run before #1299's two cases (test/same-cases
-    // ADDED); every other case is in both.
-    const added = new Set(ADDED.map((c) => `${c.file} ${c.name}`));
+    // The recording predates the cases declared in cases-added.ts: it holds
+    // the manifest minus exactly those, never a case with an invented time.
+    const added = new Set(
+      CASES_ADDED_SINCE_1730.map((c) => `${c.file} ${c.name}`),
+    );
+    const mk = m.cases.map((c) => `${c.file} ${c.name}`);
+    for (const k of added) expect(mk).toContain(k);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(
-        m.cases.map((c) => `${c.file} ${c.name}`).filter((k) => !added.has(k)),
-      ),
+      new Set(mk.filter((k) => !added.has(k))),
     );
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,

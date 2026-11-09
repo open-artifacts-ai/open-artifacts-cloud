@@ -12,7 +12,7 @@ import {
   parseManifest,
 } from "../src/report.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
-import { ADDED } from "./added-cases.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // #1730 changes when and beside what the cases run, never which cases there
 // are or what passes. test/fixtures/main-cases.json is main's required cases
@@ -27,21 +27,28 @@ const main = JSON.parse(
 ) as Main;
 const pkg = join(import.meta.dirname, "..");
 
-const isAdded = (c: { file: string; name: string }) =>
-  ADDED.some((a) => a.file === c.file && a.name === c.name);
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds main's 329 cases, in main's order, plus exactly the cases named in ADDED", () => {
+  it("manifest.json holds exactly main's 329 cases, in main's order, plus the declared additions", () => {
     const m = parseManifest(read("live/manifest.json"));
-    expect(main.manifest).toHaveLength(329);
     const all = m.cases.map((c) => ({ file: c.file, name: c.name }));
-    expect(all.filter((c) => !isAdded(c))).toEqual(main.manifest);
-    expect(all.filter(isAdded)).toEqual(ADDED);
+    const key = (c: { file: string; name: string }) =>
+      `${c.file}\u0000${c.name}`;
+    const added = new Set(CASES_ADDED_SINCE_1730.map(key));
+    const base = new Set(main.manifest.map(key));
+    expect(main.manifest).toHaveLength(329);
+    expect(added.size).toBe(CASES_ADDED_SINCE_1730.length);
+    // Every declared addition is in the manifest and not already main's.
+    for (const k of added) {
+      expect(all.map(key)).toContain(k);
+      expect(base.has(k)).toBe(false);
+    }
+    expect(all.filter((c) => !added.has(key(c)))).toEqual(main.manifest);
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set([...main.manifest, ...ADDED].map((c) => c.file));
+    const files = new Set([...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file));
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });
