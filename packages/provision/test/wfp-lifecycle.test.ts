@@ -3542,7 +3542,9 @@ describe("fix round 4 (T8): every server precondition for hosted google", () => 
       "BROKER_SIGNING_KEY",
       /BROKER_SIGNING_KEY isn't/,
     ],
-    ["AUTH_DOMAINS non-empty", "AUTH_DOMAINS", /AUTH_DOMAINS is empty/],
+    // No AUTH_DOMAINS row: the server stopped refusing google on an empty
+    // list (public #1825, owner and invites only). Provision still refuses to
+    // render it; that is the "google needs AUTH_DOMAINS" tests above.
   ];
   it.each(RENDERED)(
     "rendered by provision: %s (without %s the server refuses google)",
