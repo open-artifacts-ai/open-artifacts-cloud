@@ -962,6 +962,44 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
       expect(started).toEqual([...started].sort((a, b) => a - b));
     });
 
+    it("a dirty verdict beats a transient failure that is in flight with it, whichever has the lower number", async () => {
+      const dirty = new ProdDirty("release_dirty", "dirty");
+      const infra = new InfraError("no response twice");
+      for (const [lowIsDirty, items] of [
+        [false, [0, 1]],
+        [true, [0, 1]],
+      ] as const) {
+        const e = await forEachLimit(
+          items,
+          2,
+          async (n) => {
+            await tick();
+            throw (n === 0) === lowIsDirty ? dirty : infra;
+          },
+          (x) => x instanceof ProdDirty,
+        ).catch((x: unknown) => x);
+        expect(e, `low is dirty: ${lowIsDirty}`).toBe(dirty);
+      }
+      // No verdict among the failures: the lowest failure.
+      const e = await forEachLimit([0, 1], 2, async (n) => {
+        await tick();
+        throw new Error(`item ${n}`);
+      }).catch((x: unknown) => x);
+      expect((e as Error).message).toBe("item 0");
+    });
+
+    it("a limit that is not a positive integer throws, and runs nothing", async () => {
+      for (const limit of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY]) {
+        let ran = 0;
+        await expect(
+          forEachLimit([1, 2], limit, async () => {
+            ran++;
+          }),
+        ).rejects.toThrow(/positive integer/);
+        expect(ran).toBe(0);
+      }
+    });
+
     it("an empty list is done, and a limit above the count is fine", async () => {
       await forEachLimit([], 4, async () => {
         throw new Error("never");
@@ -1032,6 +1070,28 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
     // The fake serves one script (ID); every other row's script is unreadable.
     const w = many(1, 8);
     await expect(check(w)).rejects.toThrow(/404|not found|secrets/i);
+  });
+
+  it("a dirty release beside a release whose read gets no response twice: release_dirty, not infra", async () => {
+    // 1.0.3 is dirty; 1.0.1's record read is held open until the bound fires.
+    const w = many(4);
+    publish(w, { version: "1.0.3", js: HOOK_SQL_MARKERS[0] });
+    const { fetch } = await serve(w);
+    const held: typeof fetch = (input, init) => {
+      const raw = decodeURIComponent(
+        input instanceof Request ? input.url : String(input),
+      );
+      if (raw.includes("releases/1.0.1/release/record.sig.json"))
+        return Promise.reject(
+          Object.assign(new Error("reset"), { code: "ECONNRESET" }),
+        );
+      return fetch(input, init);
+    };
+    await expect(
+      failCode(
+        prodClean(probe(), { fetch: held, pubkey: PUB, ...bearerOf({}) }),
+      ),
+    ).resolves.toBe("release_dirty");
   });
 
   it("a dirty install among several fails install_dirty", async () => {
