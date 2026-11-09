@@ -7,6 +7,8 @@
 #   routes: *.<app>/* and *.<page>/* -> oa-<p>-dispatch; auth.<app>/* ->
 #           oa-<p>-auth-broker; directory.<app>/* -> oa-<p>-directory-broker;
 #           admin.<app>/* and api.<app>/* -> oa-<p>-provisioning
+#   staging only (#1568): the exact route billing.<app>/stripe/webhook ->
+#           oa-s-billing (Stripe's webhook); prod has none
 # `plan` reads only and prints each change (and "ok" for what already matches),
 # also to $GITHUB_STEP_SUMMARY. `apply` plans first, refuses unless every change
 # is an addition or setting change from that fixed set, makes them, then reads
@@ -57,7 +59,11 @@ must() {
 say() { echo "$1"; echo "- $1" >> "$SUMMARY"; }
 
 echo "### Zones for $env ($mode)" >> "$SUMMARY"
-for w in "oa-$P-dispatch" "oa-$P-auth-broker" "oa-$P-directory-broker" "oa-$P-provisioning"; do
+WORKERS=("oa-$P-dispatch" "oa-$P-auth-broker" "oa-$P-directory-broker" "oa-$P-provisioning")
+# Staging also routes billing's webhook, so its Worker must exist (the billing
+# target deploys before zones in a full staging run).
+[ "$env" != staging ] || WORKERS+=("oa-$P-billing")
+for w in "${WORKERS[@]}"; do
   ok="$(cf "$CLOUDFLARE_API_TOKEN" GET "$CF/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$w/settings" | jq -r '.success' 2> /dev/null)"
   [ "$ok" = true ] || { echo "$w does not exist: deploy it first" >&2; exit 1; }
 done
@@ -80,6 +86,11 @@ SETTINGS=('ssl:"strict"' 'always_use_https:"on"' 'min_tls_version:"1.2"')
 ROUTES=("$APP_ZONE auth.$APP/* oa-$P-auth-broker" "$APP_ZONE directory.$APP/* oa-$P-directory-broker"
   "$APP_ZONE *.$APP/* oa-$P-dispatch" "$PAGE_ZONE *.$PAGE/* oa-$P-dispatch"
   "$APP_ZONE admin.$APP/* oa-$P-provisioning" "$APP_ZONE api.$APP/* oa-$P-provisioning")
+# Staging only (#1568): Stripe's webhook, one exact path, to the billing Worker.
+# The wildcard AAAA above already makes billing.<app> resolve, and an exact
+# pattern beats *.<app>/* (dispatch) for it; every other path on that host
+# still goes to dispatch, which has no such install.
+[ "$env" != staging ] || ROUTES+=("$APP_ZONE billing.$APP/stripe/webhook oa-$P-billing")
 EXPECTED=()
 for pair in "$APP:$APP_ZONE" "$PAGE:$PAGE_ZONE"; do
   EXPECTED+=("dns ${pair#*:} ${pair%%:*}")

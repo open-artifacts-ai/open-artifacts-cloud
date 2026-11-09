@@ -268,6 +268,7 @@ describe("hosted-zones.sh", () => {
       "oa-s-auth-broker",
       "oa-s-directory-broker",
       "oa-s-provisioning",
+      "oa-s-billing",
     ]).run("plan", "staging");
     expect(r.code).toBe(0);
     expect(r.out).toContain(
@@ -282,5 +283,111 @@ describe("hosted-zones.sh", () => {
     expect(r.out).toContain(
       "route api.open-artifacts-staging.app/* -> oa-s-provisioning: add",
     );
+  });
+
+  describe("billing's webhook route (staging only, #1568)", () => {
+    const STG = [
+      "oa-s-dispatch",
+      "oa-s-auth-broker",
+      "oa-s-directory-broker",
+      "oa-s-provisioning",
+      "oa-s-billing",
+    ];
+    const ROUTE = "billing.open-artifacts-staging.app/stripe/webhook";
+
+    it("staging plans and applies exactly one more route, an exact path to oa-s-billing", () => {
+      const plan = setup({}, STG).run("plan", "staging");
+      expect(plan.code, plan.err).toBe(0);
+      expect(plan.out).toContain(`route ${ROUTE} -> oa-s-billing: add`);
+      expect(plan.writes).toEqual([]);
+      const apply = setup({}, STG).run("apply", "staging");
+      expect(apply.code, apply.err).toBe(0);
+      const routes = apply.writes.filter((w) => w.includes("/workers/routes "));
+      expect(routes).toHaveLength(7);
+      expect(routes.filter((w) => w.includes("billing"))).toEqual([
+        `WRITE POST /zones/${APPZ}/workers/routes {"pattern":"${ROUTE}","script":"oa-s-billing"}`,
+      ]);
+      // Nothing beyond the fixed set: still 2 records and 6 settings.
+      expect(
+        apply.writes.filter((w) => w.includes("/dns_records ")),
+      ).toHaveLength(2);
+      expect(apply.out).toContain(
+        "applied and read back: matches the expected set",
+      );
+    });
+
+    it("prod never gets it: no billing route, and its Worker is not required", () => {
+      const plan = setup().run("plan", "prod");
+      expect(plan.code, plan.err).toBe(0);
+      expect(plan.out).not.toContain("billing");
+      const apply = setup().run("apply", "prod");
+      expect(apply.writes.filter((w) => w.includes("billing"))).toEqual([]);
+      expect(
+        apply.writes.filter((w) => w.includes("/workers/routes ")),
+      ).toHaveLength(6);
+      // A prod account that has an oa-p-billing Worker (it must not) is ignored too.
+      const withP = setup({}, [
+        "oa-p-dispatch",
+        "oa-p-auth-broker",
+        "oa-p-directory-broker",
+        "oa-p-provisioning",
+        "oa-p-billing",
+      ]).run("plan", "prod");
+      expect(withP.out).not.toContain("billing");
+    });
+
+    it("staging refuses until oa-s-billing exists, in plan and apply, writing nothing", () => {
+      for (const mode of ["plan", "apply"]) {
+        const r = setup(
+          {},
+          STG.filter((w) => w !== "oa-s-billing"),
+        ).run(mode, "staging");
+        expect(r.code, mode).toBe(1);
+        expect(r.err).toContain("oa-s-billing does not exist: deploy it first");
+        expect(r.writes, mode).toEqual([]);
+      }
+    });
+
+    it("a billing route that already points at another Worker is refused, and an existing correct one is ok", () => {
+      const stagingFiles = (script: string) => ({
+        [`routes-${APPZ}.json`]: JSON.stringify([{ pattern: ROUTE, script }]),
+      });
+      const bad = setup(stagingFiles("someone-else"), STG).run(
+        "apply",
+        "staging",
+      );
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain(
+        `route ${ROUTE} points at someone-else, not oa-s-billing`,
+      );
+      expect(bad.writes).toEqual([]);
+      const good = setup(stagingFiles("oa-s-billing"), STG).run(
+        "plan",
+        "staging",
+      );
+      expect(good.code, good.err).toBe(0);
+      expect(good.out).toContain(`route ${ROUTE} -> oa-s-billing ok`);
+    });
+
+    it("a foreign route on the billing host is refused like any our patterns match, before any write, in both modes", () => {
+      for (const mode of ["plan", "apply"]) {
+        const r = setup(
+          {
+            [`routes-${APPZ}.json`]: JSON.stringify([
+              {
+                pattern: "billing.open-artifacts-staging.app/stripe/*",
+                script: "x",
+              },
+            ]),
+          },
+          STG,
+        ).run(mode, "staging");
+        expect(r.code, mode).toBe(1);
+        expect(r.err).toContain(
+          "route billing.open-artifacts-staging.app/stripe/* is not ours but matches *.open-artifacts-staging.app/*",
+        );
+        expect(r.writes, mode).toEqual([]);
+      }
+    });
   });
 });
