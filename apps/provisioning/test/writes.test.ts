@@ -231,23 +231,80 @@ describe("R4 create by an admin session", () => {
   });
 
   // Issue #1011: needs a public release carrying the names (PUBLIC_PIN bump).
-  it.each(["admins", "administrator", "root", "superuser", "sysadmin", "owner", "team", "staff", "official", "support", "help", "helpdesk", "contact", "security", "abuse", "trust", "safety", "legal", "privacy", "compliance", "postmaster", "hostmaster", "webmaster", "noreply", "no-reply", "info", "smtp", "imap", "pop", "mx", "account", "accounts", "signin", "sign-in", "register", "password", "verify", "oauth", "id", "identity", "open-artifacts", "openartifacts", "artifacts", "dashboard", "console", "cdn", "assets", "static", "files", "health", "test", "dev", "demo", "internal", "ns1", "ns2"])(
-    "reserved name %s: slug_reserved (400)",
-    async (slug) => {
-      const e = fakeEnv();
-      expect((await call(e, ADMIN_P, "R4", { body: leo({ slug }) })).code).toBe(
-        "slug_reserved",
-      );
-    },
-  );
+  it.each([
+    "admins",
+    "administrator",
+    "root",
+    "superuser",
+    "sysadmin",
+    "owner",
+    "team",
+    "staff",
+    "official",
+    "support",
+    "help",
+    "helpdesk",
+    "contact",
+    "security",
+    "abuse",
+    "trust",
+    "safety",
+    "legal",
+    "privacy",
+    "compliance",
+    "postmaster",
+    "hostmaster",
+    "webmaster",
+    "noreply",
+    "no-reply",
+    "info",
+    "smtp",
+    "imap",
+    "pop",
+    "mx",
+    "account",
+    "accounts",
+    "signin",
+    "sign-in",
+    "register",
+    "password",
+    "verify",
+    "oauth",
+    "id",
+    "identity",
+    "open-artifacts",
+    "openartifacts",
+    "artifacts",
+    "dashboard",
+    "console",
+    "cdn",
+    "assets",
+    "static",
+    "files",
+    "health",
+    "test",
+    "dev",
+    "demo",
+    "internal",
+    "ns1",
+    "ns2",
+    "signup",
+    "status",
+    "admin",
+  ])("reserved name %s: slug_reserved (400)", async (slug) => {
+    const e = fakeEnv();
+    const r = await call(e, ADMIN_P, "R4", { body: leo({ slug }) });
+    expect(r.code).toBe("slug_reserved");
+    expect(r.status).toBe(400);
+  });
 
   it.each(["leo", "rl-a", "rl-b"])(
     "existing install name %s is not reserved",
     async (slug) => {
       const e = fakeEnv();
-      expect((await call(e, ADMIN_P, "R4", { body: leo({ slug }) })).status).toBe(
-        202,
-      );
+      expect(
+        (await call(e, ADMIN_P, "R4", { body: leo({ slug }) })).status,
+      ).toBe(202);
     },
   );
 
