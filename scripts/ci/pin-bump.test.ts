@@ -467,16 +467,31 @@ describe("pin-bump.yml", () => {
 
   describe("report", () => {
     const rep = stepsOf("report");
-    it("has no checkout, no action, and is told whether anything failed", () => {
+    it("has no checkout and no action, and runs whatever the others did", () => {
       expect(rep).toHaveLength(1);
       expect(rep[0].uses).toBeUndefined();
       expect(jobs.report.if).toContain("always()");
-      expect(jobs.report.if).toContain("needs.prepare.result != 'cancelled'");
-      expect(jobs.report.if).toContain("needs.open.result != 'cancelled'");
-      expect(rep[0].env.RESULT).toContain("needs.prepare.result == 'failure'");
-      expect(rep[0].env.RESULT).toContain("needs.open.result == 'failure'");
-      // a skipped open (nothing to bump) is not a failure
-      expect(rep[0].env.RESULT).not.toContain("!= 'success'");
+      // a job past its timeout is reported as cancelled: report must still run
+      expect(jobs.report.if).not.toContain("cancelled");
+    });
+
+    // The RESULT expression is plain JS once the needs are bound.
+    const result = (prepare: string, open: string) => {
+      const expr = String(rep[0].env.RESULT)
+        .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+        .replaceAll("needs.prepare.result", "prepare")
+        .replaceAll("needs.open.result", "open");
+      return new Function("prepare", "open", `return ${expr};`)(prepare, open);
+    };
+
+    it("anything but success is red; an open skipped for no bump is green", () => {
+      expect(result("success", "success")).toBe("success");
+      expect(result("success", "skipped")).toBe("success");
+      expect(result("success", "failure")).toBe("failure");
+      expect(result("success", "cancelled")).toBe("failure");
+      expect(result("failure", "skipped")).toBe("failure");
+      // a prepare past its timeout is reported cancelled, so it files an issue
+      expect(result("cancelled", "skipped")).toBe("failure");
     });
 
     const bin = mkdtempSync(join(tmpdir(), "fake-gh-"));

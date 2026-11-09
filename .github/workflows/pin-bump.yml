@@ -18,8 +18,9 @@
 #   prepare but the lockfile is trusted), re-applies the pin files, takes the
 #   lockfile as data, and only then mints the App token to push and open the PR.
 # - report: issues: write, no checkout. Red keeps one `blocker` issue titled
-#   "pin-bump failed" open with the run URL; green closes it. A cancelled run
-#   is neither. A run with nothing to bump is green.
+#   "pin-bump failed" open with the run URL; green closes it. A run past its
+#   timeout is reported as cancelled, so cancelled counts as red: anything but
+#   success is red, except an `open` skipped because there was nothing to bump.
 name: pin-bump
 
 on:
@@ -181,7 +182,7 @@ jobs:
 
   report:
     needs: [prepare, open]
-    if: ${{ always() && github.ref == 'refs/heads/main' && needs.prepare.result != 'cancelled' && needs.open.result != 'cancelled' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -191,7 +192,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          RESULT: ${{ (needs.prepare.result == 'failure' || needs.open.result == 'failure') && 'failure' || 'success' }}
+          RESULT: ${{ (needs.prepare.result != 'success' || needs.open.result == 'failure' || needs.open.result == 'cancelled') && 'failure' || 'success' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
