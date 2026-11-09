@@ -112,10 +112,11 @@ jobs:
           REASON: ${{ inputs.reason }}
           VERIFY_ONLY: ${{ inputs.verify_only }}
           OA_OWNER_EMAIL: ${{ secrets.OA_OWNER_EMAIL }}
-          # Billing's Stripe secrets (#1568): staging only, so a prod run never
-          # holds either, whatever its Environment has.
-          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}
-          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}
+          # Billing's Stripe secrets (#1568): only a staging run that includes the
+          # billing target holds them; any other run (prod included) gets neither,
+          # whatever its Environment has.
+          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           # Defense in depth: the env is checked here too.
@@ -128,9 +129,12 @@ jobs:
             *,scheduler,*) [ -n "$OA_OWNER_EMAIL" ] || { echo "OA_OWNER_EMAIL is not set; the scheduler target needs it"; exit 1; } ;;
           esac
           # #1568: the billing target needs both Stripe secrets, test-mode shapes.
-          # Refuse here, before any target runs, so a full staging run never
-          # deploys the earlier Workers and then stops at billing (verify only
-          # reads, so it needs neither).
+          # This check runs before any target, so a run that includes billing
+          # without them (or with a live key) fails here, not after the earlier
+          # targets deployed; verify only reads, so it needs neither. It checks
+          # the secrets only: a tag cut before the billing migration lock was
+          # frozen is refused later, at the billing target (billing-db.ts), after
+          # the targets before it have deployed.
           case ",$TARGETS," in
             *,billing,*)
               if [ "${VERIFY_ONLY:-}" != true ]; then
@@ -229,7 +233,7 @@ jobs:
             scripts/ci
             packages/provision/src
             apps/platform-db
-            apps/billing/migration-lock.json
+            apps/billing
             .github/hosted
           persist-credentials: false
       # main's provision pins the broker's Google client; the auth-broker
@@ -274,10 +278,15 @@ jobs:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
       - name: Build and test the Workers being deployed
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
         run: |
           set -euo pipefail
           pnpm --filter @oa/provision build
           pnpm --filter @oa/auth-broker --filter @oa/directory-broker --filter @oa/dispatch --filter @oa/scheduler --filter @oa/inventory --filter @oa/provisioner --filter @oa/provisioning --filter @oa/admin test
+          # Staging's billing service and its Stripe core (#1568): staging only,
+          # so prod's run builds and tests exactly what it did before.
+          if [ "$DEPLOY_ENV" = staging ]; then pnpm --filter @oa/billing --filter @oa/billing-core test; fi
       # main's committed constants (account id, email, Google client ids),
       # and the alert address from the OA_OWNER_EMAIL secret (#1084: never
       # committed, masked in the log).
@@ -339,10 +348,11 @@ jobs:
           # The OIDC principal's repository (inventory, staging's provisioning);
           # GITHUB_REPOSITORY (owner/repo) is the runner's own.
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
-          # Billing's Stripe secrets (#1568): staging only; the billing target
-          # refuses without them and puts them on oa-s-billing alone.
-          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}
-          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}
+          # Billing's Stripe secrets (#1568): only a staging run that includes the
+          # billing target holds them; the target refuses without them and puts
+          # them on oa-s-billing alone.
+          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           IFS=, read -ra list <<< "$TARGETS"

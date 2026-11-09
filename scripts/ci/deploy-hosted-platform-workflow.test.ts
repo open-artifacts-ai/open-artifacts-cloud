@@ -31,6 +31,9 @@ const named = (n: string) =>
 
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+// The gate on billing's Stripe secrets: staging and the billing target (#1568).
+const HOLD =
+  "inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') &&";
 // Staging's full list: the same with billing (a staging-only target, #1568).
 const FULLB =
   "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
@@ -74,11 +77,9 @@ describe("deploy-hosted-platform.yml", () => {
       REASON: "${{ inputs.reason }}",
       VERIFY_ONLY: "${{ inputs.verify_only }}",
       OA_OWNER_EMAIL: "${{ secrets.OA_OWNER_EMAIL }}",
-      // Billing's Stripe secrets are staging's only (#1568).
-      STRIPE_SECRET_KEY:
-        "${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}",
-      STRIPE_WEBHOOK_SECRET:
-        "${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}",
+      // Billing's Stripe secrets: a staging run that includes billing only (#1568).
+      STRIPE_SECRET_KEY: `\${{ ${HOLD} secrets.STRIPE_SECRET_KEY || '' }}`,
+      STRIPE_WEBHOOK_SECRET: `\${{ ${HOLD} secrets.STRIPE_WEBHOOK_SECRET || '' }}`,
     });
     const go = (
       TARGETS: string,
@@ -242,7 +243,7 @@ describe("deploy-hosted-platform.yml", () => {
       ref: "${{ github.sha }}",
       path: ".deploy-logic",
       "sparse-checkout":
-        "scripts/ops\nscripts/ci\npackages/provision/src\napps/platform-db\napps/billing/migration-lock.json\n.github/hosted\n",
+        "scripts/ops\nscripts/ci\npackages/provision/src\napps/platform-db\napps/billing\n.github/hosted\n",
     });
     const use = named("Use main's deploy scripts").run as string;
     expect(use).toContain(
@@ -601,11 +602,32 @@ describe("deploy-hosted-platform.yml", () => {
     ).toBe(0);
     // Prod: billing is refused whatever the secrets say.
     expect(go("billing", {}, "prod").status).toBe(1);
-    // The deploy step gets them for staging only, by the same expression.
+    // The deploy step gets them by the same expression.
     for (const k of ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"])
       expect(named("Deploy and verify").env[k]).toBe(
-        `\${{ inputs.env == 'staging' && secrets.${k} || '' }}`,
+        `\${{ ${HOLD} secrets.${k} || '' }}`,
       );
+    // Evaluated: only staging with billing in the targets holds a secret; a
+    // prod run, or a staging run without billing, holds none.
+    const held = (env: string, targets: string, k: string) => {
+      const expr = (named("Deploy and verify").env[k] as string)
+        .replace(/^\$\{\{\s*/, "")
+        .replace(/\s*\}\}$/, "")
+        .replace(
+          /contains\(format\(',\{0\},', inputs\.targets\), '([^']*)'\)/g,
+          (_, t) => JSON.stringify(`,${targets},`.includes(t)),
+        )
+        .replace(/secrets\.\w+/, JSON.stringify("the-secret"));
+      return new Function("inputs", `return (${expr});`)({ env }) as string;
+    };
+    for (const k of ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"]) {
+      expect(held("staging", FULLB, k), k).toBe("the-secret");
+      expect(held("staging", "billing", k)).toBe("the-secret");
+      expect(held("staging", FULL, k), "staging default list").toBe("");
+      expect(held("staging", "dispatch,scheduler", k)).toBe("");
+      expect(held("prod", FULL, k), "prod").toBe("");
+      expect(held("prod", "billing", k), "prod billing").toBe("");
+    }
     // No other step sees them.
     const seeing = steps
       .filter((s) => JSON.stringify(s).includes("STRIPE_"))
@@ -745,6 +767,16 @@ describe("deploy-hosted-platform.yml", () => {
       .run as string;
     for (const p of ["@oa/provisioner", "@oa/provisioning", "@oa/admin"])
       expect(run).toContain(`--filter ${p}`);
+    // Staging's billing service and its Stripe core, staging only (#1568): the
+    // step covers each Worker target, and prod's run is exactly what it was.
+    const step = named("Build and test the Workers being deployed");
+    expect(step.env).toEqual({ DEPLOY_ENV: "${{ inputs.env }}" });
+    expect(run).toContain(
+      'if [ "$DEPLOY_ENV" = staging ]; then pnpm --filter @oa/billing --filter @oa/billing-core test; fi',
+    );
+    const main =
+      run.split("\n").find((l) => l.includes("--filter @oa/admin test")) ?? "";
+    expect(main).not.toContain("billing");
   });
 
   it("reads every Worker's tag back with main's script after a full-list run (#1064)", () => {

@@ -55,8 +55,13 @@ export async function run(o: {
       await db.all("SELECT name, sha256 FROM billing_migrations ORDER BY name")
     ).map((r) => ({ name: String(r.name), sha256: String(r.sha256) }));
   } catch {
-    if (!verifyOnly) throw new Refused("the tracker can't be read");
-    tracked = [];
+    // Verify only never creates the tracker: a database without one (or one
+    // that can't be read) is not "pending", it is not tracked yet.
+    throw new Refused(
+      verifyOnly
+        ? "the billing_migrations tracker is missing or unreadable (verify only)"
+        : "the tracker can't be read",
+    );
   }
   tracked.forEach((r, i) => {
     if (!pins.has(r.name))

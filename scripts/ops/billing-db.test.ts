@@ -109,9 +109,20 @@ describe("billing-db.ts", () => {
 
   it("verify only: reads only; passes on a migrated database, fails while a file is pending", async () => {
     const f = fakeDb();
+    // No tracker yet: not "pending", an accurate message, and still a refusal.
+    const none = await go(f, { verifyOnly: true });
+    expect(none.ok).toBe(false);
+    expect(none.err).toContain(
+      "billing_migrations tracker is missing or unreadable",
+    );
+    expect(none.err).not.toContain("pending");
+    expect(f.execs).toEqual([]);
+    // A tracker that is behind: that is pending.
+    await go(f, { migrations: migrations.slice(0, 1) });
+    f.execs.length = 0;
     const pend = await go(f, { verifyOnly: true });
     expect(pend.ok).toBe(false);
-    expect(pend.err).toContain("pending (verify only)");
+    expect(pend.err).toContain("0002_solo_tier.sql pending (verify only)");
     expect(f.execs).toEqual([]);
     await go(f);
     f.execs.length = 0;
