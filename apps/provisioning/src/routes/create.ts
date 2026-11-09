@@ -104,8 +104,6 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   // refuses it (apps/provisioner/src/recheck.ts, packages/provision/src/wfp.ts),
   // so it would be accepted here and fail later. Refuse it now, until Gmail
   // owners (#864/#865).
-  if (body.auth?.providers?.includes("google") && !body.auth.domains?.length)
-    throw new ApiError("invalid_input", "auth.domains: google needs a domain");
 
   const w = await writeOf(env, p, a.surface, "R4", null, body);
   const prior = await replay(w);
