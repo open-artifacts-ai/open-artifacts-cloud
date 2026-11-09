@@ -54,7 +54,11 @@ const tracked = (f: ReturnType<typeof fakeDb>) =>
 
 describe("billing-db.ts", () => {
   it("the repo's lock is frozen and pins every file (the wrapper refuses a deploy otherwise)", () => {
-    expect(names).toEqual(["0001_init.sql", "0002_solo_tier.sql"]);
+    expect(names).toEqual([
+      "0001_init.sql",
+      "0002_solo_tier.sql",
+      "0003_solo_checked_out.sql",
+    ]);
   });
 
   it("a fresh database: every file applied in order, each with its tracker row in the same request, then read back", async () => {
@@ -64,13 +68,14 @@ describe("billing-db.ts", () => {
     expect(r.log).toEqual([
       "0001_init.sql applied",
       "0002_solo_tier.sql applied",
-      "2 migrations tracked, tables present",
+      "0003_solo_checked_out.sql applied",
+      "3 migrations tracked, tables present",
     ]);
     expect(tracked(f)).toEqual(
       migrations.map((m) => ({ name: m.name, sha256: m.sha256 })),
     );
     // Tracker creation, then one request per file carrying its own record.
-    expect(f.execs).toHaveLength(3);
+    expect(f.execs).toHaveLength(4);
     for (const [i, m] of migrations.entries()) {
       const e = f.execs[i + 1] as string;
       expect(e).toContain(m.sql.trimEnd());
@@ -91,7 +96,7 @@ describe("billing-db.ts", () => {
     f.execs.length = 0;
     const r = await go(f);
     expect(r.ok, r.err).toBe(true);
-    expect(r.log).toEqual(["2 migrations tracked, tables present"]);
+    expect(r.log).toEqual(["3 migrations tracked, tables present"]);
     expect(f.execs).toEqual([
       expect.stringContaining("CREATE TABLE IF NOT EXISTS billing_migrations"),
     ]);
@@ -122,7 +127,9 @@ describe("billing-db.ts", () => {
     f.execs.length = 0;
     const pend = await go(f, { verifyOnly: true });
     expect(pend.ok).toBe(false);
-    expect(pend.err).toContain("0002_solo_tier.sql pending (verify only)");
+    expect(pend.err).toContain(
+      "0002_solo_tier.sql, 0003_solo_checked_out.sql pending (verify only)",
+    );
     expect(f.execs).toEqual([]);
     await go(f);
     f.execs.length = 0;
