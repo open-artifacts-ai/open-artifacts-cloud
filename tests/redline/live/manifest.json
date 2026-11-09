@@ -950,10 +950,6 @@
     },
     {
       "file": "live/surfaces.test.ts",
-      "name": "surface probes (cross-install) > org GET /api/v1/bus/reach [pat2]"
-    },
-    {
-      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org PUT /api/v1/bus/reach [session]"
     },
     {
