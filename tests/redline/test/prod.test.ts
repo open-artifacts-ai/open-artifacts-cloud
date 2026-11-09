@@ -13,9 +13,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
+  forEachLimit,
   guardProdClean,
   HOOK_SQL_MARKERS,
   PROD_CLEAN_CODES,
+  PROD_CLEAN_CONCURRENCY,
   PROD_CLEAN_LINE_RE,
   ProdDirty,
   prodClean,
@@ -923,5 +925,122 @@ describe("prodClean (spec 2026-10-26)", () => {
       "utf8",
     );
     for (const m of HOOK_SQL_MARKERS) expect(src).toContain(JSON.stringify(m));
+  });
+});
+
+// The guard's prod-clean case hit its 180 s timeout (run 42707092416; 168 s and
+// 139 s before): every release and install was read one after another. They
+// are checked a few at a time now, and the check is as complete as before.
+describe("prodClean: releases and installs are checked a few at a time", () => {
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+
+  describe("forEachLimit", () => {
+    it("runs every item, never more than the limit at once, and more than one", async () => {
+      let live = 0;
+      let peak = 0;
+      const done: number[] = [];
+      await forEachLimit([...Array(20).keys()], 4, async (n) => {
+        live++;
+        peak = Math.max(peak, live);
+        await tick();
+        live--;
+        done.push(n);
+      });
+      expect(done.sort((a, b) => a - b)).toEqual([...Array(20).keys()]);
+      expect(peak).toBe(4);
+    });
+
+    it("a failure stops new work, lets the running finish, and throws the lowest-numbered failure", async () => {
+      const started: number[] = [];
+      const e = await forEachLimit([...Array(30).keys()], 4, async (n) => {
+        started.push(n);
+        await tick();
+        if (n === 5 || n === 6) throw new Error(`item ${n}`);
+      }).catch((x: unknown) => x);
+      expect((e as Error).message).toBe("item 5");
+      expect(started.length).toBeLessThan(30);
+      expect(started).toEqual([...started].sort((a, b) => a - b));
+    });
+
+    it("an empty list is done, and a limit above the count is fine", async () => {
+      await forEachLimit([], 4, async () => {
+        throw new Error("never");
+      });
+      let n = 0;
+      await forEachLimit([1, 2], 9, async () => {
+        n++;
+      });
+      expect(n).toBe(2);
+    });
+  });
+
+  const many = (releases: number, installs = 1) => {
+    const w = cleanWorld();
+    for (let i = 0; i < releases; i++) publish(w, { version: `1.0.${i}` });
+    w.installs = Array.from({ length: installs }, (_, i) => ({
+      ...(w.installs[0] as Record<string, unknown>),
+      id: i === 0 ? ID : `i00000000${String(i).padStart(3, "0")}`,
+    }));
+    return w;
+  };
+
+  it("twelve releases: every record is read once, and the R2 reads overlap but never pass the limit", async () => {
+    const w = many(12);
+    const { fetch } = await serve(w);
+    let live = 0;
+    let peak = 0;
+    const slow: typeof fetch = async (input, init) => {
+      const raw = input instanceof Request ? input.url : String(input);
+      if (!raw.includes("/objects/")) return fetch(input, init);
+      live++;
+      peak = Math.max(peak, live);
+      await tick();
+      try {
+        return await fetch(input, init);
+      } finally {
+        live--;
+      }
+    };
+    const r = await prodClean(probe(), {
+      fetch: slow,
+      pubkey: PUB,
+      ...bearerOf({}),
+    });
+    expect(r).toEqual({ level: "pass", releases: 12, installs: 1 });
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(PROD_CLEAN_CONCURRENCY);
+    const records = (w.seen ?? [])
+      .map((x) => decodeURIComponent(x))
+      .filter((x) => x.endsWith("/record.sig.json"));
+    expect(new Set(records).size).toBe(12);
+    expect(records).toHaveLength(12);
+  });
+
+  it("a dirty release late in the list still fails release_dirty (never a partial pass)", async () => {
+    const w = many(12);
+    publish(w, { version: "1.0.11", js: HOOK_SQL_MARKERS[0] });
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a release with no record, among clean ones, fails", async () => {
+    const w = many(12);
+    w.objects?.delete("releases/1.0.7/release/record.sig.json");
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("an unreadable install (its script's secret list answers 404 on a serving row) fails, among clean ones", async () => {
+    // The fake serves one script (ID); every other row's script is unreadable.
+    const w = many(1, 8);
+    await expect(check(w)).rejects.toThrow(/404|not found|secrets/i);
+  });
+
+  it("a dirty install among several fails install_dirty", async () => {
+    const w = many(1, 1);
+    w.installs.push({
+      ...(w.installs[0] as Record<string, unknown>),
+      testHooks: true,
+      id: ID,
+    });
+    await expect(failCode(check(w))).resolves.toBe("install_dirty");
   });
 });
