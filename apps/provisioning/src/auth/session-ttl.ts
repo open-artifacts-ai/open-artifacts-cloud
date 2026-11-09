@@ -24,7 +24,5 @@ export function adminSessionTtlMs(
   if (typeof raw !== "string" || !/^[1-9][0-9]{0,2}$/.test(raw))
     return SESSION_TTL_MS;
   const hours = Number(raw);
-  return hours <= ADMIN_SESSION_TTL_MAX_HOURS
-    ? hours * 3600_000
-    : SESSION_TTL_MS;
+  return hours * 3600_000;
 }
