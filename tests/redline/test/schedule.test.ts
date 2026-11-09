@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
 // its per-case durations and per-file walls (test/fixtures/run-42402998826.json,
@@ -109,8 +110,15 @@ describe("the recording (run 42402998826)", () => {
     );
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
+    // The recording predates the cases declared in cases-added.ts: it holds
+    // the manifest minus exactly those, never a case with an invented time.
+    const added = new Set(
+      CASES_ADDED_SINCE_1730.map((c) => `${c.file} ${c.name}`),
+    );
+    const mk = m.cases.map((c) => `${c.file} ${c.name}`);
+    for (const k of added) expect(mk).toContain(k);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(m.cases.map((c) => `${c.file} ${c.name}`)),
+      new Set(mk.filter((k) => !added.has(k))),
     );
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
