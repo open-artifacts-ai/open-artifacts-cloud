@@ -367,8 +367,13 @@ async function operate(
         await markStep(ctx, jobId, "teardown");
         await transient(modeStatement(ctx, job.installId, "unmapped").run());
         // The install is gone: free its self-serve account claim (#1046). A
-        // replay or an install that never claimed one changes nothing.
-        await record(ctx, FREE_ACCOUNT_ON_PURGE, job.installId, ctx.io.now());
+        // replay or an install that never claimed one changes nothing. A
+        // suspended install keeps it: the claim is the ban, so a suspended
+        // owner cannot sign up again (the scheduler skips these too).
+        if (job.suspended)
+          console.warn(PURGE_KEPT_CLAIM, job.installId);
+        else
+          await record(ctx, FREE_ACCOUNT_ON_PURGE, job.installId, ctx.io.now());
         return { state: "deleted" };
       });
       break;
@@ -423,6 +428,9 @@ async function operate(
     );
   await s("done", undefined, () => finish(ctx, job));
 }
+
+/** Logged when a suspended install's purge keeps its signup claim. */
+const PURGE_KEPT_CLAIM = "purge of a suspended install keeps its signup claim:";
 
 /** The owner token label of a job: its signup's, else the job's own. */
 const labelOf = (j: { signupId: string | null; jobId: string }) =>
