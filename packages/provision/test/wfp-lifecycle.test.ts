@@ -6835,3 +6835,36 @@ describe("every same-state claim: the holding job re-takes, another job is refus
     expect(s.row(inst.id).lease).toBeNull();
   });
 });
+
+describe("stagingBusSlugs reaches the rendered metadata (#1299 part 6)", () => {
+  const featuresOf = (s: S, id: string): string =>
+    String(
+      (
+        (s.scriptOf(id)?.metadata.bindings ?? []) as {
+          name: string;
+          text?: string;
+        }[]
+      ).find((b) => b.name === "FEATURES")?.text,
+    );
+
+  it("staging and listed: a real create and a var change send bus; unlisted does not", async () => {
+    const s = setup();
+    const p = s.mk({ stagingBusSlugs: ["finqore"] });
+    const inst = keep(await p.create(input("finqore")));
+    expect(featuresOf(s, inst.id).split(",")).toContain("bus");
+    expect((await p.updateVars(inst.id, { FEATURES: "beta" })).ok).toBe(true);
+    expect(featuresOf(s, inst.id).split(",")).toContain("bus");
+    const other = keep(await p.create(input("other")));
+    expect(featuresOf(s, other.id).split(",")).not.toContain("bus");
+  });
+
+  it("without the option, or on prod with it, no bus", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input("finqore")));
+    expect(featuresOf(s, inst.id).split(",")).not.toContain("bus");
+    const prod = setup({ env: "prod" });
+    const pp = prod.mk({ stagingBusSlugs: ["finqore"] });
+    const pi = keep(await pp.create(input("finqore")));
+    expect(featuresOf(prod, pi.id).split(",")).not.toContain("bus");
+  });
+});
