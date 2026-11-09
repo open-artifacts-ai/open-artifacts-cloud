@@ -366,6 +366,9 @@ async function operate(
         });
         await markStep(ctx, jobId, "teardown");
         await transient(modeStatement(ctx, job.installId, "unmapped").run());
+        // The install is gone: free its self-serve account claim (#1046). A
+        // replay or an install that never claimed one changes nothing.
+        await record(ctx, FREE_ACCOUNT_ON_PURGE, job.installId, ctx.io.now());
         return { state: "deleted" };
       });
       break;
@@ -424,6 +427,14 @@ async function operate(
 /** The owner token label of a job: its signup's, else the job's own. */
 const labelOf = (j: { signupId: string | null; jobId: string }) =>
   `ss-${j.signupId ?? j.jobId}`;
+
+/**
+ * Purge frees the account's one-install claim (#1046). The claim's signup is
+ * one of this install's jobs' signup_id; a claim already freed is untouched.
+ */
+const FREE_ACCOUNT_ON_PURGE = `UPDATE signup_accounts SET freed_at = ?2
+WHERE freed_at IS NULL
+  AND signup_id IN (SELECT signup_id FROM jobs WHERE install_id = ?1 AND signup_id IS NOT NULL)`;
 
 /** One lifecycle write; the step's output is the change count only. */
 async function record(
