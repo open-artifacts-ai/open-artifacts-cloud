@@ -31,8 +31,8 @@
 #                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
 #                    only, both put on the Worker, a run without them fails
 #                    before anything changes)
-#   dispatch         HOSTS_KV_ID (both brokers must exist; staging also
-#                    oa-s-billing, its BILLING binding, #1568)
+#   dispatch         HOSTS_KV_ID (both brokers must exist; on staging, when the
+#                    tag declares a BILLING binding, oa-s-billing too, #1568)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
 #                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
@@ -254,14 +254,40 @@ expect_private() {
   [ "$got" = "$3" ] || { echo "$4: not the expected value" >&2; exit 1; }
 }
 
-# billing_bound <settings json> <app>: the BILLING service binding (#1568) is
-# oa-s-billing on staging, where dispatch and the scheduler bind it together,
-# and absent on prod, which has no billing Worker.
+# The BILLING service binding (#1568) is staging only, and required only when
+# the tag being deployed declares it: main's scripts run against the tag's
+# Workers, so a staging run of an older tag (whose wrangler has none) must not
+# fail for lack of it, and a tag that declares it must not deploy without it.
+# billing_pre <app> <entrypoint>, before deploying: reads the tag's committed
+# env block (wrangler-env.ts billing). Prod refuses a tag that binds BILLING.
+# Staging: a declared binding must be exactly oa-s-billing with this app's
+# entrypoint ("" for the default one, BillingProvisionerRpc for the
+# provisioner), and the Worker must exist (a binding needs its service
+# deployed first); sets BILLING_DECLARED=1. Not declared: BILLING_DECLARED="" and
+# nothing is required.
+BILLING_DECLARED=""
+billing_pre() {
+  local c service entry
+  BILLING_DECLARED=""
+  c="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/wrangler-env.ts" "$root/apps/$1/wrangler.jsonc" "$env" billing)" ||
+    { echo "can't read $1's committed BILLING binding" >&2; exit 1; }
+  [ "$c" != null ] || return 0
+  [ "$env" = staging ] || { echo "the tag's $env $1 config binds BILLING; it is staging only; refusing" >&2; exit 1; }
+  service="$(jq -r '.service' <<< "$c")"
+  entry="$(jq -r '.entrypoint // ""' <<< "$c")"
+  [ "$service" = "oa-$P-billing" ] || { echo "the tag's $1 BILLING binding is '$service', want oa-$P-billing; refusing" >&2; exit 1; }
+  [ "$entry" = "$2" ] || { echo "the tag's $1 BILLING binding has entrypoint '$entry', want '$2'; refusing" >&2; exit 1; }
+  need_workers "oa-$P-billing"
+  BILLING_DECLARED=1
+}
+# billing_bound <settings json> <app> <entrypoint>, after deploying (or verify
+# only): when the tag declared it, the live binding is a service oa-s-billing
+# with the entrypoint; otherwise (an older tag, or prod) there is none.
 billing_bound() {
   local want=""
-  [ "$env" != staging ] || want="oa-$P-billing"
-  expect "$1" '[.result.bindings[] | select(.name == "BILLING") | "\(.type) \(.service)"] | join(",")' \
-    "${want:+service $want}" "$2 BILLING binding"
+  [ -z "$BILLING_DECLARED" ] || want="service oa-$P-billing $3"
+  expect "$1" '[.result.bindings[] | select(.name == "BILLING") | "\(.type) \(.service) \(.entrypoint // "")"] | join(",")' \
+    "$want" "$2 BILLING binding"
 }
 
 # broker_pin: provision's BROKER_GOOGLE_CLIENT_ID[$env] from $BROKER_PIN_FILE
@@ -304,6 +330,11 @@ case "$target" in
   provisioner)
     need PLATFORM_DB_ID; need SECRETS_STORE_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED; need WELCOME_FROM
     signups_committed provisioner
+    # BILLING (#1568, staging only, when the tag declares it): the provisioner
+    # starts an install's Solo trial through billing's BillingProvisionerRpc.
+    # Unbound it would silently skip the free month, so a tag that declares the
+    # binding must not deploy without it (read back below).
+    billing_pre provisioner BillingProvisionerRpc
     # Check first, create only when absent; a failed listing stops the run.
     queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
     for q in "oa-$P-signups" "oa-$P-signups-dlq"; do
@@ -334,7 +365,8 @@ case "$target" in
       "oa-$P-provision-install ProvisionInstall" "PROVISION_INSTALL"
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
-    names_are "$S" "DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
+    billing_bound "$S" provisioner BillingProvisionerRpc
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     expect "$S" '.result.observability.enabled // false' false "observability"
@@ -592,16 +624,15 @@ case "$target" in
   dispatch)
     need HOSTS_KV_ID
     need_workers oa-$P-auth-broker oa-$P-directory-broker
-    # Staging binds BILLING (#1568): a binding needs its service deployed
-    # first. Prod has none.
-    [ "$env" != staging ] || need_workers oa-$P-billing
+    # BILLING (#1568, staging only, when the tag declares it).
+    billing_pre dispatch ""
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
     expect "$S" '.result.bindings[] | select(.name == "HOSTS") | .namespace_id' "$HOSTS_KV_ID" "HOSTS"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' oa-$P-auth-broker "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
-    billing_bound "$S" dispatch
+    billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
     expect "$S" '.result.observability.enabled // false' false "observability"
     ;;
@@ -612,7 +643,8 @@ case "$target" in
     # Its Workflows, RPC and producer bindings point at these: deploying first
     # would ship a scheduler bound to nothing.
     need_workers oa-$P-auth-broker oa-$P-directory-broker oa-$P-provisioner
-    [ "$env" != staging ] || need_workers oa-$P-billing
+    # BILLING (#1568, staging only, when the tag declares it).
+    billing_pre scheduler ""
     need_queue oa-$P-signups
     # The tag's alert wiring (#915) must be "pinned": every alert var and
     # ALERT_EMAIL's destination is this env's placeholder. "absent" (none of
@@ -653,7 +685,7 @@ case "$target" in
       sched_deploy
     fi
     S="$(settings oa-$P-scheduler)"
-    billing_bound "$S" scheduler
+    billing_bound "$S" scheduler ""
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .type' service "PROVISIONER type"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .service' oa-$P-provisioner "PROVISIONER"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .entrypoint' ProvisionerRpc "PROVISIONER entrypoint"

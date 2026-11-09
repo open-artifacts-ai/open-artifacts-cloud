@@ -109,8 +109,19 @@ describe("wrangler.jsonc", () => {
       expect(e.vars.OA_ENV).toBe(api.env[env].vars.OA_ENV);
       // Workers Logs would record message bodies' context.
       expect(e.observability).toEqual({ enabled: false });
-      for (const k of ["services", "durable_objects", "triggers", "assets"])
+      for (const k of ["durable_objects", "triggers", "assets"])
         expect(e).not.toHaveProperty(k);
+      // The one service binding (#1568): billing's BillingProvisionerRpc, on
+      // STAGING only, to start an install's Solo trial. Prod has none.
+      if (env === "staging")
+        expect(e.services).toEqual([
+          {
+            binding: "BILLING",
+            service: platformNames("staging").billing,
+            entrypoint: "BillingProvisionerRpc",
+          },
+        ]);
+      else expect(e).not.toHaveProperty("services");
     }
   });
 

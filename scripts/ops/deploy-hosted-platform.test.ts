@@ -380,6 +380,18 @@ NEXT["oa-s-billing"] = settings([
   { type: "secret_text", name: "STRIPE_WEBHOOK_SECRET" },
 ]);
 NEXT["oa-p-provisioner"] = provisionerSettings();
+// Staging's provisioner, with its BILLING binding to billing's RPC entrypoint
+// (#1568; the tag declares it).
+NEXT["oa-s-provisioner"] = (() => {
+  const o = JSON.parse(provisionerSettings("s", "staging"));
+  o.result.bindings.push({
+    type: "service",
+    name: "BILLING",
+    service: "oa-s-billing",
+    entrypoint: "BillingProvisionerRpc",
+  });
+  return JSON.stringify(o);
+})();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
 
 const ENV = {
@@ -753,6 +765,218 @@ describe("deploy-hosted-platform.sh", () => {
     });
   });
 
+  describe("the BILLING binding follows the tag's own wrangler (#1568): required only when the tag declares it", () => {
+    // main's scripts run against the tag's Workers: an older tag whose wrangler
+    // has no BILLING must deploy on staging as before, and a tag that declares
+    // it must not deploy without it.
+    const DEPS = {
+      dispatch: ["oa-s-auth-broker", "oa-s-directory-broker"],
+      scheduler: SCHED_DEPS("s").filter((w) => w !== "oa-s-billing"),
+      provisioner: [] as string[],
+    } as const;
+    const APP_CONFIG = (app: string) =>
+      app === "scheduler"
+        ? SCHED_CONFIG
+        : readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8");
+    // The same config with its staging BILLING binding taken out (an older tag).
+    const withoutBilling = (src: string) =>
+      src.replace(/,?\s*\{\s*"binding":\s*"BILLING"[^}]*\}/g, "");
+    // The same config with the binding replaced.
+    const withBilling = (src: string, binding: string) =>
+      src.replace(/\{\s*"binding":\s*"BILLING"[^}]*\}/g, binding);
+    const liveWithout = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "BILLING",
+      );
+      return JSON.stringify(next);
+    };
+    const ENTRY = {
+      dispatch: "",
+      scheduler: "",
+      provisioner: "BillingProvisionerRpc",
+    } as const;
+    const APPS = ["dispatch", "scheduler", "provisioner"] as const;
+    // The staging provisioner's verify-only run reads an existing bucket.
+    const VERIFY_FILES = { "r2-oa-s-releases": "" };
+
+    it("the repo's staging configs declare it: dispatch and scheduler on the default entrypoint, the provisioner on BillingProvisionerRpc; prod's declare none", () => {
+      for (const app of APPS) {
+        const src = APP_CONFIG(app);
+        const staging = src.slice(
+          src.indexOf('"staging"'),
+          src.indexOf('"prod"'),
+        );
+        expect(staging, app).toMatch(/"binding": "BILLING"/);
+        expect(staging, app).toMatch(/"service": "oa-s-billing"/);
+        expect(/BillingProvisionerRpc/.test(staging), app).toBe(
+          app === "provisioner",
+        );
+        expect(src.slice(src.indexOf('"prod"')), app).not.toMatch(/"BILLING"/);
+      }
+    });
+
+    for (const app of APPS) {
+      it(`${app}, a tag that declares it: refuses until oa-s-billing exists (before any deploy), then deploys and verifies`, () => {
+        const none = setup({ exists: DEPS[app] }).run(app, {}, "staging");
+        expect(none.code, app).toBe(1);
+        expect(none.err).toContain(
+          "oa-s-billing does not exist: deploy it first",
+        );
+        expect(none.log.some((l) => l.startsWith("wrapper"))).toBe(false);
+        const ok = setup({ exists: [...DEPS[app], "oa-s-billing"] }).run(
+          app,
+          {},
+          "staging",
+        );
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+        expect(ok.out).toContain(`staging ${app}: deployed and verified`);
+      });
+
+      it(`${app}, a tag that declares it but deploys without the binding fails the read-back`, () => {
+        const bad = setup({
+          exists: [...DEPS[app], "oa-s-billing"],
+          next: { [`oa-s-${app}`]: liveWithout(`oa-s-${app}`) },
+        }).run(app, {}, "staging");
+        expect(bad.code, app).toBe(1);
+        expect(bad.err).toContain(`${app} BILLING binding: got`);
+      });
+
+      it(`${app}, an older tag with no BILLING in its wrangler: no oa-s-billing needed, deploys and verifies; a BILLING binding the tag did not declare fails`, () => {
+        const configs = { [app]: withoutBilling(APP_CONFIG(app)) };
+        // oa-s-billing does not exist, and none is asked for.
+        const ok = setup({
+          configs,
+          exists: DEPS[app],
+          next: { [`oa-s-${app}`]: liveWithout(`oa-s-${app}`) },
+        }).run(app, {}, "staging");
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+        expect(ok.log.some((l) => l.startsWith(`wrapper ${app} staging`))).toBe(
+          true,
+        );
+        // A live BILLING the tag never declared is not tolerated either.
+        const bound = setup({ configs, exists: DEPS[app] }).run(
+          app,
+          {},
+          "staging",
+        );
+        expect(bound.code, app).toBe(1);
+        expect(bound.err).toContain(`${app} BILLING binding: got`);
+      });
+
+      it(`${app}, verify only: a tag that declares it needs it live; an older one needs none`, () => {
+        // Verify only reads the live Worker (its settings file), deploys nothing.
+        const base = {
+          exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
+          queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+        };
+        const live = setup({ ...base, files: VERIFY_FILES }).run(
+          app,
+          { VERIFY_ONLY: "1" },
+          "staging",
+        );
+        expect(live.code, `${app} ${live.err}`).toBe(0);
+        expect(noDeploy(live.log)).toEqual([]);
+        const missing = setup({
+          ...base,
+          files: {
+            ...VERIFY_FILES,
+            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+          },
+        }).run(app, { VERIFY_ONLY: "1" }, "staging");
+        expect(missing.code, app).toBe(1);
+        expect(missing.err).toContain(`${app} BILLING binding: got`);
+        // An older tag: no BILLING declared, none live: verified without oa-s-billing.
+        const old = setup({
+          configs: { [app]: withoutBilling(APP_CONFIG(app)) },
+          exists: [...DEPS[app], `oa-s-${app}`],
+          queues: base.queues,
+          files: {
+            ...VERIFY_FILES,
+            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+          },
+        }).run(app, { VERIFY_ONLY: "1" }, "staging");
+        expect(old.code, `${app} ${old.err}`).toBe(0);
+      });
+
+      it(`${app}, a tag that binds the wrong service or entrypoint is refused before any deploy`, () => {
+        for (const [why, binding] of [
+          [
+            "wrong service",
+            '{ "binding": "BILLING", "service": "oa-p-billing" }',
+          ],
+          [
+            "wrong entrypoint",
+            `{ "binding": "BILLING", "service": "oa-s-billing", "entrypoint": "${app === "provisioner" ? "Other" : "BillingProvisionerRpc"}" }`,
+          ],
+        ] as const) {
+          const configs = { [app]: withBilling(APP_CONFIG(app), binding) };
+          const r = setup({
+            configs,
+            exists: [...DEPS[app], "oa-s-billing"],
+          }).run(app, {}, "staging");
+          expect(r.code, `${app} ${why}`).toBe(1);
+          expect(r.err).toMatch(/BILLING binding (is|has)/);
+          expect(noDeploy(r.log)).toEqual([]);
+        }
+      });
+
+      it(`${app}, prod: a tag whose prod config binds BILLING is refused before any deploy; the live read-back asserts none`, () => {
+        // Splice a BILLING binding into the prod block of the tag's config.
+        const src = APP_CONFIG(app);
+        const at = src.indexOf('"prod"');
+        const head = src.slice(0, at);
+        const rest = src.slice(at);
+        const entry = '{ "binding": "BILLING", "service": "oa-p-billing" }';
+        const prod = /"services":\s*\[/.test(rest)
+          ? rest.replace(/"services":\s*\[/, `"services": [ ${entry},`)
+          : rest.replace(/"prod":\s*\{/, `"prod": { "services": [ ${entry} ],`);
+        const configs = { [app]: head + prod };
+        const r = setup({ configs, exists: SCHED_DEPS("p") }).run(
+          app,
+          {},
+          "prod",
+        );
+        expect(r.code, app).toBe(1);
+        expect(r.err).toContain("it is staging only");
+        expect(noDeploy(r.log)).toEqual([]);
+      });
+    }
+
+    it("the provisioner's read-back also confirms the entrypoint, and a staging binding to another entrypoint fails", () => {
+      const wrongEntry = JSON.parse(NEXT["oa-s-provisioner"] as string);
+      for (const b of wrongEntry.result.bindings)
+        if (b.name === "BILLING") b.entrypoint = "default";
+      const r = setup({
+        exists: ["oa-s-billing"],
+        next: { "oa-s-provisioner": JSON.stringify(wrongEntry) },
+      }).run("provisioner", {}, "staging");
+      expect(r.code).toBe(1);
+      expect(r.err).toContain(
+        "provisioner BILLING binding: got 'service oa-s-billing default', want 'service oa-s-billing BillingProvisionerRpc'",
+      );
+    });
+
+    it("prod's provisioner needs no billing Worker and asserts no BILLING binding", () => {
+      const ok = setup({}).run("provisioner");
+      expect(ok.code, ok.err).toBe(0);
+      const next = JSON.parse(NEXT["oa-p-provisioner"] as string);
+      next.result.bindings.push({
+        type: "service",
+        name: "BILLING",
+        service: "oa-p-billing",
+        entrypoint: "BillingProvisionerRpc",
+      });
+      const bad = setup({
+        next: { "oa-p-provisioner": JSON.stringify(next) },
+      }).run("provisioner");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("provisioner BILLING binding: got");
+    });
+  });
+
   it("the scheduler also refuses until the provisioner exists", () => {
     const noProv = setup({
       exists: ["oa-p-auth-broker", "oa-p-directory-broker"],
@@ -799,9 +1023,16 @@ describe("deploy-hosted-platform.sh", () => {
       vars: Record<string, string> = {},
     ) => {
       const p = env[0] as "s" | "p";
+      // A config that does not declare BILLING is an older tag: its Worker
+      // is deployed without the binding (#1568).
+      const live = JSON.parse(next);
+      if (!/"BILLING"/.test(config))
+        live.result.bindings = live.result.bindings.filter(
+          (b: { name: string }) => b.name !== "BILLING",
+        );
       const s = setup({
         exists: SCHED_DEPS(p),
-        next: { [`oa-${p}-scheduler`]: next },
+        next: { [`oa-${p}-scheduler`]: JSON.stringify(live) },
       });
       const r = s.sb.run(
         ["bash", tree({ scheduler: config }), env, "scheduler"],

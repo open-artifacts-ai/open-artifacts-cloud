@@ -701,7 +701,7 @@ describe("deploy-hosted-platform.yml", () => {
         String(s.service).replace(/^oa-s-/, ""),
       );
     };
-    for (const app of ["dispatch", "scheduler"]) {
+    for (const app of ["dispatch", "scheduler", "provisioner"]) {
       expect(stagingBound(app), app).toContain("billing");
       expect(order.indexOf("billing"), `billing before ${app}`).toBeLessThan(
         order.indexOf(app),
