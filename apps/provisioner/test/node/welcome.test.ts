@@ -49,7 +49,7 @@ describe("welcomeEmail", () => {
       "Then connect your agent. Paste this into Claude Code, Cursor or any AI agent:",
       "Set up Open Artifacts for me: follow https://acme.open-artifacts.app/llms.txt",
       "Sign in through the browser. Never ask me to paste a token into this chat.",
-      "You got this because you created acme.open-artifacts.app.",
+      "You got this because you signed up and created acme.open-artifacts.app.",
     ]) {
       expect(m.text).toContain(s);
       expect(html).toContain(s);
@@ -58,7 +58,9 @@ describe("welcomeEmail", () => {
 
   it("links only to the instance's own host", () => {
     const m = welcomeEmail(base);
-    const urls = [...`${m.text}\n${m.html}`.matchAll(/https?:\/\/[^\s"'<>]+/g)];
+    // xmlns attributes are namespace names, not links.
+    const html = m.html.replace(/\sxmlns(:\w+)?="[^"]*"/g, "");
+    const urls = [...`${m.text}\n${html}`.matchAll(/https?:\/\/[^\s"'<>]+/g)];
     expect(urls.length).toBeGreaterThan(0);
     for (const [u] of urls)
       expect(new URL(u).host, u).toBe("acme.open-artifacts.app");
@@ -79,6 +81,33 @@ describe("welcomeEmail", () => {
     );
     expect(m.html).not.toMatch(/width="18"/);
     expect(m.html).not.toMatch(/<\/img>|>\s*Open Artifacts\s*<\/p>/);
+  });
+
+  it("self-serve html is the Outlook-safe table template, with no reminder promise", () => {
+    const m = welcomeEmail(base);
+    expect(m.html).toContain('<table role="presentation"');
+    expect(m.html).toContain("<!--[if mso]>");
+    expect(m.html).toContain("<v:roundrect");
+    expect(m.html).toContain("[data-ogsc]");
+    expect(m.html).toContain("max-width:560px");
+    expect(m.html).not.toMatch(
+      /<div class="card"|<pre|<h1 style="font-size:19px/,
+    );
+    expect(m.html).toContain(
+      'href="https://acme.open-artifacts.app/" target="_blank"',
+    );
+    for (const part of [m.text, m.html]) {
+      expect(part).not.toMatch(/remind/i);
+      expect(part).not.toMatch(/invited|added you/i);
+    }
+    expect(m.text).toContain("No card on file.");
+  });
+
+  it("keeps the hostname in the setup prompt unbreakable", () => {
+    const m = welcomeEmail(base);
+    expect(m.html).toContain(
+      '<span style="white-space:nowrap;">https://acme.open-artifacts.app/llms.txt</span>',
+    );
   });
 
   it("neutral copy unless self-serve: no Google, Solo, price or 'you created'", () => {

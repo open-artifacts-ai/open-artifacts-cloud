@@ -17,6 +17,7 @@ import {
 } from "../../../../packages/provision/test/fixtures/release.js";
 import { JOB_ERROR_TEXT, LOG_DETAIL_MAX } from "../../src/errors.js";
 import { jobStep } from "../../src/steps.js";
+import { welcomeEmail } from "../../src/welcome.js";
 import { REACHABLE_MS, runCreate } from "../../src/workflow.js";
 import {
   EMAIL,
@@ -43,6 +44,11 @@ vi.mock(
     },
   }),
 );
+
+vi.mock("../../src/welcome.js", async (orig) => {
+  const m = await orig<typeof import("../../src/welcome.js")>();
+  return { ...m, welcomeEmail: vi.fn(m.welcomeEmail) };
+});
 
 const app = (slug: string) => `${slug}.${HOSTED_DOMAINS[ENV].app}`;
 const plain = (w: World, id: string, name: string) =>
@@ -196,6 +202,29 @@ describe("ProvisionInstall: create", () => {
     // The second notify found the claim taken.
     expect(r.log.find((l) => l.name === "notify")?.output).toEqual({
       sent: false,
+    });
+  });
+
+  it("welcomeEmail throws: no claim taken, install finishes, welcome_unsent can see it, a replay still sends", async () => {
+    const s = seedCreate(w, { slug: "badwel", sendWelcome: true });
+    vi.mocked(welcomeEmail).mockImplementationOnce(() => {
+      throw new Error("invalid app host");
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = await run(w, s.jobId);
+    expect(r.error).toBeNull();
+    expect(w.mail).toHaveLength(0);
+    expect(err).toHaveBeenCalledWith(
+      "welcome email not built",
+      expect.objectContaining({ signupId: s.signupId }),
+    );
+    err.mockRestore();
+    // Owed (send_welcome = 1, ready, never sent) and the claim is free.
+    expect(w.signup(s.signupId)).toMatchObject({
+      status: "ready",
+      send_welcome: 1,
+      welcome_claimed_at: null,
+      welcome_sent_at: null,
     });
   });
 
