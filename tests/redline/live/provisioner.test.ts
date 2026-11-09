@@ -1,5 +1,6 @@
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import { beforeAll, describe, expect, it } from "vitest";
+import { waitFor } from "../src/barrier.ts";
 import {
   createTaken,
   type ProvisionerClient,
@@ -13,8 +14,8 @@ import { proof } from "../src/report.ts";
 import { loadTargets, type Targets, verifyTarget } from "../src/targets.ts";
 
 // SS3 red-line cases for the hosted provisioner (staging only; #859 and its
-// leftovers). Both are listed in live/manifest.json and run in the `signup`
-// lane (src/lanes.ts). Without REDLINE_STG_PROVISIONER (the workflow builds it
+// leftovers). Both are listed in live/manifest.json and run in the
+// `provisioner` lane (src/lanes.ts). Without REDLINE_STG_PROVISIONER (the workflow builds it
 // from the Environment's variable of that name and the REDLINE_STG_PROVISIONER_TOKEN
 // secret) each is unproven-live, which the gate does not accept; local mode
 // has no provisioner and each is staging-only.
@@ -113,6 +114,10 @@ describe("provisioner", () => {
         ),
       });
     const before = await snap();
+    // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which the prov lane's
+    // probes also spend: wait for that lane to end (src/barrier.ts). Off
+    // unless the lanes' runner set it; an overrun is an InfraError.
+    await waitFor("prov-done", { orLaneExit: "prov" });
     const res = await createTaken(process.env, {
       requestId,
       slug,

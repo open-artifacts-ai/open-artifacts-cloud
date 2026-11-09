@@ -45,13 +45,11 @@ const P = fx.phases;
  */
 const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
 
-// #859's live/provisioner.test.ts runs last in the prov lane. The simulation
-// replays the recorded plan without it; its cost is bounded separately ("the
-// provisioner file", below), since on the critical path it would move every
-// recorded end by its whole wall.
+// #859's live/provisioner.test.ts has its own lane ("provisioner"). The
+// recording predates it, so the replay of run 42402998826 leaves the file out
+// (its lane is dropped); the real plan, with the file's wall, is simulated
+// below from run 42642922707.
 const NEW_FILE = "live/provisioner.test.ts";
-/** A 60 s replay watch, the taken-slug probe (a sync 409, 90 s timeout), 30 s setup. */
-const NEW_FILE_MODELED_SEC = 60 + 90 + 30;
 const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
     ph
@@ -170,20 +168,14 @@ describe("the recording (run 42402998826)", () => {
 });
 
 describe("the provisioner file (#859, not in the recording)", () => {
-  it("runs last in the prov lane, after provisioning", () => {
-    const l = (PLAN[0] ?? []).find((x) => x.name === "prov") as Lane;
-    expect(l.files).toEqual(["live/provisioning.test.ts", NEW_FILE]);
-  });
-
-  it("puts the plan that runs over the 600 s target: about 650 s, the prov lane last", () => {
-    // Modeled, not recorded: the first live run with it replaces this. The
-    // prov lane is the critical path and the knobs never scale it, so its
-    // ~180 s lands on the job's end under every knob. The "under 600"
-    // assertions below hold for the recorded plan (RPLAN) only; this one
-    // records that the plan CI runs breaches that target (#859, to Platform).
-    const base = jobEnd(RPLAN, { t19: "job" }).end;
-    near(base + NEW_FILE_MODELED_SEC, 650, 1);
-    expect(base + NEW_FILE_MODELED_SEC).toBeGreaterThan(600);
+  it("has a lane of its own beside prov, and prov holds only provisioning", () => {
+    const lanes = PLAN[0] ?? [];
+    expect(lanes.find((x) => x.name === "prov")?.files).toEqual([
+      "live/provisioning.test.ts",
+    ]);
+    expect(lanes.find((x) => x.name === "provisioner")?.files).toEqual([
+      NEW_FILE,
+    ]);
   });
 });
 
@@ -335,5 +327,77 @@ describe("a real upgrade (run 42436122165, reported figures)", () => {
     expect(t19End).toBeLessThan(otherSec + bringup + live.suiteSec);
     // What would be needed: a suite wall of at most this.
     expect(600 - (otherSec + bringup + live.revokeSec)).toBe(354);
+  });
+});
+
+// Run 42642922707 (cloud, v0.140.0, 577 s redline job; measured per step and
+// per lane from the run's log; the figures are Platform's, from cloud branch
+// redline/26-under-ten, commit 1c3ab4f). The real PLAN is simulated here,
+// the provisioner file's wall included. The lane walls, steps and totals are
+// measurements. The provisioner file's own figures are modeled (a 60 s replay
+// watch, 30 s setup; a sync 409 for createTaken, taken as 3 s), until a live
+// run includes the file's own lane.
+describe("the plan with the provisioner file in its own lane (run 42642922707)", () => {
+  const m = {
+    upgradeSec: 121,
+    betweenSec: 7,
+    revokeSec: 24,
+    totalSec: 577,
+    mergeSec: 2,
+    suiteSec: 390,
+    // prov's rl-p chain is P13 180 + P45 99 + P31 51 + P23 40 s.
+    lanes: { prov: 388, surfaces: 320, creds: 233, guard: 184, front: 162 },
+  };
+  const otherSec =
+    m.totalSec - (m.upgradeSec + m.betweenSec + m.suiteSec + m.revokeSec);
+  /** The replay case (a 60 s watch) and the file's setup; spends no provisioning-api. */
+  const REPLAY_SEC = 60 + 30;
+  /** createTaken's own time once it is released: one R4 POST (a sync 409) and two snapshots. */
+  const TAKEN_SEC = 3;
+  /**
+   * Each lane's end in the suite step's clock. The provisioner lane's
+   * createTaken waits for prov's exit (the prov-done barrier), so the lane
+   * ends TAKEN_SEC after the later of its replay case and prov's end.
+   */
+  const ends = (walls: Record<string, number> = m.lanes) => {
+    const out: Record<string, number> = { ...walls };
+    out.provisioner = Math.max(REPLAY_SEC, out.prov ?? 0) + TAKEN_SEC;
+    return out;
+  };
+  const job = (e: Record<string, number>) =>
+    otherSec +
+    m.upgradeSec +
+    m.betweenSec +
+    Math.max(...Object.values(e)) +
+    m.mergeSec +
+    m.revokeSec;
+
+  it("the simulated lanes are the plan's lanes", () => {
+    expect(Object.keys(ends()).sort()).toEqual(
+      (PLAN[0] ?? []).map((l) => l.name).sort(),
+    );
+  });
+
+  it("the plan ends at 580 s, under 600: the provisioner lane ends 3 s after prov", () => {
+    const e = ends();
+    expect(e.provisioner).toBe(391);
+    const end = job(e);
+    expect(end).toBe(580);
+    expect(end).toBeLessThan(600);
+  });
+
+  it("the probes after provisioning in the prov lane would have been about 757 s (760 here): the reason for the lane", () => {
+    expect(
+      job(ends({ ...m.lanes, prov: m.lanes.prov + REPLAY_SEC + 90 })),
+    ).toBe(760);
+  });
+
+  it("the margin is 20 s: createTaken may take 23 s, not its 90 s bound", () => {
+    expect(600 - job(ends())).toBe(20);
+    const e = ends();
+    e.provisioner = (e.prov ?? 0) + 23;
+    expect(job(e)).toBe(600);
+    e.provisioner = (e.prov ?? 0) + 90;
+    expect(job(e)).toBeGreaterThan(600);
   });
 });

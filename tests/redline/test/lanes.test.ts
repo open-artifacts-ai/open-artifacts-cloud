@@ -70,13 +70,14 @@ describe("the lane plan", () => {
     }
   });
 
-  it("is one phase of five lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of six lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
       "creds",
       "front",
       "guard",
       "prov",
+      "provisioner",
       "surfaces",
     ]);
     const front = PLAN[0]?.find((l) => l.name === "front") as Lane;
@@ -97,7 +98,7 @@ describe("the lane plan", () => {
     expect(conflicts(PLAN_SERIAL)).toEqual([]);
   });
 
-  it("PLAN_SERIAL is the two-phase plan from before #1730, plus #859's provisioner file after provisioning", () => {
+  it("PLAN_SERIAL is the two-phase plan from before #1730, plus #859's provisioner file in a lane beside provisioning", () => {
     expect(PLAN_SERIAL.map((ph) => ph.map((l) => [...l.files]))).toEqual([
       [["live/signin.test.ts", "live/edge.test.ts"]],
       [
@@ -107,7 +108,8 @@ describe("the lane plan", () => {
           "live/guard.test.ts",
           "live/surfaces.test.ts",
         ],
-        ["live/provisioning.test.ts", "live/provisioner.test.ts"],
+        ["live/provisioning.test.ts"],
+        ["live/provisioner.test.ts"],
       ],
     ]);
   });
@@ -145,7 +147,7 @@ describe("the lane plan", () => {
         if (typeof m === "object" && "observe" in m)
           expect(m.observe.length, `${f} ${k}`).toBeGreaterThan(10);
     for (const b of orderedBarriers()) expect(BARRIERS).toContain(b);
-    expect(orderedBarriers()).toEqual(["broker-done"]);
+    expect(orderedBarriers().sort()).toEqual(["broker-done", "prov-done"]);
   });
 
   it("an observe without a reason is a conflict", () => {
@@ -301,8 +303,13 @@ function claimGaps(file: string, c: Claims): string[] {
   }
   if (imports.includes("src/provisioner.ts") || text.includes("createTaken(")) {
     need(
-      c.buckets["provisioning-api"] === "exclusive",
-      "spends RL_PV_* through createTaken: needs provisioning-api",
+      JSON.stringify(c.buckets["provisioning-api"]) ===
+        JSON.stringify({ ordered: "prov-done" }),
+      "spends RL_PV_* through createTaken: needs provisioning-api ordered(prov-done)",
+    );
+    need(
+      text.includes('waitFor("prov-done", { orLaneExit: "prov" })'),
+      'spends RL_PV_* through createTaken: must waitFor("prov-done", { orLaneExit: "prov" })',
     );
   }
   if (imports.includes("src/provisioning.ts")) {
@@ -316,8 +323,9 @@ function claimGaps(file: string, c: Claims): string[] {
       'P34 must waitFor("broker-done")',
     );
     need(
-      c.buckets["provisioning-api"] === "exclusive",
-      "the Provisioning API: needs provisioning-api",
+      JSON.stringify(c.buckets["provisioning-api"]) ===
+        JSON.stringify({ ordered: "prov-done" }),
+      "the Provisioning API: needs provisioning-api ordered(prov-done)",
     );
     need(
       read("src/provisioning.ts").includes("rlAPat") &&

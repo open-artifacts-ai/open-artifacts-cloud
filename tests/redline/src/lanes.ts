@@ -7,7 +7,7 @@
 // time (vitest.live.config.ts keeps fileParallelism off inside each lane).
 // test/lanes.test.ts fails when two lanes of one phase claim the same thing.
 //
-// #1730: PLAN is one phase of five lanes. Where two lanes touch one thing
+// #1730: PLAN is one phase of six lanes. Where two lanes touch one thing
 // they do not just conflict: the thing is guarded by a lock (src/locks.ts),
 // paced by a ledger (hook-ledger.ts, src/rl-anon.ts), or ordered by a barrier
 // (src/barrier.ts). Each of those only adds a wait; an overrun is an
@@ -177,8 +177,10 @@ export const CLAIMS: Record<string, Claims> = {
     buckets: {
       // P34 spends RL_BROKER_IP past its limit on purpose.
       "broker-ip": ordered("broker-done"),
-      // RL_PV_* (P25 spends RL_PV_SIGNIN_IP past its limit on purpose).
-      "provisioning-api": "exclusive",
+      // RL_PV_* (P25 spends RL_PV_SIGNIN_IP past its limit on purpose). The
+      // provisioner file's createTaken spends RL_PV_WRITE / RL_PV_PRE_IP from
+      // its own lane, and waits for this lane to exit first.
+      "provisioning-api": ordered("prov-done"),
     },
   },
   "live/provisioner.test.ts": {
@@ -192,8 +194,10 @@ export const CLAIMS: Record<string, Claims> = {
     buckets: {
       ...installBuckets(),
       // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which provisioning's
-      // P25 and friends also spend: same lane, after provisioning.
-      "provisioning-api": "exclusive",
+      // P25 and friends also spend: its own lane, beside prov, and createTaken
+      // waits for the prov lane's exit (waitFor("prov-done", { orLaneExit:
+      // "prov" }); nothing marks it). The replay case spends none.
+      "provisioning-api": ordered("prov-done"),
     },
   },
 };
@@ -214,10 +218,13 @@ const lane = (name: string, ...files: string[]): Lane => ({
 });
 
 /**
- * The run (#1730): one phase, five lanes, the longest file per lane.
+ * The run (#1730): one phase, six lanes, the longest file per lane.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
- *   barrier, then #859's provisioner file (it spends the provisioning-api
- *   bucket, so it shares the lane; a sync 409 and a 60 s replay watch);
+ *   barrier;
+ * - provisioner: #859's provisioner file, in a lane of its own so its 60 s
+ *   replay watch runs beside prov instead of after it (the job would end
+ *   about 180 s later). Its createTaken spends the provisioning-api bucket,
+ *   so that case waits for prov's exit (the prov-done barrier);
  * - surfaces: surfaces (335.0 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean stays serial inside it), then bus (#1299:
@@ -227,7 +234,8 @@ const lane = (name: string, ...files: string[]): Lane => ({
  */
 export const PLAN: readonly Phase[] = [
   [
-    lane("prov", "provisioning", "provisioner"),
+    lane("prov", "provisioning"),
+    lane("provisioner", "provisioner"),
     lane("surfaces", "surfaces"),
     lane("creds", "credentials"),
     lane("guard", "guard", "bus"),
@@ -238,13 +246,15 @@ export const PLAN: readonly Phase[] = [
 /**
  * The plan #1730 replaced, kept as the kill switch (REDLINE_PLAN=serial).
  * Phase 1: signin (the broker) and edge, with nothing beside them. Phase 2:
- * the other install files, one at a time, beside provisioning.
+ * the other install files, one at a time, beside provisioning and the
+ * provisioner file (its createTaken waits for provisioning's lane to exit).
  */
 export const PLAN_SERIAL: readonly Phase[] = [
   [lane("front", "signin", "edge")],
   [
     lane("install", "credentials", "live", "guard", "surfaces"),
-    lane("prov", "provisioning", "provisioner"),
+    lane("prov", "provisioning"),
+    lane("provisioner", "provisioner"),
   ],
 ];
 
