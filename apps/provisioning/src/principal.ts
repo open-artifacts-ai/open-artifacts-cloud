@@ -12,8 +12,9 @@ import type {
  * - actorKey: idempotency and audit (`admin:<email>`, `token:<tokenId>`,
  *   `oidc:<repository_id>`, `user:<sub>`, `system:<name>`).
  * - rateKey: the rate-limit key; a token shares its admin's (`admin:<email>`).
- * - hd: self-serve users only (the verified Workspace domain, 4.2 policy);
- *   `test.invalid` marks an OIDC test user (4.4), refused outside staging.
+ * - hd: self-serve users only (the Google Workspace domain the sign-in
+ *   recorded; absent for a personal Google account, and information only:
+ *   it gates nothing); `test.invalid` marks an OIDC test user (4.4), refused outside staging.
  * - tokenKind, client, tokenExpiresAt: tokens only, from the row; audit
  *   `via` and `client` (9A.8), R1's token kind and expiry. `client` is the
  *   sanitized client name (oauth), null for `oat`.

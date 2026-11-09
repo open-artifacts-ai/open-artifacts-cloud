@@ -13,3 +13,11 @@ export class WorkflowEntrypoint<E = unknown, _P = unknown> {
     readonly env: E,
   ) {}
 }
+// The server's Durable Objects extend this; the sign-in tests import its
+// modules without running one.
+export class DurableObject<E = unknown> {
+  constructor(
+    readonly ctx: unknown,
+    readonly env: E,
+  ) {}
+}

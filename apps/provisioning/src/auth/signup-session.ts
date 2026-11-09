@@ -94,8 +94,9 @@ export async function signupSessionOf(
 }
 
 /**
- * The `user` principal for the sign-up cookie (4.1 U): `hd` is the verified
- * Workspace domain the sign-in recorded, absent for a personal account.
+ * The `user` principal for the sign-up cookie (4.1 U): `hd` is the Google
+ * Workspace domain the sign-in recorded, absent for a personal account. It is
+ * information only: any verified Google account may sign up.
  */
 export async function signupPrincipal(
   req: Request,

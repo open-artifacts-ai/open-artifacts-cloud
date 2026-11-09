@@ -13,6 +13,12 @@ export interface CreateInput {
    * id on another slug, is refused. Not with resumeId.
    */
   installId?: InstallId;
+  /**
+   * Google sign-in with an empty AUTH_DOMAINS (owner and invites only), for a
+   * self-serve personal Google account, which has no hd. The provisioner sets
+   * it only for source self-serve; admin creates still need a domain.
+   */
+  googleWithoutDomains?: boolean;
 }
 
 export interface Install {

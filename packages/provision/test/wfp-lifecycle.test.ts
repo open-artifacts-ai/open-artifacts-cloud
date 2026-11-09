@@ -3460,6 +3460,17 @@ describe("fix round 4 (T8): every server precondition for hosted google", () => 
     },
   );
 
+  it("a self-serve create (googleWithoutDomains) may use google with no AUTH_DOMAINS: an empty-domain registry entry", async () => {
+    const s = setup();
+    const inst = keep(
+      await s.p.create({
+        ...input("gmailowner", { vars: { AUTH_PROVIDERS: "google" } }),
+        googleWithoutDomains: true,
+      }),
+    );
+    expect(JSON.parse(regEntry(s, inst.id) as string).domains).toEqual([]);
+  });
+
   it.each([
     [
       "keeps google and drops AUTH_DOMAINS",
@@ -3542,7 +3553,8 @@ describe("fix round 4 (T8): every server precondition for hosted google", () => 
       "BROKER_SIGNING_KEY",
       /BROKER_SIGNING_KEY isn't/,
     ],
-    ["AUTH_DOMAINS non-empty", "AUTH_DOMAINS", /AUTH_DOMAINS is empty/],
+    // AUTH_DOMAINS is not here: the server accepts google with none (owner and
+    // invites only); apps/provisioner/test/node/gmail-signup-owner.test.ts.
   ];
   it.each(RENDERED)(
     "rendered by provision: %s (without %s the server refuses google)",
