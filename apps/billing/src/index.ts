@@ -595,6 +595,50 @@ async function tier(db: D1Database, install: string, now: number) {
   return Response.json(view(r, now));
 }
 
+// Solo trials ending in (from, to], oldest install id first, after a cursor.
+// Only a live no-card Solo trial: a Solo row (or a Solo kept live under the
+// 14-day Business trial, tier trial with solo_status active), active, that
+// never checked out. Another tier, a lapsed or suspended status, a Solo that
+// paid (solo_trial_ends_at is then past) and one that checked out during the
+// trial (it keeps solo_trial_ends_at but has a card, solo_checked_out) never
+// match.
+const SOLO_ENDING_SQL =
+  "SELECT install_id, solo_trial_ends_at FROM tiers WHERE ((tier = 'solo' AND status = 'active') OR (tier = 'trial' AND status = 'active' AND solo_status = 'active')) AND solo_checked_out IS NULL AND solo_trial_ends_at > ?1 AND solo_trial_ends_at <= ?2 AND install_id > ?3 ORDER BY install_id LIMIT ?4";
+const SOLO_ENDING_MAX = 200;
+
+/** GET /solo/trial-ending?from=<ms>&to=<ms>[&after=<install>][&limit=<n>]. */
+async function soloTrialEnding(db: D1Database, q: URLSearchParams) {
+  const num = (k: string) => {
+    const v = q.get(k);
+    return v !== null && /^\d{1,15}$/.test(v) ? Number(v) : null;
+  };
+  const from = num("from");
+  const to = num("to");
+  const after = q.get("after") ?? "";
+  const limit = Math.min(num("limit") ?? 100, SOLO_ENDING_MAX);
+  if (
+    from === null ||
+    to === null ||
+    to < from ||
+    limit < 1 ||
+    (after !== "" && !INSTALL_ID.test(after))
+  )
+    return bad("bad_query");
+  const { results } = await db
+    .prepare(SOLO_ENDING_SQL)
+    .bind(from, to, after, limit)
+    .all<{ install_id: string; solo_trial_ends_at: number }>();
+  console.log("billing solo trial-ending", results.length);
+  return Response.json({
+    installs: results.map((r) => ({
+      installId: r.install_id,
+      trialEndsAt: r.solo_trial_ends_at,
+    })),
+    next:
+      results.length === limit ? (results.at(-1)?.install_id ?? null) : null,
+  });
+}
+
 async function trialStart(
   db: D1Database,
   install: string,
@@ -791,6 +835,7 @@ async function usage(
 const GATE = new Set([
   "GET /tier",
   "GET /health",
+  "GET /solo/trial-ending",
   "POST /trial/start",
   "POST /usage",
   "POST /checkout",
@@ -836,6 +881,16 @@ export default {
       return notFound();
     }
     if (route === "GET /health") return Response.json({ ok: true });
+    // The scheduler's trial-reminder read (no install: it lists them). The
+    // gate's allowlist never forwards this path, so only a raw binding gets here.
+    if (route === "GET /solo/trial-ending") {
+      try {
+        return await soloTrialEnding(env.BILLING_DB, url.searchParams);
+      } catch {
+        console.error("billing db_error");
+        return bad("unavailable", 503);
+      }
+    }
     // The install is the gate's header and nothing else.
     const install = req.headers.get(GATE_INSTALL_HEADER);
     if (install === null || !INSTALL_ID.test(install)) {

@@ -406,3 +406,45 @@ describe("the upgrade's cancel goes through the Worker's Stripe key (#1568)", ()
     });
   });
 });
+
+describe("a Checkout during the no-card Solo trial is recorded (trial reminder)", () => {
+  it("sets solo_checked_out when a kept-free-days Checkout adopts the subscription", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', stripe_subscription_id = 'sub_OldA0001', solo_trial_ends_at = ?2 WHERE install_id = ?1",
+      )
+      .bind(A, T * 1000 + 5 * 86_400_000)
+      .run();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_i, init) =>
+      Response.json(
+        init?.method === "GET"
+          ? { id: "sub_NewA0001", status: "trialing" }
+          : { id: "sub_OldA0001", status: "canceled" },
+      ),
+    );
+    const ev = JSON.stringify({
+      id: "evt_SoloCk01",
+      object: "event",
+      type: "checkout.session.completed",
+      livemode: false,
+      created: T,
+      data: {
+        object: {
+          customer: CUS_A,
+          subscription: "sub_NewA0001",
+          payment_status: "no_payment_required",
+          metadata: { tier: "solo" },
+        },
+      },
+    });
+    const r = await call(await hook(ev), {
+      ...env,
+      STRIPE_SECRET_KEY: "sk_test_FAKEfakeFAKEfake0123456789",
+    } as Env);
+    expect(r.status).toBe(200);
+    expect(await rowOf(A)).toMatchObject({
+      stripe_subscription_id: "sub_NewA0001",
+      solo_checked_out: 1,
+    });
+  });
+});

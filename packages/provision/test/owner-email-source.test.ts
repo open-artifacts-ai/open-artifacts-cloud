@@ -54,6 +54,10 @@ const ALLOWED: Record<string, RegExp[]> = {
   "apps/provisioner/src/workflow.ts": [
     /^\s*"SELECT owner_email AS email FROM signup_secret WHERE signup_id = \?";$/,
   ],
+  // The trial reminder's mailable-install read (goes through ownerEmailOf).
+  "apps/scheduler/src/trial-reminder.ts": [
+    /^\s*"SELECT i\.id AS id, i\.app_host AS app_host, i\.owner_email AS owner_email FROM installs i";$/,
+  ],
   // The purge (a write).
   "apps/scheduler/src/index.ts": [
     /^\s*"UPDATE installs SET owner_email = '', inputs_hash = '' WHERE state='deleted' AND updated_at < \?1 AND owner_email <> '' RETURNING id";$/,

@@ -19,6 +19,7 @@ const TABLES = [
   "install_lifecycle",
   "signups",
   "signup_secret",
+  "trial_reminders",
   "audit_refusals",
   "sessions",
   "agent_tokens",

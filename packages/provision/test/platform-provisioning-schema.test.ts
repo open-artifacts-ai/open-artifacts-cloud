@@ -208,7 +208,7 @@ describe("0008_provisioning: jobs", () => {
 
 describe("0009_job_fail_point (#995)", () => {
   it("follows 0008 and only adds columns", () => {
-    expect(migrationFiles.slice(8)).toEqual(["0009_job_fail_point.sql"]);
+    expect(migrationFiles.slice(8, 9)).toEqual(["0009_job_fail_point.sql"]);
     const sql = migrationSql("0009_job_fail_point.sql").replace(
       /--[^\n]*/g,
       "",
@@ -595,5 +595,40 @@ describe("0008_provisioning: install_status (5.1 precedence)", () => {
     job(db, "i1", { signup_id: sg, status: "failed" });
     job(db, "i1", { signup_id: sg, kind: "retry", status: "failed" });
     expect(count(db, "install_status")).toBe(1);
+  });
+});
+
+describe("0010_trial_reminders (cloud #39)", () => {
+  it("follows 0009 and only creates the table", () => {
+    expect(migrationFiles.slice(9)).toEqual(["0010_trial_reminders.sql"]);
+    const sql = migrationSql("0010_trial_reminders.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|UPDATE|DELETE|ALTER)\b/i);
+    expect(sql).toMatch(/^\s*CREATE TABLE IF NOT EXISTS trial_reminders /);
+  });
+
+  it("holds one row per install and kind, with no address column", () => {
+    const db = platformDb();
+    expect(cols(db, "trial_reminders")).toEqual([
+      "install_id TEXT NN PK",
+      "kind TEXT NN PK",
+      "trial_ends_at INTEGER NN",
+      "claimed_at INTEGER NN",
+      "sent_at INTEGER",
+    ]);
+    const ins = (id: string, kind = "week") =>
+      db
+        .prepare(
+          "INSERT INTO trial_reminders (install_id, kind, trial_ends_at, claimed_at) VALUES (?, ?, 1, 2)",
+        )
+        .run(id, kind);
+    ins("i1");
+    expect(() => ins("i1")).toThrow(/UNIQUE|PRIMARY/);
+    ins("i1", "last_day");
+    expect(() => ins("i1", "last_day")).toThrow(/UNIQUE|PRIMARY/);
+    expect(() => ins("i1", "other")).toThrow(/CHECK/);
+    ins("i2");
   });
 });
