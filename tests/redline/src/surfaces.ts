@@ -371,7 +371,6 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "PUT /api/v1/bus/links",
   "DELETE /api/v1/bus/links/:id",
   "PUT /api/v1/bus/reach",
-  "DELETE /api/v1/bus/reach/:id",
   // #1300: the /bus page's share-notice form, as PUT R.shareNotices. A
   // public-policy page route (PUBLIC_ROUTES), so no org surface or case:
   // the suite probes scoped routes only (coverageGaps' `scoped`).
