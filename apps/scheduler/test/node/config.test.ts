@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HOSTED_DOMAINS, NAMESPACES, platformNames } from "@oa/provision";
 import { describe, expect, it } from "vitest";
+import { HOSTED_BUS_LIFTED } from "../../../../tests/redline/src/bus-gate.ts";
 
 const app = join(dirname(fileURLToPath(import.meta.url)), "../..");
 // Strip // and /* */ comments outside strings.
@@ -53,6 +54,10 @@ describe("wrangler.jsonc", () => {
         FLEET_SMOKE: env === "staging" ? "off" : "required",
         // The share check is on in both: an explicit, committed choice.
         FLEET_SMOKE_SHARE: "on",
+        // #1299: on exactly when red-line's flag says the /bus routes are
+        // lifted on hosted installs (tests/redline/src/bus-gate.ts), so part 6
+        // can't flip one and forget the other.
+        FLEET_SMOKE_BUS: HOSTED_BUS_LIFTED ? "on" : "off",
         // ... and keeps the passive soak: 15 min on staging, 60 on prod.
         FLEET_SOAK_MIN: env === "staging" ? "15" : "60",
       });

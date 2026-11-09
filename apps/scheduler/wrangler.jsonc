@@ -57,6 +57,11 @@
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
+        // #1299: the smoke's bus check (GET /api/v1/bus/ping). "off" while
+        // the /bus routes are gated on hosted installs (HOSTED=1); the PR
+        // that lifts the gate sets "on", so a bus that is down then halts
+        // the release.
+        "FLEET_SMOKE_BUS": "off",
         // The passive soak with the smoke off, in minutes.
         "FLEET_SOAK_MIN": "15",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts-staging.app",
@@ -141,6 +146,11 @@
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
+        // #1299: the smoke's bus check (GET /api/v1/bus/ping). "off" while
+        // the /bus routes are gated on hosted installs (HOSTED=1); the PR
+        // that lifts the gate sets "on", so a bus that is down then halts
+        // the release.
+        "FLEET_SMOKE_BUS": "off",
         // The passive soak with the smoke off, in minutes.
         "FLEET_SOAK_MIN": "60",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts.app",

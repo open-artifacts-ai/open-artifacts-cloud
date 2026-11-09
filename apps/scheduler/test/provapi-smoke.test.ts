@@ -71,6 +71,7 @@ function canary(o: { fault?: Fault; arts?: Art[]; me?: object } = {}) {
       });
     if (!authed) return json({ error: "unauthorized" }, 401);
     if (p === "/api/v1/me") return json({ user: o.me ?? ME });
+    if (p === "/api/v1/bus/ping") return json({ ok: true });
     if (p === "/api/v1/artifacts" && method === "GET")
       return json({
         items: arts
@@ -180,11 +181,11 @@ const input = (
 const live = (c: ReturnType<typeof canary>) => c.arts.filter((a) => !a.deleted);
 
 describe("the canary smoke", () => {
-  it("passes every check, cleans up, and notes the bus skip", async () => {
+  it("passes every check (the bus ping included) and cleans up", async () => {
     const c = canary();
     expect(await smoke(input(c))).toEqual({
       ok: true,
-      notes: [SMOKE_BUS_SKIPPED],
+      notes: [],
     });
     expect(live(c)).toEqual([]);
     expect(c.arts.map((a) => a.title)).toEqual([TITLE]);
@@ -202,6 +203,7 @@ describe("the canary smoke", () => {
       "GET /api/v1/artifacts/a1/shares",
       "POST /mcp",
       "POST /mcp",
+      "GET /api/v1/bus/ping",
       // The finally: unshare, then delete.
       `DELETE /api/v1/artifacts/a1/shares/${encodeURIComponent(SHARE_TO)}`,
       "DELETE /api/v1/artifacts/a1",
@@ -504,7 +506,7 @@ describe("the canary smoke", () => {
     const d = canary({ arts: c.arts });
     expect(await smoke(input(d, { nonce: () => "n2" }))).toEqual({
       ok: true,
-      notes: [SMOKE_BUS_SKIPPED],
+      notes: [],
     });
     expect(live(d)).toEqual([]);
   });
@@ -533,12 +535,85 @@ describe("the canary smoke", () => {
     expect(c.calls.some((x) => x.path === "/auth/login/google")).toBe(false);
   });
 
+  it("bus (#1299): the hub's ping must answer 200 { ok: true }; 404 (bus off), a wrong body, a refusal all halt as check bus", async () => {
+    for (const bad of [
+      Response.json({ error: "not_found" }, { status: 404 }),
+      Response.json({ ok: false }),
+      Response.json({}),
+      new Response("not json"),
+      Response.json({ error: "unauthorized" }, { status: 401 }),
+    ]) {
+      const c = canary({
+        fault: (p) => (p === "/api/v1/bus/ping" ? bad.clone() : null),
+      });
+      expect(await smoke(input(c))).toEqual({
+        ok: false,
+        kind: "assert",
+        check: "bus",
+      });
+      // The cleanup still ran.
+      expect(live(c)).toEqual([]);
+    }
+  });
+
+  it("bus (#1299): a timeout or 5xx counts as transport, never a pass", async () => {
+    for (const fault of [
+      "throw",
+      Response.json({}, { status: 503 }),
+      Response.json({}, { status: 429 }),
+    ] as const) {
+      const c = canary({
+        fault: (p) =>
+          p === "/api/v1/bus/ping"
+            ? fault === "throw"
+              ? "throw"
+              : fault.clone()
+            : null,
+      });
+      expect(await smoke(input(c))).toEqual({
+        ok: false,
+        kind: "transport",
+        check: "bus",
+      });
+      expect(live(c)).toEqual([]);
+    }
+  });
+
+  it("bus (#1299): the ping carries smoke's token, and the token is never in the result", async () => {
+    const c = canary();
+    const r = await smoke(input(c));
+    expect(r).toEqual({ ok: true, notes: [] });
+    expect(c.calls.filter((x) => x.path === "/api/v1/bus/ping")).toEqual([
+      { method: "GET", path: "/api/v1/bus/ping", auth: true },
+    ]);
+    const bad = canary({
+      fault: (p) =>
+        p === "/api/v1/bus/ping" ? new Response(TOKEN, { status: 404 }) : null,
+    });
+    expect(JSON.stringify(await smoke(input(bad)))).not.toContain(TOKEN);
+  });
+
+  it("FLEET_SMOKE_BUS off: no ping, a note, and the rest still runs even when the bus is 404", async () => {
+    const c = canary({
+      fault: (p) =>
+        p === "/api/v1/bus/ping"
+          ? Response.json({ error: "not_found" }, { status: 404 })
+          : null,
+    });
+    expect(await smoke(input(c, { bus: false }))).toEqual({
+      ok: true,
+      notes: [SMOKE_BUS_SKIPPED],
+    });
+    expect(c.calls.some((x) => x.path.includes("/bus/"))).toBe(false);
+    expect(live(c)).toEqual([]);
+  });
+
   it("FLEET_SMOKE_SHARE off: the share is skipped with a note, target or not, and the rest still runs", async () => {
     for (const shareTo of ["", "  ", undefined, SHARE_TO]) {
       const c = canary();
       expect(await smoke(input(c, { shareTo, share: false }))).toEqual({
         ok: true,
-        notes: [SMOKE_SHARE_SKIPPED, SMOKE_BUS_SKIPPED],
+        notes: [SMOKE_SHARE_SKIPPED],
       });
       expect(c.calls.some((x) => x.path.includes("/shares"))).toBe(false);
       expect(c.calls.filter((x) => x.path === "/mcp")).toHaveLength(2);

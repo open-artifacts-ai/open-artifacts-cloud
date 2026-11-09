@@ -11,6 +11,7 @@ import {
   HOSTED_DOMAINS,
   NAMESPACES,
   PROVISIONER_MAX_TOKEN_DAYS,
+  parseBusSlugs,
   type R2CatalogBucket,
   r2BindingReleaseReader,
   type WfpOptions,
@@ -23,6 +24,8 @@ export interface ProvisionerEnv {
   ACCOUNT_ID: string;
   /** "staging" or "prod"; anything else is a terminal internal error. */
   OA_ENV: string;
+  /** Staging only (#1299 part 6): comma list of exact install slugs that get `bus`. Absent in prod. */
+  STAGING_BUS_SLUGS?: string;
 }
 
 /** The runtime's network and clock; the tests' run on fakes. */
@@ -75,6 +78,8 @@ export async function provisionerOptions(
       sleep: io.sleep,
     }),
     env: e,
+    stagingBusSlugs:
+      e === "staging" ? parseBusSlugs(env.STAGING_BUS_SLUGS) : [],
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),

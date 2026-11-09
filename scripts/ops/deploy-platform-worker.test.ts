@@ -994,7 +994,6 @@ describe("deploy-platform-worker.sh", () => {
       const pins = pinsOf();
       const first = Object.keys(pins)[0] as string;
       for (const [why, lock] of [
-        ["the repo's own lock (not frozen until the first deploy)", undefined],
         ["not frozen", lockAt("open.json", { frozen: false, pins })],
         [
           "a migration not pinned",
@@ -1023,6 +1022,11 @@ describe("deploy-platform-worker.sh", () => {
         expect(r.code, why).toBe(1);
         expect(r.log, why).toEqual([]);
       }
+    });
+
+    it("the repo's own lock is frozen and holds: the first deploy needs no other lock (#1568)", () => {
+      const r = run(["billing", "staging"], { ...PRICES, ...IDS });
+      expect(r.code, r.err).toBe(0);
     });
   });
 });

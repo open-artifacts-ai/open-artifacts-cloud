@@ -22,6 +22,16 @@ const REG = "126a6ed45b8842ccb42b8c55a9467760";
 const DIRREG = "55d5f7d77ef240e5a2255fe43f2c5170";
 const HOSTS = "32737a5cd6224418bf14e15fa2732bab";
 const DB = "6ca9103e-507e-4541-b3bb-2485e699512b";
+const BDB = "7d7d7d7d-7d7d-4d7d-8d7d-7d7d7d7d7d7d";
+// Billing's Stripe secrets, marked so a leak shows; test-mode shapes.
+const STRIPE_KEY = "rk_test_NEVERAPPEARstripekey0123456789";
+const STRIPE_WH = "whsec_NEVERAPPEARwebhooksecret0123456789";
+const PRICES = {
+  STRIPE_PRICE_TEAM: "price_1TeamAbc",
+  STRIPE_PRICE_BUSINESS: "price_1BizXyz",
+  STRIPE_PRICE_SOLO_MONTHLY: "price_1SoloMo",
+  STRIPE_PRICE_SOLO_YEARLY: "price_1SoloYr",
+};
 const ZONE = "eb90975c0a329d0c743fa4f33f917934";
 const CLIENT =
   "206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com";
@@ -128,7 +138,7 @@ const wrapperStub = (dir: string) => {
   writeFileSync(
     p,
     `#!/usr/bin/env bash
-echo "wrapper $* reg=\${BROKER_REGISTRY_ID:-}\${DIRECTORY_REGISTRY_ID:-} client=\${GOOGLE_CLIENT_ID_PROD:-}\${GOOGLE_DIRECTORY_CLIENT_ID_PROD:-} hosts=\${HOSTS_KV_ID:-} db=\${PLATFORM_DB_ID:-} tag=\${DEPLOY_TAG:-}" >> "$STUB_LOG"
+echo "wrapper $* reg=\${BROKER_REGISTRY_ID:-}\${DIRECTORY_REGISTRY_ID:-} client=\${GOOGLE_CLIENT_ID_PROD:-}\${GOOGLE_DIRECTORY_CLIENT_ID_PROD:-} hosts=\${HOSTS_KV_ID:-} db=\${PLATFORM_DB_ID:-} bdb=\${BILLING_DB_ID:-} tag=\${DEPLOY_TAG:-}" >> "$STUB_LOG"
 w="oa-$([ "$2" = staging ] && echo s || echo p)-$1"
 touch "$STATE/$w.exists"
 [ -f "$STATE/$w.next.json" ] && cp "$STATE/$w.next.json" "$STATE/$w.settings.json"
@@ -341,6 +351,19 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
 ];
+NEXT["oa-s-billing"] = settings([
+  { type: "d1", name: "BILLING_DB", id: BDB },
+  { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
+  ...Object.entries(
+    committedVars(
+      readFileSync(join(root, "apps/billing/wrangler.jsonc"), "utf8"),
+      "staging",
+      PRICES,
+    ),
+  ).map(([name, text]) => ({ type: "plain_text", name, text })),
+  { type: "secret_text", name: "STRIPE_SECRET_KEY" },
+  { type: "secret_text", name: "STRIPE_WEBHOOK_SECRET" },
+]);
 NEXT["oa-p-provisioner"] = provisionerSettings();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
 
@@ -373,6 +396,11 @@ const ENV = {
   WELCOME_FROM: FILLS.WELCOME_FROM,
   GITHUB_REPOSITORY_ID: REPO_ID,
   NEW_KV: OAUTH,
+  BILLING_DB_ID: BDB,
+  MAIN_BILLING_MIGRATION_LOCK: join(root, "apps/billing/migration-lock.json"),
+  STRIPE_SECRET_KEY: STRIPE_KEY,
+  STRIPE_WEBHOOK_SECRET: STRIPE_WH,
+  ...PRICES,
 };
 
 // What the scheduler needs deployed first.
@@ -419,8 +447,8 @@ const setup = (
     pins?: { staging?: string | null; prod?: string | null };
     /** Extra state files (name -> content). */
     files?: Record<string, string>;
-    /** Stub node (logs its argv, exits $NODE_EXIT). */
-    node?: boolean;
+    /** Stub node (logs its argv, exits $NODE_EXIT); "billing": only billing-db.ts is stubbed. */
+    node?: boolean | "billing";
     // The account's queue listing; null: the listing fails.
     queues?: string | null;
   } = {},
@@ -429,12 +457,25 @@ const setup = (
     pnpm,
     curl,
     openssl,
-    ...(opts.node ? { node: `exit "\${NODE_EXIT:-0}"` } : {}),
+    ...(opts.node === "billing"
+      ? {
+          node: `case "$*" in *billing-db.ts*) exit "\${NODE_EXIT:-0}" ;; esac\nexec "$REAL_NODE" "$@"`,
+        }
+      : opts.node
+        ? { node: `exit "\${NODE_EXIT:-0}"` }
+        : {}),
   });
   const state = join(sb.dir, "state");
   mkdirSync(state);
   for (const [w, s] of Object.entries({ ...NEXT, ...opts.next }))
     writeFileSync(join(state, `${w}.next.json`), s);
+  writeFileSync(
+    join(state, "oa-s-billing.schedules.json"),
+    JSON.stringify({
+      success: true,
+      result: { schedules: [{ cron: "17 3 * * *" }] },
+    }),
+  );
   for (const p of ["s", "p"])
     writeFileSync(
       join(state, `oa-${p}-scheduler.schedules.json`),
@@ -480,6 +521,7 @@ const setup = (
       env: {
         ...ENV,
         STATE: state,
+        REAL_NODE: process.execPath,
         DEPLOY_WRAPPER: wrapperStub(sb.dir),
         BROKER_PIN_FILE: pinFile,
         ...env,
@@ -493,7 +535,15 @@ const setup = (
 // Nothing secret in any argv, stdout or stderr.
 const clean = (r: { out: string; err: string; log: string[] }) => {
   const all = [r.out, r.err, ...r.log].join("\n");
-  for (const s of [TOKEN, SECRET, DSECRET, "k".repeat(64), "c3RhdGVrZXlz"])
+  for (const s of [
+    TOKEN,
+    SECRET,
+    DSECRET,
+    STRIPE_KEY,
+    STRIPE_WH,
+    "k".repeat(64),
+    "c3RhdGVrZXlz",
+  ])
     expect(all).not.toContain(s);
 };
 // Nothing deployed or set: no wrapper, pnpm or wrangler call.
@@ -1266,6 +1316,211 @@ describe("deploy-hosted-platform.sh", () => {
       const bad = setup({ node: true }).run("platform-db", { NODE_EXIT: "1" });
       expect(bad.code).toBe(1);
       expect(bad.out).not.toContain("verified");
+    });
+  });
+
+  describe("billing (staging only)", () => {
+    const stg = (opts: Parameters<typeof setup>[0] = {}) =>
+      setup({ node: "billing", ...opts });
+    const BAD = (r: { log: string[]; err: string }) => {
+      // Nothing was deployed, set or migrated.
+      expect(noDeploy(r.log)).toEqual([]);
+      expect(
+        r.log.filter((l) => l.startsWith("node") && l.includes("billing-db")),
+      ).toEqual([]);
+    };
+
+    it("prod refuses before anything: no Cloudflare call, no wrapper, no secret", () => {
+      for (const VERIFY_ONLY of ["", "1"]) {
+        const r = setup({ node: "billing" }).run(
+          "billing",
+          { VERIFY_ONLY },
+          "prod",
+        );
+        expect(r.code, VERIFY_ONLY).toBe(2);
+        expect(r.err).toContain("billing target is staging only");
+        expect(
+          r.log.filter((l) => /^(pnpm|wrapper|curl|node) /.test(l)),
+        ).toEqual([]);
+        clean(r);
+      }
+    });
+
+    it("migrates the D1 first, deploys with its ids and the four prices, puts both secrets, deploys again, then verifies", () => {
+      const r = stg().run("billing", {}, "staging");
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      // The schema before the Worker.
+      const order = r.log.filter((l) =>
+        /^(node .*billing-db|wrapper|stdin-len)/.test(l),
+      );
+      expect(order[0]).toBe(
+        `node --experimental-strip-types --no-warnings ${join(root, "scripts/ops/billing-db.ts")} staging`,
+      );
+      expect(order.slice(1).map((l) => l.split(" ")[0])).toEqual([
+        "wrapper",
+        "stdin-len",
+        "stdin-len",
+        "wrapper",
+      ]);
+      const w = r.log.filter((l) => l.startsWith("wrapper billing staging "));
+      expect(w).toHaveLength(2);
+      expect(w[0]).toContain(`bdb=${BDB}`);
+      expect(w[0]).toContain(`reg=${REG}`);
+      expect(puts(r.log)).toEqual([
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+      ]);
+      expect(r.out).toContain("staging billing: deployed and verified");
+      clean(r);
+    });
+
+    it("a run without the Stripe key, the webhook secret or a price fails clearly before anything is migrated, deployed or put", () => {
+      for (const k of [
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        ...Object.keys(PRICES),
+        "BILLING_DB_ID",
+        "MAIN_BILLING_MIGRATION_LOCK",
+      ])
+        for (const v of ["", "unset"]) {
+          const env: Record<string, string> = { [k]: "" };
+          const r = stg().run("billing", env, "staging");
+          expect(r.code, `${k} ${v}`).toBe(2);
+          expect(r.err).toContain(`${k} is required for billing`);
+          BAD(r);
+          expect(puts(r.log)).toEqual([]);
+          clean(r);
+        }
+    });
+
+    it("a live key, a non-test key or a malformed secret or price is refused without printing it", () => {
+      for (const [k, v, want] of [
+        [
+          "STRIPE_SECRET_KEY",
+          "sk_live_abcdefgh12345678",
+          "test-mode key",
+        ],
+        [
+          "STRIPE_SECRET_KEY",
+          "rk_live_abcdefgh12345678",
+          "test-mode key",
+        ],
+        [
+          "STRIPE_SECRET_KEY",
+          "pk_test_abcdefgh12345678",
+          "test-mode key",
+        ],
+        ["STRIPE_SECRET_KEY", "sk_test_short", "test-mode key"],
+        [
+          "STRIPE_WEBHOOK_SECRET",
+          "NEVERAPPEARnoprefix0123456789",
+          "signing secret",
+        ],
+        ["STRIPE_PRICE_TEAM", "prod_1Abc", "price id"],
+        ["STRIPE_PRICE_SOLO_YEARLY", "price_1 Abc", "price id"],
+      ] as const) {
+        const r = stg().run("billing", { [k]: v }, "staging");
+        expect(r.code, `${k}=${v}`).toBe(2);
+        expect(r.err).toContain(want);
+        BAD(r);
+        expect([r.out, r.err, ...r.log].join("\n")).not.toContain(v);
+      }
+    });
+
+    it("a migration that fails stops the run before the Worker is deployed", () => {
+      const r = stg().run("billing", { NODE_EXIT: "1" }, "staging");
+      expect(r.code).toBe(1);
+      expect(r.log.filter((l) => l.startsWith("wrapper"))).toEqual([]);
+      expect(puts(r.log)).toEqual([]);
+    });
+
+    it("verify only: migrations are only verified, nothing deployed or put, no secret needed, every check runs", () => {
+      const env = {
+        VERIFY_ONLY: "1",
+        STRIPE_SECRET_KEY: "",
+        STRIPE_WEBHOOK_SECRET: "",
+      };
+      const s = stg({
+        exists: ["oa-s-billing"],
+        secrets: {
+          "oa-s-billing": ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"],
+        },
+      });
+      const r = s.run("billing", env, "staging");
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      expect(noDeploy(r.log)).toEqual([]);
+      expect(puts(r.log)).toEqual([]);
+      expect(r.log.filter((l) => l.includes("billing-db"))).toHaveLength(1);
+      expect(r.out).toContain("staging billing: verified (verify only)");
+    });
+
+    it("the read-back refuses a wrong D1, registry, var or price, an extra or missing secret, and a wrong schedule", () => {
+      const live = (mut: (b: Record<string, unknown>[]) => void) => {
+        const b = JSON.parse(NEXT["oa-s-billing"] as string).result.bindings;
+        mut(b);
+        return settings(b);
+      };
+      for (const [why, next, want] of [
+        [
+          "D1",
+          live((b) => {
+            (b[0] as { id: string }).id = DB;
+          }),
+          "BILLING_DB: got",
+        ],
+        [
+          "registry",
+          live((b) => {
+            (b[1] as { namespace_id: string }).namespace_id = DIRREG;
+          }),
+          "BROKER_REGISTRY: got",
+        ],
+        [
+          "price",
+          live((b) => {
+            (
+              b.find((x) => x.name === "STRIPE_PRICE_TEAM") as { text: string }
+            ).text = "price_1Other";
+          }),
+          "billing vars: got",
+        ],
+        [
+          "extra binding",
+          live((b) => {
+            b.push({
+              type: "kv_namespace",
+              name: "HOSTS",
+              namespace_id: HOSTS,
+            });
+          }),
+          "bindings: got",
+        ],
+      ] as const) {
+        const s = stg({ next: { "oa-s-billing": next } });
+        const r = s.run("billing", {}, "staging");
+        expect(r.code, why).toBe(1);
+        expect(r.err, why).toContain(want);
+      }
+      const extra = stg({ secrets: { "oa-s-billing": ["EXTRA_SECRET"] } }).run(
+        "billing",
+        {},
+        "staging",
+      );
+      expect(extra.code).toBe(1);
+      expect(extra.err).toContain("oa-s-billing secrets are");
+      const sched = stg();
+      writeFileSync(
+        join(sched.state, "oa-s-billing.schedules.json"),
+        JSON.stringify({
+          success: true,
+          result: { schedules: [{ cron: "*/5 * * * *" }] },
+        }),
+      );
+      const bad = sched.run("billing", {}, "staging");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("oa-s-billing schedules are");
     });
   });
 
@@ -2117,7 +2372,8 @@ describe("deploy-hosted-platform.sh", () => {
           expect(ok.err).toBe("");
           expect(ok.code).toBe(0);
           // W8's refs as the Manager approved them (6.3 amended).
-          const base = "open-artifacts-ai/open-artifacts-cloud/.github/workflows";
+          const base =
+            "open-artifacts-ai/open-artifacts-cloud/.github/workflows";
           expect(VARS.OIDC_JOB_WORKFLOW_REFS).toBe(
             env === "prod"
               ? `${base}/redline-staging.yml@refs/heads/main,${base}/prodclean-monitor.yml@refs/heads/main`

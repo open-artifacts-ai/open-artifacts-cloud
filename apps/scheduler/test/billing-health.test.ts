@@ -122,6 +122,8 @@ describe("billingHealth", () => {
     expect(b.subjects).toEqual([]);
   });
 
+  // Timeout 15 s: about 60 ticks, each with D1 writes: 1.1 s unloaded, 7.9 s on a
+  // loaded machine against the 5 s default (a timeout, not a retry).
   it("down for up to an hour: nothing; past an hour: the alert opens, then stays quiet for 24 h", async () => {
     const b = billing();
     const lines = logs();
@@ -147,7 +149,7 @@ describe("billingHealth", () => {
     expect(b.subjects).toEqual([OPEN, REMIND]);
     // The last success never moves while billing is down.
     expect(await state(BILLING_OK_KEY)).toBe(T0);
-  });
+  }, 15_000);
 
   it("every failure kind counts as down: a 500, ok:false, a throw, a hang past the timeout", async () => {
     for (const m of ["500", "notok", "throw", "hang"] as Mode[]) {
