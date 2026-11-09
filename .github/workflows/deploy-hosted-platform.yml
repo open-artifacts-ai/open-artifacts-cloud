@@ -149,7 +149,9 @@ jobs:
           # Known targets only, each once, in dependency order: every bound
           # target before its binder (design v7 10.2). The scheduler is last
           # (#1343): nothing binds it, and its tag is the fleet's target, so a
-          # run that stops partway never moves the fleet.
+          # run that stops before the scheduler step never moves the fleet; once
+          # that step's first deploy has run, the fleet follows even if the run
+          # goes red afterwards (#55).
           order="platform-db auth-broker directory-broker billing provision-token provisioner dispatch inventory provisioning zones scheduler"
           last=-1
           seen=""

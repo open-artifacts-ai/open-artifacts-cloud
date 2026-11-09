@@ -27,7 +27,8 @@
 # against a manual deploy; require_newer re-checks the tag against prod once
 # the run holds that group, so a manual deploy of a newer tag is never
 # downgraded. The scheduler deploys last there, so a run
-# that stops partway never moves the fleet. A red chain run keeps one
+# that stops before the scheduler step never moves the fleet; once that step's
+# first deploy has run, the fleet follows even if the run goes red afterwards. A red chain run keeps one
 # `blocker` issue open; a green one closes it.
 name: prod-release-chain
 
