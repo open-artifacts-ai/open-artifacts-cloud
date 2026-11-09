@@ -208,7 +208,7 @@ describe("0008_provisioning: jobs", () => {
 
 describe("0009_job_fail_point (#995)", () => {
   it("follows 0008 and only adds columns", () => {
-    expect(migrationFiles.slice(8)).toEqual(["0009_job_fail_point.sql"]);
+    expect(migrationFiles.slice(8, 9)).toEqual(["0009_job_fail_point.sql"]);
     const sql = migrationSql("0009_job_fail_point.sql").replace(
       /--[^\n]*/g,
       "",
@@ -238,6 +238,24 @@ describe("0009_job_fail_point (#995)", () => {
         .run(v as never, id);
     for (const ok of [null, 100, 404, 599]) set(ok);
     for (const bad of [99, 600, 0]) expect(() => set(bad)).toThrow(/CHECK/);
+  });
+});
+
+describe("0010_session_hd", () => {
+  it("follows 0009 and only adds the sessions.hd column", () => {
+    expect(migrationFiles.slice(9)).toEqual(["0010_session_hd.sql"]);
+    const sql = migrationSql("0010_session_hd.sql").replace(/--[^\n]*/g, "");
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|UPDATE|DELETE)\b/i);
+    const stmts = sql
+      .split(";")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    expect(stmts).toEqual(["ALTER TABLE sessions ADD COLUMN hd TEXT"]);
+  });
+
+  it("adds a nullable hd TEXT column to sessions", () => {
+    const db = platformDb();
+    expect(cols(db, "sessions")).toContain("hd TEXT");
   });
 });
 
