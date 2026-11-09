@@ -2229,6 +2229,29 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     ]);
   });
 
+  it("a rollback the product refuses (no previous version) fails invalid_state: one job.failed row with that code, as job:<id>, and the install unchanged", async () => {
+    const s = await active({ slug: "norollco", version: V1 });
+    const before = w.install(s.installId);
+    const r = await manage("rollback", s.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(r.job).toMatchObject({
+      status: "failed",
+      error_code: "invalid_state",
+    });
+    expect(jobAudits(s.installId, "rollback", "job.failed")).toEqual([
+      {
+        actor: `job:${r.id}`,
+        detail: JSON.stringify({
+          code: "invalid_state",
+          jobId: r.id,
+          kind: "rollback",
+        }),
+      },
+    ]);
+    expect(w.install(s.installId)).toEqual(before);
+  });
+
   it("a failed create is audited job.failed", async () => {
     const s = seedCreate(w, { slug: "badrel", version: "9.9.9" });
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(

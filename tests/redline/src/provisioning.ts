@@ -1236,8 +1236,8 @@ export async function removeLifecycle(run: Run): Promise<void> {
 /**
  * P31 when the tag adds a migration over the rollback target: the product
  * refuses the rollback by design. The job fails invalid_state, nothing
- * changes (the install still serves the tag, healthy), and the refusal is
- * audited as a job.failed row with that code.
+ * changes (the install still serves the tag, healthy). The job.failed audit
+ * row is not read here (see the comment at the end of the function).
  */
 async function refusedRollback(
   run: Run,
@@ -1277,30 +1277,19 @@ async function refusedRollback(
     throw new ProbeFail(
       `P31: after the refusal /healthz is not ok on ${run.c.version} (${desc(hz)})`,
     );
-  const q = new URLSearchParams({
-    installId: p.id,
-    action: "job.failed",
-    limit: "100",
-  });
-  const r = await run.v1(`/audit?${q}`, { read: true });
-  expect(r, 200, "P31 R17");
-  const rows = (
-    r.json as {
-      items: {
-        jobId: string | null;
-        code?: string | null;
-        detail?: { code?: unknown } | null;
-      }[];
-    }
-  ).items.filter((i) => i.jobId === a.job.id);
-  if (rows.length === 0)
-    throw new ProbeFail(
-      "P31: the refused rollback has no job.failed audit row",
-    );
-  if (!rows.some((i) => (i.code ?? i.detail?.code) === "invalid_state"))
-    throw new ProbeFail(
-      "P31: the job.failed audit row does not carry invalid_state",
-    );
+  // The live part proves the refusal: the job failed invalid_state, the
+  // install is unchanged, /healthz is ok. It does not read the job.failed
+  // audit row: the provisioner writes it as a `provision` row with actor
+  // job:<id>, and R17 for this run's OIDC actor has reach "own", which
+  // returns only source='api' rows of its own actor (apps/provisioning/src/
+  // routes/reads.ts queryAudit), so it can never see it, and the run's actor
+  // gets no wider reach. What proves the audit row is the provisioner unit
+  // test apps/provisioner/test/node/manage.test.ts, "a rollback the product
+  // refuses (no previous version) fails invalid_state: one job.failed row
+  // with that code, as job:<id>, and the install unchanged" (with "job.done
+  // is written once on a replay; job.failed once with its kind and code, as
+  // job:<id>"). That test refuses on a missing previous version, not on a
+  // migration; both refusals fail the job through the same settle step.
   return pass(`refused as designed: the tag adds ${ahead.join(", ")}`);
 }
 
