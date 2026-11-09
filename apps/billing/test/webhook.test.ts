@@ -253,3 +253,156 @@ describe("POST /stripe/webhook", () => {
       expect(all).not.toContain(bad);
   });
 });
+
+describe("Solo prices (#1568)", () => {
+  const priced = {
+    ...env,
+    STRIPE_PRICE_TEAM: "price_team1",
+    STRIPE_PRICE_BUSINESS: "price_business1",
+    STRIPE_PRICE_SOLO_MONTHLY: "price_soloM1",
+    STRIPE_PRICE_SOLO_YEARLY: "price_soloY1",
+  } as Env;
+  const solo = (id: string, type: string, status: string, price: string) =>
+    JSON.stringify({
+      id,
+      object: "event",
+      type,
+      livemode: false,
+      created: T,
+      data: {
+        object: {
+          id: "sub_TestA0001",
+          object: "subscription",
+          customer: CUS_A,
+          status,
+          items: { data: [{ price: { id: price } }] },
+        },
+      },
+    });
+  const tierOf = () => rowOf(A);
+  const read = async () =>
+    (
+      await billing.fetch(
+        new Request(`${ORIGIN}/tier`, {
+          headers: { "x-oa-gate-install": A },
+        }) as Parameters<typeof billing.fetch>[0],
+        priced,
+      )
+    ).json();
+
+  it("the env's two Solo prices reach the webhook: either one makes the row solo", async () => {
+    for (const [i, price] of ["price_soloM1", "price_soloY1"].entries()) {
+      await db
+        .prepare(
+          "UPDATE tiers SET tier = 'free', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?1",
+        )
+        .bind(A)
+        .run();
+      const r = await call(
+        await hook(
+          solo(
+            `evt_Solo${i}x1`,
+            "customer.subscription.updated",
+            "active",
+            price,
+          ),
+        ),
+        priced,
+      );
+      expect(r.status).toBe(200);
+      expect(await tierOf(), price).toMatchObject({
+        tier: "solo",
+        status: "active",
+      });
+    }
+  });
+
+  it("a Solo whose no-card trial ended (canceled) is reported as lapsed, and a failed payment is past_due with grace", async () => {
+    await call(
+      await hook(
+        solo(
+          "evt_SoloTr1",
+          "customer.subscription.created",
+          "trialing",
+          "price_soloM1",
+        ),
+      ),
+      priced,
+    );
+    expect(await read()).toMatchObject({
+      tier: "solo",
+      status: "active",
+      trialEndsAt: null,
+    });
+    const r = await call(
+      await hook(
+        solo(
+          "evt_SoloDel1",
+          "customer.subscription.deleted",
+          "canceled",
+          "price_soloM1",
+        ),
+      ),
+      priced,
+    );
+    expect(r.status).toBe(200);
+    expect(await read()).toMatchObject({
+      tier: "solo",
+      status: "lapsed",
+      graceUntil: null,
+    });
+  });
+});
+
+describe("the upgrade's cancel goes through the Worker's Stripe key (#1568)", () => {
+  const evCompleted = JSON.stringify({
+    id: "evt_Upg00001",
+    object: "event",
+    type: "checkout.session.completed",
+    livemode: false,
+    created: T,
+    data: {
+      object: {
+        customer: CUS_A,
+        subscription: "sub_NewA0001",
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      },
+    },
+  });
+  it("cancels the previous Solo subscription with STRIPE_SECRET_KEY, never a live key", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'solo', stripe_subscription_id = 'sub_OldA0001' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const seen: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      seen.push(
+        `${init?.method} ${new URL(String(input)).pathname} ${new Headers(init?.headers).get("authorization")}`,
+      );
+      return Response.json(
+        init?.method === "GET"
+          ? { id: "sub_OldA0001", status: "active" }
+          : { id: "sub_OldA0001", status: "canceled" },
+      );
+    });
+    const key = "sk_test_FAKEfakeFAKEfake0123456789";
+    const r = await call(await hook(evCompleted), {
+      ...env,
+      STRIPE_SECRET_KEY: key,
+    } as Env);
+    expect(r.status).toBe(200);
+    expect(seen).toEqual([
+      // The adoption check reads the new subscription first.
+      `GET /v1/subscriptions/sub_NewA0001 Bearer ${key}`,
+      `GET /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
+      `DELETE /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
+    ]);
+    expect(await rowOf(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_NewA0001",
+    });
+  });
+});

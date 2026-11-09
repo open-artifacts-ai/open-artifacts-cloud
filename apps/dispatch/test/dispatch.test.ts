@@ -544,6 +544,48 @@ describe("broker gates in props", () => {
     ]);
   });
 
+  it("every request shape carries the same install's billing gate: a page, an MCP POST, an MCP event stream (#1514)", async () => {
+    const f = fakes(MAP);
+    const host = "https://beta.open-artifacts-staging.app";
+    await call(f.env, `${host}/`);
+    await call(
+      f.env,
+      new Request(`${host}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer t",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+    );
+    await call(
+      f.env,
+      new Request(`${host}/mcp`, {
+        headers: { accept: "text/event-stream", authorization: "Bearer t" },
+      }),
+    );
+    expect(f.args).toHaveLength(3);
+    for (const a of f.args)
+      expect((a as { props: { BILLING: unknown } }).props.BILLING).toEqual({
+        billingGate: {
+          installId: B,
+          appHost: "beta.open-artifacts-staging.app",
+        },
+      });
+    // Unbound: none of them carries one.
+    const g = fakes(MAP, { noBilling: true });
+    await call(g.env, `${host}/`);
+    await call(
+      g.env,
+      new Request(`${host}/mcp`, { method: "POST", body: "{}" }),
+    );
+    for (const a of g.args)
+      expect(Object.keys((a as { props: object }).props)).not.toContain(
+        "BILLING",
+      );
+  });
+
   it("each request builds its own gates: two installs never share one", async () => {
     const f = fakes(MAP);
     gates.length = 0;

@@ -68,7 +68,7 @@ async function seed(rows: Row[]) {
         )
         .bind(
           r.install,
-          r.tier ?? "free",
+          r.tier ?? "solo",
           r.status ?? "active",
           r.trialEndsAt ?? null,
           `cus_${r.install}`,
@@ -267,7 +267,7 @@ describe("the install id comes only from x-oa-gate-install", () => {
         headers: { "x-oa-gate-install": A },
       }),
     );
-    expect(((await r.json()) as { tier: string }).tier).toBe("free");
+    expect(((await r.json()) as { tier: string }).tier).toBe("solo");
     expect((await rowOf(A))?.last_read_at).toBe(NOW);
     expect((await rowOf(B))?.last_read_at).toBeNull();
 
@@ -298,7 +298,7 @@ describe("the POSTs carry the gate install's signature", () => {
 
   /** Nothing was written for A or B, and B's row is as seeded. */
   async function nothingWritten() {
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
     expect(await rowOf(B)).toMatchObject({ tier: "team", version: 1 });
     expect(await usageOf(A)).toEqual([]);
     expect(await usageOf(B)).toEqual([]);
@@ -473,6 +473,7 @@ describe("GET /tier", () => {
       status: "active",
       trialEndsAt: NOW + 5,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 3,
       asOf: NOW,
     });
@@ -481,14 +482,15 @@ describe("GET /tier", () => {
     expect((await rowOf(B))?.last_read_at).toBeNull();
   });
 
-  it("a missing row is free/active at version 0, and nothing is written", async () => {
+  it("a missing row is solo/active at version 0, and nothing is written", async () => {
     at();
     const r = await call(gated("GET", "/tier"));
     expect(await r.json()).toEqual({
-      tier: "free",
+      tier: "solo",
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 0,
       asOf: NOW,
     });
@@ -512,7 +514,7 @@ describe("trial/start and usage take the body's own fields only, like /checkout 
       const r = await call(gated("POST", path, body));
       expect([r.status, await r.json()]).toEqual([400, { error: "bad_body" }]);
     }
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
     expect(await usageOf(A)).toEqual([]);
     // The exact fields still work.
     expect(
@@ -522,7 +524,7 @@ describe("trial/start and usage take the body's own fields only, like /checkout 
 });
 
 describe("POST /trial/start", () => {
-  it("from free/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
+  it("from solo/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
     at();
     await seed([{ install: A, version: 4 }, { install: B }]);
     const r = await call(gated("POST", "/trial/start", { install: A }));
@@ -532,6 +534,7 @@ describe("POST /trial/start", () => {
       status: "active",
       trialEndsAt: NOW + TRIAL_MS,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 5,
       asOf: NOW,
     });
@@ -544,26 +547,41 @@ describe("POST /trial/start", () => {
       trialEndsAt: NOW + TRIAL_MS,
       version: 5,
     });
-    expect(await rowOf(B)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(B)).toMatchObject({ tier: "solo", version: 1 });
   });
 
-  it("never twice: back on free after a trial, it doesn't start again", async () => {
-    await seed([
-      { install: A, tier: "free", trialEndsAt: NOW - 1, version: 7 },
-    ]);
+  it("a row made before Solo (tier free) starts the trial too, once", async () => {
+    at();
+    await seed([{ install: A, tier: "free", version: 4 }]);
     const r = await call(gated("POST", "/trial/start", { install: A }));
-    expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({
-      tier: "free",
-      version: 7,
-      trialEndsAt: NOW - 1,
+      tier: "trial",
+      trialEndsAt: NOW + TRIAL_MS,
+      version: 5,
     });
+  });
+
+  it("never twice: back on solo after a trial, it doesn't start again", async () => {
+    for (const tier of ["solo", "free"]) {
+      await db.prepare("DELETE FROM tiers").run();
+      await seed([{ install: A, tier, trialEndsAt: NOW - 1, version: 7 }]);
+      const r = await call(gated("POST", "/trial/start", { install: A }));
+      expect(r.status).toBe(200);
+      expect(await r.json()).toMatchObject({
+        tier,
+        version: 7,
+        trialEndsAt: NOW - 1,
+      });
+    }
   });
 
   it("any other state: 200 with the unchanged row", async () => {
     for (const [tier, status] of [
       ["team", "active"],
       ["business", "past_due"],
+      ["solo", "lapsed"],
+      ["solo", "past_due"],
+      ["solo", "suspended"],
       ["free", "lapsed"],
       ["free", "suspended"],
       ["trial", "active"],
@@ -610,7 +628,7 @@ describe("POST /trial/start", () => {
       const r = await call(gated("POST", "/trial/start", b));
       expect(r.status).toBe(400);
     }
-    expect(await rowOf(A)).toMatchObject({ tier: "free", version: 1 });
+    expect(await rowOf(A)).toMatchObject({ tier: "solo", version: 1 });
   });
 });
 
@@ -753,5 +771,292 @@ describe("logs", () => {
     );
     expect(r.status).toBe(503);
     expect(lines).toEqual([`billing db_error ${A}`]);
+  });
+});
+
+describe("scheduled: prune stripe_events (#1479)", () => {
+  const DAY = 86_400_000;
+  const run = (time: number, e: Env = env) =>
+    billing.scheduled(
+      { scheduledTime: time, cron: "17 3 * * *", noRetry() {} },
+      e,
+    );
+  const ids = async () =>
+    (
+      await db
+        .prepare("SELECT event_id FROM stripe_events ORDER BY event_id")
+        .all<{ event_id: string }>()
+    ).results.map((r) => r.event_id);
+
+  it("drops ids older than 30 days at the cron's scheduled time, keeps the rest, touches nothing else", async () => {
+    await seed([{ install: A, tier: "team", version: 3 }]);
+    await db.batch(
+      [
+        ["evt_old", NOW - 31 * DAY],
+        ["evt_keep", NOW - 29 * DAY],
+        ["evt_now", NOW],
+      ].map(([id, at]) =>
+        db
+          .prepare(
+            "INSERT INTO stripe_events (event_id, received_at) VALUES (?, ?)",
+          )
+          .bind(id, at),
+      ),
+    );
+    const before = await rowOf(A);
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    await run(NOW);
+    expect(await ids()).toEqual(["evt_keep", "evt_now"]);
+    expect(await rowOf(A)).toEqual(before);
+    expect(lines).toEqual(["billing prune stripe_events 1"]);
+  });
+
+  it("a D1 failure is logged by category only and does not throw", async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    const broken = {
+      ...env,
+      BILLING_DB: {
+        prepare: () => {
+          throw new Error("D1_ERROR: secret detail");
+        },
+      },
+    } as unknown as Env;
+    await expect(run(NOW, broken)).resolves.toBeUndefined();
+    expect(lines).toEqual(["billing prune db_error"]);
+  });
+});
+
+describe("soloTrialEndsAt (#1568)", () => {
+  it("GET /tier and /trial/start carry the Solo trial's end beside the Business trial's, never merged", async () => {
+    at();
+    await seed([{ install: A, tier: "solo", version: 2 }]);
+    await db
+      .prepare("UPDATE tiers SET solo_trial_ends_at = ?1 WHERE install_id = ?2")
+      .bind(NOW + 30 * 86_400_000, A)
+      .run();
+    const r = await call(gated("GET", "/tier"));
+    expect(await r.json()).toMatchObject({
+      tier: "solo",
+      trialEndsAt: null,
+      soloTrialEndsAt: NOW + 30 * 86_400_000,
+    });
+    // The first invite starts the Business trial; both ends are reported.
+    const t = await call(gated("POST", "/trial/start", { install: A }));
+    expect(await t.json()).toMatchObject({
+      tier: "trial",
+      trialEndsAt: NOW + TRIAL_MS,
+      soloTrialEndsAt: NOW + 30 * 86_400_000,
+    });
+  });
+});
+
+describe("the Business trial over a Solo subscription (#1568)", () => {
+  const DAY = 86_400_000;
+  const trialRow = async (o: {
+    ends: number;
+    solo: string | null;
+    grace?: number | null;
+    sub?: boolean;
+    status?: string;
+  }) => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed([
+      {
+        install: A,
+        tier: "trial",
+        status: o.status ?? "active",
+        trialEndsAt: o.ends,
+        version: 4,
+      },
+    ]);
+    await db
+      .prepare(
+        "UPDATE tiers SET solo_status = ?1, solo_grace_until = ?2, solo_trial_ends_at = ?3, stripe_subscription_id = ?4 WHERE install_id = ?5",
+      )
+      .bind(
+        o.solo,
+        o.grace ?? null,
+        NOW - 20 * DAY,
+        o.sub === false ? null : `sub_${A}`,
+        A,
+      )
+      .run();
+  };
+  const read = async () =>
+    (await call(gated("GET", "/tier"))).json() as Promise<
+      Record<string, unknown>
+    >;
+
+  it("starting the trial from a Solo with a live subscription snapshots its state; with none, nothing", async () => {
+    at();
+    await seed([
+      { install: A, tier: "solo" },
+      { install: B, tier: "solo" },
+    ]);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_A1', solo_trial_ends_at = ?2 WHERE install_id = ?1",
+      )
+      .bind(A, NOW + 30 * 86_400_000)
+      .run();
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = NULL WHERE install_id = ?1",
+      )
+      .bind(B)
+      .run();
+    await call(gated("POST", "/trial/start", { install: A }));
+    expect(await rowOf(A)).toMatchObject({
+      tier: "trial",
+      solo_status: "active",
+      trial_ends_at: NOW + TRIAL_MS,
+    });
+    await call(
+      gated("POST", "/trial/start", { install: B }, { "x-oa-gate-install": B }),
+    );
+    expect(await rowOf(B)).toMatchObject({ tier: "trial", solo_status: null });
+  });
+
+  it("while the trial runs, the answer is the trial's, whatever the Solo subscription does", async () => {
+    at();
+    await trialRow({ ends: NOW + DAY, solo: "lapsed" });
+    expect(await read()).toMatchObject({
+      tier: "trial",
+      status: "active",
+      trialEndsAt: NOW + DAY,
+      version: 4,
+    });
+  });
+
+  it("once trial_ends_at has passed: solo/active if the Solo subscription is alive, lapsed if not or never there; version bumped once; the end stays set", async () => {
+    at();
+    for (const [solo, grace, sub, want] of [
+      ["active", null, true, { status: "active", graceUntil: null }],
+      [
+        "past_due",
+        NOW + 3 * DAY,
+        true,
+        { status: "past_due", graceUntil: NOW + 3 * DAY },
+      ],
+      ["lapsed", null, true, { status: "lapsed", graceUntil: null }],
+      [null, null, false, { status: "lapsed", graceUntil: null }],
+    ] as const) {
+      await trialRow({ ends: NOW - 1000, solo, grace, sub });
+      const a = await read();
+      expect(a, String(solo)).toMatchObject({
+        tier: "solo",
+        ...want,
+        trialEndsAt: NOW - 1000,
+        version: 5,
+      });
+      // Reading again changes nothing: one bump for the passage of time.
+      const b = await read();
+      expect(b).toMatchObject({
+        tier: "solo",
+        ...want,
+        trialEndsAt: NOW - 1000,
+        version: 5,
+      });
+      expect(await rowOf(A)).toMatchObject({
+        tier: "solo",
+        trial_ends_at: NOW - 1000,
+        version: 5,
+      });
+    }
+  });
+
+  it("the boundary: at trial_ends_at it is over; a millisecond before it is not", async () => {
+    at();
+    await trialRow({ ends: NOW + 1, solo: "active" });
+    expect(await read()).toMatchObject({ tier: "trial", version: 4 });
+    await trialRow({ ends: NOW, solo: "active" });
+    expect(await read()).toMatchObject({
+      tier: "solo",
+      status: "active",
+      version: 5,
+    });
+  });
+
+  it("the Business trial never restarts, and /trial/start and /solo/start answer the ended trial's row", async () => {
+    at();
+    await trialRow({ ends: NOW - 1000, solo: "active" });
+    const t = await call(gated("POST", "/trial/start", { install: A }));
+    expect(await t.json()).toMatchObject({
+      tier: "solo",
+      status: "active",
+      trialEndsAt: NOW - 1000,
+      version: 5,
+    });
+    const again = await call(gated("POST", "/trial/start", { install: A }));
+    expect(await again.json()).toMatchObject({
+      tier: "solo",
+      trialEndsAt: NOW - 1000,
+      version: 5,
+    });
+  });
+
+  it("a suspended row keeps its suspension through the passage of time", async () => {
+    at();
+    await trialRow({ ends: NOW - 1000, solo: "active", status: "suspended" });
+    expect(await read()).toMatchObject({ tier: "solo", status: "suspended" });
+  });
+
+  it("another install's row and a team row are never touched by a read", async () => {
+    at();
+    await trialRow({ ends: NOW - 1000, solo: "active" });
+    await seed([{ install: B, tier: "team", version: 9 }]);
+    await read();
+    expect(await rowOf(B)).toMatchObject({ tier: "team", version: 9 });
+  });
+});
+
+describe("soloTrialEndsAt is answered only while it is in the future (#1568)", () => {
+  it("a Solo trial end in the past is null; one still ahead is the date", async () => {
+    at();
+    await seed([{ install: A, tier: "solo" }]);
+    const set = (v: number) =>
+      db
+        .prepare(
+          "UPDATE tiers SET solo_trial_ends_at = ?1 WHERE install_id = ?2",
+        )
+        .bind(v, A)
+        .run();
+    await set(NOW - 1);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: null,
+    });
+    await set(NOW);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: null,
+    });
+    await set(NOW + 1);
+    expect(await (await call(gated("GET", "/tier"))).json()).toMatchObject({
+      soloTrialEndsAt: NOW + 1,
+    });
+    // The column keeps the history: only the answer hides it.
+    await set(NOW - 5);
+    await call(gated("GET", "/tier"));
+    expect(await rowOf(A)).toMatchObject({ solo_trial_ends_at: NOW - 5 });
+  });
+});
+
+describe("the Business trial snapshots a Solo only when it is known live (#1568)", () => {
+  it("a subscription id with no live evidence (an unfinished first payment: no solo_trial_ends_at) snapshots nothing", async () => {
+    at();
+    await seed([{ install: A, tier: "solo" }]);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_pending1', solo_trial_ends_at = NULL WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    await call(gated("POST", "/trial/start", { install: A }));
+    expect(await rowOf(A)).toMatchObject({ tier: "trial", solo_status: null });
   });
 });
