@@ -517,7 +517,7 @@ export async function prodClean(
     const secretNames = await scripts
       .secretList({ kind: "namespace", ns }, script)
       .catch((e: unknown) => {
-        if (!serving && e instanceof CfError && e.status === 404) return null;
+        if (e instanceof CfError && e.status === 404) return null;
         throw e;
       });
     if (secretNames === null) return;
