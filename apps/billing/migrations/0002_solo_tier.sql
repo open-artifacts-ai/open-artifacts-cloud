@@ -21,11 +21,6 @@ CREATE TABLE tiers_new (
   -- Solo's 30-day no-card trial end (ms): the Solo subscription's own trial,
   -- never the 14-day Business trial's trial_ends_at.
   solo_trial_ends_at INTEGER,
-  -- 1 once the install has a paid Checkout (a card is on file), set by the
-  -- checkout webhook when it adopts the subscription. Such a row keeps
-  -- solo_trial_ends_at (the Checkout kept the free days), so the trial-ending
-  -- reminder list skips it: the no-card copy would be false for it.
-  solo_checked_out INTEGER,
   -- The Solo subscription's state while the 14-day Business trial runs over
   -- it (tier trial): the trial's own tier, status and dates stay the row's,
   -- and this is what the row becomes when the trial ends (null: no Solo

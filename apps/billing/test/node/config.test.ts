@@ -103,11 +103,12 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init and 0002_solo_tier are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier and 0003_solo_checked_out are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
       "0002_solo_tier.sql",
+      "0003_solo_checked_out.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -137,7 +138,6 @@ describe("migrations", () => {
       ...cols(tiers(init)),
       "last_checkout_created",
       "solo_trial_ends_at",
-      "solo_checked_out",
       "solo_status",
       "solo_grace_until",
       "open_checkout_id",
@@ -145,6 +145,16 @@ describe("migrations", () => {
     ]);
     expect(sql).toMatch(
       /DROP TABLE tiers;\nALTER TABLE tiers_new RENAME TO tiers;/,
+    );
+  });
+
+  it("0003 adds solo_checked_out to tiers", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0003_solo_checked_out.sql"),
+      "utf8",
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE tiers ADD COLUMN solo_checked_out INTEGER;/,
     );
   });
 
