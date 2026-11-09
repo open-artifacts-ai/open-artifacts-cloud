@@ -110,6 +110,12 @@ export function welcomeEmail(o: {
     "Geist,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
   const MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
   const homeUrl = esc(`${origin}/`);
+  // Button label: the host never breaks at a hyphen (U+2011 non-breaking
+  // hyphen); with wbr, it may break after a dot instead (Design-2).
+  const btnHtml = (wbr: boolean): string =>
+    esc(lines.button)
+      .replaceAll("-", "\u2011")
+      .replaceAll(".", wbr ? ".<wbr>" : ".");
   const btnW = Math.min(480, Math.max(240, lines.button.length * 9 + 48));
   // The hostname never breaks (nowrap on the host alone, so the rest of a long
   // line can still wrap); <wbr> after "https://" and before "/llms.txt" gives
@@ -192,9 +198,9 @@ export function welcomeEmail(o: {
             <table role="presentation" cellpadding="0" cellspacing="0" border="0">
               <tr>
                 <td class="oa-btn" align="center" bgcolor="#15181C" style="border-radius:6px;background-color:#15181C;">
-                  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" href="${homeUrl}" style="height:44px;v-text-anchor:middle;width:${btnW}px;" arcsize="14%" stroke="f" fillcolor="#15181C"><v:textbox inset="0,0,0,0"><center style="color:#FFFFFF;font-family:'Segoe UI',Arial,sans-serif;font-size:15px;font-weight:600;">${esc(lines.button)}</center></v:textbox></v:roundrect><![endif]-->
+                  <!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" href="${homeUrl}" style="height:44px;v-text-anchor:middle;width:${btnW}px;" arcsize="14%" stroke="f" fillcolor="#15181C"><v:textbox inset="0,0,0,0"><center style="color:#FFFFFF;font-family:'Segoe UI',Arial,sans-serif;font-size:15px;font-weight:600;">${btnHtml(false)}</center></v:textbox></v:roundrect><![endif]-->
                   <!--[if !mso]><!-->
-                  <a href="${homeUrl}" target="_blank" style="display:inline-block;padding:12px 22px;font-family:${FONT};font-size:15px;line-height:20px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:6px;">${esc(lines.button)}</a>
+                  <a href="${homeUrl}" target="_blank" style="display:inline-block;padding:12px 22px;font-family:${FONT};font-size:15px;line-height:20px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:6px;">${btnHtml(true)}</a>
                   <!--<![endif]-->
                 </td>
               </tr>

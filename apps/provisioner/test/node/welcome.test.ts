@@ -40,6 +40,7 @@ describe("welcomeEmail", () => {
         .replace(/<\/?(?:span|wbr)\b[^>]*>/g, "")
         .replace(/<[^>]+>/g, " ")
         .replace(/&#39;/g, "'")
+        .replace(/\u2011/g, "-")
         .replace(/\s+/g, " ")
         .trim();
     const html = flat(m.html);
@@ -55,6 +56,20 @@ describe("welcomeEmail", () => {
       expect(m.text).toContain(s);
       expect(html).toContain(s);
     }
+  });
+
+  it("button label never breaks the host at a hyphen", () => {
+    const m = welcomeEmail({
+      ...base,
+      appHost: "acme-design-studio.open-artifacts.app",
+    });
+    expect(m.html).toContain(
+      "Open acme\u2011design\u2011studio.<wbr>open\u2011artifacts.<wbr>app</a>",
+    );
+    expect(m.html).toContain(
+      "Open acme\u2011design\u2011studio.open\u2011artifacts.app</center>",
+    );
+    expect(m.text).toContain("Open acme-design-studio.open-artifacts.app");
   });
 
   it("links only to the instance's own host", () => {
