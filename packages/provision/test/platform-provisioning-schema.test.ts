@@ -208,7 +208,7 @@ describe("0008_provisioning: jobs", () => {
 
 describe("0009_job_fail_point (#995)", () => {
   it("follows 0008 and only adds columns", () => {
-    expect(migrationFiles.slice(8)).toEqual(["0009_job_fail_point.sql"]);
+    expect(migrationFiles.slice(8, 9)).toEqual(["0009_job_fail_point.sql"]);
     const sql = migrationSql("0009_job_fail_point.sql").replace(
       /--[^\n]*/g,
       "",
@@ -595,5 +595,17 @@ describe("0008_provisioning: install_status (5.1 precedence)", () => {
     job(db, "i1", { signup_id: sg, status: "failed" });
     job(db, "i1", { signup_id: sg, kind: "retry", status: "failed" });
     expect(count(db, "install_status")).toBe(1);
+  });
+});
+
+describe("0012_solo_start (self-serve Solo start)", () => {
+  it("follows 0009 and only adds two nullable signups columns, backfilling legacy rows as skipped", () => {
+    expect(migrationFiles.slice(9)).toEqual(["0012_solo_start.sql"]);
+    const sql = migrationSql("0012_solo_start.sql").replace(/--[^\n]*/g, "");
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
+    const db = platformDb();
+    const c = cols(db, "signups");
+    expect(c).toContain("solo_started_at INTEGER");
+    expect(c).toContain("solo_skipped_at INTEGER");
   });
 });

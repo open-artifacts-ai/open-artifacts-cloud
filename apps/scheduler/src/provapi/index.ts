@@ -10,6 +10,7 @@ import { prune } from "./prune.js";
 import { purgeDue } from "./purge.js";
 import { type Duty, type DutyOutcome, runDuties } from "./run.js";
 import { signupsDue } from "./signups.js";
+import { soloStartMissingAlert } from "./solo-start.js";
 import { type SweepDeps, sweep } from "./sweep.js";
 
 export { SCHEDULER_TICK_KEY } from "@oa/provisioning-contract/state";
@@ -57,6 +58,8 @@ export async function alertsTick(env: ProvapiEnv, now: number): Promise<void> {
     // stepAlert never throws: one key's failure never stops the next.
     await stepAlert(env, alertFor(k, env.OA_ENV, facts), cond.open, now);
   }
+  // Local to this repo (not in the public ALERT_KEYS): never throws.
+  await soloStartMissingAlert(env, now);
 }
 
 export interface ProvapiOptions extends SweepDeps {
