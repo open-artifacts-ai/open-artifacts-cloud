@@ -2,10 +2,12 @@
 # hosted-release run on main is red (#1782). A failed release run reaches
 # nobody otherwise. A green real run closes the issue.
 #
-# - Red is `failure` or `timed_out`. `success` is green. `cancelled` is neither:
-#   a hosted-release run on a PUBLIC_PIN push can be cancelled by a newer one,
-#   and a missed release fails the next run loudly, which this alert catches.
-#   `skipped` and anything else count as nothing. Each is logged.
+# - Red is `failure`, `timed_out` or `startup_failure`. `success` is green.
+#   `cancelled` is neither: a hosted-release run on a PUBLIC_PIN push can be
+#   cancelled when a newer pin is queued behind it. The older pin is then
+#   superseded silently, which is harmless: the newer run releases the newer
+#   pin. Counting it red would open an issue on every superseded run. `skipped`
+#   and anything else count as nothing. Each is logged.
 # - A dry run (run-name "hosted-release (dry run)") is not counted either way:
 #   it creates no release, so its result says nothing about the last real one.
 # - Reads only the workflow_run event's own fields, passed through env: and
@@ -15,8 +17,10 @@
 # - The concurrency group keeps two completions from opening two issues. GitHub
 #   keeps one running and one pending run per group, so a third completion
 #   replaces the pending one (cancel-in-progress: false only protects the
-#   running one). A dropped completion can lose one "failed again" comment, not
-#   the issue: the next red or green completion sets the state.
+#   running one). In rare cases that drops a red run: a red completion waiting
+#   as the pending one is replaced and never seen. The next red or green
+#   completion sets the state, so a dropped red is lost only if nothing red
+#   follows it.
 # - workflow_run runs only from the default branch's copy of this file.
 # Named hosted-release-alert, not release-alert: the public repo's own
 # release-alert.yml lands at .github/workflows/release-alert.yml in the overlay.
@@ -58,10 +62,10 @@ jobs:
               exit 0 ;;
           esac
           case "$CONCLUSION" in
-            failure | timed_out) result=red ;;
+            failure | timed_out | startup_failure) result=red ;;
             success) result=green ;;
             cancelled)
-              echo "Run $RUN was cancelled: neither red nor green, nothing changed (a missed release fails the next run, which this alert catches)."
+              echo "Run $RUN was cancelled: neither red nor green, nothing changed (an older pin superseded by a newer run)."
               exit 0 ;;
             *)
               echo "Run $RUN ended '$CONCLUSION': not counted, nothing changed."

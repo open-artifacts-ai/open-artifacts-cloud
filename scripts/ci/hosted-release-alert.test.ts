@@ -52,7 +52,7 @@ describe("hosted-release-alert.yml", () => {
 
   const GH = `#!/usr/bin/env bash
 echo "$*" >> "$STUB_LOG"
-if [ "$1 $2" = "issue list" ]; then printf '%s' "$STUB_ISSUES"; fi
+if [ "$1 $2" = "issue list" ]; then [ -z "$STUB_FAIL" ] || exit 1; printf '%s' "$STUB_ISSUES"; fi
 `;
   const TITLE = "hosted-release failed";
   const issue = (number: number, title = TITLE) => ({ number, title });
@@ -60,6 +60,7 @@ if [ "$1 $2" = "issue list" ]; then printf '%s' "$STUB_ISSUES"; fi
     conclusion: string,
     issues: unknown[] = [],
     title = "hosted-release",
+    fail = false,
   ) => {
     const dir = mkdtempSync(join(tmpdir(), "ra-"));
     writeFileSync(join(dir, "gh"), GH, { mode: 0o755 });
@@ -69,6 +70,7 @@ if [ "$1 $2" = "issue list" ]; then printf '%s' "$STUB_ISSUES"; fi
         PATH: `${dir}:${process.env.PATH}`,
         STUB_LOG: join(dir, "log"),
         STUB_ISSUES: JSON.stringify(issues),
+        STUB_FAIL: fail ? "1" : "",
         GH_TOKEN: "t",
         REPO: "o/r",
         TITLE: step.env.TITLE,
@@ -83,7 +85,7 @@ if [ "$1 $2" = "issue list" ]; then printf '%s' "$STUB_ISSUES"; fi
       calls = readFileSync(join(dir, "log"), "utf8").trim().split("\n");
     } catch {}
     const writes = calls.filter((c) => !c.startsWith("issue list"));
-    return { code: r.status, writes, out: r.stdout + r.stderr };
+    return { code: r.status, calls, writes, out: r.stdout + r.stderr };
   };
 
   it("a dry run counts as nothing, red or green", () => {
@@ -93,6 +95,30 @@ if [ "$1 $2" = "issue list" ]; then printf '%s' "$STUB_ISSUES"; fi
       expect(r.writes).toEqual([]);
       expect(r.out).toContain("dry run");
     }
+  });
+  it("lists open blocker issues with the exact arguments, once", () => {
+    const r = alert("success");
+    expect(r.calls.filter((c) => c.startsWith("issue list"))).toEqual([
+      "issue list --repo o/r --state open --label blocker --limit 100 --json number,title",
+    ]);
+  });
+  it("comments on the first matching open issue", () => {
+    const r = alert("failure", [issue(8, "other"), issue(7), issue(9)]);
+    expect(r.writes).toHaveLength(1);
+    expect(r.writes[0]).toMatch(/^issue comment 7 /);
+  });
+  it("startup_failure is red", () => {
+    expect(alert("startup_failure").writes[0]).toMatch(/^issue create /);
+  });
+  it("a failed issue list fails the job and creates nothing", () => {
+    for (const c of ["failure", "success"]) {
+      const r = alert(c, [issue(7)], "hosted-release", true);
+      expect(r.code).not.toBe(0);
+      expect(r.writes).toEqual([]);
+    }
+  });
+  it("fails on any error", () => {
+    expect(step.run).toMatch(/^set -euo pipefail$/m);
   });
   it("uses the fixed title", () => {
     expect(step.env.TITLE).toBe(TITLE);
