@@ -9,7 +9,7 @@ export const CLIENT_JS = String.raw`(function () {
   var S = {
     cfg: null, me: null, signup: null, view: "loading",
     slug: "", avail: null, availSlug: "", seq: 0,
-    token: null, busy: false, err: "", notice: "", widget: null, poll: null
+    token: null, busy: false, forbidden: false, err: "", notice: "", widget: null, poll: null
   };
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -103,7 +103,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("button", { class: "btn pri", type: "button", onclick: go }, ["Go to my instance"]),
       h("div", { class: "or" }, ["or"]),
       h("a", { class: "btn", href: S.cfg.githubUrl, rel: "noopener" }, ["Run Open Artifacts yourself"]),
-      h("p", { class: "muted small", style: "margin:10px 0 0" }, ["Open source; it runs on your own Cloudflare account."])
+      h("p", { class: "muted small mt" }, ["Open source; it runs on your own Cloudflare account."])
     ]));
   }
 
@@ -143,7 +143,7 @@ export const CLIENT_JS = String.raw`(function () {
       who,
       h("div", { class: "field" }, [h("label", { for: "slug" }, ["Your address"]), refs.box, refs.help, refs.sugg]),
       refs.err, refs.ts, refs.btn,
-      h("p", { class: "muted small", style: "margin:10px 0 0" }, [
+      h("p", { class: "muted small mt" }, [
         "Solo: free for your first 30 days, then $1/month or $12/year. No card needed."
       ])
     ]));
@@ -157,11 +157,17 @@ export const CLIENT_JS = String.raw`(function () {
     var ns = "http://www.w3.org/2000/svg";
     var s = document.createElementNS(ns, "svg");
     s.setAttribute("width", "16"); s.setAttribute("height", "16");
-    s.setAttribute("viewBox", "0 0 16 16"); s.setAttribute("aria-hidden", "true");
-    var c = document.createElementNS(ns, "circle");
-    c.setAttribute("cx", "8"); c.setAttribute("cy", "8"); c.setAttribute("r", "7");
-    c.setAttribute("fill", "none"); c.setAttribute("stroke", "currentColor"); c.setAttribute("stroke-width", "2");
-    s.appendChild(c);
+    s.setAttribute("viewBox", "0 0 48 48"); s.setAttribute("aria-hidden", "true");
+    [
+      ["#EA4335", "M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"],
+      ["#4285F4", "M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"],
+      ["#FBBC05", "M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"],
+      ["#34A853", "M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"]
+    ].forEach(function (d) {
+      var p = document.createElementNS(ns, "path");
+      p.setAttribute("fill", d[0]); p.setAttribute("d", d[1]);
+      s.appendChild(p);
+    });
     return s;
   }
 
@@ -176,6 +182,7 @@ export const CLIENT_JS = String.raw`(function () {
     var cls = "help", text = "", box = "inp" + (S.me ? "" : " off");
     refs.sugg.replaceChildren();
     if (!S.me) text = "Sign in with Google first.";
+    else if (S.forbidden) text = "Sign in with a work account to continue.";
     else if (!s) text = "Pick the address your team will use.";
     else if (a === null || S.availSlug !== s) text = "Checking...";
     else if (a === "ok") { cls += " ok"; box += " ok"; text = host(s) + " is available."; }
@@ -183,7 +190,7 @@ export const CLIENT_JS = String.raw`(function () {
       cls += " err"; box += " err";
       var base = s.slice(0, 26);
       var opts = [base + "-team", base + "-labs"];
-      text = host(s) + " is taken. Try " + opts[0] + " or " + opts[1] + ".";
+      text = host(s) + " is taken.";
       opts.forEach(function (o) {
         refs.sugg.appendChild(h("button", { type: "button", onclick: function () {
           S.slug = o; refs.inp.value = o; checkSlug(); refs.inp.focus();
@@ -226,7 +233,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
 
   function canCreate() {
-    return !!S.me && S.avail === "ok" && S.availSlug === S.slug && !S.busy &&
+    return !!S.me && !S.forbidden && S.avail === "ok" && S.availSlug === S.slug && !S.busy &&
       (!S.cfg.turnstileSiteKey || !!S.token) && !!S.cfg.turnstileSiteKey;
   }
   function paintCreate() {
@@ -236,7 +243,11 @@ export const CLIENT_JS = String.raw`(function () {
     refs.err.replaceChildren();
     var msg = S.err;
     if (S.me && !S.cfg.turnstileSiteKey) msg = "Sign-ups are temporarily unavailable. Try again later.";
-    if (msg) refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, [msg]));
+    if (msg) {
+      var kids = [msg];
+      if (S.forbidden) kids.push(h("button", { class: "btn mt", type: "button", onclick: switchAccount }, ["Use another Google account"]));
+      refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, kids));
+    }
   }
 
   function mountTurnstile() {
@@ -285,6 +296,7 @@ export const CLIENT_JS = String.raw`(function () {
       if (r.code === "signup_limit") { loadSignup().then(route); return; }
       if (r.code === "slug_taken") { S.avail = "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
       if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
+      if (r.code === "forbidden") { S.forbidden = true; S.avail = null; S.err = CREATE_ERR.forbidden; paintAvail(); return; }
       S.err = CREATE_ERR[r.code] || "We couldn't create your instance. Try again in a few minutes.";
       paintCreate();
     }, function () {
@@ -300,9 +312,16 @@ export const CLIENT_JS = String.raw`(function () {
   }
 
   function signOut() {
-    api("POST", "/auth/logout").then(function () {
-      S.me = null; S.slug = ""; S.avail = null; S.token = null; route();
+    return api("POST", "/auth/logout").then(function () {
+      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.forbidden = false; S.err = ""; route();
     });
+  }
+  function switchAccount() {
+    signOut().then(function () { window.location.assign("/auth/start"); });
+  }
+  function startOver() {
+    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.forbidden = false; S.token = null;
+    route();
   }
 
   // ---------- provisioning (design: provisioning screen) ----------
@@ -322,42 +341,42 @@ export const CLIENT_JS = String.raw`(function () {
 
   function viewSetup() {
     var g = S.signup, hostName = g.host, st = g.stage;
-    var steps, label, body = [];
+    var steps, label, head, body = [];
     var reserve = step("done", "Reserve your address");
+    var create = "Create your instance", email = "Send your welcome email";
+    var pending = [
+      h("h1", {}, ["Setting up " + hostName]),
+      h("p", { class: "muted lead" }, ["We'll email you when it's ready. You can close this page."])
+    ];
+    head = pending;
     if (st === "ready") {
       label = "Ready";
-      steps = [reserve, step("done", "Create your instance"), step("done", "Welcome email sent")];
-      body = [
-        h("h1", {}, [hostName + " is ready"]),
-        h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])
-      ];
+      head = [h("h1", {}, [hostName + " is ready"])];
+      steps = [reserve, step("done", create), step("done", email)];
+      body = [h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])];
     } else if (st === "failed") {
       label = "Failed";
-      steps = [reserve, step("fail", "Create your instance", "This didn't finish.")];
+      head = [h("h1", {}, ["We couldn't set up " + hostName])];
+      steps = [reserve, step("fail", create, "This didn't finish."), step("todo", email)];
       body = [
         h("div", { class: "note bad" }, [
-          h("strong", {}, ["We couldn't set up your instance"]),
           "We've been alerted and will look into it. Your address isn't reserved anymore. If you have questions, email support."
         ]),
-        h("a", { class: "btn", href: "mailto:" + S.cfg.supportEmail }, ["Email support"])
+        h("div", { class: "stack" }, [
+          h("a", { class: "btn", href: "mailto:" + S.cfg.supportEmail }, ["Email support"]),
+          h("button", { class: "btn", type: "button", onclick: startOver }, ["Start over"])
+        ])
       ];
     } else if (st === "waiting_cap") {
       label = "Waiting for capacity";
-      steps = [reserve, step("wait", "Waiting for capacity", "We're adding room. No need to do anything."),
-        step("todo", "Create your instance"), step("todo", "Send your welcome email")];
+      steps = [reserve, step("wait", create, "Waiting for capacity. We're adding room, no need to do anything."), step("todo", email)];
     } else if (st === "creating") {
       label = "Creating";
-      steps = [reserve, step("now", "Creating your instance", "This is the longest step."),
-        step("todo", "Send your welcome email")];
+      steps = [reserve, step("now", create, "This is the longest step."), step("todo", email)];
     } else {
       label = "Queued";
-      steps = [reserve, step("now", "In the queue", "Waiting for a free slot."),
-        step("todo", "Create your instance"), step("todo", "Send your welcome email")];
+      steps = [reserve, step("now", create, "Waiting for a free slot."), step("todo", email)];
     }
-    var head = st === "ready" || st === "failed" ? [] : [
-      h("h1", {}, ["Setting up " + hostName]),
-      h("p", { class: "muted", style: "margin:4px 0 0" }, ["We'll email you when it's ready. You can close this page."])
-    ];
     shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
     ], body)));

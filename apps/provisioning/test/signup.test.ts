@@ -625,3 +625,25 @@ describe("GET /api/v1/slugs/:slug and /api/v1/signup", () => {
     expect((await call(e, `${SIGNUP}/api/v1/signup`)).status).toBe(401);
   });
 });
+
+describe("CSP: no inline styles on the sign-up page", () => {
+  it("the document, script and noscript carry no style attribute and write no .style", async () => {
+    const html = await (await call(fakeEnv(), `${SIGNUP}/`)).text();
+    expect(html).not.toMatch(/\sstyle\s*=/i);
+    expect(CLIENT_JS).not.toMatch(/style:\s*"/);
+    expect(CLIENT_JS).not.toMatch(/["']style["']/);
+    expect(CLIENT_JS).not.toMatch(
+      /\.style\b|cssText|setAttribute\(\s*["']style/,
+    );
+  });
+
+  it("every stage keeps a heading: no empty header branch", () => {
+    for (const t of [
+      '"Setting up " + hostName',
+      'hostName + " is ready"',
+      '"We couldn\'t set up " + hostName',
+    ])
+      expect(CLIENT_JS).toContain(t);
+    expect(CLIENT_JS).not.toContain("? [] :");
+  });
+});

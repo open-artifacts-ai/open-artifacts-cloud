@@ -52,6 +52,10 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin:16px 0}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--divider)}
 .stack{display:grid;gap:10px}
+.panel .mt{margin:10px 0 0}
+.panel .lead{margin:4px 0 0}
+.note .btn{display:flex;width:fit-content}
+.ns{max-width:420px;margin:24px auto;padding:0 16px}
 .state{border-top:1px solid var(--divider);margin-top:12px;padding-top:8px}
 .lab{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .steps{list-style:none;margin:10px 0;padding:0;display:grid;gap:10px}
