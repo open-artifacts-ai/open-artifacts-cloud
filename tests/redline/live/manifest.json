@@ -1315,6 +1315,14 @@
     {
       "file": "live/provisioning.test.ts",
       "name": "provisioning > P25: GET /auth/start one at a time (up to 30): a 303 to /sign-in?error=rate_limited, with no flow cookie"
+    },
+    {
+      "file": "live/provisioner.test.ts",
+      "name": "provisioner > a replayed signup creates nothing new"
+    },
+    {
+      "file": "live/provisioner.test.ts",
+      "name": "provisioner > a signup for a taken slug fails cleanly"
     }
   ],
   "notes": [

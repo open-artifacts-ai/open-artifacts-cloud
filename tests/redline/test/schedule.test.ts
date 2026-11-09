@@ -36,6 +36,18 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
+// The recording predates #859's live/provisioner.test.ts and its `signup`
+// lane. The simulation replays the lanes and files that were recorded; the new
+// file is bounded separately ("the signup lane", below).
+const NEW_FILE = "live/provisioner.test.ts";
+const recorded = (plan: readonly Phase[]): readonly Phase[] =>
+  plan.map((ph) =>
+    ph
+      .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
+      .filter((l) => l.files.length > 0),
+  );
+const RPLAN = recorded(PLAN);
+const RSERIAL = recorded(PLAN_SERIAL);
 const wall = (f: string): number => {
   const w = fx.fileWallsSec[f];
   if (w === undefined) throw new Error(`no recorded wall for ${f}`);
@@ -107,11 +119,17 @@ describe("the recording (run 42402998826)", () => {
     const m = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
+    // The recording's 329 cases, plus the two #859 added (NEW_FILE).
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(m.cases.map((c) => `${c.file} ${c.name}`)),
+      new Set(
+        m.cases
+          .filter((c) => c.file !== NEW_FILE)
+          .map((c) => `${c.file} ${c.name}`),
+      ),
     );
+    expect(m.cases.filter((c) => c.file === NEW_FILE)).toHaveLength(2);
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
     );
@@ -135,17 +153,32 @@ describe("the recording (run 42402998826)", () => {
   });
 });
 
+describe("the signup lane (#859, not in the recording)", () => {
+  it("holds only the provisioner file, beside the recorded lanes", () => {
+    const l = (PLAN[0] ?? []).find((x) => x.name === "signup") as Lane;
+    expect(l.files).toEqual([NEW_FILE]);
+  });
+
+  it("ends before provisioning when the replay and a taken slug take a few minutes", () => {
+    // Modeled, not recorded: a 60 s replay watch and a taken slug that ends
+    // failed inside 2 minutes, with setup. Its hard bound is TAKEN_BOUND_MS
+    // (10 min) plus the watch: that is a failure, not a schedule.
+    const modeled = 60 + 120 + 30;
+    expect(modeled).toBeLessThan(wall("live/provisioning.test.ts"));
+  });
+});
+
 describe("the schedule simulation", () => {
   it("today's plan reproduces the observed run: 1197 s (19m57s)", () => {
-    const { end } = jobEnd(PLAN_SERIAL, { t19: "after" });
+    const { end } = jobEnd(RSERIAL, { t19: "after" });
     near(end, 1197, 1);
     expect(fx.observedEndSec).toBe(1197);
     // The suite alone: signin+edge, then credentials' chain (the critical path).
-    near(suiteEnd(PLAN_SERIAL), 102 + 132.5 + 745.2 + 2, 0.5);
+    near(suiteEnd(RSERIAL), 102 + 132.5 + 745.2 + 2, 0.5);
   });
 
   it("the new plan: 102 + 337.7 + 2 + 28 = 470 s (7.8 min), with T19 in its own job", () => {
-    const r = jobEnd(PLAN, { t19: "job" });
+    const r = jobEnd(RPLAN, { t19: "job" });
     near(r.end, 470, 1);
     expect(r.end).toBeLessThan(600);
     // The t19 job ends at about 298 s, before the redline job does.
@@ -154,7 +187,7 @@ describe("the schedule simulation", () => {
   });
 
   it("the critical path is provisioning; every install lane ends before it", () => {
-    const lanes = (PLAN[0] ?? []).map(
+    const lanes = (RPLAN[0] ?? []).map(
       (l) => [l.name, P.preSec + laneWall(l, {})] as const,
     );
     const byEnd = [...lanes].sort((a, b) => b[1] - a[1]);
@@ -164,13 +197,14 @@ describe("the schedule simulation", () => {
     near(byEnd[0]?.[1] ?? 0, 102 + 337.7);
     near(byEnd[1]?.[1] ?? 0, 102 + 335.0);
     near(
-      P.preSec + laneWall(PLAN[0]?.find((l) => l.name === "front") as Lane, {}),
+      P.preSec +
+        laneWall(RPLAN[0]?.find((l) => l.name === "front") as Lane, {}),
       102 + 177.1,
     );
   });
 
   it("with T19 still after the suite (the suite change alone): 657 s, over 10 minutes", () => {
-    const { end } = jobEnd(PLAN, { t19: "after" });
+    const { end } = jobEnd(RPLAN, { t19: "after" });
     near(end, 470 + 187, 1);
     expect(end).toBeGreaterThan(600);
   });
@@ -180,21 +214,21 @@ describe("the schedule simulation", () => {
     ["install lanes +20%", { slow: 0.2 }, 532],
     ["+60 s pacing and +20% together", { pacing: 60, slow: 0.2 }, 594],
   ])("%s ends at about %i s, under 600", (_, knobs, want) => {
-    const { end } = jobEnd(PLAN, { ...knobs, t19: "job" });
+    const { end } = jobEnd(RPLAN, { ...knobs, t19: "job" });
     near(end, want, 3);
     expect(end).toBeLessThan(600);
   });
 
   it("+60 s pacing and +20% leaves under 10 s of headroom: the reason for the sharding trigger", () => {
-    const { end } = jobEnd(PLAN, { pacing: 60, slow: 0.2, t19: "job" });
+    const { end } = jobEnd(RPLAN, { pacing: 60, slow: 0.2, t19: "job" });
     expect(600 - end).toBeLessThan(10);
     // One more 20 s of anything (a slow candidate) would cross 10 minutes.
     expect(end + 20).toBeGreaterThan(600 - 10);
   });
 
   it("B4 (provisioning from the mint) saves only what surfaces allows", () => {
-    const base = jobEnd(PLAN, { t19: "job" }).end;
-    const b4 = jobEnd(PLAN, { provFromMint: true, t19: "job" }).end;
+    const base = jobEnd(RPLAN, { t19: "job" }).end;
+    const b4 = jobEnd(RPLAN, { provFromMint: true, t19: "job" }).end;
     expect(b4).toBeLessThan(base);
     // Provisioning would end at 64 + 337.7 + 30 = 431.7 s (the spec's "about
     // 432 s"), but surfaces (102 + 335) still ends the run at 467 s until it is
@@ -210,17 +244,17 @@ describe("the schedule simulation", () => {
   });
 
   it("the plan's lanes are the ones the simulation ran", () => {
-    expect(PLAN).toHaveLength(1);
-    const names = (PLAN[0] ?? []).map((l) => l.name).sort();
+    expect(RPLAN).toHaveLength(1);
+    const names = (RPLAN[0] ?? []).map((l) => l.name).sort();
     expect(names).toEqual(["creds", "front", "guard", "prov", "surfaces"]);
     // Every recorded file is in a lane, so no recorded second is left out.
-    expect((PLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
+    expect((RPLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
       Object.keys(fx.fileWallsSec).sort(),
     );
   });
 
   it("each lane's cases, replayed one after another, fit its wall", () => {
-    for (const l of PLAN[0] ?? []) {
+    for (const l of RPLAN[0] ?? []) {
       const caseSec =
         fx.cases
           .filter((c) => l.files.includes(c.file))

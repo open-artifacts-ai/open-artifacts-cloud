@@ -70,13 +70,14 @@ describe("the lane plan", () => {
     }
   });
 
-  it("is one phase of five lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of six lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
       "creds",
       "front",
       "guard",
       "prov",
+      "signup",
       "surfaces",
     ]);
     const front = PLAN[0]?.find((l) => l.name === "front") as Lane;
@@ -97,7 +98,7 @@ describe("the lane plan", () => {
     expect(conflicts(PLAN_SERIAL)).toEqual([]);
   });
 
-  it("PLAN_SERIAL is the two-phase plan from before #1730", () => {
+  it("PLAN_SERIAL is the two-phase plan from before #1730, plus #859's provisioner file after provisioning", () => {
     expect(PLAN_SERIAL.map((ph) => ph.map((l) => [...l.files]))).toEqual([
       [["live/signin.test.ts", "live/edge.test.ts"]],
       [
@@ -107,7 +108,7 @@ describe("the lane plan", () => {
           "live/guard.test.ts",
           "live/surfaces.test.ts",
         ],
-        ["live/provisioning.test.ts"],
+        ["live/provisioning.test.ts", "live/provisioner.test.ts"],
       ],
     ]);
   });

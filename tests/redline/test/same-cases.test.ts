@@ -24,20 +24,32 @@ interface Main {
 const main = JSON.parse(
   readFileSync(join(import.meta.dirname, "fixtures/main-cases.json"), "utf8"),
 ) as Main;
+// Cases added after main-cases.json was cut: #859's provisioner probes.
+const ADDED = [
+  {
+    file: "live/provisioner.test.ts",
+    name: "provisioner > a replayed signup creates nothing new",
+  },
+  {
+    file: "live/provisioner.test.ts",
+    name: "provisioner > a signup for a taken slug fails cleanly",
+  },
+];
 const pkg = join(import.meta.dirname, "..");
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds exactly main's 329 cases, in main's order", () => {
+  it("manifest.json holds exactly main's 329 cases, in main's order, then #859's two", () => {
     const m = parseManifest(read("live/manifest.json"));
     expect(main.manifest).toHaveLength(329);
-    expect(m.cases.map((c) => ({ file: c.file, name: c.name }))).toEqual(
-      main.manifest,
-    );
+    expect(m.cases.map((c) => ({ file: c.file, name: c.name }))).toEqual([
+      ...main.manifest,
+      ...ADDED,
+    ]);
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set(main.manifest.map((c) => c.file));
+    const files = new Set([...main.manifest, ...ADDED].map((c) => c.file));
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });

@@ -7,7 +7,7 @@
 // time (vitest.live.config.ts keeps fileParallelism off inside each lane).
 // test/lanes.test.ts fails when two lanes of one phase claim the same thing.
 //
-// #1730: PLAN is one phase of five lanes. Where two lanes touch one thing
+// #1730: PLAN is one phase of six lanes. Where two lanes touch one thing
 // they do not just conflict: the thing is guarded by a lock (src/locks.ts),
 // paced by a ledger (hook-ledger.ts, src/rl-anon.ts), or ordered by a barrier
 // (src/barrier.ts). Each of those only adds a wait; an overrun is an
@@ -177,6 +177,16 @@ export const CLAIMS: Record<string, Claims> = {
       "provisioning-api": "exclusive",
     },
   },
+  "live/provisioner.test.ts": {
+    state: {
+      ...installs(),
+      // Its own signups rows and queue messages on staging's platform D1, and
+      // the provisioner's work on them. It never changes an install: rl-a is
+      // read (its row before and after) and checked with verifyTarget.
+      "provisioner-plane": "write",
+    },
+    buckets: installBuckets(),
+  },
 };
 
 export interface Lane {
@@ -195,11 +205,13 @@ const lane = (name: string, ...files: string[]): Lane => ({
 });
 
 /**
- * The run (#1730): one phase, five lanes, the longest file per lane.
+ * The run (#1730): one phase, six lanes (the sixth, `signup`, is #859's), the longest file per lane.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker barrier;
  * - surfaces: surfaces (335.0 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean stays serial inside it);
+ * - signup: provisioner (replay and taken slug, #859; ~2 minutes when it
+ *   passes, bounded at 10 for a taken slug);
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
  */
@@ -210,6 +222,7 @@ export const PLAN: readonly Phase[] = [
     lane("creds", "credentials"),
     lane("guard", "guard"),
     lane("front", "signin", "edge", "live"),
+    lane("signup", "provisioner"),
   ],
 ];
 
@@ -222,7 +235,7 @@ export const PLAN_SERIAL: readonly Phase[] = [
   [lane("front", "signin", "edge")],
   [
     lane("install", "credentials", "live", "guard", "surfaces"),
-    lane("prov", "provisioning"),
+    lane("prov", "provisioning", "provisioner"),
   ],
 ];
 

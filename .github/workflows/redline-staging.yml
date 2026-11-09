@@ -458,6 +458,9 @@ jobs:
         env:
           REDLINE_STG_INVENTORY_URL: ${{ vars.REDLINE_STG_INVENTORY_URL }}
           REDLINE_DELETED_HOSTS: ${{ vars.REDLINE_DELETED_HOSTS }}
+          # The provisioner probes (live/provisioner.test.ts, #859): JSON ids
+          # and a token file path, no secret value. Unset, both are unproven-live.
+          REDLINE_STG_PROVISIONER: ${{ vars.REDLINE_STG_PROVISIONER }}
           REDLINE_PROD_ACCOUNT_ID: ${{ vars.REDLINE_PROD_ACCOUNT_ID }}
           REDLINE_PROD_INVENTORY_URL: ${{ vars.REDLINE_PROD_INVENTORY_URL }}
           REDLINE_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
