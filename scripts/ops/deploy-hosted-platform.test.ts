@@ -195,6 +195,9 @@ function schedulerBindings(
       service: `oa-${p}-provisioner`,
       entrypoint: "ProvisionerRpc",
     },
+    ...(p === "s"
+      ? [{ type: "service", name: "BILLING", service: "oa-s-billing" }]
+      : []),
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
@@ -249,6 +252,18 @@ const NEXT: Record<string, string> = {
       service: "oa-p-directory-broker",
     },
     { type: "plain_text", name: "OA_ENV", text: "prod" },
+  ]),
+  "oa-s-dispatch": settings([
+    { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+    { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-staging" },
+    { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
+    {
+      type: "service",
+      name: "DIRECTORY_BROKER",
+      service: "oa-s-directory-broker",
+    },
+    { type: "service", name: "BILLING", service: "oa-s-billing" },
+    { type: "plain_text", name: "OA_ENV", text: "staging" },
   ]),
   "oa-p-inventory": settings([
     { type: "d1", name: "PLATFORM_DB", id: DB },
@@ -404,10 +419,12 @@ const ENV = {
 };
 
 // What the scheduler needs deployed first.
+// Staging also needs oa-s-billing: its BILLING binding (#1568).
 const SCHED_DEPS = (p: "s" | "p") => [
   `oa-${p}-auth-broker`,
   `oa-${p}-directory-broker`,
   `oa-${p}-provisioner`,
+  ...(p === "s" ? ["oa-s-billing"] : []),
 ];
 
 // The scheduler's config: #915's placeholders (the repo's own once it carries
@@ -654,6 +671,88 @@ describe("deploy-hosted-platform.sh", () => {
       clean(ok);
     });
   }
+  describe("the BILLING binding (#1568): staging only", () => {
+    const DEPS_S = ["oa-s-auth-broker", "oa-s-directory-broker"];
+    it("staging dispatch and scheduler refuse until oa-s-billing exists, before any deploy", () => {
+      for (const t of ["dispatch", "scheduler"]) {
+        const exists =
+          t === "scheduler"
+            ? SCHED_DEPS("s").filter((w) => w !== "oa-s-billing")
+            : DEPS_S;
+        const r = setup({ exists }).run(t, {}, "staging");
+        expect(r.code, t).toBe(1);
+        expect(r.err).toContain("oa-s-billing does not exist: deploy it first");
+        expect(r.log.some((l) => l.startsWith("wrapper"))).toBe(false);
+      }
+    });
+    it("staging dispatch deploys and verifies its BILLING service binding", () => {
+      const ok = setup({ exists: [...DEPS_S, "oa-s-billing"] }).run(
+        "dispatch",
+        {},
+        "staging",
+      );
+      expect(ok.err).toBe("");
+      expect(ok.code).toBe(0);
+      expect(ok.out).toContain("staging dispatch: deployed and verified");
+      // A missing, wrong or non-service BILLING binding fails the read-back.
+      for (const [why, mut] of [
+        [
+          "missing",
+          (b: Record<string, unknown>[]) =>
+            b.filter((x) => x.name !== "BILLING"),
+        ],
+        [
+          "the wrong Worker",
+          (b: Record<string, unknown>[]) =>
+            b.map((x) =>
+              x.name === "BILLING" ? { ...x, service: "oa-p-billing" } : x,
+            ),
+        ],
+      ] as const) {
+        const next = JSON.parse(NEXT["oa-s-dispatch"] as string);
+        next.result.bindings = mut(next.result.bindings);
+        const bad = setup({
+          exists: [...DEPS_S, "oa-s-billing"],
+          next: { "oa-s-dispatch": JSON.stringify(next) },
+        }).run("dispatch", {}, "staging");
+        expect(bad.code, why).toBe(1);
+        expect(bad.err, why).toContain("dispatch BILLING binding: got");
+      }
+    });
+    it("staging scheduler verifies its BILLING binding too", () => {
+      const next = JSON.parse(NEXT["oa-s-scheduler"] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "BILLING",
+      );
+      const bad = setup({
+        exists: SCHED_DEPS("s"),
+        next: { "oa-s-scheduler": JSON.stringify(next) },
+      }).run("scheduler", {}, "staging");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("scheduler BILLING binding: got");
+    });
+    it("prod needs no billing Worker and refuses any BILLING binding on dispatch or the scheduler", () => {
+      for (const t of ["dispatch", "scheduler"]) {
+        // No oa-p-billing exists, and none is asked for.
+        const ok = setup({ exists: SCHED_DEPS("p") }).run(t);
+        expect(ok.code, `${t} ${ok.err}`).toBe(0);
+        const key = t === "dispatch" ? "oa-p-dispatch" : "oa-p-scheduler";
+        const next = JSON.parse(NEXT[key] as string);
+        next.result.bindings.push({
+          type: "service",
+          name: "BILLING",
+          service: "oa-p-billing",
+        });
+        const bad = setup({
+          exists: SCHED_DEPS("p"),
+          next: { [key]: JSON.stringify(next) },
+        }).run(t);
+        expect(bad.code, t).toBe(1);
+        expect(bad.err, t).toContain(`${t} BILLING binding: got`);
+      }
+    });
+  });
+
   it("the scheduler also refuses until the provisioner exists", () => {
     const noProv = setup({
       exists: ["oa-p-auth-broker", "oa-p-directory-broker"],
@@ -1396,21 +1495,9 @@ describe("deploy-hosted-platform.sh", () => {
 
     it("a live key, a non-test key or a malformed secret or price is refused without printing it", () => {
       for (const [k, v, want] of [
-        [
-          "STRIPE_SECRET_KEY",
-          "sk_live_abcdefgh12345678",
-          "test-mode key",
-        ],
-        [
-          "STRIPE_SECRET_KEY",
-          "rk_live_abcdefgh12345678",
-          "test-mode key",
-        ],
-        [
-          "STRIPE_SECRET_KEY",
-          "pk_test_abcdefgh12345678",
-          "test-mode key",
-        ],
+        ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "rk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "pk_test_abcdefgh12345678", "test-mode key"],
         ["STRIPE_SECRET_KEY", "sk_test_short", "test-mode key"],
         [
           "STRIPE_WEBHOOK_SECRET",
