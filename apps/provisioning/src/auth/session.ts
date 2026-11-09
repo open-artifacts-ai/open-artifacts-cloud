@@ -4,14 +4,15 @@ import type { SessionRow } from "../services/tokens.js";
 import { randomToken, sameString, sha256Hex } from "./crypto.js";
 import { csrfToken } from "./csrf.js";
 import { isAdminIdentity } from "./identities.js";
+import { adminSessionTtlMs, SESSION_TTL_MS } from "./session-ttl.js";
 import { isTestAdminRow, testAdminPrincipal } from "./test-admin.js";
 
 // Admin sessions (design v7 4.5): `__Host-oa-admin=<sid>` (32 random bytes),
-// Secure, HttpOnly, SameSite=Strict, 8 h absolute. D1 keeps sha256(sid) and
+// Secure, HttpOnly, SameSite=Strict, 8 h absolute (staging may set up to 168 h). D1 keeps sha256(sid) and
 // auth_at, never the sid.
 
 export const SESSION_COOKIE = "__Host-oa-admin";
-export const SESSION_TTL_MS = 8 * 3600_000;
+export { adminSessionTtlMs, SESSION_TTL_MS };
 /**
  * A sign-in for the session's own pair with less than this left gets a new
  * session, not the old one (9A.3.2 step 4: MCP consent sends it here).
@@ -34,8 +35,8 @@ export function readCookie(req: Request, name: string): string | null {
 
 export const sessionHash = (sid: string) => sha256Hex(sid);
 
-export const sessionCookie = (sid: string) =>
-  `${SESSION_COOKIE}=${sid}; Max-Age=${SESSION_TTL_MS / 1000}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+export const sessionCookie = (env: Env, sid: string) =>
+  `${SESSION_COOKIE}=${sid}; Max-Age=${adminSessionTtlMs(env) / 1000}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 export const clearSessionCookie = () =>
   `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`;
 
@@ -46,7 +47,7 @@ export async function createSession(
   now: number,
 ): Promise<{ sid: string; expiresAt: number }> {
   const sid = randomToken(32);
-  const expiresAt = now + SESSION_TTL_MS;
+  const expiresAt = now + adminSessionTtlMs(env);
   await env.PLATFORM_DB.prepare(
     `INSERT INTO sessions (id_hash, kind, host, email, sub, auth_at, created_at, expires_at)
      VALUES (?, 'admin', ?, ?, ?, ?, ?, ?)`,

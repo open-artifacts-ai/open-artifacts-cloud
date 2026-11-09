@@ -983,7 +983,7 @@ describe("the Business trial over a Solo subscription (#1568)", () => {
     });
   });
 
-  it("the Business trial never restarts, and /trial/start and /solo/start answer the ended trial's row", async () => {
+  it("the Business trial never restarts, and /trial/start answers the ended trial's row", async () => {
     at();
     await trialRow({ ends: NOW - 1000, solo: "active" });
     const t = await call(gated("POST", "/trial/start", { install: A }));

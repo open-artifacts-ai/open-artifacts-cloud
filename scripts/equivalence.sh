@@ -39,7 +39,8 @@ set -uo pipefail
 # is listed by exact path so that any other new workflow still fails.
 # The same holds for the pin-bump opener (cloud #20): a workflow, its script and
 # its test that public never had and the private-paths list (public's, at S)
-# does not name.
+# does not name. So does the hosted-release alert (#1782), named apart from
+# public's release-alert.yml so the two never share a path in the overlay.
 # And the billing database's migration runner for the staging deploy (#1568):
 # a script and its test that public never had (the deploy scripts that call it
 # are in the private list, this pair is not).
@@ -47,8 +48,10 @@ ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
+  .github/workflows/hosted-release-alert.yml
   scripts/ci/pin-bump.ts
   scripts/ci/pin-bump.test.ts
+  scripts/ci/hosted-release-alert.test.ts
   scripts/ops/billing-db.ts
   scripts/ops/billing-db.test.ts
 )
