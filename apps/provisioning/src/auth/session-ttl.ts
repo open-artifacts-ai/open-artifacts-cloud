@@ -19,7 +19,6 @@ export const ADMIN_SESSION_TTL_MAX_HOURS = 168;
 export function adminSessionTtlMs(
   env: Pick<Env, "OA_ENV"> & { ADMIN_SESSION_TTL_HOURS?: unknown },
 ): number {
-  if (env.OA_ENV !== "staging") return SESSION_TTL_MS;
   const raw = env.ADMIN_SESSION_TTL_HOURS;
   if (typeof raw !== "string" || !/^[1-9][0-9]{0,2}$/.test(raw))
     return SESSION_TTL_MS;
