@@ -645,34 +645,52 @@ case "$target" in
     if [ -n "${FLEET_SMOKE_SHARE_TO:-}" ] && ! [[ "$FLEET_SMOKE_SHARE_TO" =~ ^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$ ]]; then
       echo "FLEET_SMOKE_SHARE_TO must be one lowercase address; refusing" >&2; exit 1
     fi
+    # The retry wait is checked before any deploy: a bad value must not leave
+    # the run half done.
+    [[ "${PUT_RETRY_SLEEP:-5}" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; exit 1; }
     sched_deploy() {
       PLATFORM_DB_ID="$PLATFORM_DB_ID" EMAIL_ZONE_TAGS="$EMAIL_ZONE_TAGS" EMAIL_DAILY_LIMIT="$EMAIL_DAILY_LIMIT" \
         ALERT_TO="$ALERT_TO" ALERT_FROM="$ALERT_FROM" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" \
         deploy scheduler
     }
-    # The tag order (#1040): a secret put makes an untagged version, so the
-    # tagged deploy comes after every put. When the scheduler already exists the
-    # puts come first and nothing has moved if one fails: a failed put can never
-    # leave the scheduler on the tag with the run red (#55). Deploys keep
-    # secrets. Only a scheduler that does not exist yet (its first deploy) must
-    # be deployed before it can take a secret, and then deploys again. The
-    # Environment always provides the values and a secret's value can't be
-    # read back (only its name is listed), so "only when changed" can't be
-    # known: they are put on every run.
-    put_smoke() {
+    # The tag order (#1040): a secret put makes an untagged version, so a
+    # tagged deploy follows the puts (deploys keep secrets). The scheduler's
+    # tag is read by the chain (worker-tag.sh exits on an untagged scheduler),
+    # so it must never be left untagged: if a put still fails after its
+    # retries, the last tagged deploy runs anyway (an earlier put may already
+    # have made an untagged version), and then the run is red (#55). That
+    # deploy is retried the same bounded way. The Environment always provides
+    # the values and a secret's value can't be read back (only its name is
+    # listed), so "only when changed" can't be known: they are put every run.
+    sched_deploy
+    if [ -n "$smoke_puts" ]; then
+      put_failed=""
       for k in $smoke_puts; do
-        printf '%s' "${!k}" | put_secret oa-$P-scheduler scheduler "$k" || exit 1
+        if ! printf '%s' "${!k}" | put_secret oa-$P-scheduler scheduler "$k"; then
+          put_failed="$k"
+          break
+        fi
       done
-    }
-    if [ -z "$smoke_puts" ]; then
-      sched_deploy
-    elif [ -n "$VERIFY_ONLY" ] || worker_exists oa-$P-scheduler; then
-      put_smoke
-      sched_deploy
-    else
-      sched_deploy
-      put_smoke
-      sched_deploy
+      final_pause="${PUT_RETRY_SLEEP:-5}"
+      final_ok=""
+      for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+        if sched_deploy; then final_ok=1; break; fi
+        if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+          echo "oa-$P-scheduler: the tagged deploy after the secrets failed (attempt $a of $PUT_ATTEMPTS); trying again" >&2
+          sleep "$final_pause"
+          final_pause=$((final_pause * 3))
+        fi
+      done
+      if [ -n "$put_failed" ] && [ -z "$final_ok" ]; then
+        echo "oa-$P-scheduler: putting $put_failed failed, and the tagged deploy after it failed too: the scheduler may serve an untagged version" >&2
+        exit 1
+      elif [ -n "$put_failed" ]; then
+        echo "oa-$P-scheduler: putting $put_failed failed; the tagged deploy ran again, so the scheduler serves the tag, and the run stays red" >&2
+        exit 1
+      elif [ -z "$final_ok" ]; then
+        echo "oa-$P-scheduler: the tagged deploy after the secrets failed: the scheduler may serve an untagged version" >&2
+        exit 1
+      fi
     fi
     S="$(settings oa-$P-scheduler)"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .type' service "PROVISIONER type"

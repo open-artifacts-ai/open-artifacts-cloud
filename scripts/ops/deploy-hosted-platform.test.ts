@@ -141,6 +141,10 @@ const wrapperStub = (dir: string) => {
     `#!/usr/bin/env bash
 echo "wrapper $* reg=\${BROKER_REGISTRY_ID:-}\${DIRECTORY_REGISTRY_ID:-} client=\${GOOGLE_CLIENT_ID_PROD:-}\${GOOGLE_DIRECTORY_CLIENT_ID_PROD:-} hosts=\${HOSTS_KV_ID:-} db=\${PLATFORM_DB_ID:-} bdb=\${BILLING_DB_ID:-} tag=\${DEPLOY_TAG:-}" >> "$STUB_LOG"
 w="oa-$([ "$2" = staging ] && echo s || echo p)-$1"
+n=$(( $(cat "$STATE/wrapper-count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/wrapper-count"
+# fail-wrapper-from: every call from that number on fails; fail-wrapper-at: just that call.
+[ -f "$STATE/fail-wrapper-from" ] && [ "$n" -ge "$(cat "$STATE/fail-wrapper-from")" ] && exit 1
+[ -f "$STATE/fail-wrapper-at" ] && [ "$n" -eq "$(cat "$STATE/fail-wrapper-at")" ] && exit 1
 touch "$STATE/$w.exists"
 [ -f "$STATE/$w.next.json" ] && cp "$STATE/$w.next.json" "$STATE/$w.settings.json"
 exit 0
@@ -2673,52 +2677,19 @@ describe("the canary smoke's secrets (#1343)", () => {
     clean(r);
   });
 
-  // #55: run 42647320740 put FLEET_SMOKE_TOKEN after the tagged deploy, the put
-  // failed (Cloudflare 10013) and the scheduler stayed on the tag with the run
-  // red. The tag order (#1040) still holds: every put comes before the last
-  // deploy, and an existing scheduler is deployed once, after its puts.
-  describe("the smoke secrets' put order and retry (#55)", () => {
+  // #55: run 42647320740's put failed after the tagged deploy and the run went
+  // red. The order stays deploy, puts, deploy (#1040: a put makes an untagged
+  // version, and the chain reads the scheduler's tag, so it may never be left
+  // untagged): a put that still fails after its retries is followed by the
+  // last tagged deploy anyway, and then the run is red.
+  describe("the smoke secrets' retry and the last tagged deploy (#55)", () => {
     const wrappers = (log: string[]) =>
       log.flatMap((l, i) => (l.startsWith("wrapper") ? [i] : []));
     const lastPut = (log: string[]) =>
       log.reduce((m, l, i) => (l.startsWith("stdin-len") ? i : m), -1);
-    const live = () => ({ exists: [...SCHED_DEPS("p"), "oa-p-scheduler"] });
+    const live = () => ({ exists: SCHED_DEPS("p") });
 
-    it("an existing scheduler: both puts, then one tagged deploy", () => {
-      const r = setup(live()).run("scheduler", SMOKE);
-      expect(r.code, r.err).toBe(0);
-      expect(puts(r.log)).toEqual([
-        "FLEET_SMOKE_TOKEN",
-        "FLEET_SMOKE_SHARE_TO",
-      ]);
-      expect(wrappers(r.log)).toHaveLength(1);
-      expect(wrappers(r.log)[0]).toBeGreaterThan(lastPut(r.log));
-      hidden(r);
-      clean(r);
-    });
-
-    it("an existing scheduler whose put fails every time: three tries, then nothing deployed and the run red", () => {
-      const r = setup({
-        ...live(),
-        files: { "fail-put-FLEET_SMOKE_TOKEN": "" },
-      }).run("scheduler", SMOKE);
-      expect(r.code).toBe(1);
-      expect(puts(r.log)).toEqual([
-        "FLEET_SMOKE_TOKEN",
-        "FLEET_SMOKE_TOKEN",
-        "FLEET_SMOKE_TOKEN",
-      ]);
-      expect(r.err).toContain(
-        "putting FLEET_SMOKE_TOKEN failed (attempt 1 of 3)",
-      );
-      expect(r.err).toContain(
-        "oa-p-scheduler: putting FLEET_SMOKE_TOKEN failed\n",
-      );
-      expect(wrappers(r.log)).toEqual([]);
-      hidden(r);
-    });
-
-    it("one transient failure is retried: the second try succeeds and the run goes on", () => {
+    it("one transient put failure is retried: the second try succeeds and the run goes on", () => {
       const r = setup({
         ...live(),
         files: { "fail-put-once-FLEET_SMOKE_TOKEN": "" },
@@ -2733,32 +2704,87 @@ describe("the canary smoke's secrets (#1343)", () => {
       expect(
         r.log.filter((l) => l === `stdin-len FLEET_SMOKE_TOKEN ${PAT.length}`),
       ).toHaveLength(2);
-      expect(wrappers(r.log)).toHaveLength(1);
+      expect(wrappers(r.log)).toHaveLength(2);
       hidden(r);
     });
 
-    it("a scheduler that does not exist yet keeps the old order: deploy, puts, deploy", () => {
+    it("put 1 ok, put 2 fails every try: the last tagged deploy still runs, then the run is red", () => {
       const r = setup({
-        exists: SCHED_DEPS("p"),
-        files: { "fail-put-once-FLEET_SMOKE_SHARE_TO": "" },
+        ...live(),
+        files: { "fail-put-FLEET_SMOKE_SHARE_TO": "" },
       }).run("scheduler", SMOKE);
-      expect(r.code, r.err).toBe(0);
+      expect(r.code).toBe(1);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_SHARE_TO",
+        "FLEET_SMOKE_SHARE_TO",
+        "FLEET_SMOKE_SHARE_TO",
+      ]);
       const w = wrappers(r.log);
       expect(w).toHaveLength(2);
-      expect(w[0]).toBeLessThan(
-        r.log.findIndex((l) => l.startsWith("stdin-len")),
-      );
       expect(w[1]).toBeGreaterThan(lastPut(r.log));
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_SHARE_TO failed (attempt 1 of 3)",
+      );
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_SHARE_TO failed; the tagged deploy ran again, so the scheduler serves the tag, and the run stays red",
+      );
+      hidden(r);
     });
 
-    it("a bad PUT_RETRY_SLEEP is refused, without a put", () => {
+    it("all puts ok, the last deploy fails: three bounded tries, then red, naming it", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-wrapper-from": "2" },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      // The first deploy, then three tries of the last one.
+      expect(wrappers(r.log)).toHaveLength(4);
+      expect(r.err).toContain(
+        "the tagged deploy after the secrets failed (attempt 2 of 3)",
+      );
+      expect(r.err).toContain(
+        "the tagged deploy after the secrets failed: the scheduler may serve an untagged version",
+      );
+      hidden(r);
+    });
+
+    it("a last deploy that fails once is retried and the run is green", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-wrapper-at": "2" },
+      }).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      expect(wrappers(r.log)).toHaveLength(3);
+    });
+
+    it("a put and the last deploy both fail: both are named, the run is red", () => {
+      const r = setup({
+        ...live(),
+        files: {
+          "fail-put-FLEET_SMOKE_TOKEN": "",
+          "fail-wrapper-from": "2",
+        },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      expect(wrappers(r.log)).toHaveLength(4);
+      expect(r.err).toContain(
+        "oa-p-scheduler: putting FLEET_SMOKE_TOKEN failed\n",
+      );
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_TOKEN failed, and the tagged deploy after it failed too: the scheduler may serve an untagged version",
+      );
+      hidden(r);
+    });
+
+    it("a bad PUT_RETRY_SLEEP is refused before any deploy or put", () => {
       const r = setup(live()).run("scheduler", {
         ...SMOKE,
         PUT_RETRY_SLEEP: "soon",
       });
       expect(r.code).toBe(1);
       expect(r.err).toContain("PUT_RETRY_SLEEP must be 0 to 999 seconds");
-      expect(wrappers(r.log)).toEqual([]);
+      expect(noDeploy(r.log)).toEqual([]);
     });
   });
 

@@ -532,6 +532,7 @@ describe("report: one blocker issue while red", () => {
     expect(body).not.toMatch(/did not move|never moves|stayed/);
     expect(body).toContain("Every platform Worker runs the tag");
     expect(body).toContain("the fleet follows it");
+    expect(body).toContain("require_newer false");
   });
 
   it("a neutral skip (stale event, a release prod has) neither opens, refreshes nor closes it", () => {
