@@ -3180,6 +3180,57 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
     ]);
   });
 
+  it("a Solo adopted as past_due on a row in its Business trial keeps the trial's status and grace, and is shadowed in solo_status", async () => {
+    await solo();
+    const END = (T + 10 * 86_400) * 1000;
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'trial', trial_ends_at = ?, solo_status = 'active' WHERE install_id = ?",
+      )
+      .bind(END, A)
+      .run();
+    const s = stripe({ sub_Late1: "past_due" });
+    const ev = checkout("sub_Late1", { metadata: { tier: "solo" } });
+    await deliver(ev, { env: s.e });
+    expect(await row(A)).toMatchObject({
+      tier: "trial",
+      status: "active",
+      grace_until: null,
+      trial_ends_at: END,
+      stripe_subscription_id: "sub_Late1",
+      solo_status: "past_due",
+      solo_grace_until: ev.created * 1000 + GRACE_MS,
+    });
+    expect(s.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
+      "DELETE sub_Old1",
+    ]);
+  });
+
+  it("a Solo adopted as past_due on a Solo row is past_due with grace; a Team adopted as past_due on a trial row is past_due too", async () => {
+    await solo();
+    const ev = checkout("sub_Late1", { metadata: { tier: "solo" } });
+    await deliver(ev, { env: stripe({ sub_Late1: "past_due" }).e });
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      status: "past_due",
+      grace_until: ev.created * 1000 + GRACE_MS,
+    });
+    await solo();
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'trial', trial_ends_at = ?, solo_status = 'active' WHERE install_id = ?",
+      )
+      .bind((T + 10 * 86_400) * 1000, A)
+      .run();
+    const t = checkout("sub_Late2");
+    await deliver(t, { env: stripe({ sub_Late2: "past_due" }).e });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "past_due",
+      grace_until: t.created * 1000 + GRACE_MS,
+    });
+  });
+
   it("trialing and active are live: adopted as active", async () => {
     for (const state of ["trialing", "active"]) {
       await solo();

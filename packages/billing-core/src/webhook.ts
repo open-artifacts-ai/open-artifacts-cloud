@@ -364,20 +364,39 @@ export function changeFor(
         o.payment_status === "paid" ||
         o.payment_status === "no_payment_required"
       ) {
-        sets.push(
-          adopted === "past_due"
-            ? guarded("status", "'past_due'")
-            : guarded("status", "'active'"),
-          adopted === "past_due"
-            ? guarded("grace_until", "?", [graceEnd])
-            : guarded("grace_until", "NULL"),
-        );
-        const tier = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
+        const tierNow = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
+        if (adopted === "past_due") {
+          // A Solo on a row in its Business trial: the trial's own status and
+          // grace stay; the Solo's past_due is shadowed below. Anything else
+          // is past_due with grace from the event.
+          const soloUnderTrial = (
+            col: string,
+            value: string,
+            args: unknown[],
+          ) =>
+            tierNow === "solo"
+              ? {
+                  sql: `${col} = CASE WHEN status = 'suspended' OR tier = 'trial' THEN ${col} ELSE ${value} END`,
+                  args,
+                }
+              : guarded(col, value, args);
+          sets.push(
+            soloUnderTrial("status", "'past_due'", []),
+            soloUnderTrial("grace_until", "?", [graceEnd]),
+          );
+        } else
+          sets.push(
+            guarded("status", "'active'"),
+            guarded("grace_until", "NULL"),
+          );
+        const tier = tierNow;
         if (tier) sets.push(setTier(tier));
         if (tier === "solo")
           sets.push(
-            shadow("solo_status", "'active'"),
-            shadow("solo_grace_until", "NULL"),
+            shadow("solo_status", `'${adopted}'`),
+            adopted === "past_due"
+              ? shadow("solo_grace_until", "?", [graceEnd])
+              : shadow("solo_grace_until", "NULL"),
           );
         // A Solo checkout that charged now (paid, no trial end passed) ends
         // the Solo trial then. One that kept the free days
