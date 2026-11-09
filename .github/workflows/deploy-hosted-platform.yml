@@ -403,7 +403,7 @@ jobs:
       # moved. Only after a deploy step ran, never after an earlier gate failed
       # or the run was cancelled.
       - name: Every platform Worker runs the tag
-        if: ${{ (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
+        if: ${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}
