@@ -37,6 +37,8 @@ export interface ProvapiEnv {
   FLEET_SMOKE?: string;
   /** The smoke's share check: "off" skips it; anything else runs it. */
   FLEET_SMOKE_SHARE?: string;
+  /** The smoke's bus check (#1299): "off" skips it; anything else runs it. */
+  FLEET_SMOKE_BUS?: string;
   /** The passive soak in minutes with FLEET_SMOKE "off"; unset is 15. */
   FLEET_SOAK_MIN?: string;
   /** smoke's PAT on the canary (secret, #1343 smoke.ts); unset: never smoked. */

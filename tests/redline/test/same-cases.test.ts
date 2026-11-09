@@ -26,6 +26,7 @@ const main = JSON.parse(
   readFileSync(join(import.meta.dirname, "fixtures/main-cases.json"), "utf8"),
 ) as Main;
 const pkg = join(import.meta.dirname, "..");
+
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
@@ -47,7 +48,7 @@ describe("the same cases", () => {
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set(main.manifest.map((c) => c.file));
+    const files = new Set([...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file));
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });

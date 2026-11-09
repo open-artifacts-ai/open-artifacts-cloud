@@ -5,6 +5,17 @@
 // schedule.test.ts hold the manifest to the snapshot plus exactly this list.
 export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
   [
+    // #1299 part 4: the bus's cross-install machine token and P51. Both pass
+    // or fail on a real assertion before and after the lift (src/bus-gate.ts);
+    // neither is an accepted unproven.
+    {
+      file: "live/bus.test.ts",
+      name: "bus > A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)",
+    },
+    {
+      file: "live/provisioning.test.ts",
+      name: "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",
+    },
     // #1346 role reach, ported with the v0.140.0 pin bump.
     ...[
       "org GET /api/v1/bus/reach [session]",

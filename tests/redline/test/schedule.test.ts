@@ -37,8 +37,15 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
+/**
+ * Files added after the recording (#1299's live/bus.test.ts), so no wall was
+ * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
+ * case that is a few requests while the bus is off). The first live run that
+ * includes them replaces it; test/cases-added.ts names what is estimated.
+ */
+const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
 const wall = (f: string): number => {
-  const w = fx.fileWallsSec[f];
+  const w = fx.fileWallsSec[f] ?? ESTIMATED_WALL_SEC[f];
   if (w === undefined) throw new Error(`no recorded wall for ${f}`);
   return w;
 };
@@ -221,9 +228,13 @@ describe("the schedule simulation", () => {
     expect(PLAN).toHaveLength(1);
     const names = (PLAN[0] ?? []).map((l) => l.name).sort();
     expect(names).toEqual(["creds", "front", "guard", "prov", "surfaces"]);
-    // Every recorded file is in a lane, so no recorded second is left out.
+    // Every recorded file is in a lane, so no recorded second is left out;
+    // the only others are the estimated, post-recording files.
     expect((PLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
-      Object.keys(fx.fileWallsSec).sort(),
+      [
+        ...Object.keys(fx.fileWallsSec),
+        ...Object.keys(ESTIMATED_WALL_SEC),
+      ].sort(),
     );
   });
 
