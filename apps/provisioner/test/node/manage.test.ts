@@ -58,7 +58,7 @@ vi.mock(
     get RELEASE_PUBKEY() {
       return { staging: TEST_PUBKEY, prod: TEST_PUBKEY };
     },
-  })
+  }),
 );
 
 let w: World;
@@ -84,13 +84,13 @@ async function manage(
   installId: string,
   o: Omit<Parameters<typeof seedJob>[1], "kind" | "installId"> & {
     twice?: boolean;
-  } = {}
+  } = {},
 ) {
   const id = seedJob(w, { kind, installId, ...o });
   const r = stepRunner(w.clock, { twice: o.twice });
   const error = await runManage(w.ctx, event(id), r.step).then(
     () => null,
-    (x: unknown) => x as Error
+    (x: unknown) => x as Error,
   );
   return { id, error, log: r.log, job: w.job(id) };
 }
@@ -116,7 +116,7 @@ const installDb = (installId: string) =>
 function fill(
   db: import("node:sqlite").DatabaseSync,
   table: string,
-  id: string
+  id: string,
 ): Record<string, unknown> {
   const row: Record<string, unknown> = Object.fromEntries(
     (
@@ -128,7 +128,7 @@ function fill(
       }[]
     )
       .filter((c) => c.notnull === 1 && c.dflt_value === null)
-      .map((c) => [c.name, /INT/i.test(c.type) ? 1 : `x-${id}`])
+      .map((c) => [c.name, /INT/i.test(c.type) ? 1 : `x-${id}`]),
   );
   for (const fk of db.prepare(`PRAGMA foreign_key_list(${table})`).all() as {
     table: string;
@@ -144,7 +144,7 @@ function fill(
           db,
           fk.table,
           `${id}-${fk.table}`,
-          fk.table === "users" ? { role: "owner" } : {}
+          fk.table === "users" ? { role: "owner" } : {},
         );
   }
   return row;
@@ -154,14 +154,12 @@ function insert(
   db: import("node:sqlite").DatabaseSync,
   table: string,
   id: string,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
 ): unknown {
   const row = { ...fill(db, table, id), id, ...extra };
   const names = Object.keys(row);
   db.prepare(
-    `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names
-      .map(() => "?")
-      .join(", ")})`
+    `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
   ).run(...(Object.values(row) as never[]));
   return id;
 }
@@ -201,10 +199,10 @@ describe("upgrade and rollback (5.4)", () => {
       lease: null,
     });
     expect(plain(s.installId, "AUTH_BROKER_URL")).toBe(
-      `https://auth.${HOSTED_DOMAINS[ENV].app}`
+      `https://auth.${HOSTED_DOMAINS[ENV].app}`,
     );
     expect(plain(s.installId, "GOOGLE_CLIENT_ID")).toMatch(
-      /apps\.googleusercontent\.com$/
+      /apps\.googleusercontent\.com$/,
     );
     // Already on `to`: done with no Cloudflare write.
     const writes = w.fake.writes().length;
@@ -273,7 +271,7 @@ describe("upgrade and rollback (5.4)", () => {
       ...tpl,
       durable_objects: {
         bindings: (tpl.durable_objects?.bindings ?? []).filter(
-          (x: { class_name: string }) => x.class_name !== "BusHub"
+          (x: { class_name: string }) => x.class_name !== "BusHub",
         ),
       },
     };
@@ -283,7 +281,7 @@ describe("upgrade and rollback (5.4)", () => {
         w.r2,
         FIX.makeRelease({ template: unbound }),
         STEP,
-        variant
+        variant,
       );
     }
     const s = await active({ slug: "stepco", version: V1 });
@@ -313,7 +311,7 @@ describe("upgrade and rollback (5.4)", () => {
         CF_VERSION_METADATA: { id: "x", tag: `v${TARGET}`, timestamp: "" },
         FLEET_CANARY: s.installId,
       } as never,
-      w.clock.t
+      w.clock.t,
     );
     expect(c.fleet_halted.open).toBe(true);
     expect(c.fleet_halted.rows).toContainEqual(
@@ -323,9 +321,9 @@ describe("upgrade and rollback (5.4)", () => {
         code: "do_step_required",
         version: TARGET,
         message: expect.stringContaining(
-          `Upgrade this install to ${STEP} first`
+          `Upgrade this install to ${STEP} first`,
         ),
-      })
+      }),
     );
   });
 
@@ -390,7 +388,7 @@ describe("upgrade and rollback (5.4)", () => {
       w.all(
         "SELECT 1 FROM hosted_audit WHERE install_id = ? AND action = ?",
         s.installId,
-        action
+        action,
       );
     expect(audited("upgrade.forward_fix")).toHaveLength(1);
     expect(audited("rollback.done")).toHaveLength(0);
@@ -420,7 +418,7 @@ describe("upgrade and rollback (5.4)", () => {
     const s = await active({ slug: "fwdco", version: V1 });
     w.db
       .prepare(
-        "UPDATE install_versions SET do_migration_tag = 'v-older' WHERE install_id = ? AND version = ?"
+        "UPDATE install_versions SET do_migration_tag = 'v-older' WHERE install_id = ? AND version = ?",
       )
       .run(s.installId, V1);
     w.fake.health = (sc) =>
@@ -465,7 +463,7 @@ describe("upgrade and rollback (5.4)", () => {
           mine = w.install(s.installId)?.lease as string | null;
           w.db
             .prepare(
-              "UPDATE installs SET lease = 'stolen', lease_until = ? WHERE id = ?"
+              "UPDATE installs SET lease = 'stolen', lease_until = ? WHERE id = ?",
             )
             .run(w.clock.t + 30 * 60_000, s.installId);
         }
@@ -491,7 +489,7 @@ describe("upgrade and rollback (5.4)", () => {
     const until = w.clock.t + 20 * 60_000;
     w.db
       .prepare(
-        "UPDATE installs SET state = 'upgrading', lease = 'theirs', lease_until = ? WHERE id = ?"
+        "UPDATE installs SET state = 'upgrading', lease = 'theirs', lease_until = ? WHERE id = ?",
       )
       .run(until, s.installId);
     const r = await manage("upgrade", s.installId, {
@@ -543,7 +541,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     // A second suspend is not a transition from suspended.
     expect(
       (await manage("suspend", s.installId, { args: { reason: "x" } })).job
-        ?.error_code
+        ?.error_code,
     ).toBe("invalid_state");
     const back = await manage("resume", s.installId, { twice: true });
     expect(back.error).toBeNull();
@@ -601,13 +599,13 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
       });
       expect(w.status(s.installId)?.state).toBe("suspended");
       const lines = (warn?.mock.calls ?? []).filter(
-        (c) => c[0] === CLOSE_SOCKETS_FAILED
+        (c) => c[0] === CLOSE_SOCKETS_FAILED,
       );
       expect(lines).toEqual([[CLOSE_SOCKETS_FAILED, cat]]);
       // No id, no error text.
       expect(JSON.stringify(lines)).not.toContain(s.installId);
       expect(JSON.stringify(lines)).not.toContain("a@b.co");
-    }
+    },
   );
 
   it("a close-sockets call that never settles times out, logged; it never throws", async () => {
@@ -615,7 +613,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     w.fake.onScheduled = () => new Promise(() => {});
     expect(await closeInstallSockets(w.ctx, s.installId, 20)).toBe("timeout");
     expect(
-      (warn?.mock.calls ?? []).filter((c) => c[0] === CLOSE_SOCKETS_FAILED)
+      (warn?.mock.calls ?? []).filter((c) => c[0] === CLOSE_SOCKETS_FAILED),
     ).toEqual([[CLOSE_SOCKETS_FAILED, "timeout"]]);
   });
 
@@ -677,7 +675,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     const rl = await active({ slug: "rl-x", actor: "oidc", testHooks: true });
     expect(
       (await manage("release_lease", rl.installId, { actor: "oidc" })).job
-        ?.error_code
+        ?.error_code,
     ).toBe("invalid_state");
     // On a prod config the recheck refuses OIDC before anything else.
     (w.env as { OA_ENV: string }).OA_ENV = "prod";
@@ -687,7 +685,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     });
     w.env.OA_ENV = ENV;
     expect(prod.log.find((l) => l.name === "recheck")?.error?.message).toBe(
-      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`
+      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
     );
     expect(logged()).toContain('"detail":"OIDC is staging only"');
     expect(w.status(rl.installId)?.state).toBe("active");
@@ -706,7 +704,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     });
     expect(r.job?.error_code).toBe("invalid_state");
     expect(logged()).toContain(
-      '"detail":"the test member acts only on its own install"'
+      '"detail":"the test member acts only on its own install"',
     );
     expect(w.status(other.installId)?.state).toBe("active");
     // Red-line's key on the same install is unchanged.
@@ -717,7 +715,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
           actorKey: "oidc:42",
           args: { reason: "r" },
         })
-      ).error
+      ).error,
     ).toBeNull();
     const mine = await active({
       slug: "rl-agents",
@@ -730,7 +728,7 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
           ...tm,
           args: { reason: "r" },
         })
-      ).error
+      ).error,
     ).toBeNull();
     expect(w.status(mine.installId)?.state).toBe("suspended");
   });
@@ -762,7 +760,7 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     expect(w.install(s.installId)?.state).toBe("active");
     w.clock.t += GRACE_MS;
     expect(
-      (await manage("purge", s.installId, { actor: "system" })).error
+      (await manage("purge", s.installId, { actor: "system" })).error,
     ).toBeNull();
     expect(w.install(s.installId)?.state).toBe("deleted");
   });
@@ -806,13 +804,13 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
       .prepare(
         `INSERT INTO signup_accounts (owner_sub, signup_id, created_at) VALUES (?1, ?2, ?3)
 ON CONFLICT (owner_sub) DO UPDATE SET signup_id = excluded.signup_id, created_at = excluded.created_at, freed_at = NULL
-WHERE signup_accounts.freed_at IS NOT NULL`
+WHERE signup_accounts.freed_at IS NOT NULL`,
       )
       .run(sub, signupId, w.clock.t).changes;
   const claim = (sub: string | null) =>
     w.get(
       "SELECT signup_id, freed_at FROM signup_accounts WHERE owner_sub = ?",
-      sub
+      sub,
     ) as { signup_id: string; freed_at: number | null } | undefined;
 
   it("purging a deleted self-serve install frees its account; the same account signs up again (#1046)", async () => {
@@ -828,7 +826,7 @@ WHERE signup_accounts.freed_at IS NOT NULL`
     expect(reclaim(s.sub as string, "signup-2")).toBe(0);
     w.clock.t += GRACE_MS;
     expect(
-      (await manage("purge", s.installId, { actor: "system" })).error
+      (await manage("purge", s.installId, { actor: "system" })).error,
     ).toBeNull();
     expect(w.install(s.installId)?.state).toBe("deleted");
     expect(claim(s.sub)?.freed_at).toEqual(expect.any(Number));
@@ -859,13 +857,13 @@ WHERE signup_accounts.freed_at IS NOT NULL`
     expect(s.sub).toBeNull();
     w.db
       .prepare(
-        "INSERT INTO signup_accounts (owner_sub, signup_id, created_at) VALUES ('other', 'other-signup', 1)"
+        "INSERT INTO signup_accounts (owner_sub, signup_id, created_at) VALUES ('other', 'other-signup', 1)",
       )
       .run();
     await manage("delete", s.installId);
     w.clock.t += GRACE_MS;
     expect(
-      (await manage("purge", s.installId, { actor: "system" })).error
+      (await manage("purge", s.installId, { actor: "system" })).error,
     ).toBeNull();
     expect(w.install(s.installId)?.state).toBe("deleted");
     expect(w.all("SELECT * FROM signup_accounts")).toEqual([
@@ -889,7 +887,7 @@ WHERE signup_accounts.freed_at IS NOT NULL`
     const s = seedCreate(w, { slug: "dirtyco" });
     w.fake.settingsEdit = (_x, b) => [...b, { name: "EXTRA", type: "service" }];
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
-      () => {}
+      () => {},
     );
     w.fake.settingsEdit = undefined;
     const purgeId = w.manage.created[0]?.id as string;
@@ -901,15 +899,15 @@ WHERE signup_accounts.freed_at IS NOT NULL`
       w.all(
         "SELECT detail FROM hosted_audit WHERE install_id = ? AND detail LIKE ?",
         s.installId,
-        `%${NEVER_ROUTED}%`
-      )
+        `%${NEVER_ROUTED}%`,
+      ),
     ).not.toHaveLength(0);
   });
 
   it("discard: a failed create with no installs row is freed in D1 only", async () => {
     const s = seedCreate(w, { slug: "discardco", version: "0.30.0" });
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
-      () => {}
+      () => {},
     );
     expect(w.status(s.installId)?.state).toBe("failed");
     const writes = w.fake.writes().length;
@@ -924,7 +922,7 @@ describe("retry (5.2, kind retry)", () => {
   it("a failed create retried by R12 reaches done under the same install and owner token label", async () => {
     const s = seedCreate(w, { slug: "retryco", version: "0.30.0" });
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
-      () => {}
+      () => {},
     );
     expect(w.status(s.installId)?.state).toBe("failed");
     // What R12 writes: a retry job, the signup queued again under it.
@@ -938,7 +936,7 @@ describe("retry (5.2, kind retry)", () => {
       .run(retry);
     w.db
       .prepare(
-        "UPDATE signups SET job_id = ?, status = 'queued', version = NULL, error = NULL WHERE signup_id = ?"
+        "UPDATE signups SET job_id = ?, status = 'queued', version = NULL, error = NULL WHERE signup_id = ?",
       )
       .run(retry, s.signupId);
     await runCreate(w.ctx, event(retry), stepRunner(w.clock).step);
@@ -953,7 +951,7 @@ describe("retry resume (5.2, R12)", () => {
     const s = seedCreate(w, { slug: "resumeco" });
     w.fake.health = () => new Response(null, { status: 503 });
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
-      () => {}
+      () => {},
     );
     w.fake.health = undefined;
     expect(w.job(s.jobId)?.status).toBe("failed");
@@ -970,7 +968,7 @@ describe("retry resume (5.2, R12)", () => {
       .run(retry);
     w.db
       .prepare(
-        "UPDATE signups SET job_id = ?, status = 'queued', error = NULL WHERE signup_id = ?"
+        "UPDATE signups SET job_id = ?, status = 'queued', error = NULL WHERE signup_id = ?",
       )
       .run(retry, s.signupId);
     await runCreate(w.ctx, event(retry), stepRunner(w.clock).step);
@@ -985,14 +983,14 @@ describe("release_lease and cleanup (3.6, R13, R25)", () => {
     const s = await active({ slug: "leaseco" });
     w.db
       .prepare(
-        "UPDATE installs SET lease = 'dead', lease_until = ? WHERE id = ?"
+        "UPDATE installs SET lease = 'dead', lease_until = ? WHERE id = ?",
       )
       .run(w.clock.t + 60_000, s.installId);
     const live = await manage("release_lease", s.installId);
     expect(live.job?.status).toBe("failed");
     expect(
       (await manage("release_lease", s.installId, { args: { force: true } }))
-        .error
+        .error,
     ).toBeNull();
     expect(w.install(s.installId)?.lease).toBeNull();
   });
@@ -1006,7 +1004,7 @@ describe("release_lease and cleanup (3.6, R13, R25)", () => {
     // R25: the job failed canceled, its cleanup inserted.
     w.db
       .prepare(
-        "UPDATE jobs SET status = 'failed', error_code = 'canceled', finished_at = 1 WHERE id = ?"
+        "UPDATE jobs SET status = 'failed', error_code = 'canceled', finished_at = 1 WHERE id = ?",
       )
       .run(s.jobId);
     const r = await manage("cleanup", s.installId, {
@@ -1026,7 +1024,7 @@ describe("release_lease and cleanup (3.6, R13, R25)", () => {
     expect(w.signup(s.signupId)?.status).toBe("failed");
     expect(w.job(s.jobId)?.error_code).toBe("canceled");
     expect(
-      w.get("SELECT freed_at FROM signup_accounts WHERE owner_sub = ?", s.sub)
+      w.get("SELECT freed_at FROM signup_accounts WHERE owner_sub = ?", s.sub),
     ).toEqual({
       freed_at: expect.any(Number),
     });
@@ -1037,7 +1035,7 @@ describe("release_lease and cleanup (3.6, R13, R25)", () => {
     const until = w.clock.t + 20 * 60_000;
     w.db
       .prepare(
-        "UPDATE installs SET state = 'upgrading', lease = 'gone', lease_until = ? WHERE id = ?"
+        "UPDATE installs SET state = 'upgrading', lease = 'gone', lease_until = ? WHERE id = ?",
       )
       .run(until, s.installId);
     const parent = seedJob(w, {
@@ -1097,7 +1095,7 @@ function stubInstall(
     respond?: (call: string) => Response | undefined;
     /** Key-live probes that see the old key before the new one (#1002). */
     staleProbes?: number;
-  } = {}
+  } = {},
 ) {
   const scriptName = `oa-s-${installId}`;
   const script = w.fake.script(NAMESPACES[ENV], scriptName);
@@ -1130,7 +1128,7 @@ function stubInstall(
                     details: { reason: "bad_input" },
                   },
                 },
-                { status: 404 }
+                { status: 404 },
               )
             : new Response(null, { status: 404 });
         }
@@ -1164,7 +1162,7 @@ function stubInstall(
           tokens.push({ id, label });
           return Response.json(
             { id, label, token: "oa_pat_minted_secret_value" },
-            { status: 201 }
+            { status: 201 },
           );
         }
         if (u.pathname === "/api/v1/me")
@@ -1186,8 +1184,8 @@ describe("job fail point (#995)", () => {
     ])) as CryptoKeyPair;
     return Buffer.from(
       new Uint8Array(
-        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
-      )
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
     ).toString("base64url");
   };
   const refusal = (reason: unknown) =>
@@ -1195,12 +1193,12 @@ describe("job fail point (#995)", () => {
       {
         error: { code: "not_found", message: "Not found", details: { reason } },
       },
-      { status: 404 }
+      { status: 404 },
     );
   const failCols = (id: string) =>
     w.all(
       "SELECT fail_at, fail_status, fail_reason FROM jobs WHERE id = ?",
-      id
+      id,
     )[0];
   const SECRET_TEXT = "leaky detail redline-admin@guests.oa-redline-a.fyi";
 
@@ -1245,7 +1243,7 @@ describe("job fail point (#995)", () => {
       name: "a test session 404 before the key (no reason)",
       setup: at(
         "POST /__test/session",
-        () => new Response(null, { status: 404 })
+        () => new Response(null, { status: 404 }),
       ),
       want: { fail_at: "test_session", fail_status: 404, fail_reason: null },
     },
@@ -1266,7 +1264,7 @@ describe("job fail point (#995)", () => {
     {
       name: "a test session 200 without a cookie (no status)",
       setup: at("POST /__test/session", () =>
-        Response.json({ note: SECRET_TEXT })
+        Response.json({ note: SECRET_TEXT }),
       ),
       want: { fail_at: "test_session", fail_status: null, fail_reason: null },
     },
@@ -1274,7 +1272,7 @@ describe("job fail point (#995)", () => {
       name: "the token list",
       setup: at(
         "GET /api/v1/tokens",
-        () => new Response(SECRET_TEXT, { status: 500 })
+        () => new Response(SECRET_TEXT, { status: 500 }),
       ),
       want: { fail_at: "list_tokens", fail_status: 500, fail_reason: null },
     },
@@ -1282,7 +1280,7 @@ describe("job fail point (#995)", () => {
       name: "the mint",
       setup: at(
         "POST /api/v1/tokens",
-        () => new Response(SECRET_TEXT, { status: 503 })
+        () => new Response(SECRET_TEXT, { status: 503 }),
       ),
       want: { fail_at: "mint_token", fail_status: 503, fail_reason: null },
     },
@@ -1315,7 +1313,7 @@ describe("job fail point (#995)", () => {
       revoke: true,
       setup: at(
         "POST /__test/session",
-        () => new Response(null, { status: 404 })
+        () => new Response(null, { status: 404 }),
       ),
       want: { fail_at: "test_session", fail_status: 404, fail_reason: null },
     },
@@ -1348,7 +1346,7 @@ describe("job fail point (#995)", () => {
       expect(row).not.toContain("leaky detail");
       expect(row).not.toContain("redline-admin@");
       expect(row).not.toMatch(/HTTP \d{3}/);
-    }
+    },
   );
 
   it("each failed attempt rewrites the point: the last attempt's stays", async () => {
@@ -1384,14 +1382,14 @@ describe("the rotated hook key is live before use (#1002)", () => {
     ])) as CryptoKeyPair;
     return Buffer.from(
       new Uint8Array(
-        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
-      )
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
     ).toString("base64url");
   };
   const keyPuts = () =>
     w.fake.log.filter(
       (l) =>
-        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200
+        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200,
     ).length;
   const sleeps = () => {
     const got: number[] = [];
@@ -1437,8 +1435,8 @@ describe("the rotated hook key is live before use (#1002)", () => {
     expect(
       w.all(
         "SELECT fail_at, fail_status, fail_reason FROM jobs WHERE id = ?",
-        r.id
-      )[0]
+        r.id,
+      )[0],
     ).toEqual({
       fail_at: "hook_key_live",
       fail_status: 404,
@@ -1451,12 +1449,12 @@ describe("the rotated hook key is live before use (#1002)", () => {
     // Each attempt probes one key only: rotating happens between attempts.
     for (let a = 0; a < attempts; a++)
       expect(
-        new Set(probes.slice(a * perAttempt, (a + 1) * perAttempt)).size
+        new Set(probes.slice(a * perAttempt, (a + 1) * perAttempt)).size,
       ).toBe(1);
     expect(new Set(probes).size).toBe(attempts);
     expect(KEY_LIVE_WAITS_MS.reduce((x, y) => x + y)).toBe(60_000);
     expect(waits.filter((ms) => KEY_LIVE_WAITS_MS.includes(ms))).toHaveLength(
-      attempts * KEY_LIVE_WAITS_MS.length
+      attempts * KEY_LIVE_WAITS_MS.length,
     );
     expect(seen).not.toContain("POST /__test/session");
   });
@@ -1471,7 +1469,7 @@ describe("redline_creds (10.1, R26)", () => {
       "deriveBits",
     ])) as CryptoKeyPair;
     const raw = new Uint8Array(
-      (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
+      (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
     );
     const recipientKey = Buffer.from(raw).toString("base64url");
     const r = await manage("redline_creds", s.installId, {
@@ -1513,15 +1511,15 @@ describe("redline_creds (10.1, R26)", () => {
         { id: "r3", label: "redline-103" },
         { id: "c1", label: "ci-1" },
       ],
-      { failDelete: (_id, n) => n === 1 }
+      { failDelete: (_id, n) => n === 1 },
     );
     const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
       "deriveBits",
     ])) as CryptoKeyPair;
     const recipientKey = Buffer.from(
       new Uint8Array(
-        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
-      )
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
     ).toString("base64url");
     const r = await manage("redline_creds", s.installId, {
       actor: "oidc",
@@ -1531,7 +1529,7 @@ describe("redline_creds (10.1, R26)", () => {
     expect(r.job).toMatchObject({ status: "done", step: "done" });
     // Each attempt mints before it revokes.
     const order = seen.filter((x) =>
-      /^(POST|DELETE) \/api\/v1\/tokens/.test(x)
+      /^(POST|DELETE) \/api\/v1\/tokens/.test(x),
     );
     expect(order[0]).toBe("POST /api/v1/tokens");
     expect(order.filter((x) => x === "POST /api/v1/tokens")).toHaveLength(2);
@@ -1540,10 +1538,10 @@ describe("redline_creds (10.1, R26)", () => {
     expect(deleted).toEqual(["r1", "r2", "r3", "t-new"]);
     expect(tokens.map((t) => t.id)).toEqual(["c1", "t-new-2"]);
     expect(
-      tokens.filter((t) => t.label.startsWith("redline-")).map((t) => t.id)
+      tokens.filter((t) => t.label.startsWith("redline-")).map((t) => t.id),
     ).toEqual(["t-new-2"]);
     expect(
-      JSON.parse(await openSealed(pair, r.job?.sealed as string))
+      JSON.parse(await openSealed(pair, r.job?.sealed as string)),
     ).toMatchObject({
       pat: "oa_pat_minted_secret_value",
     });
@@ -1601,8 +1599,8 @@ describe("redline_creds (10.1, R26)", () => {
     ])) as CryptoKeyPair;
     const recipientKey = Buffer.from(
       new Uint8Array(
-        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
-      )
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
     ).toString("base64url");
     // An R25 cancel lands just before the seal UPDATE.
     const db = w.env.PLATFORM_DB;
@@ -1612,7 +1610,7 @@ describe("redline_creds (10.1, R26)", () => {
       if (sql.startsWith("UPDATE jobs SET sealed"))
         w.db
           .prepare(
-            "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?"
+            "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?",
           )
           .run(jobId);
       return prepare(sql);
@@ -1654,8 +1652,8 @@ describe("redline_creds (10.1, R26)", () => {
     expect(JSON.stringify(r.log) + JSON.stringify(r.job)).not.toContain(newKey);
     expect(
       JSON.stringify(
-        w.all("SELECT * FROM hosted_audit WHERE install_id = ?", s.installId)
-      )
+        w.all("SELECT * FROM hosted_audit WHERE install_id = ?", s.installId),
+      ),
     ).not.toContain(newKey);
   });
 
@@ -1712,7 +1710,7 @@ describe("redline_creds (10.1, R26)", () => {
       F.pats
         .filter(
           (p) =>
-            p.installId === installId && p.revokedAt === null && p.id !== skip
+            p.installId === installId && p.revokedAt === null && p.id !== skip,
         )
         .map((p) => ({ id: p.id, label: p.label }));
     const target = stubInstall(t.installId, live(F.target, F.minted));
@@ -1723,8 +1721,8 @@ describe("redline_creds (10.1, R26)", () => {
     ])) as CryptoKeyPair;
     const recipientKey = Buffer.from(
       new Uint8Array(
-        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer
-      )
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
     ).toString("base64url");
     // The stub mints `t-new`; the fixture's minted PAT is F.minted.
     target.tokens.length = 0;
@@ -1765,7 +1763,7 @@ describe("redline_creds (10.1, R26)", () => {
         TIER: "business",
         TEST_DOMAIN: d,
       }),
-      installId
+      installId,
     );
 
   for (const d of [
@@ -1880,7 +1878,7 @@ describe("near-expiry token mode per kind (5.7)", () => {
     const s = await active({ slug: "nearco", version: V1 });
     nearExpiry();
     expect(
-      (await manage("suspend", s.installId, { args: { reason: "r" } })).error
+      (await manage("suspend", s.installId, { args: { reason: "r" } })).error,
     ).toBeNull();
     await manage("resume", s.installId);
     const up = await manage("upgrade", s.installId, {
@@ -1905,7 +1903,7 @@ describe("near-expiry token mode per kind (5.7)", () => {
     const outcome = async (
       kind: string,
       installId: string,
-      o: Parameters<typeof manage>[2] = {}
+      o: Parameters<typeof manage>[2] = {},
     ) => {
       const r = await manage(kind, installId, o);
       return r.job?.status === "done" ? "done" : r.job?.error_code;
@@ -1921,12 +1919,12 @@ describe("near-expiry token mode per kind (5.7)", () => {
     expect(await outcome("delete", gone.installId)).toBe("done");
     expect(await outcome("purge", gone.installId)).toBe("done");
     expect(
-      await outcome("rollback", back.installId, { args: { from: V2, to: V1 } })
+      await outcome("rollback", back.installId, { args: { from: V2, to: V1 } }),
     ).toBe("done");
     const expired = () =>
       w.db
         .prepare(
-          "UPDATE installs SET lease = 'dead', lease_until = ? WHERE id = ?"
+          "UPDATE installs SET lease = 'dead', lease_until = ? WHERE id = ?",
         )
         .run(w.clock.t - 1, lease.installId);
     expired();
@@ -1938,7 +1936,7 @@ describe("near-expiry token mode per kind (5.7)", () => {
       status: "failed",
     });
     expect(
-      await outcome("cleanup", lease.installId, { parentJobId: parent })
+      await outcome("cleanup", lease.installId, { parentJobId: parent }),
     ).toBe("done");
     expect(w.install(lease.installId)?.lease).toBeNull();
   });
@@ -1956,7 +1954,7 @@ describe("near-expiry token mode per kind (5.7)", () => {
     });
     const names = up.log.map((l) => l.name);
     expect(new Set(names.filter((n) => /^upload_token\d$/.test(n))).size).toBe(
-      8
+      8,
     );
     expect(names).toContain("upload_token8");
     expect(w.clock.t - t0).toBeGreaterThanOrEqual(2 * 3_600_000);
@@ -1979,7 +1977,7 @@ describe("near-expiry token mode per kind (5.7)", () => {
     await runManage(w.ctx, event(id), r.step);
     expect(w.job(id)?.status).toBe("done");
     expect(r.log.find((l) => l.name === "upload")?.error?.message).toMatch(
-      /^token_invalid: /
+      /^token_invalid: /,
     );
     expect(w.install(s.installId)?.version).toBe(V2);
   });
@@ -2006,14 +2004,14 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     w.all(
       "SELECT detail FROM hosted_audit WHERE install_id = ? AND action = ?",
       installId,
-      action
+      action,
     );
   const jobAudits = (installId: string, kind: string, action: string) =>
     w.all(
       "SELECT actor, detail FROM hosted_audit WHERE install_id = ? AND action = ? AND json_extract(detail, '$.kind') = ?",
       installId,
       action,
-      kind
+      kind,
     );
 
   it("4.9: WfpProvisioner's own rows go to hosted_audit through auditAs, as job:<jobId>, never actorless", async () => {
@@ -2024,7 +2022,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     expect(up.job?.status).toBe("done");
     const rows = w.all(
       "SELECT actor, action FROM hosted_audit WHERE install_id = ? ORDER BY id",
-      s.installId
+      s.installId,
     ) as { actor: string | null; action: string }[];
     const by = (a: string) => rows.filter((x) => x.action === a);
     expect(by("create.start").map((x) => x.actor)).toEqual([`job:${s.jobId}`]);
@@ -2033,7 +2031,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     expect(rows.filter((x) => x.actor === null)).toEqual([]);
     // Nothing of provision's lands in admin_audit (4.9's table).
     expect(
-      w.all("SELECT 1 FROM admin_audit WHERE detail LIKE ?", `%${up.id}%`)
+      w.all("SELECT 1 FROM admin_audit WHERE detail LIKE ?", `%${up.id}%`),
     ).toEqual([]);
   });
 
@@ -2069,7 +2067,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
   it("a failed create is audited job.failed", async () => {
     const s = seedCreate(w, { slug: "badrel", version: "9.9.9" });
     await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
-      () => {}
+      () => {},
     );
     expect(w.job(s.jobId)?.status).toBe("failed");
     expect(jobAudits(s.installId, "create", "job.failed")).toHaveLength(1);
@@ -2122,7 +2120,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
       w.fake
         .writes()
         .slice(writes)
-        .filter((x) => x.includes("/scripts/"))
+        .filter((x) => x.includes("/scripts/")),
     ).toEqual([]);
     expect(w.lifecycle(s.installId)?.serving_mode).toBe("paused");
     expect(JSON.parse(w.job(id)?.args as string)).toEqual({ from: V1, to: V2 });
@@ -2160,7 +2158,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
       w.fake
         .writes()
         .slice(writes)
-        .filter((x) => x.includes("/scripts/"))
+        .filter((x) => x.includes("/scripts/")),
     ).toEqual([]);
     expect(JSON.parse(w.job(id)?.args as string)).toEqual({ from: V1, to: V2 });
     return { s, id, again };
@@ -2202,7 +2200,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     await runManage(
       w.ctx,
       event(id),
-      stepRunner(w.clock, { results, twice: true }).step
+      stepRunner(w.clock, { results, twice: true }).step,
     );
     expect(w.job(id)?.status).toBe("done");
     expect(JSON.parse(w.job(id)?.args as string)).toEqual({ from: V1, to: V2 });
@@ -2249,7 +2247,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
         until = w.clock.t + 30 * 60_000;
         w.db
           .prepare(
-            "UPDATE installs SET state = 'upgrading', lease = 'early', lease_until = ? WHERE id = ?"
+            "UPDATE installs SET state = 'upgrading', lease = 'early', lease_until = ? WHERE id = ?",
           )
           .run(until, s.installId);
         throw new Error("isolate evicted");
@@ -2281,7 +2279,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
         until = w.clock.t + 30 * 60_000;
         w.db
           .prepare(
-            "UPDATE installs SET state = 'upgrading', lease = 'early', lease_until = ? WHERE id = ?"
+            "UPDATE installs SET state = 'upgrading', lease = 'early', lease_until = ? WHERE id = ?",
           )
           .run(until, s.installId);
         throw new Error("isolate evicted");
@@ -2293,7 +2291,7 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     // During the sleep, another holder claims the row (after the job started).
     w.db
       .prepare(
-        "UPDATE installs SET state = 'upgrading', lease = 'other', lease_until = ? WHERE id = ?"
+        "UPDATE installs SET state = 'upgrading', lease = 'other', lease_until = ? WHERE id = ?",
       )
       .run(until + 60 * 60_000, s.installId);
     const again = stepRunner(w.clock, { results });
@@ -2315,12 +2313,12 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     const until = w.clock.t + 20 * 60_000;
     w.db
       .prepare(
-        "UPDATE installs SET state = 'creating', lease = 'create', lease_until = ? WHERE id = ?"
+        "UPDATE installs SET state = 'creating', lease = 'create', lease_until = ? WHERE id = ?",
       )
       .run(until, s.installId);
     w.db
       .prepare(
-        "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?"
+        "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?",
       )
       .run(s.jobId);
     w.db
@@ -2350,13 +2348,13 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     const renew = () =>
       w.db
         .prepare(
-          "UPDATE installs SET state = 'upgrading', lease = 'stuck', lease_until = ? WHERE id = ?"
+          "UPDATE installs SET state = 'upgrading', lease = 'stuck', lease_until = ? WHERE id = ?",
         )
         .run(w.clock.t + 10 * 60_000, s.installId);
     renew();
     w.db
       .prepare(
-        "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?"
+        "UPDATE jobs SET status = 'failed', error_code = 'canceled' WHERE id = ?",
       )
       .run(parent);
     // Renewed once: the second wait releases it.
@@ -2412,11 +2410,11 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
     });
     expect(r.job?.error_code).toBe("invalid_state");
     expect(r.log.find((l) => l.name === "recheck")?.error?.message).toBe(
-      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`
+      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
     );
     // Its args keys are request values: redacted in the log line.
     expect(logged()).toContain(
-      `"detail":"[value] is an admin's, with a [value]"`
+      `"detail":"[value] is an admin's, with a [value]"`,
     );
   });
 });
@@ -2492,7 +2490,7 @@ describe("a create's lease across its attempts (#1326)", () => {
     const again = stepRunner(w.clock, { results });
     const error = await runCreate(w.ctx, event(s.jobId), again.step).then(
       () => null,
-      (x: unknown) => x as Error
+      (x: unknown) => x as Error,
     );
     expect(error).toBeNull();
     expect(again.log.filter((l) => l.name === "create" && l.error)).toEqual([]);
