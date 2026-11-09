@@ -42,6 +42,8 @@
         "ACCOUNT_ID": "{{ACCOUNT_ID_STAGING}}",
         // The Workflow's env: it refuses any other value.
         "OA_ENV": "staging",
+        // #1299 part 6: installs (exact slugs) that get the bus feature. Staging only.
+        "STAGING_BUS_SLUGS": "rl-agents,bus1299-b",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },

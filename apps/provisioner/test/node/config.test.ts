@@ -100,6 +100,10 @@ describe("wrangler.jsonc", () => {
         ACCOUNT_ID: `{{ACCOUNT_ID_${E}}}`,
         // Literal, not filled: the Workflow refuses anything but these two.
         OA_ENV: env,
+        // #1299 part 6: staging only, exact slugs; prod has no such key.
+        ...(env === "staging"
+          ? { STAGING_BUS_SLUGS: "rl-agents,bus1299-b" }
+          : {}),
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
