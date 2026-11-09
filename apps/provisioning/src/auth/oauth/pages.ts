@@ -131,7 +131,7 @@ const chromeValues = (c: Chrome) => ({
   env_label: c.env === "prod" ? "Production" : "Staging",
   env_name: c.env === "prod" ? "production" : "staging",
   admin_host: c.adminHost,
-  session_length: sessionLength(c.sessionTtlMs),
+  session_length: "8 hours",
 });
 
 const shell = (body: string, extraHead = "") => `<!doctype html>
