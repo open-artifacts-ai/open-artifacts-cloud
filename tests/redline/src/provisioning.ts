@@ -1277,16 +1277,19 @@ async function refusedRollback(
     throw new ProbeFail(
       `P31: after the refusal /healthz is not ok on ${run.c.version} (${desc(hz)})`,
     );
-  // No job.failed audit read here. The provisioner writes that row as a
-  // `provision` row with actor job:<id>; R17 for this run's OIDC actor has
-  // reach "own", which returns only source='api' rows of its own actor
-  // (apps/provisioning/src/routes/reads.ts queryAudit), so it can never see
-  // it, and the run's actor gets no wider reach. The write is covered by
-  // apps/provisioner/test/node/manage.test.ts, "job.done is written once on
-  // a replay; job.failed once with its kind and code, as job:<id>" (an
-  // upgrade that fails) and "a failed create is audited job.failed". GAP: no
-  // test there fails a rollback with invalid_state and reads its row, and
-  // this probe no longer proves the refusal is audited.
+  // The live part proves the refusal: the job failed invalid_state, the
+  // install is unchanged, /healthz is ok. It does not read the job.failed
+  // audit row: the provisioner writes it as a `provision` row with actor
+  // job:<id>, and R17 for this run's OIDC actor has reach "own", which
+  // returns only source='api' rows of its own actor (apps/provisioning/src/
+  // routes/reads.ts queryAudit), so it can never see it, and the run's actor
+  // gets no wider reach. What proves the audit row is the provisioner unit
+  // test apps/provisioner/test/node/manage.test.ts, "a rollback the product
+  // refuses (no previous version) fails invalid_state: one job.failed row
+  // with that code, as job:<id>, and the install unchanged" (with "job.done
+  // is written once on a replay; job.failed once with its kind and code, as
+  // job:<id>"). That test refuses on a missing previous version, not on a
+  // migration; both refusals fail the job through the same settle step.
   return pass(`refused as designed: the tag adds ${ahead.join(", ")}`);
 }
 
