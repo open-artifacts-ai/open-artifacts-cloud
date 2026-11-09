@@ -205,7 +205,7 @@ describe("ProvisionInstall: create", () => {
     });
   });
 
-  it("welcomeEmail throws: no claim taken, install finishes, welcome_unsent can see it, a replay still sends", async () => {
+  it("welcomeEmail throws: no claim taken, install finishes, welcome_unsent can see it", async () => {
     const s = seedCreate(w, { slug: "badwel", sendWelcome: true });
     vi.mocked(welcomeEmail).mockImplementationOnce(() => {
       throw new Error("invalid app host");

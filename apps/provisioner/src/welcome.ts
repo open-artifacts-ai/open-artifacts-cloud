@@ -84,8 +84,8 @@ export function welcomeEmail(o: {
     plan: !selfServe
       ? null
       : end
-        ? `You're on Solo: free until ${end}, then $1/month or $12/year. No card on file.`
-        : "You're on Solo: free for your first month, then $1/month or $12/year. No card on file.",
+        ? `You're on Solo: free until ${end}, then $1/month or $12/year. No card on file; we'll remind you a week before.`
+        : "You're on Solo: free for your first month, then $1/month or $12/year. No card on file; we'll remind you a week before.",
     why: selfServe
       ? `You got this because you signed up and created ${host}.`
       : "You got this because you signed up for Open Artifacts.",
@@ -111,17 +111,22 @@ export function welcomeEmail(o: {
   const MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
   const homeUrl = esc(`${origin}/`);
   const btnW = Math.min(480, Math.max(240, lines.button.length * 9 + 48));
-  // The prompt's URL never breaks mid-hostname: nowrap on the span (the line
-  // may wrap before it), and the hostname's hyphens are the only break points
-  // a client could pick.
+  // The hostname never breaks (nowrap on the host alone, so the rest of a long
+  // line can still wrap); <wbr> after "https://" and before "/llms.txt" gives
+  // clients a break point that is not inside the host.
+  const nowrapHost = (h: string): string =>
+    `<span style="white-space:nowrap;">${h}</span>`;
   const promptHtml = lines.prompt
     .map((l) =>
       esc(l).replace(
         esc(`${origin}/llms.txt`),
-        (u) => `<span style="white-space:nowrap;">${u}</span>`,
+        () => `https://<wbr>${nowrapHost(esc(host))}<wbr>/llms.txt`,
       ),
     )
     .join("<br>");
+  const whyHtml = esc(lines.why).replace(esc(host), () =>
+    nowrapHost(esc(host)),
+  );
 
   // Table layout per design/emails/README.md (the invite's template): inline
   // styles, 560px card, hidden preheader, VML button for Outlook, one <style>
@@ -160,6 +165,7 @@ export function welcomeEmail(o: {
   @media (max-width: 600px) {
     .oa-pad { padding-left: 24px !important; padding-right: 24px !important; }
     .oa-outer { padding-left: 12px !important; padding-right: 12px !important; }
+    .oa-pre { font-size: 11px !important; padding-left: 10px !important; padding-right: 10px !important; }
   }
 </style>
 </head>
@@ -212,7 +218,7 @@ export function welcomeEmail(o: {
         </tr>
         <tr>
           <td class="oa-pad" style="padding:20px 40px 32px 40px;font-family:${FONT};">
-${lines.plan ? `            <p class="oa-muted" style="margin:0 0 8px 0;font-size:13px;line-height:20px;color:#5F6670;">${esc(lines.plan)}</p>\n` : ""}            <p class="oa-muted" style="margin:0;font-size:13px;line-height:20px;color:#5F6670;">${esc(lines.why)}</p>
+${lines.plan ? `            <p class="oa-muted" style="margin:0 0 8px 0;font-size:13px;line-height:20px;color:#5F6670;">${esc(lines.plan)}</p>\n` : ""}            <p class="oa-muted" style="margin:0;font-size:13px;line-height:20px;color:#5F6670;">${whyHtml}</p>
           </td>
         </tr>
       </table>

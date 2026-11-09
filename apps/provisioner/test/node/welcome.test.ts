@@ -37,6 +37,7 @@ describe("welcomeEmail", () => {
       s
         .replace(/<style[\s\S]*?<\/style>/g, "")
         .replace(/<title>[\s\S]*?<\/title>/g, "")
+        .replace(/<\/?(?:span|wbr)\b[^>]*>/g, "")
         .replace(/<[^>]+>/g, " ")
         .replace(/&#39;/g, "'")
         .replace(/\s+/g, " ")
@@ -83,7 +84,7 @@ describe("welcomeEmail", () => {
     expect(m.html).not.toMatch(/<\/img>|>\s*Open Artifacts\s*<\/p>/);
   });
 
-  it("self-serve html is the Outlook-safe table template, with no reminder promise", () => {
+  it("self-serve html is the Outlook-safe table template, with the trial reminder promise", () => {
     const m = welcomeEmail(base);
     expect(m.html).toContain('<table role="presentation"');
     expect(m.html).toContain("<!--[if mso]>");
@@ -97,16 +98,23 @@ describe("welcomeEmail", () => {
       'href="https://acme.open-artifacts.app/" target="_blank"',
     );
     for (const part of [m.text, m.html]) {
-      expect(part).not.toMatch(/remind/i);
+      expect(part).toContain(
+        "No card on file; we&#39;ll remind you a week before.".replace(
+          "&#39;",
+          part === m.html ? "&#39;" : "'",
+        ),
+      );
       expect(part).not.toMatch(/invited|added you/i);
     }
-    expect(m.text).toContain("No card on file.");
+    expect(m.text).toContain(
+      "No card on file; we'll remind you a week before.",
+    );
   });
 
   it("keeps the hostname in the setup prompt unbreakable", () => {
     const m = welcomeEmail(base);
     expect(m.html).toContain(
-      '<span style="white-space:nowrap;">https://acme.open-artifacts.app/llms.txt</span>',
+      'https://<wbr><span style="white-space:nowrap;">acme.open-artifacts.app</span><wbr>/llms.txt',
     );
   });
 
