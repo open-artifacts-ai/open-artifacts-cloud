@@ -362,7 +362,7 @@ describe("cancelSubscription (#1568)", () => {
     }) as unknown as typeof fetch;
   };
 
-  it("reads the subscription, then cancels it when it is not canceled yet", async () => {
+  it("reads the subscription, then cancels it: the DELETE carries invoice_now and prorate in the query string, no body", async () => {
     const f = stripe({ get: [{ id: "sub_Old1", status: "active" }] });
     expect(
       await cancelSubscription(
@@ -372,15 +372,15 @@ describe("cancelSubscription (#1568)", () => {
     ).toEqual({ id: "sub_Old1" });
     expect(calls.map((c) => [c.method, c.url])).toEqual([
       ["GET", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
-      ["DELETE", "https://api.stripe.com/v1/subscriptions/sub_Old1"],
+      [
+        "DELETE",
+        "https://api.stripe.com/v1/subscriptions/sub_Old1?invoice_now=true&prorate=true",
+      ],
     ]);
-    for (const c of calls) expect(c.auth).toBe(`Bearer ${KEY}`);
-    // The read has no body. The DELETE asks for a final invoice with the
-    // unused time prorated, which lands on the customer's credit balance.
-    expect(calls[0]?.body).toBeUndefined();
-    expect(
-      Object.fromEntries(new URLSearchParams(String(calls[1]?.body))),
-    ).toEqual({ invoice_now: "true", prorate: "true" });
+    for (const c of calls) {
+      expect(c.auth).toBe(`Bearer ${KEY}`);
+      expect(c.body).toBeUndefined();
+    }
   });
 
   it("a trialing subscription has nothing to credit: Stripe cancels it with no invoice, and that is a success, not an error", async () => {

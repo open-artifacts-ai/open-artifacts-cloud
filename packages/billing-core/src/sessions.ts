@@ -319,16 +319,13 @@ export async function cancelSubscription(
       return { id };
     // Cancel with a final invoice that prorates the unused time: it lands on
     // the customer's credit balance, which Stripe applies to later invoices
-    // (what was paid for before an upgrade is not lost). A trialing
-    // subscription has nothing paid, so the proration is empty and Stripe just
-    // cancels it (no error). Parameter names are from Stripe's docs (the cancel
-    // endpoint's invoice_now and prorate); their placement in the DELETE's form
-    // body, and the trialing answer, are unverified.
+    // (what was paid for before an upgrade is not lost). The parameters go in
+    // the query string with no body, as the official clients send a DELETE's.
     await send(
       cfg,
       "DELETE",
-      path,
-      { invoice_now: "true", prorate: "true" },
+      `${path}?invoice_now=true&prorate=true`,
+      null,
       null,
     );
   } catch (e) {
