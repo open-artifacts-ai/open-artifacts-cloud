@@ -3057,16 +3057,76 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
     });
   });
 
-  it("incomplete, incomplete_expired and paused are not live either", async () => {
-    for (const state of ["incomplete", "incomplete_expired", "paused"]) {
+  const recorded = async (id: string) =>
+    (await db
+      .prepare("SELECT 1 AS x FROM stripe_events WHERE event_id = ?")
+      .bind(id)
+      .first()) !== null;
+
+  it("a terminal state (canceled, incomplete_expired) is recorded and not adopted", async () => {
+    for (const state of ["canceled", "incomplete_expired"]) {
       await solo();
-      const s = stripe({ sub_Dead1: state });
-      await deliver(checkout("sub_Dead1"), { env: s.e });
+      await db.prepare("DELETE FROM stripe_events").run();
+      const ev = checkout("sub_Dead1");
+      expect(
+        (await deliver(ev, { env: stripe({ sub_Dead1: state }).e })).status,
+        state,
+      ).toBe(200);
       expect(await row(A), state).toMatchObject({
         tier: "solo",
         stripe_subscription_id: "sub_Old1",
       });
+      expect(await recorded(ev.id), state).toBe(true);
+      expect(await pending()).toEqual([]);
     }
+  });
+
+  it("any other non-live state (incomplete, paused, one we do not know) answers 500 while the event is young, recording nothing", async () => {
+    for (const state of ["incomplete", "paused", "something_new"]) {
+      await solo();
+      await db.prepare("DELETE FROM stripe_events").run();
+      const ev = checkout("sub_Wait1");
+      expect(
+        (await deliver(ev, { env: stripe({ sub_Wait1: state }).e })).status,
+        state,
+      ).toBe(500);
+      expect(await row(A), state).toMatchObject({
+        tier: "solo",
+        stripe_subscription_id: "sub_Old1",
+      });
+      expect(await recorded(ev.id), state).toBe(false);
+    }
+  });
+
+  it("after the window it is answered 200 and not adopted, not queued and not recorded: a Dashboard resend once it is active adopts it and never cancels it", async () => {
+    await solo();
+    const ev = checkout("sub_Wait1");
+    const later = NOW + 2 * 3_600_000;
+    const late = { now: later, t: Math.floor(later / 1000) };
+    const s = stripe({ sub_Wait1: "incomplete" });
+    expect((await deliver(ev, { env: s.e, ...late })).status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "solo",
+      stripe_subscription_id: "sub_Old1",
+    });
+    expect(await pending()).toEqual([]);
+    expect(await recorded(ev.id)).toBe(false);
+    // Still not live on a second delivery: the same.
+    expect((await deliver(ev, { env: s.e, ...late })).status).toBe(200);
+    expect(await pending()).toEqual([]);
+    // It became active; the resend of the same event adopts it.
+    const live = stripe({ sub_Wait1: "active" });
+    expect((await deliver(ev, { env: live.e, ...late })).status).toBe(200);
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      stripe_subscription_id: "sub_Wait1",
+    });
+    // Only the replaced Solo is cancelled, never the adopted subscription.
+    expect(live.calls.filter((c) => c.startsWith("DELETE"))).toEqual([
+      "DELETE sub_Old1",
+    ]);
+    expect(await pending()).toEqual([]);
   });
 
   it("a 404 on the read is retried while the event is young (Stripe may not have the subscription yet), and counts as dead only after that", async () => {

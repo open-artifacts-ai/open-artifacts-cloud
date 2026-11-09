@@ -919,15 +919,29 @@ export async function handleStripeWebhook(
           log("subscription_read_failed");
           return json({ error: "unavailable" }, 500);
         }
-        // A 404 may only mean Stripe does not have it yet: like an unknown
-        // customer, retried (500) while the event is young; dead after that.
-        if (state === "missing" && now / 1000 - ev.created < UNKNOWN_RETRY_S) {
-          log("subscription_not_found");
-          return json({ error: "unavailable" }, 500);
-        }
         const live = statusFromSubscription(state);
         if (live !== "active" && live !== "past_due") {
-          // Recorded, nothing applied, nothing queued.
+          // Not live. Only a TERMINAL state is recorded: canceled and
+          // incomplete_expired can never come back, and a 404 is only taken as
+          // gone once the event is old (Stripe may not have a just-created
+          // subscription yet, like an unknown customer, UNKNOWN_RETRY_S).
+          // Anything else (incomplete, paused, a state we don't know) may
+          // still become live: while the event is young the webhook answers
+          // 500 and Stripe retries; after that it answers 200 without
+          // recording it, so a later resend (a Dashboard resend once it is
+          // active) is read again and adopts it. Never queued: this path
+          // returns before the batch, so nothing is cancelled either way.
+          const young = now / 1000 - ev.created < UNKNOWN_RETRY_S;
+          const terminal =
+            state === "canceled" ||
+            state === "incomplete_expired" ||
+            (state === "missing" && !young);
+          if (!terminal) {
+            log(young ? "subscription_not_live_yet" : "not_live_unrecorded");
+            return young
+              ? json({ error: "unavailable" }, 500)
+              : json({ received: true });
+          }
           const r = await db.batch([
             db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
           ]);
