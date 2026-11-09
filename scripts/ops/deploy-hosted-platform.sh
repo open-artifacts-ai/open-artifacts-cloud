@@ -667,8 +667,8 @@ case "$target" in
     if [ -z "$smoke_puts" ]; then
       sched_deploy
     elif [ -n "$VERIFY_ONLY" ] || worker_exists oa-$P-scheduler; then
-      sched_deploy
       put_smoke
+      sched_deploy
     else
       sched_deploy
       put_smoke
