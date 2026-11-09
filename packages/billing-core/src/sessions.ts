@@ -359,3 +359,32 @@ export async function expireCheckoutSession(
   }
   return { id };
 }
+
+/**
+ * A subscription's state, read from Stripe (a Checkout adopts a subscription
+ * only if it is live, #1568). One GET; answers the id and status only, or
+ * status "missing" for a 404. Any other error is thrown (status and type
+ * only).
+ */
+export async function retrieveSubscription(
+  input: { subscriptionId: string },
+  cfg: StripeConfig,
+): Promise<{ id: string; status: string }> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  try {
+    const { status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/subscriptions/${id}`,
+      null,
+      null,
+    );
+    if (typeof out?.status !== "string")
+      throw new StripeApiError(status, "bad_answer");
+    return { id, status: out.status };
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404)
+      return { id, status: "missing" };
+    throw e;
+  }
+}

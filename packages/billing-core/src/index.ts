@@ -15,6 +15,7 @@ export {
   createSoloTrialSubscription,
   expireCheckoutSession,
   type PortalInput,
+  retrieveSubscription,
   SOLO_TRIAL_DAYS,
   type SoloTrialInput,
   STRIPE_API,

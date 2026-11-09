@@ -395,6 +395,8 @@ describe("the upgrade's cancel goes through the Worker's Stripe key (#1568)", ()
     } as Env);
     expect(r.status).toBe(200);
     expect(seen).toEqual([
+      // The adoption check reads the new subscription first.
+      `GET /v1/subscriptions/sub_NewA0001 Bearer ${key}`,
       `GET /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
       `DELETE /v1/subscriptions/sub_OldA0001 Bearer ${key}`,
     ]);

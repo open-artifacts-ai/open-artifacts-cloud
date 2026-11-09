@@ -75,7 +75,11 @@ export const pricesOf = (env: WebhookEnv): PriceIds => ({
 const anyConfigured = (p: PriceIds): boolean =>
   Boolean(p.team || p.business || p.soloMonthly || p.soloYearly);
 
-import { cancelSubscription, type StripeConfig } from "./sessions.js";
+import {
+  cancelSubscription,
+  retrieveSubscription,
+  type StripeConfig,
+} from "./sessions.js";
 import { verifyStripeSignature } from "./signature.js";
 
 export type PaidTier = "solo" | "team" | "business";
@@ -259,6 +263,12 @@ type Set = { sql: string; args: unknown[] };
 export function changeFor(
   ev: StripeEvent,
   prices: PriceIds = {},
+  /**
+   * A checkout's subscription as Stripe reports it when it is adopted:
+   * past_due makes the row past_due with grace from the event (default
+   * active).
+   */
+  adopted: "active" | "past_due" = "active",
 ): Set[] | null {
   const o = ev.object;
   const graceEnd = ev.created * 1000 + GRACE_MS;
@@ -355,8 +365,12 @@ export function changeFor(
         o.payment_status === "no_payment_required"
       ) {
         sets.push(
-          guarded("status", "'active'"),
-          guarded("grace_until", "NULL"),
+          adopted === "past_due"
+            ? guarded("status", "'past_due'")
+            : guarded("status", "'active'"),
+          adopted === "past_due"
+            ? guarded("grace_until", "?", [graceEnd])
+            : guarded("grace_until", "NULL"),
         );
         const tier = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
         if (tier) sets.push(setTier(tier));
@@ -828,7 +842,7 @@ export async function handleStripeWebhook(
     log("livemode_ignored");
     return json({ received: true });
   }
-  const change = changeFor(ev, pricesOf(env));
+  let change = changeFor(ev, pricesOf(env));
   const customer = customerOf(ev.object);
   try {
     const db = env.BILLING_DB;
@@ -844,6 +858,81 @@ export async function handleStripeWebhook(
       unknownPrice(ev.object, pricesOf(env))
     )
       log("unknown_price");
+    const isCheckout =
+      ev.type === "checkout.session.completed" ||
+      ev.type === "checkout.session.async_payment_succeeded";
+    // Checkout names the subscription it sets (?n+2); the other events the
+    // one they are about.
+    const eventSub = isCheckout
+      ? typeof ev.object.subscription === "string" &&
+        SUB_ID.test(ev.object.subscription)
+        ? ev.object.subscription
+        : null
+      : subscriptionOf(ev);
+    // A paid checkout replaces the row's live subscription: read which one
+    // (to queue it for cancel after the update). It is only ever queued when
+    // the row then holds the checkout's subscription, and never the row's
+    // current one, so a stale read can't cancel what is live.
+    const paidSub =
+      isCheckout &&
+      eventSub &&
+      (ev.object.payment_status === "paid" ||
+        ev.object.payment_status === "no_payment_required")
+        ? eventSub
+        : null;
+    // Adopting a subscription different from the row's: read it from Stripe
+    // first and apply its actual state. One that is not live (its deleted or
+    // past_due events arrived first and were dropped) is not adopted and
+    // cancels nothing of the row's; past_due is adopted as past_due. A failed
+    // read (or no or a live key) answers 500 before anything is written, so
+    // Stripe retries. Not needed for the row's own subscription, or a Solo
+    // held by a live Team (it is never adopted).
+    let adopted: "active" | "past_due" = "active";
+    if (paidSub) {
+      const cur = await db
+        .prepare(
+          "SELECT stripe_subscription_id AS id, tier, status FROM tiers WHERE stripe_customer_id = ?",
+        )
+        .bind(customer)
+        .first<{
+          id: string | null;
+          tier: string | null;
+          status: string | null;
+        }>();
+      const heldByTeam =
+        (cur?.tier === "team" || cur?.tier === "business") &&
+        (cur.status === "active" ||
+          cur.status === "past_due" ||
+          cur.status === "suspended");
+      const soloPaid =
+        isObj(ev.object.metadata) && asTier(ev.object.metadata.tier) === "solo";
+      if (cur && cur.id !== paidSub && !(soloPaid && heldByTeam)) {
+        const cfg: StripeConfig = {
+          secretKey: env.STRIPE_SECRET_KEY ?? "",
+          ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+        };
+        let state: string;
+        try {
+          state = (await retrieveSubscription({ subscriptionId: paidSub }, cfg))
+            .status;
+        } catch {
+          log("subscription_read_failed");
+          return json({ error: "unavailable" }, 500);
+        }
+        const live = statusFromSubscription(state);
+        if (live !== "active" && live !== "past_due") {
+          // Recorded, nothing applied, nothing queued.
+          const r = await db.batch([
+            db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
+          ]);
+          log((r[0]?.meta.changes ?? 0) > 0 ? "not_live" : "replay");
+          return json({ received: true });
+        }
+        adopted = live;
+      }
+    }
+    if (adopted !== "active")
+      change = changeFor(ev, pricesOf(env), adopted) ?? change;
     const stream = streamOf(ev.type);
     const sets = [
       ...change,
@@ -856,17 +945,6 @@ export async function handleStripeWebhook(
     ];
     // The sets use plain `?`; the WHERE binds by number after them.
     const n = sets.reduce((k, s) => k + s.args.length, 0);
-    const isCheckout =
-      ev.type === "checkout.session.completed" ||
-      ev.type === "checkout.session.async_payment_succeeded";
-    // Checkout names the subscription it sets (?n+2); the other events the
-    // one they are about.
-    const eventSub = isCheckout
-      ? typeof ev.object.subscription === "string" &&
-        SUB_ID.test(ev.object.subscription)
-        ? ev.object.subscription
-        : null
-      : subscriptionOf(ev);
     const at = `?${n + 3}`;
     const subOrder = IN_ORDER.subscription.replaceAll("?1", at);
     const order =
@@ -899,17 +977,6 @@ export async function handleStripeWebhook(
           lapses(ev)
           ? ` AND stripe_subscription_id = ?${n + 2}`
           : ` AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?${n + 2})`;
-    // A paid checkout replaces the row's live subscription: read which one
-    // (to queue it for cancel after the update). It is only ever queued when
-    // the row then holds the checkout's subscription, and never the row's
-    // current one, so a stale read can't cancel what is live.
-    const paidSub =
-      isCheckout &&
-      eventSub &&
-      (ev.object.payment_status === "paid" ||
-        ev.object.payment_status === "no_payment_required")
-        ? eventSub
-        : null;
     const queue: D1PreparedStatement[] = [];
     // A paid checkout replaces the row's live subscription. Which one is read
     // INSIDE the batch, before the update and under the same order and hold
