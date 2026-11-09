@@ -15,13 +15,13 @@ export const BROWSER_HEADERS = {
  */
 export function browserHeaders(
   res: Response,
-  { ownCsp = false }: { ownCsp?: boolean } = {},
+  { ownCsp = false, csp }: { ownCsp?: boolean; csp?: string } = {},
 ): Response {
   const out = new Response(res.body, res);
   for (const [k, v] of Object.entries(BROWSER_HEADERS)) {
     if (k === "content-security-policy" && ownCsp && out.headers.has(k))
       continue;
-    out.headers.set(k, v);
+    out.headers.set(k, k === "content-security-policy" ? (csp ?? v) : v);
   }
   return out;
 }

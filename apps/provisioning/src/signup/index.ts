@@ -1,0 +1,115 @@
+import type { Env } from "../env.js";
+import type { Principal } from "../principal.js";
+import { CLIENT_JS } from "./client.js";
+import { CSS } from "./style.js";
+
+// The sign-up page's own responses on signup.<app>: the static document, its
+// two assets, the public config and the signed-in user's sign-up status. The
+// contract routes it also calls (R1 me, R18 slug check, R4 create) go through
+// the normal route table (SIGNUP_ROUTES). Everything is served from this
+// Worker's code: the admin SPA bundle is never read on this host.
+
+/** The sign-up host's CSP (4.5 adds Turnstile; nothing else leaves 'self'). */
+export const SIGNUP_CSP = [
+  "default-src 'none'",
+  "script-src 'self' https://challenges.cloudflare.com",
+  "style-src 'self'",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "frame-src https://challenges.cloudflare.com",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+].join("; ");
+
+const HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Create your Open Artifacts</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app"></div>
+<noscript><main style="max-width:420px;margin:24px auto;padding:0 16px"><h1>Create your Open Artifacts</h1><p>This page needs JavaScript to sign you in and create your instance.</p></main></noscript>
+<script src="/app.js"></script>
+</body>
+</html>
+`;
+
+const json = (body: unknown, status: number, headers: HeadersInit = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+
+const asset = (body: string, type: string, cache: string) =>
+  new Response(body, {
+    headers: {
+      "content-type": `${type}; charset=utf-8`,
+      "cache-control": cache,
+    },
+  });
+
+/** The static document and assets, or null for any other path. */
+export function signupStatic(req: Request, path: string): Response | null {
+  if (req.method !== "GET" && req.method !== "HEAD") return null;
+  if (path === "/app.css") return asset(CSS, "text/css", "public, max-age=300");
+  if (path === "/app.js")
+    return asset(CLIENT_JS, "text/javascript", "public, max-age=300");
+  if (path === "/") return asset(HTML, "text/html", "no-store");
+  return null;
+}
+
+/** `open` is false while SIGNUPS_ENABLED is "false"; "test-users" shows the form. */
+export function signupConfig(env: Env): Response {
+  return json(
+    {
+      open: env.SIGNUPS_ENABLED !== "false",
+      appDomain: env.APP_DOMAIN,
+      turnstileSiteKey: env.TURNSTILE_SITEKEY ?? null,
+      supportEmail: `support@${env.APP_DOMAIN}`,
+      docsUrl: "https://open-artifacts.com",
+      githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+type Row = { status: string; slug: string };
+const STAGES = new Set([
+  "pending",
+  "queued",
+  "waiting_cap",
+  "creating",
+  "ready",
+  "failed",
+]);
+
+/**
+ * The caller's newest self-serve sign-up: `stage` is the signups.status
+ * (`pending` shows as queued). A failed one frees the address; the page shows
+ * it so the person is told, and a new sign-up replaces it.
+ */
+export async function signupStatus(env: Env, p: Principal): Promise<Response> {
+  const row = await env.PLATFORM_DB.prepare(
+    `SELECT status, slug FROM signups WHERE source = 'self-serve' AND owner_sub = ?
+     ORDER BY created_at DESC, signup_id DESC LIMIT 1`,
+  )
+    .bind(p.sub ?? "")
+    .first<Row>();
+  const h = { "cache-control": "no-store" };
+  if (!row || !STAGES.has(row.status)) return json({ stage: "none" }, 200, h);
+  return json(
+    {
+      stage: row.status === "pending" ? "queued" : row.status,
+      slug: row.slug,
+      host: `${row.slug}.${env.APP_DOMAIN}`,
+    },
+    200,
+    h,
+  );
+}

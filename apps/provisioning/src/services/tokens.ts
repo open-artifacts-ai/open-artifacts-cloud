@@ -80,6 +80,8 @@ export type SessionRow = {
   expires_at: number;
   revoked_at: number | null;
   last_seen_at: number | null;
+  /** Self-serve sessions: the verified Google Workspace domain, else null (0010). */
+  hd?: string | null;
 };
 
 export type MintOpts =

@@ -4,6 +4,7 @@ import { type Principal, type Refusal, refusal } from "../principal.js";
 import { principalByBearer } from "../services/tokens.js";
 import { oidcPrincipal } from "./oidc.js";
 import { sessionPrincipal } from "./session.js";
+import { signupPrincipal } from "./signup-session.js";
 
 /** Three base64url parts: a JWT (the OIDC bearer); OAuth tokens are not. */
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -24,6 +25,7 @@ export async function authenticate(
   now: number = Date.now(),
 ): Promise<Principal | Refusal> {
   if (host === "admin") return sessionPrincipal(req, env, now);
+  if (host === "signup") return signupPrincipal(req, env, now);
   if (host !== "api") return refusal("unauthenticated");
   const m = /^Bearer (\S+)$/i.exec(req.headers.get("authorization") ?? "");
   const token = m?.[1];

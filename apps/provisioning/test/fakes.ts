@@ -13,6 +13,7 @@ import type { Principal } from "../src/principal.js";
 export const APP = "hosted.test";
 export const ADMIN = `https://admin.${APP}`;
 export const API = `https://api.${APP}`;
+export const SIGNUP = `https://signup.${APP}`;
 
 /** An Ed25519 PKCS#8 key (base64url) from one fill byte. */
 export const pkcs8 = (fill: number) =>
@@ -21,6 +22,7 @@ export const pkcs8 = (fill: number) =>
     Buffer.alloc(32, fill),
   ]).toString("base64url");
 export const ADMIN_BROKER_KEY = pkcs8(21);
+export const SIGNUP_BROKER_KEY = pkcs8(22);
 
 export type FakeLimiter = RateLimit & { keys: string[]; allow: boolean };
 export const limiter = (allow = true): FakeLimiter => {
@@ -90,6 +92,8 @@ export function fakeEnv(over: Partial<Env> = {}) {
     MCP_REDIRECT_URIS: "https://claude.ai/api/mcp/auth_callback",
     ADMIN_SESSION_KEY: "k".repeat(32),
     ADMIN_BROKER_KEY,
+    SIGNUP_BROKER_KEY,
+    TURNSTILE_SITEKEY: "0x4AAAAAAAtest",
     PLATFORM_DB: db,
     PROVISION_INSTALL: provisionInstall,
     MANAGE_INSTALL: manageInstall,

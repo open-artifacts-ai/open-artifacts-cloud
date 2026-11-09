@@ -17,9 +17,13 @@ export const csrfToken = (env: Env, sid: string) =>
  * Before authn, every non-GET admin-host request: `Origin` exactly
  * `https://admin.<app>`, and `Sec-Fetch-Site`, when present, `same-origin`.
  */
-export function checkOrigin(req: Request, env: Env): Refusal | null {
+export function checkOrigin(
+  req: Request,
+  env: Env,
+  host: "admin" | "signup" = "admin",
+): Refusal | null {
   if (SAFE.has(req.method)) return null;
-  if (req.headers.get("origin") !== `https://admin.${env.APP_DOMAIN}`)
+  if (req.headers.get("origin") !== `https://${host}.${env.APP_DOMAIN}`)
     return refusal("csrf_failed");
   const site = req.headers.get("sec-fetch-site");
   if (site !== null && site !== "same-origin") return refusal("csrf_failed");

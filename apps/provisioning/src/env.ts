@@ -36,6 +36,16 @@ export interface Env {
   /** Secrets (4.6). */
   ADMIN_SESSION_KEY: string;
   ADMIN_BROKER_KEY: string;
+  /**
+   * Ed25519 pkcs8 for the `i00000signup` broker entry (the sign-up host's
+   * ticket and redeem key). Unset: the sign-up host's sign-in answers 503.
+   */
+  SIGNUP_BROKER_KEY?: string;
+  /**
+   * The public Turnstile site key the sign-up page renders (a self-serve
+   * create needs a token, 4.2). Unset: the page cannot create and says so.
+   */
+  TURNSTILE_SITEKEY?: string;
   OA_ENV: ProvisioningEnv;
   /** Committed `email:sub` comma list (4.1), read on every request. */
   ADMIN_IDENTITIES: string;
