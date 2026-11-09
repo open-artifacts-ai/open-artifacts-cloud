@@ -257,6 +257,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
       "GET /bus/links/confirm",
       "POST /bus/links/confirm/view",
       "POST /bus/links/confirm",
+      "GET /bus/reach/confirm",
+      "POST /bus/reach/confirm/view",
+      "POST /bus/reach/confirm",
     ]);
   });
 

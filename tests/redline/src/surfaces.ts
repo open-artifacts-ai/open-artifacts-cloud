@@ -384,6 +384,10 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "GET /bus/links/confirm",
   "POST /bus/links/confirm/view",
   "POST /bus/links/confirm",
+  // #1346: the reach confirm page, the same kind (PUBLIC_ROUTES).
+  "GET /bus/reach/confirm",
+  "POST /bus/reach/confirm/view",
+  "POST /bus/reach/confirm",
   // Hosted billing: Checkout, Portal and the usage report open Stripe or
   // reach billing only for a person in a browser session (billing.ts
   // requireBillingManager), so a hook-minted session is 404 here.
