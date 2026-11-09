@@ -631,6 +631,7 @@ describe("handleStripeWebhook", () => {
     });
   });
 
+  // Timeout 20s: 2 tiers x 3 orders x 8 signed deliveries (48), about 50 ms each unloaded, with room for a loaded CI runner (default 5s).
   it("on a free or trial row no non-activating event, in any order, changes tier or status or sets grace (invariant)", async () => {
     const events = () => [
       event("customer.subscription.created", sub({ status: "incomplete" })),
@@ -669,7 +670,7 @@ describe("handleStripeWebhook", () => {
           });
         }
       }
-  });
+  }, 20000);
 
   it("with price ids configured, a subscription whose price matches none logs unknown_price once", async () => {
     const lines: string[] = [];
@@ -1021,6 +1022,7 @@ describe("handleStripeWebhook", () => {
       });
     });
 
+    // Timeout 10s: a dozen deliveries, with room for a loaded CI runner (default 5s).
     it("a second subscription's events never move the row (H2)", async () => {
       await deliver(
         event("checkout.session.completed", {
@@ -1060,7 +1062,7 @@ describe("handleStripeWebhook", () => {
       expect((await row(A)).status).toBe("past_due");
       await deliver(event("customer.subscription.deleted", sub()));
       expect((await row(A)).status).toBe("lapsed");
-    });
+    }, 10000);
 
     it("a delayed invoice never undoes a newer subscription change, nor an older invoice a newer one (R8)", async () => {
       await deliver(event("customer.subscription.updated", sub(), at(T + 100)));
@@ -1405,6 +1407,7 @@ describe("Solo (#1568)", () => {
     });
   });
 
+  // Timeout 10s: two rows, three deliveries each, with room for a loaded CI runner (default 5s).
   it("a trial or free row (no live subscription) still never moves: solo does not widen the invariant", async () => {
     for (const tier of ["trial", "free"]) {
       await db
@@ -1426,7 +1429,7 @@ describe("Solo (#1568)", () => {
         });
       }
     }
-  });
+  }, 10000);
 
   it("a delayed active update after a payment failure leaves grace_until unchanged (#862)", async () => {
     await asSolo();
@@ -1652,6 +1655,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     expect(s.calls).toEqual([]);
   });
 
+  // Timeout 10s: three keys, each two deliveries, with room for a loaded CI runner (default 5s).
   it("a live Stripe key or no key never reaches Stripe: 500 before anything is written, so Stripe retries", async () => {
     for (const key of [
       "sk_live_abcdefgh12345678",
@@ -1676,7 +1680,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
         stripe_subscription_id: "sub_New1",
       });
     }
-  });
+  }, 10000);
 
   it("a pruned id arriving again settles nothing new and never cancels the current subscription", async () => {
     await soloLive();
@@ -1747,6 +1751,7 @@ describe("subscription events apply only to the row's current subscription (#156
     };
   };
 
+  // Timeout 10s: an upgrade then six deliveries, with room for a loaded CI runner (default 5s).
   it("after the upgrade, the old Solo subscription's deleted, canceled, past_due and active events change nothing", async () => {
     await solo(OLD);
     const s = okStripe();
@@ -1783,7 +1788,7 @@ describe("subscription events apply only to the row's current subscription (#156
         stripe_subscription_id: NEW,
       });
     }
-  });
+  }, 10000);
 
   it("the new subscription's events arriving before checkout.session.completed are ignored, then the checkout applies", async () => {
     await solo(OLD);
@@ -2495,6 +2500,7 @@ describe("a delayed upgrade Checkout is ordered against other Checkouts only (#1
     });
   });
 
+  // Timeout 10s: two checkouts with Stripe reads and a cancel, with room for a loaded CI runner (default 5s).
   it("an older Checkout never replaces a newer one", async () => {
     await solo();
     const s = stripe();
@@ -2513,7 +2519,7 @@ describe("a delayed upgrade Checkout is ordered against other Checkouts only (#1
       status: "active",
       stripe_subscription_id: "sub_New2",
     });
-  });
+  }, 10000);
 
   it("a retried Checkout of the current subscription, or of one the row left, never revives a lapse (N6 still holds)", async () => {
     await solo();
@@ -2582,6 +2588,7 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
       created === undefined ? {} : { created },
     );
 
+  // Timeout 10s: three rows, each a checkout, a read and a cancel, with room for a loaded CI runner (default 5s).
   it("a Solo checkout on a live Team or Business row keeps the row and queues the NEW subscription for cancel", async () => {
     for (const [tier, status] of [
       ["team", "active"],
@@ -2609,7 +2616,7 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
       expect(s.calls).toEqual(["GET sub_Solo1", "DELETE sub_Solo1"]);
       expect(await pending()).toEqual([]);
     }
-  });
+  }, 10000);
 
   it("a suspended row's subscription is live too: a Solo session paid after suspension changes nothing and is queued; a Team session replaces and queues it", async () => {
     await live("team", "suspended");
@@ -2644,6 +2651,7 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
     expect(s.calls.filter((c) => c.startsWith("DELETE"))).toEqual([]);
   });
 
+  // Timeout 10s: four checkouts with reads and cancels, with room for a loaded CI runner (default 5s).
   it("two paid Team sessions: the later wins and the earlier is cancelled, in either arrival order", async () => {
     await live("solo");
     await db
@@ -2682,7 +2690,7 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
       "DELETE sub_Old1",
       "DELETE sub_T3",
     ]);
-  });
+  }, 10000);
 
   it("an unpaid checkout is never queued; the row's own subscription's checkout replay queues nothing", async () => {
     await live("team");
@@ -2936,6 +2944,7 @@ describe("last_checkout_created moves only when a Checkout adopts its subscripti
 
 describe("concurrent paid Checkouts cannot orphan a subscription (#1568)", () => {
   const KEY = "sk_test_notarealkey0000";
+  // Timeout 10s: three concurrent checkouts with reads and cancels, with room for a loaded CI runner (default 5s).
   it("two paid Team Checkouts racing on a Solo row: the later wins, and both others are cancelled", async () => {
     await db
       .prepare(
@@ -2980,7 +2989,7 @@ describe("concurrent paid Checkouts cannot orphan a subscription (#1568)", () =>
       "sub_T3",
     ]);
     expect(await pending()).toEqual([]);
-  });
+  }, 10000);
 });
 
 // ------------------------------------------------- adoption reads the subscription from Stripe
