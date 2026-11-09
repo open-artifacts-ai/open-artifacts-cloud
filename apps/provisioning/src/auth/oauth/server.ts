@@ -32,7 +32,7 @@ export const OAUTH_SCOPES = [...TokenScopeSchema.options];
 /** The refresh chain's cap: the admin session's length (8 h, Q3). */
 export const refreshCapS = (
   env: Pick<Env, "OA_ENV"> & { ADMIN_SESSION_TTL_HOURS?: unknown },
-) => adminSessionTtlMs(env) / 1000;
+) => (8 * 3600_000) / 1000;
 /** 30 days (the library's default is 90): a secret grants nothing without a live grant. */
 export const CLIENT_REGISTRATION_TTL_S = 2_592_000;
 /** The library's KV floor: a shorter refresh TTL cannot be stored. */
