@@ -487,6 +487,17 @@ export const DROPPED: Readonly<
       },
     ],
   },
+  "org GET /api/v1/onboarding": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/onboarding.test.ts",
+        describe: "R.onboarding",
+        test: "refuses everyone but the owner, and writes nothing",
+      },
+    ],
+  },
   "org PUT /api/v1/onboarding": {
     why: "owner-only",
     coveredBy: [
