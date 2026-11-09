@@ -160,7 +160,7 @@ export class ManageInstall extends WorkflowEntrypoint<
 > {
   async run(
     event: Readonly<WorkflowEvent<WorkflowParams>>,
-    step: WorkflowStep,
+    step: WorkflowStep
   ): Promise<void> {
     return runManage({ env: this.env, io: RUNTIME_IO }, event, step);
   }
@@ -183,7 +183,7 @@ export type RunState = {
 export async function runManage(
   ctx: CreateCtx,
   event: Readonly<WorkflowEvent<WorkflowParams>>,
-  step: WorkflowStep,
+  step: WorkflowStep
 ): Promise<void> {
   const params = WorkflowParamsSchema.safeParse(event.payload);
   if (!params.success) throw new NonRetryableError("internal");
@@ -224,7 +224,7 @@ async function operate(
   ctx: CreateCtx,
   jobId: string,
   step: WorkflowStep,
-  run: RunState,
+  run: RunState
 ): Promise<void> {
   const { kind } = await step.do("load", async () => {
     const job = await readJob(ctx, jobId);
@@ -235,7 +235,7 @@ async function operate(
   const s = <T>(
     name: string,
     config: Parameters<typeof jobStep>[4],
-    fn: () => Promise<T>,
+    fn: () => Promise<T>
   ) => jobStep(ctx, step, jobId, name, config, fn);
   if (kind === "cleanup") return cleanup(ctx, jobId, step);
   const job = await s("recheck", undefined, () => recheck(ctx, jobId));
@@ -250,7 +250,7 @@ async function operate(
           releaseGate({
             release: r2BindingReleaseReader(
               ctx.env.RELEASES as unknown as R2CatalogBucket,
-              deployEnv(ctx.env.OA_ENV),
+              deployEnv(ctx.env.OA_ENV)
             ),
             env: deployEnv(ctx.env.OA_ENV),
             version: job.args.to as string,
@@ -258,10 +258,10 @@ async function operate(
             versions: () =>
               bucketVersions(ctx.env.RELEASES as unknown as R2CatalogBucket),
             above: job.args.from as string,
-          }),
+          })
         );
         const u = await s("upload", MANAGE_UPLOAD_STEP, () =>
-          render(ctx, job, "upgrade", g.version, run),
+          render(ctx, job, "upgrade", g.version, run)
         );
         if (u.dirty) await pauseDirty(ctx, step, job, "upgrade", run);
       }
@@ -270,14 +270,16 @@ async function operate(
     case "rollback":
       if (!job.already) {
         const u = await s("upload", MANAGE_UPLOAD_STEP, () =>
-          render(ctx, job, "rollback", job.args.to as string, run),
+          render(ctx, job, "rollback", job.args.to as string, run)
         );
         if (u.dirty) await pauseDirty(ctx, step, job, "rollback", run);
       }
       break;
     case "suspend":
       await s("pause", LEASED_STEP, async () => {
-        await (await p(job)).pause(job.installId, "paused", {
+        await (
+          await p(job)
+        ).pause(job.installId, "paused", {
           kind: "suspend",
         });
         await transient(modeStatement(ctx, job.installId, "paused").run());
@@ -291,8 +293,8 @@ async function operate(
           "UPDATE install_lifecycle SET suspended_at = COALESCE(suspended_at, ?2), suspend_reason = ?3, updated_at = ?2 WHERE install_id = ?1",
           job.installId,
           ctx.io.now(),
-          job.args.reason ?? null,
-        ),
+          job.args.reason ?? null
+        )
       );
       break;
     case "resume":
@@ -301,8 +303,8 @@ async function operate(
           ctx,
           "UPDATE install_lifecycle SET suspended_at = NULL, suspend_reason = NULL, updated_at = ?2 WHERE install_id = ?1",
           job.installId,
-          ctx.io.now(),
-        ),
+          ctx.io.now()
+        )
       );
       await s("unpause", LEASED_STEP, async () => {
         await (await p(job)).unpause(job.installId, { kind: "resume" });
@@ -323,7 +325,7 @@ async function operate(
           "UPDATE install_lifecycle SET deleted_at = COALESCE(deleted_at, ?2), purge_at = COALESCE(purge_at, ?3), updated_at = ?2 WHERE install_id = ?1",
           job.installId,
           now,
-          now + GRACE_MS,
+          now + GRACE_MS
         );
       });
       break;
@@ -334,8 +336,8 @@ async function operate(
           ctx,
           "UPDATE install_lifecycle SET deleted_at = NULL, purge_at = NULL, updated_at = ?2 WHERE install_id = ?1",
           job.installId,
-          ctx.io.now(),
-        ),
+          ctx.io.now()
+        )
       );
       await s("reopen", LEASED_STEP, async () => {
         const w = await p(job);
@@ -361,11 +363,14 @@ async function operate(
               jobId,
               p.state === "done" || p.state === "skipped"
                 ? "teardown"
-                : "revoke_directory",
+                : "revoke_directory"
             ),
         });
         await markStep(ctx, jobId, "teardown");
         await transient(modeStatement(ctx, job.installId, "unmapped").run());
+        // The install is gone: free its self-serve account claim (#1046). A
+        // replay or an install that never claimed one changes nothing.
+        await record(ctx, FREE_ACCOUNT_ON_PURGE, job.installId, ctx.io.now());
         return { state: "deleted" };
       });
       break;
@@ -376,7 +381,7 @@ async function operate(
           ctx,
           "UPDATE install_lifecycle SET deleted_at = COALESCE(deleted_at, ?2), purge_at = COALESCE(purge_at, ?2), discarded_at = COALESCE(discarded_at, ?2), serving_mode = 'unmapped', updated_at = ?2 WHERE install_id = ?1",
           job.installId,
-          now,
+          now
         );
       });
       break;
@@ -384,11 +389,11 @@ async function operate(
       await s("release", undefined, async () => {
         const row = await installRow(ctx, job.installId);
         if (!row?.lease) return { released: false };
-        const r = await (await p(job)).releaseLease(
-          job.installId,
-          job.installId,
-          { force: job.args.force === true },
-        );
+        const r = await (
+          await p(job)
+        ).releaseLease(job.installId, job.installId, {
+          force: job.args.force === true,
+        });
         return { released: r.released };
       });
       break;
@@ -416,7 +421,7 @@ async function operate(
       "copy_key_check",
       undefined,
       () => seeLeftKey(ctx, jobId, job.installId),
-      job.kind === "update" ? "mode_live" : "health",
+      job.kind === "update" ? "mode_live" : "health"
     );
   await s("done", undefined, () => finish(ctx, job));
 }
@@ -426,6 +431,12 @@ const labelOf = (j: { signupId: string | null; jobId: string }) =>
   `ss-${j.signupId ?? j.jobId}`;
 
 /** One lifecycle write; the step's output is the change count only. */
+// Purge frees the account's one-install claim (#1046). The claim's signup is
+// one of this install's jobs' signup_id; a claim already freed is untouched.
+const FREE_ACCOUNT_ON_PURGE = `UPDATE signup_accounts SET freed_at = ?2
+WHERE freed_at IS NULL
+  AND signup_id IN (SELECT signup_id FROM jobs WHERE install_id = ?1 AND signup_id IS NOT NULL)`;
+
 async function record(
   ctx: CreateCtx,
   sql: string,
@@ -434,7 +445,7 @@ async function record(
   const r = await transient(
     ctx.env.PLATFORM_DB.prepare(sql)
       .bind(...binds)
-      .run(),
+      .run()
   );
   return { changed: r.meta.changes ?? 0 };
 }
@@ -455,7 +466,7 @@ async function render(
   job: ManageJob,
   kind: "upgrade" | "rollback",
   to: string,
-  run: RunState,
+  run: RunState
 ): Promise<{ version: string; dirty?: true }> {
   // An earlier attempt in this run found it dirty: never render again.
   if (run.dirty) return { version: to, dirty: true };
@@ -503,12 +514,12 @@ async function render(
 const rolledBack = (to: string, from: string) =>
   new ProvisionRefused(
     `upgrade to ${to} failed and rolled back to ${from}`,
-    "upgrade_rolled_back",
+    "upgrade_rolled_back"
   );
 const incomplete = (kind: string, to: string) =>
   new ProvisionRefused(
     `${kind} to ${to} did not finish; a forward fix is needed`,
-    "upgrade_incomplete",
+    "upgrade_incomplete"
   );
 
 /** The rows that start an upload, and those that end one. */
@@ -538,19 +549,21 @@ const RENDER_ROWS = [
 async function renderOutcome(
   ctx: CreateCtx,
   job: ManageJob,
-  kind: "upgrade" | "rollback",
+  kind: "upgrade" | "rollback"
 ): Promise<"clean" | "dirty" | "rolled_back" | "incomplete" | null> {
   const r = await transient(
     ctx.env.PLATFORM_DB.prepare(
-      `SELECT action FROM hosted_audit WHERE install_id = ?1 AND actor = ?2 AND action IN (${RENDER_ROWS.map((a) => `'${a}'`).join(", ")}) ORDER BY id`,
+      `SELECT action FROM hosted_audit WHERE install_id = ?1 AND actor = ?2 AND action IN (${RENDER_ROWS.map(
+        (a) => `'${a}'`
+      ).join(", ")}) ORDER BY id`
     )
       .bind(job.installId, `job:${job.jobId}`)
-      .all<{ action: string }>(),
+      .all<{ action: string }>()
   );
   const rows = r.results.map((x) => x.action);
   const i = Math.max(
     rows.lastIndexOf("upgrade.start"),
-    rows.lastIndexOf("rollback.start"),
+    rows.lastIndexOf("rollback.start")
   );
   if (i < 0) return null;
   const after = rows.slice(i + 1);
@@ -570,7 +583,7 @@ async function pauseDirty(
   step: WorkflowStep,
   job: ManageJob,
   kind: "upgrade" | "rollback",
-  run: RunState,
+  run: RunState
 ): Promise<never> {
   // Set before the pause: a pause that fails still fails prod_dirty.
   run.dirty = true;
@@ -584,18 +597,16 @@ async function pauseDirty(
       // Lowering exposure only warns near expiry (5.5, 5.7): the pause runs
       // as a suspend whatever the parent kind, so an upgrade's "refuse"
       // never keeps the dirty script serving.
-      await (await provisionerWith(ctx, labelOf(job), job.jobId)).pause(
-        job.installId,
-        "paused",
-        { kind: "suspend" },
-      );
+      await (
+        await provisionerWith(ctx, labelOf(job), job.jobId)
+      ).pause(job.installId, "paused", { kind: "suspend" });
       await transient(modeStatement(ctx, job.installId, "paused").run());
       throw new ProvisionRefused(
         `${kind} left a script that fails verify_clean; paused`,
-        "prod_dirty",
+        "prod_dirty"
       );
     },
-    "upload",
+    "upload"
   );
   throw new NonRetryableError("prod_dirty");
 }
@@ -607,13 +618,13 @@ async function pauseDirty(
  */
 async function finish(
   ctx: CreateCtx,
-  job: { jobId: string; kind: string; installId: string },
+  job: { jobId: string; kind: string; installId: string }
 ): Promise<{ done: true }> {
   await transient(
     ctx.env.PLATFORM_DB.batch([
       doneAuditStatement(ctx, job),
       doneStatement(ctx, job.jobId),
-    ]),
+    ])
   );
   return { done: true };
 }
@@ -687,7 +698,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         job,
         st,
         args,
-        now,
+        now
       );
       break;
     case "discard":
@@ -732,7 +743,7 @@ const oauthGrant = async (ctx: CreateCtx, job: JobRow) =>
     await transient(
       ctx.env.PLATFORM_DB.prepare("SELECT kind FROM agent_tokens WHERE id = ?")
         .bind(job.token_id)
-        .first<{ kind: string }>(),
+        .first<{ kind: string }>()
     )
   )?.kind === "oauth";
 
@@ -741,7 +752,7 @@ async function checkKind(
   ctx: CreateCtx,
   job: JobRow,
   kind: ManageKind,
-  st: StatusRow,
+  st: StatusRow
 ): Promise<void> {
   // A prod_dirty create's purge (5.2 x) is the provisioner's own job:
   // system, from failed, compensating that create.
@@ -765,10 +776,10 @@ async function checkKind(
 const purgeSince = async (ctx: CreateCtx, installId: string, since: number) =>
   (await transient(
     ctx.env.PLATFORM_DB.prepare(
-      "SELECT 1 AS x FROM jobs WHERE install_id = ? AND kind = 'purge' AND created_at >= ? LIMIT 1",
+      "SELECT 1 AS x FROM jobs WHERE install_id = ? AND kind = 'purge' AND created_at >= ? LIMIT 1"
     )
       .bind(installId, since)
-      .first(),
+      .first()
   )) !== null;
 
 /**
@@ -795,7 +806,7 @@ async function purgePreconditions(
   job: JobRow,
   st: StatusRow,
   args: Record<string, unknown>,
-  now: number,
+  now: number
 ): Promise<string | undefined> {
   // OIDC purges its own rl- installs as an admin would (4.4), but a
   // skipped directory revoke is an admin's only (5.6, PURGE_FIELD_RULES).
@@ -836,12 +847,12 @@ async function purgePreconditions(
 async function cleanup(
   ctx: CreateCtx,
   jobId: string,
-  step: WorkflowStep,
+  step: WorkflowStep
 ): Promise<void> {
   const s = <T>(
     name: string,
     config: Parameters<typeof jobStep>[4],
-    fn: () => Promise<T>,
+    fn: () => Promise<T>
   ) => jobStep(ctx, step, jobId, name, config, fn);
   const job = await step.do("parent", async () => {
     const j = checkJob(await readJob(ctx, jobId), "manage_install", [
@@ -880,13 +891,13 @@ async function cleanup(
         (
           await transient(
             ctx.env.PLATFORM_DB.prepare(
-              "SELECT COALESCE(finished_at, updated_at) AS t FROM jobs WHERE id = ?",
+              "SELECT COALESCE(finished_at, updated_at) AS t FROM jobs WHERE id = ?"
             )
               .bind(parent.id)
-              .first<{ t: number }>(),
+              .first<{ t: number }>()
           )
         )?.t ?? ctx.io.now(),
-      until: row?.lease ? (row.lease_until ?? 0) : null,
+      until: row?.lease ? row.lease_until ?? 0 : null,
     };
   });
   const { parentId, label } = job;
@@ -900,7 +911,7 @@ async function cleanup(
       jobId,
       label ?? `ss-${jobId}`,
       job.installId,
-      job.until,
+      job.until
     );
   } catch (e) {
     released = e;
@@ -915,12 +926,12 @@ async function cleanup(
       jobId,
       job.installId,
       job.stoppedAt,
-      "sweep_tokens",
+      "sweep_tokens"
     ).catch((e: unknown) => {
       keyLeft = e;
     });
   await s("sweep_tokens", undefined, async () =>
-    label ? sweepTokens(ctx, label, job.installId, jobId) : { revoked: 0 },
+    label ? sweepTokens(ctx, label, job.installId, jobId) : { revoked: 0 }
   );
   await s("settle", undefined, async () => {
     const p = await readJob(ctx, parentId);
@@ -931,14 +942,14 @@ async function cleanup(
         ...(p ? [failedAuditStatement(ctx, p, code)] : []),
         ...settleFailedStatements(db, parentId, code, ctx.io.now()),
         ...(await reconcile(ctx, job.installId)),
-      ]),
+      ])
     );
     return { settled: parentId };
   });
   if (released !== null) throw released;
   if (keyLeft !== null) throw keyLeft;
   await s("done", undefined, () =>
-    finish(ctx, { jobId, kind: "cleanup", installId: job.installId }),
+    finish(ctx, { jobId, kind: "cleanup", installId: job.installId })
   );
 }
 
@@ -957,7 +968,7 @@ async function releaseWhenExpired(
   jobId: string,
   label: string,
   installId: string,
-  first: number | null,
+  first: number | null
 ): Promise<void> {
   let until = first;
   for (let i = 0; ; i++) {
@@ -978,14 +989,14 @@ async function releaseWhenExpired(
           if (i < CLEANUP_LEASE_WAITS) return { released: false, until: live };
           throw new ProvisionRetry(
             "the lease is still held after cleanup waited it out",
-            "lease_held",
+            "lease_held"
           );
         }
         const w = await provisionerWith(ctx, label, jobId);
         await w.releaseLease(installId, installId);
         return { released: true, until: null };
       },
-      "release_lease",
+      "release_lease"
     );
     if (r.until === null) return;
     until = r.until;
@@ -1002,7 +1013,7 @@ async function releaseWhenExpired(
 async function fail(
   ctx: CreateCtx,
   jobId: string,
-  run: RunState,
+  run: RunState
 ): Promise<{
   failed: boolean;
   leaseUntil: number | null;
@@ -1021,7 +1032,7 @@ async function fail(
       failedAuditStatement(ctx, job, code),
       ...settleFailedStatements(db, jobId, code, ctx.io.now()),
       ...(await reconcile(ctx, job.install_id)),
-    ]),
+    ])
   );
   // update: updateVars claims the same lease.
   if (
@@ -1054,7 +1065,7 @@ export const CLAIM_LEASE_MS = 30 * 60_000;
 function ownLease(
   job: JobRow,
   row: { state: string; lease: string | null; lease_until: number | null },
-  claimed: string | null | undefined,
+  claimed: string | null | undefined
 ): boolean {
   if (row.state !== "upgrading" || row.lease === null) return false;
   if (claimed !== undefined && claimed !== null) return claimed === row.lease;
@@ -1072,7 +1083,7 @@ function ownLease(
 async function releaseExpired(
   ctx: CreateCtx,
   jobId: string,
-  lease: string | null,
+  lease: string | null
 ): Promise<{ released: boolean }> {
   const job = await readJob(ctx, jobId);
   if (!job) return { released: false };
