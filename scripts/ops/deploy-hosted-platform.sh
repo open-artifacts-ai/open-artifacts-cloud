@@ -31,8 +31,7 @@
 #                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
 #                    only, both put on the Worker, a run without them fails
 #                    before anything changes)
-#   dispatch         HOSTS_KV_ID (both brokers must exist; staging also
-#                    oa-s-billing, its BILLING binding, #1568)
+#   dispatch         HOSTS_KV_ID (both brokers must exist)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
 #                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
@@ -252,16 +251,6 @@ expect_private() {
   local got
   got="$(jq -r "$2" <<< "$1")"
   [ "$got" = "$3" ] || { echo "$4: not the expected value" >&2; exit 1; }
-}
-
-# billing_bound <settings json> <app>: the BILLING service binding (#1568) is
-# oa-s-billing on staging, where dispatch and the scheduler bind it together,
-# and absent on prod, which has no billing Worker.
-billing_bound() {
-  local want=""
-  [ "$env" != staging ] || want="oa-$P-billing"
-  expect "$1" '[.result.bindings[] | select(.name == "BILLING") | "\(.type) \(.service)"] | join(",")' \
-    "${want:+service $want}" "$2 BILLING binding"
 }
 
 # broker_pin: provision's BROKER_GOOGLE_CLIENT_ID[$env] from $BROKER_PIN_FILE
@@ -592,16 +581,12 @@ case "$target" in
   dispatch)
     need HOSTS_KV_ID
     need_workers oa-$P-auth-broker oa-$P-directory-broker
-    # Staging binds BILLING (#1568): a binding needs its service deployed
-    # first. Prod has none.
-    [ "$env" != staging ] || need_workers oa-$P-billing
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
     expect "$S" '.result.bindings[] | select(.name == "HOSTS") | .namespace_id' "$HOSTS_KV_ID" "HOSTS"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' oa-$P-auth-broker "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
-    billing_bound "$S" dispatch
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
     expect "$S" '.result.observability.enabled // false' false "observability"
     ;;
@@ -612,7 +597,6 @@ case "$target" in
     # Its Workflows, RPC and producer bindings point at these: deploying first
     # would ship a scheduler bound to nothing.
     need_workers oa-$P-auth-broker oa-$P-directory-broker oa-$P-provisioner
-    [ "$env" != staging ] || need_workers oa-$P-billing
     need_queue oa-$P-signups
     # The tag's alert wiring (#915) must be "pinned": every alert var and
     # ALERT_EMAIL's destination is this env's placeholder. "absent" (none of
@@ -653,7 +637,6 @@ case "$target" in
       sched_deploy
     fi
     S="$(settings oa-$P-scheduler)"
-    billing_bound "$S" scheduler
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .type' service "PROVISIONER type"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .service' oa-$P-provisioner "PROVISIONER"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .entrypoint' ProvisionerRpc "PROVISIONER entrypoint"

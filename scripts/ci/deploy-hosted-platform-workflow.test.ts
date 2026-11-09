@@ -669,26 +669,6 @@ describe("deploy-hosted-platform.yml", () => {
           order.indexOf(app),
         );
       }
-    // Staging binds billing (#1568) on dispatch and the scheduler: it
-    // deploys before both, and prod binds it nowhere.
-    const stagingBound = (app: string): string[] => {
-      const cfg = JSON.parse(
-        strip(readFileSync(join(root, `apps/${app}/wrangler.jsonc`), "utf8")),
-      ).env.staging;
-      return (cfg.services ?? []).map((s: { service: string }) =>
-        String(s.service).replace(/^oa-s-/, ""),
-      );
-    };
-    for (const app of ["dispatch", "scheduler"]) {
-      expect(stagingBound(app), app).toContain("billing");
-      expect(order.indexOf("billing"), `billing before ${app}`).toBeLessThan(
-        order.indexOf(app),
-      );
-      expect(bound(app), `prod ${app}`).not.toContain("billing");
-    }
-    expect(order.indexOf("billing")).toBeGreaterThan(
-      order.indexOf("directory-broker"),
-    );
     expect(bound("provisioning")).toEqual(
       expect.arrayContaining(["platform-db", "provisioner", "auth-broker"]),
     );
