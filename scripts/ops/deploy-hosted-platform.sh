@@ -125,17 +125,40 @@ need() { # name: a required, non-empty env var
   [ -n "${!1:-}" ] || { echo "$1 is required for $target" >&2; exit 2; }
 }
 secret_names() { cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name'; }
-# put_secret <worker> <app dir> <name>: the value comes on stdin.
+# put_secret <worker> <app dir> <name>: the value comes on stdin. A failed put
+# is tried PUT_ATTEMPTS (3) times in all, PUT_RETRY_SLEEP seconds (default 5)
+# after the first failure and three times that after the second: Cloudflare
+# answers an unknown 10013 now and then (run 42647320740, #55). The value is
+# held in a shell variable and fed to each attempt by the printf builtin, so it
+# is never in argv, the log or a file.
+PUT_ATTEMPTS=3
 put_secret() {
   if [ -n "$VERIFY_ONLY" ]; then
     cat > /dev/null
     echo "$1: verify only, not setting $3"
     return
   fi
-  # A failure returns 1 (an `if` caller turns set -e off).
-  (cd "$root/apps/$2" && pnpm exec wrangler secret put "$3" --env "$env" > /dev/null) ||
-    { echo "$1: putting $3 failed" >&2; return 1; }
-  echo "$1: $3 set"
+  local pause="${PUT_RETRY_SLEEP:-5}" v a
+  [[ "$pause" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; return 1; }
+  # The whole stdin, trailing newlines kept (as the one-shot put read it).
+  v="$(cat; printf x)"
+  v="${v%x}"
+  for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+    # A failure returns 1 (an `if` caller turns set -e off).
+    if printf '%s' "$v" | (cd "$root/apps/$2" && pnpm exec wrangler secret put "$3" --env "$env" > /dev/null); then
+      v=""
+      echo "$1: $3 set"
+      return 0
+    fi
+    if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+      echo "$1: putting $3 failed (attempt $a of $PUT_ATTEMPTS); trying again" >&2
+      sleep "$pause"
+      pause=$((pause * 3))
+    fi
+  done
+  v=""
+  echo "$1: putting $3 failed" >&2
+  return 1
 }
 # A secret put deploys a new, untagged Worker version, and the release tag
 # (#1040) must be on the version that serves. A Worker that takes secrets
@@ -627,13 +650,28 @@ case "$target" in
         ALERT_TO="$ALERT_TO" ALERT_FROM="$ALERT_FROM" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" \
         deploy scheduler
     }
-    sched_deploy
-    # Put only when given (a rotation); secrets survive deploys. Then deploy
-    # again so the serving version carries the tag (#1040).
-    if [ -n "$smoke_puts" ]; then
+    # The tag order (#1040): a secret put makes an untagged version, so the
+    # tagged deploy comes after every put. When the scheduler already exists the
+    # puts come first and nothing has moved if one fails: a failed put can never
+    # leave the scheduler on the tag with the run red (#55). Deploys keep
+    # secrets. Only a scheduler that does not exist yet (its first deploy) must
+    # be deployed before it can take a secret, and then deploys again. The
+    # Environment always provides the values and a secret's value can't be
+    # read back (only its name is listed), so "only when changed" can't be
+    # known: they are put on every run.
+    put_smoke() {
       for k in $smoke_puts; do
         printf '%s' "${!k}" | put_secret oa-$P-scheduler scheduler "$k" || exit 1
       done
+    }
+    if [ -z "$smoke_puts" ]; then
+      sched_deploy
+    elif [ -n "$VERIFY_ONLY" ] || worker_exists oa-$P-scheduler; then
+      put_smoke
+      sched_deploy
+    else
+      sched_deploy
+      put_smoke
       sched_deploy
     fi
     S="$(settings oa-$P-scheduler)"

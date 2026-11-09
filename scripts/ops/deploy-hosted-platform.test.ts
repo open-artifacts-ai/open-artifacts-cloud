@@ -59,6 +59,7 @@ case "$*" in
     v="$(cat)"
     echo "stdin-len $5 \${#v}" >> "$STUB_LOG"
     [ -f "$STATE/fail-put-$5" ] && exit 1
+    [ -f "$STATE/fail-put-once-$5" ] && { rm "$STATE/fail-put-once-$5"; exit 1; }
     touch "$STATE/$w.secrets"; grep -qx "$5" "$STATE/$w.secrets" || echo "$5" >> "$STATE/$w.secrets"
     ;;
 esac`;
@@ -368,6 +369,8 @@ NEXT["oa-p-provisioner"] = provisionerSettings();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
 
 const ENV = {
+  // The put's retry waits (#55) cost nothing here.
+  PUT_RETRY_SLEEP: "0",
   // Not in CI by default (CI sets these, and prod there needs main).
   GITHUB_ACTIONS: "",
   GITHUB_REF: "",
@@ -1396,21 +1399,9 @@ describe("deploy-hosted-platform.sh", () => {
 
     it("a live key, a non-test key or a malformed secret or price is refused without printing it", () => {
       for (const [k, v, want] of [
-        [
-          "STRIPE_SECRET_KEY",
-          "sk_live_abcdefgh12345678",
-          "test-mode key",
-        ],
-        [
-          "STRIPE_SECRET_KEY",
-          "rk_live_abcdefgh12345678",
-          "test-mode key",
-        ],
-        [
-          "STRIPE_SECRET_KEY",
-          "pk_test_abcdefgh12345678",
-          "test-mode key",
-        ],
+        ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "rk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "pk_test_abcdefgh12345678", "test-mode key"],
         ["STRIPE_SECRET_KEY", "sk_test_short", "test-mode key"],
         [
           "STRIPE_WEBHOOK_SECRET",
@@ -2680,6 +2671,95 @@ describe("the canary smoke's secrets (#1343)", () => {
     expect(wrappers[1]).toBeGreaterThan(lastPut);
     hidden(r);
     clean(r);
+  });
+
+  // #55: run 42647320740 put FLEET_SMOKE_TOKEN after the tagged deploy, the put
+  // failed (Cloudflare 10013) and the scheduler stayed on the tag with the run
+  // red. The tag order (#1040) still holds: every put comes before the last
+  // deploy, and an existing scheduler is deployed once, after its puts.
+  describe("the smoke secrets' put order and retry (#55)", () => {
+    const wrappers = (log: string[]) =>
+      log.flatMap((l, i) => (l.startsWith("wrapper") ? [i] : []));
+    const lastPut = (log: string[]) =>
+      log.reduce((m, l, i) => (l.startsWith("stdin-len") ? i : m), -1);
+    const live = () => ({ exists: [...SCHED_DEPS("p"), "oa-p-scheduler"] });
+
+    it("an existing scheduler: both puts, then one tagged deploy", () => {
+      const r = setup(live()).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_SHARE_TO",
+      ]);
+      expect(wrappers(r.log)).toHaveLength(1);
+      expect(wrappers(r.log)[0]).toBeGreaterThan(lastPut(r.log));
+      hidden(r);
+      clean(r);
+    });
+
+    it("an existing scheduler whose put fails every time: three tries, then nothing deployed and the run red", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-put-FLEET_SMOKE_TOKEN": "" },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_TOKEN",
+      ]);
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_TOKEN failed (attempt 1 of 3)",
+      );
+      expect(r.err).toContain(
+        "oa-p-scheduler: putting FLEET_SMOKE_TOKEN failed\n",
+      );
+      expect(wrappers(r.log)).toEqual([]);
+      hidden(r);
+    });
+
+    it("one transient failure is retried: the second try succeeds and the run goes on", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-put-once-FLEET_SMOKE_TOKEN": "" },
+      }).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_SHARE_TO",
+      ]);
+      // Every try carried the whole value.
+      expect(
+        r.log.filter((l) => l === `stdin-len FLEET_SMOKE_TOKEN ${PAT.length}`),
+      ).toHaveLength(2);
+      expect(wrappers(r.log)).toHaveLength(1);
+      hidden(r);
+    });
+
+    it("a scheduler that does not exist yet keeps the old order: deploy, puts, deploy", () => {
+      const r = setup({
+        exists: SCHED_DEPS("p"),
+        files: { "fail-put-once-FLEET_SMOKE_SHARE_TO": "" },
+      }).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      const w = wrappers(r.log);
+      expect(w).toHaveLength(2);
+      expect(w[0]).toBeLessThan(
+        r.log.findIndex((l) => l.startsWith("stdin-len")),
+      );
+      expect(w[1]).toBeGreaterThan(lastPut(r.log));
+    });
+
+    it("a bad PUT_RETRY_SLEEP is refused, without a put", () => {
+      const r = setup(live()).run("scheduler", {
+        ...SMOKE,
+        PUT_RETRY_SLEEP: "soon",
+      });
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("PUT_RETRY_SLEEP must be 0 to 999 seconds");
+      expect(wrappers(r.log)).toEqual([]);
+    });
   });
 
   it("absent: nothing put, one deploy (the smoke then reports itself unconfigured)", () => {

@@ -177,7 +177,7 @@ export function report(o: {
     "",
     ...(o.deployRun ? [`Deploy run: ${o.deployRun}`, ""] : []),
     ...(o.deployNote ? [`Deploy step: ${o.deployNote}`, ""] : []),
-    "The scheduler deploys last and its tag is the fleet's target, so the fleet did not move unless the run failed after the scheduler deployed (then only the read-back failed: check `platform-tags.sh prod`). Read the run: a gate refused the tag, or the deploy or its read-back failed. Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
+    "The scheduler deploys last and its tag is the fleet's target. Whether it moved is not known from here: the deploy run's \"Every platform Worker runs the tag\" step reads every Worker's tag back, and runs even when a deploy step failed, so read it (or `platform-tags.sh prod`). If the scheduler runs the tag, the fleet follows it and the next chain run cannot undo that (forward only). Read the run: a gate refused the tag, or the deploy or its read-back failed. Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
   ].join("\n");
   const existing = open[0];
   if (existing) {

@@ -786,7 +786,7 @@ describe("deploy-hosted-platform.yml", () => {
     // skips the read-back.
     // Prod's full list, or staging's with billing (a staging-only target).
     expect(t.if).toBe(
-      `\${{ inputs.targets == '${w.on.workflow_dispatch.inputs.targets.default}' || inputs.targets == '${FULLB}' }}`,
+      `\${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == '${w.on.workflow_dispatch.inputs.targets.default}' || inputs.targets == '${FULLB}') }}`,
     );
     expect(t.run).toBe(
       'bash "$RUNNER_TEMP/main-ci/platform-tags.sh" "$DEPLOY_ENV" "$TAG"',

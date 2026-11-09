@@ -289,7 +289,7 @@ describe("prod-release-chain.yml", () => {
     );
     expect(sh).not.toContain("billing");
     expect(ifOf("Every platform Worker runs the tag")).toBe(
-      `\${{ inputs.targets == '${FULL}' || inputs.targets == '${FULLB}' }}`,
+      `\${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == '${FULL}' || inputs.targets == '${FULLB}') }}`,
     );
     expect(ifOf("Record the break-glass deploy")).toBe(
       `\${{ !inputs.verify_only && inputs.targets != '${FULL}' && inputs.targets != '${FULLB}' }}`,
@@ -522,6 +522,16 @@ describe("report: one blocker issue while red", () => {
         run: RUN,
       }),
     ).toEqual({ action: "refreshed", issue: 4 });
+  });
+
+  it("a red issue never claims the fleet stayed put: it points at the read-back that runs after a failed deploy (#55)", () => {
+    const a = world([]);
+    report({ exec: a.exec, repo: REPO, tag: TAG, result: "failure", run: RUN });
+    const create = a.calls.find((c) => c[1] === "create") ?? [];
+    const body = create[create.indexOf("--body") + 1] ?? "";
+    expect(body).not.toMatch(/did not move|never moves|stayed/);
+    expect(body).toContain("Every platform Worker runs the tag");
+    expect(body).toContain("the fleet follows it");
   });
 
   it("a neutral skip (stale event, a release prod has) neither opens, refreshes nor closes it", () => {
