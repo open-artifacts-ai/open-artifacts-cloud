@@ -140,6 +140,13 @@ test("form and closed pages have no inline styles and no CSP violations", async 
   }
 });
 
+test("form price line reads exactly", async ({ page }) => {
+  await mount(page, { me: false });
+  await expect(page.locator(".panel .muted.small")).toHaveText(
+    "Solo: free for your first month, then $1/month or $12/year. No card needed.",
+  );
+});
+
 const SHOTS = process.env.SHOTS_DIR;
 const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   closed: { open: false },

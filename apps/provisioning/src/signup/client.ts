@@ -145,7 +145,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("div", { class: "field" }, [h("label", { for: "slug" }, ["Your address"]), refs.box, refs.help, refs.sugg]),
       refs.err, refs.ts, refs.btn,
       h("p", { class: "muted small mt" }, [
-        "Solo: free for your first 30 days, then $1/month or $12/year. No card needed."
+        "Solo: free for your first month, then $1/month or $12/year. No card needed."
       ])
     ]));
     paintAvail();
