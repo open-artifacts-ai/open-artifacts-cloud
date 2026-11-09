@@ -213,7 +213,7 @@ export const PLAN: readonly Phase[] = [
     lane("prov", "provisioning"),
     lane("surfaces", "surfaces"),
     lane("creds", "credentials"),
-    lane("guard", "guard", "bus"),
+    lane("guardx", "guard", "bus"),
     lane("front", "signin", "edge", "live"),
   ],
 ];
