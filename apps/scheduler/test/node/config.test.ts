@@ -53,6 +53,8 @@ describe("wrangler.jsonc", () => {
         FLEET_SMOKE: env === "staging" ? "off" : "required",
         // The share check is on in both: an explicit, committed choice.
         FLEET_SMOKE_SHARE: "on",
+        // #1299: off until the /bus routes are lifted on hosted installs.
+        FLEET_SMOKE_BUS: "off",
         // ... and keeps the passive soak: 15 min on staging, 60 on prod.
         FLEET_SOAK_MIN: env === "staging" ? "15" : "60",
       });
