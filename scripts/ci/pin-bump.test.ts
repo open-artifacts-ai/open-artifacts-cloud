@@ -1,5 +1,6 @@
 // The pin-bump PR opener: one PR for the newest public release, never a
 // second, never armed, and any API error is a thrown error (a red run).
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,10 +15,13 @@ import {
   openPr,
   plan,
   rewritePin,
+  STALE_PR_MS,
 } from "./pin-bump.ts";
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const PUB = "open-artifacts-ai/open-artifacts";
+const NOW = Date.parse("2026-11-09T12:00:00Z");
+const hoursAgo = (h: number) => new Date(NOW - h * 3_600_000).toISOString();
 const OLD_SHA = "607c02b1bc6e2f918260d657e5032257aa6f8d3f";
 const NEW_SHA = "a".repeat(40);
 const PIN = `# The public open-artifacts release this repo builds on.
@@ -34,7 +38,12 @@ const rel = (tag_name: string, extra: Partial<Rel> = {}) => ({
 
 const world = (o: {
   releases?: Rel[];
-  open?: { number: number; headRefName: string; url: string }[];
+  open?: {
+    number: number;
+    headRefName: string;
+    url: string;
+    createdAt?: string;
+  }[];
   taken?: { number: number; state: string }[];
   sha?: string;
   failApi?: string;
@@ -64,7 +73,7 @@ const world = (o: {
   return { exec, calls };
 };
 const go = (o: Parameters<typeof world>[0], pin = PIN) =>
-  plan({ exec: world(o).exec, repo: REPO, publicRepo: PUB, pin });
+  plan({ exec: world(o).exec, repo: REPO, publicRepo: PUB, pin, now: NOW });
 
 describe("compareTags", () => {
   it("compares numbers, not strings", () => {
@@ -110,9 +119,16 @@ describe("plan", () => {
 
   it("never opens a second PR while a pin-bump PR is open", () => {
     const { exec, calls } = world({
-      open: [{ number: 3, headRefName: "pin-bump/v0.136.2", url: "u3" }],
+      open: [
+        {
+          number: 3,
+          headRefName: "pin-bump/v0.136.2",
+          url: "u3",
+          createdAt: hoursAgo(1),
+        },
+      ],
     });
-    const r = plan({ exec, repo: REPO, publicRepo: PUB, pin: PIN });
+    const r = plan({ exec, repo: REPO, publicRepo: PUB, pin: PIN, now: NOW });
     expect(r.bump).toBe(false);
     expect(r.why).toContain("u3");
     expect(calls.some((c) => c[1] === "create")).toBe(false);
@@ -120,7 +136,16 @@ describe("plan", () => {
 
   it("an open PR from another branch is not a pin-bump PR", () => {
     expect(
-      go({ open: [{ number: 3, headRefName: "feature/x", url: "u" }] }),
+      go({
+        open: [
+          {
+            number: 3,
+            headRefName: "feature/x",
+            url: "u",
+            createdAt: hoursAgo(1),
+          },
+        ],
+      }),
     ).toMatchObject({ bump: true });
   });
 
@@ -144,6 +169,47 @@ describe("plan", () => {
   it("a broken PUBLIC_PIN throws", () => {
     expect(() => go({}, "sha=abc\n")).toThrow("no tag=");
     expect(() => go({}, "tag=latest\nsha=x\n")).toThrow("isn't vX.Y.Z");
+  });
+});
+
+describe("a stuck bump PR", () => {
+  const stuck = (ms: number, extra: object = {}) => ({
+    open: [
+      {
+        number: 3,
+        headRefName: "pin-bump/v0.136.2",
+        url: "u3",
+        createdAt: new Date(NOW - ms).toISOString(),
+        ...extra,
+      },
+    ],
+  });
+
+  it("is three days", () => {
+    expect(STALE_PR_MS).toBe(3 * 24 * 3_600_000);
+  });
+
+  it("turns the run red once it is older than that, even with no newer release", () => {
+    expect(() => go(stuck(STALE_PR_MS + 60_000))).toThrow(
+      "open for over 3 days",
+    );
+    expect(() =>
+      go({ ...stuck(STALE_PR_MS + 60_000), releases: [rel("v0.136.1")] }),
+    ).toThrow("u3");
+  });
+
+  it("a younger one just holds the line", () => {
+    expect(go(stuck(STALE_PR_MS - 60_000))).toMatchObject({ bump: false });
+  });
+
+  it("a PR from another branch is never stuck", () => {
+    expect(
+      go(stuck(STALE_PR_MS * 3, { headRefName: "feature/x" })),
+    ).toMatchObject({ bump: true });
+  });
+
+  it("an unreadable age is an error, not a pass", () => {
+    expect(() => go(stuck(0, { createdAt: undefined }))).toThrow("createdAt");
   });
 });
 
@@ -208,7 +274,14 @@ describe("openPr", () => {
 
   it("a PR that appeared since the plan is left, not duplicated", () => {
     const { exec, calls } = world({
-      open: [{ number: 8, headRefName: "pin-bump/v0.137.0", url: "u8" }],
+      open: [
+        {
+          number: 8,
+          headRefName: "pin-bump/v0.137.0",
+          url: "u8",
+          createdAt: hoursAgo(1),
+        },
+      ],
     });
     expect(openPr({ ...base, exec })).toEqual({ action: "left", url: "u8" });
     expect(calls.some((c) => c[1] === "create")).toBe(false);
@@ -230,21 +303,37 @@ describe("pin-bump.yml", () => {
   // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
   const w: any = parse(text);
   // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
-  const steps: any[] = w.jobs.bump.steps;
-  const step = (id: string) => steps.find((s) => s.id === id);
+  type Step = any;
+  const jobs = w.jobs;
+  const stepsOf = (j: string): Step[] => jobs[j].steps;
+  const step = (j: string, id: string) => stepsOf(j).find((s) => s.id === id);
+  const MAIN = "github.ref == 'refs/heads/main'";
 
-  it("runs on a schedule, and by dispatch", () => {
+  it("runs on a schedule, and by dispatch, from main only", () => {
     expect(Object.keys(w.on)).toEqual(["schedule", "workflow_dispatch"]);
     expect(w.on.schedule).toHaveLength(1);
     expect(w.on.schedule[0].cron).toMatch(/^\S+ \S+ \S+ \S+ \S+$/);
+    for (const j of ["prepare", "open", "report"])
+      expect(jobs[j].if).toContain(MAIN);
   });
 
-  it("grants nothing wide: the token only reads, one run at a time", () => {
+  it("is three jobs, in order", () => {
+    expect(Object.keys(jobs)).toEqual(["prepare", "open", "report"]);
+    expect(jobs.open.needs).toBe("prepare");
+    expect(jobs.report.needs).toEqual(["prepare", "open"]);
+  });
+
+  it("grants nothing wide, one run at a time", () => {
     expect(w.permissions).toEqual({});
-    expect(w.jobs.bump.permissions).toEqual({
+    expect(jobs.prepare.permissions).toEqual({
       contents: "read",
       "pull-requests": "read",
     });
+    expect(jobs.open.permissions).toEqual({
+      contents: "read",
+      "pull-requests": "read",
+    });
+    expect(jobs.report.permissions).toEqual({ issues: "write" });
     expect(w.concurrency).toEqual({
       group: "pin-bump",
       "cancel-in-progress": false,
@@ -252,13 +341,82 @@ describe("pin-bump.yml", () => {
   });
 
   it("pins every third-party action by full SHA", () => {
-    const uses = steps.map((s) => s.uses).filter(Boolean) as string[];
-    expect(uses.length).toBeGreaterThan(4);
+    const uses = Object.values(jobs)
+      // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+      .flatMap((j: any) => j.steps)
+      .map((s: Step) => s.uses)
+      .filter(Boolean) as string[];
+    expect(uses.length).toBeGreaterThan(8);
     for (const u of uses) expect(u).toMatch(/@[0-9a-f]{40}( |$)/);
   });
 
+  it("prepare holds no secret and no token that can write", () => {
+    const j = JSON.stringify(jobs.prepare);
+    expect(j).not.toContain("secrets.");
+    expect(j).not.toContain("create-github-app-token");
+    expect(j).not.toContain("id-token");
+    expect(j).not.toContain("steps.app");
+    expect(jobs.prepare.environment).toBeUndefined();
+    expect(jobs.prepare.permissions.contents).toBe("read");
+  });
+
+  it("prepare sends out only the lockfile", () => {
+    const ups = stepsOf("prepare").filter((s) =>
+      s.uses?.startsWith("actions/upload-artifact@"),
+    );
+    expect(ups).toHaveLength(1);
+    expect(ups[0].with.path).toMatch(/\/pnpm-lock\.yaml$/);
+    expect(ups[0].with.name).toBe(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "pin-bump-lock-${{ steps.plan.outputs.tag }}",
+    );
+  });
+
+  it("open never checks out or runs the public tree, and never installs", () => {
+    const open = stepsOf("open");
+    for (const s of open) {
+      expect(s.with?.repository).toBeUndefined();
+      expect(s.uses ?? "").not.toMatch(/pnpm\/action-setup/);
+      expect(s.run ?? "").not.toMatch(
+        /(^|\s)(pnpm|npm|npx|yarn) |overlay\.sh|public\//,
+      );
+      expect(s.working_directory ?? s["working-directory"] ?? "").not.toMatch(
+        /public/,
+      );
+    }
+    expect(JSON.stringify(jobs.open)).not.toContain("path: public");
+    // main's own checkout only
+    const co = open.filter((s) => s.uses?.startsWith("actions/checkout@"));
+    expect(co).toHaveLength(1);
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(co[0].with.ref).toBe("${{ github.sha }}");
+  });
+
+  it("open plans again itself and takes the lockfile by its own tag, as data", () => {
+    const open = stepsOf("open");
+    const names = open.map((s) => s.id ?? s.name ?? s.uses);
+    expect(names.indexOf("plan")).toBeGreaterThan(-1);
+    const dl = open.find((s) =>
+      s.uses?.startsWith("actions/download-artifact@"),
+    );
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(dl.with.name).toBe("pin-bump-lock-${{ steps.plan.outputs.tag }}");
+    // the token is minted only after the lockfile is in place
+    const at = (f: (s: Step) => boolean) => open.findIndex(f);
+    const iApp = at((s) => s.id === "app");
+    expect(iApp).toBeGreaterThan(at((s) => s === dl));
+    expect(iApp).toBeGreaterThan(
+      at((s) => s.name === "Take the lockfile as data"),
+    );
+    expect(iApp).toBeGreaterThan(at((s) => s.id === "plan"));
+    expect(iApp).toBeGreaterThan(at((s) => s.name === "Move the pin files"));
+    const take = open.find((s) => s.name === "Take the lockfile as data");
+    expect(take.run).toContain("-L");
+    expect(take.run).toContain("10000000");
+  });
+
   it("writes only with the release App's token, scoped to contents and PRs", () => {
-    const app = step("app");
+    const app = step("open", "app");
     expect(app.uses).toMatch(/^actions\/create-github-app-token@[0-9a-f]{40}/);
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(app.with["app-id"]).toBe("${{ secrets.RELEASE_APP_ID }}");
@@ -267,9 +425,11 @@ describe("pin-bump.yml", () => {
     expect(app.with["private-key"]).toBe(key);
     expect(app.with["permission-contents"]).toBe("write");
     expect(app.with["permission-pull-requests"]).toBe("write");
-    const planStep = step("plan");
-    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(planStep.env.GH_TOKEN).toBe("${{ github.token }}");
+    for (const j of ["prepare", "open"]) {
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(step(j, "plan").env.GH_TOKEN).toBe("${{ github.token }}");
+    }
+    expect(JSON.stringify(jobs.report)).not.toContain("secrets.");
   });
 
   it("never arms or merges", () => {
@@ -281,18 +441,108 @@ describe("pin-bump.yml", () => {
     ).not.toMatch(/"merge"|--auto(?![-\w])|--admin/);
   });
 
-  it("every step after the plan runs only when the plan says bump", () => {
-    const i = steps.findIndex((s) => s.id === "plan");
-    for (const s of steps.slice(i + 1))
-      expect(s.if).toContain("steps.plan.outputs.bump == 'true'");
+  it("after the plan, prepare's and open's steps run only when it says bump", () => {
+    for (const j of ["prepare", "open"]) {
+      const steps = stepsOf(j);
+      const i = steps.findIndex((s) => s.id === "plan");
+      for (const s of steps.slice(i + 1))
+        expect(s.if).toContain("steps.plan.outputs.bump == 'true'");
+    }
+    expect(jobs.open.if).toContain("needs.prepare.outputs.bump == 'true'");
   });
 
-  it("checks out only the pinned sha of public, with no stored credentials", () => {
-    const pub = steps.find(
+  it("prepare checks out only the pinned sha of public, with no stored credentials", () => {
+    const pub = stepsOf("prepare").find(
       (s) => s.with?.repository === "open-artifacts-ai/open-artifacts",
     );
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(pub.with.ref).toBe("${{ steps.plan.outputs.sha }}");
     expect(pub.with["persist-credentials"]).toBe(false);
+    for (const j of ["prepare", "open"])
+      for (const s of stepsOf(j).filter((s) =>
+        s.uses?.startsWith("actions/checkout@"),
+      ))
+        expect(s.with["persist-credentials"]).toBe(false);
+  });
+
+  describe("report", () => {
+    const rep = stepsOf("report");
+    it("has no checkout, no action, and is told whether anything failed", () => {
+      expect(rep).toHaveLength(1);
+      expect(rep[0].uses).toBeUndefined();
+      expect(jobs.report.if).toContain("always()");
+      expect(jobs.report.if).toContain("needs.prepare.result != 'cancelled'");
+      expect(jobs.report.if).toContain("needs.open.result != 'cancelled'");
+      expect(rep[0].env.RESULT).toContain("needs.prepare.result == 'failure'");
+      expect(rep[0].env.RESULT).toContain("needs.open.result == 'failure'");
+      // a skipped open (nothing to bump) is not a failure
+      expect(rep[0].env.RESULT).not.toContain("!= 'success'");
+    });
+
+    const bin = mkdtempSync(join(tmpdir(), "fake-gh-"));
+    const log = join(bin, "log");
+    writeFileSync(
+      join(bin, "gh"),
+      `#!/usr/bin/env bash
+echo "$*" >> "${log}"
+case "$1 $2" in
+  "issue list") printf '%s' "\${FAKE_OPEN:-}" ;;
+  "label list") printf '%s' "\${FAKE_LABELS:-}" ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    const run = (result: string, env: Record<string, string> = {}) => {
+      writeFileSync(log, "");
+      const r = spawnSync("bash", ["-c", rep[0].run], {
+        encoding: "utf8",
+        env: {
+          PATH: `${bin}:${process.env.PATH}`,
+          REPO,
+          RESULT: result,
+          RUN: "https://github.com/x/y/actions/runs/1",
+          ...env,
+        },
+      });
+      expect(r.status, r.stderr).toBe(0);
+      return readFileSync(log, "utf8").trim().split("\n");
+    };
+
+    it("red opens one blocker issue titled 'pin-bump failed' with the run URL", () => {
+      const calls = run("failure", { FAKE_LABELS: "blocker\nbug" });
+      const create = calls.find((c) => c.startsWith("issue create")) ?? "";
+      expect(create).toContain("--title pin-bump failed");
+      expect(create).toContain("--label blocker");
+      expect(create).toContain("actions/runs/1");
+      expect(calls.filter((c) => c.startsWith("issue create"))).toHaveLength(1);
+      expect(calls.some((c) => c.startsWith("label create"))).toBe(false);
+    });
+
+    it("creates the blocker label only when it is missing", () => {
+      const calls = run("failure", { FAKE_LABELS: "bug" });
+      expect(calls.some((c) => c.startsWith("label create blocker"))).toBe(
+        true,
+      );
+    });
+
+    it("red with one already open comments on it and opens no second", () => {
+      const calls = run("failure", { FAKE_OPEN: "12" });
+      expect(calls.some((c) => c.startsWith("issue create"))).toBe(false);
+      expect(calls.some((c) => c.startsWith("issue comment 12"))).toBe(true);
+    });
+
+    it("green closes the open issue, and does nothing when none is open", () => {
+      const closed = run("success", { FAKE_OPEN: "12" });
+      expect(closed.some((c) => c.startsWith("issue close 12"))).toBe(true);
+      const none = run("success");
+      expect(none.every((c) => c.startsWith("issue list"))).toBe(true);
+    });
+
+    it("looks only among open issues labelled blocker, by the exact title", () => {
+      const list = run("success")[0] ?? "";
+      expect(list).toContain("--state open");
+      expect(list).toContain("--label blocker");
+      expect(list).toContain("pin-bump failed");
+    });
   });
 });

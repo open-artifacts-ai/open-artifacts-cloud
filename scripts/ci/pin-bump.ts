@@ -15,6 +15,8 @@ import { pathToFileURL } from "node:url";
 export const PUBLIC_REPO = "open-artifacts-ai/open-artifacts";
 /** Every bump branch starts with this; one open PR from such a branch is the limit. */
 export const BRANCH_PREFIX = "pin-bump/";
+/** An open bump PR older than this turns the run red: a stuck PR must not block later tags. */
+export const STALE_PR_MS = 3 * 24 * 3_600_000;
 export const branchOf = (tag: string) => `${BRANCH_PREFIX}${tag}`;
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
@@ -71,7 +73,12 @@ export function applyPin(dir: string, tag: string, sha: string) {
 }
 
 type Release = { tag_name: string; draft: boolean; prerelease: boolean };
-type Pr = { number: number; headRefName: string; url: string };
+type Pr = {
+  number: number;
+  headRefName: string;
+  url: string;
+  createdAt?: string;
+};
 
 /** What tonight does: nothing, or one bump to the newest public release. */
 export function plan(o: {
@@ -79,6 +86,7 @@ export function plan(o: {
   repo: string;
   publicRepo: string;
   pin: string; // PUBLIC_PIN's text
+  now?: number;
 }): Plan {
   const current = pinField(o.pin, "tag");
   parts(current);
@@ -88,6 +96,34 @@ export function plan(o: {
     sha,
     why,
   });
+
+  const open = (
+    JSON.parse(
+      gh(o.exec, [
+        "pr",
+        "list",
+        "--repo",
+        o.repo,
+        "--state",
+        "open",
+        "--json",
+        "number,headRefName,url,createdAt",
+        "--limit",
+        "100",
+      ]),
+    ) as Pr[]
+  ).find((p) => p.headRefName.startsWith(BRANCH_PREFIX));
+  if (open) {
+    const opened = Date.parse(open.createdAt ?? "");
+    if (Number.isNaN(opened))
+      throw new Error(
+        `${open.url} has no createdAt; cannot tell if it is stuck`,
+      );
+    if ((o.now ?? Date.now()) - opened > STALE_PR_MS)
+      throw new Error(
+        `${open.url} has been open for over 3 days; merge or close it so later releases are not blocked`,
+      );
+  }
 
   const releases = JSON.parse(
     gh(o.exec, ["api", `repos/${o.publicRepo}/releases?per_page=30`]),
@@ -100,22 +136,6 @@ export function plan(o: {
   if (compareTags(newest, current) <= 0)
     return none(`PUBLIC_PIN ${current} is the newest release (${newest})`);
 
-  const open = (
-    JSON.parse(
-      gh(o.exec, [
-        "pr",
-        "list",
-        "--repo",
-        o.repo,
-        "--state",
-        "open",
-        "--json",
-        "number,headRefName,url",
-        "--limit",
-        "100",
-      ]),
-    ) as Pr[]
-  ).find((p) => p.headRefName.startsWith(BRANCH_PREFIX));
   if (open)
     return none(
       `${open.url} (${open.headRefName}) is open; ${newest} waits for it`,
@@ -172,7 +192,7 @@ export function openPr(o: {
         "--state",
         "open",
         "--json",
-        "number,headRefName,url",
+        "number,headRefName,url,createdAt",
         "--limit",
         "100",
       ]),

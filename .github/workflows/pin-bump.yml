@@ -1,11 +1,25 @@
 # Opens the pin-bump PR (cloud #20): when public has a stable release newer than
-# PUBLIC_PIN, one PR moves PUBLIC_PIN and SYNCED_FROM to it and regenerates the
-# merged lockfile in the overlay. The PR is opened with the release App's token,
-# because a PR made with GITHUB_TOKEN starts no CI. Everything it does is
-# reviewed by CI: pin-check's port check and equivalence run on the PR as on
-# any other. This workflow never arms or merges, and never opens a second PR:
-# while any pin-bump/* PR is open, or a PR already took the newest tag (open,
-# merged or closed), it does nothing. A failure at any step fails the run.
+# PUBLIC_PIN, one PR moves PUBLIC_PIN and SYNCED_FROM to it and carries the
+# merged lockfile regenerated in the overlay. The PR is opened with the release
+# App's token, because a PR made with GITHUB_TOKEN starts no CI. CI then judges
+# it as any other: pin-check's port check and equivalence. This workflow never
+# arms or merges, and never opens a second PR: while any pin-bump/* PR is open,
+# or a PR already took the newest tag (open, merged or closed), it does nothing.
+# An open pin-bump PR older than STALE_PR_MS (3 days) turns the run red, so a
+# stuck PR cannot quietly block later releases.
+#
+# Three jobs, so the public tree's install never runs beside the App key:
+# - prepare: no secrets. Plans, moves the pin files, overlays the public tree,
+#   runs `pnpm install --lockfile-only` (it reads the public tree's pnpmfile,
+#   npmrc and workspace config, so it is inside no trust boundary) and uploads
+#   pnpm-lock.yaml, as data, and nothing else.
+# - open: a fresh runner on main's checkout. It never checks out or runs the
+#   public tree, and never installs. It plans again itself (nothing from
+#   prepare but the lockfile is trusted), re-applies the pin files, takes the
+#   lockfile as data, and only then mints the App token to push and open the PR.
+# - report: issues: write, no checkout. Red keeps one `blocker` issue titled
+#   "pin-bump failed" open with the run URL; green closes it. A cancelled run
+#   is neither. A run with nothing to bump is green.
 name: pin-bump
 
 on:
@@ -20,15 +34,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bump:
+  prepare:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      bump: ${{ steps.plan.outputs.bump }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           path: private
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -74,7 +92,59 @@ jobs:
         run: |
           set -euo pipefail
           pnpm install --lockfile-only
-          cp pnpm-lock.yaml ../private/pnpm-lock.yaml
+          mkdir -p "$RUNNER_TEMP/lock"
+          cp pnpm-lock.yaml "$RUNNER_TEMP/lock/pnpm-lock.yaml"
+      # Only the lockfile leaves this job, and open takes it as data.
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pin-bump-lock-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/lock/pnpm-lock.yaml
+          if-no-files-found: error
+          retention-days: 1
+
+  open:
+    needs: prepare
+    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.bump == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      # Planned again here: the tag and sha used below are this job's own.
+      - id: plan
+        name: Plan again
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.bump == 'true'
+        name: Move the pin files
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts apply --tag "$TAG" --sha "$SHA"
+      # By this run's own tag: a lockfile built for another tag is not found.
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pin-bump-lock-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/lock
+      - if: steps.plan.outputs.bump == 'true'
+        name: Take the lockfile as data
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/lock/pnpm-lock.yaml"
+          [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular pnpm-lock.yaml in the artifact"; exit 1; }
+          [ "$(wc -c < "$f")" -le 10000000 ] || { echo "::error::the lockfile is over 10 MB"; exit 1; }
+          cp "$f" pnpm-lock.yaml
       - id: app
         if: steps.plan.outputs.bump == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -85,7 +155,6 @@ jobs:
           permission-pull-requests: write
       - if: steps.plan.outputs.bump == 'true'
         name: Commit and push the branch
-        working-directory: private
         env:
           TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
@@ -103,10 +172,39 @@ jobs:
           git push --force "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/$BRANCH"
       - if: steps.plan.outputs.bump == 'true'
         name: Open the PR (never armed)
-        working-directory: private
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
           SHA: ${{ steps.plan.outputs.sha }}
           BRANCH: ${{ steps.plan.outputs.branch }}
         run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH"
+
+  report:
+    needs: [prepare, open]
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.prepare.result != 'cancelled' && needs.open.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Keep the blocker issue in step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ (needs.prepare.result == 'failure' || needs.open.result == 'failure') && 'failure' || 'success' }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="pin-bump failed"
+          open=$(gh issue list --repo "$REPO" --state open --label blocker --limit 100 --json number,title --jq "[.[] | select(.title == \"$title\") | .number][0] // empty")
+          if [ "$RESULT" = failure ]; then
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --repo "$REPO" --body "Failed again: $RUN"
+            else
+              labels=$(gh label list --repo "$REPO" --limit 200 --json name --jq '.[].name')
+              grep -qx blocker <<< "$labels" || gh label create blocker --repo "$REPO" --description "Blocks a release or a merge" --color B60205
+              gh issue create --repo "$REPO" --title "$title" --label blocker --body "The pin-bump workflow failed: $RUN"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --repo "$REPO" --comment "Green again: $RUN"
+          fi

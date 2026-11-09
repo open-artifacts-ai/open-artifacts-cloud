@@ -38,6 +38,7 @@ pinned public release, with this tree copied on top.
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
 | `.github/ISSUE_TEMPLATE/blocker.yml` | Repo-only GitHub config so the hosted workflows can open `blocker` issues here. Never overlaid; `equivalence.sh` requires it to be byte-identical to public's at `SYNCED_FROM`. |
 | `.github/workflows/hosted-release.yml` | Mirrors the public release at `PUBLIC_PIN` into this repo (tag and release, by the release App), then builds, signs and attaches the hosted release files (cut-over step C3, #1056). Runs for real on a push to `main` that changes `PUBLIC_PIN` (step F2): a push has no inputs, so `inputs.dry_run` is null and every dry-run test treats it as not a dry run. `workflow_dispatch` keeps `dry_run` (the default), which builds and signs with the staging key and stops before the tag and the attach. |
+| `.github/workflows/pin-bump.yml` | Every 6 hours (and on dispatch, from main): if public has a stable release newer than `PUBLIC_PIN`, opens one PR into main that moves `PUBLIC_PIN` and `SYNCED_FROM` to it and carries the lockfile regenerated in the overlay (cloud #20). Three jobs: `prepare` (no secrets) installs and regenerates the lockfile and uploads only that file; `open` (fresh runner, main's checkout, never the public tree) plans again, takes the lockfile as data, then uses the release App token to push `pin-bump/<tag>` and open the PR; `report` keeps one `blocker` issue "pin-bump failed" open while the last run is red. It never arms or merges; CI's port check and equivalence judge the PR. It does nothing while a `pin-bump/*` PR is open or one already took the tag, and an open one older than 3 days turns the run red. Needs the App to hold contents and pull-requests write. |
 | `.github/workflows/<hosted>.yml` | The hosted workflows (deploy, publish, floor, red-line, monitors, token pings), live since C2 (#1056). Dispatch only, plus `hosted-publish`'s `workflow_run` on `hosted-release` (C3). `prodclean-monitor` runs hourly from here; the `redline-nightly` schedule stays off until cut-over step F5. `PROD_RELEASE_CHAIN` stays unset. |
 | `.github/actions/overlay/` | The overlay prelude every hosted job that installs or builds uses: check this repo out at `_cloud`, then this action puts public at the `PUBLIC_PIN` of that checkout with this repo on top, at the workspace root. |
 | `.nvmrc` | Node version for jobs that check out only this repo (scripts, no install). CI fails if it differs from public's at the pin. |
@@ -150,17 +151,20 @@ listed path.
 
 ## Bumping the pin
 
-One PR per bump:
+One PR per bump. The `pin-bump` workflow opens it for a new public release (steps 1 to 3
+below, done for you); fix what CI finds on its branch by hand. By hand:
 
 1. Set `tag=` and `sha=` in PUBLIC_PIN to the new public release. The sha is
    `gh api repos/open-artifacts-ai/open-artifacts/commits/<tag> --jq .sha`.
-2. If public changed any hosted path or the list since `SYNCED_FROM`, hand-port
-   it and bump `SYNCED_FROM` to the same commit in this PR ("Hand-porting a
-   public fix"). `pin-check.sh` fails the PR otherwise. If it did not, leave
-   `SYNCED_FROM` alone: the pin may lead it. A pin that leads `SYNCED_FROM`
-   over any change to public's non-private lockfile importers still fails
-   `equivalence.sh` (CI installs at the pin, equivalence compares at the sync),
-   so a lockfile change also needs `SYNCED_FROM` moved, with its port.
+2. `SYNCED_FROM` moves to the same release as `PUBLIC_PIN`; the pin-bump
+   workflow always does this. Moving it is the claim that every public change
+   to the hosted paths or the list since the old `SYNCED_FROM` is already in
+   this PR, and CI checks the claim: `pin-check.sh --prev` must be able to
+   reverse-apply the public diff to this tree. If public changed a hosted path
+   or the list, hand-port it into the PR ("Hand-porting a public fix") or the
+   port check fails. Leaving `SYNCED_FROM` behind is only possible while public
+   did not change any non-private lockfile importer; otherwise `equivalence.sh`
+   fails (CI installs at the pin, equivalence compares at the sync).
 3. Build the overlay (`scripts/dev-overlay.sh`) and run `pnpm install` in it
    without `--frozen-lockfile`, to regenerate the merged lockfile. Copy the
    overlay's `pnpm-lock.yaml` back here.
