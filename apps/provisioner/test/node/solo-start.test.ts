@@ -36,6 +36,16 @@ beforeEach(async () => {
   w = await world();
 });
 
+const OK: SoloStartResult = {
+  ok: true,
+  tier: "solo",
+  status: "trialing",
+  trialEndsAt: null,
+  graceUntil: null,
+  soloTrialEndsAt: 1,
+  version: 1,
+  asOf: 1,
+};
 type Answer = SoloStartResult | Error;
 /** A BILLING binding that answers from `answers` in turn (the last repeats). */
 function bind(answers: Answer[], seen: string[] = []) {
@@ -68,7 +78,7 @@ describe("ProvisionInstall: solo_start", () => {
       seen.status = signup(s.signupId).status;
       seen.mail = w.mail.length;
       seen.jobDone = (w.job(s.jobId) as { status: string }).status;
-      return { ok: true };
+      return OK;
     });
     w.ctx.env.BILLING = { soloStart } as BillingProvisionerRpc;
     const r = await run(w, s.jobId);
@@ -97,7 +107,7 @@ describe("ProvisionInstall: solo_start", () => {
     const b = bind([
       { ok: false, error: "unknown_install", retryable: true },
       { ok: false, error: "unknown_install", retryable: true },
-      { ok: true },
+      OK,
     ]);
     const r = await run(w, s.jobId);
     expect(r.error).toBeNull();
@@ -109,7 +119,7 @@ describe("ProvisionInstall: solo_start", () => {
 
   it("a thrown transport error is retried", async () => {
     const s = selfServe("sthrow");
-    const b = bind([new Error("network lost"), { ok: true }]);
+    const b = bind([new Error("network lost"), OK]);
     const r = await run(w, s.jobId);
     expect(r.error).toBeNull();
     expect(b.calls).toHaveLength(2);
@@ -121,14 +131,36 @@ describe("ProvisionInstall: solo_start", () => {
     const b = bind([{ ok: false, error: "unknown_install", retryable: true }]);
     const r = await run(w, s.jobId);
     expect(r.error).not.toBeNull();
-    expect(b.calls).toHaveLength(5);
+    expect(b.calls).toHaveLength(7);
     expect(signup(s.signupId).status).toBe("failed");
     expect(w.mail).toHaveLength(0);
   });
 
+  it("a malformed answer is never marked started and is retried", async () => {
+    const s = selfServe("smal");
+    const b = bind([
+      {} as SoloStartResult,
+      { ok: "yes" } as unknown as SoloStartResult,
+      OK as SoloStartResult,
+    ]);
+    const r = await run(w, s.jobId);
+    expect(r.error).toBeNull();
+    expect(b.calls).toHaveLength(3);
+    expect(signup(s.signupId).solo_started_at).not.toBeNull();
+  });
+
+  it("a malformed answer that never clears fails without marking started", async () => {
+    const s = selfServe("smal2");
+    const b = bind([undefined as unknown as SoloStartResult]);
+    const r = await run(w, s.jobId);
+    expect(r.error).not.toBeNull();
+    expect(b.calls).toHaveLength(7);
+    expect(signup(s.signupId).solo_started_at).toBeNull();
+  });
+
   it("a non-retryable answer fails the job once, runs fail and settles the signup failed", async () => {
     const s = selfServe("snonret");
-    const b = bind([{ ok: false, error: "tier_conflict", retryable: false }]);
+    const b = bind([{ ok: false, error: "plan_conflict", retryable: false }]);
     const r = await run(w, s.jobId);
     expect(r.error?.name).toBe("NonRetryableError");
     expect(b.calls).toHaveLength(1);
@@ -138,7 +170,7 @@ describe("ProvisionInstall: solo_start", () => {
       error_code: "internal",
     });
     // billing's error text is not stored on the job row
-    expect(JSON.stringify(w.job(s.jobId))).not.toContain("tier_conflict");
+    expect(JSON.stringify(w.job(s.jobId))).not.toContain("plan_conflict");
     expect(signup(s.signupId)).toMatchObject({
       status: "failed",
       solo_started_at: null,
@@ -170,7 +202,7 @@ describe("ProvisionInstall: solo_start", () => {
 
   it("an admin create never calls billing and has no solo_start step", async () => {
     const s = seedCreate(w, { slug: "sadmin" });
-    const b = bind([{ ok: true }]);
+    const b = bind([OK]);
     const r = await run(w, s.jobId);
     expect(r.error).toBeNull();
     expect(b.calls).toHaveLength(0);
@@ -179,7 +211,7 @@ describe("ProvisionInstall: solo_start", () => {
 
   it("a replay of the step (twice, or an engine replay) is idempotent", async () => {
     const s = selfServe("sreplay");
-    const b = bind([{ ok: true }]);
+    const b = bind([OK]);
     const r = await run(w, s.jobId, { twice: true });
     expect(r.error).toBeNull();
     // every body ran twice; the second call carries the same install id
@@ -189,7 +221,7 @@ describe("ProvisionInstall: solo_start", () => {
     // a second full run with the steps' results replayed does not call billing
     const results = new Map<string, unknown>();
     const s2 = selfServe("sreplay2");
-    const calls1 = bind([{ ok: true }]);
+    const calls1 = bind([OK]);
     const r1 = stepRunner(w.clock, { results, evictAfter: "reachable" });
     void runCreate(w.ctx, event(s2.jobId), r1.step);
     await r1.evicted;

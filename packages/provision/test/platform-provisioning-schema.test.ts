@@ -608,4 +608,31 @@ describe("0012_solo_start (self-serve Solo start)", () => {
     expect(c).toContain("solo_started_at INTEGER");
     expect(c).toContain("solo_skipped_at INTEGER");
   });
+
+  it("backfills only terminal rows as skipped; in-flight rows stay NULL", () => {
+    const db = platformDb(migrationFiles.slice(0, 9));
+    const ids: Record<string, string> = {};
+    for (const status of [
+      "pending",
+      "queued",
+      "waiting_cap",
+      "creating",
+      "ready",
+      "failed",
+    ])
+      ids[status] = signup(db, { status });
+    apply(db, ["0012_solo_start.sql"]);
+    const row = (id: string) =>
+      db
+        .prepare(
+          "SELECT solo_started_at s, solo_skipped_at k FROM signups WHERE signup_id = ?",
+        )
+        .get(id) as { s: number | null; k: number | null };
+    for (const st of ["ready", "failed"]) {
+      expect(row(ids[st] as string).k).not.toBeNull();
+      expect(row(ids[st] as string).s).toBeNull();
+    }
+    for (const st of ["pending", "queued", "waiting_cap", "creating"])
+      expect(row(ids[st] as string)).toEqual({ s: null, k: null });
+  });
 });

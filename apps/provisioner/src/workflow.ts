@@ -79,9 +79,30 @@ import { welcomeEmail } from "./welcome.js";
  * expected outcomes are values, never throws; a throw is transport.
  * TODO: replace with Billing's export once its PR lands.
  */
+export type SoloStartError =
+  | "bad_install"
+  | "unknown_install"
+  | "plan_conflict"
+  | "not_active"
+  | "config"
+  | "upstream"
+  | "bad_upstream"
+  | "retry"
+  | "unavailable"
+  | "stripe_refused";
+
 export type SoloStartResult =
-  | { ok: true }
-  | { ok: false; error: string; retryable: boolean };
+  | {
+      ok: true;
+      tier: string;
+      status: string;
+      trialEndsAt: number | null;
+      graceUntil: number | null;
+      soloTrialEndsAt: number | null;
+      version: number;
+      asOf: number;
+    }
+  | { ok: false; error: SoloStartError; retryable: boolean };
 
 /** The BILLING service binding, entrypoint BillingProvisionerRpc. */
 export interface BillingProvisionerRpc {
@@ -144,12 +165,15 @@ export const REACHABLE_STEP = {
 } as const;
 
 /**
- * 4 retries, 30 seconds, exponential: a retryable soloStart answer
- * (unknown_install while BROKER_REGISTRY's KV write propagates) or a
- * transport error.
+ * 6 retries, 30 seconds, exponential (waits 30, 60, 120, 240, 480, 960 s):
+ * a retryable soloStart answer or a transport error. unknown_install lasts
+ * as long as BROKER_REGISTRY's KV write takes to propagate plus billing's
+ * 60 s negative cache, so retries must span >= 2 minutes after the registry
+ * write: the 4th retry starts ~450 s after the first attempt (the 3rd, 210 s,
+ * already clears it); the extra two give headroom.
  */
 export const SOLO_START_STEP = {
-  retries: { limit: 4, delay: "30 seconds", backoff: "exponential" },
+  retries: { limit: 6, delay: "30 seconds", backoff: "exponential" },
 } as const;
 
 /** reachable polls the public /healthz this long (HOSTS is cached 60 s). */
@@ -496,10 +520,15 @@ async function soloStart(
     return { skipped: "no_billing" };
   }
   // A throw is transport: the step retries it.
-  const r = await billing.soloStart(installId);
-  if (r.ok) {
+  const r = (await billing.soloStart(installId)) as SoloStartResult | undefined;
+  if (r?.ok === true) {
     await mark("solo_started_at");
     return { started: true };
+  }
+  if (r?.ok !== false) {
+    // Malformed answer: never mark started; retry like a transport error.
+    console.warn(JSON.stringify({ evt: "solo_start_malformed", installId }));
+    throw new Error("internal");
   }
   const detail = String(r.error)
     .replace(/[^A-Za-z0-9_.:-]/g, "")
@@ -512,7 +541,7 @@ async function soloStart(
       error: detail,
     }),
   );
-  if (r.retryable) throw new Error("internal");
+  if (r.retryable === true) throw new Error("internal");
   throw new StepRefusal("internal", `solo_start refused: ${detail}`);
 }
 
