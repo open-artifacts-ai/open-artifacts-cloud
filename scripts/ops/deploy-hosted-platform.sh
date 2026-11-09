@@ -131,7 +131,7 @@ secret_names() { cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" |
 # answers an unknown 10013 now and then (run 42647320740, #55). The value is
 # held in a shell variable and fed to each attempt by the printf builtin, so it
 # is never in argv, the log or a file.
-PUT_ATTEMPTS=1
+PUT_ATTEMPTS=3
 put_secret() {
   if [ -n "$VERIFY_ONLY" ]; then
     cat > /dev/null
