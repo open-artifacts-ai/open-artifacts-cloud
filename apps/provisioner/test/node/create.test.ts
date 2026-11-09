@@ -199,6 +199,27 @@ describe("ProvisionInstall: create", () => {
     });
   });
 
+  it("admin create with sendWelcome gets neutral copy; self-serve gets Solo copy", async () => {
+    const a = seedCreate(w, {
+      slug: "adminwel",
+      sendWelcome: true,
+      vars: { AUTH_PROVIDERS: "email", AUTH_DOMAINS: "", TIER: "team" },
+    });
+    expect((await run(w, a.jobId)).error).toBeNull();
+    const m = w.mail[0];
+    expect(m?.text).not.toMatch(/Google|Solo|\$1|you created/);
+    expect(m?.html).not.toMatch(/Google|Solo|\$1|you created/);
+    const s = seedCreate(w, {
+      slug: "ssowel",
+      source: "self-serve",
+      tier: "trial",
+      sendWelcome: true,
+    });
+    expect((await run(w, s.jobId)).error).toBeNull();
+    expect(w.mail.at(-1)?.text).toContain("You're on Solo");
+    expect(w.mail.at(-1)?.text).toContain("Google account");
+  });
+
   it("codes on: the env widget's pair is passed (cf.turnstileList, cf.turnstileWidget)", async () => {
     const s = seedCreate(w, {
       slug: "codesco",

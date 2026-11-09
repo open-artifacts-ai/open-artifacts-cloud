@@ -53,6 +53,12 @@ export function welcomeEmail(o: {
   appHost: string;
   /** End of the Solo trial. Absent until the trial is wired: no date is named. */
   trialEndsAt?: Date | number;
+  /**
+   * True only for a self-serve signup (Google sign-in, Solo). Anything else,
+   * e.g. an admin create with any auth or tier, gets neutral copy: no sign-in
+   * method, no plan, no price.
+   */
+  selfServe?: boolean;
 }): Welcome {
   const url = new URL(`https://${o.appHost}/`);
   if (url.host !== o.appHost.toLowerCase()) throw new Error("invalid app host");
@@ -60,10 +66,13 @@ export function welcomeEmail(o: {
   const origin = url.origin;
   const to = oneLine(o.to);
   const end = trialEndLabel(o.trialEndsAt);
+  const selfServe = o.selfServe === true;
 
   const lines = {
     title: "Your Open Artifacts is ready",
-    intro: `${host} is set up and you're its owner. Sign in with the Google account you used to create it, ${to}.`,
+    intro: selfServe
+      ? `${host} is set up and you're its owner. Sign in with the Google account you used to create it, ${to}.`
+      : `${host} is set up and you're its owner. Sign in with the account you signed up with, ${to}.`,
     button: `Open ${host}`,
     connect: "Then connect your agent.",
     paste: "Paste this into Claude Code, Cursor or any AI agent:",
@@ -71,10 +80,14 @@ export function welcomeEmail(o: {
       `Set up Open Artifacts for me: follow ${origin}/llms.txt`,
       "Sign in through the browser. Never ask me to paste a token into this chat.",
     ],
-    plan: end
-      ? `You're on Solo: free until ${end}, then $1/month or $12/year. No card on file; we'll remind you a week before.`
-      : "You're on Solo: free for your first month, then $1/month or $12/year. No card on file; we'll remind you a week before.",
-    why: `You got this because you created ${host}.`,
+    plan: !selfServe
+      ? null
+      : end
+        ? `You're on Solo: free until ${end}, then $1/month or $12/year. No card on file; we'll remind you a week before.`
+        : "You're on Solo: free for your first month, then $1/month or $12/year. No card on file; we'll remind you a week before.",
+    why: selfServe
+      ? `You got this because you created ${host}.`
+      : "You got this because you signed up for Open Artifacts.",
   };
 
   const text = [
@@ -88,8 +101,7 @@ export function welcomeEmail(o: {
     "",
     ...lines.prompt.map((l) => `  ${l}`),
     "",
-    lines.plan,
-    "",
+    ...(lines.plan ? [lines.plan, ""] : []),
     lines.why,
   ].join("\n");
 
@@ -114,14 +126,14 @@ body{background:#131518!important;color:#e9ebee!important}
 </style></head>
 <body style="margin:0;padding:24px 12px;background:#eef0f3;font:14px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
 <div class="card" style="max-width:460px;margin:0 auto;background:#fff;border:1px solid #bec4cd;border-radius:8px;padding:24px 28px">
-<p style="margin:0 0 22px;font-weight:700;font-size:15px"><img src="${esc(`${origin}/email/logo@2x.png`)}" alt="" width="18" height="18" style="vertical-align:-3px;margin-right:8px">Open Artifacts</p>
+<p style="margin:0 0 22px"><img src="${esc(`${origin}/email/logo@2x.png`)}" width="156" height="44" alt="Open Artifacts" style="display:block;width:156px;height:44px;border:0;outline:none;text-decoration:none"></p>
 <h1 style="font-size:19px;line-height:1.35;margin:0 0 10px">${esc(lines.title)}</h1>
 <p class="t2" style="margin:0 0 10px">${esc(lines.intro)}</p>
 <p style="margin:6px 0 18px"><a class="btn" href="${esc(`${origin}/`)}" style="display:inline-block;background:#15181c;color:#fff;text-decoration:none;padding:10px 18px;border-radius:6px;font-weight:600;font-size:14px">${esc(lines.button)}</a></p>
 <p class="t2" style="margin:0 0 10px"><strong>${esc(lines.connect)}</strong> ${esc(lines.paste)}</p>
 <pre class="pre" style="white-space:pre-wrap;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#eceef1;border:1px solid #e0e3e8;border-radius:6px;padding:10px 12px;margin:6px 0 14px">${lines.prompt.map(esc).join("\n")}</pre>
 <hr class="rule" style="border:0;border-top:1px solid #e0e3e8;margin:16px 0 12px">
-<p class="muted" style="margin:0 0 10px;font-size:12.5px">${esc(lines.plan)}</p>
+${lines.plan ? `<p class="muted" style="margin:0 0 10px;font-size:12.5px">${esc(lines.plan)}</p>\n` : ""}
 <p class="muted" style="margin:0;font-size:12.5px">${esc(lines.why)}</p>
 </div>
 </body></html>

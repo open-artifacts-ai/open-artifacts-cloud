@@ -478,7 +478,12 @@ async function notify(
   // Claimed, never sent: the scheduler's welcome_unsent alert says so.
   if (to === null) throw new NonRetryableError("internal");
   await ctx.env.WELCOME_EMAIL.send(
-    welcomeEmail({ from: ctx.env.WELCOME_FROM, to, appHost }),
+    welcomeEmail({
+      from: ctx.env.WELCOME_FROM,
+      to,
+      appHost,
+      selfServe: job.source === "self-serve",
+    }),
   );
   await transient(
     db

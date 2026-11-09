@@ -5,6 +5,7 @@ const base = {
   from: "welcome@x.test",
   to: "ana@example.com",
   appHost: "acme.open-artifacts.app",
+  selfServe: true,
 };
 
 describe("welcomeEmail", () => {
@@ -69,5 +70,27 @@ describe("welcomeEmail", () => {
     expect(m.html).not.toContain("<b>x</b>");
     expect(m.text).not.toMatch(/\r|Bcc: a@b\.c\n/);
     expect(() => welcomeEmail({ ...base, appHost: "evil.com/x@y" })).toThrow();
+  });
+
+  it("logo is the 156x44 wordmark with no duplicate text label", () => {
+    const m = welcomeEmail(base);
+    expect(m.html).toContain(
+      'src="https://acme.open-artifacts.app/email/logo@2x.png" width="156" height="44" alt="Open Artifacts"',
+    );
+    expect(m.html).not.toMatch(/width="18"/);
+    expect(m.html).not.toMatch(/<\/img>|>\s*Open Artifacts\s*<\/p>/);
+  });
+
+  it("neutral copy unless self-serve: no Google, Solo, price or 'you created'", () => {
+    const m = welcomeEmail({
+      ...base,
+      selfServe: undefined,
+      trialEndsAt: Date.UTC(2026, 11, 9),
+    });
+    for (const part of [m.text, m.html])
+      expect(part).not.toMatch(/Google|Solo|\$1|\$12|free|trial|you created/i);
+    expect(m.text).toContain("Sign in with the account you signed up with");
+    expect(m.text).toContain("Open acme.open-artifacts.app");
+    expect(m.text).toContain("/llms.txt");
   });
 });
