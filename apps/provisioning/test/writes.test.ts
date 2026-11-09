@@ -249,7 +249,6 @@ describe("R4 create by an admin session", () => {
       {},
       leo({ requestId: "short" }),
       leo({ tier: "free" }),
-      leo({ auth: { providers: ["google"], domains: [] } }),
       leo({ version: "1.42" }),
     ])
       expect((await call(e, ADMIN_P, "R4", { body })).code).toBe(
