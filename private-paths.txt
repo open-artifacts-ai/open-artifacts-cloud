@@ -23,6 +23,7 @@ docs/ops/redline-signin.md
 .github/workflows/deploy-hosted-platform.yml
 .github/workflows/hosted-floor.yml
 .github/workflows/hosted-publish.yml
+.github/workflows/pin-bump.yml
 .github/workflows/prod-inspect.yml
 .github/workflows/prod-release-chain.yml
 .github/workflows/prodclean-monitor.yml
@@ -56,6 +57,8 @@ scripts/ci/hosted-release.test.ts
 scripts/ci/hosted-workflow-rules.test.ts
 scripts/ci/hosted-resource-ids.sh
 scripts/ci/owner-email-guard-hosted.test.ts
+scripts/ci/pin-bump.test.ts
+scripts/ci/pin-bump.ts
 scripts/ci/platform-tags.sh
 scripts/ci/platform-tags.test.ts
 scripts/ci/prod-inspect-workflow.test.ts
