@@ -48,7 +48,9 @@ describe("the same cases", () => {
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set([...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file));
+    const files = new Set(
+      [...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file),
+    );
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });

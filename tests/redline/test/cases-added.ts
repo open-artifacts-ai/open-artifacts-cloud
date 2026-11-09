@@ -26,4 +26,13 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // #859: the provisioner probes, run last in the prov lane.
+    {
+      file: "live/provisioner.test.ts",
+      name: "provisioner > a replayed signup creates nothing new",
+    },
+    {
+      file: "live/provisioner.test.ts",
+      name: "provisioner > a signup for a taken slug fails cleanly",
+    },
   ];
