@@ -34,8 +34,7 @@ import {
 
 // Sign-in for the sign-up page (signup.<app>): the same Google broker flow as
 // the admin panel (4.3), as the broker's second platform principal
-// `i00000signup`. Any verified Google account may sign in (the Workspace rule
-// lives in the create policy, 4.2); nothing reads ADMIN_IDENTITIES. The
+// `i00000signup`. Any verified Google account may sign in (personal Gmail included); nothing reads ADMIN_IDENTITIES. The
 // session is `kind = 'user'`, host-only, with its own CSRF.
 
 export const SIGNUP_PRINCIPAL_ID = "i00000signup";

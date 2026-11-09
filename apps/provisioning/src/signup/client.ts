@@ -9,7 +9,7 @@ export const CLIENT_JS = String.raw`(function () {
   var S = {
     cfg: null, me: null, signup: null, view: "loading",
     slug: "", avail: null, availSlug: "", seq: 0,
-    token: null, busy: false, forbidden: false, err: "", notice: "", widget: null, poll: null
+    token: null, busy: false, err: "", notice: "", widget: null, poll: null
   };
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -46,6 +46,7 @@ export const CLIENT_JS = String.raw`(function () {
     });
   }
 
+  function nw(t) { return h("span", { class: "nw" }, [t]); }
   function host(slug) { return slug + "." + S.cfg.appDomain; }
   function rid() {
     var a = new Uint8Array(18);
@@ -182,7 +183,6 @@ export const CLIENT_JS = String.raw`(function () {
     var cls = "help", text = "", box = "inp" + (S.me ? "" : " off");
     refs.sugg.replaceChildren();
     if (!S.me) text = "Sign in with Google first.";
-    else if (S.forbidden) text = "Sign in with a work account to continue.";
     else if (!s) text = "Pick the address your team will use.";
     else if (a === null || S.availSlug !== s) text = "Checking...";
     else if (a === "ok") { cls += " ok"; box += " ok"; text = host(s) + " is available."; }
@@ -233,7 +233,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
 
   function canCreate() {
-    return !!S.me && !S.forbidden && S.avail === "ok" && S.availSlug === S.slug && !S.busy &&
+    return !!S.me && S.avail === "ok" && S.availSlug === S.slug && !S.busy &&
       (!S.cfg.turnstileSiteKey || !!S.token) && !!S.cfg.turnstileSiteKey;
   }
   function paintCreate() {
@@ -244,9 +244,7 @@ export const CLIENT_JS = String.raw`(function () {
     var msg = S.err;
     if (S.me && !S.cfg.turnstileSiteKey) msg = "Sign-ups are temporarily unavailable. Try again later.";
     if (msg) {
-      var kids = [msg];
-      if (S.forbidden) kids.push(h("button", { class: "btn mt", type: "button", onclick: switchAccount }, ["Use another Google account"]));
-      refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, kids));
+      refs.err.appendChild(h("div", { class: "note bad", role: "alert" }, [msg]));
     }
   }
 
@@ -273,7 +271,6 @@ export const CLIENT_JS = String.raw`(function () {
   window.__oaTsLoaded = function () { if (window.__oaTs) window.__oaTs(); };
 
   var CREATE_ERR = {
-    forbidden: "Open Artifacts needs a Google Workspace account to sign up. Sign in with your work account.",
     turnstile_failed: "The verification did not pass. Try again.",
     rate_limited: "Too many attempts. Wait a minute and try again.",
     slug_invalid: AVAIL_MSG.invalid,
@@ -296,7 +293,6 @@ export const CLIENT_JS = String.raw`(function () {
       if (r.code === "signup_limit") { loadSignup().then(route); return; }
       if (r.code === "slug_taken") { S.avail = "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
       if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
-      if (r.code === "forbidden") { S.forbidden = true; S.avail = null; S.err = CREATE_ERR.forbidden; paintAvail(); return; }
       S.err = CREATE_ERR[r.code] || "We couldn't create your instance. Try again in a few minutes.";
       paintCreate();
     }, function () {
@@ -313,14 +309,11 @@ export const CLIENT_JS = String.raw`(function () {
 
   function signOut() {
     return api("POST", "/auth/logout").then(function () {
-      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.forbidden = false; S.err = ""; route();
+      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; route();
     });
   }
-  function switchAccount() {
-    signOut().then(function () { window.location.assign("/auth/start"); });
-  }
   function startOver() {
-    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.forbidden = false; S.token = null;
+    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.token = null;
     route();
   }
 
@@ -345,18 +338,18 @@ export const CLIENT_JS = String.raw`(function () {
     var reserve = step("done", "Reserve your address");
     var create = "Create your instance", email = "Send your welcome email";
     var pending = [
-      h("h1", {}, ["Setting up " + hostName]),
+      h("h1", {}, ["Setting up ", nw(hostName)]),
       h("p", { class: "muted lead" }, ["We'll email you when it's ready. You can close this page."])
     ];
     head = pending;
     if (st === "ready") {
       label = "Ready";
-      head = [h("h1", {}, [hostName + " is ready"])];
+      head = [h("h1", {}, [nw(hostName), " is ready"])];
       steps = [reserve, step("done", create), step("done", email)];
       body = [h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])];
     } else if (st === "failed") {
       label = "Failed";
-      head = [h("h1", {}, ["We couldn't set up " + hostName])];
+      head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
       steps = [reserve, step("fail", create, "This didn't finish."), step("todo", email)];
       body = [
         h("div", { class: "note bad" }, [

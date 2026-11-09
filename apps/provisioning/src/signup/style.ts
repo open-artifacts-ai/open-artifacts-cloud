@@ -19,6 +19,7 @@ main{flex:1;width:100%;max-width:452px;margin:0 auto;padding:24px 16px 48px}
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px;box-shadow:var(--shadow)}
 h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .panel p{color:var(--text2);margin:0 0 14px}
+.nw{white-space:nowrap}
 .muted{color:var(--muted)}
 .small{font-size:12px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:38px;padding:0 14px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:600 13.5px/1 Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;text-decoration:none;cursor:pointer}

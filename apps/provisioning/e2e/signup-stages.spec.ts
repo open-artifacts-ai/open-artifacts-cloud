@@ -120,26 +120,6 @@ test("failed: Start over returns to the form", async ({ page }) => {
   await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
 });
 
-test("workspace error: banner offers another account and the field is not green", async ({
-  page,
-}) => {
-  const v = await mount(page, {
-    me: true,
-    avail: "ok",
-    createCode: "forbidden",
-  });
-  await page.locator("#slug").fill("acme");
-  await expect(page.locator(".inp.ok")).toHaveCount(1);
-  await page.getByRole("button", { name: "Create" }).click();
-  await expect(
-    page.getByRole("button", { name: "Use another Google account" }),
-  ).toBeVisible();
-  await expect(page.locator(".inp.ok")).toHaveCount(0);
-  await expect(page.locator(".help.ok")).toHaveCount(0);
-  expect(await page.locator("[style]").count()).toBe(0);
-  expect(v).toEqual([]);
-});
-
 test("taken: suggestions appear once, as chips", async ({ page }) => {
   await mount(page, { me: true, avail: "taken" });
   await page.locator("#slug").fill("acme");
@@ -176,18 +156,6 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
     me: true,
     avail: "taken",
     act: (p) => p.locator("#slug").fill("acme"),
-  },
-  "form-error-workspace": {
-    me: true,
-    avail: "ok",
-    act: async (p) => {
-      await p.locator("#slug").fill("acme");
-      await expect(p.locator(".inp.ok")).toHaveCount(1);
-      await p.getByRole("button", { name: "Create" }).click();
-      await expect(
-        p.getByRole("button", { name: "Use another Google account" }),
-      ).toBeVisible();
-    },
   },
   "setup-queued": { me: true, stage: "queued" },
   "setup-waiting-cap": { me: true, stage: "waiting_cap" },

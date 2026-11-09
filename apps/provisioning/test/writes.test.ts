@@ -465,11 +465,12 @@ describe("R4 self-serve policy (4.2 order)", () => {
     });
   });
 
-  it("no hd is 403; a second live install for the account is 409 signup_limit", async () => {
+  it("no hd (a personal account) is admitted; a second live install for the account is 409 signup_limit", async () => {
     const e = fakeEnv({ SIGNUPS_ENABLED: "true" });
-    expect((await call(e, userP("u9"), "R4", { body: ss() })).code).toBe(
-      "forbidden",
-    );
+    expect(
+      (await call(e, userP("u9"), "R4", { body: ss({ slug: "acme9" }) }))
+        .status,
+    ).toBe(202);
     expect((await call(e, u("u2"), "R4", { body: ss() })).status).toBe(202);
     expect(
       (await call(e, u("u2"), "R4", { body: ss({ slug: "acme2" }) })).code,

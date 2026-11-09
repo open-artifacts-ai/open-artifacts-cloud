@@ -479,7 +479,7 @@ describe("create from the sign-up host (R4, self-serve policy)", () => {
     expect(await db.prepare("SELECT 1 FROM signups").first()).toBeNull();
   });
 
-  it("a personal Google account is 403 forbidden (a Workspace account is required)", async () => {
+  it("a personal Gmail account (no hd) creates: 202, no domain, owner pinned to the sub", async () => {
     const e = env({ SIGNUPS_ENABLED: "true" });
     const { sid } = await signIn(e, {
       email: "ana@gmail.com",
@@ -487,10 +487,16 @@ describe("create from the sign-up host (R4, self-serve policy)", () => {
       sub: "g-300",
     });
     const r = await create(e, sid);
-    expect(r.status).toBe(403);
-    expect(((await r.json()) as { error: { code: string } }).error.code).toBe(
-      "forbidden",
-    );
+    expect(r.status).toBe(202);
+    const s = await db
+      .prepare("SELECT owner_sub, vars FROM signups")
+      .first<{ owner_sub: string; vars: string }>();
+    expect(s?.owner_sub).toBe("g-300");
+    expect(JSON.parse(s?.vars ?? "{}")).toMatchObject({
+      AUTH_PROVIDERS: "google",
+      AUTH_DOMAINS: "",
+    });
+    expect(e.queued).toHaveLength(1);
   });
 
   it("while sign-ups are closed it is 503 signups_closed", async () => {
@@ -639,9 +645,9 @@ describe("CSP: no inline styles on the sign-up page", () => {
 
   it("every stage keeps a heading: no empty header branch", () => {
     for (const t of [
-      '"Setting up " + hostName',
-      'hostName + " is ready"',
-      '"We couldn\'t set up " + hostName',
+      '"Setting up ", nw(hostName)',
+      'nw(hostName), " is ready"',
+      '"We couldn\'t set up ", nw(hostName)',
     ])
       expect(CLIENT_JS).toContain(t);
     expect(CLIENT_JS).not.toContain("? [] :");
