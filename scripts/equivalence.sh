@@ -41,6 +41,9 @@ set -uo pipefail
 # its test that public never had and the private-paths list (public's, at S)
 # does not name. So does the hosted-release alert (#1782), named apart from
 # public's release-alert.yml so the two never share a path in the overlay.
+# And the billing database's migration runner for the staging deploy (#1568):
+# a script and its test that public never had (the deploy scripts that call it
+# are in the private list, this pair is not).
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
@@ -49,6 +52,8 @@ ALLOW=(
   scripts/ci/pin-bump.ts
   scripts/ci/pin-bump.test.ts
   scripts/ci/hosted-release-alert.test.ts
+  scripts/ops/billing-db.ts
+  scripts/ops/billing-db.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

@@ -22,6 +22,15 @@
 #   directory-broker DIRECTORY_REGISTRY_ID GOOGLE_DIRECTORY_CLIENT_ID GOOGLE_DIRECTORY_CLIENT_SECRET
 #   provision-token  SECRETS_STORE_ID (reads only: the user pastes the secret)
 #   provisioner      PLATFORM_DB_ID SECRETS_STORE_ID SIGNUP_DAILY_CAP SIGNUPS_ENABLED WELCOME_FROM
+#   billing          STAGING ONLY. BILLING_DB_ID (D1 oa-s-billing, which must exist)
+#                    BROKER_REGISTRY_ID MAIN_BILLING_MIGRATION_LOCK (main's
+#                    apps/billing/migration-lock.json; migrations,
+#                    scripts/ops/billing-db.ts) the four Stripe price ids
+#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY)
+#                    and, unless VERIFY_ONLY, STRIPE_SECRET_KEY and
+#                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
+#                    only, both put on the Worker, a run without them fails
+#                    before anything changes)
 #   dispatch         HOSTS_KV_ID (both brokers must exist)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
@@ -39,7 +48,7 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 staging|prod platform-db|auth-broker|directory-broker|provision-token|provisioner|dispatch|scheduler|inventory|provisioning" >&2
+  echo "usage: $0 staging|prod platform-db|auth-broker|directory-broker|billing|provision-token|provisioner|dispatch|scheduler|inventory|provisioning" >&2
   exit 2
 fi
 env="$1"
@@ -50,6 +59,12 @@ case "$env" in
   *) echo "env must be staging or prod" >&2; exit 2 ;;
 esac
 NS="oa-$env"
+# The billing service is staging only (no prod Worker, binding, route or
+# Stripe secret): refused before anything is read or changed.
+if [ "$target" = billing ] && [ "$env" != staging ]; then
+  echo "the billing target is staging only; refusing for $env" >&2
+  exit 2
+fi
 # In CI, prod runs only from main, in the prod deploy Environment.
 if [ "${GITHUB_ACTIONS:-}" = true ] && [ "$env" = prod ]; then
   [ "${GITHUB_REF:-}" = refs/heads/main ] || { echo "prod deploys run only from main (GITHUB_REF is ${GITHUB_REF:-unset})" >&2; exit 2; }
@@ -515,6 +530,53 @@ case "$target" in
     expect "$S" '.result.observability.enabled // false' false "observability"
     names="$(secret_names oa-$P-directory-broker | sort | tr '\n' ' ')"
     [ "$names" = "DIRECTORY_STATE_KEY GOOGLE_DIRECTORY_CLIENT_SECRET " ] || { echo "oa-$P-directory-broker secrets are '$names'" >&2; exit 1; }
+    ;;
+  billing)
+    # Staging only (checked above). Everything is checked before anything
+    # changes, so a Worker is never left half configured.
+    need BILLING_DB_ID; need BROKER_REGISTRY_ID; need MAIN_BILLING_MIGRATION_LOCK
+    for k in STRIPE_PRICE_TEAM STRIPE_PRICE_BUSINESS STRIPE_PRICE_SOLO_MONTHLY STRIPE_PRICE_SOLO_YEARLY; do
+      need "$k"
+      [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
+    done
+    if [ -z "$VERIFY_ONLY" ]; then
+      need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
+      # Test mode only (billing-core refuses a live key too); never printed.
+      [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] ||
+        { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_); a live key is refused" >&2; exit 2; }
+      [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] ||
+        { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)" >&2; exit 2; }
+    fi
+    # The schema first: the Worker never runs on a stale one. billing-db.ts
+    # applies each pinned file once (a frozen lock, main's pins kept) and reads
+    # it back; VERIFY_ONLY passes through and fails while one is pending.
+    BILLING_DB_ID="$BILLING_DB_ID" MAIN_BILLING_MIGRATION_LOCK="$MAIN_BILLING_MIGRATION_LOCK" \
+      node --experimental-strip-types --no-warnings "$root/scripts/ops/billing-db.ts" "$env"
+    billing_deploy() {
+      BILLING_DB_ID="$BILLING_DB_ID" BROKER_REGISTRY_ID="$BROKER_REGISTRY_ID" \
+        STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
+        STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
+        deploy billing
+    }
+    billing_deploy
+    # Both secrets every run (a rotation is a re-run), then deploy again so the
+    # serving version carries the tag (#1040). Never in argv or the log.
+    if [ -z "$VERIFY_ONLY" ]; then
+      printf '%s' "$STRIPE_SECRET_KEY" | put_secret oa-$P-billing billing STRIPE_SECRET_KEY || exit 1
+      printf '%s' "$STRIPE_WEBHOOK_SECRET" | put_secret oa-$P-billing billing STRIPE_WEBHOOK_SECRET || exit 1
+      billing_deploy
+    fi
+    S="$(settings oa-$P-billing)"
+    expect "$S" '.result.bindings[] | select(.name == "BILLING_DB") | .id' "$BILLING_DB_ID" "BILLING_DB"
+    expect "$S" '.result.bindings[] | select(.name == "BROKER_REGISTRY") | .namespace_id' "$BROKER_REGISTRY_ID" "BROKER_REGISTRY"
+    names_are "$S" "BILLING_DB,BROKER_REGISTRY"
+    # OA_ENV and the four price ids, as the tag commits them (filled from env).
+    vars_are "$S" billing
+    expect "$S" '.result.observability.enabled // false' false "observability"
+    names="$(secret_names oa-$P-billing | sort | tr '\n' ' ')"
+    [ "$names" = "STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET " ] || { echo "oa-$P-billing secrets are '$names'" >&2; exit 1; }
+    crons="$(cf_get /workers/scripts/oa-$P-billing/schedules | must "read oa-$P-billing schedules" | jq -r '[.result.schedules[].cron] | sort | join(",")')"
+    [ "$crons" = "17 3 * * *" ] || { echo "oa-$P-billing schedules are '$crons'" >&2; exit 1; }
     ;;
   dispatch)
     need HOSTS_KV_ID
