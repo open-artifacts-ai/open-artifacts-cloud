@@ -27,16 +27,15 @@ export const ClaimFreeSchema = z
 
 export const CLAIM_FREE_ACTION = "signup_claim.free";
 
-/** A signup still in flight, or whose install is not `deleted`: the claim is in use. */
-const LIVE_SQL = `SELECT 1 AS x FROM signups s
+/** True when the signup `sid` is in flight, or its install is not `deleted`: the claim is in use. */
+const live = (sid: string) => `(EXISTS (SELECT 1 FROM signups s
   LEFT JOIN installs i ON i.id = s.install_id
-WHERE s.signup_id = ?1
-  AND (s.status IN ('pending', 'queued', 'waiting_cap', 'creating')
-    OR (i.id IS NOT NULL AND i.state <> 'deleted'))
-UNION ALL
-SELECT 1 FROM jobs j JOIN installs i2 ON i2.id = j.install_id
-WHERE j.signup_id = ?1 AND i2.state <> 'deleted'
-LIMIT 1`;
+  WHERE s.signup_id = ${sid}
+    AND (s.status IN ('pending', 'queued', 'waiting_cap', 'creating')
+      OR (i.id IS NOT NULL AND i.state <> 'deleted')))
+  OR EXISTS (SELECT 1 FROM jobs j JOIN installs i2 ON i2.id = j.install_id
+    WHERE j.signup_id = ${sid} AND i2.state <> 'deleted'))`;
+const LIVE_SQL = `SELECT 1 AS x WHERE ${live("?1")}`;
 
 /** The Google subs an email has signed up with (installs or the signup queue). */
 async function subsOfEmail(env: Env, email: string): Promise<string[]> {
@@ -128,35 +127,46 @@ export async function freeClaim(
       sub,
       signupId: claim.signup_id,
     });
-  const live = await env.PLATFORM_DB.prepare(LIVE_SQL)
+  const inUse = await env.PLATFORM_DB.prepare(LIVE_SQL)
     .bind(claim.signup_id)
     .first();
-  if (live)
+  if (inUse)
     return refuse("invalid_state", "the claim's install is still live", {
       sub,
       signupId: claim.signup_id,
     });
 
   const now = Date.now();
-  // One batch: the claim is never freed without its audit row.
+  // One batch: the claim is never freed without its audit row, and the ok row
+  // only commits if the UPDATE freed one. The liveness check is repeated in
+  // the UPDATE's WHERE so an install that went live since the read above
+  // is not freed (TOCTOU).
   const res = await env.PLATFORM_DB.batch([
     env.PLATFORM_DB.prepare(
-      "UPDATE signup_accounts SET freed_at = ?3 WHERE owner_sub = ?1 AND signup_id = ?2 AND freed_at IS NULL",
+      `UPDATE signup_accounts SET freed_at = ?3 WHERE owner_sub = ?1 AND signup_id = ?2 AND freed_at IS NULL AND NOT ${live("?2")}`,
     ).bind(sub, claim.signup_id, now),
-    await auditStatement(env, {
-      action: CLAIM_FREE_ACTION,
-      actor: p,
-      outcome: "ok",
-      ip,
-      email,
-      detail: {
-        sub,
-        signupId: claim.signup_id,
-        claimedAt: claim.created_at,
-        reason,
+    await auditStatement(
+      env,
+      {
+        action: CLAIM_FREE_ACTION,
+        actor: p,
+        outcome: "ok",
+        ip,
+        email,
+        detail: {
+          sub,
+          signupId: claim.signup_id,
+          claimedAt: claim.created_at,
+          reason,
+        },
       },
-    }),
+      true,
+    ),
   ]);
-  if ((res[0]?.meta.changes ?? 0) !== 1) throw new ApiError("invalid_state");
+  if ((res[0]?.meta.changes ?? 0) !== 1)
+    return refuse("invalid_state", "the claim changed; retry", {
+      sub,
+      signupId: claim.signup_id,
+    });
   return { status: 200, body: { freed: true, sub, freedAt: now } };
 }
