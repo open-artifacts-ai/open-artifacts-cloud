@@ -182,6 +182,8 @@ describe("ProvisionInstall: create", () => {
     expect(w.mail).toHaveLength(1);
     expect(w.mail[0]).toMatchObject({ to: EMAIL });
     expect(w.mail[0]?.text).toContain(`https://${app("welcomeco")}`);
+    expect(w.mail[0]?.html).toContain(`https://${app("welcomeco")}/`);
+    expect(w.mail[0]?.subject).toBe(`${app("welcomeco")} is ready`);
     expect(w.signup(s.signupId)).toMatchObject({
       status: "ready",
       welcome_claimed_at: expect.any(Number),
