@@ -149,7 +149,9 @@ jobs:
           # Known targets only, each once, in dependency order: every bound
           # target before its binder (design v7 10.2). The scheduler is last
           # (#1343): nothing binds it, and its tag is the fleet's target, so a
-          # run that stops partway never moves the fleet.
+          # run that stops before the scheduler step never moves the fleet; once
+          # that step's first deploy has run, the fleet follows even if the run
+          # goes red afterwards (#55).
           order="platform-db auth-broker directory-broker billing provision-token provisioner dispatch inventory provisioning zones scheduler"
           last=-1
           seen=""
@@ -328,7 +330,8 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/hosted-resource-ids.sh" "$DEPLOY_ENV"
-      - name: Deploy and verify
+      - id: deploy
+        name: Deploy and verify
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           DEPLOY_ENVIRONMENT: ${{ inputs.env == 'prod' && 'hosted-prod-deploy' || 'hosted-staging-deploy' }}
@@ -381,7 +384,8 @@ jobs:
       # only once every other target, the zones included, has succeeded. The
       # canary smoke's two secrets (#1343) reach this step, and so only the
       # scheduler: the Environment's, put on oa-<p>-scheduler when set.
-      - name: Scheduler, last
+      - id: scheduler
+        name: Scheduler, last
         if: ${{ contains(format(',{0},', inputs.targets), ',scheduler,') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
@@ -396,8 +400,12 @@ jobs:
       # "workers/tag" back after a full-list run, on prod as on staging. A
       # break-glass run (fewer targets) leaves the others on their own tag,
       # so it is not checked here.
+      # It also runs when the deploy or the scheduler step failed (#55): the
+      # scheduler's tag is the fleet's target, so a red run must say whether it
+      # moved. Only after a deploy step ran, never after an earlier gate failed
+      # or the run was cancelled.
       - name: Every platform Worker runs the tag
-        if: ${{ inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' }}
+        if: ${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}
