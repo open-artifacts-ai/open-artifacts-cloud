@@ -36,6 +36,7 @@ pinned public release, with this tree copied on top.
 | `scripts/overlay.test.sh` | Tests for the scripts above, on throwaway repos. |
 | `hosted-workflows/` | Where the sync parks public's copies of the hosted workflows (it never writes under `.github/workflows/`). Empty since C2: the live workflows are in `.github/workflows/`, edited for this repo, and a re-sync's changes are hand-ported into them. |
 | `.github/workflows/ci.yml` | Checks out public at the pin, overlays, then install, build, typecheck, test. |
+| `.github/ISSUE_TEMPLATE/blocker.yml` | Repo-only GitHub config so the hosted workflows can open `blocker` issues here. Never overlaid; `equivalence.sh` requires it to be byte-identical to public's at `SYNCED_FROM`. |
 | `.github/workflows/hosted-release.yml` | Mirrors the public release at `PUBLIC_PIN` into this repo (tag and release, by the release App), then builds, signs and attaches the hosted release files (cut-over step C3, #1056). Runs for real on a push to `main` that changes `PUBLIC_PIN` (step F2): a push has no inputs, so `inputs.dry_run` is null and every dry-run test treats it as not a dry run. `workflow_dispatch` keeps `dry_run` (the default), which builds and signs with the staging key and stops before the tag and the attach. |
 | `.github/workflows/<hosted>.yml` | The hosted workflows (deploy, publish, floor, red-line, monitors, token pings), live since C2 (#1056). Dispatch only, plus `hosted-publish`'s `workflow_run` on `hosted-release` (C3). `prodclean-monitor` runs hourly from here; the `redline-nightly` schedule stays off until cut-over step F5. `PROD_RELEASE_CHAIN` stays unset. |
 | `.github/actions/overlay/` | The overlay prelude every hosted job that installs or builds uses: check this repo out at `_cloud`, then this action puts public at the `PUBLIC_PIN` of that checkout with this repo on top, at the workspace root. |
@@ -60,7 +61,9 @@ pinned public release, with this tree copied on top.
 5. **This repo's own files never overlay**: root-level files (this README,
    PUBLIC_PIN, SYNCED_FROM, private-paths.txt), the tooling scripts listed in
    `TOOLING` in `overlay.sh`, `.github/workflows/ci.yml` (this repo's CI;
-   public has its own), `.github/actions/` (this repo's CI actions) and
+   public has its own), `.github/actions/` (this repo's CI actions),
+   `.github/ISSUE_TEMPLATE/blocker.yml` (repo-only
+   GitHub config, checked equal to public's by `equivalence.sh`) and
    `hosted-workflows/`. Any other file directly in
    `scripts/` fails the run. Everything else in the tree overlays, at the
    same path.

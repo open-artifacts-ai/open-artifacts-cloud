@@ -19,7 +19,9 @@
 #      PUBLIC_PIN, SYNCED_FROM, private-paths.txt, ...), the tooling listed in
 #      TOOLING below, .github/workflows/ci.yml (this repo's CI),
 #      .github/actions/ (this repo's own CI actions, the overlay prelude
-#      among them) and hosted-workflows/ (where the sync parks public's
+#      among them), .github/ISSUE_TEMPLATE/blocker.yml (repo-only GitHub
+#      config; public holds the same file, and equivalence.sh requires byte
+#      equality) and hosted-workflows/ (where the sync parks public's
 #      copies of the hosted workflows; the live ones are .github/workflows/).
 #      Any other file directly in scripts/ fails the run: it is
 #      neither tooling nor a path public could hold.
@@ -118,6 +120,7 @@ while IFS= read -r f; do
     .github/workflows/ci.yml) continue ;;   # Rule 5: this repo's CI
     .github/actions/*) continue ;;          # Rule 5: this repo's CI actions
     hosted-workflows/*) continue ;;         # Rule 5: parked copies (the sync's landing dir)
+    .github/ISSUE_TEMPLATE/blocker.yml) continue ;;   # Rule 5: repo-only GitHub config; equivalence.sh requires it to equal public's
     scripts/*/*) ;;
     scripts/*)
       case "$TOOLING" in

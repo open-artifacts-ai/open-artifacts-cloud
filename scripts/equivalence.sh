@@ -196,6 +196,19 @@ while IFS= read -r line; do
   bad=$((bad + 1))
 done <<< "$diffs"
 
+# Repo-only GitHub config: overlay.sh never overlays this file (public holds
+# it too), so the diff above cannot see it. It must be byte-identical to
+# public@S, and public@S must hold it.
+rf=.github/ISSUE_TEMPLATE/blocker.yml
+{
+  if [ -e "$PRIV/$rf" ] || [ -L "$PRIV/$rf" ]; then
+    if [ -L "$PRIV/$rf" ] || [ ! -f "$PRIV/$rf" ] || [ ! -f "$ref/$rf" ] || ! cmp -s "$PRIV/$rf" "$ref/$rf"; then
+      echo "equivalence: DIFF: $rf (repo-only config must be a regular file identical to public's at $sha)" >&2
+      bad=$((bad + 1))
+    fi
+  fi
+}
+
 # diff -rq ignores permissions: compare the executable bit.
 execs() { (cd "$1" && find . -path ./.git -prune -o -type f -perm /111 -print | sed 's|^\./||' | LC_ALL=C sort); }
 while IFS= read -r path; do
