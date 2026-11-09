@@ -94,6 +94,26 @@ describe("provisionerOptions", () => {
     }
   });
 
+  it("STAGING_BUS_SLUGS: staging parses it strictly, prod always gets an empty list (#1299)", async () => {
+    const v = "rl-agents,bus1299-b, bad,X";
+    const st = await provisionerOptions(
+      mkEnv({ OA_ENV: "staging", STAGING_BUS_SLUGS: v }),
+      LABEL,
+      io(),
+      JOB,
+    );
+    expect(st.stagingBusSlugs).toEqual(["rl-agents", "bus1299-b"]);
+    const none = await provisionerOptions(mkEnv(), LABEL, io(), JOB);
+    expect(none.stagingBusSlugs).toEqual([]);
+    const prod = await provisionerOptions(
+      mkEnv({ OA_ENV: "prod", STAGING_BUS_SLUGS: v }),
+      LABEL,
+      io(),
+      JOB,
+    );
+    expect(prod.stagingBusSlugs).toEqual([]);
+  });
+
   it("reads PROVISION_TOKEN once and calls Cloudflare with it on ACCOUNT_ID", async () => {
     const gets: string[] = [];
     const calls: { url: string; auth: string | null }[] = [];

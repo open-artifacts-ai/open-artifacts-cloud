@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import type { Duplex } from "node:stream";
 import { paceAnon, targetsFromEnv, tripwire } from "./rl-anon.ts";
 
 // WebSocket handshakes and raw-Host requests over node:http(s). fetch can't
@@ -40,6 +41,11 @@ interface RawOpts {
   host?: string;
   servername?: string;
   timeoutMs?: number;
+  /**
+   * An upgrade keeps its socket and hands it here instead of destroying it
+   * (holdSocket). The caller owns the socket from then on.
+   */
+  keep?: (socket: Duplex) => void;
 }
 
 /** One request over node:http(s); the reply (any status) as a Response. */
@@ -78,7 +84,8 @@ export function rawRequest(o: RawOpts): Promise<Response> {
       resolve(r);
     };
     req.on("upgrade", (res, socket) => {
-      socket.destroy();
+      if (o.keep) o.keep(socket);
+      else socket.destroy();
       done(toResponse(res, Buffer.alloc(0)));
     });
     req.on("response", (res) => {
@@ -127,4 +134,145 @@ function upgrade(req: Request): Promise<Response> {
   headers.set("sec-websocket-version", "13");
   headers.set("sec-websocket-key", randomBytes(16).toString("base64"));
   return rawRequest({ url: req.url, headers });
+}
+
+/** A WebSocket this run keeps open (holdSocket). */
+export interface Held {
+  /** The handshake's status: 101 when the server upgraded. */
+  status: number;
+  /** Resolves when the connection ends, whoever ended it. Never rejects. */
+  closed: Promise<void>;
+  /** Writes one masked text frame (a client frame must be masked). */
+  send: (text: string) => void;
+  /** Every text frame the server has sent, in order. */
+  texts: string[];
+  /** True once a text frame matching `pred` has arrived (or does within `ms`); false on timeout or close. */
+  waitText: (pred: (t: string) => boolean, ms: number) => Promise<boolean>;
+  /** Ends it from this side; safe to call twice. */
+  destroy: () => void;
+}
+
+/** One masked client text frame (RFC 6455 5.2), for a short payload. */
+export function textFrame(text: string): Buffer {
+  const payload = Buffer.from(text, "utf8");
+  const mask = randomBytes(4);
+  const n = payload.length;
+  const head =
+    n < 126
+      ? Buffer.from([0x81, 0x80 | n])
+      : Buffer.from([0x81, 0x80 | 126, n >> 8, n & 0xff]);
+  if (n > 0xffff) throw new Error("textFrame: payload too long");
+  const body = Buffer.from(payload);
+  for (let i = 0; i < n; i++)
+    body[i] = (body[i] as number) ^ (mask[i % 4] as number);
+  return Buffer.concat([head, mask, body]);
+}
+
+/** The bus keepalive cadence (bus-protocol limits.pingIntervalMs). */
+export const KEEPALIVE_MS = 25_000;
+
+/**
+ * The handshake for `req`, and the socket kept open when the server upgraded
+ * (101): the caller watches `closed`. Any other status has no socket and an
+ * already-resolved `closed`. A timeout or socket error before a response
+ * rejects, as wsHandshake does. While open it reads the server's text frames
+ * (`texts`) and sends the bare keepalive "ping" every `pingMs` (default
+ * KEEPALIVE_MS), as a bus client does, so an idle timeout can't be what ends
+ * it.
+ */
+export async function holdSocket(
+  req: Request,
+  o: { pingMs?: number } = {},
+): Promise<Held> {
+  const headers = new Headers(req.headers);
+  headers.set("connection", "Upgrade");
+  headers.set("upgrade", "websocket");
+  headers.set("sec-websocket-version", "13");
+  headers.set("sec-websocket-key", randomBytes(16).toString("base64"));
+  let kept: Duplex | undefined;
+  const res = await rawRequest({
+    url: req.url,
+    headers,
+    keep: (s) => {
+      kept = s;
+    },
+  });
+  const socket = kept;
+  const texts: string[] = [];
+  if (!socket)
+    return {
+      status: res.status,
+      closed: Promise.resolve(),
+      send: () => {},
+      destroy: () => {},
+      texts,
+      waitText: async () => false,
+    };
+  let ended = false;
+  const waiters = new Set<() => void>();
+  const closed = new Promise<void>((resolve) => {
+    const end = () => {
+      ended = true;
+      for (const w of waiters) w();
+      resolve();
+    };
+    socket.once("close", end);
+    socket.once("end", end);
+    socket.once("error", end);
+  });
+  let buf: Buffer = Buffer.alloc(0);
+  socket.on("data", (d: Buffer) => {
+    buf = Buffer.concat([buf, d]);
+    for (;;) {
+      if (buf.length < 2) break;
+      let len = (buf[1] as number) & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) break;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) break;
+        len = Number(buf.readBigUInt64BE(2));
+        off = 10;
+      }
+      if (buf.length < off + len) break;
+      if (((buf[0] as number) & 0x0f) === 1)
+        texts.push(buf.subarray(off, off + len).toString("utf8"));
+      buf = buf.subarray(off + len);
+    }
+    for (const w of waiters) w();
+  });
+  const ping = setInterval(() => {
+    if (!socket.destroyed) socket.write(textFrame("ping"));
+  }, o.pingMs ?? KEEPALIVE_MS);
+  ping.unref();
+  void closed.then(() => clearInterval(ping));
+  return {
+    status: res.status,
+    closed,
+    texts,
+    send: (text) => {
+      if (!socket.destroyed) socket.write(textFrame(text));
+    },
+    destroy: () => {
+      clearInterval(ping);
+      socket.destroy();
+    },
+    waitText: (pred, ms) =>
+      new Promise<boolean>((resolve) => {
+        const done = (v: boolean) => {
+          clearTimeout(t);
+          waiters.delete(check);
+          resolve(v);
+        };
+        const check = () => {
+          if (texts.some(pred)) done(true);
+          else if (ended) done(false);
+        };
+        const t = setTimeout(() => done(false), ms);
+        waiters.add(check);
+        check();
+      }),
+  };
 }

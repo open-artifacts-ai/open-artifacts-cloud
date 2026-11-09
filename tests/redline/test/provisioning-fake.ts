@@ -3,7 +3,7 @@ import {
   JOB_STEPS,
   TOKEN_SCOPES,
 } from "@oa/provisioning-contract";
-import type { ProvConfig, ProvIo } from "../src/provisioning.ts";
+import type { BusIo, ProvConfig, ProvIo } from "../src/provisioning.ts";
 import { type Schema, schemaAhead } from "../src/schema.ts";
 import { sealTo } from "./provisioner-seal.ts";
 
@@ -89,6 +89,23 @@ interface FJob {
   createdAt: number;
   finishedAt: number | null;
 }
+
+/**
+ * How the fake's bus (P51) behaves:
+ * - conforming: a socket opens while the install serves, ends when the install
+ *   is suspended (seen at the next wait), a new connect while it is paused is
+ *   503, and the same token connects again once it serves;
+ * - off: the bus answers 404;
+ * - stays_open: a suspend leaves the held socket open (the bug P51 catches);
+ * - connects_suspended: a suspended install still upgrades a new socket;
+ * - dead_token: after the resume the same machine token is refused (401).
+ */
+export type BusMode =
+  | "conforming"
+  | "off"
+  | "stays_open"
+  | "connects_suspended"
+  | "dead_token";
 
 export type Fault =
   | "p1_200"
@@ -179,6 +196,8 @@ export interface FakeApi {
   };
   /** Every accepted OIDC create's body, in order. */
   creates: Record<string, unknown>[];
+  /** The bus seam's behaviour (P51), and what it was asked. */
+  bus: { mode: BusMode; opened: string[]; cleaned: number; connects: number[] };
 }
 
 /** apps/provisioning/src/auth/flow.ts clearFlowCookie(). */
@@ -1064,12 +1083,57 @@ export function fakeApi(): FakeApi {
     return page(host, url.pathname);
   };
 
+  const bus: FakeApi["bus"] = {
+    mode: "conforming",
+    opened: [],
+    cleaned: 0,
+    connects: [],
+  };
+  const watchers: (() => void)[] = [];
+  const busIo: BusIo = {
+    async open({ app, pat, hookKey }) {
+      if (!pat || !hookKey) throw new Error("fake bus: no creds");
+      if (bus.mode === "off") return "off";
+      const host = new URL(app).host;
+      const inst = [...installs.values()].find((x) => x.appHost === host);
+      if (!inst) throw new Error("fake bus: no such install");
+      bus.opened.push(inst.id);
+      let end!: () => void;
+      const closed = new Promise<void>((r) => {
+        end = r;
+      });
+      watchers.push(() => {
+        if (inst.mode !== "serving" && bus.mode !== "stays_open") end();
+      });
+      const connect = async () => {
+        const st =
+          inst.mode !== "serving"
+            ? bus.mode === "connects_suspended"
+              ? 101
+              : 503
+            : bus.mode === "dead_token" && bus.connects.length > 0
+              ? 401
+              : 101;
+        bus.connects.push(st);
+        return st;
+      };
+      return {
+        closed,
+        connect,
+        cleanup: async () => {
+          bus.cleaned++;
+        },
+      };
+    },
+  };
   const io: ProvIo = {
     fetch: handler as typeof fetch,
     now: () => clock.t,
     wait: async (ms) => {
       clock.t += ms;
+      for (const w of watchers) w();
     },
+    bus: busIo,
     jwt: async () => API_JWT,
     stgInventoryJwt: async () => INV_JWT,
     schemaOf: async (v) => schemaOf(v),
@@ -1089,6 +1153,7 @@ export function fakeApi(): FakeApi {
     signin,
     broker,
     creates,
+    bus,
   };
 }
 

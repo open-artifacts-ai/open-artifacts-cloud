@@ -1726,9 +1726,21 @@ describe("deploy-hosted-platform.sh", () => {
 
     it("a live key, a non-test key or a malformed secret or price is refused without printing it", () => {
       for (const [k, v, want] of [
-        ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "test-mode key"],
-        ["STRIPE_SECRET_KEY", "rk_live_abcdefgh12345678", "test-mode key"],
-        ["STRIPE_SECRET_KEY", "pk_test_abcdefgh12345678", "test-mode key"],
+        [
+          "STRIPE_SECRET_KEY",
+          "sk_live_abcdefgh12345678",
+          "test-mode key",
+        ],
+        [
+          "STRIPE_SECRET_KEY",
+          "rk_live_abcdefgh12345678",
+          "test-mode key",
+        ],
+        [
+          "STRIPE_SECRET_KEY",
+          "pk_test_abcdefgh12345678",
+          "test-mode key",
+        ],
         ["STRIPE_SECRET_KEY", "sk_test_short", "test-mode key"],
         [
           "STRIPE_WEBHOOK_SECRET",

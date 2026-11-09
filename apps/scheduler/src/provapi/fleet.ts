@@ -761,6 +761,8 @@ async function smokeCanary(
     shareTo: env.FLEET_SMOKE_SHARE_TO,
     // Only "off" skips the share check; unset or anything else runs it.
     share: env.FLEET_SMOKE_SHARE?.trim() !== "off",
+    // Likewise only "off" skips the bus check (#1299).
+    bus: env.FLEET_SMOKE_BUS?.trim() !== "off",
     brokerOrigin: env.AUTH_BROKER_ORIGIN,
     version: target,
   });

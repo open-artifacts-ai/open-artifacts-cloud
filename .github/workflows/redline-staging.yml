@@ -321,11 +321,19 @@ jobs:
           # inventory bearer is the OIDC JWT minted below).
           PROD_R2_TOKEN: ${{ secrets.REDLINE_PROD_R2_TOKEN }}
           PROD_SCRIPTS_TOKEN: ${{ secrets.REDLINE_PROD_SCRIPTS_TOKEN }}
+          # The provisioner probes (live/provisioner.test.ts, #859): a staging
+          # Cloudflare token, D1 Edit on oa-s-platform and Queues Write on
+          # oa-s-signups. Unset, the probes are unproven-live.
+          STG_PROVISIONER_TOKEN: ${{ secrets.REDLINE_STG_PROVISIONER_TOKEN }}
         run: |
           set -euo pipefail
           umask 077
           d="$RUNNER_TEMP/redline-secrets"
           mkdir -p "$d"
+          if [ -n "${STG_PROVISIONER_TOKEN:-}" ]; then
+            echo "::add-mask::$STG_PROVISIONER_TOKEN"
+            printf '%s' "$STG_PROVISIONER_TOKEN" > "$d/REDLINE_STG_PROVISIONER_TOKEN"
+          fi
           if [ -n "${PROD_R2_TOKEN:-}${PROD_SCRIPTS_TOKEN:-}" ]; then
             printf '%s' "$PROD_R2_TOKEN" > "$d/REDLINE_PROD_R2_TOKEN"
             printf '%s' "$PROD_SCRIPTS_TOKEN" > "$d/REDLINE_PROD_SCRIPTS_TOKEN"
@@ -338,6 +346,9 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
           REDLINE_TARGETS_BASE: ${{ vars.REDLINE_TARGETS }}
+          # JSON ids only (accountId, platformDbId, signupsQueueId,
+          # replaySignupId); the token file's path is built below, not a var.
+          REDLINE_STG_PROVISIONER_BASE: ${{ vars.REDLINE_STG_PROVISIONER }}
           REDLINE_PROD_INVENTORY_URL: ${{ vars.REDLINE_PROD_INVENTORY_URL }}
           RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
@@ -356,6 +367,12 @@ jobs:
           # tokens: a .prod without them fails loadTargets for the whole suite.
           if [ -n "${REDLINE_PROD_INVENTORY_URL:-}" ] && [ -s "$d/REDLINE_PROD_R2_TOKEN" ]; then
             targets=$(jq -c --arg u "$REDLINE_PROD_INVENTORY_URL" '.prod = {inventoryUrl: $u}' <<< "$targets")
+          fi
+          # The provisioner probes' config: the var's ids plus the token file
+          # the step above wrote. Without both the probes stay unproven-live.
+          if [ -n "${REDLINE_STG_PROVISIONER_BASE:-}" ] && [ -s "$d/REDLINE_STG_PROVISIONER_TOKEN" ]; then
+            prov=$(jq -ce --arg f "$d/REDLINE_STG_PROVISIONER_TOKEN" 'if type == "object" then . + {tokenFile: $f} else error("not an object") end' <<< "$REDLINE_STG_PROVISIONER_BASE") || { echo "REDLINE_STG_PROVISIONER is not a JSON object"; exit 1; }
+            echo "REDLINE_STG_PROVISIONER=$prov" >> "$GITHUB_ENV"
           fi
           {
             echo "REDLINE_TARGETS=$targets"
