@@ -1277,6 +1277,12 @@ async function refusedRollback(
     throw new ProbeFail(
       `P31: after the refusal /healthz is not ok on ${run.c.version} (${desc(hz)})`,
     );
+  const q = new URLSearchParams({ installId: p.id, action: "job.failed", limit: "100" });
+  const r = await run.v1(`/audit?${q}`, { read: true });
+  expect(r, 200, "P31 R17");
+  const rows = (r.json as { items: { jobId: string | null }[] }).items.filter((i) => i.jobId === a.job.id);
+  if (rows.length === 0)
+    throw new ProbeFail("P31: the refused rollback has no job.failed audit row");
   // No job.failed audit read here. The provisioner writes that row as a
   // `provision` row with actor job:<id>; R17 for this run's OIDC actor has
   // reach "own", which returns only source='api' rows of its own actor
