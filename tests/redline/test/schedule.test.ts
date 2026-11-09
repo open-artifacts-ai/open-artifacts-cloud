@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { ADDED } from "./added-cases.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
 // its per-case durations and per-file walls (test/fixtures/run-42402998826.json,
@@ -36,8 +37,15 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
+/**
+ * Files added after the recording (#1299's live/bus.test.ts), so no wall was
+ * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
+ * case that is a few requests while the bus is off). The first live run that
+ * includes them replaces it; test/same-cases ADDED names what is estimated.
+ */
+const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
 const wall = (f: string): number => {
-  const w = fx.fileWallsSec[f];
+  const w = fx.fileWallsSec[f] ?? ESTIMATED_WALL_SEC[f];
   if (w === undefined) throw new Error(`no recorded wall for ${f}`);
   return w;
 };
@@ -109,8 +117,13 @@ describe("the recording (run 42402998826)", () => {
     );
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
+    // The recording is of a run before #1299's two cases (test/same-cases
+    // ADDED); every other case is in both.
+    const added = new Set(ADDED.map((c) => `${c.file} ${c.name}`));
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(m.cases.map((c) => `${c.file} ${c.name}`)),
+      new Set(
+        m.cases.map((c) => `${c.file} ${c.name}`).filter((k) => !added.has(k)),
+      ),
     );
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
@@ -213,9 +226,13 @@ describe("the schedule simulation", () => {
     expect(PLAN).toHaveLength(1);
     const names = (PLAN[0] ?? []).map((l) => l.name).sort();
     expect(names).toEqual(["creds", "front", "guard", "prov", "surfaces"]);
-    // Every recorded file is in a lane, so no recorded second is left out.
+    // Every recorded file is in a lane, so no recorded second is left out;
+    // the only others are the estimated, post-recording files.
     expect((PLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
-      Object.keys(fx.fileWallsSec).sort(),
+      [
+        ...Object.keys(fx.fileWallsSec),
+        ...Object.keys(ESTIMATED_WALL_SEC),
+      ].sort(),
     );
   });
 

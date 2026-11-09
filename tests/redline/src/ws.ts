@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import type { Duplex } from "node:stream";
 import { paceAnon, targetsFromEnv, tripwire } from "./rl-anon.ts";
 
 // WebSocket handshakes and raw-Host requests over node:http(s). fetch can't
@@ -40,6 +41,11 @@ interface RawOpts {
   host?: string;
   servername?: string;
   timeoutMs?: number;
+  /**
+   * An upgrade keeps its socket and hands it here instead of destroying it
+   * (holdSocket). The caller owns the socket from then on.
+   */
+  keep?: (socket: Duplex) => void;
 }
 
 /** One request over node:http(s); the reply (any status) as a Response. */
@@ -78,7 +84,8 @@ export function rawRequest(o: RawOpts): Promise<Response> {
       resolve(r);
     };
     req.on("upgrade", (res, socket) => {
-      socket.destroy();
+      if (o.keep) o.keep(socket);
+      else socket.destroy();
       done(toResponse(res, Buffer.alloc(0)));
     });
     req.on("response", (res) => {
@@ -127,4 +134,77 @@ function upgrade(req: Request): Promise<Response> {
   headers.set("sec-websocket-version", "13");
   headers.set("sec-websocket-key", randomBytes(16).toString("base64"));
   return rawRequest({ url: req.url, headers });
+}
+
+/** A WebSocket this run keeps open (holdSocket). */
+export interface Held {
+  /** The handshake's status: 101 when the server upgraded. */
+  status: number;
+  /** Resolves when the connection ends, whoever ended it. Never rejects. */
+  closed: Promise<void>;
+  /** Writes one masked text frame (a client frame must be masked). */
+  send: (text: string) => void;
+  /** Ends it from this side; safe to call twice. */
+  destroy: () => void;
+}
+
+/** One masked client text frame (RFC 6455 5.2), for a short payload. */
+export function textFrame(text: string): Buffer {
+  const payload = Buffer.from(text, "utf8");
+  const mask = randomBytes(4);
+  const n = payload.length;
+  const head =
+    n < 126
+      ? Buffer.from([0x81, 0x80 | n])
+      : Buffer.from([0x81, 0x80 | 126, n >> 8, n & 0xff]);
+  if (n > 0xffff) throw new Error("textFrame: payload too long");
+  const body = Buffer.from(payload);
+  for (let i = 0; i < n; i++)
+    body[i] = (body[i] as number) ^ (mask[i % 4] as number);
+  return Buffer.concat([head, mask, body]);
+}
+
+/**
+ * The handshake for `req`, and the socket kept open when the server upgraded
+ * (101): the caller watches `closed`. Any other status has no socket and an
+ * already-resolved `closed`. A timeout or socket error before a response
+ * rejects, as wsHandshake does. Nothing here reads a frame: the socket is
+ * drained so the server's own frames never stall it.
+ */
+export async function holdSocket(req: Request): Promise<Held> {
+  const headers = new Headers(req.headers);
+  headers.set("connection", "Upgrade");
+  headers.set("upgrade", "websocket");
+  headers.set("sec-websocket-version", "13");
+  headers.set("sec-websocket-key", randomBytes(16).toString("base64"));
+  let kept: Duplex | undefined;
+  const res = await rawRequest({
+    url: req.url,
+    headers,
+    keep: (s) => {
+      kept = s;
+    },
+  });
+  const socket = kept;
+  if (!socket)
+    return {
+      status: res.status,
+      closed: Promise.resolve(),
+      send: () => {},
+      destroy: () => {},
+    };
+  const closed = new Promise<void>((resolve) => {
+    socket.once("close", () => resolve());
+    socket.once("end", () => resolve());
+    socket.once("error", () => resolve());
+  });
+  socket.resume();
+  return {
+    status: res.status,
+    closed,
+    send: (text) => {
+      if (!socket.destroyed) socket.write(textFrame(text));
+    },
+    destroy: () => socket.destroy(),
+  };
 }

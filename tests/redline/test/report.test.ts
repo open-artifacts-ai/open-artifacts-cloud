@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
+import { BUS_OFF_REASON } from "../src/bus-gate.ts";
 import {
   ID_TOKEN_CASES,
   ID_TOKEN_DESCRIBE,
@@ -40,6 +41,7 @@ import {
   runKindOf,
 } from "../src/report.ts";
 import { bindingOf } from "../src/reporter.ts";
+import { ADDED } from "./added-cases.ts";
 
 const c = (name: string, level: Level, reason?: string): CaseResult => ({
   name,
@@ -246,10 +248,18 @@ describe("gate", () => {
       ACCEPTED_UNPROVEN.map((e) => c(e.name, "unproven-live", e.reason));
     const ok = c("a", "pass");
 
-    it("is exactly the four, frozen, each citing a test file", () => {
-      expect(ACCEPTED_UNPROVEN).toHaveLength(4);
-      expect(ACCEPTED_UNPROVEN.map((e) => e.name)).toEqual(NAMES);
-      expect(ACCEPTED_UNPROVEN.map((e) => e.reason)).toEqual(REASONS);
+    it("is main's four then #1299's two bus entries, frozen, each citing a test file", () => {
+      expect(ACCEPTED_UNPROVEN).toHaveLength(6);
+      expect(ACCEPTED_UNPROVEN.slice(0, 4).map((e) => e.name)).toEqual(NAMES);
+      expect(ACCEPTED_UNPROVEN.slice(0, 4).map((e) => e.reason)).toEqual(
+        REASONS,
+      );
+      // Only while the bus is off (src/bus-gate.ts): part 6 deletes both.
+      expect(ACCEPTED_UNPROVEN.slice(4).map((e) => e.name)).toEqual(
+        ADDED.map((a) => a.name),
+      );
+      for (const e of ACCEPTED_UNPROVEN.slice(4))
+        expect(e.reason).toBe(BUS_OFF_REASON);
       expect(Object.isFrozen(ACCEPTED_UNPROVEN)).toBe(true);
       for (const e of ACCEPTED_UNPROVEN) {
         expect(Object.isFrozen(e)).toBe(true);
@@ -267,7 +277,7 @@ describe("gate", () => {
       const r = buildReport([ok, ...listed()]);
       expect(r.gate).toEqual({
         passed: true,
-        reason: "every case passed but 4 accepted unproven-live",
+        reason: "every case passed but 6 accepted unproven-live",
       });
       expect(exitCode(r, true)).toBe(0);
     });
@@ -287,6 +297,8 @@ describe("gate", () => {
         "provisioning.test.ts",
         "signin.test.ts",
         "signin.test.ts",
+        "bus.test.ts",
+        "provisioning.test.ts",
       ]);
     });
 
@@ -306,7 +318,7 @@ describe("gate", () => {
         const r = buildReport([ok, ...listed(), bad]);
         expect(r.gate.passed, JSON.stringify(bad)).toBe(false);
         expect(r.gate.reason).toBe(
-          '1 of 6 cases are not "pass"; 4 accepted unproven-live',
+          '1 of 8 cases are not "pass"; 6 accepted unproven-live',
         );
       }
     });
@@ -337,7 +349,7 @@ describe("gate", () => {
         );
       }
       expect(t).toContain(
-        'Gate: FAIL (1 of 6 cases are not "pass"; 4 accepted unproven-live)',
+        'Gate: FAIL (1 of 8 cases are not "pass"; 6 accepted unproven-live)',
       );
     });
   });

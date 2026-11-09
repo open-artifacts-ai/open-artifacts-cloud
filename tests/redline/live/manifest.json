@@ -1113,6 +1113,10 @@
       "name": "anonymous writes on a B public artifact > A's PAT sent along does not change the actor to A's user"
     },
     {
+      "file": "live/bus.test.ts",
+      "name": "bus > A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)"
+    },
+    {
       "file": "live/edge.test.ts",
       "name": "cross-site isolation > artifact content is served on a registrable domain cross-site to every app host"
     },
@@ -1211,6 +1215,10 @@
     {
       "file": "live/provisioning.test.ts",
       "name": "provisioning > P31: rollback of the rl-p install after an upgrade: the previous version"
+    },
+    {
+      "file": "live/provisioning.test.ts",
+      "name": "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume"
     },
     {
       "file": "live/provisioning.test.ts",

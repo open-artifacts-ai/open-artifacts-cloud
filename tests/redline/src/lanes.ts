@@ -122,6 +122,10 @@ export const CLAIMS: Record<string, Claims> = {
     buckets: installBuckets(),
   },
   "live/live.test.ts": { state: installs(), buckets: installBuckets() },
+  // #1299: a machine on each side (labelled, revoked at the end) and its
+  // device-flow requests, which the rl-anon ledgers pace (bus-dev, bus-tok,
+  // bus-code, bus-approve in src/rl-anon.ts).
+  "live/bus.test.ts": { state: installs(), buckets: installBuckets() },
   "live/surfaces.test.ts": {
     state: {
       ...installs(),
@@ -199,7 +203,8 @@ const lane = (name: string, ...files: string[]): Lane => ({
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker barrier;
  * - surfaces: surfaces (335.0 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
- * - guard: guard (130.8 s; prodClean stays serial inside it);
+ * - guard: guard (130.8 s; prodClean stays serial inside it), then bus (#1299:
+ *   one case, a few requests; unproven-live while the bus is off);
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
  */
@@ -208,7 +213,7 @@ export const PLAN: readonly Phase[] = [
     lane("prov", "provisioning"),
     lane("surfaces", "surfaces"),
     lane("creds", "credentials"),
-    lane("guard", "guard"),
+    lane("guard", "guard", "bus"),
     lane("front", "signin", "edge", "live"),
   ],
 ];

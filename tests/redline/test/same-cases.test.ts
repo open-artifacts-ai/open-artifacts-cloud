@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { BUS_OFF_REASON } from "../src/bus-gate.ts";
 import { PLAN } from "../src/lanes.ts";
 import {
   ACCEPTED_UNPROVEN,
@@ -12,6 +13,7 @@ import {
   parseManifest,
 } from "../src/report.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
+import { ADDED } from "./added-cases.ts";
 
 // #1730 changes when and beside what the cases run, never which cases there
 // are or what passes. test/fixtures/main-cases.json is main's required cases
@@ -25,19 +27,22 @@ const main = JSON.parse(
   readFileSync(join(import.meta.dirname, "fixtures/main-cases.json"), "utf8"),
 ) as Main;
 const pkg = join(import.meta.dirname, "..");
+
+const isAdded = (c: { file: string; name: string }) =>
+  ADDED.some((a) => a.file === c.file && a.name === c.name);
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds exactly main's 329 cases, in main's order", () => {
+  it("manifest.json holds main's 329 cases, in main's order, plus exactly the cases named in ADDED", () => {
     const m = parseManifest(read("live/manifest.json"));
     expect(main.manifest).toHaveLength(329);
-    expect(m.cases.map((c) => ({ file: c.file, name: c.name }))).toEqual(
-      main.manifest,
-    );
+    const all = m.cases.map((c) => ({ file: c.file, name: c.name }));
+    expect(all.filter((c) => !isAdded(c))).toEqual(main.manifest);
+    expect(all.filter(isAdded)).toEqual(ADDED);
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set(main.manifest.map((c) => c.file));
+    const files = new Set([...main.manifest, ...ADDED].map((c) => c.file));
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });
@@ -72,15 +77,17 @@ describe("the same cases", () => {
 });
 
 describe("the same pass bar", () => {
-  it("ACCEPTED_UNPROVEN is main's four entries, by name, reason and file", () => {
-    expect(
-      ACCEPTED_UNPROVEN.map((e) => ({
-        name: e.name,
-        reason: e.reason,
-        file: e.file,
-      })),
-    ).toEqual(main.acceptedUnproven);
+  it("ACCEPTED_UNPROVEN is main's four entries, by name, reason and file, plus one per ADDED case (the bus is off until part 6)", () => {
+    const all = ACCEPTED_UNPROVEN.map((e) => ({
+      name: e.name,
+      reason: e.reason,
+      file: e.file,
+    }));
+    const added = (e: { name: string }) => ADDED.some((a) => a.name === e.name);
+    expect(all.filter((e) => !added(e))).toEqual(main.acceptedUnproven);
     expect(main.acceptedUnproven).toHaveLength(4);
+    expect(all.filter(added)).toHaveLength(ADDED.length);
+    for (const e of all.filter(added)) expect(e.reason).toBe(BUS_OFF_REASON);
   });
 
   it("MAX_RETRIED_CASES is 5 and the gate is read from --gate or REDLINE_GATE=1", () => {

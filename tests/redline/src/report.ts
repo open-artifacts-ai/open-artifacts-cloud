@@ -1,3 +1,4 @@
+import { BUS_OFF_REASON } from "./bus-gate.ts";
 // Proof levels and the gate rule (the Manager's): every case reports exactly
 // one level, and the gate passes only when EVERY case is "pass". staging-only,
 // not-applicable, unproven-live and infra never count as a pass, and neither
@@ -516,6 +517,24 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
       file: "signin.test.ts",
       evidence:
         'apps/server/test/xt-google.local.test.ts "sign-in ID-token cases across installs (fake Google) > an ID token minted for A\'s client (aud) replayed at B: no session"; apps/server/test/google-broker.test.ts "Google through the broker > a token minted through install A with B\'s client nonce is refused at B (accepted at A)"; the laptop capture run: docs/ops/redline-signin.md, tests/redline/test/rehearsal.test.ts; the capture duty: #1047',
+    },
+    // #1299 part 4: the bus is off on hosted installs until part 6 lifts the
+    // HOSTED=1 gate, so these two cases cannot run live. Part 6 deletes both
+    // entries and sets HOSTED_BUS_LIFTED (src/bus-gate.ts), after which a bus
+    // that is off is a fail, never an accepted unproven.
+    {
+      name: "bus > A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)",
+      reason: BUS_OFF_REASON,
+      file: "bus.test.ts",
+      evidence:
+        'apps/server/test/bus/bus.revoke.test.ts "a revoked token\'s socket closes with 4403, and the token is 401 after" (a machine token is one D1 row of one install, found by its hash); apps/server/test/bus/bus.routes.test.ts "a PAT, an OAuth-shaped token, a cookie or nothing is 401"; the live cross-install proof waits for the lift: open-artifacts#1299 part 6',
+    },
+    {
+      name: "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",
+      reason: BUS_OFF_REASON,
+      file: "provisioning.test.ts",
+      evidence:
+        'apps/server/test/suspend.sockets.test.ts "closes every kind of open socket, signed-in and anonymous, with 4403 (never the TTL\'s 4408)"; apps/server/test/bus/bus.billing-gate.test.ts "an existing machine is refused at connect (401): suspension is not just the capped set"; the live proof waits for the lift: open-artifacts#1299 part 6',
     },
   ].map((e) => Object.freeze(e)),
 );
