@@ -382,7 +382,7 @@ async function callback(
   }
   const origin = adminOrigin(env);
   return redirect(`${origin}${safeReturn(flow.return, origin)}`, 303, [
-    sessionCookie(sid),
+    sessionCookie(env, sid),
     clearFlowCookie(),
   ]);
 }

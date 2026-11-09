@@ -120,9 +120,10 @@ describe("metadata (RFC 8414, RFC 9728)", () => {
 describe("refreshTtlFor (Q3)", () => {
   it("is the seconds left, capped at 8 h", () => {
     const now = 1_000_000_000_000;
-    expect(refreshTtlFor(now + 2 * HOUR, now)).toBe(7200);
-    expect(refreshTtlFor(now + 10 * HOUR, now)).toBe(28_800);
-    expect(refreshTtlFor(now + 2 * HOUR + 999, now)).toBe(7200);
+    const env = { OA_ENV: "prod" } as const;
+    expect(refreshTtlFor(env, now + 2 * HOUR, now)).toBe(7200);
+    expect(refreshTtlFor(env, now + 10 * HOUR, now)).toBe(28_800);
+    expect(refreshTtlFor(env, now + 2 * HOUR + 999, now)).toBe(7200);
   });
 });
 
