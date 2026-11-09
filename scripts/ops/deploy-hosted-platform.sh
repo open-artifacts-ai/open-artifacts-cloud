@@ -671,6 +671,7 @@ case "$target" in
           break
         fi
       done
+      [ -z "$put_failed" ] || exit 1
       final_pause="${PUT_RETRY_SLEEP:-5}"
       final_ok=""
       for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
