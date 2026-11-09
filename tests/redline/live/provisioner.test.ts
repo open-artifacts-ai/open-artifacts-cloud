@@ -1,6 +1,6 @@
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import { beforeAll, describe, expect, it } from "vitest";
-import { waitFor } from "../src/barrier.ts";
+import { BARRIER_DEADLINE_MS, waitFor } from "../src/barrier.ts";
 import {
   createTaken,
   type ProvisionerClient,
@@ -85,63 +85,68 @@ describe("provisioner", () => {
     REPLAY_WATCH_MS + 60_000,
   );
 
-  it("a signup for a taken slug fails cleanly", async (ctx) => {
-    if (T.mode !== "staging")
-      return proof(ctx, "staging-only", "needs the staging provisioner");
-    if (!P) return proof(ctx, "unproven-live", NOT_CONFIGURED);
-    // The contract is the Provisioning API's (R4 createInstall: slugHeld,
-    // then onConflict, both slug_taken), not the provisioner's: a taken
-    // name is refused before anything is written.
-    const [owner] = await C.query(
-      "SELECT slug, state, updated_at FROM installs WHERE id = ?1",
-      [T.a.installId],
-    );
-    expect(owner?.state, `${T.a.name} is active`).toBe("active");
-    const slug = String(owner?.slug);
-    const requestId = `rl${process.env.REDLINE_RUN_ID ?? "x"}-taken`
-      .replace(/[^A-Za-z0-9_-]/g, "-")
-      .slice(0, 64)
-      .padEnd(16, "0");
-    const snap = async () =>
-      JSON.stringify({
-        installs: await C.query(
-          "SELECT id, state, updated_at FROM installs WHERE slug = ?1 ORDER BY id",
-          [slug],
-        ),
-        signups: await C.query(
-          "SELECT signup_id, status, install_id, updated_at FROM signups WHERE slug = ?1 ORDER BY signup_id",
-          [slug],
-        ),
+  it(
+    "a signup for a taken slug fails cleanly",
+    async (ctx) => {
+      if (T.mode !== "staging")
+        return proof(ctx, "staging-only", "needs the staging provisioner");
+      if (!P) return proof(ctx, "unproven-live", NOT_CONFIGURED);
+      // First, so the snapshots below are not read before a long wait.
+      // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which the prov lane's
+      // probes also spend: wait for that lane to end (src/barrier.ts). Off
+      // unless the lanes' runner set it; an overrun is an InfraError.
+      await waitFor("prov-done", { orLaneExit: "prov" });
+      // The contract is the Provisioning API's (R4 createInstall: slugHeld,
+      // then onConflict, both slug_taken), not the provisioner's: a taken
+      // name is refused before anything is written.
+      const [owner] = await C.query(
+        "SELECT slug, state, updated_at FROM installs WHERE id = ?1",
+        [T.a.installId],
+      );
+      expect(owner?.state, `${T.a.name} is active`).toBe("active");
+      const slug = String(owner?.slug);
+      const requestId = `rl${process.env.REDLINE_RUN_ID ?? "x"}-taken`
+        .replace(/[^A-Za-z0-9_-]/g, "-")
+        .slice(0, 64)
+        .padEnd(16, "0");
+      const snap = async () =>
+        JSON.stringify({
+          installs: await C.query(
+            "SELECT id, state, updated_at FROM installs WHERE slug = ?1 ORDER BY id",
+            [slug],
+          ),
+          signups: await C.query(
+            "SELECT signup_id, status, install_id, updated_at FROM signups WHERE slug = ?1 ORDER BY signup_id",
+            [slug],
+          ),
+        });
+      const before = await snap();
+      const res = await createTaken(process.env, {
+        requestId,
+        slug,
+        ownerEmail: `redline-signup@${STAGING_TEST_DOMAIN}`,
       });
-    const before = await snap();
-    // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which the prov lane's
-    // probes also spend: wait for that lane to end (src/barrier.ts). Off
-    // unless the lanes' runner set it; an overrun is an InfraError.
-    await waitFor("prov-done", { orLaneExit: "prov" });
-    const res = await createTaken(process.env, {
-      requestId,
-      slug,
-      ownerEmail: `redline-signup@${STAGING_TEST_DOMAIN}`,
-    });
-    expect(
-      { status: res.status, code: res.code },
-      `R4 for ${T.a.name}'s slug: ${res.status} ${res.code ?? "no code"}`,
-    ).toEqual({ status: 409, code: "slug_taken" });
-    // Nothing written for it. The job, the signup, its secret and the
-    // lifecycle row go in one D1 batch (create.ts, accept), so no jobs row
-    // for this request id means none of the others either; the slug's
-    // installs and signups are what they were; no message was sent.
-    expect(
-      await C.query("SELECT id FROM jobs WHERE request_id = ?1", [requestId]),
-      "a jobs row for the refused request",
-    ).toEqual([]);
-    expect(await snap(), "installs or signups for the slug changed").toBe(
-      before,
-    );
-    expect(JSON.parse(before).installs).toEqual([
-      { id: T.a.installId, state: "active", updated_at: owner?.updated_at },
-    ]);
-    // A still serves as itself.
-    await verifyTarget(T.a);
-  }, 90_000);
+      expect(
+        { status: res.status, code: res.code },
+        `R4 for ${T.a.name}'s slug: ${res.status} ${res.code ?? "no code"}`,
+      ).toEqual({ status: 409, code: "slug_taken" });
+      // Nothing written for it. The job, the signup, its secret and the
+      // lifecycle row go in one D1 batch (create.ts, accept), so no jobs row
+      // for this request id means none of the others either; the slug's
+      // installs and signups are what they were; no message was sent.
+      expect(
+        await C.query("SELECT id FROM jobs WHERE request_id = ?1", [requestId]),
+        "a jobs row for the refused request",
+      ).toEqual([]);
+      expect(await snap(), "installs or signups for the slug changed").toBe(
+        before,
+      );
+      expect(JSON.parse(before).installs).toEqual([
+        { id: T.a.installId, state: "active", updated_at: owner?.updated_at },
+      ]);
+      // A still serves as itself.
+      await verifyTarget(T.a);
+    },
+    BARRIER_DEADLINE_MS + 90_000,
+  );
 });

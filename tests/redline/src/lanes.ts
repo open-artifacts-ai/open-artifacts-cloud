@@ -44,7 +44,9 @@ export const guarded = (
  * - paced(ledger): every spender claims a slot in the named ledger first, so
  *   the sum stays under the limit whoever spends;
  * - ordered(barrier): spenders are ordered by the named barrier
- *   (src/barrier.ts): the one that overspends on purpose waits for the mark.
+ *   (src/barrier.ts): a spender that would break the other's cases waits for
+ *   the mark, or for the named lane's exit when nothing marks it (waitFor
+ *   with orLaneExit); the overspender itself need not wait.
  */
 export type BucketMode = "exclusive" | { paced: string } | { ordered: string };
 

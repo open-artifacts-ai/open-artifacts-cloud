@@ -266,6 +266,13 @@ function claimGaps(file: string, c: Claims): string[] {
     for (const s of ["hook(", "prepareSide(", "sessionCred(", "loadTargets("])
       need(!all.includes(s), `calls ${s} without claiming the installs`);
   }
+  // A case that waits on a barrier needs a timeout that outlasts the wait.
+  if (text.includes("waitFor(")) {
+    need(
+      /waitFor\([\s\S]*?\},\s*BARRIER_DEADLINE_MS\s*\+/.test(text),
+      "waitFor: the case timeout must be BARRIER_DEADLINE_MS plus its own",
+    );
+  }
   // Only the files that send codes hold the codes bucket (exclusive: one lane).
   const sendsCodes = imports.includes("src/signin.ts");
   for (const b of ["rl-a/codes", "rl-b/codes"]) {
