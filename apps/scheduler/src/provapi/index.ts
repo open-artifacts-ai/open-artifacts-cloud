@@ -1,6 +1,7 @@
 // The Provisioning API's scheduler duties (design v7 5.8), run on the */2
 // tick after the revoke tick and the directory sync.
 import { ALERT_KEYS } from "@oa/provisioning-contract/enum-values";
+import { trialRemindersDue } from "../trial-reminder.js";
 import { alertFor, factsOf, prodcleanReport, stepAlert } from "./alerts.js";
 import { alertConditions, signupDailyCap } from "./conditions.js";
 import type { ProvapiEnv } from "./env.js";
@@ -23,6 +24,7 @@ export { writeTick } from "./run.js";
 export const DUTY_TIMEOUT_MS = {
   sweep: 20_000,
   signups: 5_000,
+  reminders: 4_500,
   purge: 10_000,
   health: 20_000,
   fleet: 25_000,
@@ -69,7 +71,7 @@ export interface ProvapiOptions extends SweepDeps {
 }
 
 /**
- * Sweep, signups, purge, health, fleet, alerts, prune: in that order, so the
+ * Sweep, signups, trial reminders, purge, health, fleet, alerts, prune: in that order, so the
  * alerts read the tick's own sweep, purge, health and fleet writes. Never throws.
  */
 export function provapiTick(
@@ -91,6 +93,11 @@ export function provapiTick(
       name: "signups",
       timeoutMs: t.signups,
       run: () => signupsDue(env, now),
+    },
+    {
+      name: "reminders",
+      timeoutMs: t.reminders,
+      run: () => trialRemindersDue(env, now),
     },
     { name: "purge", timeoutMs: t.purge, run: () => purgeDue(env, now) },
     {
