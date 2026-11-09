@@ -11,14 +11,25 @@ import {
   minutesLeft,
   PAGE_CSP,
   reauthPage,
+  sessionLength,
   signinPage,
 } from "../src/auth/oauth/pages.js";
 
 // W13b: Design's admin-consent pages (design v7 9A.3.2, 4.5), rendered with
 // every placeholder filled and every value escaped.
 
-const STAGING: Chrome = { env: "staging", adminHost: "admin.example.test" };
-const PROD: Chrome = { env: "prod", adminHost: "admin.example.test" };
+const EIGHT_H = 8 * 3_600_000;
+const STAGING: Chrome = {
+  env: "staging",
+  adminHost: "admin.example.test",
+  sessionTtlMs: EIGHT_H,
+};
+const PROD: Chrome = {
+  env: "prod",
+  adminHost: "admin.example.test",
+  sessionTtlMs: EIGHT_H,
+};
+const STAGING_LONG: Chrome = { ...STAGING, sessionTtlMs: 168 * 3_600_000 };
 
 const VIEW: ConsentView = {
   clientName: "Test agent",
@@ -140,6 +151,18 @@ describe("consent page", () => {
     );
   });
 
+  it("the duration is the real one: 8 hours on prod, 7 days on staging at 168 h", async () => {
+    const prod = await consentPage(PROD, VIEW, new Headers()).text();
+    expect(prod).toContain(
+      "Access ends when your admin session does, within 8 hours. Revoke",
+    );
+    const long = await consentPage(STAGING_LONG, VIEW, new Headers()).text();
+    expect(long).toContain(
+      "Access ends when your admin session does, within 7 days. Revoke",
+    );
+    expect(long).not.toContain("within 8 hours");
+  });
+
   it("a non-loopback redirect has no Local app note; an unknown date still renders", async () => {
     const html = await consentPage(
       STAGING,
@@ -178,7 +201,7 @@ describe("consent page", () => {
     const esc =
       "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=&#39;a()&#39;&gt;&amp;";
     const html = await consentPage(
-      { env: "staging", adminHost: evil },
+      { env: "staging", adminHost: evil, sessionTtlMs: EIGHT_H },
       {
         clientName: evil,
         clientId: evil,
@@ -315,6 +338,25 @@ describe("the other pages", () => {
     expect(html).toContain(
       '<a class="button primary" href="/auth/start?return=x">Sign in again</a>',
     );
+  });
+
+  it("reauth gives the real length: up to 8 hours on prod, 7 days on staging at 168 h", async () => {
+    const v = { leftMs: 60_000, cancelUrl: "/", reauthUrl: "/x" };
+    expect(await reauthPage(PROD, v).text()).toContain(
+      "Sign in again to give it up to 8 hours.",
+    );
+    const long = await reauthPage(STAGING_LONG, v).text();
+    expect(long).toContain("Sign in again to give it up to 7 days.");
+    expect(long).not.toContain("8 hours");
+  });
+
+  it("sessionLength words whole days and other hours", () => {
+    const H = 3_600_000;
+    expect(sessionLength(8 * H)).toBe("8 hours");
+    expect(sessionLength(H)).toBe("1 hour");
+    expect(sessionLength(24 * H)).toBe("1 day");
+    expect(sessionLength(168 * H)).toBe("7 days");
+    expect(sessionLength(36 * H)).toBe("36 hours");
   });
 
   it("message pages escape their title and text and keep the status", async () => {

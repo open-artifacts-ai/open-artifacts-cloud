@@ -203,9 +203,10 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .map(([n]) => `${n} [session]`)
         .sort(),
     );
-    // Seven real-only and six interactive-only on main, three hosted-only
-    // billing writes (interactive-only: browser sessions).
-    expect(only).toHaveLength(16);
+    // Seven real-only and eight interactive-only on main (#1346's two reach
+    // writes among them), three hosted-only billing writes (interactive-only:
+    // browser sessions).
+    expect(only).toHaveLength(18);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
@@ -315,9 +316,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(16);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(18);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 17);
+    expect(by("own")).toHaveLength(cases.length - 2 - 19);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });

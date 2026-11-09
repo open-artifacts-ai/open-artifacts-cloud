@@ -23,7 +23,11 @@
 //   in the finally, before the delete.
 // - MCP: tools/list names publish_artifact and get_artifact; tools/call
 //   get_artifact returns the smoke artifact's title.
-// - bus: skipped until the hub is bound, with a note in the result.
+// - bus (#1299): GET /api/v1/bus/ping with smoke's PAT answers 200 and
+//   { ok: true }: the install's bus hub is up. It is a read with no member
+//   state. A 404 (bus off) or any other answer is a failure of the check
+//   `bus`, which halts the version; FLEET_SMOKE_BUS "off" skips it with a
+//   note, for an env whose bus routes are still gated (HOSTED=1).
 // - finally, whatever happened: unshare, then delete the artifact.
 //
 // Never logged or stored: the PAT, any response body, the target's address.
@@ -36,8 +40,8 @@ export const SMOKE_TITLE_PREFIX = "fleet-smoke-";
 export const SMOKE_CALL_MS = 3_000;
 /** The whole smoke's budget, cleanup aside. */
 export const SMOKE_BUDGET_MS = 10_000;
-/** The bus check's note while the hub is unbound. */
-export const SMOKE_BUS_SKIPPED = "bus: skipped, hub not bound";
+/** The bus check's note with FLEET_SMOKE_BUS off. */
+export const SMOKE_BUS_SKIPPED = "bus: skipped, FLEET_SMOKE_BUS off";
 /** The share check's note with no share target set. */
 export const SMOKE_SHARE_SKIPPED = "share: skipped, FLEET_SMOKE_SHARE off";
 
@@ -55,6 +59,7 @@ export type SmokeCheck =
   | "read"
   | "share"
   | "mcp"
+  | "bus"
   | "delete";
 
 /**
@@ -89,6 +94,12 @@ export interface SmokeInput {
    * with a note.
    */
   share?: boolean;
+  /**
+   * FLEET_SMOKE_BUS (#1299), a committed per-env choice: true (the default)
+   * runs the bus check and a bus that answers 404 or wrongly halts the
+   * version; false skips it with a note.
+   */
+  bus?: boolean;
   /** This env's auth broker origin (AUTH_BROKER_ORIGIN). */
   brokerOrigin: string | undefined;
   /** The release under test, X.Y.Z, for the title. */
@@ -399,8 +410,15 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
           ?.id === artifactId,
     );
 
-    // bus: not until the hub is bound.
-    notes.push(SMOKE_BUS_SKIPPED);
+    // bus (#1299): the hub answers its reserved liveness ping. Anything but
+    // 200 { ok: true } is a failed check, 404 (bus off) included.
+    if (o.bus === false) notes.push(SMOKE_BUS_SKIPPED);
+    else {
+      const ping = await call("bus", "/api/v1/bus/ping");
+      expect("bus", ping.status === 200);
+      const pj = (await json("bus", ping)) as { ok?: unknown } | null;
+      expect("bus", pj?.ok === true);
+    }
   } catch (e) {
     result =
       e instanceof Fail

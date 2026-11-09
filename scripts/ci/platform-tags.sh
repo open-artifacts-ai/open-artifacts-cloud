@@ -90,7 +90,14 @@ check() {
 }
 
 bad=0
-for app in auth-broker directory-broker provisioner dispatch scheduler inventory provisioning; do
+apps=(auth-broker directory-broker provisioner dispatch scheduler inventory provisioning)
+# Staging's billing service (#1568; staging only): read back too when the run
+# deployed it (the workflow sets PLATFORM_TAGS_BILLING). Prod has none.
+if [ -n "${PLATFORM_TAGS_BILLING:-}" ]; then
+  [ "$p" = s ] || { echo "billing is a staging-only Worker" >&2; exit 2; }
+  apps+=(billing)
+fi
+for app in "${apps[@]}"; do
   if line="$(check "oa-$p-$app")"; then echo "$line"; else bad=1; fi
 done
 [ "$bad" = 0 ] || { echo "platform Workers in $1 are not all on $tag: deploy $tag to every target (deploy-hosted-platform.yml)" >&2; exit 1; }

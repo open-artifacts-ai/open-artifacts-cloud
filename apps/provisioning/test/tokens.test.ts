@@ -7,7 +7,6 @@ import {
   type AgentTokenRow,
   mintAgentToken,
   OAUTH_ACCESS_TTL_S,
-  OAUTH_GRANT_MAX_MS,
   oauthLabel,
   principalByBearer,
   principalByTokenId,
@@ -437,8 +436,7 @@ describe("mintAgentToken: oauth (MCP consent)", () => {
     expect(m.oauthUser).toMatch(/^adm_[0-9a-f]{32}$/);
     expect(m.oauthUser).not.toContain(session.email);
     // The chain ends with the session (8 h here) and never later than 8 h.
-    expect(m.expiresAt).toBe(T + OAUTH_GRANT_MAX_MS);
-    expect(OAUTH_GRANT_MAX_MS).toBe(8 * 3_600_000);
+    expect(m.expiresAt).toBe(T + 8 * 3_600_000);
     expect(OAUTH_ACCESS_TTL_S).toBe(15 * 60);
     expect(await rowOf(db, m.tokenId)).toMatchObject({
       kind: "oauth",

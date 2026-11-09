@@ -5,6 +5,8 @@
 #   HOSTS_KV_ID            KV oa-<p>-hosts
 #   BROKER_REGISTRY_ID     KV oa-<p>-broker-registry
 #   DIRECTORY_REGISTRY_ID  KV oa-<p>-directory-registry
+#   BILLING_DB_ID          D1 oa-s-billing (its uuid), only when TARGETS names
+#                          billing (staging only; the database must exist)
 #   EMAIL_ZONE_TAGS        the id of the sending zone $EMAIL_ZONE, on this account
 #   SECRETS_STORE_ID       the account's Secrets Store default_secrets_store
 #                          (the provisioner's PROVISION_TOKEN, design v7 2.5),
@@ -36,6 +38,10 @@ esac
 . "$(dirname "${BASH_SOURCE[0]}")/hosted-cf.sh"
 ACCT="/accounts/$CLOUDFLARE_ACCOUNT_ID"
 
+want_billing=""
+case ",${TARGETS:-}," in *,billing,*) want_billing=1 ;; esac
+[ -z "$want_billing" ] || [ "$P" = s ] || { echo "billing is a staging-only target" >&2; exit 2; }
+
 db="oa-$P-platform"
 kvs=("oa-$P-hosts" "oa-$P-broker-registry" "oa-$P-directory-registry")
 d1="$(list_all "$ACCT/d1/database?" 100 "list D1 databases (for $db)")" || exit 1
@@ -60,6 +66,10 @@ for n in "${kvs[@]}"; do
   [[ "$id" =~ $hex32 ]] || { echo "KV namespace $n: its id is not 32 hex" >&2; exit 1; }
   ids+=("$id")
 done
+if [ -n "$want_billing" ]; then
+  BILLING_DB_ID="$(one "$d1" name "oa-$P-billing" uuid "D1 database")" || exit 1
+  [[ "$BILLING_DB_ID" =~ $uuid ]] || { echo "D1 database oa-$P-billing: its uuid is not a uuid" >&2; exit 1; }
+fi
 EMAIL_ZONE_TAGS="$(one "$zones" name "$EMAIL_ZONE" id "zone")" || exit 1
 [[ "$EMAIL_ZONE_TAGS" =~ $hex32 ]] || { echo "zone $EMAIL_ZONE: its id is not 32 hex" >&2; exit 1; }
 if [ -n "$want_store" ]; then
@@ -75,8 +85,10 @@ fi
   echo "DIRECTORY_REGISTRY_ID=${ids[2]}"
   echo "EMAIL_ZONE_TAGS=$EMAIL_ZONE_TAGS"
   [ -z "$want_store" ] || echo "SECRETS_STORE_ID=$SECRETS_STORE_ID"
+  [ -z "$want_billing" ] || echo "BILLING_DB_ID=$BILLING_DB_ID"
 } >> "$GITHUB_ENV"
 echo "$db: $PLATFORM_DB_ID"
 for i in 0 1 2; do echo "${kvs[$i]}: ${ids[$i]}"; done
 echo "$EMAIL_ZONE: $EMAIL_ZONE_TAGS"
+[ -z "$want_billing" ] || echo "oa-$P-billing: $BILLING_DB_ID"
 [ -z "$want_store" ] || echo "$store: $SECRETS_STORE_ID"

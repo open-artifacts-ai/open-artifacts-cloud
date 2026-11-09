@@ -9,6 +9,7 @@ import {
   TOKEN_SCOPES,
 } from "@oa/provisioning-contract";
 import { waitFor } from "./barrier.ts";
+import { HOSTED_BUS_LIFTED } from "./bus-gate.ts";
 import {
   InfraError,
   isNetworkError,
@@ -20,6 +21,7 @@ import { note } from "./notes.ts";
 import { PROD_ADMIN_ORIGIN } from "./prod.ts";
 import { NIGHTLY_NA_REASON, PRE_PROD_REASON } from "./report.ts";
 import { type Schema, schemaAhead } from "./schema.ts";
+import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 
 // The red-line provisioning probes (design v7 12.2, P1-P50 but
 // REMOVED_PROBES) against the staging Provisioning API, as the GitHub OIDC principal "O" (4.4): `rl-`
@@ -82,8 +84,38 @@ export interface ProvIo {
   rlAPat?: () => string;
   /** Hides a secret the run learns from the public log (CI: ::add-mask::). */
   mask?: (v: string) => void;
+  /** The bus on rl-l (P51); live wiring in provisioning-live.ts. */
+  bus?: BusIo;
   /** The D1 migrations and Durable Object tags of a release (P31). */
   schemaOf?: (version: string) => Promise<Schema>;
+}
+
+/**
+ * What P51 needs of the bus on one install, as a seam so a fake API can drive
+ * it: the live one (provisioning-live.ts liveBusIo) mints a session and a
+ * machine token on the install and holds a real bus socket open.
+ */
+export interface BusIo {
+  /**
+   * One signed-in bus session on the install: a machine token, and a bus
+   * socket opened with it (it throws unless the upgrade answered 101).
+   * "off" when the install's bus answers 404.
+   */
+  open(i: {
+    /** The install's app origin, https://host. */
+    app: string;
+    pat: string;
+    hookKey: string;
+  }): Promise<BusSession | "off">;
+}
+
+export interface BusSession {
+  /** Resolves when the socket held since open() ends, whoever ended it. */
+  closed: Promise<void>;
+  /** A new connect with the same machine token: the upgrade's status. */
+  connect(): Promise<number>;
+  /** Best effort: closes sockets and revokes the machine. Never throws. */
+  cleanup(): Promise<void>;
 }
 
 export type Outcome =
@@ -118,6 +150,13 @@ export class ModeNotSettled extends ProbeFail {
 /** Poll cadence and bounds (12.2: paused and resumed pages within 120 s). */
 export const POLL_MS = 3_000;
 export const PAGE_WITHIN_MS = 120_000;
+/**
+ * P51: how long after the suspend job is done the held bus socket may stay
+ * open. The install index closes at once, again SECOND_PASS_MS (120 s) later
+ * and a last time 300 s after (apps/server runtime/presence.ts
+ * LATER_PASSES_MS); this is the last pass and a minute of slack.
+ */
+export const BUS_CLOSE_WITHIN_MS = 360_000;
 /** HOSTS is KV: a write takes up to 60 s to show everywhere. Two periods. */
 export const HOSTS_SETTLE_MS = 120_000;
 export const JOB_WITHIN_MS = 20 * 60_000;
@@ -882,7 +921,11 @@ export const CHAINS: readonly Chain[] = [
       "P23",
     ],
   },
-  { name: "rl-l", probes: ["P20", "P21", "P22"], tail: removeLifecycle },
+  {
+    name: "rl-l",
+    probes: ["P51", "P20", "P21", "P22"],
+    tail: removeLifecycle,
+  },
   {
     name: "api",
     probes: [
@@ -1957,6 +2000,120 @@ export const PROBES: readonly Probe[] = [
       if (v !== p.createdAt)
         throw new ProbeFail(`P31: version ${v}, want ${p.createdAt}`);
       p.version = v;
+      return pass();
+    },
+  },
+  {
+    id: "P51",
+    title:
+      "bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",
+    timeoutMs: 3 * JOB_WITHIN_MS + 10 * 60_000,
+    // On rl-l, before P20: it suspends and resumes rl-l itself, so P20 to
+    // P22 start from a serving install as ever. Needs the install's bus: on
+    // a hosted install it is off (404) until the HOSTED=1 gate is lifted
+    // (#1299, part 6): until then the case asserts it is off.
+    run: async (run) => {
+      const bus = run.io.bus;
+      if (!bus)
+        return na("no bus seam: the local pair has no Provisioning API");
+      const p = await lifecycleInstall(run);
+      const v = (await ownDetail(run, p.id)).json as InstallDetail | undefined;
+      if (v?.version !== run.c.version)
+        throw new ProbeFail(
+          `P51: rl-l runs ${typeof v?.version === "string" ? v.version.slice(0, 20) : "no version"}, want the release under test ${run.c.version}`,
+        );
+      const m = run.io.mask ?? (() => {});
+      const r = await newRecipient();
+      const c = await mintCreds(run, p.id, p.slug, {
+        publicKey: r.publicKey,
+        open: async (sealed) => parseCreds(await openSealed(r, sealed)),
+      });
+      m(c.pat);
+      m(c.hookKey);
+      const s = await bus.open({
+        app: `https://${p.appHost}`,
+        pat: c.pat,
+        hookKey: c.hookKey,
+      });
+      if (s === "off") {
+        if (HOSTED_BUS_LIFTED)
+          throw new ProbeFail("P51: rl-l's bus answers 404 after the lift");
+        // Before the lift the design is: the bus is off under HOSTED=1.
+        return pass("bus off before the lift (HOSTED_BUS_LIFTED is false)");
+      }
+      if (!HOSTED_BUS_LIFTED) {
+        await s.cleanup();
+        throw new ProbeFail(
+          "P51: rl-l's bus is on before the lift: HOSTED=1 should answer 404 (set HOSTED_BUS_LIFTED in src/bus-gate.ts with part 6)",
+        );
+      }
+      try {
+        // Marked before the POST: a suspend whose answer was lost is still
+        // resumed below.
+        let suspended = false;
+        let failure: unknown;
+        let resumeFailure: unknown;
+        try {
+          suspended = true;
+          const a = run.accepted(
+            await run.v1(`/installs/${p.id}/suspend`, {
+              body: { requestId: run.rid("p51"), reason: "red-line P51" },
+            }),
+            "P51",
+          );
+          await run.done(a.job.id, "P51 suspend");
+          // Held (hello_ok, keepalive) since before the suspend: only the
+          // suspend can end it, on the install-index passes.
+          let closed = false;
+          void s.closed.then(() => {
+            closed = true;
+          });
+          const end = run.io.now() + BUS_CLOSE_WITHIN_MS;
+          while (!closed && run.io.now() < end) await run.io.wait(POLL_MS);
+          if (!closed)
+            throw new ProbeFail(
+              `P51: the bus socket was still open ${BUS_CLOSE_WITHIN_MS / 1000} s after the suspend`,
+            );
+          const st = await s.connect();
+          if (st === 101)
+            throw new ProbeFail(
+              "P51: a suspended install upgraded a bus socket",
+            );
+          await run.settledMode("P51", p.appHost, "paused");
+        } catch (e) {
+          failure = e;
+        }
+        if (suspended) {
+          try {
+            const b = run.accepted(
+              await run.v1(`/installs/${p.id}/resume`, {
+                body: { requestId: run.rid("p51-res") },
+              }),
+              "P51 resume",
+            );
+            await run.done(b.job.id, "P51 resume");
+            await run.within(
+              PAGE_WITHIN_MS,
+              "P51 /healthz 200",
+              async () => (await run.page(p.appHost)).status === 200,
+            );
+          } catch (e) {
+            resumeFailure = e;
+          }
+        }
+        // The first failure is the one reported; a failed resume never
+        // replaces it.
+        if (failure) throw failure;
+        if (resumeFailure) throw resumeFailure;
+        // The control: the refusal was the suspend, not a dead token.
+        const st = await s.connect();
+        if (st !== 101)
+          throw new ProbeFail(
+            `P51: after the resume the same machine token got ${st}, want 101`,
+          );
+      } finally {
+        await s.cleanup();
+      }
       return pass();
     },
   },

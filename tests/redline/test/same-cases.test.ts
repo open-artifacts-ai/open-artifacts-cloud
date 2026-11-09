@@ -12,6 +12,7 @@ import {
   parseManifest,
 } from "../src/report.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // #1730 changes when and beside what the cases run, never which cases there
 // are or what passes. test/fixtures/main-cases.json is main's required cases
@@ -24,32 +25,32 @@ interface Main {
 const main = JSON.parse(
   readFileSync(join(import.meta.dirname, "fixtures/main-cases.json"), "utf8"),
 ) as Main;
-// Cases added after main-cases.json was cut: #859's provisioner probes.
-const ADDED = [
-  {
-    file: "live/provisioner.test.ts",
-    name: "provisioner > a replayed signup creates nothing new",
-  },
-  {
-    file: "live/provisioner.test.ts",
-    name: "provisioner > a signup for a taken slug fails cleanly",
-  },
-];
 const pkg = join(import.meta.dirname, "..");
+
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds exactly main's 329 cases, in main's order, then #859's two", () => {
+  it("manifest.json holds exactly main's 329 cases, in main's order, plus the declared additions", () => {
     const m = parseManifest(read("live/manifest.json"));
+    const all = m.cases.map((c) => ({ file: c.file, name: c.name }));
+    const key = (c: { file: string; name: string }) =>
+      `${c.file}\u0000${c.name}`;
+    const added = new Set(CASES_ADDED_SINCE_1730.map(key));
+    const base = new Set(main.manifest.map(key));
     expect(main.manifest).toHaveLength(329);
-    expect(m.cases.map((c) => ({ file: c.file, name: c.name }))).toEqual([
-      ...main.manifest,
-      ...ADDED,
-    ]);
+    expect(added.size).toBe(CASES_ADDED_SINCE_1730.length);
+    // Every declared addition is in the manifest and not already main's.
+    for (const k of added) {
+      expect(all.map(key)).toContain(k);
+      expect(base.has(k)).toBe(false);
+    }
+    expect(all.filter((c) => !added.has(key(c)))).toEqual(main.manifest);
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set([...main.manifest, ...ADDED].map((c) => c.file));
+    const files = new Set(
+      [...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file),
+    );
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });

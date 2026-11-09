@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
 // its per-case durations and per-file walls (test/fixtures/run-42402998826.json,
@@ -36,10 +37,21 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
-// The recording predates #859's live/provisioner.test.ts, which now runs last
-// in the `prov` lane. The simulation replays the files that were recorded; the
-// new file is bounded separately ("the provisioner file", below).
+/**
+ * Files added after the recording (#1299's live/bus.test.ts), so no wall was
+ * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
+ * case that is a few requests while the bus is off). The first live run that
+ * includes them replaces it; test/cases-added.ts names what is estimated.
+ */
+const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
+
+// #859's live/provisioner.test.ts runs last in the prov lane. The simulation
+// replays the recorded plan without it; its cost is bounded separately ("the
+// provisioner file", below), since on the critical path it would move every
+// recorded end by its whole wall.
 const NEW_FILE = "live/provisioner.test.ts";
+/** A 60 s replay watch, the taken-slug probe (a sync 409, 90 s timeout), 30 s setup. */
+const NEW_FILE_MODELED_SEC = 60 + 90 + 30;
 const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
     ph
@@ -49,7 +61,7 @@ const recorded = (plan: readonly Phase[]): readonly Phase[] =>
 const RPLAN = recorded(PLAN);
 const RSERIAL = recorded(PLAN_SERIAL);
 const wall = (f: string): number => {
-  const w = fx.fileWallsSec[f];
+  const w = fx.fileWallsSec[f] ?? ESTIMATED_WALL_SEC[f];
   if (w === undefined) throw new Error(`no recorded wall for ${f}`);
   return w;
 };
@@ -119,17 +131,18 @@ describe("the recording (run 42402998826)", () => {
     const m = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
-    // The recording's 329 cases, plus the two #859 added (NEW_FILE).
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
-    expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(
-        m.cases
-          .filter((c) => c.file !== NEW_FILE)
-          .map((c) => `${c.file} ${c.name}`),
-      ),
+    // The recording predates the cases declared in cases-added.ts: it holds
+    // the manifest minus exactly those, never a case with an invented time.
+    const added = new Set(
+      CASES_ADDED_SINCE_1730.map((c) => `${c.file} ${c.name}`),
     );
-    expect(m.cases.filter((c) => c.file === NEW_FILE)).toHaveLength(2);
+    const mk = m.cases.map((c) => `${c.file} ${c.name}`);
+    for (const k of added) expect(mk).toContain(k);
+    expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
+      new Set(mk.filter((k) => !added.has(k))),
+    );
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
     );
@@ -159,12 +172,13 @@ describe("the provisioner file (#859, not in the recording)", () => {
     expect(l.files).toEqual(["live/provisioning.test.ts", NEW_FILE]);
   });
 
-  it("is a few minutes: a 60 s replay watch and a sync 409 for a taken slug", () => {
-    // Modeled, not recorded: the replay watch (60 s) and the taken-slug probe
-    // (a synchronous 409, 90 s test timeout), with setup. It is added to the
-    // prov lane's wall, which this bound keeps well under the old 10 minutes.
-    const modeled = 60 + 90 + 30;
-    expect(modeled).toBeLessThan(wall("live/provisioning.test.ts"));
+  it("is about 3 minutes, added to the prov lane's end (the critical path)", () => {
+    // Modeled, not recorded: the first live run with it replaces this.
+    expect(NEW_FILE_MODELED_SEC).toBeLessThan(
+      wall("live/provisioning.test.ts"),
+    );
+    const base = jobEnd(RPLAN, { t19: "job" }).end;
+    expect(base + NEW_FILE_MODELED_SEC).toBeLessThan(11 * 60);
   });
 });
 
@@ -247,9 +261,13 @@ describe("the schedule simulation", () => {
     expect(RPLAN).toHaveLength(1);
     const names = (RPLAN[0] ?? []).map((l) => l.name).sort();
     expect(names).toEqual(["creds", "front", "guard", "prov", "surfaces"]);
-    // Every recorded file is in a lane, so no recorded second is left out.
+    // Every recorded file is in a lane, so no recorded second is left out;
+    // the only others are the estimated, post-recording files.
     expect((RPLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
-      Object.keys(fx.fileWallsSec).sort(),
+      [
+        ...Object.keys(fx.fileWallsSec),
+        ...Object.keys(ESTIMATED_WALL_SEC),
+      ].sort(),
     );
   });
 

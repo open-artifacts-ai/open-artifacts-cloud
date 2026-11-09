@@ -17,6 +17,8 @@
 // Claude.ai callback is unverified until acceptance (14.4).
 // SIGNUP_DAILY_CAP: the provisioner's and scheduler's cap, the same
 // placeholder, so R27's signup_cap runs with their value (9A.5).
+// ADMIN_SESSION_TTL_HOURS: staging only (168); adminSessionTtlMs ignores it
+// outside staging, so prod stays at 8 h.
 // OIDC_* (4.4) are staging only; the prod deploy read-back refuses them.
 // Ratelimit namespace ids: staging 1141-1146, prod 1151-1156 (4.7, 9A.7).
 // ASSETS: the admin SPA build: `pnpm --filter @oa/admin build` writes straight into dist-assets (@oa/admin is a devDependency, so `pnpm --filter @oa/provisioning... build` builds it first).
@@ -41,6 +43,7 @@
       },
       "vars": {
         "OA_ENV": "staging",
+        "ADMIN_SESSION_TTL_HOURS": "168",
         "APP_DOMAIN": "open-artifacts-staging.app",
         "SIGNUPS_ENABLED": "test-users",
         "SELF_SERVE_TIER": "trial",
