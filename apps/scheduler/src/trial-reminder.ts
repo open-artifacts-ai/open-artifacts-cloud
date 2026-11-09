@@ -62,7 +62,8 @@ const SELECT_OWNER =
 const ELIGIBLE = `JOIN signups s ON s.install_id = i.id
 WHERE s.source = 'self-serve' AND s.status = 'ready' AND i.state = 'active'
   AND NOT EXISTS (SELECT 1 FROM install_lifecycle l WHERE l.install_id = i.id AND l.suspended_at IS NOT NULL)`;
-const DONE_SQL = "SELECT install_id, kind FROM trial_reminders WHERE install_id IN";
+const DONE_SQL =
+  "SELECT install_id, kind FROM trial_reminders WHERE install_id IN";
 const CLAIM_SQL =
   "INSERT INTO trial_reminders (install_id, kind, trial_ends_at, claimed_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id, kind) DO NOTHING";
 const SENT_SQL =
@@ -157,9 +158,7 @@ async function mailable(
     );
     const { results } = await d1(
       db
-        .prepare(
-          `${SELECT_OWNER} ${ELIGIBLE} AND i.id IN (${marks})`,
-        )
+        .prepare(`${SELECT_OWNER} ${ELIGIBLE} AND i.id IN (${marks})`)
         .bind(...chunk)
         .all<Record<string, unknown>>(),
     );
@@ -256,11 +255,7 @@ export async function sendDueReminders(
   let failed = 0;
   let more = false;
   try {
-    const due = await dueFromBilling(
-      env.BILLING,
-      now,
-      now + REMINDER_LEAD_MS,
-    );
+    const due = await dueFromBilling(env.BILLING, now, now + REMINDER_LEAD_MS);
     const ok = await mailable(db, due, now);
     for (const d of due) {
       const m = ok.get(d.installId);
