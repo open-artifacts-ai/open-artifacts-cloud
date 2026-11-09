@@ -517,6 +517,26 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
       evidence:
         'apps/server/test/xt-google.local.test.ts "sign-in ID-token cases across installs (fake Google) > an ID token minted for A\'s client (aud) replayed at B: no session"; apps/server/test/google-broker.test.ts "Google through the broker > a token minted through install A with B\'s client nonce is refused at B (accepted at A)"; the laptop capture run: docs/ops/redline-signin.md, tests/redline/test/rehearsal.test.ts; the capture duty: #1047',
     },
+    // #34's provisioner probes: staging has no REDLINE_STG_PROVISIONER config,
+    // so both report unproven-live. Accepted by the OA Manager while sign-ups
+    // are off on prod; cloud #59 must close before they open, and removes
+    // both entries (test/cases-added.ts ACCEPTED_UNPROVEN_ADDED_SINCE_1730).
+    {
+      name: "provisioner > a replayed signup creates nothing new",
+      reason:
+        "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
+      file: "provisioner.test.ts",
+      evidence:
+        'apps/provisioner/test/consumer.test.ts "handleSignup > a settled row is acked and never restarted"; apps/provisioner/test/node/create.test.ts "sendWelcome: one email, and a replay of every step changes nothing"; before sign-ups open: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59',
+    },
+    {
+      name: "provisioner > a signup for a taken slug fails cleanly",
+      reason:
+        "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
+      file: "provisioner.test.ts",
+      evidence:
+        'apps/provisioning/test/writes.test.ts "R4 create by an admin session > slug_taken by an installs row or a live signup; a failed signup frees it"; before sign-ups open: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59',
+    },
   ].map((e) => Object.freeze(e)),
 );
 

@@ -36,3 +36,26 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       name: "provisioner > a signup for a taken slug fails cleanly",
     },
   ];
+
+// The accepted-unproven entries added after #1730's base (main-cases.json holds
+// the four before it). Declared by exact name, file and reason; never a
+// loosening of the gate. Cloud #59 (https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59)
+// removes both, and must close before sign-ups open.
+export const ACCEPTED_UNPROVEN_ADDED_SINCE_1730: readonly {
+  name: string;
+  reason: string;
+  file: string;
+}[] = [
+  {
+    name: "provisioner > a replayed signup creates nothing new",
+    reason:
+      "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
+    file: "provisioner.test.ts",
+  },
+  {
+    name: "provisioner > a signup for a taken slug fails cleanly",
+    reason:
+      "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
+    file: "provisioner.test.ts",
+  },
+];
