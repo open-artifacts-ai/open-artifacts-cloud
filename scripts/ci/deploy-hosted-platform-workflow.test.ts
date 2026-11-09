@@ -74,6 +74,11 @@ describe("deploy-hosted-platform.yml", () => {
       REASON: "${{ inputs.reason }}",
       VERIFY_ONLY: "${{ inputs.verify_only }}",
       OA_OWNER_EMAIL: "${{ secrets.OA_OWNER_EMAIL }}",
+      // Billing's Stripe secrets are staging's only (#1568).
+      STRIPE_SECRET_KEY:
+        "${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}",
+      STRIPE_WEBHOOK_SECRET:
+        "${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}",
     });
     const go = (
       TARGETS: string,
@@ -90,6 +95,8 @@ describe("deploy-hosted-platform.yml", () => {
           REASON,
           VERIFY_ONLY,
           OA_OWNER_EMAIL: "me@test.invalid",
+          STRIPE_SECRET_KEY: "sk_test_abcdefgh12345678",
+          STRIPE_WEBHOOK_SECRET: "whsec_abcdefgh12345678",
         },
         encoding: "utf8",
       });
@@ -373,7 +380,11 @@ describe("deploy-hosted-platform.yml", () => {
     // The input check sees that one secret, and no token.
     expect(
       JSON.stringify(named("Check the inputs").env).match(/secrets\.\w+/g),
-    ).toEqual(["secrets.OA_OWNER_EMAIL"]);
+    ).toEqual([
+      "secrets.OA_OWNER_EMAIL",
+      "secrets.STRIPE_SECRET_KEY",
+      "secrets.STRIPE_WEBHOOK_SECRET",
+    ]);
     expect(named("Load the hosted constants").env).toEqual({
       DEPLOY_ENV: "${{ inputs.env }}",
       OA_OWNER_EMAIL: "${{ secrets.OA_OWNER_EMAIL }}",
@@ -409,6 +420,8 @@ describe("deploy-hosted-platform.yml", () => {
       "CLOUDFLARE_API_TOKEN",
       "GOOGLE_CLIENT_SECRET",
       "GOOGLE_DIRECTORY_CLIENT_SECRET",
+      "STRIPE_SECRET_KEY",
+      "STRIPE_WEBHOOK_SECRET",
     ]);
     // The inventory key is gone (design v7 6.3): OIDC replaces it.
     expect(text).not.toContain("INVENTORY_KEY");
@@ -522,6 +535,82 @@ describe("deploy-hosted-platform.yml", () => {
       ["v0.74.1", ""],
     ])
       expect(go(tag as string, t as string), `${tag} ${t}`).toBe(1);
+  });
+
+  it("billing's Stripe secrets: staging only, and a billing run without them fails in the input check, before any target runs (#1568)", () => {
+    const c = named("Check the inputs");
+    const SECRET = "sk_test_abcdefgh12345678";
+    const WH = "whsec_abcdefgh12345678";
+    const go = (
+      TARGETS: string,
+      env: Record<string, string> = {},
+      DEPLOY_ENV = "staging",
+      VERIFY_ONLY = "false",
+    ) =>
+      spawnSync("bash", ["-c", c.run], {
+        env: {
+          PATH: process.env.PATH,
+          DEPLOY_ENV,
+          TAG: "v0.90.3",
+          TARGETS,
+          REASON: "test",
+          VERIFY_ONLY,
+          OA_OWNER_EMAIL: "me@test.invalid",
+          STRIPE_SECRET_KEY: SECRET,
+          STRIPE_WEBHOOK_SECRET: WH,
+          ...env,
+        },
+        encoding: "utf8",
+      });
+    expect(go(FULLB).status).toBe(0);
+    expect(go("billing").status).toBe(0);
+    // A run that does not deploy billing needs neither secret.
+    expect(
+      go("dispatch", { STRIPE_SECRET_KEY: "", STRIPE_WEBHOOK_SECRET: "" })
+        .status,
+    ).toBe(0);
+    for (const [k, v, want] of [
+      [
+        "STRIPE_SECRET_KEY",
+        "",
+        "STRIPE_SECRET_KEY is not set in hosted-staging-deploy",
+      ],
+      [
+        "STRIPE_WEBHOOK_SECRET",
+        "",
+        "STRIPE_WEBHOOK_SECRET is not set in hosted-staging-deploy",
+      ],
+      ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "test-mode key"],
+      ["STRIPE_SECRET_KEY", "rk_live_abcdefgh12345678", "test-mode key"],
+      ["STRIPE_WEBHOOK_SECRET", "abcdefgh12345678", "signing secret"],
+    ] as const) {
+      const r = go(FULLB, { [k]: v });
+      expect(r.status, `${k}=${v}`).toBe(1);
+      expect(r.stdout).toContain(want);
+      // The value is never printed.
+      if (v) expect(r.stdout + r.stderr).not.toContain(v);
+    }
+    // verify only reads: no secret needed.
+    expect(
+      go(
+        "billing",
+        { STRIPE_SECRET_KEY: "", STRIPE_WEBHOOK_SECRET: "" },
+        "staging",
+        "true",
+      ).status,
+    ).toBe(0);
+    // Prod: billing is refused whatever the secrets say.
+    expect(go("billing", {}, "prod").status).toBe(1);
+    // The deploy step gets them for staging only, by the same expression.
+    for (const k of ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"])
+      expect(named("Deploy and verify").env[k]).toBe(
+        `\${{ inputs.env == 'staging' && secrets.${k} || '' }}`,
+      );
+    // No other step sees them.
+    const seeing = steps
+      .filter((s) => JSON.stringify(s).includes("STRIPE_"))
+      .map((s) => s.name);
+    expect(seeing).toEqual(["Check the inputs", "Deploy and verify"]);
   });
 
   it("the order puts every bound target before its binder (design v7 10.2)", () => {
@@ -740,6 +829,8 @@ describe("deploy-hosted-platform.yml", () => {
       "GOOGLE_CLIENT_SECRET",
       "GOOGLE_DIRECTORY_CLIENT_SECRET",
       "OA_OWNER_EMAIL",
+      "STRIPE_SECRET_KEY",
+      "STRIPE_WEBHOOK_SECRET",
     ]);
     // Defense in depth: the first step refuses
     // anything but staging or prod, before any checkout.

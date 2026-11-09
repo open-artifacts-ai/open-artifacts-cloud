@@ -112,6 +112,10 @@ jobs:
           REASON: ${{ inputs.reason }}
           VERIFY_ONLY: ${{ inputs.verify_only }}
           OA_OWNER_EMAIL: ${{ secrets.OA_OWNER_EMAIL }}
+          # Billing's Stripe secrets (#1568): staging only, so a prod run never
+          # holds either, whatever its Environment has.
+          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           # Defense in depth: the env is checked here too.
@@ -122,6 +126,19 @@ jobs:
           # is masked, so it must already be in that form.
           case ",$TARGETS," in
             *,scheduler,*) [ -n "$OA_OWNER_EMAIL" ] || { echo "OA_OWNER_EMAIL is not set; the scheduler target needs it"; exit 1; } ;;
+          esac
+          # #1568: the billing target needs both Stripe secrets, test-mode shapes.
+          # Refuse here, before any target runs, so a full staging run never
+          # deploys the earlier Workers and then stops at billing (verify only
+          # reads, so it needs neither).
+          case ",$TARGETS," in
+            *,billing,*)
+              if [ "${VERIFY_ONLY:-}" != true ]; then
+                [ -n "$STRIPE_SECRET_KEY" ] || { echo "STRIPE_SECRET_KEY is not set in hosted-staging-deploy; the billing target needs it"; exit 1; }
+                [ -n "$STRIPE_WEBHOOK_SECRET" ] || { echo "STRIPE_WEBHOOK_SECRET is not set in hosted-staging-deploy; the billing target needs it"; exit 1; }
+                [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] || { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_); a live key is refused"; exit 1; }
+                [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] || { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)"; exit 1; }
+              fi ;;
           esac
           [[ ! "$OA_OWNER_EMAIL" =~ [[:upper:][:space:]] ]] || { echo "OA_OWNER_EMAIL must be trimmed and lowercase"; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must be a stable vX.Y.Z"; exit 1; }
@@ -322,6 +339,10 @@ jobs:
           # The OIDC principal's repository (inventory, staging's provisioning);
           # GITHUB_REPOSITORY (owner/repo) is the runner's own.
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          # Billing's Stripe secrets (#1568): staging only; the billing target
+          # refuses without them and puts them on oa-s-billing alone.
+          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           IFS=, read -ra list <<< "$TARGETS"
