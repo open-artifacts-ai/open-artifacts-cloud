@@ -1236,8 +1236,8 @@ export async function removeLifecycle(run: Run): Promise<void> {
 /**
  * P31 when the tag adds a migration over the rollback target: the product
  * refuses the rollback by design. The job fails invalid_state, nothing
- * changes (the install still serves the tag, healthy), and the refusal is
- * audited as a job.failed row with that code.
+ * changes (the install still serves the tag, healthy). The job.failed audit
+ * row is not read here (see the comment at the end of the function).
  */
 async function refusedRollback(
   run: Run,
@@ -1277,30 +1277,16 @@ async function refusedRollback(
     throw new ProbeFail(
       `P31: after the refusal /healthz is not ok on ${run.c.version} (${desc(hz)})`,
     );
-  const q = new URLSearchParams({
-    installId: p.id,
-    action: "job.failed",
-    limit: "100",
-  });
-  const r = await run.v1(`/audit?${q}`, { read: true });
-  expect(r, 200, "P31 R17");
-  const rows = (
-    r.json as {
-      items: {
-        jobId: string | null;
-        code?: string | null;
-        detail?: { code?: unknown } | null;
-      }[];
-    }
-  ).items.filter((i) => i.jobId === a.job.id);
-  if (rows.length === 0)
-    throw new ProbeFail(
-      "P31: the refused rollback has no job.failed audit row",
-    );
-  if (!rows.some((i) => (i.code ?? i.detail?.code) === "invalid_state"))
-    throw new ProbeFail(
-      "P31: the job.failed audit row does not carry invalid_state",
-    );
+  // No job.failed audit read here. The provisioner writes that row as a
+  // `provision` row with actor job:<id>; R17 for this run's OIDC actor has
+  // reach "own", which returns only source='api' rows of its own actor
+  // (apps/provisioning/src/routes/reads.ts queryAudit), so it can never see
+  // it, and the run's actor gets no wider reach. The write is covered by
+  // apps/provisioner/test/node/manage.test.ts, "job.done is written once on
+  // a replay; job.failed once with its kind and code, as job:<id>" (an
+  // upgrade that fails) and "a failed create is audited job.failed". GAP: no
+  // test there fails a rollback with invalid_state and reads its row, and
+  // this probe no longer proves the refusal is audited.
   return pass(`refused as designed: the tag adds ${ahead.join(", ")}`);
 }
 

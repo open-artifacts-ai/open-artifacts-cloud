@@ -148,8 +148,6 @@ export type Fault =
   | "p21_stays_paused"
   /** A rollback is refused invalid_state even when no migration was added. */
   | "rollback_refused"
-  /** The refused rollback writes no job.failed row. */
-  | "no_failed_audit"
   /** The refused rollback leaves the install failed, not active. */
   | "refusal_breaks_install"
   /** After a refused rollback /healthz says ok: false. */
@@ -401,14 +399,13 @@ export function fakeApi(): FakeApi {
         if (j.kind !== "rollback" || faults.has("refusal_breaks_install"))
           i.state = "failed";
       }
-      if (!faults.has("no_failed_audit"))
-        audit.push({
-          actor: `job:${j.id}`,
-          action: "job.failed",
-          jobId: j.id,
-          installId: j.installId,
-          code: j.failAt.code,
-        });
+      audit.push({
+        actor: `job:${j.id}`,
+        action: "job.failed",
+        jobId: j.id,
+        installId: j.installId,
+        code: j.failAt.code,
+      });
       return;
     }
     j.onStep?.(step);
@@ -487,7 +484,10 @@ export function fakeApi(): FakeApi {
             (a) =>
               (actor === null || a.actor === actor) &&
               (installId === null || a.installId === installId) &&
-              a.action === url.searchParams.get("action"),
+              a.action === url.searchParams.get("action") &&
+              // reach "own" (R17 for the run's OIDC actor): source='api'
+              // rows only; the provisioner's job:<id> rows are never seen.
+              !a.actor.startsWith("job:"),
           )
           .map((a) => ({
             jobId: a.jobId,
