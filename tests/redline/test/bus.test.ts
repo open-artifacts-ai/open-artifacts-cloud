@@ -305,12 +305,19 @@ describe("holdSocket on a loopback server", () => {
     expect(await within(h.closed, 2000)).toBe(true);
   });
 
-  it("sends the token as a bearer, upgrade headers and the hello frame", async () => {
+  /** One unmasked server text frame. */
+  const serverText = (t: string) =>
+    Buffer.concat([Buffer.from([0x81, t.length]), Buffer.from(t)]);
+
+  it("sends the token as a bearer, upgrade headers and the hello frame, and waits for hello_ok", async () => {
     let headers: Record<string, unknown> = {};
     const frames: Buffer[] = [];
     const base = await start((s, h) => {
       headers = h;
-      s.on("data", (b: Buffer) => frames.push(b));
+      s.on("data", (b: Buffer) => {
+        frames.push(b);
+        s.write(serverText('{"type":"hello_ok"}'));
+      });
     });
     const h = await openBusSocket(base, TOKEN);
     expect(h.status).toBe(101);
@@ -327,6 +334,32 @@ describe("holdSocket on a loopback server", () => {
     for (let i = 0; i < body.length; i++)
       body[i] = (body[i] as number) ^ (mask[i % 4] as number);
     expect(body.toString("utf8")).toBe(HELLO);
+  });
+
+  it("a 101 that never answers hello_ok is closed and throws, never a live session", async () => {
+    const base = await start(() => {});
+    await expect(openBusSocket(base, TOKEN, holdSocket, 100)).rejects.toThrow(
+      "bus connect: 101 but no hello_ok",
+    );
+  });
+
+  it("sends the bare ping keepalive on its cadence and reads the server's text frames", async () => {
+    const got: string[] = [];
+    let theirs!: Socket;
+    const base = await start((s) => {
+      theirs = s;
+      s.on("data", (b: Buffer) => got.push(String(b.length)));
+    });
+    const h = await holdSocket(new Request(`${base}/bus/connect`), {
+      pingMs: 20,
+    });
+    for (let i = 0; i < 100 && got.length < 2; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    expect(got.length).toBeGreaterThanOrEqual(2);
+    theirs.write(serverText("hi"));
+    expect(await h.waitText((t) => t === "hi", 2000)).toBe(true);
+    expect(h.texts).toEqual(["hi"]);
+    h.destroy();
   });
 
   it("a refusal returns its status and nothing open: closed already settled, destroy a no-op", async () => {

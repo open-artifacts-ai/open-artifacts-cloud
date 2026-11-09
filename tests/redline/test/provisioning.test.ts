@@ -2501,6 +2501,7 @@ describe("the chains run at once (startChains)", () => {
       expect(out.get("P20")).toEqual({ level: "pass" });
       expect(out.get("P21")).toEqual({ level: "pass" });
       expect(f.bus.connects).toEqual([]);
+      expect(f.bus.cleaned).toBe(1);
     });
 
     it("a suspended install still upgrades a new socket: fails", async () => {

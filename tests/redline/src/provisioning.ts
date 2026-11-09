@@ -2047,50 +2047,65 @@ export const PROBES: readonly Probe[] = [
           "P51: rl-l's bus is on before the lift: HOSTED=1 should answer 404 (set HOSTED_BUS_LIFTED in src/bus-gate.ts with part 6)",
         );
       }
-      let suspended = false;
       try {
-        const a = run.accepted(
-          await run.v1(`/installs/${p.id}/suspend`, {
-            body: { requestId: run.rid("p51"), reason: "red-line P51" },
-          }),
-          "P51",
-        );
-        suspended = true;
-        await run.done(a.job.id, "P51 suspend");
-        // Held since before the suspend: it must end on the install-index
-        // passes, with nothing that closes it from this side.
-        let closed = false;
-        void s.closed.then(() => {
-          closed = true;
-        });
-        const end = run.io.now() + BUS_CLOSE_WITHIN_MS;
-        while (!closed && run.io.now() < end) await run.io.wait(POLL_MS);
-        if (!closed)
-          throw new ProbeFail(
-            `P51: the bus socket was still open ${BUS_CLOSE_WITHIN_MS / 1000} s after the suspend`,
-          );
-        const st = await s.connect();
-        if (st === 101)
-          throw new ProbeFail("P51: a suspended install upgraded a bus socket");
-        await run.settledMode("P51", p.appHost, "paused");
-      } finally {
-        if (suspended) {
-          const b = run.accepted(
-            await run.v1(`/installs/${p.id}/resume`, {
-              body: { requestId: run.rid("p51-res") },
+        // Marked before the POST: a suspend whose answer was lost is still
+        // resumed below.
+        let suspended = false;
+        let failure: unknown;
+        let resumeFailure: unknown;
+        try {
+          suspended = true;
+          const a = run.accepted(
+            await run.v1(`/installs/${p.id}/suspend`, {
+              body: { requestId: run.rid("p51"), reason: "red-line P51" },
             }),
-            "P51 resume",
+            "P51",
           );
-          await run.done(b.job.id, "P51 resume");
-          await run.within(
-            PAGE_WITHIN_MS,
-            "P51 /healthz 200",
-            async () => (await run.page(p.appHost)).status === 200,
-          );
+          await run.done(a.job.id, "P51 suspend");
+          // Held (hello_ok, keepalive) since before the suspend: only the
+          // suspend can end it, on the install-index passes.
+          let closed = false;
+          void s.closed.then(() => {
+            closed = true;
+          });
+          const end = run.io.now() + BUS_CLOSE_WITHIN_MS;
+          while (!closed && run.io.now() < end) await run.io.wait(POLL_MS);
+          if (!closed)
+            throw new ProbeFail(
+              `P51: the bus socket was still open ${BUS_CLOSE_WITHIN_MS / 1000} s after the suspend`,
+            );
+          const st = await s.connect();
+          if (st === 101)
+            throw new ProbeFail(
+              "P51: a suspended install upgraded a bus socket",
+            );
+          await run.settledMode("P51", p.appHost, "paused");
+        } catch (e) {
+          failure = e;
         }
-      }
-      // The control: the refusal was the suspend, not a dead token.
-      try {
+        if (suspended) {
+          try {
+            const b = run.accepted(
+              await run.v1(`/installs/${p.id}/resume`, {
+                body: { requestId: run.rid("p51-res") },
+              }),
+              "P51 resume",
+            );
+            await run.done(b.job.id, "P51 resume");
+            await run.within(
+              PAGE_WITHIN_MS,
+              "P51 /healthz 200",
+              async () => (await run.page(p.appHost)).status === 200,
+            );
+          } catch (e) {
+            resumeFailure = e;
+          }
+        }
+        // The first failure is the one reported; a failed resume never
+        // replaces it.
+        if (failure) throw failure;
+        if (resumeFailure) throw resumeFailure;
+        // The control: the refusal was the suspend, not a dead token.
         const st = await s.connect();
         if (st !== 101)
           throw new ProbeFail(

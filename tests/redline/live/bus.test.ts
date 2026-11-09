@@ -8,7 +8,7 @@ import {
   revokeMachines,
 } from "../src/bus.ts";
 import { deleteThrowaways } from "../src/fixtures.ts";
-import { describeRes, readBody } from "../src/http.ts";
+import { describeRes, readBody, sendProbe } from "../src/http.ts";
 import {
   crossCheck,
   expectRefused,
@@ -16,6 +16,7 @@ import {
   prepareSide,
   type Side,
 } from "../src/refused.ts";
+import { label, proof } from "../src/report.ts";
 import { loadTargets, type Targets } from "../src/targets.ts";
 import { wsHandshake } from "../src/ws.ts";
 
@@ -53,6 +54,9 @@ const cookieOf = (s: Side): string => {
 
 beforeAll(async () => {
   T = await loadTargets();
+  // The local pair has no hosted gate (and no device approval host): nothing
+  // to set up, and the case is not-applicable there.
+  if (T.mode === "local") return;
   A = await prepareSide(T.a);
   B = await prepareSide(T.b);
   const states = [
@@ -68,6 +72,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (T?.mode === "local") return;
   let bad = 0;
   for (const m of minted)
     try {
@@ -81,12 +86,36 @@ afterAll(async () => {
 });
 
 describe("bus", () => {
-  it("A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)", async () => {
+  it("A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)", async (ctx) => {
+    if (T.mode === "local")
+      return proof(
+        ctx,
+        "not-applicable",
+        "the local pair has no hosted bus gate; the hosted red-line runs this",
+      );
     if (!HOSTED_BUS_LIFTED) {
+      // Before the lift the design is: the bus is off. Say so in the report:
+      // this run did not check the cross-install token at all.
+      label(
+        ctx,
+        "only checked that the bus is off (HOSTED_BUS_LIFTED is false); the cross-install token case runs after the lift",
+      );
       if (on)
         throw new Error(
           "the bus is on at the red-line pair before the lift: HOSTED=1 should answer 404 (set HOSTED_BUS_LIFTED in src/bus-gate.ts with part 6)",
         );
+      // A junk token is 404 at /bus/connect while the bus is off (it would
+      // be 401 on a bus that is on).
+      for (const t of [T.a, T.b]) {
+        const r = await sendProbe(
+          connectRequest(t.app, `oa_machine_${"0".repeat(43)}`),
+          wsHandshake,
+        );
+        if (r.status !== 404)
+          throw new Error(
+            `${t.name} /bus/connect with a junk token answered ${r.status}, want 404 (bus off)`,
+          );
+      }
       return;
     }
     if (!on)

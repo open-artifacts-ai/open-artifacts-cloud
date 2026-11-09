@@ -185,18 +185,28 @@ export const HELLO = JSON.stringify({
   client_version: "0.1.0",
 });
 
+/** How long a held socket may take to answer its hello. */
+export const HELLO_WAIT_MS = 10_000;
+
 /**
- * Opens a bus socket with `token` and says hello. A 101 returns a Held the
- * caller closes; any other status returns it with a Held that has nothing
- * open. Rejects only with no response at all (wsHandshake's rule).
+ * Opens a bus socket with `token`, says hello and waits for hello_ok, so a
+ * 101 that the hub never accepted can't stand in for a live session. Any
+ * other status returns a Held with nothing open. A 101 with no hello_ok is
+ * closed and throws. Rejects with no response at all (wsHandshake's rule).
  */
 export async function openBusSocket(
   app: string,
   token: string,
   hold: (r: Request) => Promise<Held> = holdSocket,
+  helloMs = HELLO_WAIT_MS,
 ): Promise<Held> {
   const h = await hold(connectRequest(app, token));
-  if (h.status === 101) h.send(HELLO);
+  if (h.status !== 101) return h;
+  h.send(HELLO);
+  if (!(await h.waitText((t) => t.includes('"hello_ok"'), helloMs))) {
+    h.destroy();
+    throw new BusError("bus connect: 101 but no hello_ok");
+  }
   return h;
 }
 

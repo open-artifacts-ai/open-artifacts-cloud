@@ -137,7 +137,11 @@ export function liveBusIo(
         );
       });
       m(token);
-      const held = await openBusSocket(app, token);
+      const held = await openBusSocket(app, token).catch((e) => {
+        throw new ProbeFail(
+          e instanceof BusError ? `P51: ${e.message}` : "P51: no bus socket",
+        );
+      });
       if (held.status !== 101)
         throw new ProbeFail(
           `P51: before the suspend, rl-l's bus upgrade answered ${held.status}, want 101`,

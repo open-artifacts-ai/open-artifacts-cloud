@@ -144,6 +144,10 @@ export interface Held {
   closed: Promise<void>;
   /** Writes one masked text frame (a client frame must be masked). */
   send: (text: string) => void;
+  /** Every text frame the server has sent, in order. */
+  texts: string[];
+  /** True once a text frame matching `pred` has arrived (or does within `ms`); false on timeout or close. */
+  waitText: (pred: (t: string) => boolean, ms: number) => Promise<boolean>;
   /** Ends it from this side; safe to call twice. */
   destroy: () => void;
 }
@@ -164,14 +168,22 @@ export function textFrame(text: string): Buffer {
   return Buffer.concat([head, mask, body]);
 }
 
+/** The bus keepalive cadence (bus-protocol limits.pingIntervalMs). */
+export const KEEPALIVE_MS = 25_000;
+
 /**
  * The handshake for `req`, and the socket kept open when the server upgraded
  * (101): the caller watches `closed`. Any other status has no socket and an
  * already-resolved `closed`. A timeout or socket error before a response
- * rejects, as wsHandshake does. Nothing here reads a frame: the socket is
- * drained so the server's own frames never stall it.
+ * rejects, as wsHandshake does. While open it reads the server's text frames
+ * (`texts`) and sends the bare keepalive "ping" every `pingMs` (default
+ * KEEPALIVE_MS), as a bus client does, so an idle timeout can't be what ends
+ * it.
  */
-export async function holdSocket(req: Request): Promise<Held> {
+export async function holdSocket(
+  req: Request,
+  o: { pingMs?: number } = {},
+): Promise<Held> {
   const headers = new Headers(req.headers);
   headers.set("connection", "Upgrade");
   headers.set("upgrade", "websocket");
@@ -186,25 +198,81 @@ export async function holdSocket(req: Request): Promise<Held> {
     },
   });
   const socket = kept;
+  const texts: string[] = [];
   if (!socket)
     return {
       status: res.status,
       closed: Promise.resolve(),
       send: () => {},
       destroy: () => {},
+      texts,
+      waitText: async () => false,
     };
+  let ended = false;
+  const waiters = new Set<() => void>();
   const closed = new Promise<void>((resolve) => {
-    socket.once("close", () => resolve());
-    socket.once("end", () => resolve());
-    socket.once("error", () => resolve());
+    const end = () => {
+      ended = true;
+      for (const w of waiters) w();
+      resolve();
+    };
+    socket.once("close", end);
+    socket.once("end", end);
+    socket.once("error", end);
   });
-  socket.resume();
+  let buf: Buffer = Buffer.alloc(0);
+  socket.on("data", (d: Buffer) => {
+    buf = Buffer.concat([buf, d]);
+    for (;;) {
+      if (buf.length < 2) break;
+      let len = (buf[1] as number) & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) break;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) break;
+        len = Number(buf.readBigUInt64BE(2));
+        off = 10;
+      }
+      if (buf.length < off + len) break;
+      if (((buf[0] as number) & 0x0f) === 1)
+        texts.push(buf.subarray(off, off + len).toString("utf8"));
+      buf = buf.subarray(off + len);
+    }
+    for (const w of waiters) w();
+  });
+  const ping = setInterval(() => {
+    if (!socket.destroyed) socket.write(textFrame("ping"));
+  }, o.pingMs ?? KEEPALIVE_MS);
+  ping.unref();
+  void closed.then(() => clearInterval(ping));
   return {
     status: res.status,
     closed,
+    texts,
     send: (text) => {
       if (!socket.destroyed) socket.write(textFrame(text));
     },
-    destroy: () => socket.destroy(),
+    destroy: () => {
+      clearInterval(ping);
+      socket.destroy();
+    },
+    waitText: (pred, ms) =>
+      new Promise<boolean>((resolve) => {
+        const done = (v: boolean) => {
+          clearTimeout(t);
+          waiters.delete(check);
+          resolve(v);
+        };
+        const check = () => {
+          if (texts.some(pred)) done(true);
+          else if (ended) done(false);
+        };
+        const t = setTimeout(() => done(false), ms);
+        waiters.add(check);
+        check();
+      }),
   };
 }
