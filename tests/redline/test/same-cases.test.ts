@@ -103,6 +103,23 @@ describe("the same pass bar", () => {
     expect(ACCEPTED_UNPROVEN_ADDED_SINCE_1730).toHaveLength(2);
   });
 
+  it("the gate accepts each declared provisioner probe as unproven-live, by exact name, file and reason, and no sibling", () => {
+    const pass: CaseResult = { name: "x", level: "pass" };
+    for (const e of ACCEPTED_UNPROVEN_ADDED_SINCE_1730) {
+      const c: CaseResult = {
+        name: e.name,
+        file: `live/${e.file}`,
+        level: "unproven-live",
+        reason: e.reason,
+      };
+      expect(gatePasses([pass, c]), e.name).toBe(true);
+      expect(gatePasses([pass, { ...c, reason: "other" }]), e.name).toBe(false);
+      expect(gatePasses([pass, { ...c, name: `${e.name} ` }]), e.name).toBe(
+        false,
+      );
+    }
+  });
+
   it("MAX_RETRIED_CASES is 5 and the gate is read from --gate or REDLINE_GATE=1", () => {
     expect(MAX_RETRIED_CASES).toBe(main.maxRetriedCases);
     expect(MAX_RETRIED_CASES).toBe(5);
