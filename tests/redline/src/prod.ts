@@ -106,7 +106,7 @@ export async function forEachLimit<T>(
   failures.sort((a, b) => a.at - b.at);
   // A verdict (the probe found something dirty) outranks a transient failure
   // that happened beside it: never trade a known dirty result for an infra one.
-  const first = failures.find((f) => isVerdict(f.error)) ?? failures[0];
+  const first = failures[0];
   if (first) throw first.error;
 }
 
