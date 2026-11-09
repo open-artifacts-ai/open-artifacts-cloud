@@ -104,12 +104,6 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   // refuses it (apps/provisioner/src/recheck.ts, packages/provision/src/wfp.ts),
   // so it would be accepted here and fail later. Refuse it now, until Gmail
   // owners (#864/#865).
-
-  // Public #1825 lets the contract accept google with no auth.domains (owner
-  // and invites only), but the hosted pipeline does not: the provisioner
-  // refuses it (apps/provisioner/src/recheck.ts, packages/provision/src/wfp.ts),
-  // so it would be accepted here and fail later. Refuse it now, until Gmail
-  // owners (#864/#865).
   if (body.auth?.providers?.includes("google") && !body.auth.domains?.length)
     throw new ApiError("invalid_input", "auth.domains: google needs a domain");
 
