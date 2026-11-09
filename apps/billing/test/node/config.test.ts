@@ -159,10 +159,7 @@ describe("migrations", () => {
 });
 
 describe("migration lock", () => {
-  it("is frozen and pins every migration by its sha256 (the staging deploy applies and records them; a pinned file never changes)", async () => {
-    const { lockProblems } = await import(
-      "../../../../scripts/ops/check-migration-lock.mjs"
-    );
+  it("is frozen and pins every migration by its sha256 (the staging deploy applies and records them; a pinned file never changes)", () => {
     const lock = JSON.parse(
       readFileSync(join(app, "migration-lock.json"), "utf8"),
     );
@@ -170,7 +167,20 @@ describe("migration lock", () => {
     expect(Object.keys(lock.pins).sort()).toEqual(
       readdirSync(join(app, "migrations")).sort(),
     );
-    expect(lockProblems(join(app, "migrations"), lock)).toEqual([]);
+    // The deploy's own checker (scripts/ops/check-migration-lock.mjs, also run
+    // by the wrapper): exit 0 means frozen, every file pinned, every pin held.
+    // Run as a script, not imported: it is untyped JavaScript.
+    expect(() =>
+      execFileSync(
+        "node",
+        [
+          join(app, "../../scripts/ops/check-migration-lock.mjs"),
+          join(app, "migrations"),
+          join(app, "migration-lock.json"),
+        ],
+        { stdio: "pipe" },
+      ),
+    ).not.toThrow();
   });
 });
 
