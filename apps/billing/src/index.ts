@@ -20,6 +20,13 @@
 // over the exact body text, and the body's `ts` is within ASSERTION_SKEW_MS.
 // Anything else is 401 bad_signature and writes nothing.
 //
+// The provisioner starts an install's 30-day no-card Solo trial through a named
+// RPC entrypoint, BillingProvisionerRpc.soloStart (service binding with
+// entrypoint "BillingProvisionerRpc"), never an HTTP route: the provisioner
+// holds no install key to sign one with. The install must be in BROKER_REGISTRY
+// (its entry is written by the provisioner; KV is eventually consistent, so an
+// unknown install is a retryable answer). #1568.
+//
 // POST /stripe/webhook is the one public route (internet traffic, with
 // cf-connecting-ip). @oa/billing-core's handleStripeWebhook reads the raw
 // body once and checks its Stripe-Signature itself, so billing never reads
@@ -31,6 +38,7 @@
 // Logs carry fixed categories and install ids only: never bodies, headers or
 // URLs.
 
+import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   type CheckoutTier,
   createCheckoutSession,
@@ -40,7 +48,11 @@ import {
   expireCheckoutSession,
   handleStripeWebhook,
   pruneStripeEvents,
+  SOLO_START_RETRYABLE,
   SOLO_TRIAL_DAYS,
+  type SoloStartError,
+  type SoloStartResult,
+  type SoloStartView,
   StripeApiError,
   type StripeConfig,
   StripeConfigError,
@@ -142,7 +154,7 @@ const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // rows); an existing row moves only from solo/free and active, and only once
 // (trial_ends_at stays set after). The Solo subscription under it is kept as
 // solo_status active only when it is known live: a stored id plus
-// solo_trial_ends_at (set by /solo/start, a Solo trialing or active event, or a
+// solo_trial_ends_at (set by the Solo trial start, a Solo trialing or active event, or a
 // paid Solo checkout); an id with none is a pending first payment. Solo's own
 // 30-day no-card trial is a Stripe
 // subscription and never sets trial_ends_at, so it doesn't use this up.
@@ -250,7 +262,6 @@ const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
   "/checkout": ["install", "ts", "plan", "interval"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
-  "/solo/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
 };
 /** Only a Stripe-hosted page is ever passed back. */
@@ -275,7 +286,11 @@ const MAP_CUSTOMER_SQL =
 
 /** A Stripe failure, as the route's answer (logged by category only). */
 class StripeFailure {
-  constructor(public res: Response) {}
+  constructor(
+    public res: Response,
+    /** The same failure as a fixed code (the provisioner RPC's answers). */
+    public code: "config" | "retry" | "bad_upstream" | "upstream",
+  ) {}
 }
 
 /**
@@ -289,20 +304,20 @@ async function stripe<T>(install: string, fn: () => Promise<T>): Promise<T> {
   } catch (e) {
     if (e instanceof StripeConfigError) {
       console.error("billing stripe config", install);
-      throw new StripeFailure(bad("config", 500));
+      throw new StripeFailure(bad("config", 500), "config");
     }
     // An idempotent request still in progress (a concurrent call with the
     // same key): the caller may retry it.
     if (e instanceof StripeApiError && e.status === 409) {
       console.error("billing stripe retry", install);
-      throw new StripeFailure(bad("retry", 503));
+      throw new StripeFailure(bad("retry", 503), "retry");
     }
     if (e instanceof StripeApiError && e.type === "bad_answer") {
       console.error("billing stripe bad_upstream", install);
-      throw new StripeFailure(bad("bad_upstream", 502));
+      throw new StripeFailure(bad("bad_upstream", 502), "bad_upstream");
     }
     console.error("billing stripe upstream", install);
-    throw new StripeFailure(bad("upstream", 502));
+    throw new StripeFailure(bad("upstream", 502), "upstream");
   }
 }
 
@@ -597,24 +612,24 @@ async function trialStart(
 }
 
 /**
- * POST /solo/start: the Solo plan's 30-day no-card trial, made through the
- * Stripe API (no Checkout visit). Idempotent per install: the subscription
- * is keyed solo-trial-<install>, and nothing is created when the row already
- * holds a subscription or ever had a Solo trial. A row on team, business or
- * trial is refused. The caller is the provisioner (#1046); the gate's
- * allowlist does not forward it for installs.
+ * The Solo plan's 30-day no-card trial, made through the Stripe API (no
+ * Checkout visit), for the provisioner's RPC (BillingProvisionerRpc.soloStart,
+ * #1568). Idempotent per install: the subscription is keyed
+ * solo-trial-<install>, and nothing is created when the row already holds a
+ * subscription or ever had a Solo trial (an "ok" answer all the same). A row
+ * on team, business or trial is plan_conflict; a lapsed, past_due or
+ * suspended one is not_active, with no customer and no Stripe call. Answers a
+ * result; a StripeFailure or a D1 error is the caller's to classify.
  */
-async function soloStart(
+async function soloStartCore(
   env: Env,
   install: string,
-  body: Record<string, unknown>,
   now: number,
-) {
-  if (mismatched(body, install)) return bad("install_mismatch", 403);
+): Promise<SoloStartResult> {
   const priceId = env.STRIPE_PRICE_SOLO_MONTHLY;
   if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
     console.error("billing stripe config", install);
-    return bad("config", 500);
+    return soloFail("config");
   }
   const db = env.BILLING_DB;
   await materialize(db, install, now);
@@ -626,18 +641,18 @@ async function soloStart(
   }>();
   if (held?.tier && held.tier !== "solo" && held.tier !== "free") {
     console.log("billing solo plan_conflict", install);
-    return bad("plan_conflict", 409);
+    return soloFail("plan_conflict");
   }
   // A lapsed, past_due or suspended row gets no trial and no Stripe call (a
   // missing row is an active Solo by default).
   if (held && held.status !== "active") {
     console.log("billing solo not_active", install);
-    return bad("not_active", 409);
+    return soloFail("not_active");
   }
-  const unchanged = async () => {
+  const unchanged = async (): Promise<SoloStartResult> => {
     const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
     console.log("billing solo unchanged", install);
-    return Response.json(view(r, now));
+    return soloOk(view(r, now));
   };
   // One trial per install, and nothing beside a subscription already there.
   if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
@@ -659,9 +674,67 @@ async function soloStart(
     .first<TierRow>();
   if (started) {
     console.log("billing solo started", install);
-    return Response.json(view(started, now));
+    return soloOk(view(started, now));
   }
   return unchanged();
+}
+
+const soloFail = (error: SoloStartError): SoloStartResult => ({
+  ok: false,
+  error,
+  retryable: SOLO_START_RETRYABLE[error],
+});
+const soloOk = (v: ReturnType<typeof view>): SoloStartResult => ({
+  ok: true,
+  tier: v.tier as SoloStartView["tier"],
+  status: v.status as SoloStartView["status"],
+  trialEndsAt: v.trialEndsAt,
+  graceUntil: v.graceUntil,
+  soloTrialEndsAt: v.soloTrialEndsAt,
+  version: v.version,
+  asOf: v.asOf,
+});
+
+/**
+ * The provisioner's call, as a module function (the class below must hold
+ * nothing else: Workers RPC exposes every public method). Validates the id,
+ * requires the install in BROKER_REGISTRY, runs the core, and turns every
+ * outcome into a result: it never throws.
+ */
+async function provisionerSoloStart(
+  env: Env,
+  install: unknown,
+): Promise<SoloStartResult> {
+  if (typeof install !== "string" || !INSTALL_ID.test(install))
+    return soloFail("bad_install");
+  const now = Date.now();
+  try {
+    // The provisioner writes the entry before it calls; KV takes time to show
+    // it, so "not there" is retryable.
+    if (!(await lookupInstall(env.BROKER_REGISTRY, install, now))) {
+      console.log("billing solo unknown_install", install);
+      return soloFail("unknown_install");
+    }
+    return await soloStartCore(env, install, now);
+  } catch (e) {
+    if (e instanceof StripeFailure) return soloFail(e.code);
+    // Never the error text: it can carry a D1 message.
+    console.error("billing solo_start db_error", install);
+    return soloFail("unavailable");
+  }
+}
+
+/**
+ * The provisioner's RPC entrypoint (a service binding with
+ * `entrypoint: "BillingProvisionerRpc"`). Workers RPC exposes every public
+ * method of a WorkerEntrypoint and TS `private` is not enforced at runtime, so
+ * this class has exactly one method, delegating to a module function; no
+ * helpers on the class (a test pins the prototype).
+ */
+export class BillingProvisionerRpc extends WorkerEntrypoint<Env> {
+  soloStart(install: string): Promise<SoloStartResult> {
+    return provisionerSoloStart(this.env, install);
+  }
 }
 
 async function usage(
@@ -694,7 +767,6 @@ const GATE = new Set([
   "GET /tier",
   "GET /health",
   "POST /trial/start",
-  "POST /solo/start",
   "POST /usage",
   "POST /checkout",
   "POST /portal",
@@ -774,14 +846,6 @@ export default {
       if (!strictBody(body, url.pathname)) return bad("bad_body");
       if (route === "POST /trial/start")
         return await trialStart(env.BILLING_DB, install, body, now);
-      if (route === "POST /solo/start") {
-        try {
-          return await soloStart(env, install, body, now);
-        } catch (e) {
-          if (e instanceof StripeFailure) return e.res;
-          throw e;
-        }
-      }
       return await usage(env.BILLING_DB, install, body, now);
     } catch {
       // Never the error text: it can carry a D1 message.
