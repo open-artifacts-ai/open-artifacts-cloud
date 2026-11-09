@@ -499,6 +499,22 @@ describe("create from the sign-up host (R4, self-serve policy)", () => {
     expect(e.queued).toHaveLength(1);
   });
 
+  it("a non-Gmail account with no hd is refused 403 with a clear message, nothing queued", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e, {
+      email: "ana@corp.example",
+      hd: undefined,
+      sub: "g-310",
+    });
+    const r = await create(e, sid);
+    expect(r.status).toBe(403);
+    const b = (await r.json()) as { error: { code: string; message: string } };
+    expect(b.error.code).toBe("forbidden");
+    expect(b.error.message).toMatch(/Gmail/);
+    expect(await db.prepare("SELECT 1 FROM signups").first()).toBeNull();
+    expect(e.queued).toHaveLength(0);
+  });
+
   it("while sign-ups are closed it is 503 signups_closed", async () => {
     const e = env({ SIGNUPS_ENABLED: "false" });
     const { sid } = await signIn(e);

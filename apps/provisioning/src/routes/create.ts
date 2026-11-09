@@ -59,6 +59,10 @@ function slugRule(slug: string) {
   if (e) throw new ApiError(e);
 }
 
+const GMAIL_DOMAINS = ["gmail.com", "googlemail.com"];
+const isGmailAddress = (email: string): boolean =>
+  GMAIL_DOMAINS.includes(email.slice(email.lastIndexOf("@") + 1).toLowerCase());
+
 /** 4.2 self-serve policy, in order, after the forbidden fields. */
 async function selfServePolicy(
   a: HandlerArgs,
@@ -84,8 +88,14 @@ async function selfServePolicy(
   if (!t.ok) throw new ApiError("turnstile_failed");
   if (!(await chargeSelfServeCreate(env, surface.client.ip)))
     throw new ApiError("rate_limited");
-  // Any verified Google account may sign up (a personal Gmail has no hd).
   if (!p.email || !p.sub) throw new ApiError("forbidden");
+  // Mirrors the public rule: with no hd (no Workspace domain) only a Gmail
+  // address may sign up; any other email without hd is refused.
+  if (!p.hd && !isGmailAddress(p.email))
+    throw new ApiError(
+      "forbidden",
+      "Sign up with a Gmail address or a Google Workspace account.",
+    );
   if (await liveClaim(env, p.sub)) throw new ApiError("signup_limit");
   return { hd: p.hd ?? null, email: p.email };
 }

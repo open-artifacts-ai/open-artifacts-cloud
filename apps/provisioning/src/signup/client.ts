@@ -41,7 +41,7 @@ export const CLIENT_JS = String.raw`(function () {
       return r.text().then(function (t) {
         var j = null;
         try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
-        return { status: r.status, body: j, code: j && j.error && j.error.code };
+        return { status: r.status, body: j, code: j && j.error && j.error.code, message: j && j.error && j.error.message };
       });
     });
   }
@@ -293,7 +293,7 @@ export const CLIENT_JS = String.raw`(function () {
       if (r.code === "signup_limit") { loadSignup().then(route); return; }
       if (r.code === "slug_taken") { S.avail = "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
       if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
-      S.err = CREATE_ERR[r.code] || "We couldn't create your instance. Try again in a few minutes.";
+      S.err = CREATE_ERR[r.code] || (r.code === "forbidden" && r.message && r.message !== "forbidden" ? r.message : null) || "We couldn't create your instance. Try again in a few minutes.";
       paintCreate();
     }, function () {
       S.busy = false; resetTurnstile();
