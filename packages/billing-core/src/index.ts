@@ -52,3 +52,9 @@ export {
   tierFromSubscription,
   type WebhookEnv,
 } from "./webhook.js";
+export {
+  SOLO_START_RETRYABLE,
+  type SoloStartError,
+  type SoloStartResult,
+  type SoloStartView,
+} from "./solo-start.js";
