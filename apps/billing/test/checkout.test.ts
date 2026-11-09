@@ -1071,6 +1071,26 @@ describe("Stripe answers and errors", () => {
     }
   });
 
+  it("the HTTP routes still answer every Stripe error as 502 upstream, whatever its status (stripe_refused is the provisioner RPC's only)", async () => {
+    await seed(A, "cus_existingA");
+    for (const status of [400, 401, 403, 404, 429, 500]) {
+      vi.restoreAllMocks();
+      fakeStripe((c) =>
+        c.path === CHECKOUT
+          ? Response.json(
+              { error: { type: "invalid_request_error" } },
+              { status },
+            )
+          : undefined,
+      );
+      const r = await call(req("/checkout", { install: A, plan: "team" }));
+      expect([r.status, await r.json()], String(status)).toEqual([
+        502,
+        { error: "upstream" },
+      ]);
+    }
+  });
+
   it("Stripe's 409 (the same key still in progress) is 503 retry, on every call", async () => {
     const busy = () =>
       Response.json({ error: { type: "idempotency_error" } }, { status: 409 });

@@ -290,6 +290,8 @@ class StripeFailure {
     public res: Response,
     /** The same failure as a fixed code (the provisioner RPC's answers). */
     public code: "config" | "retry" | "bad_upstream" | "upstream",
+    /** Stripe's HTTP status, when it answered one (not a network error). */
+    public status?: number,
   ) {}
 }
 
@@ -317,7 +319,11 @@ async function stripe<T>(install: string, fn: () => Promise<T>): Promise<T> {
       throw new StripeFailure(bad("bad_upstream", 502), "bad_upstream");
     }
     console.error("billing stripe upstream", install);
-    throw new StripeFailure(bad("upstream", 502), "upstream");
+    throw new StripeFailure(
+      bad("upstream", 502),
+      "upstream",
+      e instanceof StripeApiError ? e.status : undefined,
+    );
   }
 }
 
@@ -717,7 +723,24 @@ async function provisionerSoloStart(
     }
     return await soloStartCore(env, install, now);
   } catch (e) {
-    if (e instanceof StripeFailure) return soloFail(e.code);
+    if (e instanceof StripeFailure) {
+      // A 4xx Stripe refused outright (other than 409, in progress, and 429,
+      // rate limited) will not change by retrying: a revoked or restricted
+      // key, a bad price, a missing customer. The HTTP routes keep answering
+      // 502 upstream; only this RPC tells the caller apart. A fixed category
+      // and the status number, never Stripe's text.
+      if (
+        e.code === "upstream" &&
+        e.status !== undefined &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 429
+      ) {
+        console.error("billing solo stripe_refused", install, e.status);
+        return soloFail("stripe_refused");
+      }
+      return soloFail(e.code);
+    }
     // Never the error text: it can carry a D1 message.
     console.error("billing solo_start db_error", install);
     return soloFail("unavailable");

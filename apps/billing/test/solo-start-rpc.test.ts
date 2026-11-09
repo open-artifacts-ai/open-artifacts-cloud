@@ -401,6 +401,64 @@ describe("the guards of the Solo trial start (moved from the old route)", () => 
     expect(await start(A)).toMatchObject({ ok: true, tier: "solo" });
   });
 
+  it("a permanent Stripe refusal is stripe_refused, not retryable: 400 (bad price), 401 (revoked key), 403 (a permission missing), 404 (no such customer), 422; on the customer call and on the subscription call", async () => {
+    for (const status of [400, 401, 403, 404, 422]) {
+      for (const path of ["/v1/customers", "/v1/subscriptions"]) {
+        await db.prepare("DELETE FROM tiers").run();
+        vi.restoreAllMocks();
+        const lines: string[] = [];
+        vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+          lines.push(a.map(String).join(" "));
+        });
+        fakeStripe((c) =>
+          c.path === path
+            ? Response.json(
+                {
+                  error: {
+                    type: "invalid_request_error",
+                    message: "secret detail",
+                  },
+                },
+                { status },
+              )
+            : undefined,
+        );
+        expect(await start(A), `${status} ${path}`).toEqual(
+          fail("stripe_refused", false),
+        );
+        // A fixed category, the install and the status number: no Stripe text.
+        expect(lines, `${status} ${path}`).toContain(
+          `billing solo stripe_refused ${A} ${status}`,
+        );
+        expect(lines.join("\n")).not.toContain("secret detail");
+        expect(await rowOf()).toMatchObject({ stripe_subscription_id: null });
+      }
+    }
+  });
+
+  it("429 and 5xx stay upstream and retryable; 409 stays retry; a network error is upstream", async () => {
+    for (const [status, want] of [
+      [429, "upstream"],
+      [500, "upstream"],
+      [502, "upstream"],
+      [503, "upstream"],
+      [409, "retry"],
+    ] as const) {
+      await db.prepare("DELETE FROM tiers").run();
+      vi.restoreAllMocks();
+      fakeStripe((c) =>
+        c.path === "/v1/subscriptions"
+          ? Response.json({ error: { type: "api_error" } }, { status })
+          : undefined,
+      );
+      expect(await start(A), String(status)).toEqual(fail(want, true));
+    }
+    await db.prepare("DELETE FROM tiers").run();
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("network"));
+    expect(await start(A)).toEqual(fail("upstream", true));
+  });
+
   it("an unexpected error (a D1 failure) is unavailable, retryable, never thrown, and logs a fixed category only", async () => {
     const lines: string[] = [];
     for (const m of ["log", "error", "warn"] as const)
