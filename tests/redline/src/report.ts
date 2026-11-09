@@ -529,14 +529,6 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
       evidence:
         'apps/provisioner/test/consumer.test.ts "handleSignup > a settled row is acked and never restarted"; apps/provisioner/test/node/create.test.ts "sendWelcome: one email, and a replay of every step changes nothing"; before sign-ups open: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59',
     },
-    {
-      name: "provisioner > a signup for a taken slug fails cleanly",
-      reason:
-        "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
-      file: "provisioner.test.ts",
-      evidence:
-        'apps/provisioning/test/writes.test.ts "R4 create by an admin session > slug_taken by an installs row or a live signup; a failed signup frees it"; before sign-ups open: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59',
-    },
   ].map((e) => Object.freeze(e)),
 );
 
