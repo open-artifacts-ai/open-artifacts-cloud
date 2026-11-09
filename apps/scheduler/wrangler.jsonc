@@ -69,12 +69,14 @@
       },
       // The BrokerGate stubs each install call carries (see the gate), and
       // the provisioner's RPC entrypoint (tokenStatus for the token alerts).
-      // No BILLING binding yet: it and the billing deploy target land
-      // together in the cloud repo. Without it the calls carry no billing
-      // gate and the */2 billing health check does nothing.
+      // BILLING (#1568): STAGING ONLY, bound with dispatch's together; the
+      // calls then carry the billing gate and the */2 billing health check
+      // runs. oa-s-billing must be deployed first (the billing target). Prod
+      // has no BILLING binding: the check does nothing there.
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-s-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
+        { "binding": "BILLING", "service": "oa-s-billing" },
         {
           "binding": "PROVISIONER",
           "service": "oa-s-provisioner",

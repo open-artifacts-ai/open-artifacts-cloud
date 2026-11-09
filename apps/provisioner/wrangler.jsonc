@@ -70,6 +70,18 @@
           "class_name": "ManageInstall"
         }
       ],
+      // STAGING ONLY (#1568): billing's BillingProvisionerRpc entrypoint, how the
+      // provisioner starts an install's 30-day no-card Solo trial. oa-s-billing
+      // must be deployed first (the billing target), and the deploy reads the
+      // binding back when the tag declares it: unbound, the free month would
+      // silently be skipped. Prod has no BILLING binding.
+      "services": [
+        {
+          "binding": "BILLING",
+          "service": "oa-s-billing",
+          "entrypoint": "BillingProvisionerRpc"
+        }
+      ],
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-staging" }
       ],
