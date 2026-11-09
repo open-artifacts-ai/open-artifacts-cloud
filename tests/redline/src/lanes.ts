@@ -185,7 +185,12 @@ export const CLAIMS: Record<string, Claims> = {
       // read (its row before and after) and checked with verifyTarget.
       "provisioner-plane": "write",
     },
-    buckets: installBuckets(),
+    buckets: {
+      ...installBuckets(),
+      // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which provisioning's
+      // P25 and friends also spend: same lane, after provisioning.
+      "provisioning-api": "exclusive",
+    },
   },
 };
 
@@ -205,24 +210,23 @@ const lane = (name: string, ...files: string[]): Lane => ({
 });
 
 /**
- * The run (#1730): one phase, six lanes (the sixth, `signup`, is #859's), the longest file per lane.
- * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker barrier;
+ * The run (#1730): one phase, five lanes, the longest file per lane.
+ * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
+ *   barrier, then #859's provisioner file (it spends the provisioning-api
+ *   bucket, so it shares the lane; a sync 409 and a 60 s replay watch);
  * - surfaces: surfaces (335.0 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean stays serial inside it);
- * - signup: provisioner (replay and taken slug, #859; ~2 minutes when it
- *   passes, bounded at 10 for a taken slug);
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
  */
 export const PLAN: readonly Phase[] = [
   [
-    lane("prov", "provisioning"),
+    lane("prov", "provisioning", "provisioner"),
     lane("surfaces", "surfaces"),
     lane("creds", "credentials"),
     lane("guard", "guard"),
     lane("front", "signin", "edge", "live"),
-    lane("signup", "provisioner"),
   ],
 ];
 

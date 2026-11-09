@@ -70,14 +70,13 @@ describe("the lane plan", () => {
     }
   });
 
-  it("is one phase of six lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of five lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
       "creds",
       "front",
       "guard",
       "prov",
-      "signup",
       "surfaces",
     ]);
     const front = PLAN[0]?.find((l) => l.name === "front") as Lane;
@@ -298,6 +297,12 @@ function claimGaps(file: string, c: Claims): string[] {
     need(
       text.includes('mark("broker-done")'),
       'reaches the broker: must mark("broker-done")',
+    );
+  }
+  if (imports.includes("src/provisioner.ts") || text.includes("createTaken(")) {
+    need(
+      c.buckets["provisioning-api"] === "exclusive",
+      "spends RL_PV_* through createTaken: needs provisioning-api",
     );
   }
   if (imports.includes("src/provisioning.ts")) {

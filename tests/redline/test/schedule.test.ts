@@ -36,9 +36,9 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
-// The recording predates #859's live/provisioner.test.ts and its `signup`
-// lane. The simulation replays the lanes and files that were recorded; the new
-// file is bounded separately ("the signup lane", below).
+// The recording predates #859's live/provisioner.test.ts, which now runs last
+// in the `prov` lane. The simulation replays the files that were recorded; the
+// new file is bounded separately ("the provisioner file", below).
 const NEW_FILE = "live/provisioner.test.ts";
 const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
@@ -153,17 +153,17 @@ describe("the recording (run 42402998826)", () => {
   });
 });
 
-describe("the signup lane (#859, not in the recording)", () => {
-  it("holds only the provisioner file, beside the recorded lanes", () => {
-    const l = (PLAN[0] ?? []).find((x) => x.name === "signup") as Lane;
-    expect(l.files).toEqual([NEW_FILE]);
+describe("the provisioner file (#859, not in the recording)", () => {
+  it("runs last in the prov lane, after provisioning", () => {
+    const l = (PLAN[0] ?? []).find((x) => x.name === "prov") as Lane;
+    expect(l.files).toEqual(["live/provisioning.test.ts", NEW_FILE]);
   });
 
-  it("ends before provisioning when the replay and a taken slug take a few minutes", () => {
-    // Modeled, not recorded: a 60 s replay watch and a taken slug that ends
-    // failed inside 2 minutes, with setup. Its hard bound is TAKEN_BOUND_MS
-    // (10 min) plus the watch: that is a failure, not a schedule.
-    const modeled = 60 + 120 + 30;
+  it("is a few minutes: a 60 s replay watch and a sync 409 for a taken slug", () => {
+    // Modeled, not recorded: the replay watch (60 s) and the taken-slug probe
+    // (a synchronous 409, 90 s test timeout), with setup. It is added to the
+    // prov lane's wall, which this bound keeps well under the old 10 minutes.
+    const modeled = 60 + 90 + 30;
     expect(modeled).toBeLessThan(wall("live/provisioning.test.ts"));
   });
 });

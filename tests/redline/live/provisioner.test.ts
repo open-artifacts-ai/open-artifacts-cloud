@@ -1,3 +1,4 @@
+import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   createTaken,
@@ -62,11 +63,11 @@ describe("provisioner", () => {
       };
       const before = await snap();
       const b = JSON.parse(before);
-      if (b.s?.status !== "ready" || !b.s?.welcome_sent_at)
+      if (b.s?.status !== "ready" || !b.s?.welcome_sent_at || !b.s?.admitted_at)
         return proof(
           ctx,
           "unproven-live",
-          `the fixture signup is ${b.s ? b.s.status : "missing"}, not ready with its welcome sent`,
+          `the fixture signup is ${b.s ? b.s.status : "missing"}, not admitted and ready with its welcome sent`,
         );
       expect(b.installs).toHaveLength(1);
       // The same message twice, as a redelivery and a client retry would.
@@ -115,7 +116,7 @@ describe("provisioner", () => {
     const res = await createTaken(process.env, {
       requestId,
       slug,
-      ownerEmail: `redline-signup@${T.a.testDomain}`,
+      ownerEmail: `redline-signup@${STAGING_TEST_DOMAIN}`,
     });
     expect(
       { status: res.status, code: res.code },
