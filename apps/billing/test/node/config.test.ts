@@ -158,6 +158,22 @@ describe("migrations", () => {
   });
 });
 
+describe("migration lock", () => {
+  it("is frozen and pins every migration by its sha256 (the staging deploy applies and records them; a pinned file never changes)", async () => {
+    const { lockProblems } = await import(
+      "../../../../scripts/ops/check-migration-lock.mjs"
+    );
+    const lock = JSON.parse(
+      readFileSync(join(app, "migration-lock.json"), "utf8"),
+    );
+    expect(lock.frozen).toBe(true);
+    expect(Object.keys(lock.pins).sort()).toEqual(
+      readdirSync(join(app, "migrations")).sort(),
+    );
+    expect(lockProblems(join(app, "migrations"), lock)).toEqual([]);
+  });
+});
+
 const wrangler = (args: string[]) =>
   execFileSync("pnpm", ["exec", "wrangler", "deploy", "--dry-run", ...args], {
     cwd: app,

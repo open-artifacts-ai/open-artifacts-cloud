@@ -281,11 +281,18 @@ describe("prod-release-chain.yml", () => {
     expect(deploy.on.workflow_dispatch.inputs.targets.default).toBe(FULL);
     const steps = deploy.jobs.deploy.steps as Record<string, string>[];
     const ifOf = (n: string) => steps.find((s) => s.name === n)?.if;
+    // Prod's list is unchanged; staging's full list adds billing (#1568), a
+    // staging-only target that prod refuses, so the chain never carries it.
+    const FULLB = FULL.replace(
+      "directory-broker,",
+      "directory-broker,billing,",
+    );
+    expect(sh).not.toContain("billing");
     expect(ifOf("Every platform Worker runs the tag")).toBe(
-      `\${{ inputs.targets == '${FULL}' }}`,
+      `\${{ inputs.targets == '${FULL}' || inputs.targets == '${FULLB}' }}`,
     );
     expect(ifOf("Record the break-glass deploy")).toBe(
-      `\${{ !inputs.verify_only && inputs.targets != '${FULL}' }}`,
+      `\${{ !inputs.verify_only && inputs.targets != '${FULL}' && inputs.targets != '${FULLB}' }}`,
     );
     // Its Environment and concurrency group resolve from inputs.env.
     expect(deploy.jobs.deploy.environment).toBe(

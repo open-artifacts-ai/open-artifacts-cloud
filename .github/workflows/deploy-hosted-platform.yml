@@ -20,7 +20,13 @@
 # ahead (scripts/ci/deploy-token-expiry.sh).
 # One version everywhere (#1040): the default is every target, in order. Any
 # other list is break-glass: it needs a reason and opens an issue naming the
-# run (verify_only is a check, so it needs neither). Every Worker version is
+# run (verify_only is a check, so it needs neither). `billing` (the Stripe
+# billing service, #1568) is a STAGING-ONLY target between directory-broker and
+# provision-token: prod refuses it, so prod's list, bindings, routes and
+# secrets are unchanged. The staging full list is the default list with
+# billing in it (no reason needed); the default list itself stays every
+# target prod has, so a default staging run leaves billing on its own tag
+# (the tag read-back checks billing only when the run included it). Every Worker version is
 # tagged with the release (the "workers/tag" annotation), which
 # redline-staging.yml checks before it starts (scripts/ci/platform-tags.sh).
 name: deploy-hosted-platform
@@ -39,7 +45,7 @@ on:
         required: true
         type: string
       targets:
-        description: "Comma-separated, in order: platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
+        description: "Comma-separated, in order: platform-db,auth-broker,directory-broker,billing (staging only),provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
         required: true
         default: "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
         type: string
@@ -123,7 +129,7 @@ jobs:
           # target before its binder (design v7 10.2). The scheduler is last
           # (#1343): nothing binds it, and its tag is the fleet's target, so a
           # run that stops partway never moves the fleet.
-          order="platform-db auth-broker directory-broker provision-token provisioner dispatch inventory provisioning zones scheduler"
+          order="platform-db auth-broker directory-broker billing provision-token provisioner dispatch inventory provisioning zones scheduler"
           last=-1
           seen=""
           IFS=, read -ra list <<< "$TARGETS"
@@ -133,13 +139,15 @@ jobs:
             for o in $order; do [ "$o" = "$t" ] && pos=$i; i=$((i + 1)); done
             [ "$pos" -ge 0 ] || { echo "unknown target: $t"; exit 1; }
             case " $seen " in *" $t "*) echo "duplicate target: $t"; exit 1 ;; esac
+            # Staging only: prod has no billing Worker, binding, route or secret.
+            [ "$t" != billing ] || [ "$DEPLOY_ENV" = staging ] || { echo "billing is a staging-only target"; exit 1; }
             [ "$pos" -gt "$last" ] || { echo "targets out of order: $TARGETS"; exit 1; }
             last=$pos; seen="$seen $t"
           done
           # One version everywhere (#1040): fewer targets is break-glass and
           # needs a reason (the issue step records it); verify_only is a check.
           REASON="${REASON:-}"
-          if [ "$TARGETS" != "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler" ] && [ "${VERIFY_ONLY:-}" != true ]; then
+          if [ "$TARGETS" != "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler" ] && [ "$TARGETS" != "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler" ] && [ "${VERIFY_ONLY:-}" != true ]; then
             [ -n "${REASON//[[:space:]]/}" ] || { echo "targets other than the full list need a reason (break-glass)"; exit 1; }
           fi
           [ "${#REASON}" -le 500 ] || { echo "reason: 500 characters at most"; exit 1; }
@@ -169,7 +177,7 @@ jobs:
       # A break-glass deploy (fewer than every target) leaves a record: an
       # issue with the reason, the run and the actor; no secret, no email.
       - name: Record the break-glass deploy
-        if: ${{ !inputs.verify_only && inputs.targets != 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' }}
+        if: ${{ !inputs.verify_only && inputs.targets != 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' && inputs.targets != 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}
@@ -204,6 +212,7 @@ jobs:
             scripts/ci
             packages/provision/src
             apps/platform-db
+            apps/billing/migration-lock.json
             .github/hosted
           persist-credentials: false
       # main's provision pins the broker's Google client; the auth-broker
@@ -211,7 +220,7 @@ jobs:
       - name: Use main's deploy scripts
         run: |
           set -euo pipefail
-          for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do
+          for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do
             cp ".deploy-logic/scripts/ops/$f" "scripts/ops/$f"
           done
           cp .deploy-logic/packages/provision/src/wfp.ts "$RUNNER_TEMP/main-wfp.ts"
@@ -222,6 +231,7 @@ jobs:
           cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"
           # main's migration pins: the tag may add a migration, never re-pin one.
           cp .deploy-logic/apps/platform-db/migration-lock.json "$RUNNER_TEMP/main-ci/migration-lock.json"
+          cp .deploy-logic/apps/billing/migration-lock.json "$RUNNER_TEMP/main-ci/billing-migration-lock.json"
           rm -rf .deploy-logic
       # Staging first, automatic: prod's platform-db, provisioner,
       # provisioning and scheduler (its tag is the fleet target, #955) deploy
@@ -286,7 +296,7 @@ jobs:
       # exact name on the account (exactly one each); only for the targets
       # that use them (the store for provision-token and provisioner only).
       - name: Resolve the resource ids
-        if: ${{ contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',auth-broker,') || contains(format(',{0},', inputs.targets), ',directory-broker,') || contains(format(',{0},', inputs.targets), ',provision-token,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',dispatch,') || contains(format(',{0},', inputs.targets), ',scheduler,') || contains(format(',{0},', inputs.targets), ',inventory,') || contains(format(',{0},', inputs.targets), ',provisioning,') }}
+        if: ${{ contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',auth-broker,') || contains(format(',{0},', inputs.targets), ',billing,') || contains(format(',{0},', inputs.targets), ',directory-broker,') || contains(format(',{0},', inputs.targets), ',provision-token,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',dispatch,') || contains(format(',{0},', inputs.targets), ',scheduler,') || contains(format(',{0},', inputs.targets), ',inventory,') || contains(format(',{0},', inputs.targets), ',provisioning,') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TARGETS: ${{ inputs.targets }}
@@ -308,6 +318,7 @@ jobs:
           ADMIN_IDENTITIES: ${{ secrets.ADMIN_IDENTITIES }}
           BROKER_PIN_FILE: ${{ runner.temp }}/main-wfp.ts
           MAIN_MIGRATION_LOCK: ${{ runner.temp }}/main-ci/migration-lock.json
+          MAIN_BILLING_MIGRATION_LOCK: ${{ runner.temp }}/main-ci/billing-migration-lock.json
           # The OIDC principal's repository (inventory, staging's provisioning);
           # GITHUB_REPOSITORY (owner/repo) is the runner's own.
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -355,11 +366,13 @@ jobs:
       # break-glass run (fewer targets) leaves the others on their own tag,
       # so it is not checked here.
       - name: Every platform Worker runs the tag
-        if: ${{ inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' }}
+        if: ${{ inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Staging's full list with billing: its Worker is read back too.
+          PLATFORM_TAGS_BILLING: ${{ contains(format(',{0},', inputs.targets), ',billing,') && '1' || '' }}
         run: bash "$RUNNER_TEMP/main-ci/platform-tags.sh" "$DEPLOY_ENV" "$TAG"
       # The token's own end date (provision's checkToken never sees it): an
       # issue naming only the secret, 30 days ahead.

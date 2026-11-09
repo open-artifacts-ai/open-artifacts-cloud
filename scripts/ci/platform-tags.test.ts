@@ -132,6 +132,42 @@ describe("platform-tags.sh", () => {
     for (const c of calls) expect(c).toMatch(/^curl -sS -K - https:\/\//);
   });
 
+  it("billing (staging only) is read back too when the run deployed it, and never otherwise", () => {
+    const fx = allTagged();
+    fx["oa-s-billing"] = {
+      deployments: deployment([{ version_id: vid(9), percentage: 100 }]),
+      versions: [[vid(9), version(vid(9), TAG)]],
+    };
+    const r = run(fx, ["staging", TAG], { PLATFORM_TAGS_BILLING: "1" });
+    expect(r.err).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.out.trim().split("\n")).toHaveLength(8);
+    expect(r.out).toContain(`ok oa-s-billing runs ${TAG}`);
+    // Billing on another tag fails the run, naming it.
+    fx["oa-s-billing"] = {
+      deployments: deployment([{ version_id: vid(9), percentage: 100 }]),
+      versions: [[vid(9), version(vid(9), "v0.1.0")]],
+    };
+    const bad = run(fx, ["staging", TAG], {
+      PLATFORM_TAGS_BILLING: "1",
+      PLATFORM_TAGS_ATTEMPTS: "1",
+    });
+    expect(bad.code).toBe(1);
+    expect(bad.err).toContain("oa-s-billing runs v0.1.0");
+    // Without the flag billing is not read at all.
+    const plain = run(fx);
+    expect(plain.code, plain.err).toBe(0);
+    expect(plain.log.some((l) => l.includes("oa-s-billing"))).toBe(false);
+  });
+
+  it("billing is refused for prod", () => {
+    const r = run(allTagged("p"), ["prod", TAG], {
+      PLATFORM_TAGS_BILLING: "1",
+    });
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("staging-only");
+  });
+
   it("prod reads the oa-p- Workers", () => {
     const r = run(allTagged("p"), ["prod", TAG]);
     expect(r.code, r.err).toBe(0);
