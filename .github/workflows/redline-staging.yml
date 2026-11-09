@@ -1,27 +1,56 @@
 # The red-line suite (P5) and the provisioning probes (design v7 12.2) against
-# staging, on demand, for one release tag. The job mints GitHub OIDC JWTs (the
-# staging Provisioning API's and both inventories' audiences, 4.4 and 6.3)
-# into 0600 files under RUNNER_TEMP, upgrades rl-a and rl-b to the tag through
-# the staging API (R5) and takes this run's rl-a and rl-b credentials from it
-# (R26, sealed to a key that lives only in this run). Every file reaches the
-# suite by path (REDLINE_TARGETS.secretsDir), never as env, and is scanned for
-# in the reports before upload. The job ends with the R26 revoke for both
-# installs and the removal of every file, whatever happened before. Cases
-# that need prod credentials report not-applicable, never a pass. T19 (the M1
-# gate's dashboard suite) runs in this job after the red-line suite, never
-# beside it: it needs this run's rl-a hook key, which only this job holds.
-# Deviation from 4.4 ("id-token on the redline job only, not t19"): T19 is a
-# step of the id-token job, so before it runs every JWT and prod token file
-# is deleted, and its shell unsets the OIDC request variables and fails if
-# they survive, so no process it starts can mint.
+# staging, on demand, for one release tag. The redline job mints GitHub OIDC
+# JWTs (the staging Provisioning API's and both inventories' audiences, 4.4 and
+# 6.3) into 0600 files under RUNNER_TEMP, upgrades rl-a and rl-b to the tag
+# through the staging API (R5) at the same time and takes this run's rl-a and
+# rl-b credentials from it (R26, sealed to a key that lives only in this run).
+# Every file reaches the suite by path (REDLINE_TARGETS.secretsDir), never as
+# env, and is scanned for in the reports before upload. The job ends with the
+# R26 revoke for both installs and the removal of every file, whatever happened
+# before. Cases that need prod credentials report not-applicable, never a pass.
+#
+# T19 (the M1 gate's dashboard suite) is its own job, `t19`, and runs while the
+# suite runs (#1730). It holds no id-token, no Environment and no secret of the
+# redline job: 4.4's "id-token on the redline job only, not t19" holds as
+# written. What it needs is rl-a's hook key, handed over as a sealed file:
+#   1. t19 makes a key pair and uploads the public key (artifact
+#      t19-recipient-<run>-<attempt>); the private key never leaves that runner.
+#   2. the redline job, once rl-a and rl-b report the tag, seals rl-a's hook key
+#      to that public key (AAD run_id:run_attempt) and uploads it with the
+#      staged version (artifact t19-handoff-<run>-<attempt>); when it can't, it
+#      uploads a marker instead, so t19 fails at once instead of waiting.
+#   3. t19 opens it, pins T19_EXPECT_VERSION to the staged version, runs T19,
+#      scans its report for the key and deletes the key, whatever happened.
+# Why T19 may run beside the suite (it once ran after it, "both write to rl-a
+# through its hooks"): the hook rate limit, the code caps and every RL_ANON key
+# are per IP, per user or per client, and the t19 job is another runner with
+# its own hook ledger and its own users (t19-<run>-*). That it also has its own
+# IP is ASSUMED (separate GitHub-hosted VMs), not verified. If the two runners
+# did share an IP, the hook bucket (30 a minute) would be spent by both ledgers
+# (25 each) and a hook call could get RL_ANON's bare 404; T19's code-caps reset
+# could clear the suite's per-IP caps. Cases then fail, never pass wrongly: the
+# guard's wrong-key case no longer takes a 404 for the key check, it needs the
+# `denied` audit row. What the two share on rl-a regardless is the hook audit
+# log, which the red-line cases read for their own unique user in the newest 200
+# rows; T19's calls add at most one row per 2.4 s.
+# tests/redline/test/t19-isolation.test.ts pins each of these.
+#
+# The R26 revoke rotates rl-a's TEST_HOOK_KEY as well as revoking the PATs
+# (apps/provisioner/src/redline.ts revokeAll), so it would cut T19 off mid-run:
+# the redline job waits for the t19 job to end (when it handed the key over)
+# before it revokes, and the revoke still runs always.
+#
 # The suite is the tag's, never main's (#1137), so suite and release always
 # match: this file, the platform-tags job and the constants are main's, and
-# everything the redline job runs comes from the tag's checkout. So the
-# commands below (provisioning mint-oidc, bringup, staged-version and revoke,
-# live, the T19 config) are a contract with every tag still in use; a rename
-# fails redline-staging.test.ts. A suite fix reaches a candidate only in a new
-# release. Release tags can't be moved, and platform-tags passes only for a
-# tag a gated deploy put on every staging Worker.
+# everything the redline and t19 jobs run comes from the tag's checkout. So the
+# commands below (provisioning mint-oidc, bringup, staged-version, revoke,
+# t19-recipient, t19-seal, t19-open, live, the T19 config) are a contract with
+# every tag still in use; a rename fails redline-staging.test.ts. A suite fix
+# reaches a candidate only in a new release. Release tags can't be moved, and
+# platform-tags passes only for a tag a gated deploy put on every staging Worker.
+#
+# staging-first-gate.sh reads only the run's conclusion: the run passes only if
+# every job does, t19 included.
 name: redline-staging
 # scripts/ci/staging-first-gate.sh finds this run by the tag in its name.
 run-name: redline-staging ${{ inputs.tag }}
@@ -78,14 +107,178 @@ jobs:
           TAG: ${{ inputs.tag }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash scripts/ci/platform-tags.sh staging "$TAG"
+  # T19 beside the suite (#1730): the dashboard against rl-a
+  # (apps/dashboard/e2e/staging). No Environment and no id-token: it can't
+  # mint OIDC JWTs and can't see the Environment's secrets or variables (so
+  # no `vars.*` here: REDLINE_TARGETS lives on the redline-staging Environment
+  # only). The key pair needs no targets; the install data T19 reads comes in
+  # the hand-off (targets.json). `actions: read` is for downloading it.
+  #
+  # Timeouts, from the real worst case. One bring-up chain is an upgrade job
+  # (up to 20 min, JOB_WITHIN_MS) and an R26 job that waits twice (up to 40
+  # min): 60 min, the two installs at once. The seal then waits up to 10 min
+  # for the public key, so the key wait is 75 min. The job = 10 min of setup
+  # before the wait + 75 + T19's own bound (15 min globalTimeout + 5) + 5 =
+  # 110 min. The redline job waits for it up to 115 min after the t19 job's own
+  # start, but never past 110 min after the run's start: the revoke (up to 40
+  # min itself) has to end inside the redline job's 150 min. T19 holds the key
+  # at the latest at 5 + 60 + 10 + 20 = 95 min after the run's start, under that
+  # cap. Only a t19 job that starts more than 15 min late AND a worst-case
+  # bring-up could be cut off by the revoke; nothing fits that inside 150 min.
+  t19:
+    name: t19
+    needs: platform-tags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 110
+    steps:
+      - name: On main, for a release tag
+        env:
+          TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "dispatch redline-staging on main"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || { echo "tag must be vX.Y.Z"; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+        with:
+          exact-tag: ${{ inputs.tag }}
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # The provisioning CLI (it makes the key pair and opens the hand-off)
+      # needs provision and shared built; Chromium installs beside the builds
+      # (about 20 s), and either failing fails the step.
+      - id: prep
+        name: Build provision and shared, install Chromium alongside
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/playwright-install.log"
+          pnpm --filter @oa/dashboard exec playwright install --with-deps chromium > "$log" 2>&1 &
+          pw=$!
+          b=0
+          { pnpm --filter @oa/provision build && pnpm --filter @oa/shared build; } || b=$?
+          p=0
+          wait "$pw" || p=$?
+          echo "::group::playwright install"
+          cat "$log"
+          echo "::endgroup::"
+          rm -f "$log"
+          [ "$b" -eq 0 ] || { echo "build failed: $b"; exit 1; }
+          [ "$p" -eq 0 ] || { echo "playwright install failed: $p"; exit 1; }
+      # The private key stays in this runner's RUNNER_TEMP; only the public key goes up.
+      - name: Make this run's recipient key
+        run: pnpm --filter @oa/redline provisioning t19-recipient
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: t19-recipient-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/t19-recipient/public-key
+          retention-days: 1
+          if-no-files-found: error
+      # Until the redline job has sealed rl-a's hook key (after bring-up: about
+      # 4 minutes, 75 at the very worst), or said it can't (a marker file): then
+      # the run fails here, never waiting for a key that isn't coming. A re-run
+      # of only this job has no redline job in the attempt: fails at once.
+      - id: wait
+        name: Wait for rl-a's sealed hook key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="t19-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          dir="$RUNNER_TEMP/t19-sealed"
+          wait_s="${WAIT_S:-4500}"
+          deadline=$(( $(date +%s) + wait_s ))
+          redline=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )redline$"))] | length' 2> /dev/null) || redline=""
+          if [ "$redline" = 0 ]; then echo "t19: the redline job is not part of this attempt (a partial re-run): re-run all jobs"; exit 1; fi
+          while :; do
+            rm -rf "$dir"
+            if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$dir" > /dev/null 2>&1; then break; fi
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "t19: no hand-off from the redline job within ${wait_s} s"; exit 1; }
+            sleep "${POLL_S:-10}"
+          done
+          [ -s "$dir/sealed" ] || { echo "t19: the redline job handed over no key (bring-up or the hand-off failed there)"; exit 1; }
+      # Everything T19 reads from REDLINE_TARGETS (mode, a's name, installId,
+      # app and testDomain) comes from the redline job's targets, handed over
+      # with the key: not from a variable this job can't see. T19 reads
+      # nothing from REDLINE_RELEASE, REDLINE_RUN_ID or the Turnstile file.
+      - name: Set the targets from the hand-off
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/redline-secrets"
+          mkdir -p "$d"
+          targets=$(jq -ce --arg d "$d" '
+            select(.mode == "staging"
+              and (.a.name | type == "string") and (.a.installId | type == "string")
+              and (.a.app | type == "string") and (.a.testDomain | type == "string")
+              and (.b.name | type == "string") and (.b.installId | type == "string")
+              and (.b.app | type == "string"))
+            | . + {secretsDir: $d}' "$RUNNER_TEMP/t19-sealed/targets.json") || { echo "t19: the hand-off has no usable targets.json"; exit 1; }
+          echo "REDLINE_TARGETS=$targets" >> "$GITHUB_ENV"
+      - id: open
+        name: Open the hook key (the private key is deleted)
+        run: pnpm --filter @oa/redline provisioning t19-open
+      - id: t19
+        name: Run T19
+        env:
+          T19_EXPECT_TIER: team
+        run: |
+          set -euo pipefail
+          # The pin (#1251): the version the staged step saw on rl-a's and
+          # rl-b's /healthz (version.txt, X.Y.Z), handed over with the key. A
+          # gated skip then fails, and guard.setup checks rl-a; leo has its
+          # own pin, unset until #955. No file means staging didn't take the tag.
+          T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/t19-sealed/version.txt")"
+          if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi
+          export T19_EXPECT_VERSION
+          pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts
+      # Artifacts are not masked: the hook key in a report stops the upload.
+      - id: scan
+        name: No secret in the report
+        if: always()
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/redline-secrets"
+          [ -d "$d" ] || exit 0
+          dirs=()
+          for r in apps/dashboard/playwright-report apps/dashboard/test-results; do
+            [ -d "$r" ] && dirs+=("$r")
+          done
+          [ "${#dirs[@]}" -gt 0 ] || exit 0
+          for f in "$d"/*; do
+            [ -s "$f" ] || continue
+            # -f reads the pattern from the file: the key never reaches argv.
+            if grep -rqF -f "$f" "${dirs[@]}"; then echo "secret in report: ${f##*/}"; exit 1; fi
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && steps.scan.outcome == 'success' && steps.t19.outcome != 'skipped'
+        with:
+          name: t19-report
+          path: apps/dashboard/playwright-report
+          if-no-files-found: warn
+      - name: Remove the hook key and the private key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/t19-recipient" "$RUNNER_TEMP/t19-sealed"
   redline:
     needs: platform-tags
     runs-on: ubuntu-latest
     environment: redline-staging
-    # The OIDC principal (4.4): this job only, never the workflow.
+    # The OIDC principal (4.4): this job only, never the workflow. `actions:
+    # read` is for the t19 hand-off (this run's artifacts and jobs).
     permissions:
       contents: read
       id-token: write
+      actions: read
     timeout-minutes: 150
     steps:
       # Before the checkout: the input picks the code this job runs.
@@ -116,26 +309,12 @@ jobs:
       # could mint as O. pnpm already skips dependency scripts.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       # Before any secret file exists: only the probes and suites run while they do.
-      # Chromium installs (apt and a download, about 20 s) beside the two
-      # builds (about 8 s). Both exit codes are read, so either failing fails
-      # the step; the builds' failure still waits for the install to end.
+      # (Chromium is the t19 job's.)
       - id: prep
-        name: Build provision and shared, install Chromium alongside
+        name: Build provision and shared
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/playwright-install.log"
-          pnpm --filter @oa/dashboard exec playwright install --with-deps chromium > "$log" 2>&1 &
-          pw=$!
-          b=0
-          { pnpm --filter @oa/provision build && pnpm --filter @oa/shared build; } || b=$?
-          p=0
-          wait "$pw" || p=$?
-          echo "::group::playwright install"
-          cat "$log"
-          echo "::endgroup::"
-          rm -f "$log"
-          [ "$b" -eq 0 ] || { echo "build failed: $b"; exit 1; }
-          [ "$p" -eq 0 ] || { echo "playwright install failed: $p"; exit 1; }
+          pnpm --filter @oa/provision build && pnpm --filter @oa/shared build
       - name: Write the suite's secrets as 0600 files
         env:
           # The "prod is clean" probe: read-only tokens, both or none (its
@@ -203,6 +382,70 @@ jobs:
           name: redline-staged-version
           path: ${{ runner.temp }}/redline-staged/version.txt
           if-no-files-found: error
+      # The t19 hand-off (header comment): waits for the t19 job's public key
+      # (it is normally up long before bring-up ends), seals rl-a's hook key to
+      # it and uploads it with the staged version. Only after rl-a and rl-b
+      # report the tag. A failure here (the seal, or its upload) doesn't stop
+      # the suite (its results are still wanted), but the job's last step fails
+      # it: a run whose T19 never got its key is never green.
+      - id: t19-key
+        name: Seal rl-a's hook key for the t19 job
+        if: steps.staged.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="t19-recipient-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          pub="$RUNNER_TEMP/t19-recipient-pub"
+          out="$RUNNER_TEMP/t19-handoff"
+          wait_s="${WAIT_S:-600}"
+          deadline=$(( $(date +%s) + wait_s ))
+          # A re-run of only this job has no t19 job in the attempt, so no
+          # public key will ever come: stop at once, not after the wait.
+          t19=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$"))] | length' 2> /dev/null) || t19=""
+          if [ "$t19" = 0 ]; then echo "the t19 job is not part of this attempt (a partial re-run): re-run all jobs"; exit 1; fi
+          while :; do
+            rm -rf "$pub"
+            if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$pub" > /dev/null 2>&1; then break; fi
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "no public key from the t19 job within ${wait_s} s"; exit 1; }
+            sleep "${POLL_S:-10}"
+          done
+          [ -s "$pub/public-key" ] || { echo "the t19 job's artifact has no public key"; exit 1; }
+          rm -rf "$out"
+          mkdir -p "$out"
+          pnpm --filter @oa/redline provisioning t19-seal "$pub/public-key" "$out/sealed"
+          cp "$RUNNER_TEMP/redline-staged/version.txt" "$out/version.txt"
+          # The install data T19 reads (public origins and ids, no secret, no
+          # secretsDir, no prod or Turnstile fields): the t19 job can't read
+          # the Environment's REDLINE_TARGETS variable itself.
+          jq -c '{mode, a: {name: .a.name, installId: .a.installId, app: .a.app, testDomain: .a.testDomain}, b: {name: .b.name, installId: .b.installId, app: .b.app}}' <<< "$REDLINE_TARGETS" > "$out/targets.json"
+      - id: handoff-up
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.t19-key.outcome == 'success'
+        continue-on-error: true
+        with:
+          name: t19-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/t19-handoff
+          retention-days: 1
+          if-no-files-found: error
+      # Whatever stopped the key (bring-up failed, the seal failed): the t19
+      # job reads the missing `sealed` as "none is coming" and fails.
+      - name: Tell the t19 job no key is coming
+        if: always() && steps.handoff-up.outcome != 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/t19-nohandoff"
+          echo "no key was handed over" > "$RUNNER_TEMP/t19-nohandoff/none"
+      - id: marker-up
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && steps.handoff-up.outcome != 'success'
+        continue-on-error: true
+        with:
+          name: t19-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/t19-nohandoff
+          retention-days: 1
+          if-no-files-found: error
       # After bring-up (up to 4 jobs of 20 min), only with the prod tokens;
       # the suite re-mints it near expiry (600 s at most) like the others.
       - name: Mint the prod inventory OIDC JWT
@@ -231,8 +474,7 @@ jobs:
           export REDLINE_REPORT="$RUNNER_TEMP/redline-report/report.json"
           mkdir -p "$RUNNER_TEMP/redline-report"
           pnpm --filter @oa/redline live
-      # The red-line report is scanned now, while every file still exists:
-      # the next step deletes the JWT and prod files before T19 runs.
+      # Artifacts are not masked: a secret echoed into a report stops the upload.
       - id: scan-suite
         name: No secret in the red-line report
         if: always()
@@ -246,65 +488,44 @@ jobs:
             # -f reads the pattern from the file: the key never reaches argv.
             if grep -rqF -f "$f" "$r"; then echo "secret in report: ${f##*/}"; exit 1; fi
           done
-      # T19 needs only rl-a's hook key. The revoke re-mints the provisioning
-      # JWT itself (the file is missing, so jwtSource mints a new one).
-      - name: Delete the JWT and prod files before T19
-        if: always()
-        run: rm -f "$RUNNER_TEMP"/redline-secrets/REDLINE_*_OIDC "$RUNNER_TEMP"/redline-secrets/REDLINE_PROD_*
-      # T19: the dashboard against rl-a (apps/dashboard/e2e/staging), after
-      # the red-line suite, never beside it: both write to rl-a through its
-      # hooks (per-IP code caps, the hook audit log the red-line cases read).
-      # The step env blanks the OIDC request variables; the shell then unsets
-      # them and fails if either survives, before Playwright starts.
-      - id: t19
-        name: Run T19
-        if: ${{ !cancelled() && steps.bringup.outcome == 'success' }}
-        env:
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          T19_EXPECT_TIER: team
-        run: |
-          set -euo pipefail
-          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
-          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL+x}${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}" ]; then echo "T19 can reach the OIDC request variables"; exit 1; fi
-          # The pin (#1251): the version the staged step saw on rl-a's and rl-b's
-          # /healthz (version.txt, X.Y.Z). A gated skip then fails, and
-          # guard.setup checks rl-a; leo has its own pin, unset until #955.
-          # No file means staging didn't take the tag.
-          T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/redline-staged/version.txt")"
-          if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi
-          export T19_EXPECT_VERSION
-          pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts
-      # Artifacts are not masked: a secret echoed into a report stops the upload.
-      - id: scan
-        name: No secret in the report
-        if: always()
-        run: |
-          set -euo pipefail
-          d="$RUNNER_TEMP/redline-secrets"
-          [ -d "$d" ] || exit 0
-          dirs=()
-          for r in "$RUNNER_TEMP/redline-report" apps/dashboard/playwright-report apps/dashboard/test-results; do
-            [ -d "$r" ] && dirs+=("$r")
-          done
-          [ "${#dirs[@]}" -gt 0 ] || exit 0
-          for f in "$d"/*; do
-            [ -s "$f" ] || continue
-            # -f reads the pattern from the file: the key never reaches argv.
-            if grep -rqF -f "$f" "${dirs[@]}"; then echo "secret in report: ${f##*/}"; exit 1; fi
-          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always() && steps.scan-suite.outcome == 'success' && steps.scan.outcome == 'success'
+        if: always() && steps.scan-suite.outcome == 'success'
         with:
           name: redline-report
           path: ${{ runner.temp }}/redline-report
           if-no-files-found: warn
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always() && steps.scan.outcome == 'success' && steps.t19.outcome != 'skipped'
-        with:
-          name: t19-report
-          path: apps/dashboard/playwright-report
-          if-no-files-found: warn
+      # The R26 revoke also rotates rl-a's TEST_HOOK_KEY (the key T19 holds), so
+      # it must not start while T19 runs. Only when the key was handed over;
+      # otherwise no T19 run holds it. The wait ends when the t19 job has
+      # completed (any result), 115 minutes after the t19 job's own start (its
+      # timeout is 110), or 110 minutes after the run's start, whichever is
+      # first: the revoke itself can take up to 40 minutes and must fit in this
+      # job's 150. Then the revoke goes ahead whatever T19 is doing.
+      - id: t19-done
+        name: Wait for the t19 job to end
+        if: always() && steps.handoff-up.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          wait_s="${WAIT_S:-6900}"
+          cap_s="${CAP_S:-6600}"
+          now=$(date +%s)
+          # An unreadable or empty start is the step's own start, never midnight.
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.run_started_at // ""' 2> /dev/null) || started=""
+          if [ -n "$started" ]; then run_start=$(date -d "$started" +%s 2> /dev/null) || run_start=$now; else run_start=$now; fi
+          while :; do
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | "\(.status) \(.started_at // "")"] | first // "none "' 2> /dev/null) || row="unreadable "
+            st="${row%% *}"
+            ts="${row#* }"
+            if [ "$st" = completed ]; then echo "the t19 job has ended"; exit 0; fi
+            t19_start=$(date +%s)
+            if [ -n "$ts" ]; then t19_start=$(date -d "$ts" +%s 2> /dev/null) || t19_start=$(date +%s); fi
+            deadline=$(( t19_start + wait_s ))
+            [ "$deadline" -le $(( run_start + cap_s )) ] || deadline=$(( run_start + cap_s ))
+            if [ "$(date +%s)" -ge "$deadline" ]; then echo "::warning::the t19 job is still $st at its wait limit: revoking anyway"; exit 0; fi
+            sleep "${POLL_S:-10}"
+          done
       # R26 revoke (10.1): this run's PATs on rl-a and rl-b, then each must be
       # 401 (P36's second half). Runs whatever happened above.
       - name: Revoke this run's R26 credentials
@@ -312,4 +533,12 @@ jobs:
         run: pnpm --filter @oa/redline provisioning revoke
       - name: Remove the secret files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token"
+        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
+      # The last step, so the revoke and the file removal above have run. A run
+      # whose key was never handed over (a partial re-run of only this job, a
+      # seal or upload that failed) has no T19 result: it is never green.
+      - name: Fail when the t19 hand-off did not happen
+        if: always() && steps.staged.outcome == 'success' && steps.handoff-up.outcome != 'success'
+        run: |
+          echo "the t19 job got no key from this attempt, so T19 did not run against this release: re-run all jobs, not only the failed ones"
+          exit 1

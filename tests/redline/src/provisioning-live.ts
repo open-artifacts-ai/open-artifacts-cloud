@@ -118,12 +118,20 @@ export async function mintFiles(
   }
 }
 
-/** The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their creds. */
+/**
+ * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
+ * creds, the two installs at the same time (#1730: the two upgrades are about
+ * 2:00 and 1:38 when taken one after the other). Each install is its own
+ * chain (upgrade, then R26 mint, then its two files); both are always awaited
+ * to the end, so a failing install never leaves the other's job unwatched. Any
+ * failure fails the bring-up, and each failure line starts with the install's
+ * slug. `run` is a seam for tests (default: the live wiring).
+ */
 export async function bringUp(
   env: Record<string, string | undefined>,
   t: RawTargets,
+  run: Run = liveRun(env, t),
 ): Promise<void> {
-  const run = liveRun(env, t);
   const m = mask(env);
   const r = await newRecipient();
   const open = async (sealed: string): Promise<CredsOut> => {
@@ -132,22 +140,37 @@ export async function bringUp(
     m(c.hookKey);
     return c;
   };
-  for (const [name, side] of [
-    ["a", t.a],
-    ["b", t.b],
-  ] as const) {
+  const one = async (name: "a" | "b", side: RawTargets["a"]): Promise<void> => {
     const slug = `rl-${name}`;
-    const how = await bringUpgrade(run, side.installId, slug);
-    out(`${slug}: ${how} (${run.c.version})\n`);
-    const c = await mintCreds(run, side.installId, slug, {
-      publicKey: r.publicKey,
-      open,
-    });
-    writeSecretFile(credFile(t, name, "PAT"), c.pat);
-    writeSecretFile(credFile(t, name, "HOOK_KEY"), c.hookKey);
-    out(`${slug}: R26 creds written\n`);
-  }
+    try {
+      const how = await bringUpgrade(run, side.installId, slug);
+      out(`${slug}: ${how} (${run.c.version})\n`);
+      const c = await mintCreds(run, side.installId, slug, {
+        publicKey: r.publicKey,
+        open,
+      });
+      writeSecretFile(credFile(t, name, "PAT"), c.pat);
+      writeSecretFile(credFile(t, name, "HOOK_KEY"), c.hookKey);
+      out(`${slug}: R26 creds written\n`);
+    } catch (e) {
+      const msg = errText(e);
+      if (!(e instanceof Error)) throw new Error(`${slug}: ${msg}`);
+      // The error keeps its kind (an InfraError stays one) and gains the slug.
+      if (!msg.startsWith(`${slug}:`)) e.message = `${slug}: ${msg}`;
+      throw e;
+    }
+  };
+  const done = await Promise.allSettled([one("a", t.a), one("b", t.b)]);
+  const failed = done.filter(
+    (d): d is PromiseRejectedResult => d.status === "rejected",
+  );
+  if (failed.length === 0) return;
+  for (const f of failed.slice(1)) out(`${errText(f.reason)}\n`);
+  throw failed[0]?.reason;
 }
+
+const errText = (e: unknown): string =>
+  e instanceof Error ? e.message : String(e);
 
 /** The workflow's last step: R26 revoke on rl-a and rl-b; both run, any failure fails. */
 export async function revokeAll(
