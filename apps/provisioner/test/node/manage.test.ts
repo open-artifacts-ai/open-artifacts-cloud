@@ -874,8 +874,16 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
   });
 
   it("purging one self-serve install leaves another install's live claim held", async () => {
-    const a = await active({ slug: "twina", source: "self-serve", tier: "trial" });
-    const b = await active({ slug: "twinb", source: "self-serve", tier: "trial" });
+    const a = await active({
+      slug: "twina",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const b = await active({
+      slug: "twinb",
+      source: "self-serve",
+      tier: "trial",
+    });
     expect(a.sub).not.toBe(b.sub);
     await manage("delete", a.installId);
     w.clock.t += GRACE_MS;
@@ -884,7 +892,9 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     ).toBeNull();
     expect(claim(a.sub as string)?.freed_at).toEqual(expect.any(Number));
     expect(claim(b.sub as string)?.freed_at).toBeNull();
-    expect(await signUpAgain(b.sub as string, "signup-b2")).toBe("signup_limit");
+    expect(await signUpAgain(b.sub as string, "signup-b2")).toBe(
+      "signup_limit",
+    );
   });
 
   it("the purge's free step re-run after a new signup took the account does not free that claim", async () => {

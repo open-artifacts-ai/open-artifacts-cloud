@@ -370,8 +370,7 @@ async function operate(
         // replay or an install that never claimed one changes nothing. A
         // suspended install keeps it: the claim is the ban, so a suspended
         // owner cannot sign up again (the scheduler skips these too).
-        if (job.suspended)
-          console.warn(PURGE_KEPT_CLAIM, job.installId);
+        if (job.suspended) console.warn(PURGE_KEPT_CLAIM, job.installId);
         else
           await record(ctx, FREE_ACCOUNT_ON_PURGE, job.installId, ctx.io.now());
         return { state: "deleted" };
