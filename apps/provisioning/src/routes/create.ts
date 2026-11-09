@@ -47,7 +47,7 @@ export function signupVars(
   });
 }
 
-const liveClaim = async (env: Env, sub: string) =>
+export const liveClaim = async (env: Env, sub: string) =>
   (await env.PLATFORM_DB.prepare(
     "SELECT 1 AS x FROM signup_accounts WHERE owner_sub = ? AND freed_at IS NULL",
   )
