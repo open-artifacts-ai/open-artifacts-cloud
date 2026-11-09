@@ -724,8 +724,8 @@ async function provisionerSoloStart(
     return await soloStartCore(env, install, now);
   } catch (e) {
     if (e instanceof StripeFailure) {
-      // A 4xx Stripe refused outright (other than 409, in progress, and 429,
-      // rate limited) will not change by retrying: a revoked or restricted
+      // A 4xx Stripe refused outright (other than 409, in progress, and 408,
+      // 424 and 429, which may pass) will not change by retrying: a revoked or restricted
       // key, a bad price, a missing customer. The HTTP routes keep answering
       // 502 upstream; only this RPC tells the caller apart. A fixed category
       // and the status number, never Stripe's text.
@@ -734,7 +734,9 @@ async function provisionerSoloStart(
         e.status !== undefined &&
         e.status >= 400 &&
         e.status < 500 &&
-        e.status !== 429
+        e.status !== 429 &&
+        e.status !== 408 &&
+        e.status !== 424
       ) {
         console.error("billing solo stripe_refused", install, e.status);
         return soloFail("stripe_refused");

@@ -436,8 +436,10 @@ describe("the guards of the Solo trial start (moved from the old route)", () => 
     }
   });
 
-  it("429 and 5xx stay upstream and retryable; 409 stays retry; a network error is upstream", async () => {
+  it("408, 424, 429 and 5xx stay upstream and retryable; 409 stays retry; a network error is upstream", async () => {
     for (const [status, want] of [
+      [408, "upstream"],
+      [424, "upstream"],
       [429, "upstream"],
       [500, "upstream"],
       [502, "upstream"],
