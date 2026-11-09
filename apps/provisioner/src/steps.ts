@@ -417,7 +417,7 @@ export function failedAuditStatement(
     ctx,
     job.install_id,
     "job.failed",
-    { code, jobId: job.id, kind: job.kind },
+    { code: "other", jobId: job.id, kind: job.kind },
     job.id,
   );
 }
