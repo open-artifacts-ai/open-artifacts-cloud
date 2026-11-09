@@ -112,13 +112,26 @@ a.button.primary{background:var(--text);border-color:var(--text);color:var(--sur
 a.button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}`;
 
 /** What every page's header shows. */
-export type Chrome = { env: ProvisioningEnv; adminHost: string };
+export type Chrome = {
+  env: ProvisioningEnv;
+  adminHost: string;
+  /** adminSessionTtlMs(env): how long a session, and so a grant, lasts. */
+  sessionTtlMs: number;
+};
+
+/** "8 hours", "1 hour", "7 days", "1 day": whole days when it divides, else hours. */
+export function sessionLength(ms: number): string {
+  const h = Math.max(1, Math.round(ms / 3_600_000));
+  const unit = (n: number, u: string) => `${n} ${u}${n === 1 ? "" : "s"}`;
+  return h % 24 === 0 ? unit(h / 24, "day") : unit(h, "hour");
+}
 
 const chromeValues = (c: Chrome) => ({
   env_class: c.env === "prod" ? "prod" : "staging",
   env_label: c.env === "prod" ? "Production" : "Staging",
   env_name: c.env === "prod" ? "production" : "staging",
   admin_host: c.adminHost,
+  session_length: sessionLength(c.sessionTtlMs),
 });
 
 const shell = (body: string, extraHead = "") => `<!doctype html>
@@ -195,7 +208,7 @@ export const signinPage = (c: Chrome, signinUrl: string) =>
 
 const REAUTH = shell(`  <div class="card">
     <h1>Sign in again first</h1>
-    <p>Your admin session ends in {{session_left}}, and the agent's access would end with it. Sign in again to give it up to 8 hours.</p>
+    <p>Your admin session ends in {{session_left}}, and the agent's access would end with it. Sign in again to give it up to {{session_length}}.</p>
     <div class="actions">
       <a class="button" href="{{cancel_url}}">Cancel</a>
       <a class="button primary" href="{{reauth_url}}">Sign in again</a>
@@ -248,7 +261,7 @@ const CONSENT =
       <button type="submit" name="decision" value="deny">Deny</button>
       <button type="submit" name="decision" value="approve" class="primary">Approve</button>
     </div>
-    <p class="foot">Access ends when your admin session does, within 8 hours. Revoke it anytime in Agent tokens.</p>
+    <p class="foot">Access ends when your admin session does, within {{session_length}}. Revoke it anytime in Agent tokens.</p>
   </form>`);
 
 /** "just now", "1 minute ago", "3 minutes ago", "2 hours ago", "4 days ago". */
