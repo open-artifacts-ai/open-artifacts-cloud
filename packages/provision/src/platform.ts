@@ -528,6 +528,26 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
     return null;
   }
 
+  /**
+   * #1931: the oldest `upgrade.restore_point` bookmark this job (its job part)
+   * recorded for an upgrade to `to`: the true pre-upgrade restore point, taken
+   * before the first attempt applied any file (later rows only repeat it).
+   * Filtered in SQL, so older rows of other jobs never crowd it out. Null if none.
+   */
+  async restorePointOf(
+    id: InstallId,
+    jobPart: string,
+    to: string,
+  ): Promise<string | null> {
+    const r = await this.cf.d1Query(
+      this.db.id,
+      "SELECT json_extract(detail, '$.bookmark') AS bookmark FROM hosted_audit WHERE install_id = ?1 AND action = 'upgrade.restore_point' AND json_extract(detail, '$.job') = ?2 AND json_extract(detail, '$.to') = ?3 AND json_type(detail, '$.bookmark') = 'text' AND json_extract(detail, '$.bookmark') != '' ORDER BY id ASC LIMIT 1",
+      [id, jobPart, to],
+    );
+    const b = r[0]?.results?.[0]?.bookmark;
+    return typeof b === "string" && b !== "" ? b : null;
+  }
+
   /** H-DV: one install's revoke state, read only (delete's phase-2 poll). */
   async revokeState(id: InstallId): Promise<{
     state: DirectoryRevoke | null;

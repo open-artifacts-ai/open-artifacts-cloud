@@ -112,6 +112,9 @@ export class FakeCf {
   readonly r2 = new Set<string>();
   /** A token that can't read a D1 bookmark. */
   bookmarkFails = false;
+  /** Each bookmark read gets a number, so two reads differ. */
+  bookmarkNumbered = false;
+  private bookmarkN = 0;
   /** R2 objects by bucket, then key (the releases bucket; T3b). */
   readonly r2Objects = new Map<
     string,
@@ -493,7 +496,7 @@ export class FakeCf {
     if (m && req.method === "GET") {
       if (this.bookmarkFails) return fail(403, "Authentication error", 10000);
       return env({
-        bookmark: `bookmark-${decodeURIComponent(m[1] as string)}`,
+        bookmark: `bookmark-${decodeURIComponent(m[1] as string)}${this.bookmarkNumbered ? `-${++this.bookmarkN}` : ""}`,
       });
     }
     m = r.match(/^\/d1\/database\/([^/]+)\/query$/);

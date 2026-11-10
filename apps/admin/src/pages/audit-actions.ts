@@ -40,6 +40,7 @@ const VERB: Record<string, string> = {
   "upgrade.start": "started an upgrade",
   "upgrade.held": "held an upgrade",
   "upgrade.restore_point": "saved a restore point",
+  "upgrade.restore_point_first_missing": "found no first restore point on a retry",
   "upgrade.done": "finished an upgrade",
   "upgrade.failed": "had an upgrade fail",
   "upgrade.incomplete": "left an upgrade unfinished",
