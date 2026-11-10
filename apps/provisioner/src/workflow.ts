@@ -21,6 +21,10 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import type {
+  SoloStartError,
+  SoloStartResult,
+} from "../../../packages/billing-core/src/solo-start.js";
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   type BundleVariant,
@@ -41,7 +45,7 @@ import {
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
 import { createWorkflowInstance } from "@oa/provisioning-contract/workflow";
-import { codeOf } from "./errors.js";
+import { codeOf, StepRefusal } from "./errors.js";
 import {
   appHostOf,
   cfFor,
@@ -74,7 +78,23 @@ import {
 } from "./steps.js";
 import { type Welcome, welcomeEmail } from "./welcome.js";
 
+// What BillingProvisionerRpc.soloStart answers is Billing's contract, imported
+// from @oa/billing-core (types only).
+export type { SoloStartError, SoloStartResult };
+
+/** The BILLING service binding, entrypoint BillingProvisionerRpc. */
+export interface BillingProvisionerRpc {
+  /** Starts the install's Solo trial; idempotent per install. */
+  soloStart(install: string): Promise<SoloStartResult>;
+}
+
 export interface WorkflowEnv extends OpsEnv {
+  /**
+   * {binding: "BILLING", service: "oa-s-billing", entrypoint:
+   * "BillingProvisionerRpc"}: staging only, added by Billing's bindings PR.
+   * Unbound (prod), solo_start is skipped.
+   */
+  BILLING?: BillingProvisionerRpc;
   WELCOME_EMAIL: SendEmail;
   /** The tier a self-serve row must carry (2.5 recheck). */
   SELF_SERVE_TIER: string;
@@ -120,6 +140,18 @@ export const RELEASE_GATE_STEP = {
 /** 2 retries, 10 seconds, exponential (5.2 step 7). */
 export const REACHABLE_STEP = {
   retries: { limit: 2, delay: "10 seconds", backoff: "exponential" },
+} as const;
+
+/**
+ * 6 retries, 30 seconds, exponential (waits 30, 60, 120, 240, 480, 960 s):
+ * a retryable soloStart answer or a transport error. unknown_install lasts
+ * as long as BROKER_REGISTRY's KV write takes to propagate plus billing's
+ * 60 s negative cache, so retries must span >= 2 minutes after the registry
+ * write: the 4th retry starts ~450 s after the first attempt (the 3rd, 210 s,
+ * already clears it); the extra two give headroom.
+ */
+export const SOLO_START_STEP = {
+  retries: { limit: 6, delay: "30 seconds", backoff: "exponential" },
 } as const;
 
 /** reachable polls the public /healthz this long (HOSTS is cached 60 s). */
@@ -184,6 +216,19 @@ export async function runCreate(
       // jobs.step holds JOB_STEPS values only; onStep reports the rest.
       "upload",
     );
+    // Self-serve only, after create's registry write and before the install
+    // is marked ready (done) and the welcome goes out (notify). jobs.step
+    // holds JOB_STEPS values only, so it stays at `active`.
+    if (job.source === "self-serve")
+      await jobStep(
+        ctx,
+        step,
+        jobId,
+        "solo_start",
+        SOLO_START_STEP,
+        () => soloStart(ctx, job, installId),
+        "active",
+      );
     await s("reachable", REACHABLE_STEP, () =>
       reachable(ctx, installId, appHost),
     );
@@ -417,6 +462,65 @@ async function create(
   });
   await transient(modeStatement(ctx, installId, "serving").run());
   return { appHost: inst.appHost };
+}
+
+/**
+ * Billing starts the install's Solo trial. No BILLING binding: skipped and
+ * recorded (solo_skipped_at), so the scheduler's solo_start_missing alert
+ * stays quiet where billing is not deployed. ok: solo_started_at. A
+ * retryable answer or a thrown transport error retries the step; any other
+ * refusal is terminal, so fail runs and frees the address. Billing's error
+ * string goes to the log only, never the job row.
+ */
+async function soloStart(
+  ctx: CreateCtx,
+  job: CreateJob,
+  installId: string,
+): Promise<{ skipped: "no_billing" } | { started: true }> {
+  const billing = ctx.env.BILLING;
+  const mark = (col: "solo_started_at" | "solo_skipped_at") =>
+    transient(
+      ctx.env.PLATFORM_DB.prepare(
+        `UPDATE signups SET ${col} = COALESCE(${col}, ?2) WHERE signup_id = ?1`,
+      )
+        .bind(job.signupId, ctx.io.now())
+        .run(),
+    );
+  if (!billing) {
+    console.log(
+      JSON.stringify({
+        evt: "solo_start_skipped",
+        reason: "no_billing",
+        installId,
+      }),
+    );
+    await mark("solo_skipped_at");
+    return { skipped: "no_billing" };
+  }
+  // A throw is transport: the step retries it.
+  const r = (await billing.soloStart(installId)) as SoloStartResult | undefined;
+  if (r?.ok === true) {
+    await mark("solo_started_at");
+    return { started: true };
+  }
+  if (r?.ok !== false) {
+    // Malformed answer: never mark started; retry like a transport error.
+    console.warn(JSON.stringify({ evt: "solo_start_malformed", installId }));
+    throw new Error("internal");
+  }
+  const detail = String(r.error)
+    .replace(/[^A-Za-z0-9_.:-]/g, "")
+    .slice(0, 60);
+  console.warn(
+    JSON.stringify({
+      evt: "solo_start_refused",
+      installId,
+      retryable: r.retryable,
+      error: detail,
+    }),
+  );
+  if (r.retryable === true) throw new Error("internal");
+  throw new StepRefusal("internal", `solo_start refused: ${detail}`);
 }
 
 /**

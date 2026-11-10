@@ -600,7 +600,7 @@ describe("0008_provisioning: install_status (5.1 precedence)", () => {
 
 describe("0010_trial_reminders (cloud #39)", () => {
   it("follows 0009 and only creates the table", () => {
-    expect(migrationFiles.slice(9)).toEqual(["0010_trial_reminders.sql"]);
+    expect(migrationFiles.slice(9, 10)).toEqual(["0010_trial_reminders.sql"]);
     const sql = migrationSql("0010_trial_reminders.sql").replace(
       /--[^\n]*/g,
       "",
@@ -630,5 +630,44 @@ describe("0010_trial_reminders (cloud #39)", () => {
     expect(() => ins("i1", "last_day")).toThrow(/UNIQUE|PRIMARY/);
     expect(() => ins("i1", "other")).toThrow(/CHECK/);
     ins("i2");
+  });
+});
+
+describe("0012_solo_start (self-serve Solo start)", () => {
+  it("follows 0009 and only adds two nullable signups columns, backfilling legacy rows as skipped", () => {
+    expect(migrationFiles.slice(10)).toEqual(["0012_solo_start.sql"]);
+    const sql = migrationSql("0012_solo_start.sql").replace(/--[^\n]*/g, "");
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
+    const db = platformDb();
+    const c = cols(db, "signups");
+    expect(c).toContain("solo_started_at INTEGER");
+    expect(c).toContain("solo_skipped_at INTEGER");
+  });
+
+  it("backfills only terminal rows as skipped; in-flight rows stay NULL", () => {
+    const db = platformDb(migrationFiles.slice(0, 9));
+    const ids: Record<string, string> = {};
+    for (const status of [
+      "pending",
+      "queued",
+      "waiting_cap",
+      "creating",
+      "ready",
+      "failed",
+    ])
+      ids[status] = signup(db, { status });
+    apply(db, ["0012_solo_start.sql"]);
+    const row = (id: string) =>
+      db
+        .prepare(
+          "SELECT solo_started_at s, solo_skipped_at k FROM signups WHERE signup_id = ?",
+        )
+        .get(id) as { s: number | null; k: number | null };
+    for (const st of ["ready", "failed"]) {
+      expect(row(ids[st] as string).k).not.toBeNull();
+      expect(row(ids[st] as string).s).toBeNull();
+    }
+    for (const st of ["pending", "queued", "waiting_cap", "creating"])
+      expect(row(ids[st] as string)).toEqual({ s: null, k: null });
   });
 });
