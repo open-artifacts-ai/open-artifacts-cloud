@@ -154,7 +154,12 @@ export function published(o: {
     ) as { jobs?: { name?: string; conclusion?: string | null }[] };
     if (!Array.isArray(jobs.jobs))
       throw new Error(`unparsable jobs of run ${r.id}`);
-    if (jobs.jobs.some((j) => j.name === name && j.conclusion === "success"))
+    const ok = (n: string) =>
+      jobs.jobs?.some((j) => j.name === n && j.conclusion === "success");
+    if (ok(name)) return true;
+    // Runs before the job was named for its tag (v0.142.0, v0.144.0): a plain
+    // "publish-prod" that succeeded next to this tag's staging publish.
+    if (ok("publish-prod") && ok(`publish-staging release ${o.tag}`))
       return true;
   }
   return false;

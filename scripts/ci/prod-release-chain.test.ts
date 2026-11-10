@@ -328,9 +328,9 @@ describe("prod-release-chain.yml", () => {
         "${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}",
       RUN: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
       DEPLOY_RUN:
-        "${{ needs.deploy.outputs.url || needs.publish.outputs.url }}",
+        "${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}",
       DEPLOY_NOTE:
-        "${{ needs.deploy.outputs.note || needs.publish.outputs.note }}",
+        "${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}",
     });
     expect(step.run).toBe(
       'node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"',
@@ -823,6 +823,29 @@ describe("the gate's neutral skips", () => {
         },
       });
     expect(run({})).toBe(false);
+    // Real job list of run 42823274720 (v0.144.0), before the rename.
+    const old = [
+      { name: "resolve", conclusion: "success" },
+      { name: "publish-staging release v1.2.3", conclusion: "success" },
+      { name: "publish-prod", conclusion: "success" },
+    ];
+    expect(run({ 1: old })).toBe(true);
+    // A plain publish-prod beside another tag's staging publish is not ours.
+    expect(
+      run({
+        1: [
+          { name: "publish-staging release v1.2.4", conclusion: "success" },
+          { name: "publish-prod", conclusion: "success" },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      run({
+        1: old.map((j) =>
+          j.name === "publish-prod" ? { ...j, conclusion: "failure" } : j,
+        ),
+      }),
+    ).toBe(false);
     expect(
       run({
         1: [{ name: "publish-staging release v1.2.3", conclusion: "success" }],

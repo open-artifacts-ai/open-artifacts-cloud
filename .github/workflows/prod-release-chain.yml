@@ -154,7 +154,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 45
+    timeout-minutes: 55
     outputs:
       url: ${{ steps.dispatch.outputs.deploy_url }}
       note: ${{ steps.dispatch.outputs.deploy_note }}
@@ -236,7 +236,7 @@ jobs:
           RESULT: ${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # The dispatched deploy run (empty when it never started).
-          DEPLOY_RUN: ${{ needs.deploy.outputs.url || needs.publish.outputs.url }}
+          DEPLOY_RUN: ${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}
           # Why the dispatch step failed, e.g. that it cancelled the run.
-          DEPLOY_NOTE: ${{ needs.deploy.outputs.note || needs.publish.outputs.note }}
+          DEPLOY_NOTE: ${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}
         run: node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"
