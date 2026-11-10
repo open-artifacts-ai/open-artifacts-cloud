@@ -37,6 +37,7 @@ import {
   resetDb,
   SIGNUP,
   SIGNUP_BROKER_KEY,
+  seedInstall,
 } from "./fakes.js";
 
 // The sign-up host (signup.<app>): its page, its own Google sign-in and
@@ -411,30 +412,30 @@ describe("sessions do not cross hosts", () => {
   });
 });
 
-describe("create from the sign-up host (R4, self-serve policy)", () => {
-  const create = async (
-    e: E,
-    sid: string,
-    h: Record<string, string> = {},
-    body: Record<string, unknown> = {},
-  ) =>
-    call(e, `${SIGNUP}/api/v1/installs`, {
-      method: "POST",
-      headers: {
-        cookie: `${SIGNUP_COOKIE}=${sid}`,
-        origin: SIGNUP,
-        "content-type": "application/json",
-        "x-csrf-token": await csrfOf(e, sid),
-        ...h,
-      },
-      body: JSON.stringify({
-        requestId: "su-0123456789abcdef0123",
-        slug: "acme",
-        turnstile: "tok",
-        ...body,
-      }),
-    });
+const create = async (
+  e: E,
+  sid: string,
+  h: Record<string, string> = {},
+  body: Record<string, unknown> = {},
+) =>
+  call(e, `${SIGNUP}/api/v1/installs`, {
+    method: "POST",
+    headers: {
+      cookie: `${SIGNUP_COOKIE}=${sid}`,
+      origin: SIGNUP,
+      "content-type": "application/json",
+      "x-csrf-token": await csrfOf(e, sid),
+      ...h,
+    },
+    body: JSON.stringify({
+      requestId: "su-0123456789abcdef0123",
+      slug: "acme",
+      turnstile: "tok",
+      ...body,
+    }),
+  });
 
+describe("create from the sign-up host (R4, self-serve policy)", () => {
   it("a Workspace user creates: 202, queued for the consumer, owner pinned to the Google sub", async () => {
     const e = env({ SIGNUPS_ENABLED: "true" });
     const { sid } = await signIn(e);
@@ -623,6 +624,91 @@ describe("GET /api/v1/slugs/:slug and /api/v1/signup", () => {
         .run();
       expect(((await get()) as { stage: string }).stage).toBe(st);
     }
+  });
+
+  describe("a deleted or purged instance is not live", () => {
+    const seed = async (
+      sub: string,
+      o: { state: "active" | "deleted"; freed?: boolean },
+    ) => {
+      const inst = await seedInstall({ state: o.state });
+      const id = jobId();
+      await insert("signups", {
+        signup_id: id,
+        source: "self-serve",
+        owner_sub: sub,
+        slug: "acme",
+        install_id: inst.id,
+        job_id: id,
+        vars: "{}",
+        status: "ready",
+        created_at: 1,
+        updated_at: 1,
+      });
+      await insert("signup_accounts", {
+        owner_sub: sub,
+        signup_id: id,
+        created_at: 1,
+        freed_at: o.freed ? 5 : null,
+      });
+      return id;
+    };
+    const stage = async (e: E, sid: string) =>
+      (
+        (await (
+          await call(e, `${SIGNUP}/api/v1/signup`, {
+            headers: { cookie: `${SIGNUP_COOKIE}=${sid}` },
+          })
+        ).json()) as { stage: string }
+      ).stage;
+
+    it("a ready signup whose install is deleted is none", async () => {
+      const e = env();
+      const { sid } = await signIn(e);
+      await seed("g-100", { state: "deleted" });
+      expect(await stage(e, sid)).toBe("none");
+    });
+
+    it("a freed claim is none", async () => {
+      const e = env();
+      const { sid } = await signIn(e);
+      await seed("g-100", { state: "active", freed: true });
+      expect(await stage(e, sid)).toBe("none");
+    });
+
+    it("a live ready signup is ready", async () => {
+      const e = env();
+      const { sid } = await signIn(e);
+      await seed("g-100", { state: "active" });
+      expect(await stage(e, sid)).toBe("ready");
+    });
+
+    it("after a purge (claim freed) the same account can create again", async () => {
+      const e = env({ SIGNUPS_ENABLED: "true" });
+      const { sid } = await signIn(e);
+      const id = await seed("g-100", { state: "deleted" });
+      const blocked = await create(
+        e,
+        sid,
+        {},
+        { requestId: "su-aaaaaaaaaaaaaaaaaaaa", slug: "acme2" },
+      );
+      expect(
+        ((await blocked.json()) as { error: { code: string } }).error.code,
+      ).toBe("signup_limit");
+      await db
+        .prepare("UPDATE signup_accounts SET freed_at = 5 WHERE signup_id = ?")
+        .bind(id)
+        .run();
+      expect(await stage(e, sid)).toBe("none");
+      const again = await create(
+        e,
+        sid,
+        {},
+        { requestId: "su-bbbbbbbbbbbbbbbbbbbb", slug: "acme3" },
+      );
+      expect(again.status).toBe(202);
+    });
   });
 
   it("status never shows another account's sign-up, and needs a session", async () => {
