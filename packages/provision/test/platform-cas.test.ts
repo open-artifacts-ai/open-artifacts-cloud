@@ -76,6 +76,50 @@ describe("install CAS writes on D1's real meta.changes", () => {
     expect(await w.db.finish(r.id, "L1", "active")).toBe(true);
   });
 
+  it("#1930: an audit row under a lease lands only while that lease holds the install, actor or not", async () => {
+    for (const actor of [undefined, "job:01JOB"]) {
+      const w = world();
+      const db = new PlatformDb(
+        w.cf,
+        { id: w.id, name: platformNames("staging").db },
+        "staging",
+        () => 1,
+        actor,
+      );
+      const r = await row({ ...w, db });
+      expect(
+        await db.claim(
+          r.id,
+          ["creating"],
+          "creating",
+          "MINE",
+          1e15,
+          r.row_version,
+        ),
+      ).toBe(true);
+      expect(await db.audit(r.id, "a.live", {}, "MINE")).toBe(true);
+      // A takeover: another token holds the row now.
+      const cur = await db.byId(r.id);
+      await w.cf.d1Query(
+        w.id,
+        "UPDATE installs SET lease = 'THEIRS' WHERE id = ?1",
+        [r.id],
+      );
+      expect(cur?.lease).toBe("MINE");
+      expect(await db.audit(r.id, "a.fenced", {}, "MINE")).toBe(false);
+      // No lease (CLI, admin): written as before.
+      expect(await db.audit(r.id, "a.nolease", {})).toBe(true);
+      const rows = await w.cf.d1Query(
+        w.id,
+        "SELECT action FROM hosted_audit ORDER BY id",
+        [],
+      );
+      expect(
+        rows[0]?.results?.map((x) => (x as { action: string }).action),
+      ).toEqual(["create.start", "a.live", "a.nolease"]);
+    }
+  });
+
   it("a lost race (another holder's live lease) still reads as lost", async () => {
     const w = world();
     const r = await row(w);

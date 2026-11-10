@@ -834,14 +834,12 @@ describe("WfpProvisioner.create", () => {
         await fails(s.p.create(input("finqore", { installId: ID })));
         const n = s.fake.writes().length;
         const e = await fails(
-          s
-            .mk({ defaultVars: undefined })
-            .create(
-              input("finqore", {
-                installId: ID,
-                vars: { EMAIL_DAILY_CAP: "5" },
-              }),
-            ),
+          s.mk({ defaultVars: undefined }).create(
+            input("finqore", {
+              installId: ID,
+              vars: { EMAIL_DAILY_CAP: "5" },
+            }),
+          ),
         );
         expect(e.message).toMatch(/inputs/);
         expect(nonReads(s.fake, n)).toEqual([]);
@@ -4748,6 +4746,50 @@ describe("a job's lease across its attempts (#1326: fenced by attempt)", () => {
     );
     expect(unclassified).toEqual([]);
     for (const k of CF_WRITES) expect(methods, k).toContain(k);
+  });
+
+  it("#1930: a superseded attempt sends no further MCP selftest POST", async () => {
+    const s = setup();
+    const posts: string[] = [];
+    let hung: () => void = () => {};
+    const atMcp = new Promise<void>((r) => {
+      hung = r;
+    });
+    let wake: () => void = () => {};
+    const woken = new Promise<void>((r) => {
+      wake = r;
+    });
+    let first = true;
+    const f1: typeof globalThis.fetch = (async (
+      u: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const path = new URL(String(u)).pathname;
+      if (path === "/mcp") posts.push(init?.method ?? "GET");
+      const res = await s.fake.fetch(u as string, init);
+      // Hang after the first POST is answered: superseded mid-selftest.
+      if (first && path === "/mcp") {
+        first = false;
+        hung();
+        await woken;
+      }
+      return res;
+    }) as typeof fetch;
+    const a1 = s
+      .mk({ leaseHolder: JOB, fetch: f1 })
+      .create(input())
+      .then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+    await atMcp;
+    await s.clock.sleep(60_000);
+    await s.mk({ leaseHolder: JOB }).create(input());
+    expect(s.rows()[0]).toMatchObject({ state: "active", lease: null });
+    wake();
+    expect(await a1).toBeInstanceOf(LostLease);
+    // Only the POST already in flight when it was superseded: never the next.
+    expect(posts).toEqual(["POST"]);
   });
 
   it("attempt 2 of the same job re-takes the lease at once with its own token; attempt 1, woken, gets LostLease and frees nothing", async () => {

@@ -2922,11 +2922,10 @@ export class WfpProvisioner {
     detail: Record<string, string | number> = {},
   ): Promise<void> {
     await this.hold();
-    await this.platform.audit(
-      (this.held as { id: InstallId }).id,
-      action,
-      detail,
-    );
+    const h = this.held as { id: InstallId; lease: string };
+    // #1930: the row is written only while the lease still holds the install.
+    if (!(await this.platform.audit(h.id, action, detail, h.lease)))
+      await this.lost();
   }
 
   /** Ends the operation; a lock already gone is an error (lost the lease), not a success. */
@@ -5321,6 +5320,7 @@ export class WfpProvisioner {
     // biome-ignore lint/suspicious/noExplicitAny: JSON-RPC results are arbitrary JSON
     const post = async (method: string, params: unknown): Promise<any> => {
       const id = ++seq;
+      await this.hold(); // #1930: a superseded attempt sends no POST
       const res = await this.http(url, {
         method: "POST",
         headers,
@@ -5345,6 +5345,7 @@ export class WfpProvisioner {
         capabilities: {},
         clientInfo: { name: "oa-provision", version: "1" },
       });
+      await this.hold();
       await this.http(url, {
         method: "POST",
         headers,
