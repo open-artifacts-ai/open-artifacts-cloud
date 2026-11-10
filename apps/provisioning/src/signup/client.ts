@@ -512,7 +512,7 @@ export const CLIENT_JS = String.raw`(function () {
   // The animation and verbs are built once and survive status updates: only
   // the status line (and the lost-connection notice) change in place.
   function viewLoading() {
-    var g = S.signup;
+    var g = S.signup, hostName = g.host;
     if (!refs.ld || !document.body.contains(refs.ld)) {
       stopAnim();
       var slot = h("div", { class: "slot", id: "slot" });
@@ -520,7 +520,7 @@ export const CLIENT_JS = String.raw`(function () {
       refs.lab = h("p", { class: "addr", "aria-live": "polite" });
       refs.note = h("div");
       refs.ld = h("div", { class: "panel ld" }, [
-        h("h1", { class: "sr" }, ["Setting up ", nw(g.host)]),
+        h("h1", { class: "sr" }, ["Setting up ", nw(hostName)]),
         refs.note,
         h("div", { class: "seq" }, [slot]),
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
