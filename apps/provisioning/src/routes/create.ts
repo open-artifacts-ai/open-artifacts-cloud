@@ -59,12 +59,16 @@ function slugRule(slug: string) {
   if (e) throw new ApiError(e);
 }
 
+const GMAIL_DOMAINS = ["gmail.com", "googlemail.com"];
+const isGmailAddress = (email: string): boolean =>
+  GMAIL_DOMAINS.includes(email.slice(email.lastIndexOf("@") + 1).toLowerCase());
+
 /** 4.2 self-serve policy, in order, after the forbidden fields. */
 async function selfServePolicy(
   a: HandlerArgs,
   p: Principal & PrincipalFacts,
   body: Body,
-): Promise<{ hd: string; email: string }> {
+): Promise<{ hd: string | null; email: string }> {
   const { env, surface } = a;
   const testUser = isTestUser(p, env);
   const admitted =
@@ -84,11 +88,16 @@ async function selfServePolicy(
   if (!t.ok) throw new ApiError("turnstile_failed");
   if (!(await chargeSelfServeCreate(env, surface.client.ip)))
     throw new ApiError("rate_limited");
-  // The one place the hd rule lives (4.2); Gmail owners wait for #864/#865.
-  if (!p.hd || !p.email || !p.sub)
-    throw new ApiError("forbidden", "a Google Workspace account is required");
+  if (!p.email || !p.sub) throw new ApiError("forbidden");
+  // Mirrors the public rule: with no hd (no Workspace domain) only a Gmail
+  // address may sign up; any other email without hd is refused.
+  if (!p.hd && !isGmailAddress(p.email))
+    throw new ApiError(
+      "forbidden",
+      "Sign up with a Gmail address or a Google Workspace account.",
+    );
   if (await liveClaim(env, p.sub)) throw new ApiError("signup_limit");
-  return { hd: p.hd, email: p.email };
+  return { hd: p.hd ?? null, email: p.email };
 }
 
 export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
@@ -126,7 +135,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   // checkCreateFields required these for every principal but U.
   const tier: Tier = ss ? env.SELF_SERVE_TIER : (body.tier as Tier);
   const auth = ss
-    ? { providers: ["google"], domains: [ss.hd] }
+    ? { providers: ["google"], domains: ss.hd ? [ss.hd] : [] }
     : (body.auth as NonNullable<Body["auth"]>);
   const ownerEmail = ss ? ss.email : (body.ownerEmail as string);
   const sendWelcome = ss ? true : body.sendWelcome === true;

@@ -13,6 +13,8 @@ import {
   oauthPrincipal,
 } from "./auth/oauth/index.js";
 import { browserRoute, type SigninDeps } from "./auth/signin.js";
+import { signupPrincipal } from "./auth/signup-session.js";
+import { signupAuthRoute } from "./auth/signup-signin.js";
 import { LazyBody, readJsonBody } from "./body.js";
 import type { Env } from "./env.js";
 import {
@@ -24,7 +26,7 @@ import {
 } from "./errors.js";
 import { browserHeaders } from "./headers.js";
 import { type HostKind, hostKind } from "./hosts.js";
-import { limit } from "./limits.js";
+import { limit, limitRoute } from "./limits.js";
 import { handleMcp } from "./mcp/index.js";
 import { isRefusal } from "./principal.js";
 import { refuse } from "./refuse.js";
@@ -33,6 +35,12 @@ import { bodyKeys, invokeRoute } from "./routes/invoke.js";
 import { SET_TIER_PATH_RE, setTier } from "./routes/set-tier.js";
 import { matchRoute } from "./routes/table.js";
 import { ipKeyOf } from "./services/counters.js";
+import {
+  SIGNUP_CSP,
+  signupConfig,
+  signupStatic,
+  signupStatus,
+} from "./signup/index.js";
 
 // The HTTP adapter (design v7 4.2 check order): host policy -> pre-authn IP
 // limit -> Origin (browser writes) -> authn -> CSRF -> invokeRoute.
@@ -67,6 +75,10 @@ export async function handle(
   const host = hostKind(url.hostname, env);
   if (!host) return notFound();
   if (host === "api") return route(req, env, ctx, "api", url, signin);
+  if (host === "signup")
+    return browserHeaders(await route(req, env, ctx, "signup", url, signin), {
+      csp: SIGNUP_CSP,
+    });
   // Every admin-host response, SPA and errors alike, carries the 4.5
   // browser-host headers; the consent page keeps its own CSP (9A.3.2).
   return browserHeaders(await route(req, env, ctx, "admin", url, signin), {
@@ -84,7 +96,7 @@ async function route(
 ): Promise<Response> {
   // Host policy first: browser hosts refuse Authorization; api.<app> ignores
   // Cookie (4.5).
-  if (host === "admin" && req.headers.has("authorization"))
+  if (host !== "api" && req.headers.has("authorization"))
     return refuse(env, "auth", "unauthenticated", req);
 
   const ipKey = ipKeyOf(clientIp(req));
@@ -110,9 +122,27 @@ async function route(
   if (isOAuthPath(path)) return notFound();
 
   // Browser writes: Origin before authn (4.2).
-  if (host === "admin") {
-    const o = checkOrigin(req, env);
+  if (host === "admin" || host === "signup") {
+    const o = checkOrigin(req, env, host);
     if (o) return refuse(env, "csrf", o.code, req);
+  }
+
+  // The sign-up host: its page, its sign-in and two small reads, then the
+  // three contract routes in SIGNUP_ROUTES (no admin SPA, no other route).
+  if (host === "signup") {
+    const page = signupStatic(req, path);
+    if (page) return page;
+    if (req.method === "GET" && path === "/api/v1/config")
+      return signupConfig(env);
+    const auth = signupAuthRoute(req, env, path, signin);
+    if (auth) return guard(() => auth);
+    if (req.method === "GET" && path === "/api/v1/signup") {
+      const p = await signupPrincipal(req, env, Date.now());
+      if (isRefusal(p)) return refuse(env, "auth", p.code, req);
+      const r = await limitRoute(env, "read", p, "signup");
+      if (r) return refuse(env, "auth", r.code, req);
+      return guard(() => signupStatus(env, p));
+    }
   }
 
   if (host === "admin" && path === CLAIM_FREE_PATH) {
@@ -152,7 +182,7 @@ async function apiRoute(
 ): Promise<Response> {
   const p = await authenticate(req, env, host);
   if (isRefusal(p)) return refuse(env, "auth", p.code, req);
-  if (host === "admin") {
+  if (host === "admin" || host === "signup") {
     const c = checkCsrf(req, env, p);
     if (c) return refuse(env, "csrf", c.code, req);
   }

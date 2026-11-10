@@ -326,7 +326,6 @@ describe("R4 create by an admin session", () => {
       {},
       leo({ requestId: "short" }),
       leo({ tier: "free" }),
-      leo({ auth: { providers: ["google"], domains: [] } }),
       leo({ version: "1.42" }),
     ])
       expect((await call(e, ADMIN_P, "R4", { body })).code).toBe(
@@ -542,15 +541,47 @@ describe("R4 self-serve policy (4.2 order)", () => {
     });
   });
 
-  it("no hd is 403; a second live install for the account is 409 signup_limit", async () => {
+  it("no hd (a personal account) is admitted; a second live install for the account is 409 signup_limit", async () => {
     const e = fakeEnv({ SIGNUPS_ENABLED: "true" });
-    expect((await call(e, userP("u9"), "R4", { body: ss() })).code).toBe(
-      "forbidden",
-    );
+    expect(
+      (
+        await call(e, userP("u9", "u9@gmail.com"), "R4", {
+          body: ss({ slug: "acme9" }),
+        })
+      ).status,
+    ).toBe(202);
     expect((await call(e, u("u2"), "R4", { body: ss() })).status).toBe(202);
     expect(
       (await call(e, u("u2"), "R4", { body: ss({ slug: "acme2" }) })).code,
     ).toBe("signup_limit");
+  });
+
+  it("no hd and a non-Gmail email is refused 403 with a message; googlemail.com and any hd pass", async () => {
+    const e = fakeEnv({ SIGNUPS_ENABLED: "true" });
+    const r = await call(e, userP("v1", "v1@corp.example"), "R4", {
+      body: ss({ slug: "v1" }),
+    });
+    expect(r.status).toBe(403);
+    expect(r.code).toBe("forbidden");
+    expect(
+      (
+        await call(e, userP("v2", "V2@GoogleMail.com"), "R4", {
+          body: ss({ slug: "v2" }),
+        })
+      ).status,
+    ).toBe(202);
+    expect(
+      (
+        await call(
+          e,
+          { ...userP("v3", "v3@corp.example"), hd: "corp.example" },
+          "R4",
+          {
+            body: ss({ slug: "v3" }),
+          },
+        )
+      ).status,
+    ).toBe(202);
   });
 
   it("server-set fields; the queue starts it, not the Workflow", async () => {

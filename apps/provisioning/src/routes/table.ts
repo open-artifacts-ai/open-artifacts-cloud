@@ -8,7 +8,11 @@ import type { HostKind } from "../hosts.js";
 export const API_BASE: Record<HostKind, string> = {
   api: "/v1",
   admin: "/api/v1",
+  signup: "/api/v1",
 };
+
+/** The only contract routes the sign-up host serves: me, slug check, create. */
+export const SIGNUP_ROUTES: readonly RouteId[] = ["R1", "R4", "R18"];
 
 // A segment never holds a slash or a percent escape (no %2F tricks).
 const SEG = "([^/%]+)";
@@ -49,6 +53,7 @@ export function matchRoute(
       if (host !== "admin") continue;
       path = pathname;
     }
+    if (host === "signup" && !SIGNUP_ROUTES.includes(c.id)) continue;
     const m = c.re.exec(path);
     if (!m) continue;
     const params: Record<string, string> = {};

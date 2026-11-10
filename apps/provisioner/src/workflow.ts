@@ -459,6 +459,7 @@ async function create(
     bundle: g.bundle,
     version: g.version,
     installId,
+    googleWithoutDomains: job.source === "self-serve",
   });
   await transient(modeStatement(ctx, installId, "serving").run());
   return { appHost: inst.appHost };

@@ -1591,7 +1591,10 @@ export class WfpProvisioner {
    * parse (@oa/auth-core). The rest (client id, HOSTED, AUTH_BROKER_URL,
    * INSTALL_ID, BROKER_SIGNING_KEY) are rendered; a test pins the list.
    */
-  private checkGoogleBroker(vars: Record<string, string>): void {
+  private checkGoogleBroker(
+    vars: Record<string, string>,
+    noDomainsOk = false,
+  ): void {
     const google = googleNewlyEnabled({}, vars);
     if (
       !this.o.brokerEnabled &&
@@ -1601,7 +1604,7 @@ export class WfpProvisioner {
         "google sign-in on a hosted install needs the sign-in broker (brokerEnabled)",
         "invalid_state",
       );
-    if (google && this.registryDomainsOf(vars).length === 0)
+    if (google && !noDomainsOk && this.registryDomainsOf(vars).length === 0)
       throw new ProvisionRefused(
         "google needs AUTH_DOMAINS: the server refuses google when it is empty",
         "invalid_state",
@@ -1798,7 +1801,7 @@ export class WfpProvisioner {
     this.checkEmailCodeDomain(vars, "providers");
     const ts = this.turnstileInput(vars, testHooks);
     this.checkEmailCodeDomain(vars, "domains");
-    this.checkGoogleBroker(vars);
+    this.checkGoogleBroker(vars, i.googleWithoutDomains === true);
     if (this.o.brokerEnabled) this.registryDomainsOf(vars);
     // Without the version: replayOf compares it; a resume only refuses a downgrade.
     let hash = inputsHash({ ownerEmail, vars, testHooks });

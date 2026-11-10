@@ -241,6 +241,24 @@ describe("0009_job_fail_point (#995)", () => {
   });
 });
 
+describe("0011_session_hd", () => {
+  it("follows 0010 and only adds the sessions.hd column", () => {
+    expect(migrationFiles.slice(10, 11)).toEqual(["0011_session_hd.sql"]);
+    const sql = migrationSql("0011_session_hd.sql").replace(/--[^\n]*/g, "");
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|UPDATE|DELETE)\b/i);
+    const stmts = sql
+      .split(";")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    expect(stmts).toEqual(["ALTER TABLE sessions ADD COLUMN hd TEXT"]);
+  });
+
+  it("adds a nullable hd TEXT column to sessions", () => {
+    const db = platformDb();
+    expect(cols(db, "sessions")).toContain("hd TEXT");
+  });
+});
+
 describe("0008_provisioning: audit", () => {
   it("admin_audit is append-only", () => {
     const db = platformDb();
@@ -635,7 +653,7 @@ describe("0010_trial_reminders (cloud #39)", () => {
 
 describe("0012_solo_start (self-serve Solo start)", () => {
   it("follows 0009 and only adds two nullable signups columns, backfilling legacy rows as skipped", () => {
-    expect(migrationFiles.slice(10)).toEqual(["0012_solo_start.sql"]);
+    expect(migrationFiles.slice(11)).toEqual(["0012_solo_start.sql"]);
     const sql = migrationSql("0012_solo_start.sql").replace(/--[^\n]*/g, "");
     expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
     const db = platformDb();

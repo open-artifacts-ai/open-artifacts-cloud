@@ -86,3 +86,23 @@ describe("strictVars: EMAIL_CODE_DOMAIN", () => {
     expect(why(vars({ EXTRA: "x" }))).toMatch(/not allowed/);
   });
 });
+
+describe("strictVars: google without a domain", () => {
+  const g = JSON.stringify({
+    AUTH_PROVIDERS: "google",
+    AUTH_DOMAINS: "",
+    TIER: "trial",
+  });
+  it("is allowed for self-serve (a personal Google account has no hd)", () => {
+    expect(
+      strictVars(g, {
+        ...opts,
+        source: "self-serve",
+        selfServeTier: "trial",
+      }),
+    ).not.toHaveProperty("AUTH_DOMAINS");
+  });
+  it("is still refused for an admin create", () => {
+    expect(why(g)).toBe("google needs at least one domain");
+  });
+});
