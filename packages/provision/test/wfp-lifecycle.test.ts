@@ -7110,6 +7110,190 @@ describe("a killed upgrade, rollback or vars change: its own job's retry re-take
     });
   });
 
+  it("rollback: a row at neither version of the job's marker is refused, nothing written", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    keep(await s.p.upgrade(inst.id, "0.24.0"));
+    startMarker(s, inst.id, A, "0.24.0", "0.23.0");
+    kill(s, inst.id, {
+      row: { version: "0.24.2", previous_version: "0.24.0" },
+    });
+    const before = s.row(inst.id);
+    const e = await fails(s.mk({ leaseHolder: A }).rollback(inst.id));
+    expect(e.code).toBe("invalid_state");
+    expect(e.message).toMatch(
+      /not where the rollback from 0\.24\.0 to 0\.23\.0 left it/,
+    );
+    expect(s.row(inst.id)).toEqual(before);
+  });
+
+  it("vars change killed after its vars write with google newly on: the retry cuts sessions exactly once", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input("finqore", { vars: CODES })));
+    const epoch = epochOf(s, inst.id);
+    const next = {
+      AUTH_PROVIDERS: "email,google",
+      AUTH_DOMAINS: "finqore.test",
+    };
+    expect(epoch()).toBe(0);
+    // The dead attempt armed the cut, uploaded, wrote the vars, then died
+    // before the cut: the row holds the new vars and the owed, armed cut.
+    const cut = "ab".repeat(16);
+    kill(s, inst.id, {
+      row: {
+        vars: canonicalJson(next),
+        session_cut: cut,
+        session_cut_base: canonicalJson(CODES),
+        session_cut_armed: "1",
+      },
+    });
+    const r = keep(await s.mk({ leaseHolder: A }).updateVars(inst.id, next));
+    expect(r).toMatchObject({ ok: true, sessionCut: true });
+    expect(epoch()).toBe(1);
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      lease: null,
+      session_cut: null,
+    });
+    // Another run finds google already on and no cut owed: still once.
+    keep(await s.p.updateVars(inst.id, next));
+    expect(epoch()).toBe(1);
+    const applied = s
+      .installDb(inst.id)
+      .prepare("SELECT id FROM oa_session_cuts")
+      .all();
+    expect(applied).toEqual([{ id: cut }]);
+  });
+
+  it("a live duplicate: the retry takes over a live attempt and the first is refused at its next step, writing nothing more", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    let taken = false;
+    const second = s.mk({ leaseHolder: A });
+    const first = s.mk({
+      leaseHolder: A,
+      fetch: (async (u: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          !taken &&
+          String(u).endsWith("/mcp") &&
+          String(init?.body).includes("list_artifacts")
+        ) {
+          taken = true;
+          // The same job's second attempt, while the first is mid-run.
+          s.db()
+            .prepare("UPDATE installs SET lease = ? WHERE id = ?")
+            .run(holderLease(A), inst.id);
+          keep(await second.updateVars(inst.id, { FEATURES: "beta" }));
+        }
+        return s.fake.fetch(u, init);
+      }) as typeof fetch,
+    });
+    const e = await fails(first.updateVars(inst.id, { FEATURES: "beta" }));
+    expect(taken).toBe(true);
+    expect(e).toBeInstanceOf(LostLease);
+    const log = s.audit(inst.id);
+    expect(log).toContain("vars.lost_lease");
+    expect(log.filter((a) => a === "vars.done")).toHaveLength(1);
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+
+  const restorePointRow = (
+    s: S,
+    id: string,
+    job: string,
+    bookmark: string,
+    to = "0.24.6",
+  ) =>
+    s
+      .db()
+      .prepare(
+        "INSERT INTO hosted_audit (at, install_id, action, detail) VALUES (?, ?, 'upgrade.restore_point', ?)",
+      )
+      .run(
+        s.clock.now(),
+        id,
+        canonicalJson({
+          bookmark,
+          migrations: "9003_marked.sql (marker)",
+          to,
+          job: leaseJobPart(job),
+        }),
+      );
+  // The binding id audit reads the bookmark once itself, so a run that takes
+  // a restore point reads it twice and one that reuses a bookmark, once.
+  const bookmarkCalls = (s: S, from: number) =>
+    callsTo(s.fake, /time_travel\/bookmark/, from).length;
+  const restorePoints = (s: S, id: string) =>
+    (
+      s
+        .db()
+        .prepare(
+          "SELECT detail FROM hosted_audit WHERE install_id = ? AND action = 'upgrade.restore_point' ORDER BY id",
+        )
+        .all(id) as { detail: string }[]
+    ).map((r) => JSON.parse(r.detail) as { bookmark: string });
+
+  it("an upgrade retry after a partly applied non-additive migration reuses the first attempt's restore point", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    restorePointRow(s, inst.id, A, "bookmark-first");
+    kill(s, inst.id);
+    const w = s.fake.log.length;
+    keep(
+      await s
+        .mk({ leaseHolder: A })
+        .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(bookmarkCalls(s, w)).toBe(1);
+    expect(restorePoints(s, inst.id).map((r) => r.bookmark)).toEqual([
+      "bookmark-first",
+      "bookmark-first",
+    ]);
+    expect(s.audit(inst.id)).not.toContain(
+      "upgrade.restore_point_first_missing",
+    );
+  });
+
+  it("a retry with no first bookmark (or another job's, or another target's) takes a new one and logs that", async () => {
+    for (const seed of ["none", "other-job", "other-to"] as const) {
+      const s = setup();
+      const inst = keep(await s.p.create(input()));
+      if (seed === "other-job") restorePointRow(s, inst.id, B, "bookmark-b");
+      if (seed === "other-to")
+        restorePointRow(s, inst.id, A, "bookmark-old", "0.24.5");
+      kill(s, inst.id);
+      const w = s.fake.log.length;
+      keep(
+        await s
+          .mk({ leaseHolder: A })
+          .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+      );
+      expect(bookmarkCalls(s, w), seed).toBe(2);
+      expect(s.audit(inst.id), seed).toContain(
+        "upgrade.restore_point_first_missing",
+      );
+      expect(restorePoints(s, inst.id).at(-1)?.bookmark, seed).toBe(
+        `bookmark-${s.row(inst.id).d1_id}`,
+      );
+    }
+  });
+
+  it("a first attempt (active row) takes its own bookmark, never an older job's", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    restorePointRow(s, inst.id, A, "bookmark-stale");
+    const w = s.fake.log.length;
+    keep(
+      await s
+        .mk({ leaseHolder: A })
+        .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(bookmarkCalls(s, w)).toBe(2);
+    expect(s.audit(inst.id)).not.toContain(
+      "upgrade.restore_point_first_missing",
+    );
+  });
+
   it("any other operation is still refused on the upgrading row, even for the same job", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input()));

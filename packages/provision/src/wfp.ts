@@ -105,10 +105,10 @@ import {
   canonicalJson,
   type DirectoryRevoke,
   holderLease,
-  leaseJobPart,
   type InstallRow,
   type InstallState,
   inputsHash,
+  leaseJobPart,
   PlatformDb,
   RL_BASE,
   type StoredVersion,
@@ -681,7 +681,17 @@ const directoryText = (e: RegistryEntry): string =>
 
 /** How long a lifecycle operation holds the row's lock (installs.lease_until); renewed at each step. */
 const LEASE_MS = 30 * 60_000;
-/** The fence renews the held lease at most this often (#1326); step holds always renew. */
+/**
+ * The fence renews the held lease at most this often (#1326); step holds always renew.
+ *
+ * The gap: after a live takeover (a retry of the same job re-took an expired
+ * or live lease, #1501), the earlier attempt can still run Cloudflare and D1
+ * writes for up to this long before its next renew or finish fails. That is
+ * benign: both attempts belong to the same job and carry the same payload
+ * (same install, same target version or vars, same release bytes), so a late
+ * write repeats what the retry writes or already wrote. A different job never
+ * takes the lease (claim matches the job part), so no other payload can race.
+ */
 const FENCE_RENEW_MS = 10_000;
 const HEX32 = /^[0-9a-f]{32}$/;
 const hex16 = () =>
@@ -3531,6 +3541,7 @@ export class WfpProvisioner {
     rel: Checked,
     d1Id: string,
     o: { nonAdditive?: boolean },
+    retry = false,
   ): Promise<{ bookmark: string; files: string } | null> {
     const r = await this.cf.d1Query(d1Id, "SELECT name FROM d1_migrations");
     const done = new Set((r[0]?.results ?? []).map((x) => String(x.name)));
@@ -3550,6 +3561,19 @@ export class WfpProvisioner {
         `install ${id}: held, a pending migration can lose data: ${files}`,
         "migration_held",
       );
+    }
+    // #1931: a retry of this job after files were partly applied must keep the
+    // first attempt's bookmark: one taken now is after those files.
+    if (retry && this.o.leaseHolder !== undefined) {
+      const first = await this.platform.restorePointOf(
+        id,
+        leaseJobPart(this.o.leaseHolder),
+        rel.rec.version,
+      );
+      if (first !== null) return { bookmark: first, files };
+      await this.platform.audit(id, "upgrade.restore_point_first_missing", {
+        to: rel.rec.version,
+      });
     }
     try {
       return { bookmark: await this.cf.d1Bookmark(d1Id), files };
@@ -3721,7 +3745,13 @@ export class WfpProvisioner {
     await this.doRuleOrStep(id, from, to, rel, row.do_migration_tag);
     const { d1Id, kvId } = await this.liveInstall(row, m);
     await this.checkMigrationOrder(rel, d1Id);
-    const restorePoint = await this.migrationHold(id, rel, d1Id, o);
+    const restorePoint = await this.migrationHold(
+      id,
+      rel,
+      d1Id,
+      o,
+      row.state === "upgrading",
+    );
     const own = await this.ownerToken(row, m.appHost);
     const n = names(id, this.env);
     this.metadata(id, m, rel, {
@@ -3751,6 +3781,9 @@ export class WfpProvisioner {
         await this.logged("upgrade.restore_point", {
           bookmark: restorePoint.bookmark,
           migrations: restorePoint.files.slice(0, RESTORE_POINT_FILES_MAX),
+          ...(this.o.leaseHolder === undefined
+            ? {}
+            : { to, job: leaseJobPart(this.o.leaseHolder) }),
         });
       await this.hold();
       await this.migrate(rel.rec, d1Id, n.d1);
