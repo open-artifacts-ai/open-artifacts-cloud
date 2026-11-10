@@ -6,8 +6,8 @@
 # zone wiring (DNS, routes, settings: planned, then applied in the same run).
 # No one approves a run: the release gate (scripts/ci/tag-passed-checks.sh)
 # refuses a tag unless every earlier check on it passed, and prod's
-# platform-db, provisioner and provisioning also need a green
-# redline-staging.yml run for the same tag (scripts/ci/staging-first-gate.sh)
+# deploys (every target list, #1412; not verify_only, which deploys nothing)
+# also need a green redline-staging.yml run for the same tag (scripts/ci/staging-first-gate.sh)
 # and staging's post-deploy smoke green at or after it
 # (scripts/ci/staging-smoke-gate.sh, #1406). Each env has its own
 # Environment (hosted-staging-deploy, hosted-prod-deploy) holding the
@@ -256,20 +256,22 @@ jobs:
           cp .deploy-logic/apps/platform-db/migration-lock.json "$RUNNER_TEMP/main-ci/migration-lock.json"
           cp .deploy-logic/apps/billing/migration-lock.json "$RUNNER_TEMP/main-ci/billing-migration-lock.json"
           rm -rf .deploy-logic
-      # Staging first, automatic: prod's platform-db, provisioner,
-      # provisioning and scheduler (its tag is the fleet target, #955) deploy
-      # a tag only after redline-staging.yml passed it (within 7 days;
-      # scripts/ci/staging-first-gate.sh states the contract).
+      # Staging first, automatic: EVERY prod deploy, whatever its target list
+      # (#1412), deploys a tag only after redline-staging.yml passed it (within
+      # 7 days; scripts/ci/staging-first-gate.sh states the contract). Only a
+      # verify_only run skips the gates: it deploys and sets nothing (it reads
+      # the live Workers back), so it must stay usable to check prod when the
+      # tag has no red-line, e.g. after an incident.
       - name: Staging passed this tag
-        if: ${{ inputs.env == 'prod' && (contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',provisioning,') || contains(format(',{0},', inputs.targets), ',scheduler,')) }}
+        if: ${{ inputs.env == 'prod' && !inputs.verify_only }}
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: bash "$RUNNER_TEMP/main-ci/staging-first-gate.sh" "$TAG"
-      # #1406: the same targets also need staging's post-deploy smoke green
+      # #1406: the same runs also need staging's post-deploy smoke green
       # at or after the tag (scripts/ci/staging-smoke-gate.sh).
       - name: Staging's smoke is green at or after this tag
-        if: ${{ inputs.env == 'prod' && (contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',provisioning,') || contains(format(',{0},', inputs.targets), ',scheduler,')) }}
+        if: ${{ inputs.env == 'prod' && !inputs.verify_only }}
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}

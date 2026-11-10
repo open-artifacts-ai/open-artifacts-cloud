@@ -94,6 +94,45 @@ describe("chain-dispatch", () => {
     ])
       expect(d).toContain(f);
   });
+  it("dispatches hosted-publish.yml (#1412) with env, tag and chain id only, and matches its own run title", () => {
+    const title = `hosted-publish prod v1.2.3 [${CHAIN}]`;
+    const h = harness({ list: () => [run({ display_title: title })] });
+    const calls = h.calls;
+    const r = dispatchAndWait({
+      exec: h.exec,
+      repo: "o/r",
+      tag: "v1.2.3",
+      chainId: CHAIN,
+      workflow: "publish",
+      now: () => T0,
+      sleep: () => {},
+    });
+    expect(r.conclusion).toBe("success");
+    const d = calls[0] as string[];
+    expect(d).toContain("hosted-publish.yml");
+    for (const f of ["env=prod", "tag=v1.2.3", `chain_id=${CHAIN}`])
+      expect(d).toContain(f);
+    // None of the deploy's inputs, and never a floor.
+    expect(d.join(" ")).not.toMatch(/targets|verify_only|require_newer|floor/);
+    // A deploy run's title is not the publish's.
+    const wrong = harness({ list: () => [run()] });
+    expect(() =>
+      dispatchAndWait({
+        exec: wrong.exec,
+        repo: "o/r",
+        tag: "v1.2.3",
+        chainId: CHAIN,
+        workflow: "publish",
+        findTimeoutMs: 1000,
+        pollMs: 500,
+        now: (() => {
+          let t = T0;
+          return () => (t += 400);
+        })(),
+        sleep: () => {},
+      }),
+    ).toThrow(/no run for chain id/);
+  });
   it("waits through in-progress polls", () => {
     const h = harness({
       list: () => [run()],

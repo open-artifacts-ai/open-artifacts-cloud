@@ -2,9 +2,14 @@
 # oa-<p>-releases (design v7 6.4): the only CI step on the provisioning path.
 # After every hosted-release run on main (not cancelled; the release gate
 # decides, so an npm-only failure does not block), the release whose tag's
-# commit is that run's head goes to staging, then prod; most runs cut no
-# release and publish nothing. By hand (workflow_dispatch on main): a tag
-# (both envs, or the one named), or a hosted-floor.yml run id with its env.
+# commit is that run's head goes to STAGING only; most runs cut no release and
+# publish nothing. A release reaches prod's bucket only after staging's
+# red-line passed the tag (#1412): the publish-prod job runs
+# scripts/ci/staging-first-gate.sh for every release, and prod-release-chain.yml
+# dispatches env=prod for the tag once the red-line is green, before it
+# deploys. By hand (workflow_dispatch on main): a tag (both envs, or the one
+# named; prod fails closed without the red-line), or a hosted-floor.yml run id
+# with its env. A floor has no tag and no red-line: it is left as it was.
 # Each env's job runs in its deploy Environment (hosted-staging-deploy,
 # hosted-prod-deploy: main only, no approval), behind the release gate
 # (scripts/ci/tag-passed-checks.sh: every earlier check on the tag passed),
@@ -12,6 +17,7 @@
 # `oa:hosted publish-release` verifies against RELEASE_PUBKEY[env], writes
 # create-only and record.sig.json last; `publish-floor` verifies the floor.
 name: hosted-publish
+run-name: hosted-publish${{ inputs.env && format(' {0} {1}', inputs.env, inputs.tag || inputs.floor_run_id) || '' }}${{ inputs.chain_id && format(' [{0}]', inputs.chain_id) || '' }}
 
 # The trigger is the hosted-release workflow of this repo (cut-over step C3,
 # not here yet): workflow_run cannot cross repositories, so the public
@@ -37,6 +43,14 @@ on:
         options: [both, staging, prod]
       floor_run_id:
         description: "A hosted-floor.yml run id whose signed floor to publish"
+        required: false
+        default: ""
+        type: string
+      # The prod release chain's alone (prod-release-chain.yml, #1412): the run
+      # name carries it, so the chain finds exactly the run it dispatched
+      # (scripts/ci/chain-dispatch.ts).
+      chain_id:
+        description: "Release chain only: the chain run's id, shown in the run name"
         required: false
         default: ""
         type: string
@@ -180,6 +194,9 @@ jobs:
           test ! -e "$d"
 
   publish-prod:
+    # Named like publish-staging: the record the chain looks for to know a
+    # tag is already in prod's bucket (prod-release-chain.ts, published).
+    name: publish-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}
     needs: [resolve, publish-staging]
     # Staging first: prod runs after a green staging publish, or alone only
     # when staging was not asked for (a dispatch naming prod).
@@ -219,6 +236,15 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/tag-passed-checks.sh prod "$TAG"
+      # #1412: a release reaches prod's bucket only after staging's red-line
+      # passed this tag (scripts/ci/staging-first-gate.sh), before any token is
+      # read. A floor has no tag, so it is not gated here.
+      - name: Staging passed this tag
+        if: ${{ needs.resolve.outputs.kind == 'release' }}
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/staging-first-gate.sh "$TAG"
       - name: Fetch the floor
         id: floor
         if: ${{ needs.resolve.outputs.kind == 'floor' }}
