@@ -56,6 +56,66 @@ const HOOK_NAMES = ["TEST_HOOK_KEY", "TEST_HOOKS"];
 const MAX_KEYS = 200_000;
 
 /**
+ * How many releases, and how many installs, are checked at once. The probe
+ * made every request one after another: 168 s and 139 s in the runs before
+ * the guard's 180 s case timeout was hit (run 42707092416), and the time grows
+ * with every release ever published (each costs a signed record, a template,
+ * a module listing and every module, about one second) and with every
+ * install (a script's secret list, /healthz, its settings). Concurrency
+ * changes only how those same requests are spread in time: each is still made
+ * once, so the total against the Cloudflare API is the same, and the limit
+ * keeps the burst small.
+ */
+export const PROD_CLEAN_CONCURRENCY = 4;
+
+/**
+ * Runs fn over every item, at most `limit` at once, in the order given. Every
+ * item is run or the call throws: after the first failure nothing new starts,
+ * the ones in flight finish, and one failure is thrown: the lowest-numbered
+ * one that isVerdict says is a finding, else the lowest-numbered failure (the
+ * sequential loop threw the first). A partial result
+ * is never returned.
+ */
+export async function forEachLimit<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+  isVerdict: (error: unknown) => boolean = () => false,
+): Promise<void> {
+  if (!Number.isInteger(limit) || limit < 1)
+    throw new RangeError(
+      `forEachLimit: limit must be a positive integer, not ${limit}`,
+    );
+  let next = 0;
+  let stop = false;
+  const failures: { at: number; error: unknown }[] = [];
+  const worker = async () => {
+    while (!stop && next < items.length) {
+      const at = next++;
+      try {
+        await fn(items[at] as T);
+      } catch (error) {
+        failures.push({ at, error });
+        stop = true;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  failures.sort((a, b) => a.at - b.at);
+  // A verdict (the probe found something dirty) outranks a transient failure
+  // that happened beside it: never trade a known dirty result for an infra one.
+  const first = failures.find((f) => isVerdict(f.error)) ?? failures[0];
+  if (first) throw first.error;
+}
+
+/** A failure that is the probe's verdict: a dirty release or a dirty install. */
+const isDirty = (e: unknown): boolean =>
+  e instanceof ProdDirty &&
+  (e.code === "release_dirty" || e.code === "install_dirty");
+
+/**
  * Hook SQL only the redline bundle carries. Same strings as
  * apps/server/test/node/test-hooks-strip.test.ts MARKERS (a unit test pins
  * them equal).
@@ -415,8 +475,12 @@ export async function prodClean(
           "release_dirty",
           `release ${version.slice(0, 40)}: variant ${v.slice(0, 20)} in prod`,
         );
-  for (const version of releases.keys())
-    await checkRelease(r2, version, pubkey);
+  await forEachLimit(
+    [...releases.keys()],
+    PROD_CLEAN_CONCURRENCY,
+    (version) => checkRelease(r2, version, pubkey),
+    isDirty,
+  );
 
   // 2. Installs: no hooks reachable, no hook secret or var. The bearer is
   // read now, not before the scan: the JWT lives 5 minutes (re-minted near
@@ -447,7 +511,7 @@ export async function prodClean(
     fetch: f,
   });
   const ns = NAMESPACES.prod;
-  for (const r of rows) {
+  const checkInstall = async (r: (typeof rows)[number]): Promise<void> => {
     const id = r.id;
     if (!isInstallId(id))
       throw new ProdDirty(
@@ -473,7 +537,7 @@ export async function prodClean(
         if (!serving && e instanceof CfError && e.status === 404) return null;
         throw e;
       });
-    if (secretNames === null) continue;
+    if (secretNames === null) return;
     if (!serving) {
       await checkScript(
         get,
@@ -484,7 +548,7 @@ export async function prodClean(
         id,
         secretNames,
       );
-      continue;
+      return;
     }
     const h = await get(`https://${appHost}/healthz`, null, `${id} /healthz`, {
       code: "unreachable",
@@ -501,7 +565,8 @@ export async function prodClean(
       id,
       secretNames,
     );
-  }
+  };
+  await forEachLimit(rows, PROD_CLEAN_CONCURRENCY, checkInstall, isDirty);
 
   return { level: "pass", releases: releases.size, installs: rows.length };
 }

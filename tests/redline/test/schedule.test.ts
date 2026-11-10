@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
 // its per-case durations and per-file walls (test/fixtures/run-42402998826.json,
@@ -36,8 +37,32 @@ const fx = JSON.parse(
   ),
 ) as Fixture;
 const P = fx.phases;
+/**
+ * Files added after the recording (#1299's live/bus.test.ts), so no wall was
+ * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
+ * case that is a few requests while the bus is off). The first live run that
+ * includes them replaces it; test/cases-added.ts names what is estimated.
+ */
+const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
+
+// #859's live/provisioner.test.ts has its own lane ("provisioner"). The
+// recording predates it, so the replay of run 42402998826 leaves the file out
+// (its lane is dropped); the real plan, with the file's wall, is simulated
+// below from run 42642922707.
+const NEW_FILE = "live/provisioner.test.ts";
+const recorded = (plan: readonly Phase[]): readonly Phase[] =>
+  plan.map((ph) =>
+    ph
+      .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
+      .filter((l) => l.files.length > 0),
+  );
+// Load-bearing: isProv() is true only for a lane of provisioning.test.ts
+// alone, so without this filter the prov lane would be scaled and paced as
+// an install lane.
+const RPLAN = recorded(PLAN);
+const RSERIAL = recorded(PLAN_SERIAL);
 const wall = (f: string): number => {
-  const w = fx.fileWallsSec[f];
+  const w = fx.fileWallsSec[f] ?? ESTIMATED_WALL_SEC[f];
   if (w === undefined) throw new Error(`no recorded wall for ${f}`);
   return w;
 };
@@ -109,8 +134,15 @@ describe("the recording (run 42402998826)", () => {
     );
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
+    // The recording predates the cases declared in cases-added.ts: it holds
+    // the manifest minus exactly those, never a case with an invented time.
+    const added = new Set(
+      CASES_ADDED_SINCE_1730.map((c) => `${c.file} ${c.name}`),
+    );
+    const mk = m.cases.map((c) => `${c.file} ${c.name}`);
+    for (const k of added) expect(mk).toContain(k);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(m.cases.map((c) => `${c.file} ${c.name}`)),
+      new Set(mk.filter((k) => !added.has(k))),
     );
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
@@ -135,17 +167,29 @@ describe("the recording (run 42402998826)", () => {
   });
 });
 
+describe("the provisioner file (#859, not in the recording)", () => {
+  it("has a lane of its own beside prov, and prov holds only provisioning", () => {
+    const lanes = PLAN[0] ?? [];
+    expect(lanes.find((x) => x.name === "prov")?.files).toEqual([
+      "live/provisioning.test.ts",
+    ]);
+    expect(lanes.find((x) => x.name === "provisioner")?.files).toEqual([
+      NEW_FILE,
+    ]);
+  });
+});
+
 describe("the schedule simulation", () => {
   it("today's plan reproduces the observed run: 1197 s (19m57s)", () => {
-    const { end } = jobEnd(PLAN_SERIAL, { t19: "after" });
+    const { end } = jobEnd(RSERIAL, { t19: "after" });
     near(end, 1197, 1);
     expect(fx.observedEndSec).toBe(1197);
     // The suite alone: signin+edge, then credentials' chain (the critical path).
-    near(suiteEnd(PLAN_SERIAL), 102 + 132.5 + 745.2 + 2, 0.5);
+    near(suiteEnd(RSERIAL), 102 + 132.5 + 745.2 + 2, 0.5);
   });
 
   it("the new plan: 102 + 337.7 + 2 + 28 = 470 s (7.8 min), with T19 in its own job", () => {
-    const r = jobEnd(PLAN, { t19: "job" });
+    const r = jobEnd(RPLAN, { t19: "job" });
     near(r.end, 470, 1);
     expect(r.end).toBeLessThan(600);
     // The t19 job ends at about 298 s, before the redline job does.
@@ -154,7 +198,7 @@ describe("the schedule simulation", () => {
   });
 
   it("the critical path is provisioning; every install lane ends before it", () => {
-    const lanes = (PLAN[0] ?? []).map(
+    const lanes = (RPLAN[0] ?? []).map(
       (l) => [l.name, P.preSec + laneWall(l, {})] as const,
     );
     const byEnd = [...lanes].sort((a, b) => b[1] - a[1]);
@@ -164,13 +208,14 @@ describe("the schedule simulation", () => {
     near(byEnd[0]?.[1] ?? 0, 102 + 337.7);
     near(byEnd[1]?.[1] ?? 0, 102 + 335.0);
     near(
-      P.preSec + laneWall(PLAN[0]?.find((l) => l.name === "front") as Lane, {}),
+      P.preSec +
+        laneWall(RPLAN[0]?.find((l) => l.name === "front") as Lane, {}),
       102 + 177.1,
     );
   });
 
   it("with T19 still after the suite (the suite change alone): 657 s, over 10 minutes", () => {
-    const { end } = jobEnd(PLAN, { t19: "after" });
+    const { end } = jobEnd(RPLAN, { t19: "after" });
     near(end, 470 + 187, 1);
     expect(end).toBeGreaterThan(600);
   });
@@ -180,21 +225,21 @@ describe("the schedule simulation", () => {
     ["install lanes +20%", { slow: 0.2 }, 532],
     ["+60 s pacing and +20% together", { pacing: 60, slow: 0.2 }, 594],
   ])("%s ends at about %i s, under 600", (_, knobs, want) => {
-    const { end } = jobEnd(PLAN, { ...knobs, t19: "job" });
+    const { end } = jobEnd(RPLAN, { ...knobs, t19: "job" });
     near(end, want, 3);
     expect(end).toBeLessThan(600);
   });
 
   it("+60 s pacing and +20% leaves under 10 s of headroom: the reason for the sharding trigger", () => {
-    const { end } = jobEnd(PLAN, { pacing: 60, slow: 0.2, t19: "job" });
+    const { end } = jobEnd(RPLAN, { pacing: 60, slow: 0.2, t19: "job" });
     expect(600 - end).toBeLessThan(10);
     // One more 20 s of anything (a slow candidate) would cross 10 minutes.
     expect(end + 20).toBeGreaterThan(600 - 10);
   });
 
   it("B4 (provisioning from the mint) saves only what surfaces allows", () => {
-    const base = jobEnd(PLAN, { t19: "job" }).end;
-    const b4 = jobEnd(PLAN, { provFromMint: true, t19: "job" }).end;
+    const base = jobEnd(RPLAN, { t19: "job" }).end;
+    const b4 = jobEnd(RPLAN, { provFromMint: true, t19: "job" }).end;
     expect(b4).toBeLessThan(base);
     // Provisioning would end at 64 + 337.7 + 30 = 431.7 s (the spec's "about
     // 432 s"), but surfaces (102 + 335) still ends the run at 467 s until it is
@@ -210,17 +255,21 @@ describe("the schedule simulation", () => {
   });
 
   it("the plan's lanes are the ones the simulation ran", () => {
-    expect(PLAN).toHaveLength(1);
-    const names = (PLAN[0] ?? []).map((l) => l.name).sort();
+    expect(RPLAN).toHaveLength(1);
+    const names = (RPLAN[0] ?? []).map((l) => l.name).sort();
     expect(names).toEqual(["creds", "front", "guard", "prov", "surfaces"]);
-    // Every recorded file is in a lane, so no recorded second is left out.
-    expect((PLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
-      Object.keys(fx.fileWallsSec).sort(),
+    // Every recorded file is in a lane, so no recorded second is left out;
+    // the only others are the estimated, post-recording files.
+    expect((RPLAN[0] ?? []).flatMap((l) => l.files).sort()).toEqual(
+      [
+        ...Object.keys(fx.fileWallsSec),
+        ...Object.keys(ESTIMATED_WALL_SEC),
+      ].sort(),
     );
   });
 
   it("each lane's cases, replayed one after another, fit its wall", () => {
-    for (const l of PLAN[0] ?? []) {
+    for (const l of RPLAN[0] ?? []) {
       const caseSec =
         fx.cases
           .filter((c) => l.files.includes(c.file))
@@ -278,5 +327,77 @@ describe("a real upgrade (run 42436122165, reported figures)", () => {
     expect(t19End).toBeLessThan(otherSec + bringup + live.suiteSec);
     // What would be needed: a suite wall of at most this.
     expect(600 - (otherSec + bringup + live.revokeSec)).toBe(354);
+  });
+});
+
+// Run 42642922707 (cloud, v0.140.0, 577 s redline job; measured per step and
+// per lane from the run's log; the figures are Platform's, from cloud branch
+// redline/26-under-ten, commit 1c3ab4f). The real PLAN is simulated here,
+// the provisioner file's wall included. The lane walls, steps and totals are
+// measurements. The provisioner file's own figures are modeled (a 60 s replay
+// watch, 30 s setup; a sync 409 for createTaken, taken as 3 s), until a live
+// run includes the file's own lane.
+describe("the plan with the provisioner file in its own lane (run 42642922707)", () => {
+  const m = {
+    upgradeSec: 121,
+    betweenSec: 7,
+    revokeSec: 24,
+    totalSec: 577,
+    mergeSec: 2,
+    suiteSec: 390,
+    // prov's rl-p chain is P13 180 + P45 99 + P31 51 + P23 40 s.
+    lanes: { prov: 388, surfaces: 320, creds: 233, guard: 184, front: 162 },
+  };
+  const otherSec =
+    m.totalSec - (m.upgradeSec + m.betweenSec + m.suiteSec + m.revokeSec);
+  /** The replay case (a 60 s watch) and the file's setup; spends no provisioning-api. */
+  const REPLAY_SEC = 60 + 30;
+  /** createTaken's own time once it is released: one R4 POST (a sync 409) and two snapshots. */
+  const TAKEN_SEC = 3;
+  /**
+   * Each lane's end in the suite step's clock. The provisioner lane's
+   * createTaken waits for prov's exit (the prov-done barrier), so the lane
+   * ends TAKEN_SEC after the later of its replay case and prov's end.
+   */
+  const ends = (walls: Record<string, number> = m.lanes) => {
+    const out: Record<string, number> = { ...walls };
+    out.provisioner = Math.max(REPLAY_SEC, out.prov ?? 0) + TAKEN_SEC;
+    return out;
+  };
+  const job = (e: Record<string, number>) =>
+    otherSec +
+    m.upgradeSec +
+    m.betweenSec +
+    Math.max(...Object.values(e)) +
+    m.mergeSec +
+    m.revokeSec;
+
+  it("the simulated lanes are the plan's lanes", () => {
+    expect(Object.keys(ends()).sort()).toEqual(
+      (PLAN[0] ?? []).map((l) => l.name).sort(),
+    );
+  });
+
+  it("the plan ends at 580 s, under 600: the provisioner lane ends 3 s after prov", () => {
+    const e = ends();
+    expect(e.provisioner).toBe(391);
+    const end = job(e);
+    expect(end).toBe(580);
+    expect(end).toBeLessThan(600);
+  });
+
+  it("the probes after provisioning in the prov lane would have been about 757 s (760 here): the reason for the lane", () => {
+    expect(
+      job(ends({ ...m.lanes, prov: m.lanes.prov + REPLAY_SEC + 90 })),
+    ).toBe(760);
+  });
+
+  it("the margin is 20 s: createTaken may take 23 s, not its 90 s bound", () => {
+    expect(600 - job(ends())).toBe(20);
+    const e = ends();
+    e.provisioner = (e.prov ?? 0) + 23;
+    expect(job(e)).toBe(600);
+    e.provisioner = (e.prov ?? 0) + 90;
+    expect(job(e)).toBeGreaterThan(600);
   });
 });

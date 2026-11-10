@@ -43,14 +43,46 @@ export interface WebhookEnv {
   /** The Stripe price ids billing sells (optional): a price id matching one names the tier. */
   STRIPE_PRICE_TEAM?: string;
   STRIPE_PRICE_BUSINESS?: string;
+  /** Solo's two prices (#1568); either one names the tier solo. */
+  STRIPE_PRICE_SOLO_MONTHLY?: string;
+  STRIPE_PRICE_SOLO_YEARLY?: string;
+  /**
+   * Stripe test-mode key (a Worker secret), only for cancelling the
+   * subscription an upgrade replaces. Without it (or with a live key) that
+   * cancel can't run: the webhook answers 500 and keeps the intent.
+   */
+  STRIPE_SECRET_KEY?: string;
+  /** Test seam for that cancel; defaults to the global fetch. */
+  stripeFetch?: typeof fetch;
 }
 
 /** The price ids that name a tier (from the webhook env, when it has them). */
-export type PriceIds = { team?: string; business?: string };
+export type PriceIds = {
+  team?: string;
+  business?: string;
+  soloMonthly?: string;
+  soloYearly?: string;
+};
 
+/** The price ids of a webhook env, in PriceIds' shape. */
+export const pricesOf = (env: WebhookEnv): PriceIds => ({
+  team: env.STRIPE_PRICE_TEAM,
+  business: env.STRIPE_PRICE_BUSINESS,
+  soloMonthly: env.STRIPE_PRICE_SOLO_MONTHLY,
+  soloYearly: env.STRIPE_PRICE_SOLO_YEARLY,
+});
+
+const anyConfigured = (p: PriceIds): boolean =>
+  Boolean(p.team || p.business || p.soloMonthly || p.soloYearly);
+
+import {
+  cancelSubscription,
+  retrieveSubscription,
+  type StripeConfig,
+} from "./sessions.js";
 import { verifyStripeSignature } from "./signature.js";
 
-export type PaidTier = "team" | "business";
+export type PaidTier = "solo" | "team" | "business";
 export type TierStatus = "active" | "past_due" | "lapsed" | "suspended";
 
 /** The event fields we act on; anything else in Stripe's payload is ignored. */
@@ -66,6 +98,9 @@ export type StripeEvent = {
 
 export const HANDLED = [
   "checkout.session.completed",
+  // A delayed payment method's checkout paid later (#1568): the same change
+  // as a paid completed.
+  "checkout.session.async_payment_succeeded",
   "customer.subscription.created",
   "customer.subscription.updated",
   "customer.subscription.deleted",
@@ -110,7 +145,7 @@ export function customerOf(o: Record<string, unknown>): string | null {
 }
 
 const asTier = (v: unknown): PaidTier | null =>
-  v === "team" || v === "business" ? v : null;
+  v === "solo" || v === "team" || v === "business" ? v : null;
 
 /**
  * A subscription's paid tier, from its current price first, so a plan
@@ -126,7 +161,7 @@ export function tierFromSubscription(
 ): PaidTier | null {
   const items =
     isObj(sub.items) && Array.isArray(sub.items.data) ? sub.items.data : [];
-  const configured = Boolean(prices.team || prices.business);
+  const configured = anyConfigured(prices);
   for (const item of items) {
     if (!isObj(item) || !isObj(item.price)) continue;
     const p = item.price;
@@ -136,7 +171,9 @@ export function tierFromSubscription(
           ? "team"
           : p.id === prices.business
             ? "business"
-            : null
+            : p.id === prices.soloMonthly || p.id === prices.soloYearly
+              ? "solo"
+              : null
         : null;
     // With the configured price ids, only they name a tier; an unknown
     // price falls through to the subscription's metadata.
@@ -158,7 +195,7 @@ export function unknownPrice(
   sub: Record<string, unknown>,
   prices: PriceIds,
 ): boolean {
-  if (!prices.team && !prices.business) return false;
+  if (!anyConfigured(prices)) return false;
   const items =
     isObj(sub.items) && Array.isArray(sub.items.data) ? sub.items.data : [];
   const ids = items.flatMap((i) =>
@@ -168,7 +205,13 @@ export function unknownPrice(
   );
   return (
     ids.length > 0 &&
-    !ids.some((id) => id === prices.team || id === prices.business)
+    !ids.some(
+      (id) =>
+        id === prices.team ||
+        id === prices.business ||
+        id === prices.soloMonthly ||
+        id === prices.soloYearly,
+    )
   );
 }
 
@@ -191,8 +234,20 @@ export function statusFromSubscription(s: unknown): TierStatus | null {
   }
 }
 
-const PAID = "tier IN ('team', 'business')";
-const NOT_PAID = "coalesce(tier, '') NOT IN ('team', 'business')";
+const PAID = "tier IN ('solo', 'team', 'business')";
+/**
+ * The row's current subscription is live: a paid tier's, active, past_due or
+ * suspended (a suspension is ours and keeps the subscription billing),
+ * or (during the 14-day Business trial) the Solo subscription under it, whose
+ * state lives in solo_status.
+ */
+const PREV_LIVE =
+  "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due', 'suspended'))))";
+/** The row is live on a Team or Business subscription. */
+const HOLD =
+  "(tier IN ('team', 'business') AND stripe_subscription_id IS NOT NULL AND status IN ('active', 'past_due', 'suspended'))";
+const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/;
+const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
 /** One column assignment in the row update: SQL and its binds. */
 type Set = { sql: string; args: unknown[] };
@@ -208,6 +263,12 @@ type Set = { sql: string; args: unknown[] };
 export function changeFor(
   ev: StripeEvent,
   prices: PriceIds = {},
+  /**
+   * A checkout's subscription as Stripe reports it when it is adopted:
+   * past_due makes the row past_due with grace from the event (default
+   * active).
+   */
+  adopted: "active" | "past_due" = "active",
 ): Set[] | null {
   const o = ev.object;
   const graceEnd = ev.created * 1000 + GRACE_MS;
@@ -228,14 +289,78 @@ export function changeFor(
     sql: `${col} = CASE WHEN status = 'suspended'${o.paid ? ` OR ${NOT_PAID}` : ""}${o.stale ? " OR ? < coalesce(last_invoice_created, 0)" : ""} THEN ${col} ELSE ${value} END`,
     args: o.stale ? [ev.created, ...args] : args,
   });
+  /**
+   * The Solo subscription's state while the Business trial runs over it
+   * (tier trial): recorded in solo_status and solo_grace_until, so the row
+   * can become Solo when the trial ends. Other rows leave them alone. A
+   * suspended row, or an event older than the last invoice (`stale`), too.
+   */
+  const shadow = (
+    col: string,
+    value: string,
+    args: unknown[] = [],
+    stale = false,
+  ): Set => ({
+    sql: `${col} = CASE WHEN tier = 'trial' AND status IS NOT 'suspended'${stale ? " AND NOT (? < coalesce(last_invoice_created, 0))" : ""} THEN ${value} ELSE ${col} END`,
+    args: stale ? [ev.created, ...args] : args,
+  });
+  /**
+   * A Solo-priced event sets tier solo, except on a row in its Business
+   * trial: that trial is the row's tier until trial_ends_at passes (read
+   * time), and a Solo event never ends it early.
+   */
+  const SOLO_TIER = "tier = CASE WHEN tier = 'trial' THEN tier ELSE 'solo' END";
+  const setTier = (t: PaidTier): Set =>
+    t === "solo"
+      ? { sql: SOLO_TIER, args: [] }
+      : { sql: "tier = ?", args: [t] };
   switch (ev.type) {
-    case "checkout.session.completed": {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded": {
       const sub =
         typeof o.subscription === "string" && SUB_ID.test(o.subscription)
           ? o.subscription
           : null;
       const sets: Set[] = [];
-      if (sub) sets.push({ sql: "stripe_subscription_id = ?", args: [sub] });
+      const payNow =
+        o.payment_status === "paid" ||
+        o.payment_status === "no_payment_required";
+      if (sub) {
+        // The row adopts this subscription: its order keys belong to the one
+        // it replaced, and must not hold the new one's events back. An
+        // unpaid checkout that leaves a live subscription in place resets
+        // nothing.
+        const adopts = payNow
+          ? "1"
+          : `NOT (${PREV_LIVE} AND stripe_subscription_id != ?)`;
+        const adoptArgs = payNow ? [] : [sub];
+        sets.push(
+          {
+            sql: `last_event_created = CASE WHEN ${adopts} THEN ? ELSE last_event_created END`,
+            args: [...adoptArgs, ev.created],
+          },
+          {
+            sql: `last_invoice_created = CASE WHEN ${adopts} AND stripe_subscription_id IS NOT ? THEN NULL ELSE last_invoice_created END`,
+            args: [...adoptArgs, sub],
+          },
+        );
+        // An unpaid checkout (a payment still pending) never takes the row's
+        // live subscription from it: the row switches when the payment
+        // succeeds (async_payment_succeeded). With no live one it records
+        // the pending id, so that subscription's invoices apply (N9c).
+        // A paid (or nothing-to-pay) Checkout means a card is on file: the
+        // no-card trial reminder must skip this install (it keeps
+        // solo_trial_ends_at when the Checkout kept the free days).
+        if (payNow) sets.push({ sql: "solo_checked_out = 1", args: [] });
+        sets.push(
+          payNow
+            ? { sql: "stripe_subscription_id = ?", args: [sub] }
+            : {
+                sql: `stripe_subscription_id = CASE WHEN ${PREV_LIVE} AND stripe_subscription_id != ? THEN stripe_subscription_id ELSE ? END`,
+                args: [sub, sub],
+              },
+        );
+      }
       // Paid (or nothing to pay): active at its tier. Otherwise (an async
       // payment still pending) the status and tier wait for the invoice and
       // subscription events.
@@ -243,14 +368,89 @@ export function changeFor(
         o.payment_status === "paid" ||
         o.payment_status === "no_payment_required"
       ) {
-        sets.push(
-          guarded("status", "'active'"),
-          guarded("grace_until", "NULL"),
-        );
-        const tier = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
-        if (tier) sets.push({ sql: "tier = ?", args: [tier] });
+        const tierNow = isObj(o.metadata) ? asTier(o.metadata.tier) : null;
+        if (adopted === "past_due") {
+          // A Solo on a row in its Business trial: the trial's own status and
+          // grace stay; the Solo's past_due is shadowed below. Anything else
+          // is past_due with grace from the event.
+          const soloUnderTrial = (
+            col: string,
+            value: string,
+            args: unknown[],
+          ) =>
+            tierNow === "solo"
+              ? {
+                  sql: `${col} = CASE WHEN status = 'suspended' OR tier = 'trial' THEN ${col} ELSE ${value} END`,
+                  args,
+                }
+              : guarded(col, value, args);
+          sets.push(
+            soloUnderTrial("status", "'past_due'", []),
+            soloUnderTrial("grace_until", "?", [graceEnd]),
+          );
+        } else
+          sets.push(
+            guarded("status", "'active'"),
+            guarded("grace_until", "NULL"),
+          );
+        const tier = tierNow;
+        if (tier) sets.push(setTier(tier));
+        if (tier === "solo")
+          sets.push(
+            shadow("solo_status", `'${adopted}'`),
+            adopted === "past_due"
+              ? shadow("solo_grace_until", "?", [graceEnd])
+              : shadow("solo_grace_until", "NULL"),
+          );
+        // A Solo checkout that charged now (paid, no trial end passed) ends
+        // the Solo trial then. One that kept the free days
+        // (no_payment_required) keeps it: the new subscription's trialing
+        // event sets the same end.
+        if (tier === "solo" && o.payment_status === "paid")
+          sets.push({
+            sql: "solo_trial_ends_at = ?",
+            args: [ev.created * 1000],
+          });
       }
-      return sets.length ? sets : null;
+      // Only a paid Checkout that adopts its subscription advances the
+      // Checkout order key: an unpaid one (async) or a Solo held by a live
+      // Team leaves the row as it was, and must not make a delayed paid
+      // Checkout look out of order (its subscription would be cancelled).
+      if (payNow && sub)
+        sets.push({
+          sql: "last_checkout_created = ?",
+          args: [ev.created],
+        });
+      // This checkout's session is no longer open.
+      if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
+        sets.push({
+          sql: "open_checkout_id = CASE WHEN open_checkout_id = ? THEN NULL ELSE open_checkout_id END",
+          args: [o.id],
+        });
+      if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
+        sets.push({
+          sql: "open_checkout_key = CASE WHEN open_checkout_id = ? THEN NULL ELSE open_checkout_key END",
+          args: [o.id],
+        });
+      // A Solo checkout that completes on a row live on Team or Business
+      // (two sessions open at once) never replaces it: the row keeps its
+      // subscription, tier and status, and the NEW subscription is queued
+      // for cancel (handleStripeWebhook). The Solo can't downgrade a paying
+      // Team.
+      const soloPaid =
+        payNow && isObj(o.metadata) && asTier(o.metadata.tier) === "solo";
+      return sets.length
+        ? soloPaid
+          ? sets.map((set) => {
+              const at = set.sql.indexOf(" = ");
+              const col = set.sql.slice(0, at);
+              return {
+                sql: `${col} = CASE WHEN ${HOLD} THEN ${col} ELSE ${set.sql.slice(at + 3)} END`,
+                args: set.args,
+              };
+            })
+          : sets
+        : null;
     }
     case "customer.subscription.created":
     case "customer.subscription.updated": {
@@ -266,12 +466,50 @@ export function changeFor(
                 sql: "stripe_subscription_id = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE stripe_subscription_id END",
                 args: [subId],
               },
+              // Its Solo state (kept under a Business trial) goes with it.
+              {
+                sql: "solo_status = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE solo_status END",
+                args: [subId],
+              },
+              {
+                sql: "solo_grace_until = CASE WHEN stripe_subscription_id = ? THEN NULL ELSE solo_grace_until END",
+                args: [subId],
+              },
             ]
           : null;
       }
-      // Only a subscription going live (active) sets the tier.
-      const tier = status === "active" ? tierFromSubscription(o, prices) : null;
-      if (tier) sets.push({ sql: "tier = ?", args: [tier] });
+      // A subscription that is or was live sets the tier: active, or past_due
+      // (it has been live; incomplete never reaches past_due) so a reordered
+      // or Portal-changed past_due update isn't left on the old tier (#1487).
+      // Status and grace stay under their own guards.
+      const tier =
+        status === "active" || status === "past_due"
+          ? tierFromSubscription(o, prices)
+          : null;
+      if (tier) sets.push(setTier(tier));
+      const isSolo = tierFromSubscription(o, prices) === "solo";
+      if (isSolo) {
+        if (status === "active")
+          sets.push(
+            shadow("solo_status", "'active'", [], true),
+            shadow("solo_grace_until", "NULL", [], true),
+          );
+        else if (status === "past_due")
+          sets.push(
+            shadow("solo_status", "'past_due'", [], true),
+            shadow(
+              "solo_grace_until",
+              "coalesce(solo_grace_until, ?)",
+              [graceEnd],
+              true,
+            ),
+          );
+        else if (status === "lapsed")
+          sets.push(
+            shadow("solo_status", "'lapsed'", [], true),
+            shadow("solo_grace_until", "NULL", [], true),
+          );
+      }
       if (status === "active")
         sets.push(
           guarded("status", "'active'", [], { stale: true }),
@@ -290,19 +528,41 @@ export function changeFor(
           guarded("status", "'lapsed'", [], { paid: true, stale: true }),
           guarded("grace_until", "NULL", [], { paid: true, stale: true }),
         );
-      // Stripe's own trial (trialing), when one runs: its end.
+      // Stripe's own trial (trialing), when one runs: its end. Not Solo's:
+      // its 30-day no-card trial must leave trial_ends_at null, or the first
+      // invite could never start the 14-day Business trial (billing's
+      // TRIAL_SQL needs it unset); the Solo trial ends by cancel (lapsed).
       if (o.status === "trialing" && typeof o.trial_end === "number")
-        sets.push({ sql: "trial_ends_at = ?", args: [o.trial_end * 1000] });
+        sets.push({
+          sql: isSolo ? "solo_trial_ends_at = ?" : "trial_ends_at = ?",
+          args: [o.trial_end * 1000],
+        });
+      else if (isSolo && status === "active")
+        // A Solo subscription that is live and not trialing (paid): when it
+        // went live, once. Also what says a Solo subscription id is a live
+        // one, not a pending first payment (/trial/start snapshots only those).
+        sets.push({
+          sql: "solo_trial_ends_at = CASE WHEN solo_trial_ends_at IS NULL OR solo_trial_ends_at > ? THEN ? ELSE solo_trial_ends_at END",
+          args: [ev.created * 1000, ev.created * 1000],
+        });
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
         sets.push({ sql: "stripe_subscription_id = ?", args: [subId] });
       return sets.length ? sets : null;
     }
     case "customer.subscription.deleted":
-      // Ended: read-only on the install at once; nothing is deleted.
+      // Ended: read-only on the install at once; nothing is deleted. A Solo
+      // subscription that ends under a running Business trial is recorded
+      // for when the trial ends.
       return [
         guarded("status", "'lapsed'", [], { paid: true }),
         guarded("grace_until", "NULL", [], { paid: true }),
+        ...(tierFromSubscription(o, prices) === "solo"
+          ? [
+              shadow("solo_status", "'lapsed'"),
+              shadow("solo_grace_until", "NULL"),
+            ]
+          : []),
       ];
     case "invoice.payment_failed":
       // Grace from the first failure; a suspended or lapsed row stays so.
@@ -315,6 +575,16 @@ export function changeFor(
           sql: `grace_until = CASE WHEN status IN ('active', 'past_due') AND ${PAID} THEN coalesce(grace_until, ?) ELSE grace_until END`,
           args: [graceEnd],
         },
+        // Under a running Business trial: the Solo subscription's own state.
+        shadow(
+          "solo_status",
+          "CASE WHEN solo_status IN ('active', 'past_due') THEN 'past_due' ELSE solo_status END",
+        ),
+        shadow(
+          "solo_grace_until",
+          "CASE WHEN solo_status IN ('active', 'past_due') THEN coalesce(solo_grace_until, ?) ELSE solo_grace_until END",
+          [graceEnd],
+        ),
       ];
     case "invoice.paid":
       // Only a past_due row comes back: an old invoice never revives a
@@ -328,6 +598,14 @@ export function changeFor(
           sql: `grace_until = CASE WHEN status = 'past_due' AND ${PAID} THEN NULL ELSE grace_until END`,
           args: [],
         },
+        shadow(
+          "solo_status",
+          "CASE WHEN solo_status = 'past_due' THEN 'active' ELSE solo_status END",
+        ),
+        shadow(
+          "solo_grace_until",
+          "CASE WHEN solo_status = 'past_due' THEN NULL ELSE solo_grace_until END",
+        ),
       ];
     default:
       return null;
@@ -354,6 +632,13 @@ export function subscriptionOf(ev: StripeEvent): string | null {
   }
   return typeof v === "string" && SUB_ID.test(v) ? v : null;
 }
+
+/** A subscription event that ends or lapses the subscription (never takes a first one). */
+const lapses = (ev: StripeEvent): boolean =>
+  ev.type === "customer.subscription.deleted" ||
+  ((ev.type === "customer.subscription.created" ||
+    ev.type === "customer.subscription.updated") &&
+    statusFromSubscription(ev.object.status) === "lapsed");
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 
@@ -413,9 +698,13 @@ const KNOWN =
  * (last_invoice_created), so an invoice never advances the subscription's
  * key and never blocks a later-arriving genuine tier change.
  */
-export type EventStream = "subscription" | "invoice";
+export type EventStream = "subscription" | "invoice" | "checkout";
 export const streamOf = (type: string): EventStream =>
-  type.startsWith("invoice.") ? "invoice" : "subscription";
+  type.startsWith("invoice.")
+    ? "invoice"
+    : type.startsWith("checkout.session.")
+      ? "checkout"
+      : "subscription";
 
 /**
  * Subscription: newer than its last applied event; at the same second,
@@ -423,16 +712,116 @@ export const streamOf = (type: string): EventStream =>
  * it). Invoice: not older than the last invoice applied, nor than the
  * subscription's state (a delayed invoice never undoes a newer change).
  */
-const IN_ORDER: Record<EventStream, string> = {
+const IN_ORDER: Record<Exclude<EventStream, "checkout">, string> = {
   subscription:
     "(?1 > coalesce(last_event_created, 0) OR (?1 = coalesce(last_event_created, 0) AND status IS NOT 'lapsed'))",
   invoice:
     "(?1 >= coalesce(last_invoice_created, 0) AND ?1 >= coalesce(last_event_created, 0))",
 };
+/**
+ * A checkout is ordered against other checkouts only (last_checkout_created):
+ * a newer event for the row's old subscription must not make a delayed
+ * upgrade Checkout stale, or the row never recovers and both subscriptions
+ * bill. An older Checkout still never replaces a newer one. The
+ * subscription-stream rule is kept for a Checkout of the row's own current
+ * subscription (a retry or async_payment_succeeded): it can't revive a lapse.
+ * See handleStripeWebhook for the combined condition.
+ */
+const IN_ORDER_CHECKOUT = "(?1 >= coalesce(last_checkout_created, 0))";
 const ORDER_COLUMN: Record<EventStream, string> = {
   subscription: "last_event_created",
   invoice: "last_invoice_created",
+  checkout: "last_checkout_created",
 };
+
+/**
+ * How long a webhook event id is kept for dedupe: Stripe retries a failed
+ * delivery for up to 3 days, and a signature older than 5 minutes is refused,
+ * so 30 days is a wide margin (#1479).
+ */
+export const STRIPE_EVENT_RETENTION_MS = 30 * 86_400_000;
+
+/**
+ * Deletes the stripe_events rows received more than STRIPE_EVENT_RETENTION_MS
+ * before `now`; answers how many. A pruned id that arrives again is handled
+ * as any event: ordered by `created` against the row, so an old event never
+ * undoes newer state, and recorded again.
+ */
+export async function pruneStripeEvents(
+  db: D1Database,
+  now: number,
+): Promise<number> {
+  const r = await db
+    .prepare("DELETE FROM stripe_events WHERE received_at < ?1")
+    .bind(now - STRIPE_EVENT_RETENTION_MS)
+    .run();
+  return r.meta.changes;
+}
+
+/**
+ * Cancels every subscription queued for this customer (pending_cancels: the
+ * one an upgrade replaced, or a paid one the row did not adopt) and removes
+ * each only after its own cancel succeeded. Idempotent: the cancel repeats
+ * safely. Answers the ids it could not cancel (no or live key, Stripe down):
+ * they are kept, and the webhook answers 500 only when the event itself queued
+ * one of them (Stripe's retry, a replay of the recorded event, runs this
+ * again); any other event still tries and answers 200.
+ */
+async function settleCancels(
+  db: D1Database,
+  customer: string,
+  env: WebhookEnv,
+): Promise<{ id: string; event: string | null }[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT p.subscription_id, p.event_id, t.stripe_subscription_id AS current_id FROM pending_cancels p LEFT JOIN tiers t ON t.stripe_customer_id = p.customer_id WHERE p.customer_id = ?",
+    )
+    .bind(customer)
+    .all<{
+      subscription_id: string;
+      event_id: string | null;
+      current_id: string | null;
+    }>();
+  if (results.length === 0) return [];
+  const cfg: StripeConfig = {
+    secretKey: env.STRIPE_SECRET_KEY ?? "",
+    ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+  };
+  const failed: { id: string; event: string | null }[] = [];
+  for (const { subscription_id: id, event_id, current_id } of results) {
+    // Never the row's own subscription: dropped without a Stripe call (a
+    // queued id can end up current, e.g. a stale queue meeting a later
+    // adoption).
+    if (id === current_id) {
+      await db
+        .prepare(
+          "DELETE FROM pending_cancels WHERE subscription_id = ? AND customer_id = ?",
+        )
+        .bind(id, customer)
+        .run();
+      log("pending_is_current_dropped");
+      continue;
+    }
+    try {
+      await cancelSubscription({ subscriptionId: id }, cfg);
+    } catch {
+      log("cancel_failed");
+      failed.push({ id, event: event_id });
+      continue;
+    }
+    await db
+      .prepare(
+        "DELETE FROM pending_cancels WHERE subscription_id = ? AND customer_id = ?",
+      )
+      .bind(id, customer)
+      .run();
+    log("subscription_canceled");
+  }
+  return failed;
+}
+
+const QUEUE_UNADOPTED =
+  "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
 
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
@@ -476,10 +865,7 @@ export async function handleStripeWebhook(
     log("livemode_ignored");
     return json({ received: true });
   }
-  const change = changeFor(ev, {
-    team: env.STRIPE_PRICE_TEAM,
-    business: env.STRIPE_PRICE_BUSINESS,
-  });
+  let change = changeFor(ev, pricesOf(env));
   const customer = customerOf(ev.object);
   try {
     const db = env.BILLING_DB;
@@ -492,22 +878,12 @@ export async function handleStripeWebhook(
     if (
       (ev.type === "customer.subscription.created" ||
         ev.type === "customer.subscription.updated") &&
-      unknownPrice(ev.object, {
-        team: env.STRIPE_PRICE_TEAM,
-        business: env.STRIPE_PRICE_BUSINESS,
-      })
+      unknownPrice(ev.object, pricesOf(env))
     )
       log("unknown_price");
-    const stream = streamOf(ev.type);
-    const sets = [
-      ...change,
-      { sql: `${ORDER_COLUMN[stream]} = ?`, args: [ev.created] },
-      { sql: "version = version + 1", args: [] },
-      { sql: "updated_at = ?", args: [now] },
-    ];
-    // The sets use plain `?`; the WHERE binds by number after them.
-    const n = sets.reduce((k, s) => k + s.args.length, 0);
-    const isCheckout = ev.type === "checkout.session.completed";
+    const isCheckout =
+      ev.type === "checkout.session.completed" ||
+      ev.type === "checkout.session.async_payment_succeeded";
     // Checkout names the subscription it sets (?n+2); the other events the
     // one they are about.
     const eventSub = isCheckout
@@ -516,12 +892,117 @@ export async function handleStripeWebhook(
         ? ev.object.subscription
         : null
       : subscriptionOf(ev);
-    let order = IN_ORDER[stream].replaceAll("?1", `?${n + 3}`);
-    // A resubscribe's checkout is never "the old subscription revived": in
-    // the same second as the old one's deletion it still applies when its
-    // subscription differs from the row's.
-    if (isCheckout && eventSub)
-      order = `(${order} OR (?${n + 3} = coalesce(last_event_created, 0) AND stripe_subscription_id IS NOT ?${n + 2}))`;
+    // A paid checkout replaces the row's live subscription: read which one
+    // (to queue it for cancel after the update). It is only ever queued when
+    // the row then holds the checkout's subscription, and never the row's
+    // current one, so a stale read can't cancel what is live.
+    const paidSub =
+      isCheckout &&
+      eventSub &&
+      (ev.object.payment_status === "paid" ||
+        ev.object.payment_status === "no_payment_required")
+        ? eventSub
+        : null;
+    // Adopting a subscription different from the row's: read it from Stripe
+    // first and apply its actual state. One that is not live (its deleted or
+    // past_due events arrived first and were dropped) is not adopted and
+    // cancels nothing of the row's; past_due is adopted as past_due. A failed
+    // read (or no or a live key) answers 500 before anything is written, so
+    // Stripe retries. Not needed for the row's own subscription, or a Solo
+    // held by a live Team (it is never adopted).
+    let adopted: "active" | "past_due" = "active";
+    if (paidSub) {
+      const cur = await db
+        .prepare(
+          "SELECT stripe_subscription_id AS id, tier, status FROM tiers WHERE stripe_customer_id = ?",
+        )
+        .bind(customer)
+        .first<{
+          id: string | null;
+          tier: string | null;
+          status: string | null;
+        }>();
+      const heldByTeam =
+        (cur?.tier === "team" || cur?.tier === "business") &&
+        (cur.status === "active" ||
+          cur.status === "past_due" ||
+          cur.status === "suspended");
+      const soloPaid =
+        isObj(ev.object.metadata) && asTier(ev.object.metadata.tier) === "solo";
+      if (cur && cur.id !== paidSub && !(soloPaid && heldByTeam)) {
+        const cfg: StripeConfig = {
+          secretKey: env.STRIPE_SECRET_KEY ?? "",
+          ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+        };
+        let state: string;
+        try {
+          state = (await retrieveSubscription({ subscriptionId: paidSub }, cfg))
+            .status;
+        } catch {
+          log("subscription_read_failed");
+          return json({ error: "unavailable" }, 500);
+        }
+        const live = statusFromSubscription(state);
+        if (live !== "active" && live !== "past_due") {
+          // Not live. Only a TERMINAL state is recorded: canceled and
+          // incomplete_expired can never come back, and a 404 is only taken as
+          // gone once the event is old (Stripe may not have a just-created
+          // subscription yet, like an unknown customer, UNKNOWN_RETRY_S).
+          // Anything else (incomplete, paused, a state we don't know) may
+          // still become live: while the event is young the webhook answers
+          // 500 and Stripe retries; after that it answers 200 without
+          // recording it, so a later resend (a Dashboard resend once it is
+          // active) is read again and adopts it. Never queued: this path
+          // returns before the batch, so nothing is cancelled either way.
+          const young = now / 1000 - ev.created < UNKNOWN_RETRY_S;
+          const terminal =
+            state === "canceled" ||
+            state === "incomplete_expired" ||
+            (state === "missing" && !young);
+          if (!terminal) {
+            log(young ? "subscription_not_live_yet" : "not_live_unrecorded");
+            return young
+              ? json({ error: "unavailable" }, 500)
+              : json({ received: true });
+          }
+          const r = await db.batch([
+            db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
+          ]);
+          log((r[0]?.meta.changes ?? 0) > 0 ? "not_live" : "replay");
+          return json({ received: true });
+        }
+        adopted = live;
+      }
+    }
+    if (adopted !== "active")
+      change = changeFor(ev, pricesOf(env), adopted) ?? change;
+    const stream = streamOf(ev.type);
+    const sets = [
+      ...change,
+      // A checkout sets its own key in changeFor (only when it adopts).
+      ...(stream === "checkout"
+        ? []
+        : [{ sql: `${ORDER_COLUMN[stream]} = ?`, args: [ev.created] }]),
+      { sql: "version = version + 1", args: [] },
+      { sql: "updated_at = ?", args: [now] },
+    ];
+    // The sets use plain `?`; the WHERE binds by number after them.
+    const n = sets.reduce((k, s) => k + s.args.length, 0);
+    const at = `?${n + 3}`;
+    const subOrder = IN_ORDER.subscription.replaceAll("?1", at);
+    const order =
+      stream === "invoice"
+        ? IN_ORDER.invoice.replaceAll("?1", at)
+        : stream === "subscription"
+          ? subOrder
+          : // A Checkout: for another subscription than the row's, only
+            // against other Checkouts (so a resubscribe or a delayed upgrade
+            // applies, an older one never replaces a newer); for the row's
+            // own subscription also the subscription order, so a retried
+            // Checkout can't revive a deleted subscription.
+            eventSub
+            ? `(${IN_ORDER_CHECKOUT.replaceAll("?1", at)} AND (stripe_subscription_id IS NOT ?${n + 2} OR ${subOrder}))`
+            : subOrder;
     // Subscription and invoice events apply only to the row's own
     // subscription (or while it has none: checkout sets it). An invoice
     // naming no subscription (a one-off) never moves the row.
@@ -533,9 +1014,41 @@ export async function handleStripeWebhook(
           eventSub
           ? ` AND stripe_subscription_id = ?${n + 2}`
           : " AND 0"
-        : ` AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?${n + 2})`;
+        : // A lapse (deleted, canceled) must be the row's own subscription: a
+          // row with none is never lapsed by a stray one. Anything else may
+          // also take the first live subscription of a row that has none.
+          lapses(ev)
+          ? ` AND stripe_subscription_id = ?${n + 2}`
+          : ` AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?${n + 2})`;
+    const queue: D1PreparedStatement[] = [];
+    // A paid checkout replaces the row's live subscription. Which one is read
+    // INSIDE the batch, before the update and under the same order and hold
+    // conditions (never the row's current subscription, and never when the
+    // checkout won't be adopted), so concurrent checkouts can't orphan one:
+    // D1 runs a batch as one transaction. The event insert stays the statement
+    // right before the update (its changes() gates the update).
+    const preQueue: D1PreparedStatement[] = paidSub
+      ? [
+          db
+            .prepare(
+              `INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT stripe_subscription_id, stripe_customer_id, ?4 FROM tiers WHERE stripe_customer_id = ?1 AND ${PREV_LIVE} AND stripe_subscription_id != ?2 AND ${IN_ORDER_CHECKOUT.replaceAll("?1", "?3")}${
+                isObj(ev.object.metadata) &&
+                asTier(ev.object.metadata.tier) === "solo"
+                  ? ` AND NOT ${HOLD}`
+                  : ""
+              }`,
+            )
+            .bind(customer, paidSub, ev.created, ev.id),
+        ]
+      : [];
+    // A paid subscription the row did not adopt (an older Checkout, or a Solo
+    // on a live Team) is queued for cancel, in the same batch: never one the
+    // row holds. Runs on a replay too, so a lost queue can't stay lost.
+    if (paidSub)
+      queue.push(db.prepare(QUEUE_UNADOPTED).bind(paidSub, customer, ev.id));
     const res = await db.batch<{ known?: number; install_id?: string }>([
       db.prepare(KNOWN).bind(customer),
+      ...preQueue,
       db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
       db
         .prepare(
@@ -544,6 +1057,7 @@ export async function handleStripeWebhook(
           `UPDATE tiers SET ${sets.map((s) => s.sql).join(", ")} WHERE stripe_customer_id = ?${n + 1} AND changes() = 1${own} AND ${order} RETURNING install_id`,
         )
         .bind(...sets.flatMap((s) => s.args), customer, eventSub, ev.created),
+      ...queue,
     ]);
     if (!res[0]?.results[0]?.known) {
       if (now / 1000 - ev.created < UNKNOWN_RETRY_S) {
@@ -556,13 +1070,22 @@ export async function handleStripeWebhook(
       log("unknown_customer");
       return json({ received: true });
     }
-    if ((res[1]?.meta.changes ?? 0) === 0) {
+    const failed = await settleCancels(db, customer, env);
+    // Only the event's own queued cancels fail it: the replaced subscription
+    // and the paid one the row did not adopt.
+    const settled = !failed.some((f) => f.event === ev.id);
+    const evIdx = 1 + preQueue.length;
+    if ((res[evIdx]?.meta.changes ?? 0) === 0) {
       log("replay");
-      return json({ received: true });
+      return settled
+        ? json({ received: true })
+        : json({ error: "unavailable" }, 500);
     }
-    const install = res[2]?.results[0]?.install_id ?? null;
+    const install = res[evIdx + 1]?.results[0]?.install_id ?? null;
     log(install ? "applied" : "stale", install);
-    return json({ received: true });
+    return settled
+      ? json({ received: true })
+      : json({ error: "unavailable" }, 500);
   } catch {
     // Never the error text: it can carry a D1 message.
     log("db_error");

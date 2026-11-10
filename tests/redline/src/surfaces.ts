@@ -297,6 +297,10 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "owner-only (the broker check): no admin success leg",
   "POST /api/v1/notices/guest_summary/dismiss":
     "owner-only (the guest summary notice, parity 2): no admin success leg",
+  "GET /api/v1/onboarding":
+    "owner-only (the first-run checklist state): no admin success leg",
+  "PUT /api/v1/onboarding":
+    "owner-only (the first-run checklist state): no admin success leg",
   "GET /api/v1/bus/ping":
     "bus-off: 404 on every hosted install (the bus is off until #1299), the same as a refusal; no success leg",
   "GET /api/v1/directory/callback":
@@ -336,6 +340,11 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/bus/links/:id":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // #1346: reached through bus/routes.ts roleWriter, like the link writes.
+  "PUT /api/v1/bus/reach":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/bus/reach/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   // #1372: offered only while the bus is on; never on a hosted install.
   "tool:bus_role_propose":
     "bus-off: the tool isn't offered on a hosted install (the bus is off until #1299)",
@@ -365,6 +374,8 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "DELETE /api/v1/bus/roles/:id",
   "PUT /api/v1/bus/links",
   "DELETE /api/v1/bus/links/:id",
+  "PUT /api/v1/bus/reach",
+  "DELETE /api/v1/bus/reach/:id",
   // #1300: the /bus page's share-notice form, as PUT R.shareNotices. A
   // public-policy page route (PUBLIC_ROUTES), so no org surface or case:
   // the suite probes scoped routes only (coverageGaps' `scoped`).
@@ -377,6 +388,10 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "GET /bus/links/confirm",
   "POST /bus/links/confirm/view",
   "POST /bus/links/confirm",
+  // #1346: the reach confirm page, the same kind (PUBLIC_ROUTES).
+  "GET /bus/reach/confirm",
+  "POST /bus/reach/confirm/view",
+  "POST /bus/reach/confirm",
   // Hosted billing: Checkout, Portal and the usage report open Stripe or
   // reach billing only for a person in a browser session (billing.ts
   // requireBillingManager), so a hook-minted session is 404 here.
@@ -392,6 +407,10 @@ const ROLE_TESTS = "apps/server/test/bus/roles.rest.test.ts";
 const ROLE_D = "roles REST (#1296)";
 const LINK_TESTS = "apps/server/test/bus/links.rest.test.ts";
 const LINK_D = "links REST (#1567)";
+const REACH_TESTS = "apps/server/test/bus/reach.rest.test.ts";
+const REACH_D = "reach REST (#1346)";
+const REACH_GATE_TESTS = "apps/server/test/bus/bus.billing-gate.test.ts";
+const REACH_GATE_D = "role reach for a plan-capped member under %s";
 const PROPOSAL_TESTS = "apps/server/test/bus/roles.proposals.test.ts";
 const PROPOSAL_D = "role proposals over MCP (#1372)";
 
@@ -465,6 +484,28 @@ export const DROPPED: Readonly<
         file: "apps/server/test/notices.test.ts",
         describe: "Me.notices.guestSummary (parity 2)",
         test: "only the uncapped org owner sees it; others get 404 on dismiss",
+      },
+    ],
+  },
+  "org GET /api/v1/onboarding": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/onboarding.test.ts",
+        describe: "R.onboarding",
+        test: "refuses everyone but the owner, and writes nothing",
+      },
+    ],
+  },
+  "org PUT /api/v1/onboarding": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/onboarding.test.ts",
+        describe: "R.onboarding",
+        test: "refuses everyone but the owner, and writes nothing",
       },
     ],
   },
@@ -622,6 +663,52 @@ export const DROPPED: Readonly<
         file: LINK_TESTS,
         describe: LINK_D,
         test: "a PAT may read but never link or unlink; a machine token, guests, capped and anonymous callers get nothing",
+      },
+    ],
+  },
+  // #1346: the matrix grants a role reach (200, or the named conflict while
+  // the caller has no bus or no such role) and removes one (204) in an Access
+  // session. PUT is also refused to a plan-capped member (busConfigCap); DELETE
+  // stays open under a cap, so the gate test covers both.
+  "org PUT /api/v1/bus/reach": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: REACH_TESTS,
+        describe: REACH_D,
+        test: "the member grants, lists, regrants idempotently and removes",
+      },
+      {
+        file: REACH_TESTS,
+        describe: REACH_D,
+        test: "a PAT may read but never grant or remove; a machine token, guests, restricted and anonymous callers get nothing",
+      },
+      {
+        file: REACH_GATE_TESTS,
+        describe: REACH_GATE_D,
+        test: "cannot grant reach, but can still read and remove an existing grant",
+      },
+    ],
+  },
+  "org DELETE /api/v1/bus/reach/:id": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: REACH_TESTS,
+        describe: REACH_D,
+        test: "another member reaches only their own hub",
+      },
+      {
+        file: REACH_TESTS,
+        describe: REACH_D,
+        test: "a PAT may read but never grant or remove; a machine token, guests, restricted and anonymous callers get nothing",
+      },
+      {
+        file: REACH_GATE_TESTS,
+        describe: REACH_GATE_D,
+        test: "cannot grant reach, but can still read and remove an existing grant",
       },
     ],
   },

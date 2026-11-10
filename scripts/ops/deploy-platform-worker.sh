@@ -12,6 +12,7 @@
 #   directory-broker: DIRECTORY_REGISTRY_ID=<32 hex> [GOOGLE_DIRECTORY_CLIENT_ID_PROD=<client id>, prod]
 #   billing: BILLING_DB_ID=<D1 uuid> BROKER_REGISTRY_ID=<32 hex>
 #            STRIPE_PRICE_TEAM=<price_...> STRIPE_PRICE_BUSINESS=<price_...>
+#            STRIPE_PRICE_SOLO_MONTHLY=<price_...> STRIPE_PRICE_SOLO_YEARLY=<price_...>
 #   dispatch: HOSTS_KV_ID=<32 hex>
 #   scheduler: PLATFORM_DB_ID=<uuid> EMAIL_ZONE_TAGS=<32 hex>[,...] (at most 10) EMAIL_DAILY_LIMIT=<1-9 digits>
 #              ALERT_TO=<address> ALERT_FROM=<address> SIGNUP_DAILY_CAP=<1-9999>
@@ -131,6 +132,9 @@ case "$app" in
     # This env's Stripe test-mode price per paid plan (/checkout).
     fill "STRIPE_PRICE_TEAM_${up}" "${STRIPE_PRICE_TEAM:-}" "$price"
     fill "STRIPE_PRICE_BUSINESS_${up}" "${STRIPE_PRICE_BUSINESS:-}" "$price"
+    # Solo's two prices (#1568), one per billing interval.
+    fill "STRIPE_PRICE_SOLO_MONTHLY_${up}" "${STRIPE_PRICE_SOLO_MONTHLY:-}" "$price"
+    fill "STRIPE_PRICE_SOLO_YEARLY_${up}" "${STRIPE_PRICE_SOLO_YEARLY:-}" "$price"
     # Its D1 migrations are pinned once deployed: the lock must be frozen and
     # match every file (MIGRATION_LOCK overrides the lock path, tests only).
     node ../../scripts/ops/check-migration-lock.mjs migrations "${MIGRATION_LOCK:-migration-lock.json}"

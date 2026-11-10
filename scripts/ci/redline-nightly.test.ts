@@ -244,11 +244,12 @@ describe("redline-nightly.yml", () => {
   // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
   const w: any = parse(text);
 
-  // Until cut-over step F5 (#1056) the schedule is off here, so the public
-  // repo's copy is the only one running it. A manual run here is not a
-  // scheduled run: it would run P30 and fire its alert, so do not dispatch it.
-  it("has no schedule yet (F5); dispatch only", () => {
-    expect(Object.keys(w.on)).toEqual(["workflow_dispatch"]);
+  // The public repo's copy no longer runs (cut-over F5, #1056), so this is
+  // the only schedule. A dispatched run is not a scheduled run: it would run
+  // P30 and fire its alert, so do not dispatch it by hand.
+  it("runs on the nightly cron, and by dispatch", () => {
+    expect(Object.keys(w.on)).toEqual(["schedule", "workflow_dispatch"]);
+    expect(w.on.schedule).toEqual([{ cron: "17 3 * * *" }]);
     expect(w.permissions).toEqual({});
   });
 

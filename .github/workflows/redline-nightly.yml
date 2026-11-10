@@ -11,11 +11,9 @@
 # replaces it, so a nightly waits 3 h after any candidate run.
 name: redline-nightly
 
-# The nightly schedule (cron "17 3 * * *") is off in this repo until the
-# cut-over step F5 (#1056): the public repo's copy still runs it, and two
-# nightlies would double-run. Dispatch by hand until then. (A dispatched run
-# is not a scheduled run: the red-line gate counts only scheduled ones.)
 on:
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions: {}

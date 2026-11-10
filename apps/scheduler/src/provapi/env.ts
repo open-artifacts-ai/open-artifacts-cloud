@@ -21,6 +21,12 @@ export interface ProvapiEnv {
   ALERT_TO?: string;
   /** The sender, on a domain the account sends from. */
   ALERT_FROM?: string;
+  /** oa-<p>-billing (Solo trial ends for the trial reminder); unbound: no reminders. */
+  BILLING?: Fetcher;
+  /** Sends the trial-ending reminder to the owner (any address); unbound: none. */
+  REMINDER_EMAIL?: SendEmail;
+  /** The reminder's sender, on a domain the account sends from. */
+  REMINDER_FROM?: string;
   /** The provisioner's self-serve daily cap; unset or 0 means no cap alert. */
   SIGNUP_DAILY_CAP?: string;
   /** The producer of oa-<p>-signups (the provisioner consumes it). */
@@ -37,6 +43,8 @@ export interface ProvapiEnv {
   FLEET_SMOKE?: string;
   /** The smoke's share check: "off" skips it; anything else runs it. */
   FLEET_SMOKE_SHARE?: string;
+  /** The smoke's bus check (#1299): "off" skips it; anything else runs it. */
+  FLEET_SMOKE_BUS?: string;
   /** The passive soak in minutes with FLEET_SMOKE "off"; unset is 15. */
   FLEET_SOAK_MIN?: string;
   /** smoke's PAT on the canary (secret, #1343 smoke.ts); unset: never smoked. */

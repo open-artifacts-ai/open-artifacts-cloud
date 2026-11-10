@@ -35,16 +35,21 @@ describe("wrangler.jsonc", () => {
         AUTH_BROKER_ORIGIN: `https://auth.${zone}`,
         DIRECTORY_BROKER_ORIGIN: `https://directory.${zone}`,
       });
-      // The gate's bindings: this env's two brokers, never the other env's.
-      expect(JSON.stringify(e.services)).not.toContain("BILLING");
+      // The gate's bindings: this env's two brokers, never the other env's;
+      // and BILLING on STAGING only (#1568: oa-s-billing, deployed first, and
+      // bound on the scheduler too). Prod has none: no billing gate is built.
+      expect(JSON.stringify(e.services).includes("BILLING")).toBe(
+        env === "staging",
+      );
       expect(e.services).toEqual([
         { binding: "AUTH_BROKER", service: platformNames(env).broker },
         {
           binding: "DIRECTORY_BROKER",
           service: platformNames(env).directoryBroker,
         },
-        // No BILLING binding yet: it and the billing deploy target land
-        // together in the cloud repo. Without it no billing gate is built.
+        ...(env === "staging"
+          ? [{ binding: "BILLING", service: platformNames(env).billing }]
+          : []),
       ]);
       expect(e.dispatch_namespaces).toEqual([
         { binding: "DISPATCHER", namespace: NAMESPACES[env] },

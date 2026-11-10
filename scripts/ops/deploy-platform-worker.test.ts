@@ -888,6 +888,8 @@ describe("deploy-platform-worker.sh", () => {
     const PRICES = {
       STRIPE_PRICE_TEAM: "price_1TeamAbc",
       STRIPE_PRICE_BUSINESS: "price_1BizXyz",
+      STRIPE_PRICE_SOLO_MONTHLY: "price_1SoloMo",
+      STRIPE_PRICE_SOLO_YEARLY: "price_1SoloYr",
     };
 
     for (const env of ["staging", "prod"] as const)
@@ -915,6 +917,12 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(
           `"STRIPE_PRICE_BUSINESS": "${PRICES.STRIPE_PRICE_BUSINESS}"`,
         );
+        expect(snap).toContain(
+          `"STRIPE_PRICE_SOLO_MONTHLY": "${PRICES.STRIPE_PRICE_SOLO_MONTHLY}"`,
+        );
+        expect(snap).toContain(
+          `"STRIPE_PRICE_SOLO_YEARLY": "${PRICES.STRIPE_PRICE_SOLO_YEARLY}"`,
+        );
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         // Only this env's placeholders are filled.
         const other = env === "staging" ? "PROD" : "STAGING";
@@ -922,6 +930,8 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`{{BROKER_REGISTRY_ID_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_TEAM_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_BUSINESS_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_SOLO_MONTHLY_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_SOLO_YEARLY_${other}}}`);
         expect(r.out + r.err).not.toContain(DB);
         expect(r.out + r.err).not.toContain(REG);
         expect(existsSync(join(DIR, "wrangler.deploy.jsonc"))).toBe(false);
@@ -960,6 +970,9 @@ describe("deploy-platform-worker.sh", () => {
         {},
         { STRIPE_PRICE_TEAM: PRICES.STRIPE_PRICE_TEAM },
         { STRIPE_PRICE_BUSINESS: PRICES.STRIPE_PRICE_BUSINESS },
+        { ...PRICES, STRIPE_PRICE_SOLO_MONTHLY: "" },
+        { ...PRICES, STRIPE_PRICE_SOLO_YEARLY: "prod_1Abc" },
+        { ...PRICES, STRIPE_PRICE_SOLO_MONTHLY: "price_1Abc&x" },
         { ...PRICES, STRIPE_PRICE_TEAM: "" },
         { ...PRICES, STRIPE_PRICE_TEAM: "prod_1Abc" },
         { ...PRICES, STRIPE_PRICE_TEAM: "price_1Abc/x" },
@@ -981,7 +994,6 @@ describe("deploy-platform-worker.sh", () => {
       const pins = pinsOf();
       const first = Object.keys(pins)[0] as string;
       for (const [why, lock] of [
-        ["the repo's own lock (not frozen until the first deploy)", undefined],
         ["not frozen", lockAt("open.json", { frozen: false, pins })],
         [
           "a migration not pinned",
@@ -1010,6 +1022,11 @@ describe("deploy-platform-worker.sh", () => {
         expect(r.code, why).toBe(1);
         expect(r.log, why).toEqual([]);
       }
+    });
+
+    it("the repo's own lock is frozen and holds: the first deploy needs no other lock (#1568)", () => {
+      const r = run(["billing", "staging"], { ...PRICES, ...IDS });
+      expect(r.code, r.err).toBe(0);
     });
   });
 });

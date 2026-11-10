@@ -17,6 +17,7 @@ import {
 } from "../../../../packages/provision/test/fixtures/release.js";
 import { JOB_ERROR_TEXT, LOG_DETAIL_MAX } from "../../src/errors.js";
 import { jobStep } from "../../src/steps.js";
+import { welcomeEmail } from "../../src/welcome.js";
 import { REACHABLE_MS, runCreate } from "../../src/workflow.js";
 import {
   EMAIL,
@@ -43,6 +44,11 @@ vi.mock(
     },
   }),
 );
+
+vi.mock("../../src/welcome.js", async (orig) => {
+  const m = await orig<typeof import("../../src/welcome.js")>();
+  return { ...m, welcomeEmail: vi.fn(m.welcomeEmail) };
+});
 
 const app = (slug: string) => `${slug}.${HOSTED_DOMAINS[ENV].app}`;
 const plain = (w: World, id: string, name: string) =>
@@ -182,6 +188,8 @@ describe("ProvisionInstall: create", () => {
     expect(w.mail).toHaveLength(1);
     expect(w.mail[0]).toMatchObject({ to: EMAIL });
     expect(w.mail[0]?.text).toContain(`https://${app("welcomeco")}`);
+    expect(w.mail[0]?.html).toContain(`https://${app("welcomeco")}/`);
+    expect(w.mail[0]?.subject).toBe(`${app("welcomeco")} is ready`);
     expect(w.signup(s.signupId)).toMatchObject({
       status: "ready",
       welcome_claimed_at: expect.any(Number),
@@ -195,6 +203,50 @@ describe("ProvisionInstall: create", () => {
     expect(r.log.find((l) => l.name === "notify")?.output).toEqual({
       sent: false,
     });
+  });
+
+  it("welcomeEmail throws: no claim taken, install finishes, welcome_unsent can see it", async () => {
+    const s = seedCreate(w, { slug: "badwel", sendWelcome: true });
+    vi.mocked(welcomeEmail).mockImplementationOnce(() => {
+      throw new Error("invalid app host");
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = await run(w, s.jobId);
+    expect(r.error).toBeNull();
+    expect(w.mail).toHaveLength(0);
+    expect(err).toHaveBeenCalledWith(
+      "welcome email not built",
+      expect.objectContaining({ signupId: s.signupId }),
+    );
+    err.mockRestore();
+    // Owed (send_welcome = 1, ready, never sent) and the claim is free.
+    expect(w.signup(s.signupId)).toMatchObject({
+      status: "ready",
+      send_welcome: 1,
+      welcome_claimed_at: null,
+      welcome_sent_at: null,
+    });
+  });
+
+  it("admin create with sendWelcome gets neutral copy; self-serve gets Solo copy", async () => {
+    const a = seedCreate(w, {
+      slug: "adminwel",
+      sendWelcome: true,
+      vars: { AUTH_PROVIDERS: "email", AUTH_DOMAINS: "", TIER: "team" },
+    });
+    expect((await run(w, a.jobId)).error).toBeNull();
+    const m = w.mail[0];
+    expect(m?.text).not.toMatch(/Google|Solo|\$1|you created/);
+    expect(m?.html).not.toMatch(/Google|Solo|\$1|you created/);
+    const s = seedCreate(w, {
+      slug: "ssowel",
+      source: "self-serve",
+      tier: "trial",
+      sendWelcome: true,
+    });
+    expect((await run(w, s.jobId)).error).toBeNull();
+    expect(w.mail.at(-1)?.text).toContain("You're on Solo");
+    expect(w.mail.at(-1)?.text).toContain("Google account");
   });
 
   it("codes on: the env widget's pair is passed (cf.turnstileList, cf.turnstileWidget)", async () => {

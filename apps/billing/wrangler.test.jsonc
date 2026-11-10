@@ -7,7 +7,12 @@
   "vars": {
     "OA_ENV": "staging",
     "STRIPE_PRICE_TEAM": "price_team1",
-    "STRIPE_PRICE_BUSINESS": "price_business1"
+    "STRIPE_PRICE_BUSINESS": "price_business1",
+    "STRIPE_PRICE_SOLO_MONTHLY": "price_soloM1",
+    "STRIPE_PRICE_SOLO_YEARLY": "price_soloY1",
+    // A fake test-mode key, for the provisioner RPC tests that reach the
+    // entrypoint through a stub (its env is this file's).
+    "STRIPE_SECRET_KEY": "sk_test_FAKEfakeFAKEfake0123456789"
   },
   "kv_namespaces": [{ "binding": "BROKER_REGISTRY", "id": "registry-test" }],
   "d1_databases": [

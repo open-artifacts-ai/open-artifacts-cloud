@@ -57,6 +57,11 @@
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
+        // #1299: the smoke's bus check (GET /api/v1/bus/ping). "off" while
+        // the /bus routes are gated on hosted installs (HOSTED=1); the PR
+        // that lifts the gate sets "on", so a bus that is down then halts
+        // the release.
+        "FLEET_SMOKE_BUS": "off",
         // The passive soak with the smoke off, in minutes.
         "FLEET_SOAK_MIN": "15",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts-staging.app",
@@ -64,12 +69,14 @@
       },
       // The BrokerGate stubs each install call carries (see the gate), and
       // the provisioner's RPC entrypoint (tokenStatus for the token alerts).
-      // No BILLING binding yet: it and the billing deploy target land
-      // together in the cloud repo. Without it the calls carry no billing
-      // gate and the */2 billing health check does nothing.
+      // BILLING (#1568): STAGING ONLY, bound with dispatch's together; the
+      // calls then carry the billing gate and the */2 billing health check
+      // runs. oa-s-billing must be deployed first (the billing target). Prod
+      // has no BILLING binding: the check does nothing there.
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-s-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
+        { "binding": "BILLING", "service": "oa-s-billing" },
         {
           "binding": "PROVISIONER",
           "service": "oa-s-provisioner",
@@ -141,6 +148,11 @@
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
+        // #1299: the smoke's bus check (GET /api/v1/bus/ping). "off" while
+        // the /bus routes are gated on hosted installs (HOSTED=1); the PR
+        // that lifts the gate sets "on", so a bus that is down then halts
+        // the release.
+        "FLEET_SMOKE_BUS": "off",
         // The passive soak with the smoke off, in minutes.
         "FLEET_SOAK_MIN": "60",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts.app",

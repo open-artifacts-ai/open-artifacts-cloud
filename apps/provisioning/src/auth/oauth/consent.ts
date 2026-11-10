@@ -22,6 +22,7 @@ import {
   SESSION_RENEW_UNDER_MS,
   sessionPrincipal,
 } from "../session.js";
+import { adminSessionTtlMs } from "../session-ttl.js";
 import { oauthAudit } from "./audit.js";
 import { capped } from "./endpoints.js";
 import {
@@ -71,6 +72,7 @@ async function consentTokenOk(
 const chrome = (env: Env): Chrome => ({
   env: env.OA_ENV,
   adminHost: adminHost(env),
+  sessionTtlMs: adminSessionTtlMs(env),
 });
 
 /** RL_PV_OAUTH_IP by ipKey on the consent routes (9A.7); a refusal page or null. */

@@ -2313,7 +2313,7 @@ describe("#1343: the canary smoke gates the rollout", () => {
     const { canary, rest } = await settled();
     const f = fakes({
       canary,
-      smoke: [{ ok: true, notes: ["bus: skipped, hub not bound"] }],
+      smoke: [{ ok: true, notes: ["bus: skipped, FLEET_SMOKE_BUS off"] }],
     });
     const lines = captureLogs(vi.spyOn);
     await fleetDue(f.env, NOW, f.opts);
@@ -2323,7 +2323,7 @@ describe("#1343: the canary smoke gates the rollout", () => {
     ]);
     // The note is logged by name; no token, body or address.
     expect(lines).toContain(
-      `provapi fleet smoke passed ${canary} ${TARGET} bus: skipped, hub not bound`,
+      `provapi fleet smoke passed ${canary} ${TARGET} bus: skipped, FLEET_SMOKE_BUS off`,
     );
   });
 
@@ -2721,6 +2721,23 @@ describe("#1343: canary_blocked waits out the off-mode soak", () => {
     },
     fleetTicksTimeout(26),
   );
+});
+
+describe("#1299: FLEET_SMOKE_BUS reaches the smoke", () => {
+  for (const [v, bus] of [
+    ["off", false],
+    [undefined, true],
+    ["on", true],
+    ["Off", true],
+  ] as const)
+    it(`FLEET_SMOKE_BUS ${String(v)}: bus ${bus}`, async () => {
+      const canary = await on(TARGET, { created: 0 });
+      await soaked(canary);
+      const f = fakes({ canary });
+      if (v !== undefined) Object.assign(f.env, { FLEET_SMOKE_BUS: v });
+      await fleetDue(f.env, NOW, f.opts);
+      expect(f.smokes[0]?.bus).toBe(bus);
+    });
 });
 
 describe("#1343: FLEET_SMOKE_SHARE reaches the smoke", () => {

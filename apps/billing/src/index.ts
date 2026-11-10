@@ -20,21 +20,39 @@
 // over the exact body text, and the body's `ts` is within ASSERTION_SKEW_MS.
 // Anything else is 401 bad_signature and writes nothing.
 //
+// The provisioner starts an install's 30-day no-card Solo trial through a named
+// RPC entrypoint, BillingProvisionerRpc.soloStart (service binding with
+// entrypoint "BillingProvisionerRpc"), never an HTTP route: the provisioner
+// holds no install key to sign one with. The install must be in BROKER_REGISTRY
+// (its entry is written by the provisioner; KV is eventually consistent, so an
+// unknown install is a retryable answer). #1568.
+//
 // POST /stripe/webhook is the one public route (internet traffic, with
 // cf-connecting-ip). @oa/billing-core's handleStripeWebhook reads the raw
 // body once and checks its Stripe-Signature itself, so billing never reads
 // the body first. A missing STRIPE_WEBHOOK_SECRET (a Worker secret) is 500
 // config, body unread. Any other method or path stays the plain 404.
 //
+// A daily cron prunes stripe_events older than 30 days (#1479).
+//
 // Logs carry fixed categories and install ids only: never bodies, headers or
 // URLs.
 
+import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   type CheckoutTier,
   createCheckoutSession,
   createCustomer,
   createPortalSession,
+  createSoloTrialSubscription,
+  expireCheckoutSession,
   handleStripeWebhook,
+  pruneStripeEvents,
+  SOLO_START_RETRYABLE,
+  SOLO_TRIAL_DAYS,
+  type SoloStartError,
+  type SoloStartResult,
+  type SoloStartView,
   StripeApiError,
   type StripeConfig,
   StripeConfigError,
@@ -63,6 +81,9 @@ export interface Env {
   /** The env's Stripe price ids, one per paid plan (placeholders, filled at deploy). */
   STRIPE_PRICE_TEAM: string;
   STRIPE_PRICE_BUSINESS: string;
+  /** Solo's two prices (#1568): $1/month and $12/year, one per interval. */
+  STRIPE_PRICE_SOLO_MONTHLY: string;
+  STRIPE_PRICE_SOLO_YEARLY: string;
 }
 
 export { TRIAL_MS };
@@ -88,6 +109,7 @@ interface TierRow {
   status: string | null;
   trial_ends_at: number | null;
   grace_until: number | null;
+  solo_trial_ends_at: number | null;
   version: number;
 }
 
@@ -95,10 +117,11 @@ interface TierRow {
 function view(r: TierRow | null, now: number) {
   if (!r)
     return {
-      tier: "free",
+      tier: "solo",
       status: "active",
       trialEndsAt: null,
       graceUntil: null,
+      soloTrialEndsAt: null,
       version: 0,
       asOf: now,
     };
@@ -107,21 +130,53 @@ function view(r: TierRow | null, now: number) {
     status: r.status,
     trialEndsAt: r.trial_ends_at,
     graceUntil: r.grace_until,
+    // The Solo subscription's own trial end. trialEndsAt stays the 14-day
+    // Business trial's: the server's trial eligibility is trialEndsAt === null.
+    // Only while it is still ahead: once past it is null (the column keeps it).
+    soloTrialEndsAt:
+      r.solo_trial_ends_at !== null && r.solo_trial_ends_at > now
+        ? r.solo_trial_ends_at
+        : null,
     version: r.version,
     asOf: now,
   };
 }
 
-const COLS = "tier, status, trial_ends_at, grace_until, version";
+const COLS =
+  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, version";
 // The read records last_read_at on the install's own row and writes nothing
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;
 const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
-// Only free/active with no trial before: a trial never starts twice.
-// No row is the free/active default, so a trial can start from it too (an
-// install made before create writes rows); an existing row moves only from
-// free/active, and only once (trial_ends_at stays set after).
-const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier = 'free' AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+// Only solo/active (or free, the pre-Solo value) with no trial before: the
+// 14-day Business trial never starts twice. No row is the solo/active default,
+// so a trial can start from it too (an install made before create writes
+// rows); an existing row moves only from solo/free and active, and only once
+// (trial_ends_at stays set after). The Solo subscription under it is kept as
+// solo_status active only when it is known live: a stored id plus
+// solo_trial_ends_at (set by the Solo trial start, a Solo trialing or active event, or a
+// paid Solo checkout); an id with none is a pending first payment. Solo's own
+// 30-day no-card trial is a Stripe
+// subscription and never sets trial_ends_at, so it doesn't use this up.
+const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, solo_status = CASE WHEN tiers.stripe_subscription_id IS NOT NULL AND tiers.solo_trial_ends_at IS NOT NULL THEN 'active' END, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
+// The 14-day Business trial ended (trial_ends_at, set once, stays set so it
+// never restarts): the row is Solo again, active while the Solo subscription
+// it kept (solo_status, recorded by the webhook while the trial ran) is
+// alive, lapsed if not or if there never was one. A change made only by time
+// passing, so it bumps version here: the install stores an answer only when
+// its version is higher. One UPDATE, idempotent (it needs tier trial), run at
+// the start of every read and answer. A suspended row stays suspended.
+const MATERIALIZE_SQL = `UPDATE tiers SET tier = 'solo', status = CASE WHEN status = 'suspended' THEN status WHEN solo_status IN ('active', 'past_due') THEN solo_status ELSE 'lapsed' END, grace_until = CASE WHEN status = 'suspended' THEN grace_until WHEN solo_status = 'past_due' THEN solo_grace_until END, version = version + 1, updated_at = ?2 WHERE install_id = ?1 AND tier = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at <= ?2`;
+const materialize = (db: D1Database, install: string, now: number) =>
+  db.prepare(MATERIALIZE_SQL).bind(install, now).run();
+const OPEN_SQL =
+  "SELECT open_checkout_id, open_checkout_key FROM tiers WHERE install_id = ?1";
+const STORE_OPEN_SQL =
+  "UPDATE tiers SET open_checkout_id = ?1, open_checkout_key = ?2 WHERE install_id = ?3 AND open_checkout_id IS ?4 AND open_checkout_key IS ?5 RETURNING 1 AS ok";
+const SOLO_HELD_SQL =
+  "SELECT tier, status, stripe_subscription_id, solo_trial_ends_at FROM tiers WHERE install_id = ?1";
+const SOLO_TRIAL_MS = SOLO_TRIAL_DAYS * 86_400_000;
+const SOLO_START_SQL = `UPDATE tiers SET tier = 'solo', stripe_subscription_id = ?2, solo_trial_ends_at = ?3, version = version + 1, updated_at = ?4 WHERE install_id = ?1 AND tier IN ('solo', 'free') AND solo_trial_ends_at IS NULL AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?2) RETURNING ${COLS}`;
 const USAGE_SQL =
   "INSERT INTO usage (install_id, month, creators_json, count, received_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (install_id, month) DO UPDATE SET creators_json = excluded.creators_json, count = excluded.count, received_at = excluded.received_at";
 
@@ -204,7 +259,7 @@ const mismatched = (body: Record<string, unknown>, install: string) =>
 
 /** Each signed POST's allowed body keys; any other field is 400 bad_body. */
 const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
-  "/checkout": ["install", "ts", "plan"],
+  "/checkout": ["install", "ts", "plan", "interval"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
@@ -212,24 +267,32 @@ const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
 /** Only a Stripe-hosted page is ever passed back. */
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
 const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
+/** Stripe: a Checkout trial_end must be 48 hours out; plus a safety hour. */
+const MIN_TRIAL_END_MS = 49 * 3_600_000;
 /** billing-core's price id shape; checked before any customer is made. */
 const PRICE_ID = /^price_[A-Za-z0-9]{1,255}$/;
 
-// The free/active row, created first when missing (as /trial/start does).
+// The solo/active row, created first when missing (as /trial/start does).
 // Version 0 is what GET /tier shows for no row, so the view is unchanged.
 const ENSURE_ROW_SQL =
-  "INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, 'free', 'active', 0, ?2) ON CONFLICT (install_id) DO NOTHING";
+  "INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, 'solo', 'active', 0, ?2) ON CONFLICT (install_id) DO NOTHING";
 const CUSTOMER_SQL =
   "SELECT stripe_customer_id FROM tiers WHERE install_id = ?1";
 const SUBSCRIPTION_SQL =
-  "SELECT stripe_subscription_id, status, tier FROM tiers WHERE install_id = ?1";
+  "SELECT stripe_subscription_id, status, tier, solo_trial_ends_at, solo_status FROM tiers WHERE install_id = ?1";
 // Only where none is mapped yet: a concurrent winner's id is kept.
 const MAP_CUSTOMER_SQL =
   "UPDATE tiers SET stripe_customer_id = ? WHERE install_id = ? AND stripe_customer_id IS NULL";
 
 /** A Stripe failure, as the route's answer (logged by category only). */
 class StripeFailure {
-  constructor(public res: Response) {}
+  constructor(
+    public res: Response,
+    /** The same failure as a fixed code (the provisioner RPC's answers). */
+    public code: "config" | "retry" | "bad_upstream" | "upstream",
+    /** Stripe's HTTP status, when it answered one (not a network error). */
+    public status?: number,
+  ) {}
 }
 
 /**
@@ -243,20 +306,24 @@ async function stripe<T>(install: string, fn: () => Promise<T>): Promise<T> {
   } catch (e) {
     if (e instanceof StripeConfigError) {
       console.error("billing stripe config", install);
-      throw new StripeFailure(bad("config", 500));
+      throw new StripeFailure(bad("config", 500), "config");
     }
     // An idempotent request still in progress (a concurrent call with the
     // same key): the caller may retry it.
     if (e instanceof StripeApiError && e.status === 409) {
       console.error("billing stripe retry", install);
-      throw new StripeFailure(bad("retry", 503));
+      throw new StripeFailure(bad("retry", 503), "retry");
     }
     if (e instanceof StripeApiError && e.type === "bad_answer") {
       console.error("billing stripe bad_upstream", install);
-      throw new StripeFailure(bad("bad_upstream", 502));
+      throw new StripeFailure(bad("bad_upstream", 502), "bad_upstream");
     }
     console.error("billing stripe upstream", install);
-    throw new StripeFailure(bad("upstream", 502));
+    throw new StripeFailure(
+      bad("upstream", 502),
+      "upstream",
+      e instanceof StripeApiError ? e.status : undefined,
+    );
   }
 }
 
@@ -320,11 +387,26 @@ async function checkout(
   appHost: string,
   body: Record<string, unknown>,
 ) {
-  const { plan } = body;
-  if (plan !== "team" && plan !== "business") return bad("bad_plan");
+  const { plan, interval } = body;
+  if (plan !== "solo" && plan !== "team" && plan !== "business")
+    return bad("bad_plan");
+  // Solo names its billing interval; no other plan takes one (the shared
+  // BillingCheckoutInput contract).
+  if (
+    plan === "solo"
+      ? interval !== "month" && interval !== "year"
+      : interval !== undefined
+  )
+    return bad("bad_plan");
   const tier: CheckoutTier = plan;
   const priceId =
-    tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
+    plan === "solo"
+      ? interval === "month"
+        ? env.STRIPE_PRICE_SOLO_MONTHLY
+        : env.STRIPE_PRICE_SOLO_YEARLY
+      : plan === "team"
+        ? env.STRIPE_PRICE_TEAM
+        : env.STRIPE_PRICE_BUSINESS;
   // An unfilled or malformed price never gets as far as a customer.
   if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
     console.error("billing stripe config", install);
@@ -338,17 +420,50 @@ async function checkout(
       stripe_subscription_id: string | null;
       status: string;
       tier: string | null;
+      solo_trial_ends_at: number | null;
+      solo_status: string | null;
     }>();
-  // A live paid subscription (a trial or free row with an id is an
-  // unfinished first payment: it may retry), or a suspended one.
+  // A live Team or Business subscription is changed in the Portal, and so is
+  // a suspended one. A live Solo subscription (its own row's, or, during the
+  // 14-day Business trial, the one kept in solo_status) refuses a second Solo
+  // (a card is added through Checkout only while it is still the no-card
+  // trial, #1568) but is upgraded through Checkout: the webhook cancels it
+  // once the Team or Business subscription is paid, so there is never a
+  // double bill. A trial or free row whose id is an unfinished first payment
+  // may retry.
+  const heldSolo = held?.tier === "solo" || held?.tier === "trial";
+  const soloState = held?.tier === "trial" ? held.solo_status : held?.status;
+  const soloLive =
+    Boolean(held?.stripe_subscription_id) &&
+    heldSolo &&
+    (soloState === "active" || soloState === "past_due");
+  const inSoloTrial =
+    soloLive &&
+    soloState === "active" &&
+    held?.solo_trial_ends_at != null &&
+    held.solo_trial_ends_at > Date.now();
   if (
     held?.stripe_subscription_id &&
     (held.status === "suspended" ||
       ((held.tier === "team" || held.tier === "business") &&
-        (held.status === "active" || held.status === "past_due")))
+        (held.status === "active" || held.status === "past_due")) ||
+      (plan === "solo" && soloLive && !inSoloTrial))
   ) {
     console.log("billing checkout subscription_exists", install);
     return bad("subscription_exists", 409);
+  }
+  // Solo's prices are for a Solo (or pre-Solo free, or trial) instance: the
+  // server checks this first; billing keeps it too, so a Team or Business
+  // row never gets a Solo session.
+  if (
+    plan === "solo" &&
+    held?.tier &&
+    held.tier !== "solo" &&
+    held.tier !== "free" &&
+    held.tier !== "trial"
+  ) {
+    console.log("billing checkout plan_conflict", install);
+    return bad("plan_conflict", 409);
   }
   const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
   const customerId = await customerFor(
@@ -358,21 +473,80 @@ async function checkout(
     Date.now(),
   );
   const base = `https://${appHost}/settings/billing`;
+  // Paying during the no-card Solo trial keeps the free days: the new
+  // subscription's trial ends where the old one's does, so no money moves
+  // until then and the card is collected. Stripe needs trial_end at least 48
+  // hours ahead (checked here with a safety hour for the time it takes to
+  // arrive); with less left the Checkout charges now.
+  const now = Date.now();
+  const trialEnd =
+    plan === "solo" &&
+    inSoloTrial &&
+    held?.solo_trial_ends_at != null &&
+    held.solo_trial_ends_at - now >= MIN_TRIAL_END_MS
+      ? Math.floor(held.solo_trial_ends_at / 1000)
+      : undefined;
+  // Plan (and Solo's interval) in the key: the same ts with another plan is a
+  // new session, never Stripe's 400 for a reused key with other params.
+  const idempotencyKey =
+    plan === "solo"
+      ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
+      : `checkout-${install}-${tier}-${body.ts}`;
+  // Only the newest Checkout can be paid: the install's open session (kept
+  // below) is expired first. A retry with the same key is the same session
+  // (Stripe replays it), so it is not expired. Order matters for a crash: the
+  // expire comes first, so a crash after it leaves nothing open (the next
+  // try finds it expired and makes one); a crash after the create but before
+  // the id is stored leaves one unknown open session, which the webhook
+  // still handles (the later paid session wins, the earlier is cancelled).
+  const open = await env.BILLING_DB.prepare(OPEN_SQL).bind(install).first<{
+    open_checkout_id: string | null;
+    open_checkout_key: string | null;
+  }>();
+  if (open?.open_checkout_id && open.open_checkout_key !== idempotencyKey) {
+    const sessionId = open.open_checkout_id;
+    await stripe(install, () => expireCheckoutSession({ sessionId }, cfg));
+  }
   const s = await stripe(install, () =>
     createCheckoutSession(
       {
         customerId,
         priceId,
         tier,
+        ...(trialEnd === undefined ? {} : { trialEnd }),
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
-        // Plan in the key: the same ts with another plan is a new session,
-        // never Stripe's 400 for a reused key with other params.
-        idempotencyKey: `checkout-${install}-${tier}-${body.ts}`,
+        idempotencyKey,
       },
       cfg,
     ),
   );
+  // Store it, only if no other call stored its own meanwhile; the loser
+  // expires its session and answers 409 checkout_in_progress (a new request
+  // then expires the winner's: the later call wins).
+  const stored = await env.BILLING_DB.prepare(STORE_OPEN_SQL)
+    .bind(
+      s.id,
+      idempotencyKey,
+      install,
+      open?.open_checkout_id ?? null,
+      open?.open_checkout_key ?? null,
+    )
+    .first();
+  if (!stored) {
+    const now2 = await env.BILLING_DB.prepare(OPEN_SQL)
+      .bind(install)
+      .first<{ open_checkout_id: string | null }>();
+    if (now2?.open_checkout_id !== s.id) {
+      await stripe(install, () =>
+        expireCheckoutSession({ sessionId: s.id }, cfg),
+      ).catch(() => undefined);
+      console.log("billing checkout lost_race", install);
+      // 409, not 503: the server retries a 503 automatically with the same
+      // request (the same key), which would return this dead session's URL.
+      return bad("checkout_in_progress", 409);
+    }
+  }
   return answer(install, "checkout", s.url, CHECKOUT_URL);
 }
 
@@ -415,9 +589,54 @@ function answer(install: string, route: string, url: string, host: RegExp) {
 }
 
 async function tier(db: D1Database, install: string, now: number) {
+  await materialize(db, install, now);
   const r = await db.prepare(READ_SQL).bind(install, now).first<TierRow>();
   console.log("billing tier", r ? "row" : "default", install);
   return Response.json(view(r, now));
+}
+
+// Solo trials ending in (from, to], oldest install id first, after a cursor.
+// Only a live no-card Solo trial: a Solo row (or a Solo kept live under the
+// 14-day Business trial, tier trial with solo_status active), active, that
+// never checked out. Another tier, a lapsed or suspended status, a Solo that
+// paid (solo_trial_ends_at is then past) and one that checked out during the
+// trial (it keeps solo_trial_ends_at but has a card, solo_checked_out) never
+// match.
+const SOLO_ENDING_SQL =
+  "SELECT install_id, solo_trial_ends_at FROM tiers WHERE ((tier = 'solo' AND status = 'active') OR (tier = 'trial' AND status = 'active' AND solo_status = 'active')) AND solo_checked_out IS NULL AND solo_trial_ends_at > ?1 AND solo_trial_ends_at <= ?2 AND install_id > ?3 ORDER BY install_id LIMIT ?4";
+const SOLO_ENDING_MAX = 200;
+
+/** GET /solo/trial-ending?from=<ms>&to=<ms>[&after=<install>][&limit=<n>]. */
+async function soloTrialEnding(db: D1Database, q: URLSearchParams) {
+  const num = (k: string) => {
+    const v = q.get(k);
+    return v !== null && /^\d{1,15}$/.test(v) ? Number(v) : null;
+  };
+  const from = num("from");
+  const to = num("to");
+  const after = q.get("after") ?? "";
+  const limit = Math.min(num("limit") ?? 100, SOLO_ENDING_MAX);
+  if (
+    from === null ||
+    to === null ||
+    to < from ||
+    limit < 1 ||
+    (after !== "" && !INSTALL_ID.test(after))
+  )
+    return bad("bad_query");
+  const { results } = await db
+    .prepare(SOLO_ENDING_SQL)
+    .bind(from, to, after, limit)
+    .all<{ install_id: string; solo_trial_ends_at: number }>();
+  console.log("billing solo trial-ending", results.length);
+  return Response.json({
+    installs: results.map((r) => ({
+      installId: r.install_id,
+      trialEndsAt: r.solo_trial_ends_at,
+    })),
+    next:
+      results.length === limit ? (results.at(-1)?.install_id ?? null) : null,
+  });
 }
 
 async function trialStart(
@@ -427,6 +646,7 @@ async function trialStart(
   now: number,
 ) {
   if (mismatched(body, install)) return bad("install_mismatch", 403);
+  await materialize(db, install, now);
   const started = await db
     .prepare(TRIAL_SQL)
     .bind(install, now + TRIAL_MS, now)
@@ -439,6 +659,151 @@ async function trialStart(
   const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
   console.log("billing trial unchanged", install);
   return Response.json(view(r, now));
+}
+
+/**
+ * The Solo plan's 30-day no-card trial, made through the Stripe API (no
+ * Checkout visit), for the provisioner's RPC (BillingProvisionerRpc.soloStart,
+ * #1568). Idempotent per install: the subscription is keyed
+ * solo-trial-<install>, and nothing is created when the row already holds a
+ * subscription or ever had a Solo trial (an "ok" answer all the same). A row
+ * on team, business or trial is plan_conflict; a lapsed, past_due or
+ * suspended one is not_active, with no customer and no Stripe call. Answers a
+ * result; a StripeFailure or a D1 error is the caller's to classify.
+ */
+async function soloStartCore(
+  env: Env,
+  install: string,
+  now: number,
+): Promise<SoloStartResult> {
+  const priceId = env.STRIPE_PRICE_SOLO_MONTHLY;
+  if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
+    console.error("billing stripe config", install);
+    return soloFail("config");
+  }
+  const db = env.BILLING_DB;
+  await materialize(db, install, now);
+  const held = await db.prepare(SOLO_HELD_SQL).bind(install).first<{
+    tier: string | null;
+    status: string | null;
+    stripe_subscription_id: string | null;
+    solo_trial_ends_at: number | null;
+  }>();
+  if (held?.tier && held.tier !== "solo" && held.tier !== "free") {
+    console.log("billing solo plan_conflict", install);
+    return soloFail("plan_conflict");
+  }
+  // A lapsed, past_due or suspended row gets no trial and no Stripe call (a
+  // missing row is an active Solo by default).
+  if (held && held.status !== "active") {
+    console.log("billing solo not_active", install);
+    return soloFail("not_active");
+  }
+  const unchanged = async (): Promise<SoloStartResult> => {
+    const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
+    console.log("billing solo unchanged", install);
+    return soloOk(view(r, now));
+  };
+  // One trial per install, and nothing beside a subscription already there.
+  if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
+    return unchanged();
+  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const customerId = await customerFor(db, install, cfg, now);
+  const sub = await stripe(install, () =>
+    createSoloTrialSubscription(
+      { customerId, priceId, idempotencyKey: `solo-trial-${install}` },
+      cfg,
+    ),
+  );
+  // Only where no subscription is stored yet (or it is this one: a webhook
+  // that got here first), and only once: concurrent starts bump the version
+  // once.
+  const started = await db
+    .prepare(SOLO_START_SQL)
+    .bind(install, sub.id, now + SOLO_TRIAL_MS, now)
+    .first<TierRow>();
+  if (started) {
+    console.log("billing solo started", install);
+    return soloOk(view(started, now));
+  }
+  return unchanged();
+}
+
+const soloFail = (error: SoloStartError): SoloStartResult => ({
+  ok: false,
+  error,
+  retryable: SOLO_START_RETRYABLE[error],
+});
+const soloOk = (v: ReturnType<typeof view>): SoloStartResult => ({
+  ok: true,
+  tier: v.tier as SoloStartView["tier"],
+  status: v.status as SoloStartView["status"],
+  trialEndsAt: v.trialEndsAt,
+  graceUntil: v.graceUntil,
+  soloTrialEndsAt: v.soloTrialEndsAt,
+  version: v.version,
+  asOf: v.asOf,
+});
+
+/**
+ * The provisioner's call, as a module function (the class below must hold
+ * nothing else: Workers RPC exposes every public method). Validates the id,
+ * requires the install in BROKER_REGISTRY, runs the core, and turns every
+ * outcome into a result: it never throws.
+ */
+async function provisionerSoloStart(
+  env: Env,
+  install: unknown,
+): Promise<SoloStartResult> {
+  if (typeof install !== "string" || !INSTALL_ID.test(install))
+    return soloFail("bad_install");
+  const now = Date.now();
+  try {
+    // The provisioner writes the entry before it calls; KV takes time to show
+    // it, so "not there" is retryable.
+    if (!(await lookupInstall(env.BROKER_REGISTRY, install, now))) {
+      console.log("billing solo unknown_install", install);
+      return soloFail("unknown_install");
+    }
+    return await soloStartCore(env, install, now);
+  } catch (e) {
+    if (e instanceof StripeFailure) {
+      // A 4xx Stripe refused outright (other than 409, in progress, and 408,
+      // 424 and 429, which may pass) will not change by retrying: a revoked or restricted
+      // key, a bad price, a missing customer. The HTTP routes keep answering
+      // 502 upstream; only this RPC tells the caller apart. A fixed category
+      // and the status number, never Stripe's text.
+      if (
+        e.code === "upstream" &&
+        e.status !== undefined &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 429 &&
+        e.status !== 408 &&
+        e.status !== 424
+      ) {
+        console.error("billing solo stripe_refused", install, e.status);
+        return soloFail("stripe_refused");
+      }
+      return soloFail(e.code);
+    }
+    // Never the error text: it can carry a D1 message.
+    console.error("billing solo_start db_error", install);
+    return soloFail("unavailable");
+  }
+}
+
+/**
+ * The provisioner's RPC entrypoint (a service binding with
+ * `entrypoint: "BillingProvisionerRpc"`). Workers RPC exposes every public
+ * method of a WorkerEntrypoint and TS `private` is not enforced at runtime, so
+ * this class has exactly one method, delegating to a module function; no
+ * helpers on the class (a test pins the prototype).
+ */
+export class BillingProvisionerRpc extends WorkerEntrypoint<Env> {
+  soloStart(install: string): Promise<SoloStartResult> {
+    return provisionerSoloStart(this.env, install);
+  }
 }
 
 async function usage(
@@ -470,6 +835,7 @@ async function usage(
 const GATE = new Set([
   "GET /tier",
   "GET /health",
+  "GET /solo/trial-ending",
   "POST /trial/start",
   "POST /usage",
   "POST /checkout",
@@ -501,6 +867,9 @@ export default {
           STRIPE_WEBHOOK_SECRET: secret,
           STRIPE_PRICE_TEAM: env.STRIPE_PRICE_TEAM,
           STRIPE_PRICE_BUSINESS: env.STRIPE_PRICE_BUSINESS,
+          STRIPE_PRICE_SOLO_MONTHLY: env.STRIPE_PRICE_SOLO_MONTHLY,
+          STRIPE_PRICE_SOLO_YEARLY: env.STRIPE_PRICE_SOLO_YEARLY,
+          STRIPE_SECRET_KEY: env.STRIPE_SECRET_KEY,
         },
         Date.now(),
       );
@@ -512,6 +881,16 @@ export default {
       return notFound();
     }
     if (route === "GET /health") return Response.json({ ok: true });
+    // The scheduler's trial-reminder read (no install: it lists them). The
+    // gate's allowlist never forwards this path, so only a raw binding gets here.
+    if (route === "GET /solo/trial-ending") {
+      try {
+        return await soloTrialEnding(env.BILLING_DB, url.searchParams);
+      } catch {
+        console.error("billing db_error");
+        return bad("unavailable", 503);
+      }
+    }
     // The install is the gate's header and nothing else.
     const install = req.headers.get(GATE_INSTALL_HEADER);
     if (install === null || !INSTALL_ID.test(install)) {
@@ -552,6 +931,19 @@ export default {
       // Never the error text: it can carry a D1 message.
       console.error("billing db_error", install);
       return bad("unavailable", 503);
+    }
+  },
+  // The daily cron (wrangler.jsonc triggers): prune the webhook dedupe table
+  // (#1479). A failure is logged by category only and retried by the next run.
+  async scheduled(controller, env) {
+    try {
+      const n = await pruneStripeEvents(
+        env.BILLING_DB,
+        controller.scheduledTime,
+      );
+      console.log("billing prune stripe_events", n);
+    } catch {
+      console.error("billing prune db_error");
     }
   },
 } satisfies ExportedHandler<Env>;

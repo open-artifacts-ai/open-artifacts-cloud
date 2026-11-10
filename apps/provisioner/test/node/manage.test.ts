@@ -18,12 +18,23 @@ import {
   TEST_PUBKEY,
 } from "../../../../packages/provision/test/fixtures/release.js";
 import { seedRelease } from "../../../../packages/provision/test/r2-memory.js";
+import type { Env } from "../../../provisioning/src/env.js";
+import { liveClaim } from "../../../provisioning/src/routes/create.js";
+import {
+  claimAccount,
+  claimedByOther,
+} from "../../../provisioning/src/routes/writes.js";
 import {
   fleetConditions,
   fleetRequestId,
 } from "../../../scheduler/src/provapi/fleet.js";
 import { JOB_ERROR_TEXT } from "../../src/errors.js";
-import { GRACE_MS, NEVER_ROUTED, runManage } from "../../src/manage.js";
+import {
+  GRACE_MS,
+  NEVER_ROUTED,
+  PURGE_STEP,
+  runManage,
+} from "../../src/manage.js";
 import {
   CLOSE_SOCKETS_FAILED,
   CLOSE_SOCKETS_JOB,
@@ -796,6 +807,238 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     });
     expect(r.error).toBeNull();
     expect(w.install(s.installId)?.state).toBe("deleted");
+  });
+
+  // The provisioning API's own create-path queries, over the same platform D1
+  // (R4: liveClaim refuses a second install; claimAccount takes the account).
+  const papi = () => ({ PLATFORM_DB: w.ctx.env.PLATFORM_DB }) as unknown as Env;
+  /** A re-sign-up as R4 runs it: "signup_limit" while a live claim holds, else "claimed" or "lost" (guard). */
+  const signUpAgain = async (sub: string, signupId: string) => {
+    if (await liveClaim(papi(), sub)) return "signup_limit";
+    return w.ctx.env.PLATFORM_DB.batch(
+      claimAccount(papi(), sub, signupId, w.clock.t),
+    ).then(
+      () => "claimed",
+      () => "lost",
+    );
+  };
+  const claim = (sub: string | null) =>
+    w.get(
+      "SELECT signup_id, freed_at FROM signup_accounts WHERE owner_sub = ?",
+      sub,
+    ) as { signup_id: string; freed_at: number | null } | undefined;
+
+  it("purging a deleted self-serve install frees its account; the same account signs up again (#1046)", async () => {
+    const s = await active({
+      slug: "freeco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    expect(claim(sub)?.freed_at).toBeNull();
+    await manage("delete", s.installId);
+    // Deleted but not purged: the claim holds.
+    expect(claim(sub)?.freed_at).toBeNull();
+    expect(await signUpAgain(sub, "signup-2")).toBe("signup_limit");
+    expect(await claimedByOther(papi(), sub, "signup-2")).toBe(true);
+    w.clock.t += GRACE_MS;
+    expect(
+      (await manage("purge", s.installId, { actor: "system" })).error,
+    ).toBeNull();
+    expect(w.install(s.installId)?.state).toBe("deleted");
+    expect(claim(sub)?.freed_at).toEqual(expect.any(Number));
+    expect(await claimedByOther(papi(), sub, "signup-2")).toBe(false);
+    expect(await signUpAgain(sub, "signup-2")).toBe("claimed");
+    expect(claim(sub)).toEqual({ signup_id: "signup-2", freed_at: null });
+  });
+
+  it("an admin purge of a suspended self-serve install keeps its claim, and logs it (#1046)", async () => {
+    const s = await active({
+      slug: "banco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    await manage("suspend", s.installId, { args: { reason: "abuse" } });
+    await manage("delete", s.installId);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect((await manage("purge", s.installId)).error).toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.any(String), s.installId);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(w.install(s.installId)?.state).toBe("deleted");
+    expect(claim(sub)?.freed_at).toBeNull();
+    expect(await signUpAgain(sub, "signup-ban")).toBe("signup_limit");
+  });
+
+  it("purging one self-serve install leaves another install's live claim held", async () => {
+    const a = await active({
+      slug: "twina",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const b = await active({
+      slug: "twinb",
+      source: "self-serve",
+      tier: "trial",
+    });
+    expect(a.sub).not.toBe(b.sub);
+    await manage("delete", a.installId);
+    w.clock.t += GRACE_MS;
+    expect(
+      (await manage("purge", a.installId, { actor: "system" })).error,
+    ).toBeNull();
+    expect(claim(a.sub as string)?.freed_at).toEqual(expect.any(Number));
+    expect(claim(b.sub as string)?.freed_at).toBeNull();
+    expect(await signUpAgain(b.sub as string, "signup-b2")).toBe(
+      "signup_limit",
+    );
+  });
+
+  it("the purge's free step re-run after a new signup took the account does not free that claim", async () => {
+    const s = await active({
+      slug: "replayco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    await manage("delete", s.installId);
+    w.clock.t += GRACE_MS;
+    const id = seedJob(w, {
+      kind: "purge",
+      installId: s.installId,
+      actor: "system",
+    });
+    // The isolate dies after the unroute step's body (which freed the claim),
+    // before its result is stored.
+    const results = new Map<string, unknown>();
+    const first = stepRunner(w.clock, { results, evictAfter: "unroute" });
+    void runManage(w.ctx, event(id), first.step);
+    await first.evicted;
+    expect(claim(sub)?.freed_at).toEqual(expect.any(Number));
+    expect(await signUpAgain(sub, "signup-3")).toBe("claimed");
+    // The engine replays the stored steps and runs unroute again from its
+    // start: the free statement re-runs.
+    const again = stepRunner(w.clock, { results });
+    await runManage(w.ctx, event(id), again.step);
+    expect(
+      again.log.find((l) => l.name === "unroute")?.replayed,
+    ).toBeUndefined();
+    expect(w.job(id)?.status).toBe("done");
+    expect(claim(sub)).toEqual({ signup_id: "signup-3", freed_at: null });
+    // Same through a body run twice in one attempt (a lost result).
+    const t = await active({
+      slug: "twiceco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    await manage("delete", t.installId);
+    w.clock.t += GRACE_MS;
+    await manage("purge", t.installId, { actor: "system", twice: true });
+    expect(claim(t.sub)?.freed_at).toEqual(expect.any(Number));
+    expect(await signUpAgain(t.sub as string, "signup-4")).toBe("claimed");
+    expect(claim(t.sub)).toEqual({ signup_id: "signup-4", freed_at: null });
+  });
+
+  it("a purge whose delete fails for good (revoke_pending retries exhausted) leaves the claim held", async () => {
+    const s = await active({
+      slug: "stuckco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    await manage("delete", s.installId);
+    w.clock.t += GRACE_MS;
+    // The directory revoke never settles: every delete attempt ends in
+    // revoke_pending until the step's retries run out.
+    w.fake.revoker = () => {};
+    const r = await manage("purge", s.installId, { actor: "system" });
+    expect(r.error).not.toBeNull();
+    expect(r.log.filter((l) => l.name === "unroute" && l.error)).toHaveLength(
+      PURGE_STEP.retries.limit + 1,
+    );
+    expect(w.install(s.installId)?.state).toBe("deleting");
+    expect(claim(sub)).toEqual({
+      signup_id: expect.any(String),
+      freed_at: null,
+    });
+    expect(await signUpAgain(sub, "signup-6")).toBe("signup_limit");
+  });
+
+  it("a self-serve create that failed WITH an installs row (prod_dirty) keeps its claim until its purge frees it", async () => {
+    const s = seedCreate(w, {
+      slug: "dirtyfree",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    w.fake.settingsEdit = (_s, b) => [...b, { name: "EXTRA", type: "service" }];
+    await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
+      () => {},
+    );
+    expect(w.job(s.jobId)?.error_code).toBe("prod_dirty");
+    expect(w.install(s.installId)?.state).toBe("creating");
+    // The settle keeps the claim: an installs row exists.
+    expect(claim(sub)?.freed_at).toBeNull();
+    expect(await signUpAgain(sub, "signup-5")).toBe("signup_limit");
+    const purge = w.get<{ id: string }>(
+      "SELECT id FROM jobs WHERE install_id = ? AND kind = 'purge'",
+      s.installId,
+    );
+    expect(purge).toBeDefined();
+    w.fake.settingsEdit = undefined;
+    await runManage(
+      w.ctx,
+      event(purge?.id as string),
+      stepRunner(w.clock).step,
+    );
+    expect(w.job(purge?.id as string)?.status).toBe("done");
+    expect(w.install(s.installId)?.state).toBe("deleted");
+    expect(claim(sub)?.freed_at).toEqual(expect.any(Number));
+    expect(await signUpAgain(sub, "signup-5")).toBe("claimed");
+  });
+
+  it("a self-serve create that failed without an installs row frees its claim at once (settle's FREE_ACCOUNT, unchanged)", async () => {
+    const s = seedCreate(w, {
+      slug: "nover2",
+      source: "self-serve",
+      tier: "trial",
+      version: "0.30.0",
+    });
+    const sub = s.sub as string;
+    await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step).catch(
+      () => {},
+    );
+    expect(w.job(s.jobId)?.error_code).toBe("release_not_published");
+    expect(w.install(s.installId)).toBeUndefined();
+    expect(claim(sub)?.freed_at).toEqual(expect.any(Number));
+    expect(await signUpAgain(sub, "signup-6")).toBe("claimed");
+  });
+
+  it("purging an install whose account was never claimed is a no-op", async () => {
+    const s = await active({ slug: "noclaimco" });
+    expect(s.sub).toBeNull();
+    w.db
+      .prepare(
+        "INSERT INTO signup_accounts (owner_sub, signup_id, created_at) VALUES ('other', 'other-signup', 1)",
+      )
+      .run();
+    await manage("delete", s.installId);
+    w.clock.t += GRACE_MS;
+    expect(
+      (await manage("purge", s.installId, { actor: "system" })).error,
+    ).toBeNull();
+    expect(w.install(s.installId)?.state).toBe("deleted");
+    expect(w.all("SELECT * FROM signup_accounts")).toEqual([
+      {
+        owner_sub: "other",
+        signup_id: "other-signup",
+        created_at: 1,
+        freed_at: null,
+      },
+    ]);
   });
 
   it("purge is refused on an active install (delete accepts active; the recheck is the guard)", async () => {
@@ -1984,6 +2227,29 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
         }),
       },
     ]);
+  });
+
+  it("a rollback the product refuses (no previous version) fails invalid_state: one job.failed row with that code, as job:<id>, and the install unchanged", async () => {
+    const s = await active({ slug: "norollco", version: V1 });
+    const before = w.install(s.installId);
+    const r = await manage("rollback", s.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(r.job).toMatchObject({
+      status: "failed",
+      error_code: "invalid_state",
+    });
+    expect(jobAudits(s.installId, "rollback", "job.failed")).toEqual([
+      {
+        actor: `job:${r.id}`,
+        detail: JSON.stringify({
+          code: "invalid_state",
+          jobId: r.id,
+          kind: "rollback",
+        }),
+      },
+    ]);
+    expect(w.install(s.installId)).toEqual(before);
   });
 
   it("a failed create is audited job.failed", async () => {

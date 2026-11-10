@@ -6,6 +6,9 @@
 // through the `lane-exit.<name>` file scripts/redline.ts writes when a lane's
 // child closes.
 //
+// "prov-done" is never marked: it is released by the prov lane's exit alone
+// (waitFor("prov-done", { orLaneExit: "prov" })).
+//
 // Off unless scripts/redline.ts set REDLINE_BARRIER_DIR (a plan with lanes),
 // so a lone vitest run, the local pair and the unit tests never wait.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -13,7 +16,7 @@ import { join } from "node:path";
 import { InfraError } from "./fetch-timeout.ts";
 
 /** The barriers lanes may name (test/lanes.test.ts reads this list). */
-export const BARRIERS = ["broker-done"] as const;
+export const BARRIERS = ["broker-done", "prov-done"] as const;
 export type BarrierName = (typeof BARRIERS)[number];
 
 export const BARRIER_DIR_ENV = "REDLINE_BARRIER_DIR";

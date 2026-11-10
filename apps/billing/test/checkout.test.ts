@@ -31,6 +31,8 @@ const baseEnv = (): Env => ({
   STRIPE_SECRET_KEY: SECRET,
   STRIPE_PRICE_TEAM: "price_team1",
   STRIPE_PRICE_BUSINESS: "price_business1",
+  STRIPE_PRICE_SOLO_MONTHLY: "price_soloM1",
+  STRIPE_PRICE_SOLO_YEARLY: "price_soloY1",
 });
 let env = baseEnv();
 
@@ -49,6 +51,7 @@ beforeAll(async () => {
 // ------------------------------------------------------------ fake Stripe
 
 type StripeCall = {
+  method: string;
   path: string;
   key: string | null;
   auth: string | null;
@@ -79,6 +82,7 @@ function fakeStripe(override?: Override) {
         throw new Error(`unexpected fetch ${url.origin}`);
       const h = new Headers(init?.headers);
       const c: StripeCall = {
+        method: String(init?.method),
         path: url.pathname,
         key: h.get("idempotency-key"),
         auth: h.get("authorization"),
@@ -87,6 +91,17 @@ function fakeStripe(override?: Override) {
       calls.push(c);
       const o = await override?.(c);
       if (o) return o;
+      // A Checkout session read or expire (an open session is expired before
+      // another is made).
+      const sess =
+        /^\/v1\/checkout\/sessions\/(cs_[A-Za-z0-9_]+)(\/expire)?$/.exec(
+          c.path,
+        );
+      if (sess)
+        return Response.json({
+          id: sess[1],
+          status: sess[2] ? "expired" : "open",
+        });
       const k = `${c.path} ${c.key}`;
       if (!replay.has(k)) {
         n++;
@@ -94,15 +109,17 @@ function fakeStripe(override?: Override) {
           k,
           c.path === "/v1/customers"
             ? { id: `cus_fake${n}` }
-            : c.path === "/v1/checkout/sessions"
-              ? {
-                  id: `cs_test_${n}`,
-                  url: `https://checkout.stripe.com/c/pay/cs_test_${n}`,
-                }
-              : {
-                  id: `bps_${n}`,
-                  url: `https://billing.stripe.com/p/session/test_${n}`,
-                },
+            : c.path === "/v1/subscriptions"
+              ? { id: `sub_fake${n}`, object: "subscription" }
+              : c.path === "/v1/checkout/sessions"
+                ? {
+                    id: `cs_test_${n}`,
+                    url: `https://checkout.stripe.com/c/pay/cs_test_${n}`,
+                  }
+                : {
+                    id: `bps_${n}`,
+                    url: `https://billing.stripe.com/p/session/test_${n}`,
+                  },
         );
       }
       return Response.json(replay.get(k));
@@ -220,7 +237,7 @@ const CUSTOMERS = "/v1/customers";
 // ------------------------------------------------------------ tests
 
 describe("POST /checkout", () => {
-  it("no row: makes the free row, creates and maps the customer, then the session; answers {url} only", async () => {
+  it("no row: makes the solo row, creates and maps the customer, then the session; answers {url} only", async () => {
     const s = fakeStripe();
     const ts = Date.now();
     const r = await call(req("/checkout", { install: A, ts, plan: "team" }));
@@ -244,7 +261,7 @@ describe("POST /checkout", () => {
     });
     for (const c of s.calls) expect(c.auth).toBe(`Bearer ${SECRET}`);
     expect(await rowOf(A)).toMatchObject({
-      tier: "free",
+      tier: "solo",
       status: "active",
       version: 0,
       stripe_customer_id: "cus_fake1",
@@ -505,7 +522,11 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now, plan: "team" })),
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
-    expect(rs.map((r) => r.status)).toEqual([200, 200]);
+    // Two Checkouts at once leave one open session: the later store wins and
+    // the other answers 409 checkout_in_progress (#1568); neither fails otherwise.
+    const codes = rs.map((r) => r.status);
+    expect(codes).toContain(200);
+    for (const c of codes) expect([200, 409]).toContain(c);
     const cust = s.calls.filter((c) => c.path === CUSTOMERS);
     expect(new Set(cust.map((c) => c.key))).toEqual(new Set([`cust-${A}`]));
     const mapped = await customerOf(A);
@@ -534,7 +555,11 @@ describe("POST /checkout", () => {
       call(req("/checkout", { install: A, ts: now, plan: "team" })),
       call(req("/checkout", { install: A, ts: now + 1, plan: "team" })),
     ]);
-    expect(rs.map((r) => r.status)).toEqual([200, 200]);
+    // Two Checkouts at once leave one open session: the later store wins and
+    // the other answers 409 checkout_in_progress (#1568); neither fails otherwise.
+    const codes = rs.map((r) => r.status);
+    expect(codes).toContain(200);
+    for (const c of codes) expect([200, 409]).toContain(c);
     const mapped = await customerOf(A);
     expect(mapped).toMatch(/^cus_race[12]$/);
     expect(
@@ -561,6 +586,15 @@ describe("POST /checkout", () => {
       [{ install: A, plan: "free" }, 400, "bad_plan"],
       [{ install: A, plan: "trial" }, 400, "bad_plan"],
       [{ install: A }, 400, "bad_plan"],
+      // Solo names its interval; no other plan takes one.
+      [{ install: A, plan: "solo" }, 400, "bad_plan"],
+      [{ install: A, plan: "solo", interval: "week" }, 400, "bad_plan"],
+      [
+        { install: A, plan: "solo", interval: "month", extra: 1 },
+        400,
+        "bad_body",
+      ],
+      [{ install: A, plan: "team", interval: "month" }, 400, "bad_plan"],
       [{ install: A, plan: "team", ts: Date.now() + 0.5 }, 400, "bad_body"],
       [{ plan: "team" }, 403, "install_mismatch"],
       [{ install: B, plan: "team" }, 403, "install_mismatch"],
@@ -570,6 +604,167 @@ describe("POST /checkout", () => {
     }
     expect(s.calls).toEqual([]);
     expect(await rowOf(A)).toBeNull();
+  });
+});
+
+describe("POST /checkout, Solo (#1568)", () => {
+  it("solo month and year use their own prices, tag tier solo, and key the session by interval", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    for (const [interval, price] of [
+      ["month", "price_soloM1"],
+      ["year", "price_soloY1"],
+    ] as const) {
+      const r = await call(
+        req("/checkout", { install: A, ts, plan: "solo", interval }),
+      );
+      expect(r.status, interval).toBe(200);
+      const c = s.calls.filter((x) => x.path === CHECKOUT).at(-1);
+      expect(c?.form["line_items[0][price]"]).toBe(price);
+      expect(c?.form["metadata[tier]"]).toBe("solo");
+      expect(c?.form["subscription_data[metadata][tier]"]).toBe("solo");
+      expect(c?.form["line_items[0][quantity]"]).toBe("1");
+      expect(c?.key).toBe(`checkout-${A}-solo-${interval}-${ts}`);
+    }
+    // Same ts, two intervals: two keys, so never Stripe's 400 for a reused key.
+    expect(
+      new Set(s.calls.filter((x) => x.path === CHECKOUT).map((x) => x.key))
+        .size,
+    ).toBe(2);
+  });
+
+  it("an unfilled or malformed Solo price: 500 config before any customer; the other plans' prices are not asked", async () => {
+    for (const [interval, e] of [
+      [
+        "month",
+        { STRIPE_PRICE_SOLO_MONTHLY: "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}" },
+      ],
+      ["month", { STRIPE_PRICE_SOLO_MONTHLY: undefined }],
+      ["year", { STRIPE_PRICE_SOLO_YEARLY: "prod_1abc" }],
+    ] as const) {
+      const s = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval }),
+        { ...baseEnv(), ...e } as Env,
+      );
+      expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+      expect(s.calls).toEqual([]);
+      expect(await rowOf(A)).toBeNull();
+      vi.restoreAllMocks();
+    }
+    // The yearly price being unfilled does not stop a monthly checkout.
+    fakeStripe();
+    const ok = await call(
+      req("/checkout", { install: A, plan: "solo", interval: "month" }),
+      { ...baseEnv(), STRIPE_PRICE_SOLO_YEARLY: "{{x}}" },
+    );
+    expect(ok.status).toBe(200);
+  });
+
+  it("a live Stripe key or no key is 500 config for Solo too, with no Stripe call", async () => {
+    await seed(A, "cus_existingA", "solo");
+    const s = fakeStripe();
+    for (const e of [
+      { STRIPE_SECRET_KEY: undefined },
+      { STRIPE_SECRET_KEY: "sk_live_abcdefgh12345678" },
+      { STRIPE_SECRET_KEY: "rk_live_abcdefgh12345678" },
+    ]) {
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval: "year" }),
+        { ...baseEnv(), ...e },
+      );
+      expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+    }
+    expect(s.calls).toEqual([]);
+  });
+
+  it("a live subscription refuses a second one: Solo on Solo, anything on Team or Business: 409 subscription_exists, no Stripe call", async () => {
+    for (const status of ["active", "past_due"]) {
+      for (const [held, plan] of [
+        ["solo", "solo"],
+        ["team", "team"],
+        ["team", "solo"],
+        ["business", "team"],
+      ] as const) {
+        await seed(A, "cus_existingA", held);
+        await db
+          .prepare(
+            "UPDATE tiers SET stripe_subscription_id = 'sub_live1', status = ?1 WHERE install_id = ?2",
+          )
+          .bind(status, A)
+          .run();
+        const s = fakeStripe();
+        const body =
+          plan === "solo"
+            ? { install: A, plan, interval: "month" }
+            : { install: A, plan };
+        const r = await call(req("/checkout", body));
+        expect([r.status, await r.json()], `${status} ${plan}`).toEqual([
+          409,
+          { error: "subscription_exists" },
+        ]);
+        expect(s.calls).toEqual([]);
+        s.spy.mockRestore();
+        await db.prepare("DELETE FROM tiers").run();
+      }
+    }
+  });
+
+  it("a lapsed Solo (its trial ended with no card) can buy again; a Solo row with no subscription can too", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_old1', status = 'lapsed' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    fakeStripe();
+    expect(
+      (
+        await call(
+          req("/checkout", { install: A, plan: "solo", interval: "month" }),
+        )
+      ).status,
+    ).toBe(200);
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "free");
+    expect(
+      (
+        await call(
+          req("/checkout", { install: A, plan: "solo", interval: "year" }),
+        )
+      ).status,
+    ).toBe(200);
+  });
+
+  it("Solo is bought on a solo, free or trial row only: a Team or Business row is 409 plan_conflict, no Stripe call", async () => {
+    for (const tier of ["team", "business"]) {
+      await seed(A, "cus_existingA", tier);
+      const s = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "solo", interval: "month" }),
+      );
+      expect([r.status, await r.json()], tier).toEqual([
+        409,
+        { error: "plan_conflict" },
+      ]);
+      expect(s.calls).toEqual([]);
+      s.spy.mockRestore();
+      await db.prepare("DELETE FROM tiers").run();
+    }
+    fakeStripe();
+    for (const tier of ["solo", "free", "trial"]) {
+      await seed(A, "cus_existingA", tier);
+      expect(
+        (
+          await call(
+            req("/checkout", { install: A, plan: "solo", interval: "month" }),
+          )
+        ).status,
+        tier,
+      ).toBe(200);
+      await db.prepare("DELETE FROM tiers").run();
+    }
   });
 });
 
@@ -596,6 +791,7 @@ describe("POST /portal", () => {
     });
     expect(s.calls).toEqual([
       {
+        method: "POST",
         path: PORTAL,
         key: `portal-${A}-${ts}`,
         auth: `Bearer ${SECRET}`,
@@ -875,6 +1071,26 @@ describe("Stripe answers and errors", () => {
     }
   });
 
+  it("the HTTP routes still answer every Stripe error as 502 upstream, whatever its status (stripe_refused is the provisioner RPC's only)", async () => {
+    await seed(A, "cus_existingA");
+    for (const status of [400, 401, 403, 404, 429, 500]) {
+      vi.restoreAllMocks();
+      fakeStripe((c) =>
+        c.path === CHECKOUT
+          ? Response.json(
+              { error: { type: "invalid_request_error" } },
+              { status },
+            )
+          : undefined,
+      );
+      const r = await call(req("/checkout", { install: A, plan: "team" }));
+      expect([r.status, await r.json()], String(status)).toEqual([
+        502,
+        { error: "upstream" },
+      ]);
+    }
+  });
+
   it("Stripe's 409 (the same key still in progress) is 503 retry, on every call", async () => {
     const busy = () =>
       Response.json({ error: { type: "idempotency_error" } }, { status: 409 });
@@ -944,5 +1160,427 @@ describe("logs", () => {
       HOST_A,
     ])
       expect(all).not.toContain(bad);
+  });
+});
+
+describe("POST /checkout, Solo in its no-card trial (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const DAY = 86_400_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const solo = async (set: string, ...binds: unknown[]) => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        `UPDATE tiers SET stripe_subscription_id = 'sub_trial1', ${set} WHERE install_id = ?${binds.length + 1}`,
+      )
+      .bind(...binds, A)
+      .run();
+  };
+  const buy = (interval: "month" | "year" = "month") =>
+    call(req("/checkout", { install: A, plan: "solo", interval }));
+
+  it("while the Solo subscription is the no-card trial, Solo Checkout is allowed (the card is added through it)", async () => {
+    await solo("solo_trial_ends_at = ?1", NOW + 10 * DAY);
+    const s = fakeStripe();
+    for (const interval of ["month", "year"] as const) {
+      const r = await buy(interval);
+      expect([r.status, interval]).toEqual([200, interval]);
+    }
+    expect(s.calls.filter((c) => c.path === CHECKOUT)).toHaveLength(2);
+    // The trial's row is untouched by starting a Checkout.
+    expect(await rowOf(A)).toMatchObject({
+      tier: "solo",
+      status: "active",
+      stripe_subscription_id: "sub_trial1",
+    });
+  });
+
+  it("a Solo that has paid keeps 409: its trial is over, or it never had one", async () => {
+    for (const [why, set, bind] of [
+      ["trial ended", "solo_trial_ends_at = ?1", NOW - DAY],
+      ["bought through Checkout, no trial", "version = ?1", 3],
+      [
+        "trial window but past_due",
+        "solo_trial_ends_at = ?1, status = 'past_due'",
+        NOW + DAY,
+      ],
+    ] as const) {
+      await db.prepare("DELETE FROM tiers").run();
+      await solo(set, bind);
+      const s = fakeStripe();
+      const r = await buy();
+      expect([r.status, await r.json(), why]).toEqual([
+        409,
+        { error: "subscription_exists" },
+        why,
+      ]);
+      expect(s.calls).toEqual([]);
+      s.spy.mockRestore();
+    }
+  });
+
+  it("team and business Checkout are allowed while the Solo subscription is live, trial or paid or past_due (the upgrade)", async () => {
+    for (const [why, set, bind] of [
+      ["no-card trial", "solo_trial_ends_at = ?1", NOW + 10 * DAY],
+      ["paid", "solo_trial_ends_at = ?1", NOW - DAY],
+      ["past_due", "status = 'past_due'", 0],
+    ] as const) {
+      for (const plan of ["team", "business"] as const) {
+        await db.prepare("DELETE FROM tiers").run();
+        await solo(set, bind);
+        const s = fakeStripe();
+        const r = await call(req("/checkout", { install: A, plan }));
+        expect([r.status, why, plan]).toEqual([200, why, plan]);
+        expect(
+          s.calls.filter((c) => c.path === CHECKOUT)[0]?.form["metadata[tier]"],
+        ).toBe(plan);
+        // Starting Checkout changes nothing: the Solo subscription is still the row's.
+        expect(await rowOf(A)).toMatchObject({
+          tier: "solo",
+          stripe_subscription_id: "sub_trial1",
+        });
+        s.spy.mockRestore();
+      }
+    }
+  });
+});
+
+describe("POST /checkout on a row in its Business trial over a Solo subscription (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const DAY = 86_400_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const trial = async (soloStatus: string | null, soloEnd: number | null) => {
+    await seed(A, "cus_existingA", "trial");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_solo1', solo_status = ?1, solo_trial_ends_at = ?2, trial_ends_at = ?3 WHERE install_id = ?4",
+      )
+      .bind(soloStatus, soloEnd, NOW + 5 * DAY, A)
+      .run();
+  };
+  const buy = (plan: string, interval?: string) =>
+    call(
+      req("/checkout", { install: A, plan, ...(interval ? { interval } : {}) }),
+    );
+
+  it("team and business are allowed (the upgrade); Solo only while the Solo subscription is its no-card trial", async () => {
+    await trial("active", NOW + 10 * DAY);
+    fakeStripe();
+    for (const [plan, interval] of [
+      ["team"],
+      ["business"],
+      ["solo", "month"],
+    ] as const)
+      expect((await buy(plan, interval)).status, plan).toBe(200);
+    // A Solo that has paid: Solo again is 409, the upgrade is not.
+    await db.prepare("DELETE FROM tiers").run();
+    await trial("active", NOW - DAY);
+    const s = fakeStripe();
+    const r = await buy("solo", "month");
+    expect([r.status, await r.json()]).toEqual([
+      409,
+      { error: "subscription_exists" },
+    ]);
+    expect((await buy("team")).status).toBe(200);
+    expect(s.calls.filter((c) => c.path === CHECKOUT)).toHaveLength(1);
+  });
+
+  it("a trial row whose Solo subscription is dead or was never live may buy anything (N9c)", async () => {
+    for (const solo of [null, "lapsed"]) {
+      await db.prepare("DELETE FROM tiers").run();
+      await trial(solo, NOW - DAY);
+      fakeStripe();
+      for (const [plan, interval] of [["team"], ["solo", "year"]] as const)
+        expect((await buy(plan, interval)).status, `${solo} ${plan}`).toBe(200);
+    }
+  });
+});
+
+describe("Solo Checkout during the no-card trial keeps the free days (#1568)", () => {
+  const NOW = Date.UTC(2026, 10, 9, 12, 0);
+  const H = 3_600_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+  const inTrial = async (ends: number) => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_trial1', solo_trial_ends_at = ?1 WHERE install_id = ?2",
+      )
+      .bind(ends, A)
+      .run();
+  };
+  const session = async (plan: string, interval?: string) => {
+    const s = fakeStripe();
+    const r = await call(
+      req("/checkout", {
+        install: A,
+        ts: NOW,
+        plan,
+        ...(interval ? { interval } : {}),
+      }),
+    );
+    expect(r.status).toBe(200);
+    const c = s.calls.find((x) => x.path === CHECKOUT);
+    s.spy.mockRestore();
+    return c as StripeCall;
+  };
+
+  it("passes the trial's end (seconds) as subscription_data[trial_end]: no money moves until the free days end, the card is collected", async () => {
+    const ends = NOW + 10 * 24 * H + 123;
+    await inTrial(ends);
+    for (const interval of ["month", "year"]) {
+      const c = await session("solo", interval);
+      expect(c.form["subscription_data[trial_end]"]).toBe(
+        String(Math.floor(ends / 1000)),
+      );
+      // Collection stays at Stripe's default (always): the card is taken.
+      expect(
+        Object.keys(c.form).filter((k) => /payment_method_collection/.test(k)),
+      ).toEqual([]);
+    }
+  });
+
+  it("Stripe wants trial_end at least 48 hours out: from 49 hours (a safety hour) it is passed, under that it is omitted and the Checkout charges now", async () => {
+    await inTrial(NOW + 49 * H);
+    expect(
+      (await session("solo", "month")).form["subscription_data[trial_end]"],
+    ).toBe(String(Math.floor((NOW + 49 * H) / 1000)));
+    for (const ends of [
+      NOW + 49 * H - 1,
+      NOW + 48 * H,
+      NOW + 24 * H,
+      NOW + 1000,
+    ]) {
+      await inTrial(ends);
+      const c = await session("solo", "month");
+      expect(
+        Object.keys(c.form).filter((k) => /trial/.test(k)),
+        String(ends - NOW),
+      ).toEqual([]);
+    }
+  });
+
+  it("a Checkout that is not Solo-in-trial never carries a trial: a fresh Solo, a Team upgrade", async () => {
+    await db.prepare("DELETE FROM tiers").run();
+    await seed(A, "cus_existingA", "solo");
+    expect(
+      Object.keys((await session("solo", "month")).form).filter((k) =>
+        /trial/.test(k),
+      ),
+    ).toEqual([]);
+    await inTrial(NOW + 10 * 24 * H);
+    expect(
+      Object.keys((await session("team")).form).filter((k) => /trial/.test(k)),
+    ).toEqual([]);
+  });
+
+  it("the session key differs with and without a trial end, so a retry never reuses a key with other params", async () => {
+    await inTrial(NOW + 10 * 24 * H);
+    const withEnd = await session("solo", "month");
+    await inTrial(NOW + 24 * H);
+    const without = await session("solo", "month");
+    expect(withEnd.key).not.toBe(without.key);
+  });
+});
+
+describe("an open Checkout session is expired before another is made (#1568)", () => {
+  const sessions = (s: ReturnType<typeof fakeStripe>) =>
+    s.calls.filter((c) => c.path.startsWith("/v1/checkout/sessions"));
+  const buy = (ts: number, plan = "team") =>
+    call(req("/checkout", { install: A, ts, plan }));
+
+  it("no open session on the row: nothing to expire; the new session's id and key are stored", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    const r = await buy(ts);
+    expect(r.status).toBe(200);
+    expect(sessions(s).map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /v1/checkout/sessions",
+    ]);
+    expect(await rowOf(A)).toMatchObject({
+      open_checkout_id: "cs_test_2",
+      open_checkout_key: `checkout-${A}-team-${ts}`,
+    });
+  });
+
+  it("another Checkout expires the first one's session, before it creates its own; the new one is stored", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    await buy(ts);
+    await buy(ts + 1);
+    expect(sessions(s).map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /v1/checkout/sessions",
+      "GET /v1/checkout/sessions/cs_test_2",
+      "POST /v1/checkout/sessions/cs_test_2/expire",
+      "POST /v1/checkout/sessions",
+    ]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_3");
+  });
+
+  it("the same request again (the same key) expires nothing: Stripe replays the same session", async () => {
+    const s = fakeStripe();
+    const ts = Date.now();
+    await buy(ts);
+    await buy(ts);
+    expect(
+      sessions(s).filter(
+        (c) => c.path.includes("expire") || c.method === "GET",
+      ),
+    ).toEqual([]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_2");
+  });
+
+  it("a session that already completed or expired is left alone, and the new one is made", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_done', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    for (const status of ["complete", "expired"]) {
+      const s = fakeStripe((c) =>
+        c.method === "GET" && c.path.endsWith("cs_test_done")
+          ? Response.json({ id: "cs_test_done", status })
+          : undefined,
+      );
+      expect((await buy(Date.now())).status).toBe(200);
+      expect(
+        sessions(s).some((c) => c.path.endsWith("/expire")),
+        status,
+      ).toBe(false);
+      await db
+        .prepare(
+          "UPDATE tiers SET open_checkout_id = 'cs_test_done', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+        )
+        .bind(A)
+        .run();
+      s.spy.mockRestore();
+    }
+  });
+
+  it("an expire that fails stops the Checkout: 502, no new session, the stored one kept", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const s = fakeStripe((c) =>
+      c.path.endsWith("/expire")
+        ? Response.json({ error: { type: "api_error" } }, { status: 500 })
+        : undefined,
+    );
+    const r = await buy(Date.now());
+    expect([r.status, await r.json()]).toEqual([502, { error: "upstream" }]);
+    expect(
+      s.calls.some(
+        (c) => c.method === "POST" && c.path === "/v1/checkout/sessions",
+      ),
+    ).toBe(false);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_open");
+  });
+
+  it("a crash between the expire and the create leaves nothing open: the next try finds it expired and makes one session", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    let expired = false;
+    let failed = false;
+    const s = fakeStripe((c) => {
+      if (c.path.endsWith("/expire")) expired = true;
+      if (c.method === "GET" && c.path.endsWith("cs_test_open"))
+        return Response.json({
+          id: "cs_test_open",
+          status: expired ? "expired" : "open",
+        });
+      // The create fails once (the Worker "crashes" after the expire).
+      if (
+        c.method === "POST" &&
+        c.path === "/v1/checkout/sessions" &&
+        expired &&
+        !failed
+      ) {
+        failed = true;
+        return Response.json({ error: { type: "api_error" } }, { status: 500 });
+      }
+      return undefined;
+    });
+    expect((await buy(Date.now())).status).toBe(502);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_open");
+    s.calls.length = 0;
+    expect((await buy(Date.now() + 1)).status).toBe(200);
+    // Found expired: no second expire; one session created and stored.
+    expect(
+      sessions(s).map((c) => `${c.method} ${c.path.replace(/cs_\w+/, "cs_x")}`),
+    ).toEqual(["GET /v1/checkout/sessions/cs_x", "POST /v1/checkout/sessions"]);
+    expect((await rowOf(A))?.open_checkout_id).not.toBe("cs_test_open");
+  });
+
+  it("two Checkouts racing: the one that loses the store expires its own session and answers 409 checkout_in_progress", async () => {
+    await seed(A, "cus_existingA", "solo");
+    const s = fakeStripe((c) => {
+      // While this call's session is being created, another call stores its own.
+      if (c.method === "POST" && c.path === "/v1/checkout/sessions")
+        return db
+          .prepare(
+            "UPDATE tiers SET open_checkout_id = 'cs_test_winner', open_checkout_key = 'winner-key-1234' WHERE install_id = ?1",
+          )
+          .bind(A)
+          .run()
+          .then(() => undefined);
+      return undefined;
+    });
+    const r = await buy(Date.now());
+    // 409, not 503: the server's automatic retry of a 503 reuses the same
+    // request (the same key) and would get the dead session's URL back.
+    expect([r.status, await r.json()]).toEqual([
+      409,
+      { error: "checkout_in_progress" },
+    ]);
+    expect((await rowOf(A))?.open_checkout_id).toBe("cs_test_winner");
+    // Its own, orphaned session was expired.
+    expect(
+      sessions(s).some(
+        (c) => c.method === "POST" && c.path.endsWith("/expire"),
+      ),
+    ).toBe(true);
+  });
+
+  it("no Stripe key or a live one: 500 config before anything is expired or created", async () => {
+    await seed(A, "cus_existingA", "solo");
+    await db
+      .prepare(
+        "UPDATE tiers SET open_checkout_id = 'cs_test_open', open_checkout_key = 'old-key-1234' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const s = fakeStripe();
+    for (const key of [undefined, "sk_live_abcdefgh12345678"]) {
+      const r = await call(req("/checkout", { install: A, plan: "team" }), {
+        ...baseEnv(),
+        STRIPE_SECRET_KEY: key,
+      });
+      expect(r.status).toBe(500);
+    }
+    expect(s.calls).toEqual([]);
   });
 });
