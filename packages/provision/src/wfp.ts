@@ -1801,7 +1801,15 @@ export class WfpProvisioner {
     this.checkGoogleBroker(vars);
     if (this.o.brokerEnabled) this.registryDomainsOf(vars);
     // Without the version: replayOf compares it; a resume only refuses a downgrade.
-    const hash = inputsHash({ ownerEmail, vars, testHooks });
+    let hash = inputsHash({ ownerEmail, vars, testHooks });
+    // Before the Solo cap defaults existed, no default was rendered: a run
+    // started then hashed the caller's vars alone. Resume and replay accept
+    // that hash too, and a resume keeps those first-run vars.
+    const noDefaultsHash = inputsHash({
+      ownerEmail,
+      vars: i.vars ?? {},
+      testHooks,
+    });
     // 5.7 replay, before the release pre-flight (a fixed id only): the
     // create finished but its step result was lost, so a release pulled
     // since must not fail it. No release read, no write, no PAT re-minted.
@@ -1811,7 +1819,7 @@ export class WfpProvisioner {
       await this.resolvePlatform();
       this.checkDirect(appHost, i.installId);
       row = await this.findRow(i);
-      const done = this.replayOf(row, i, hash);
+      const done = this.replayOf(row, i, hash, noDefaultsHash);
       if (done) return done;
     }
     const rel = await this.readRelease(i);
@@ -1874,6 +1882,12 @@ export class WfpProvisioner {
           `install ${row.id} is ${row.state}; only a creating install can be resumed (a deleted install keeps its slug and hosts until a purge)`,
           "invalid_state",
         );
+      if (row.inputs_hash !== hash && row.inputs_hash === noDefaultsHash) {
+        // A run hashed without defaults: continue with its own vars.
+        const first = i.vars ?? {};
+        for (const k of Object.keys(vars)) if (!(k in first)) delete vars[k];
+        hash = noDefaultsHash;
+      }
       if (row.inputs_hash !== hash)
         throw new ProvisionRefused(
           `install ${row.id}: resume inputs differ from the first run (owner, vars or testHooks); use the original inputs`,
@@ -1964,10 +1978,14 @@ export class WfpProvisioner {
     row: InstallRow | undefined,
     i: WfpCreateInput,
     hash: string,
+    noDefaultsHash: string,
   ): Install | undefined {
     if (row?.state !== "active" || row.id !== i.installId) return undefined;
     // The version is part of the replay check only (not the hash).
-    if (row.inputs_hash !== hash || row.version !== i.version)
+    if (
+      (row.inputs_hash !== hash && row.inputs_hash !== noDefaultsHash) ||
+      row.version !== i.version
+    )
       throw new ProvisionRefused(
         `install ${row.id}: rerun inputs differ from the first run (owner, vars, testHooks or version); use the original inputs`,
         "invalid_state",
