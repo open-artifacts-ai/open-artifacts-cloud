@@ -189,7 +189,91 @@ export const prodCleanLine = (failCode?: string) =>
 export const PROD_CLEAN_LINE_RE =
   /^prod-clean: (pass|fail \([a-z][a-z0-9_]{0,39}\))$/;
 
-export type ProdResult = { level: "pass"; releases: number; installs: number };
+export type ProdResult = {
+  level: "pass";
+  releases: number;
+  installs: number;
+  /**
+   * Cloudflare API requests the scan made, 429 retries included (#64). A
+   * plain number for the private report's case detail; never printed in a log.
+   */
+  cfRequests?: number;
+};
+
+/** A 429 is retried this many times per request (Retry-After honoured). */
+export const CF_429_RETRIES = 3;
+/** One 429 wait never exceeds this, whatever Retry-After says. */
+export const CF_429_MAX_WAIT_MS = 20_000;
+/**
+ * All 429 waits of one scan together never exceed this: with the guard's
+ * 180 s case limit (LIVE_TEST_TIMEOUT_MS) a scan that waits longer would
+ * time out as a plain failure, so past the budget a 429 is infra at once.
+ */
+export const CF_429_WAIT_BUDGET_MS = 40_000;
+
+/** Retry-After as milliseconds: delta-seconds or an HTTP date; undefined if absent or bad. */
+export function retryAfterMs(
+  v: string | null,
+  now: number = Date.now(),
+): number | undefined {
+  if (v === null) return undefined;
+  const t = v.trim();
+  if (/^\d{1,9}$/.test(t)) return Number(t) * 1000;
+  const at = Date.parse(t);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/**
+ * The fetch every prodClean request goes through. It counts the Cloudflare
+ * API requests (a retried 429 counts each time) and, on a 429 from that API,
+ * waits Retry-After (else 1 s, 2 s, 4 s), capped per wait and per scan. When
+ * the retries or the wait budget run out it throws an InfraError and refuses
+ * every later Cloudflare request, so the scan stops at once instead of
+ * retrying a limited API: a 429 is no verdict on prod.
+ */
+export function cfApiFetch(
+  f: typeof fetch,
+  o: { sleep?: (ms: number) => Promise<void>; waitBudgetMs?: number } = {},
+) {
+  const sleep =
+    o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let budget = o.waitBudgetMs ?? CF_429_WAIT_BUDGET_MS;
+  let requests = 0;
+  let limited: InfraError | undefined;
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (!url.startsWith(`${API}/`)) return f(input, init);
+    for (let i = 0; ; i++) {
+      if (limited) throw limited;
+      requests++;
+      const res = await f(input, init);
+      if (res.status !== 429) return res;
+      await res.body?.cancel().catch(() => {});
+      const asked = retryAfterMs(res.headers.get("retry-after"));
+      const wait = Math.min(asked ?? 1000 * 2 ** i, CF_429_MAX_WAIT_MS);
+      if (i >= CF_429_RETRIES || wait > budget) {
+        limited = new InfraError(
+          `prodClean Cloudflare API answered 429 (rate limited) after ${i} ${i === 1 ? "retry" : "retries"}`,
+        );
+        throw limited;
+      }
+      budget -= wait;
+      note(`${RETRIED_REQUEST_PREFIX}429 GET (prodClean Cloudflare API)`);
+      await sleep(wait);
+    }
+  }) as typeof fetch;
+  return {
+    fetch: wrapped,
+    requests: () => requests,
+    /** The InfraError a spent 429 budget raised, if one did. */
+    limited: () => limited,
+  };
+}
 
 export interface ProdCleanOpts {
   /** Every request (Cloudflare API, inventory, /healthz) goes through this (tests). */
@@ -206,6 +290,10 @@ export interface ProdCleanOpts {
   inventoryBearer?: string | (() => Promise<string>);
   /** Each try's bound on an inventory, /healthz or settings read (tests). */
   readMs?: number;
+  /** The 429 wait (tests). */
+  sleep?: (ms: number) => Promise<void>;
+  /** All 429 waits of the scan together (tests; default CF_429_WAIT_BUDGET_MS). */
+  waitBudgetMs?: number;
 }
 
 async function listKeys(cf: Cf, bucket: string): Promise<string[]> {
@@ -438,8 +526,28 @@ export async function prodClean(
   o: ProdCleanOpts = {},
 ): Promise<ProdResult> {
   if (!p) throw new ProdDirty("not_configured", "prod probe not configured");
+  const api = cfApiFetch(o.fetch ?? fetch, {
+    ...(o.sleep ? { sleep: o.sleep } : {}),
+    ...(o.waitBudgetMs !== undefined ? { waitBudgetMs: o.waitBudgetMs } : {}),
+  });
+  try {
+    const r = await scan(p, o, api.fetch);
+    return { ...r, cfRequests: api.requests() };
+  } catch (e) {
+    // A spent 429 budget is infra, whatever error it caused on the way
+    // (cfClient turns a throwing fetch into "network"); a finding outranks it.
+    const infra = api.limited();
+    if (infra && !(e instanceof ProdDirty)) throw infra;
+    throw e;
+  }
+}
+
+async function scan(
+  p: ProdProbe,
+  o: ProdCleanOpts,
+  f: typeof fetch,
+): Promise<ProdResult> {
   const s = prodSecretsOf(p);
-  const f = o.fetch ?? fetch;
   const get: Get = (url, token, what, fail) =>
     getJson(f, url, token, what, fail, o.readMs);
   const pubkey = o.pubkey ?? [

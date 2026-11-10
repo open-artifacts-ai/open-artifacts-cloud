@@ -15,7 +15,7 @@ import {
 } from "../src/http.ts";
 import { guardProdClean } from "../src/prod.ts";
 import { crossCheck, prepareSide, type Side } from "../src/refused.ts";
-import { proof } from "../src/report.ts";
+import { detail, proof } from "../src/report.ts";
 import {
   loadTargets,
   secretsOf,
@@ -68,6 +68,9 @@ describe("guard", () => {
       return proof(ctx, "not-applicable", "local mode");
     if (r.level === "not-applicable")
       return proof(ctx, "not-applicable", r.reason);
+    // The private report's detail only (formatReport never prints it).
+    if (r.cfRequests !== undefined)
+      detail(ctx, `Cloudflare API requests: ${r.cfRequests}`);
   });
 });
 

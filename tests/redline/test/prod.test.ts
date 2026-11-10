@@ -13,6 +13,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
+  CF_429_MAX_WAIT_MS,
+  cfApiFetch,
   forEachLimit,
   guardProdClean,
   HOOK_SQL_MARKERS,
@@ -21,6 +23,7 @@ import {
   PROD_CLEAN_LINE_RE,
   ProdDirty,
   prodClean,
+  retryAfterMs,
 } from "../src/prod.ts";
 import {
   buildReport,
@@ -303,7 +306,11 @@ describe("prodClean (spec 2026-10-26)", () => {
   it("a clean prod (signed release, clean install) passes", async () => {
     const w = cleanWorld();
     publish(w, { version: "1.2.3" });
-    expect(await check(w)).toEqual({ level: "pass", releases: 1, installs: 1 });
+    expect(await check(w)).toMatchObject({
+      level: "pass",
+      releases: 1,
+      installs: 1,
+    });
   });
 
   it("a missing bucket fails bucket_missing, never pass", async () => {
@@ -315,7 +322,11 @@ describe("prodClean (spec 2026-10-26)", () => {
   it("configured with an empty bucket and 0 rows passes", async () => {
     const w = cleanWorld();
     w.installs = [];
-    expect(await check(w)).toEqual({ level: "pass", releases: 0, installs: 0 });
+    expect(await check(w)).toMatchObject({
+      level: "pass",
+      releases: 0,
+      installs: 0,
+    });
   });
 
   it("an inventory that is not the installs schema fails inventory_bad", async () => {
@@ -453,7 +464,7 @@ describe("prodClean (spec 2026-10-26)", () => {
           ...bearerOf({ inventory: c.inv }),
         });
         if (want === "pass")
-          expect(await r).toEqual({
+          expect(await r).toMatchObject({
             level: "pass",
             releases: c.bucket === "releases" ? 1 : 0,
             installs: c.rows,
@@ -498,7 +509,7 @@ describe("prodClean (spec 2026-10-26)", () => {
       const w = cleanWorld();
       publish(w, { version: "1.2.3" });
       w.inventoryStalls = 1;
-      expect(await guard(w)).toEqual({
+      expect(await guard(w)).toMatchObject({
         level: "pass",
         releases: 1,
         installs: 1,
@@ -598,7 +609,7 @@ describe("prodClean (spec 2026-10-26)", () => {
       const r = await guardProdClean({ mode: "staging", prod: p }, (x) =>
         prodClean(x, { fetch, pubkey: PUB }),
       );
-      expect(r).toEqual({ level: "pass", releases: 1, installs: 1 });
+      expect(r).toMatchObject({ level: "pass", releases: 1, installs: 1 });
       expect(w.inventoryAuth).toEqual([`Bearer ${JWT}`]);
     });
     it("an explicit opts.inventoryBearer wins over the secrets-dir JWT", async () => {
@@ -680,7 +691,7 @@ describe("prodClean (spec 2026-10-26)", () => {
 
       it("after the prod deploy (#1014): a clean inventory runs for real and passes, no DNS probe", async () => {
         const a = admin({ code: "ENOTFOUND" });
-        expect(await guard(undefined, a)).toEqual({
+        expect(await guard(undefined, a)).toMatchObject({
           level: "pass",
           releases: 0,
           installs: 1,
@@ -810,7 +821,7 @@ describe("prodClean (spec 2026-10-26)", () => {
         w.installs = [row(state, mode)];
         w.healthzStatus = 503;
         w.scriptMissing = true;
-        expect(await check(w)).toEqual({
+        expect(await check(w)).toMatchObject({
           level: "pass",
           releases: 0,
           installs: 1,
@@ -858,7 +869,7 @@ describe("prodClean (spec 2026-10-26)", () => {
     it("clean data passes with no /healthz request, but its script is still read", async () => {
       const w = cleanWorld();
       w.installs = [hostless()];
-      expect(await check(w)).toEqual({
+      expect(await check(w)).toMatchObject({
         level: "pass",
         releases: 0,
         installs: 1,
@@ -1044,7 +1055,7 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
       pubkey: PUB,
       ...bearerOf({}),
     });
-    expect(r).toEqual({ level: "pass", releases: 12, installs: 1 });
+    expect(r).toMatchObject({ level: "pass", releases: 12, installs: 1 });
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(PROD_CLEAN_CONCURRENCY);
     const records = (w.seen ?? [])
@@ -1102,5 +1113,161 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
       id: ID,
     });
     await expect(failCode(check(w))).resolves.toBe("install_dirty");
+  });
+});
+
+describe("Cloudflare API requests and 429 (#64)", () => {
+  const CF = "https://api.cloudflare.com/client/v4/x";
+  const res = (status: number, h: Record<string, string> = {}) =>
+    new Response("{}", { status, headers: h });
+  const sleeps = () => {
+    const waited: number[] = [];
+    return { waited, sleep: async (ms: number) => void waited.push(ms) };
+  };
+  const guard = (check: () => Promise<unknown>) =>
+    guardProdClean({ mode: "staging", prod: probe() }, check as never).then(
+      () => null,
+      (x: unknown) => x,
+    );
+
+  it("counts Cloudflare API requests only (retries included), as a plain number", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    const { fetch } = await serve(w);
+    const r = await prodClean(probe(), {
+      fetch,
+      pubkey: PUB,
+      inventoryBearer: JWT,
+    });
+    const cf = (w.urls ?? []).filter((u) =>
+      u.startsWith("https://api.cloudflare.com/"),
+    ).length;
+    expect(cf).toBeGreaterThan(0);
+    expect((w.urls ?? []).length).toBeGreaterThan(cf);
+    expect(r.cfRequests).toBe(cf);
+    expect(Number.isInteger(r.cfRequests)).toBe(true);
+  });
+
+  it("retryAfterMs reads seconds or a date; nothing else", () => {
+    expect(retryAfterMs("3")).toBe(3000);
+    expect(retryAfterMs(" 0 ")).toBe(0);
+    expect(retryAfterMs(null)).toBeUndefined();
+    expect(retryAfterMs("soon")).toBeUndefined();
+    expect(
+      retryAfterMs(
+        "Wed, 21 Oct 2015 07:28:05 GMT",
+        Date.parse("Wed, 21 Oct 2015 07:28:00 GMT"),
+      ),
+    ).toBe(5000);
+  });
+
+  it("a 429 waits Retry-After, retries, and the request counts each time", async () => {
+    const { waited, sleep } = sleeps();
+    const answers = [res(429, { "retry-after": "2" }), res(200)];
+    const a = cfApiFetch(async () => answers.shift() as Response, { sleep });
+    expect((await a.fetch(CF)).status).toBe(200);
+    expect(waited).toEqual([2000]);
+    expect(a.requests()).toBe(2);
+    expect(a.limited()).toBeUndefined();
+  });
+
+  it("without Retry-After it backs off; one wait is capped", async () => {
+    const { waited, sleep } = sleeps();
+    const answers = [res(429), res(429, { "retry-after": "9999" }), res(200)];
+    const a = cfApiFetch(async () => answers.shift() as Response, {
+      sleep,
+      waitBudgetMs: 1e9,
+    });
+    await a.fetch(CF);
+    expect(waited).toEqual([1000, CF_429_MAX_WAIT_MS]);
+  });
+
+  it("a request outside the Cloudflare API is not counted or retried", async () => {
+    const { sleep } = sleeps();
+    const a = cfApiFetch(async () => res(429), { sleep });
+    expect((await a.fetch("https://inventory.example/installs")).status).toBe(
+      429,
+    );
+    expect(a.requests()).toBe(0);
+  });
+
+  it("retries out: InfraError, and later Cloudflare requests are refused unsent", async () => {
+    const { sleep } = sleeps();
+    let sent = 0;
+    const a = cfApiFetch(
+      async () => {
+        sent++;
+        return res(429, { "retry-after": "1" });
+      },
+      { sleep },
+    );
+    const e = await a.fetch(CF).then(
+      () => null,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect(a.limited()).toBe(e);
+    const before = sent;
+    await expect(a.fetch(CF)).rejects.toBe(e);
+    expect(sent).toBe(before);
+  });
+
+  it("a Retry-After past the scan's wait budget is infra at once", async () => {
+    const { waited, sleep } = sleeps();
+    const a = cfApiFetch(async () => res(429, { "retry-after": "30" }), {
+      sleep,
+      waitBudgetMs: 10_000,
+    });
+    await expect(a.fetch(CF)).rejects.toBeInstanceOf(InfraError);
+    expect(waited).toEqual([]);
+    expect(a.requests()).toBe(1);
+  });
+
+  it("prodClean with a 429 that never lifts: infra through the guard, not a fail", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    const { fetch } = await serve(w);
+    const limited: typeof fetch = (i, init) =>
+      String(i).startsWith("https://api.cloudflare.com/")
+        ? Promise.resolve(res(429, { "retry-after": "1" }))
+        : fetch(i, init);
+    const { waited, sleep } = sleeps();
+    const e = await guard(() =>
+      prodClean(probe(), {
+        fetch: limited,
+        pubkey: PUB,
+        inventoryBearer: JWT,
+        sleep,
+      }),
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect(String((e as Error).message)).toMatch(/429/);
+    expect(
+      levelOf("failed", undefined, [e as { message?: unknown }]).level,
+    ).toBe("infra");
+    expect(waited.length).toBe(3);
+  });
+
+  it("a 429 that lifts after Retry-After still passes", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    const { fetch } = await serve(w);
+    let first = true;
+    const once: typeof fetch = (i, init) => {
+      if (first && String(i).startsWith("https://api.cloudflare.com/")) {
+        first = false;
+        return Promise.resolve(res(429, { "retry-after": "1" }));
+      }
+      return fetch(i, init);
+    };
+    const { waited, sleep } = sleeps();
+    const r = await prodClean(probe(), {
+      fetch: once,
+      pubkey: PUB,
+      inventoryBearer: JWT,
+      sleep,
+    });
+    expect(r).toMatchObject({ level: "pass", releases: 1, installs: 1 });
+    expect(waited).toEqual([1000]);
   });
 });

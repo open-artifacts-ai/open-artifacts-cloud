@@ -19,6 +19,8 @@ import {
   ACCEPTED_UNPROVEN,
   buildReport,
   type CaseResult,
+  detail,
+  detailOf,
   exitCode,
   formatReport,
   gateOn,
@@ -913,5 +915,28 @@ describe("the reporter's file for P30 (#1137)", () => {
       NIGHTLY_NA_FILE,
     );
     expect(existsSync(join(root, NIGHTLY_NA_FILE))).toBe(true);
+  });
+});
+
+describe("detail (#64)", () => {
+  it("detail() sets it on the task meta; detailOf reads it", () => {
+    const ctx = { task: { meta: {} as { redlineDetail?: string } } };
+    expect(detailOf(ctx.task.meta)).toBeUndefined();
+    detail(ctx, "Cloudflare API requests: 412");
+    expect(detailOf(ctx.task.meta)).toBe("Cloudflare API requests: 412");
+    expect(detailOf({ redlineDetail: 3 })).toBeUndefined();
+    expect(detailOf(undefined)).toBeUndefined();
+  });
+
+  it("the JSON report keeps it; the printed text never does", () => {
+    const r = buildReport([
+      {
+        name: "g > prod is clean",
+        level: "pass",
+        detail: "Cloudflare API requests: 412",
+      },
+    ]);
+    expect(JSON.stringify(r)).toContain("Cloudflare API requests: 412");
+    expect(formatReport(r)).not.toContain("412");
   });
 });

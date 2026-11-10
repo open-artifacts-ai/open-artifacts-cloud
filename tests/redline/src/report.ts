@@ -27,6 +27,11 @@ export interface CaseResult {
   reason?: string;
   /** What a pass rests on when it isn't the real thing, e.g. "Turnstile test key". */
   label?: string;
+  /**
+   * A plain figure or fact for the private report only (src/report.ts
+   * detail()): formatReport never prints it, so no public log carries it.
+   */
+  detail?: string;
   /** What happened on the way, level unchanged, e.g. a retried setup GET (src/notes.ts). */
   notes?: string[];
   /** Where crossCheck/crossWrite failed, when they know (src/refused.ts LegInfo). */
@@ -209,6 +214,17 @@ export function proof(
  */
 export function label(ctx: TaskLike, text: string): void {
   (ctx.task.meta as { redlineLabel?: string }).redlineLabel = text;
+}
+
+/** Puts a detail on a running case: kept in the JSON report, never in the printed text. */
+export function detail(ctx: TaskLike, text: string): void {
+  (ctx.task.meta as { redlineDetail?: string }).redlineDetail = text;
+}
+
+/** The detail `detail()` set on a task's meta, if any. */
+export function detailOf(meta: object | undefined): string | undefined {
+  const d = (meta as { redlineDetail?: unknown } | undefined)?.redlineDetail;
+  return typeof d === "string" && d !== "" ? redactReason(d, 300) : undefined;
 }
 
 /** The run summary's line, from every note the run kept. */
