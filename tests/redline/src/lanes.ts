@@ -229,7 +229,7 @@ const lane = (name: string, ...files: string[]): Lane => ({
  *   so that case waits for prov's exit (the prov-done barrier);
  * - surfaces: surfaces (335.0 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
- * - guard: guard (130.8 s; prodClean stays serial inside it), then bus (#1299:
+ * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it), then bus (#1299:
  *   one case, a few requests; unproven-live while the bus is off);
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
