@@ -346,7 +346,9 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
    * same job's (its job part matches `lease`'s: a retry of the holding job,
    * holderLease). The row then holds `lease`, this attempt's own token.
    * False when another operation got there first (or the row is in another
-   * state).
+   * state). `resume` (#1501) lists states a killed attempt of this same job
+   * may have left: such a row is re-taken, live lock or expired, only when
+   * its lease carries this job's part; any other holder is refused.
    */
   async claim(
     id: InstallId,
@@ -355,11 +357,24 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
     lease: string,
     until: number,
     rowVersion: number,
+    resume: InstallState[] = [],
   ): Promise<boolean> {
     const now = this.now();
+    const fromAt = (i: number) => `?${i + 8}`;
+    const resumeAt = (i: number) => `?${i + 8 + from.length}`;
     const r = await this.write(
-      `UPDATE installs SET state = ?1, lease = ?2, lease_until = ?3, updated_at = ?4 WHERE id = ?5 AND row_version = ?6 AND state IN (${from.map((_, i) => `?${i + 8}`).join(", ")}) AND (lease_until IS NULL OR lease_until <= ?4 OR (?7 IS NOT NULL AND substr(lease, 1, 17) = ?7)) RETURNING id`,
-      [to, lease, until, now, id, rowVersion, jobPartOf(lease), ...from],
+      `UPDATE installs SET state = ?1, lease = ?2, lease_until = ?3, updated_at = ?4 WHERE id = ?5 AND row_version = ?6 AND ((state IN (${from.map((_, i) => fromAt(i)).join(", ")}) AND (lease_until IS NULL OR lease_until <= ?4 OR (?7 IS NOT NULL AND substr(lease, 1, 17) = ?7)))${resume.length === 0 ? "" : ` OR (state IN (${resume.map((_, i) => resumeAt(i)).join(", ")}) AND ?7 IS NOT NULL AND substr(lease, 1, 17) = ?7)`}) RETURNING id`,
+      [
+        to,
+        lease,
+        until,
+        now,
+        id,
+        rowVersion,
+        jobPartOf(lease),
+        ...from,
+        ...resume,
+      ],
     );
     return one(r);
   }
@@ -474,6 +489,33 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
       "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
       [this.now(), actor, id, action, canonicalJson(detail)],
     );
+  }
+
+  /**
+   * #1501: the newest `rollback.start` this job (its job part) wrote for the
+   * install: the from and to a dead attempt meant, or null.
+   */
+  async rollbackStartOf(
+    id: InstallId,
+    jobPart: string,
+  ): Promise<{ from: string; to: string } | null> {
+    const r = await this.cf.d1Query(
+      this.db.id,
+      "SELECT detail FROM hosted_audit WHERE install_id = ?1 AND action = 'rollback.start' ORDER BY id DESC LIMIT 50",
+      [id],
+    );
+    for (const x of r[0]?.results ?? []) {
+      try {
+        const d = JSON.parse(String(x.detail)) as Record<string, unknown>;
+        if (
+          d.job === jobPart &&
+          typeof d.from === "string" &&
+          typeof d.to === "string"
+        )
+          return { from: d.from, to: d.to };
+      } catch {}
+    }
+    return null;
   }
 
   /** H-DV: one install's revoke state, read only (delete's phase-2 poll). */

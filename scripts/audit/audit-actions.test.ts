@@ -67,7 +67,7 @@ const hostKinds = () =>
 const lockOps = () =>
   new Set([
     ...scan("packages/provision/src", [
-      /this\.claim\([^;]*?"([a-z_-]+)",?\s*\)/g,
+      /this\.claim\([^;]*?"([a-z_-]+)",?\s*(?:\[[^\]]*\],?\s*)?\)/g,
     ]),
     ...hostKinds(),
   ]);

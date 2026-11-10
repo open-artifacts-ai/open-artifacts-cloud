@@ -675,9 +675,17 @@ async function run(
           c.emit({
             step: "publish",
             status: "ok",
-            data: { variant: r.variant, objects: r.keys.length },
+            data: {
+              variant: r.variant,
+              objects: r.keys.length,
+              status: r.status,
+            },
           });
-          out.push({ variant: r.variant, objects: r.keys.length });
+          out.push({
+            variant: r.variant,
+            objects: r.keys.length,
+            status: r.status,
+          });
         }
         return { ok: true, data: { version, published: out } };
       } finally {

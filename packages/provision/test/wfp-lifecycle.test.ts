@@ -33,7 +33,7 @@ import {
   registryKey,
   withDefaultVars,
 } from "../src/names.js";
-import { canonicalJson, holderLease } from "../src/platform.js";
+import { canonicalJson, holderLease, leaseJobPart } from "../src/platform.js";
 import {
   assetEntries,
   bundleSha256,
@@ -6942,6 +6942,187 @@ describe("every same-state claim: the holding job re-takes, another job is refus
     );
     expect(mine[0]).toMatchObject({ ok: true });
     expect(s.row(inst.id).lease).toBeNull();
+  });
+});
+
+describe("a killed upgrade, rollback or vars change: its own job's retry re-takes the upgrading row (#1501)", () => {
+  const A = "job:01JOBAAAAAAAAAAAAAAAAAAAAA";
+  const B = "job:01JOBBBBBBBBBBBBBBBBBBBBBB";
+  type S = ReturnType<typeof setup>;
+  /** Job A's dead attempt left the row upgrading under its lease. */
+  const kill = (
+    s: S,
+    id: string,
+    o: { expired?: boolean; row?: Record<string, string> } = {},
+  ) => {
+    const lease = holderLease(A);
+    s.db()
+      .prepare(
+        "UPDATE installs SET state = 'upgrading', lease = ?, lease_until = ? WHERE id = ?",
+      )
+      .run(lease, s.clock.now() + (o.expired ? -60_000 : 10 * 60_000), id);
+    for (const [k, v] of Object.entries(o.row ?? {}))
+      s.db().prepare(`UPDATE installs SET ${k} = ? WHERE id = ?`).run(v, id);
+    return lease;
+  };
+  const startMarker = (
+    s: S,
+    id: string,
+    job: string,
+    from: string,
+    to: string,
+  ) =>
+    s
+      .db()
+      .prepare(
+        "INSERT INTO hosted_audit (at, install_id, action, detail) VALUES (?, ?, 'rollback.start', ?)",
+      )
+      .run(
+        s.clock.now(),
+        id,
+        canonicalJson({ from, to, job: leaseJobPart(job) }),
+      );
+  const refusedAndUntouched = async (
+    s: S,
+    id: string,
+    lease: string,
+    op: (p: WfpProvisioner) => Promise<unknown>,
+  ) => {
+    const before = s.row(id);
+    await fails(op(s.mk({ leaseHolder: B })));
+    await fails(op(s.p));
+    expect(s.row(id)).toEqual(before);
+    expect(s.row(id).lease).toBe(lease);
+  };
+
+  it("upgrade killed before the version write: the retry runs it again", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    const lease = kill(s, inst.id);
+    await refusedAndUntouched(s, inst.id, lease, (p) =>
+      p.upgrade(inst.id, "0.24.0"),
+    );
+    expect(
+      keep(await s.mk({ leaseHolder: A }).upgrade(inst.id, "0.24.0")),
+    ).toMatchObject({ from: "0.23.0", to: "0.24.0", ok: true });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.0",
+      previous_version: "0.23.0",
+      lease: null,
+    });
+  });
+
+  it("upgrade killed after the version write, lease long expired: the retry finishes it from the recorded from", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    keep(await s.p.upgrade(inst.id, "0.24.0"));
+    s.db()
+      .prepare(
+        "UPDATE installs SET version = '0.24.2', previous_version = '0.24.0' WHERE id = ?",
+      )
+      .run(inst.id);
+    kill(s, inst.id, { expired: true });
+    expect(
+      keep(await s.mk({ leaseHolder: A }).upgrade(inst.id, "0.24.2")),
+    ).toMatchObject({ from: "0.24.0", to: "0.24.2", ok: true });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.2",
+      previous_version: "0.24.0",
+      lease: null,
+    });
+  });
+
+  it("upgrade: a row past the retry's target is refused as a downgrade, still upgrading", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    keep(await s.p.upgrade(inst.id, "0.24.2"));
+    kill(s, inst.id);
+    const e = await fails(s.mk({ leaseHolder: A }).upgrade(inst.id, "0.24.0"));
+    expect(e.code).toBe("downgrade_refused");
+    expect(s.row(inst.id).state).toBe("upgrading");
+  });
+
+  it("rollback killed before its upload (marker or none): the retry rolls back", async () => {
+    for (const marked of [false, true]) {
+      const s = setup();
+      const inst = keep(await s.p.create(input()));
+      keep(await s.p.upgrade(inst.id, "0.24.0"));
+      const lease = kill(s, inst.id);
+      if (marked) startMarker(s, inst.id, A, "0.24.0", "0.23.0");
+      await refusedAndUntouched(s, inst.id, lease, (p) => p.rollback(inst.id));
+      expect(
+        keep(await s.mk({ leaseHolder: A }).rollback(inst.id)),
+      ).toMatchObject({ from: "0.24.0", to: "0.23.0", ok: true });
+      expect(s.row(inst.id)).toMatchObject({
+        state: "active",
+        version: "0.23.0",
+        previous_version: "0.24.0",
+        lease: null,
+      });
+    }
+  });
+
+  it("rollback killed after the version swap: the retry finishes it, never swaps back", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    keep(await s.p.upgrade(inst.id, "0.24.0"));
+    startMarker(s, inst.id, A, "0.24.0", "0.23.0");
+    kill(s, inst.id, {
+      row: { version: "0.23.0", previous_version: "0.24.0" },
+    });
+    expect(
+      keep(await s.mk({ leaseHolder: A }).rollback(inst.id)),
+    ).toMatchObject({ from: "0.24.0", to: "0.23.0", ok: true });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.23.0",
+      previous_version: "0.24.0",
+      lease: null,
+    });
+  });
+
+  it("rollback: another job's marker is not this job's", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    keep(await s.p.upgrade(inst.id, "0.24.0"));
+    startMarker(s, inst.id, B, "0.24.0", "0.23.0");
+    kill(s, inst.id);
+    expect(
+      keep(await s.mk({ leaseHolder: A }).rollback(inst.id)),
+    ).toMatchObject({ from: "0.24.0", to: "0.23.0", ok: true });
+  });
+
+  it("vars change killed: the retry applies it; the row ends active with the vars", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    const lease = kill(s, inst.id);
+    const op = (p: WfpProvisioner) =>
+      p.updateVars(inst.id, { AUTH_DOMAINS: "finqore.test" });
+    await refusedAndUntouched(s, inst.id, lease, op);
+    expect(keep(await op(s.mk({ leaseHolder: A })))).toMatchObject({
+      ok: true,
+    });
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+    expect(JSON.parse(s.row(inst.id).vars)).toEqual({
+      AUTH_DOMAINS: "finqore.test",
+    });
+  });
+
+  it("any other operation is still refused on the upgrading row, even for the same job", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    const lease = kill(s, inst.id);
+    const p = s.mk({ leaseHolder: A });
+    for (const op of [
+      () => p.delete(inst.id, inst.id),
+      () => p.reissueOwnerToken(inst.id, inst.id),
+      () => p.pause(inst.id, "paused", { kind: "suspend" }),
+    ]) {
+      await fails(op());
+      expect(s.row(inst.id)).toMatchObject({ state: "upgrading", lease });
+    }
   });
 });
 

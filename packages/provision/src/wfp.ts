@@ -105,6 +105,7 @@ import {
   canonicalJson,
   type DirectoryRevoke,
   holderLease,
+  leaseJobPart,
   type InstallRow,
   type InstallState,
   inputsHash,
@@ -2788,6 +2789,7 @@ export class WfpProvisioner {
     id: InstallId,
     states: InstallState[],
     nearExpiry: "refuse" | "warn" = "refuse",
+    resume: InstallState[] = [],
   ): Promise<InstallRow> {
     if (!isInstallId(id))
       throw new ProvisionRefused("not an install id", "invalid_state");
@@ -2797,7 +2799,7 @@ export class WfpProvisioner {
     const row = await this.platform.byId(id);
     if (!row)
       throw new ProvisionRefused(`install ${id} not found`, "invalid_state");
-    if (!states.includes(row.state))
+    if (!states.includes(row.state) && !this.mayResume(row, resume))
       throw new ProvisionRefused(
         `install ${id} is ${row.state}; this operation needs ${states.join(" or ")}`,
         "invalid_state",
@@ -2806,6 +2808,20 @@ export class WfpProvisioner {
     const owner = ownerEmailOf(row);
     if (owner !== null) this.sensitive.add(owner);
     return row;
+  }
+
+  /**
+   * #1501: a row in one of `resume` that this job's own earlier attempt left
+   * (its lease carries this job's part). The claim re-checks it in SQL.
+   */
+  private mayResume(row: InstallRow, resume: InstallState[]): boolean {
+    return (
+      this.o.leaseHolder !== undefined &&
+      resume.includes(row.state) &&
+      row.lease !== null &&
+      row.lease.startsWith(leaseJobPart(this.o.leaseHolder)) &&
+      /^[0-9a-f]{16}\.[0-9a-f]{32}$/.test(row.lease)
+    );
   }
 
   /**
@@ -2818,6 +2834,7 @@ export class WfpProvisioner {
     from: InstallState[],
     to: InstallState,
     op: string,
+    resume: InstallState[] = [],
   ): Promise<void> {
     const lease =
       this.o.leaseHolder === undefined
@@ -2831,13 +2848,14 @@ export class WfpProvisioner {
         lease,
         this.now() + LEASE_MS,
         row.row_version,
+        resume,
       )
     ) {
       this.held = { id: row.id, lease, op };
       return;
     }
     const cur = await this.platform.byId(row.id);
-    if (cur && !from.includes(cur.state))
+    if (cur && !from.includes(cur.state) && !this.mayResume(cur, resume))
       throw new ProvisionRefused(
         `install ${row.id} is ${cur.state}; another operation got there first`,
         "invalid_state",
@@ -3648,9 +3666,17 @@ export class WfpProvisioner {
     to: string,
     o: UpgradeOptions,
   ): Promise<UpgradeResult> {
-    const row = await this.openInstall(id, ["active"]);
+    const row = await this.openInstall(id, ["active"], "refuse", ["upgrading"]);
     this.checkDirect(row.app_host, row.id);
-    const from = row.version;
+    // #1501: a row this job's dead attempt left upgrading may already hold
+    // `to` (the version write ran, the check did not): its from is the
+    // recorded previous_version. Otherwise the write never ran: row.version.
+    const from =
+      row.state === "upgrading" &&
+      row.version === to &&
+      row.previous_version !== null
+        ? row.previous_version
+        : row.version;
     if (!from)
       throw new ProvisionRefused(
         `install ${id} has no version`,
@@ -3712,7 +3738,7 @@ export class WfpProvisioner {
     if (m.sitekey !== null) await this.checkWidget(m.sitekey, m.testHooks);
     const cut = this.pendingCut(row);
 
-    await this.claim(row, ["active"], "upgrading", "upgrade");
+    await this.claim(row, ["active"], "upgrading", "upgrade", ["upgrading"]);
     let uploaded = false;
     try {
       await this.ciTokenUnderLease(d1Id, n.d1, m.ownerEmail);
@@ -3872,10 +3898,15 @@ export class WfpProvisioner {
    */
   async rollback(id: InstallId): Promise<UpgradeResult> {
     return this.guarded(async () => {
-      const row = await this.openInstall(id, ["active"], "warn");
+      const seen = await this.openInstall(id, ["active"], "warn", [
+        "upgrading",
+      ]);
+      const row = await this.rollbackRowOf(seen);
       this.checkDirect(row.app_host, row.id);
       const plan = await this.planRollback(row);
-      await this.claim(row, ["active"], "upgrading", "rollback");
+      await this.claim(seen, ["active"], "upgrading", "rollback", [
+        "upgrading",
+      ]);
       try {
         await this.ciTokenUnderLease(
           plan.d1Id,
@@ -3899,6 +3930,35 @@ export class WfpProvisioner {
         throw e;
       }
     });
+  }
+
+  /**
+   * #1501: the row a rollback plans from. On an upgrading row this job's
+   * dead attempt left, the version write may or may not have run. The
+   * attempt's `rollback.start` (written before the upload, with this job's
+   * part) records the from and to it meant: row at from, nothing was
+   * written, plan as usual; row at to (previous_version from), the swap ran,
+   * plan from the pre-swap view so the retry re-verifies `to` and never
+   * swaps back. No record means nothing was written. Any other row is
+   * refused: it is not a state this job's attempt could have left.
+   */
+  private async rollbackRowOf(row: InstallRow): Promise<InstallRow> {
+    if (row.state !== "upgrading") return row;
+    const start = await this.platform.rollbackStartOf(
+      row.id,
+      leaseJobPart(this.o.leaseHolder as string),
+    );
+    if (
+      start === null ||
+      (row.version === start.from && row.previous_version === start.to)
+    )
+      return row;
+    if (row.version === start.to && row.previous_version === start.from)
+      return { ...row, version: start.from, previous_version: start.to };
+    throw new ProvisionRefused(
+      `install ${row.id} is at ${String(row.version)}, not where the rollback from ${start.from} to ${start.to} left it`,
+      "invalid_state",
+    );
   }
 
   /** Every rollback refusal, before any write. `own` is passed by the auto-rollback. */
@@ -4045,7 +4105,13 @@ export class WfpProvisioner {
       await this.hold();
       await this.platform.raiseFloorSeq(rel.floor.seq);
     }
-    await this.logged("rollback.start", { from, to });
+    await this.logged("rollback.start", {
+      from,
+      to,
+      ...(this.o.leaseHolder === undefined
+        ? {}
+        : { job: leaseJobPart(this.o.leaseHolder) }),
+    });
     if (report) await this.step("upload");
     this.assertHooksAllowed(rel.rec.variant, p.m.testHooks);
     const mods = await this.readModules(rel.rec);
@@ -4156,7 +4222,9 @@ export class WfpProvisioner {
           "vars must be an object of strings",
           "invalid_state",
         );
-      const row = await this.openInstall(id, ["active"]);
+      const row = await this.openInstall(id, ["active"], "refuse", [
+        "upgrading",
+      ]);
       const version = row.version;
       if (!version)
         throw new ProvisionRefused(
@@ -4221,7 +4289,7 @@ export class WfpProvisioner {
       if (m.sitekey !== null) await this.checkWidget(m.sitekey, m.testHooks);
       let cut = this.pendingCut(row);
 
-      await this.claim(row, ["active"], "upgrading", "vars");
+      await this.claim(row, ["active"], "upgrading", "vars", ["upgrading"]);
       let uploaded = false;
       let sessionCut = false;
       let armedHere = false;

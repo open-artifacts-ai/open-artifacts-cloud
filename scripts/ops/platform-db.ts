@@ -29,6 +29,13 @@
 // The token goes in a request header, never argv, and is never printed.
 // Usage: CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PLATFORM_DB_ID MAIN_MIGRATION_LOCK [VERIFY_ONLY]
 //   node scripts/ops/platform-db.ts staging|prod
+// The fleet's gate (#1229), same token and ids, no lock needed:
+//   node scripts/ops/platform-db.ts mark-verified staging|prod vX.Y.Z
+//     writes platform_state `platform_verified:<version>` once every Worker's
+//     read-back passed (a rerun keeps the first time; D1 errors are retried);
+//   node scripts/ops/platform-db.ts unmark-verified staging|prod
+//     deletes every `platform_verified:*` key (a break-glass run).
+//   The log names the mark and nothing else (no counts).
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -451,6 +458,84 @@ export async function run({
   log(`${migrations.length} migrations tracked, shapes match`);
 }
 
+const STABLE_TAG = /^v(\d+\.\d+\.\d+)$/;
+/** D1 errors are retried: this many attempts, backing off 1 s, then 2 s. */
+export const MARK_ATTEMPTS = 3;
+const MARK_BACKOFF_MS = 1_000;
+
+async function retried<T>(
+  sleep: (ms: number) => Promise<void>,
+  f: () => Promise<T>,
+): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await f();
+    } catch (e) {
+      if (n >= MARK_ATTEMPTS) throw e;
+      await sleep(MARK_BACKOFF_MS * 2 ** (n - 1));
+    }
+  }
+}
+
+/**
+ * Writes platform_state `platform_verified:<version>` (the tag without its v;
+ * the key the scheduler's fleet duty reads, FLEET_VERIFIED_PREFIX + the target)
+ * and reads it back.
+ */
+export async function markVerified({
+  db,
+  tag,
+  now,
+  sleep,
+  log,
+}: {
+  db: Db;
+  tag: string;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (s: string) => void;
+}): Promise<void> {
+  const m = STABLE_TAG.exec(tag);
+  if (!m) throw new Refused("tag must be a stable vX.Y.Z");
+  const key = `platform_verified:${m[1]}`;
+  const t = now();
+  await retried(sleep, async () => {
+    await db.all(
+      "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2) ON CONFLICT (key) DO NOTHING",
+      [key, t],
+    );
+    const back = await db.all(
+      "SELECT value FROM platform_state WHERE key = ?1",
+      [key],
+    );
+    if (back.length !== 1 || typeof back[0]?.value !== "number")
+      throw new Refused("read back: the mark is not there");
+  });
+  log(`${key} written`);
+}
+
+/** Deletes every platform_verified:* key, and reads back that none is left. */
+export async function unmarkVerified({
+  db,
+  sleep,
+  log,
+}: {
+  db: Db;
+  sleep: (ms: number) => Promise<void>;
+  log: (s: string) => void;
+}): Promise<void> {
+  await retried(sleep, async () => {
+    await db.all(
+      "DELETE FROM platform_state WHERE key GLOB 'platform_verified:*'",
+    );
+    const left = await db.all(
+      "SELECT key FROM platform_state WHERE key GLOB 'platform_verified:*' LIMIT 1",
+    );
+    if (left.length) throw new Refused("read back: a mark is still there");
+  });
+  log("platform_verified marks cleared");
+}
+
 /** D1 over the REST API: /query, the token in a header. */
 export function d1({
   token,
@@ -508,13 +593,22 @@ if (
   process.argv[1] &&
   realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
 ) {
-  const env = process.argv[2];
+  const mode =
+    process.argv[2] === "mark-verified" || process.argv[2] === "unmark-verified"
+      ? process.argv[2]
+      : null;
+  const env = mode ? process.argv[3] : process.argv[2];
   const fail = (msg: string, code = 1): never => {
     console.error(msg);
     process.exit(code);
   };
   if (env !== "staging" && env !== "prod")
-    fail("usage: platform-db.ts staging|prod", 2);
+    fail(
+      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | staging|prod]",
+      2,
+    );
+  if (mode === "mark-verified" && !process.argv[4])
+    fail("usage: platform-db.ts mark-verified staging|prod vX.Y.Z", 2);
   const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, PLATFORM_DB_ID } =
     process.env;
   if (!CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required", 2);
@@ -526,6 +620,31 @@ if (
     )
   )
     fail("PLATFORM_DB_ID must be a uuid", 2);
+  if (mode) {
+    try {
+      const db = d1({
+        token: CLOUDFLARE_API_TOKEN as string,
+        accountId: CLOUDFLARE_ACCOUNT_ID as string,
+        databaseId: PLATFORM_DB_ID as string,
+      });
+      const log = (s: string) => console.log(`oa-${env?.[0]}-platform: ${s}`);
+      const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+      if (mode === "mark-verified")
+        await markVerified({
+          db,
+          tag: process.argv[4] as string,
+          now: () => Date.now(),
+          sleep,
+          log,
+        });
+      else await unmarkVerified({ db, sleep, log });
+      process.exit(0);
+    } catch (e) {
+      fail(
+        `oa-${env?.[0]}-platform: ${e instanceof Refused ? e.message : "failed"}; refusing`,
+      );
+    }
+  }
   // main's lock (deploy-hosted-platform.yml copies it from main's checkout).
   const mainLock = process.env.MAIN_MIGRATION_LOCK;
   if (!mainLock)

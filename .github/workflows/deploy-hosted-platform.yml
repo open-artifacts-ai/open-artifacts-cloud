@@ -6,8 +6,8 @@
 # zone wiring (DNS, routes, settings: planned, then applied in the same run).
 # No one approves a run: the release gate (scripts/ci/tag-passed-checks.sh)
 # refuses a tag unless every earlier check on it passed, and prod's
-# platform-db, provisioner and provisioning also need a green
-# redline-staging.yml run for the same tag (scripts/ci/staging-first-gate.sh)
+# deploys (every target list, #1412; not verify_only, which deploys nothing)
+# also need a green redline-staging.yml run for the same tag (scripts/ci/staging-first-gate.sh)
 # and staging's post-deploy smoke green at or after it
 # (scripts/ci/staging-smoke-gate.sh, #1406). Each env has its own
 # Environment (hosted-staging-deploy, hosted-prod-deploy) holding the
@@ -256,20 +256,25 @@ jobs:
           cp .deploy-logic/apps/platform-db/migration-lock.json "$RUNNER_TEMP/main-ci/migration-lock.json"
           cp .deploy-logic/apps/billing/migration-lock.json "$RUNNER_TEMP/main-ci/billing-migration-lock.json"
           rm -rf .deploy-logic
-      # Staging first, automatic: prod's platform-db, provisioner,
-      # provisioning and scheduler (its tag is the fleet target, #955) deploy
-      # a tag only after redline-staging.yml passed it (within 7 days;
-      # scripts/ci/staging-first-gate.sh states the contract).
+      # Staging first, automatic: EVERY prod deploy, whatever its target list
+      # (#1412), deploys a tag only after redline-staging.yml passed it (within
+      # 7 days; scripts/ci/staging-first-gate.sh states the contract). A
+      # verify_only run with a partial list skips the gates: it deploys and sets
+      # nothing (it reads the live Workers back), so it must stay usable to
+      # check prod when the tag has no red-line, e.g. after an incident. A
+      # verify_only run with the FULL list does not skip them (#1229): it can
+      # write the fleet's platform_verified mark below, and a mark is a go for
+      # the rollout, so the same gates stand before it.
       - name: Staging passed this tag
-        if: ${{ inputs.env == 'prod' && (contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',provisioning,') || contains(format(',{0},', inputs.targets), ',scheduler,')) }}
+        if: ${{ inputs.env == 'prod' && (!inputs.verify_only || (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler')) }}
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: bash "$RUNNER_TEMP/main-ci/staging-first-gate.sh" "$TAG"
-      # #1406: the same targets also need staging's post-deploy smoke green
+      # #1406: the same runs also need staging's post-deploy smoke green
       # at or after the tag (scripts/ci/staging-smoke-gate.sh).
       - name: Staging's smoke is green at or after this tag
-        if: ${{ inputs.env == 'prod' && (contains(format(',{0},', inputs.targets), ',platform-db,') || contains(format(',{0},', inputs.targets), ',provisioner,') || contains(format(',{0},', inputs.targets), ',provisioning,') || contains(format(',{0},', inputs.targets), ',scheduler,')) }}
+        if: ${{ inputs.env == 'prod' && (!inputs.verify_only || (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler')) }}
         env:
           TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
@@ -404,7 +409,8 @@ jobs:
       # scheduler's tag is the fleet's target, so a red run must say whether it
       # moved. Only after a deploy step ran, never after an earlier gate failed
       # or the run was cancelled.
-      - name: Every platform Worker runs the tag
+      - id: platform_tags
+        name: Every platform Worker runs the tag
         if: ${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
@@ -413,6 +419,31 @@ jobs:
           # Staging's full list with billing: its Worker is read back too.
           PLATFORM_TAGS_BILLING: ${{ contains(format(',{0},', inputs.targets), ',billing,') && '1' || '' }}
         run: bash "$RUNNER_TEMP/main-ci/platform-tags.sh" "$DEPLOY_ENV" "$TAG"
+      # The fleet's gate (#1229): only once every step above succeeded, the
+      # scheduler's included, and the read-back passed, the platform D1 gets
+      # platform_verified:<version>. The scheduler's fleet duty starts no job
+      # for a target without it. A verify_only run with the FULL list marks too
+      # (it deploys nothing, but its read-back proved the Workers serve the tag,
+      # so it is how a stalled version is recovered); on prod it first passed
+      # the two staging gates above, and a failed gate means no mark. A partial
+      # verify_only run is ungated and never marks (the full-list condition).
+      - name: Mark the platform verified
+        if: ${{ success() && steps.platform_tags.outcome == 'success' && (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          TAG: ${{ inputs.tag }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts mark-verified "$DEPLOY_ENV" "$TAG"
+      # A break-glass run (a partial list that deployed something) clears every
+      # platform_verified mark, whatever its outcome: the platform is no longer
+      # known to be one verified release, so the fleet holds until a full green
+      # run marks it again. verify_only deploys nothing and never clears.
+      - name: Clear the platform verified marks (break-glass)
+        if: ${{ !cancelled() && !inputs.verify_only && inputs.targets != 'zones' && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && !(inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler') }}
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts unmark-verified "$DEPLOY_ENV"
       # The token's own end date (provision's checkToken never sees it): an
       # issue naming only the secret, 30 days ahead.
       - name: The deploy token's expiry

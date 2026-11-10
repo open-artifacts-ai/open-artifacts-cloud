@@ -216,6 +216,81 @@ describe("a job's lease token (holderLease, #1326: fenced by attempt)", () => {
   });
 });
 
+describe("claim with resume states (#1501)", () => {
+  const JA = "job:01JOBA";
+  const JB = "job:01JOBB";
+  const ID = "iaaaaaaaaaaa" as InstallId;
+  const up = async (
+    w: ReturnType<typeof world>,
+    lease: string,
+    until: number,
+  ) => {
+    const cur = await w.db.byId(ID);
+    return w.db.claim(
+      ID,
+      ["creating"],
+      "upgrading",
+      lease,
+      until,
+      cur?.row_version ?? 0,
+    );
+  };
+  const resume = async (
+    w: ReturnType<typeof world>,
+    lease: string,
+    until: number,
+  ) => {
+    const cur = await w.db.byId(ID);
+    return w.db.claim(
+      ID,
+      ["creating"],
+      "upgrading",
+      lease,
+      until,
+      cur?.row_version ?? 0,
+      ["upgrading"],
+    );
+  };
+
+  it("the holding job re-takes an upgrading row, live or expired; the stale attempt is then fenced", async () => {
+    const w = world();
+    await row(w);
+    const until = 1_800_000_000_000 + 30 * 60_000;
+    const a1 = holderLease(JA);
+    expect(await up(w, a1, until)).toBe(true);
+    const a2 = holderLease(JA);
+    expect(await resume(w, a2, until)).toBe(true);
+    w.tick(31 * 60_000);
+    const a3 = holderLease(JA);
+    expect(await resume(w, a3, until + 60 * 60_000)).toBe(true);
+    for (const stale of [a1, a2]) {
+      expect(await w.db.renew(ID, stale, until)).toBe(false);
+      expect(await w.db.update(ID, { version: "0.57.1" }, stale)).toBe(false);
+      expect(await w.db.finish(ID, stale, "active")).toBe(false);
+    }
+    expect(await w.db.byId(ID)).toMatchObject({
+      lease: a3,
+      state: "upgrading",
+    });
+  });
+
+  it("another job, a CLI token, or no resume state never takes it, live or expired", async () => {
+    const w = world();
+    await row(w);
+    const until = 1_800_000_000_000 + 30 * 60_000;
+    const a = holderLease(JA);
+    expect(await up(w, a, until)).toBe(true);
+    const cli = `${"0".repeat(32)}`;
+    for (const t of [0, 31 * 60_000]) {
+      w.tick(t);
+      expect(await resume(w, holderLease(JB), until + 1e9)).toBe(false);
+      expect(await resume(w, cli, until + 1e9)).toBe(false);
+      expect(await up(w, holderLease(JA), until + 1e9)).toBe(false);
+    }
+    expect((await w.db.byId(ID))?.lease).toBe(a);
+  });
+});
+
 describe("insertCreating and platform principals (4.1)", () => {
   it.each(["i000000admin", "i00000signup"])(
     "refuses %s before any write",

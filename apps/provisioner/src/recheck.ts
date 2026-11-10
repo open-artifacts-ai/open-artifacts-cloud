@@ -19,7 +19,7 @@ import {
 } from "@oa/provisioning-contract";
 import { StepRefusal } from "./errors.js";
 import { transient } from "./provisioner.js";
-import type { JobRow, StepCtx } from "./steps.js";
+import { auditStatement, type JobRow, type StepCtx } from "./steps.js";
 
 /**
  * A failed recheck: terminal, its message exactly invalid_state's fixed
@@ -223,4 +223,73 @@ export function checkSlug(slug: unknown): string {
   if (typeof slug !== "string" || slugError(slug) !== null)
     throw refused("the slug is not valid");
   return slug;
+}
+
+/** The audit action for a token-actor job refused at its recheck (#1168). */
+export const TOKEN_REFUSED_ACTION = "job.token_refused";
+
+/** Why a token-actor job was refused; the audit row's `reason`. */
+export type TokenRefusalReason =
+  | "no_token"
+  | "revoked"
+  | "expired"
+  | "session_ended";
+
+type LiveRow = {
+  revoked_at: number | null;
+  expires_at: number;
+  admin_email: string;
+  s_kind: string | null;
+  s_email: string | null;
+  s_revoked_at: number | null;
+  s_expires_at: number | null;
+};
+
+/**
+ * #1168: a job whose actor is a token (T) was authorized at request time; its
+ * Workflow runs later. The same liveness tokenPrincipal enforces per request,
+ * minus ADMIN_IDENTITIES (this Worker has no such var): the job's agent_tokens
+ * row exists, is not revoked and not past expires_at, and its admin session
+ * (matched by session_hash) is an unrevoked, unexpired admin session of the
+ * token's admin_email. Any failure is a terminal `invalid_state`, and a
+ * `job.token_refused` audit row names the reason (no email, no token id).
+ * Other actors are not touched.
+ */
+export async function checkTokenLive(ctx: StepCtx, job: JobRow): Promise<void> {
+  if (job.actor_kind !== "token") return;
+  const row = job.token_id
+    ? await transient(
+        ctx.env.PLATFORM_DB.prepare(
+          `SELECT t.revoked_at, t.expires_at, t.admin_email, s.kind AS s_kind, s.email AS s_email,
+s.revoked_at AS s_revoked_at, s.expires_at AS s_expires_at
+FROM agent_tokens t LEFT JOIN sessions s ON s.id_hash = t.session_hash WHERE t.id = ?`,
+        )
+          .bind(job.token_id)
+          .first<LiveRow>(),
+      )
+    : null;
+  const now = ctx.io.now();
+  let reason: TokenRefusalReason | null = null;
+  if (!row) reason = "no_token";
+  else if (row.revoked_at !== null) reason = "revoked";
+  else if (row.expires_at <= now) reason = "expired";
+  else if (
+    row.s_kind !== "admin" ||
+    row.s_revoked_at !== null ||
+    row.s_expires_at === null ||
+    row.s_expires_at <= now ||
+    row.s_email?.toLowerCase() !== row.admin_email.toLowerCase()
+  )
+    reason = "session_ended";
+  if (reason === null) return;
+  await transient(
+    auditStatement(
+      ctx,
+      job.install_id,
+      TOKEN_REFUSED_ACTION,
+      { jobId: job.id, kind: job.kind, reason },
+      job.id,
+    ).run(),
+  );
+  throw refused(`the job's token is not live (${reason})`);
 }

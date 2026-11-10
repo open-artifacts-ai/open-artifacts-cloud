@@ -3,6 +3,11 @@
 // for it. It fails closed: a dispatch it cannot match to exactly one run, or
 // a run that is not a success, fails the chain.
 //
+// The same machinery dispatches hosted-publish.yml (workflow "publish",
+// #1412): the chain publishes a tag's release to prod's bucket, with env=prod,
+// the tag and its chain id, before it deploys. Both are matched and waited for
+// the same way.
+//
 // A reusable-workflow call cannot be used: a secret the caller does not pass
 // resolves empty even when the called job's Environment has it, and the
 // caller (a `uses:` job) cannot set an Environment (run 42109047045). A
@@ -22,7 +27,14 @@ import { pathToFileURL } from "node:url";
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
 
-const WORKFLOW = "deploy-hosted-platform.yml";
+export type Which = "deploy" | "publish";
+const WORKFLOWS: Record<Which, { file: string; name: string }> = {
+  deploy: {
+    file: "deploy-hosted-platform.yml",
+    name: "deploy-hosted-platform",
+  },
+  publish: { file: "hosted-publish.yml", name: "hosted-publish" },
+};
 const BOT = "github-actions[bot]";
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
@@ -48,6 +60,8 @@ export interface Opts {
   repo: string;
   tag: string;
   chainId: string;
+  /** Which workflow to dispatch; deploy by default. */
+  workflow?: Which;
   now: () => number;
   sleep: (ms: number) => void;
   /** Called as soon as the run is found, before waiting for it. */
@@ -75,6 +89,8 @@ export function dispatchAndWait(o: Opts): Outcome {
   const waitFor = o.waitTimeoutMs ?? 45 * 60_000;
   const poll = o.pollMs ?? 10_000;
 
+  const which = o.workflow ?? "deploy";
+  const WORKFLOW = WORKFLOWS[which].file;
   const t0 = o.now();
   gh(o.exec, [
     "workflow",
@@ -88,14 +104,18 @@ export function dispatchAndWait(o: Opts): Outcome {
     "env=prod",
     "-f",
     `tag=${o.tag}`,
-    "-f",
-    `targets=${FULL}`,
-    "-f",
-    "reason=",
-    "-f",
-    "verify_only=false",
-    "-f",
-    "require_newer=true",
+    ...(which === "deploy"
+      ? [
+          "-f",
+          `targets=${FULL}`,
+          "-f",
+          "reason=",
+          "-f",
+          "verify_only=false",
+          "-f",
+          "require_newer=true",
+        ]
+      : []),
     "-f",
     `chain_id=${o.chainId}`,
   ]);
@@ -103,7 +123,7 @@ export function dispatchAndWait(o: Opts): Outcome {
   const since = o.now() - skew;
   // The run-name is exactly this (deploy-hosted-platform.yml): a wrong env or
   // tag in the title is not our run.
-  const title = `deploy-hosted-platform prod ${o.tag} [${o.chainId}]`;
+  const title = `${WORKFLOWS[which].name} prod ${o.tag} [${o.chainId}]`;
   const matches = (): WorkflowRun[] => {
     const out = JSON.parse(
       gh(o.exec, [
@@ -145,7 +165,7 @@ export function dispatchAndWait(o: Opts): Outcome {
     if (r.status === "completed") {
       if (r.conclusion !== "success")
         throw new Error(
-          `deploy run ${found.id} concluded ${r.conclusion ?? "none"}: ${url}`,
+          `${which} run ${found.id} concluded ${r.conclusion ?? "none"}: ${url}`,
         );
       return { runId: found.id, url, conclusion: "success" };
     }
@@ -175,7 +195,7 @@ export function dispatchAndWait(o: Opts): Outcome {
         // Fall through: not proven green.
       }
       throw new Error(
-        `deploy run ${found.id} did not finish within ${waitFor} ms; ${did}`,
+        `${which} run ${found.id} did not finish within ${waitFor} ms; ${did}`,
       );
     }
     o.sleep(poll);
@@ -223,6 +243,7 @@ function main(argv: string[]) {
       repo: flag(argv, "repo"),
       tag: flag(argv, "tag"),
       chainId: flag(argv, "chain-id"),
+      workflow: flag(argv, "workflow") === "publish" ? "publish" : "deploy",
       now: Date.now,
       sleep: (ms) =>
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
