@@ -44,6 +44,8 @@ set -uo pipefail
 # And the billing database's migration runner for the staging deploy (#1568):
 # a script and its test that public never had (the deploy scripts that call it
 # are in the private list, this pair is not).
+# And the staging Solo test-clock workflow with its script and test (M2 step 8):
+# new hosted files that public never had.
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
@@ -54,6 +56,9 @@ ALLOW=(
   scripts/ci/hosted-release-alert.test.ts
   scripts/ops/billing-db.ts
   scripts/ops/billing-db.test.ts
+  .github/workflows/staging-solo-clock.yml
+  scripts/ops/staging-solo-clock.ts
+  scripts/ops/staging-solo-clock.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

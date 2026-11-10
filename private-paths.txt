@@ -29,7 +29,6 @@ docs/ops/redline-signin.md
 .github/workflows/provapi-staging-spikes.yml
 .github/workflows/redline-nightly.yml
 .github/workflows/redline-staging.yml
-.github/workflows/staging-solo-clock.yml
 .github/workflows/staging-test-admin.yml
 .github/workflows/staging-test-member.yml
 .github/workflows/token-ping-prod.yml
@@ -97,8 +96,6 @@ scripts/ops/hosted-zones.sh
 scripts/ops/hosted-zones.test.ts
 scripts/ops/platform-db.test.ts
 scripts/ops/platform-db.ts
-scripts/ops/staging-solo-clock.test.ts
-scripts/ops/staging-solo-clock.ts
 scripts/ops/staging-test-admin.test.ts
 scripts/ops/staging-test-admin.ts
 scripts/ops/staging-test-member.test.ts
