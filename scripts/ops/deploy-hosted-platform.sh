@@ -484,6 +484,52 @@ case "$target" in
     fi
     # Every deploy: the list can change, and the deployed value can't be read.
     printf '%s' "$ADMIN_IDENTITIES" | put_secret "$W" provisioning ADMIN_IDENTITIES
+    # The sign-up host's broker key (signup.<app>, cloud #35, #40): STAGING
+    # ONLY, made like the admin's (entry first, a failed put deletes it). Prod
+    # gets none: its sign-in stays unavailable (503) and its sign-ups stay
+    # closed; opening prod is a separate change.
+    SKEY="install:i00000signup"
+    SIGNUP_KEY_WANTED=""
+    if [ "$env" = staging ]; then
+      SIGNUP_KEY_WANTED=1
+      rc=0
+      entry="$(kv_get "$BROKER_REGISTRY_ID" "$SKEY")" || rc=$?
+      [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit 1
+      if [ -z "$VERIFY_ONLY" ] && { [ "$rc" -eq 3 ] || ! grep -qx SIGNUP_BROKER_KEY <<< "$have"; }; then
+        key="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/broker-key.ts")"
+        entry="$(jq -c --arg o "https://signup.$ZONE" '{installId: "i00000signup", origin: $o, keys: [{kid, x}], domains: []}' <<< "$key")"
+        cf_send PUT "/storage/kv/namespaces/$BROKER_REGISTRY_ID/values/$SKEY" "$entry" | must "write $SKEY" > /dev/null
+        echo "$W: registry entry $SKEY written"
+        if ! jq -r '.pkcs8' <<< "$key" | put_secret "$W" provisioning SIGNUP_BROKER_KEY; then
+          key=""
+          if cf_send DELETE "/storage/kv/namespaces/$BROKER_REGISTRY_ID/values/$SKEY" "" | must "delete $SKEY" > /dev/null; then
+            echo "$W: SIGNUP_BROKER_KEY was not set; $SKEY deleted, rerun to make both" >&2
+          else
+            echo "$W: SIGNUP_BROKER_KEY was not set and $SKEY could not be deleted: delete it by hand, then rerun" >&2
+          fi
+          exit 1
+        fi
+        key=""
+      fi
+    else
+      echo "$W: no SIGNUP_BROKER_KEY on $env: signup.<app> sign-in stays unavailable (503)"
+    fi
+    # The Turnstile site key (public): the env's one widget oa-<p>-turnstile
+    # (its domain [<app>] covers signup.<app>), found by exact name; STAGING
+    # ONLY like the broker key. The widget's secret is never read here. Zero or
+    # several widgets, or a failed listing: say so and leave it unset (the page
+    # then says sign-ups are unavailable); never fails the deploy.
+    if [ "$env" = staging ]; then
+      widgets="$(list_all "/challenges/widgets?" "list Turnstile widgets")" || widgets=""
+      sitekeys="$(jq -r --arg n "oa-$P-turnstile" '[.[]? | select(.name == $n) | .sitekey] | join(" ")' <<< "$widgets" 2> /dev/null)" || sitekeys=""
+      if [[ "$sitekeys" =~ ^[0-9A-Za-z_-]{1,64}$ ]]; then
+        printf '%s' "$sitekeys" | put_secret "$W" provisioning TURNSTILE_SITEKEY
+      else
+        echo "$W: TURNSTILE_SITEKEY not set: want exactly one Turnstile widget named oa-$P-turnstile (found: '${sitekeys:-none}', or the listing failed); the sign-up page says sign-ups are unavailable until it is" >&2
+      fi
+    else
+      echo "$W: no TURNSTILE_SITEKEY on $env: the sign-up page says sign-ups are unavailable"
+    fi
     # Again after the secrets: the serving version carries the tag.
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
       SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" deploy provisioning
@@ -514,7 +560,18 @@ case "$target" in
     vars_are "$S" provisioning
     expect "$S" '.result.observability.enabled // false' false "observability"
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
-    [ "$names" = "ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY " ] || { echo "$W secrets are '$names'" >&2; exit 1; }
+    # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
+    names="${names/TURNSTILE_SITEKEY /}"
+    want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
+    [ "$names" = "$want_names" ] || { echo "$W secrets are '$names'" >&2; exit 1; }
+    if [ -n "$SIGNUP_KEY_WANTED" ]; then
+      rc=0
+      entry="$(kv_get "$BROKER_REGISTRY_ID" "$SKEY")" || rc=$?
+      [ "$rc" -eq 0 ] || { [ "$rc" -eq 3 ] && echo "$SKEY is not in oa-$P-broker-registry" >&2; exit 1; }
+      ok="$(jq -r --arg o "https://signup.$ZONE" '.installId == "i00000signup" and .origin == $o and .domains == [] and (.keys | length) >= 1
+        and all(.keys[]; (.kid | type) == "string" and (.x | type) == "string") and (.disabled // false) == false' <<< "$entry" 2> /dev/null)" || ok=""
+      [ "$ok" = true ] || { echo "$SKEY in oa-$P-broker-registry is not the sign-up entry" >&2; exit 1; }
+    fi
     rc=0
     entry="$(kv_get "$BROKER_REGISTRY_ID" "$KEY")" || rc=$?
     [ "$rc" -eq 0 ] || { [ "$rc" -eq 3 ] && echo "$KEY is not in oa-$P-broker-registry" >&2; exit 1; }
