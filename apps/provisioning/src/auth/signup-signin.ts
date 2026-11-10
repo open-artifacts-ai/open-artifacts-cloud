@@ -18,6 +18,7 @@ import { checkCsrf } from "./csrf.js";
 import { FLOW_TTL_MS, readFlow, writeFlow } from "./flow.js";
 import { BROKER_GOOGLE_CLIENT_ID } from "./google.js";
 import { readCookie } from "./session.js";
+import { openInstance } from "./signup-open.js";
 import {
   clearSignupFlowCookie,
   clearSignupSessionCookie,
@@ -259,6 +260,8 @@ export function signupAuthRoute(
   if (req.method === "GET" && path === "/auth/start") return start(req, env, d);
   if (req.method === "GET" && path === "/auth/callback/google")
     return callback(req, env, d);
+  if (req.method === "POST" && path === "/auth/open")
+    return openInstance(req, env, d.now());
   if (req.method === "POST" && path === "/auth/logout")
     return logout(req, env, d);
   return null;
