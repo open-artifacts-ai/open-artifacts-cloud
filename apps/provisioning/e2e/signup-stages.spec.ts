@@ -202,15 +202,60 @@ test("poll: notice after 3 failures, cleared on the next success", async ({
   fail = true;
   await tick(page);
   await tick(page);
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("status")).toHaveText("");
   await tick(page);
   await expect(page.getByRole("status")).toHaveText(
     "Can't reach the server. Retrying\u2026",
   );
   fail = false;
   await tick(page);
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("status")).toHaveText("");
 });
+
+test("poll: a 429 counts as a failure and keeps the stage", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let bad = false;
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => (bad ? { status: 429 } : creating("queued")),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  bad = true;
+  await tick(page);
+  await tick(page);
+  await tick(page);
+  await expect(page.getByRole("status")).toHaveText(
+    "Can't reach the server. Retrying\u2026",
+  );
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+});
+
+for (const [name, gonesResp] of [
+  ["stage none", { status: 200, body: { stage: "none" } }],
+  ["404", { status: 404 }],
+] as const)
+  test(`poll: ${name} (signup gone) returns to the form`, async ({ page }) => {
+    await page.clock.install();
+    let gone = false;
+    await mount(page, {
+      me: true,
+      stage: "queued",
+      signup: () => (gone ? gonesResp : creating("queued")),
+    });
+    await expect(page.locator("h1")).toHaveText(
+      "Setting up acme.open-artifacts.app",
+    );
+    gone = true;
+    await tick(page);
+    await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  });
 
 test("poll: a 401 goes to sign-in", async ({ page }) => {
   await page.clock.install();

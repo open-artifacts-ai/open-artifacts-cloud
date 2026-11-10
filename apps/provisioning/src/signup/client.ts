@@ -454,7 +454,8 @@ export const CLIENT_JS = String.raw`(function () {
       h("h1", {}, ["Setting up ", nw(hostName)])
     ];
     head = pending;
-    if (S.offline) pending.push(h("div", { class: "note warn", role: "status" }, ["Can't reach the server. Retrying\u2026"]));
+    refs.live = h("div", { role: "status" });
+    pending.push(refs.live);
     if (st === "ready") {
       label = "Ready";
       head = [h("h1", {}, [nw(hostName), " is ready"])];
@@ -491,11 +492,18 @@ export const CLIENT_JS = String.raw`(function () {
   function loadSignup() {
     return api("GET", "/api/v1/signup").then(function (r) {
       if (r.status === 401) return "unauth";
-      if (r.status === 200 && r.body && r.body.stage !== "none") {
-        S.signup = { stage: r.body.stage, slug: r.body.slug, host: r.body.host };
-      } else { S.signup = null; }
-      return r.status === 200 || r.status < 500 ? "ok" : "error";
+      if (r.status === 404 || (r.status === 200 && r.body && r.body.stage === "none")) {
+        S.signup = null; return "gone";
+      }
+      if (r.status !== 200 || !r.body) return "error";
+      S.signup = { stage: r.body.stage, slug: r.body.slug, host: r.body.host };
+      return "ok";
     }, function () { return "error"; });
+  }
+  function paintLive() {
+    if (!refs.live) return;
+    refs.live.className = S.offline ? "note warn" : "";
+    refs.live.textContent = S.offline ? "Can't reach the server. Retrying\u2026" : "";
   }
   function stopPoll() { clearInterval(S.poll); S.polling = false; }
   function pollOnce() {
@@ -503,7 +511,6 @@ export const CLIENT_JS = String.raw`(function () {
     S.inflight = true;
     var before = S.signup && S.signup.stage;
     var wasOffline = S.offline;
-    var keep = S.signup;
     loadSignup().then(function (res) {
       S.inflight = false;
       if (S.view !== "setup") return;
@@ -511,15 +518,15 @@ export const CLIENT_JS = String.raw`(function () {
         stopPoll(); S.me = null; S.signup = null; S.offline = false;
         S.notice = NOTICES.expired; route(); return;
       }
+      if (res === "gone") { stopPoll(); S.offline = false; route(); return; }
       if (res === "error") {
-        S.signup = keep;
         S.fails = (S.fails || 0) + 1;
-        if (S.fails >= 3 && !S.offline) { S.offline = true; render(); }
+        if (S.fails >= 3 && !S.offline) { S.offline = true; paintLive(); }
         return;
       }
-      S.fails = 0; S.offline = false;
-      if (!S.signup) return;
-      if (S.signup.stage !== before || wasOffline) render();
+      S.fails = 0;
+      if (wasOffline) { S.offline = false; paintLive(); }
+      if (S.signup.stage !== before) render();
       if (S.signup.stage === "ready" || S.signup.stage === "failed") stopPoll();
     });
   }
