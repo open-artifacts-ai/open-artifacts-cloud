@@ -56,6 +56,8 @@ type Row = {
   status?: string;
   trialEndsAt?: number | null;
   version?: number;
+  /** A Stripe customer on the row (default true). */
+  customer?: boolean;
 };
 
 async function seed(rows: Row[]) {
@@ -71,7 +73,7 @@ async function seed(rows: Row[]) {
           r.tier ?? "solo",
           r.status ?? "active",
           r.trialEndsAt ?? null,
-          `cus_${r.install}`,
+          r.customer === false ? null : `cus_${r.install}`,
           `sub_${r.install}`,
           r.version ?? 1,
         ),
@@ -474,12 +476,25 @@ describe("GET /tier", () => {
       trialEndsAt: NOW + 5,
       graceUntil: null,
       soloTrialEndsAt: null,
+      hasCustomer: true,
       version: 3,
       asOf: NOW,
     });
     expect(JSON.stringify(body)).not.toMatch(/cus_|sub_/);
     expect(await rowOf(A)).toMatchObject({ last_read_at: NOW, version: 3 });
     expect((await rowOf(B))?.last_read_at).toBeNull();
+  });
+
+  it("hasCustomer is false without a Stripe customer, true with one, and never the id", async () => {
+    at();
+    await seed([{ install: A, customer: false }, { install: B }]);
+    const a = await (await call(gated("GET", "/tier"))).json();
+    expect(a).toMatchObject({ hasCustomer: false });
+    expect(JSON.stringify(a)).not.toMatch(/cus_/);
+    const b = await (
+      await call(gated("GET", "/tier", undefined, { "x-oa-gate-install": B }))
+    ).json();
+    expect(b).toMatchObject({ hasCustomer: true });
   });
 
   it("a missing row is solo/active at version 0, and nothing is written", async () => {
@@ -491,6 +506,7 @@ describe("GET /tier", () => {
       trialEndsAt: null,
       graceUntil: null,
       soloTrialEndsAt: null,
+      hasCustomer: false,
       version: 0,
       asOf: NOW,
     });
@@ -524,6 +540,13 @@ describe("trial/start and usage take the body's own fields only, like /checkout 
 });
 
 describe("POST /trial/start", () => {
+  it("the answer carries hasCustomer for a row with no Stripe customer", async () => {
+    at();
+    await seed([{ install: A, customer: false }]);
+    const r = await call(gated("POST", "/trial/start", { install: A }));
+    expect(await r.json()).toMatchObject({ tier: "trial", hasCustomer: false });
+  });
+
   it("from solo/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
     at();
     await seed([{ install: A, version: 4 }, { install: B }]);
@@ -535,6 +558,7 @@ describe("POST /trial/start", () => {
       trialEndsAt: NOW + TRIAL_MS,
       graceUntil: null,
       soloTrialEndsAt: null,
+      hasCustomer: true,
       version: 5,
       asOf: NOW,
     });
