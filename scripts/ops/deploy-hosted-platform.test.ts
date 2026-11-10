@@ -2554,6 +2554,42 @@ describe("deploy-hosted-platform.sh", () => {
         '"origin":"https://admin.open-artifacts-staging.app"',
       );
     });
+    it("staging also makes the sign-up host's key and entry; a given Turnstile sitekey is put, and prod gets neither (#40)", () => {
+      const exists = ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"];
+      const next = {
+        "oa-s-provisioning": settings(provisioningBindings("s", "staging")),
+      };
+      const r = setup({ exists, next }).run(
+        "provisioning",
+        { NEW_KV: OAUTH, TURNSTILE_SITEKEY: "0x4AAAAAAAtest_key-1" },
+        "staging",
+      );
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      const sp = r.writes.find((w) =>
+        w.includes("/values/install:i00000signup "),
+      ) as string;
+      expect(sp).toContain('"installId":"i00000signup"');
+      expect(sp).toContain(
+        '"origin":"https://signup.open-artifacts-staging.app"',
+      );
+      expect(sp).toContain('"domains":[]');
+      expect(puts(r.log)).toEqual([
+        "ADMIN_SESSION_KEY",
+        "ADMIN_BROKER_KEY",
+        "ADMIN_IDENTITIES",
+        "SIGNUP_BROKER_KEY",
+        "TURNSTILE_SITEKEY",
+      ]);
+      const none = setup({ exists, next }).run(
+        "provisioning",
+        { NEW_KV: OAUTH },
+        "staging",
+      );
+      expect(none.code, none.err).toBe(0);
+      expect(puts(none.log)).not.toContain("TURNSTILE_SITEKEY");
+      expect(none.out).toContain("no TURNSTILE_SITEKEY given");
+    });
   });
 
   it("auth-broker: the Google secret only when given or absent", () => {
