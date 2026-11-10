@@ -21,10 +21,6 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import type {
-  SoloStartError,
-  SoloStartResult,
-} from "../../../packages/billing-core/src/solo-start.js";
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   type BundleVariant,
@@ -45,6 +41,10 @@ import {
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
 import { createWorkflowInstance } from "@oa/provisioning-contract/workflow";
+import type {
+  SoloStartError,
+  SoloStartResult,
+} from "../../../packages/billing-core/src/solo-start.js";
 import { codeOf, StepRefusal } from "./errors.js";
 import {
   appHostOf,
@@ -61,6 +61,7 @@ import {
   checkJob,
   checkOidcScope,
   checkSlug,
+  checkTokenLive,
   checkTransition,
   readStatus,
   refused,
@@ -312,6 +313,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
     "create",
     "retry",
   ]);
+  await checkTokenLive(ctx, job);
   const kind = job.kind as "create" | "retry";
   if (!job.signup_id) throw refused("the job has no signup");
   const s = await signupOf(ctx, job.signup_id);
