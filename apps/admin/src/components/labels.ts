@@ -221,6 +221,6 @@ export const actorName = (a: {
   tokenId: string | null;
 }): string => {
   if (a.kind === "token" && (a.label === "" || a.label === "unnamed"))
-    return a.tokenId ? `agent token ${a.tokenId.slice(0, 8)}` : "agent token";
+    return a.tokenId ? `agent token ${a.tokenId.slice(-8)}` : "agent token";
   return a.label;
 };

@@ -860,9 +860,7 @@ it("a purged install shows Purged, with Health and Serving n/a", async () => {
   await open(i);
   expect(screen.getByTestId("state")).toHaveTextContent("Purged");
   const facts = within(screen.getByRole("region", { name: "Facts" }));
-  expect(facts.getByText("Health").nextElementSibling).toHaveTextContent(
-    "n/a",
-  );
+  expect(facts.getByText("Health").nextElementSibling).toHaveTextContent("n/a");
   expect(facts.getByText("Serving").nextElementSibling).toHaveTextContent(
     "n/a",
   );
@@ -910,7 +908,7 @@ it("recent jobs: an unlabeled agent token shows its id, not unnamed", async () =
   );
   await open(i);
   const cell = await screen.findByText(
-    `agent token ${FIXTURE_IDS.token.slice(0, 8)}`,
+    `agent token ${FIXTURE_IDS.token.slice(-8)}`,
   );
   expect(cell).toBeInTheDocument();
   expect(screen.queryByText("unnamed")).toBeNull();

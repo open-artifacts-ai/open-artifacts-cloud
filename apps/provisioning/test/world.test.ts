@@ -119,6 +119,18 @@ describe("R27 /world", () => {
     expect((await world()).scheduler.stale).toBe(true);
   });
 
+  it("a purged install with a stale failing health is counted unknown and raises no health alert (#2021)", async () => {
+    await seedInstall({
+      slug: "gone",
+      state: "deleted",
+      lifecycle: { health: "failing", health_at: NOW - MIN },
+    });
+    await seedInstall({ slug: "live", lifecycle: { health: "ok" } });
+    const w = await world();
+    expect(w.installs.byHealth).toEqual({ ok: 1, failing: 0, unknown: 1 });
+    expect(w.attention.some((x) => x.kind === "health_failing")).toBe(false);
+  });
+
   it("attention: one item per alert-condition row, the same rows the scheduler sees", async () => {
     const a = await seedInstall({ slug: "boom" });
     await seedJob(a.id, {

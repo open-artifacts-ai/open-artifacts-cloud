@@ -164,7 +164,8 @@ export function JobPage({ id }: { id: string }) {
           </div>
           <p className="oa-sub">
             Job <span className="oa-code">{shortId(job.id)}</span> · started{" "}
-            {fmtClock(job.createdAt)} by {job.actor.label} · step {n} of {of}
+            {fmtClock(job.createdAt)} by {actorName(job.actor)} · step {n} of{" "}
+            {of}
             <span className="sr-only" data-testid="status">
               {" "}
               · {job.status}
