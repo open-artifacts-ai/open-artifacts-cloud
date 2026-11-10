@@ -61,7 +61,9 @@ describe("wrangler.jsonc", () => {
       // env's own price placeholders; the Stripe key is a secret, never here.
       const up = env.toUpperCase();
       expect(e.vars).toEqual({
-        ...(env === "staging" ? { STAGING_TEST_CLOCK_INSTALLS: "" } : {}),
+        ...(env === "staging"
+          ? { STAGING_TEST_CLOCK_INSTALLS: "m2-walk" }
+          : {}),
         OA_ENV: env,
         STRIPE_PRICE_TEAM: `{{STRIPE_PRICE_TEAM_${up}}}`,
         STRIPE_PRICE_BUSINESS: `{{STRIPE_PRICE_BUSINESS_${up}}}`,

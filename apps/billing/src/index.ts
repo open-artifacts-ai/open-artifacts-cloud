@@ -396,7 +396,6 @@ async function customerFor(
           {
             installId: install,
             frozenTime: Math.floor(now / 1000),
-            idempotencyKey: `clock-${install}`,
           },
           cfg,
         ),
@@ -404,6 +403,9 @@ async function customerFor(
       await db.prepare(SET_CLOCK_SQL).bind(clock.id, install).run();
       testClockId = (await read()).stripe_test_clock_id ?? undefined;
       if (!testClockId) throw new Error("test clock missing after write");
+      // A concurrent start won the row: this clock is an orphan, for the sweep.
+      if (testClockId !== clock.id)
+        console.error("billing test_clock lost", install, clock.id);
       console.log("billing test_clock mapped", install);
     }
   }
@@ -411,7 +413,11 @@ async function customerFor(
     createCustomer(
       {
         installId: install,
-        idempotencyKey: `cust-${install}`,
+        // A clock's customer is keyed by its clock: after a cleanup the next
+        // one is new, never a replay of the deleted customer.
+        idempotencyKey: testClockId
+          ? `cust-${install}-${testClockId}`
+          : `cust-${install}`,
         ...(testClockId ? { testClockId } : {}),
       },
       cfg,
@@ -523,7 +529,12 @@ async function checkout(
     install,
     cfg,
     Date.now(),
-    isClockInstall(env, env.STAGING_TEST_CLOCK_INSTALLS, install),
+    isClockInstall(
+      env,
+      env.STAGING_TEST_CLOCK_INSTALLS,
+      install,
+      (await lookupInstall(env.BROKER_REGISTRY, install, Date.now()))?.origin,
+    ),
   );
   const base = `https://${appHost}/settings/billing`;
   // Paying during the no-card Solo trial keeps the free days: the new
@@ -766,7 +777,12 @@ async function soloStartCore(
     install,
     cfg,
     now,
-    isClockInstall(env, env.STAGING_TEST_CLOCK_INSTALLS, install),
+    isClockInstall(
+      env,
+      env.STAGING_TEST_CLOCK_INSTALLS,
+      install,
+      (await lookupInstall(env.BROKER_REGISTRY, install, Date.now()))?.origin,
+    ),
   );
   const sub = await stripe(install, () =>
     createSoloTrialSubscription(

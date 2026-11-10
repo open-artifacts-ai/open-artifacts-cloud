@@ -211,12 +211,29 @@ export async function cleanup(
 ): Promise<void> {
   const { db, log } = io;
   const row = await rowOf(db, install);
+  // Never reset a row that is not a clock install's: it may be a real staging
+  // install's customer map. No row at all is only the orphan-clock sweep.
+  if (row && !row.clock)
+    throw new Refused(
+      "the install's billing row has no test clock: it is not a clock install, refusing to reset it",
+    );
   const ids = new Set<string>();
   if (row?.clock) ids.add(row.clock);
-  // Orphans too: a clock named for the install whose row never stored it.
-  const list = await call("GET", "/v1/test_helpers/test_clocks?limit=100");
-  for (const c of (list.data as Obj[] | undefined) ?? [])
-    if (c.name === install && typeof c.id === "string") ids.add(c.id);
+  // Orphans too: a clock named for the install whose row never stored it
+  // (a lost concurrent start). The list is paged.
+  let after = "";
+  for (;;) {
+    const page = await call(
+      "GET",
+      `/v1/test_helpers/test_clocks?limit=100${after ? `&starting_after=${after}` : ""}`,
+    );
+    const data = (page.data as Obj[] | undefined) ?? [];
+    for (const c of data)
+      if (c.name === install && typeof c.id === "string") ids.add(c.id);
+    const last = data.at(-1)?.id;
+    if (page.has_more !== true || typeof last !== "string") break;
+    after = last;
+  }
   for (const id of ids) {
     try {
       await call("DELETE", `/v1/test_helpers/test_clocks/${id}`);
@@ -228,9 +245,13 @@ export async function cleanup(
     }
   }
   if (ids.size === 0) log("no clock found");
+  if (!row) {
+    log("no billing row: swept clocks only");
+    return;
+  }
   // Customer map and tiers row go together: the next trial start makes a
   // fresh clock and customer. (There is no billing route for this.)
-  await db.exec(`DELETE FROM tiers WHERE install_id = '${install}'`);
+  await db.all("DELETE FROM tiers WHERE install_id = ?1", [install]);
   log("billing rows reset");
 }
 

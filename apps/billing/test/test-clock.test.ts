@@ -130,12 +130,63 @@ describe("parseClockInstalls (strict)", () => {
       `,${A}`,
       `${A},,${B}`,
       `${A},${A}`,
-      "iabc123def4",
       "Iabc123def45",
       "*",
       `${A};${B}`,
     ])
       expect(parseClockInstalls(raw), raw).toBeNull();
+  });
+});
+
+describe("slugs", () => {
+  const e = { OA_ENV: "staging", STRIPE_SECRET_KEY: SECRET };
+  const APP = "open-artifacts-staging.app";
+  it("parse: slugs and ids mix; a bad slug ignores the whole list", () => {
+    expect(parseClockInstalls(`m2-walk,${A}`)).toEqual(["m2-walk", A]);
+    for (const raw of [
+      "m2--walk",
+      "-m2",
+      "m2-",
+      "M2",
+      "m2.walk",
+      `m2-walk,m2--x`,
+    ])
+      expect(parseClockInstalls(raw), raw).toBeNull();
+  });
+  it("matches the first label of an app-host origin", () => {
+    expect(isClockInstall(e, "m2-walk", B, `https://m2-walk.${APP}`)).toBe(true);
+    expect(isClockInstall(e, `x,${A}`, A, "https://nope.example.test")).toBe(true);
+    expect(isClockInstall(e, "m2-walk", B, `https://m2-other.${APP}`)).toBe(false);
+  });
+  it("refuses an origin that is not exactly <label>.<app domain>", () => {
+    for (const o of [
+      "https://m2-walk.example.test",
+      `https://a.m2-walk.${APP}`,
+      `https://m2-walk.${APP}.evil.test`,
+      `https://evilm2-walk.${APP}x`,
+      "https://m2-walk.open-artifacts.app",
+      "not a url",
+      "",
+      undefined,
+    ])
+      expect(isClockInstall(e, "m2-walk", B, o), String(o)).toBe(false);
+  });
+  it("soloStart: a listed slug puts the install on a clock", async () => {
+    const x = await publicFromPkcs8(pk());
+    await registry.put(
+      `install:${A}`,
+      JSON.stringify({
+        installId: A,
+        origin: `https://m2-walk.${APP}`,
+        keys: [{ kid: await keyId(x), x }],
+      }),
+    );
+    clearRegistryCache();
+    const stripe = fakeStripe();
+    expect(
+      (await start(listed({ STAGING_TEST_CLOCK_INSTALLS: "m2-walk" }))).ok,
+    ).toBe(true);
+    expect(stripe[0]?.path).toBe("/v1/test_helpers/test_clocks");
   });
 });
 
@@ -170,7 +221,7 @@ describe("isClockInstall (gating)", () => {
     expect(isClockInstall(e, "", A)).toBe(false);
     expect(isClockInstall(e, undefined, A)).toBe(false);
     expect(err).not.toHaveBeenCalled();
-    expect(isClockInstall(e, `${A},bad`, A)).toBe(false);
+    expect(isClockInstall(e, `${A},Bad`, A)).toBe(false);
     expect(err).toHaveBeenCalledTimes(1);
   });
 });
@@ -190,6 +241,10 @@ describe("soloStart for a listed install", () => {
       name: A,
     });
     expect(stripe[1]?.form.test_clock).toBe("clock_fake1");
+    // M2: the clock call has no idempotency key (frozen_time moves); the
+    // customer's key carries the clock, so a cleanup never replays it.
+    expect(stripe[0]?.key).toBeNull();
+    expect(stripe[1]?.key).toBe(`cust-${A}-clock_fake1`);
     expect(await rowOf()).toMatchObject({
       stripe_test_clock_id: "clock_fake1",
       stripe_customer_id: "cus_fake2",
@@ -226,6 +281,23 @@ describe("soloStart for a listed install", () => {
       stripe_customer_id: "cus_old",
       stripe_test_clock_id: null,
     });
+  });
+
+  it("M2: a concurrent winner's clock is the one used; the loser is logged for the sweep", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stripe = fakeStripe();
+    const real = db.prepare.bind(db);
+    // The winner's clock lands between our read and our write.
+    vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+      if (sql.startsWith("UPDATE tiers SET stripe_test_clock_id"))
+        return real(
+          "UPDATE tiers SET stripe_test_clock_id = 'clock_winner' WHERE install_id = ?2 AND stripe_test_clock_id IS NULL AND ?1 IS NOT NULL",
+        );
+      return real(sql);
+    });
+    expect((await start(listed())).ok).toBe(true);
+    expect(stripe[1]?.form.test_clock).toBe("clock_winner");
+    expect(err).toHaveBeenCalledWith("billing test_clock lost", A, "clock_fake1");
   });
 
   it("keeps a customer already on a clock", async () => {

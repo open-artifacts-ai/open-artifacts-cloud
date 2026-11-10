@@ -78,12 +78,15 @@ function world(over: { subStatus?: string; clockStatus?: string[] } = {}) {
     if (path.endsWith("/attach")) return j({ id: "pm_9" });
     if (path === "/v1/customers/cus_1") return j({ id: "cus_1" });
     if (path.startsWith("/v1/test_helpers/test_clocks?"))
-      return j({
-        data: [
-          { id: "clock_orphan", name: A },
-          { id: "clock_x", name: "other" },
-        ],
-      });
+      return path.includes("starting_after=clock_orphan")
+        ? j({ data: [{ id: "clock_orphan2", name: A }], has_more: false })
+        : j({
+            data: [
+              { id: "clock_x", name: "other" },
+              { id: "clock_orphan", name: A },
+            ],
+            has_more: true,
+          });
     if (method === "DELETE") return j({ deleted: true });
     return new Response("{}", { status: 404 });
   }) as unknown as typeof fetch;
@@ -96,8 +99,8 @@ function world(over: { subStatus?: string; clockStatus?: string[] } = {}) {
     now: () => clock,
     log: (s) => io.lines.push(s),
     db: {
-      all: async (sql) => {
-        queries.push(sql);
+      all: async (sql, params) => {
+        queries.push(params ? `${sql} <- ${JSON.stringify(params)}` : sql);
         if (sql.includes("solo_status"))
           return [
             {
@@ -181,10 +184,29 @@ describe("cleanup", () => {
     expect(del.sort()).toEqual([
       "/v1/test_helpers/test_clocks/clock_1",
       "/v1/test_helpers/test_clocks/clock_orphan",
+      "/v1/test_helpers/test_clocks/clock_orphan2",
     ]);
+    // Parameterized, never interpolated.
     expect(w.queries.at(-1)).toBe(
-      `DELETE FROM tiers WHERE install_id = '${A}'`,
+      `DELETE FROM tiers WHERE install_id = ?1 <- ["${A}"]`,
     );
+  });
+
+  it("M1: refuses a row that has no test clock (a real install's): nothing deleted, nothing reset", async () => {
+    const w = world();
+    w.rows[0] = { stripe_customer_id: "cus_real", stripe_test_clock_id: null };
+    await expect(cleanup(w.io, w.call, A)).rejects.toThrow(/no test clock/);
+    expect(w.calls).toEqual([]);
+    expect(w.queries.some((q) => q.startsWith("DELETE"))).toBe(false);
+  });
+
+  it("M1: with no row at all it sweeps orphan clocks only and resets nothing", async () => {
+    const w = world();
+    w.rows.length = 0;
+    await cleanup(w.io, w.call, A);
+    const del = w.calls.filter((c) => c.method === "DELETE");
+    expect(del).toHaveLength(2);
+    expect(w.queries.some((q) => q.startsWith("DELETE"))).toBe(false);
   });
 });
 

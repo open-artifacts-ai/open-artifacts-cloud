@@ -277,19 +277,22 @@ export async function createCustomer(
  * the clock_ id only.
  */
 export async function createTestClock(
-  input: { installId: string; frozenTime: number; idempotencyKey: string },
+  input: { installId: string; frozenTime: number },
   cfg: StripeConfig,
 ): Promise<{ id: string }> {
   if (!Number.isSafeInteger(input.frozenTime) || input.frozenTime <= 0)
     throw new StripeConfigError("frozenTime");
-  const { status, out } = await post(
+  const { status, out } = await send(
     cfg,
+    "POST",
     "/v1/test_helpers/test_clocks",
     {
       frozen_time: String(input.frozenTime),
       name: check(INSTALL, "installId", input.installId),
     },
-    input.idempotencyKey,
+    // No key: frozen_time moves with each call, so a replayed key would 400.
+    // Billing keeps one clock per install (the row's winner).
+    null,
   );
   const id = out?.id;
   if (typeof id !== "string" || !TEST_CLOCK.test(id))
