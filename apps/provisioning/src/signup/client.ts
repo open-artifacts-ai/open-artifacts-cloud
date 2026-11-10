@@ -445,23 +445,107 @@ export const CLIENT_JS = String.raw`(function () {
     ]);
   }
 
+  // ---------- loading page (design: round 2, loading option D) ----------
+  var VERBS = ["Bookbinding", "Annotating", "Margin-noting", "Inking", "Drafting", "Collating",
+    "Proofreading", "Indexing", "Unfolding", "Pinning", "Typesetting", "Shelving"];
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function reduced() { return window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches; }
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(SVGNS, tag), k;
+    for (k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function animMark() {
+    var s = svgEl("svg", { class: "anim a1", viewBox: "0 0 32 32", "aria-hidden": "true" });
+    s.appendChild(svgEl("path", { class: "fr", pathLength: "1", d: "M22 2H5a3 3 0 0 0-3 3v17l4 4V6h20zM10 30h17a3 3 0 0 0 3-3V10l-4-4v20H6z" }));
+    s.appendChild(svgEl("path", { class: "cn", d: "M22 2h5a3 3 0 0 1 3 3v5zM2 22v5a3 3 0 0 0 3 3h5z" }));
+    s.appendChild(svgEl("path", { class: "sq", d: "M12 10h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z" }));
+    return s;
+  }
+  function animStack() {
+    return h("div", { class: "anim a2", "aria-hidden": "true" }, [h("i"), h("i"), h("i"), h("i")]);
+  }
+  function animPage() {
+    return h("div", { class: "anim a3", "aria-hidden": "true" }, [
+      h("div", { class: "pg3" }, [h("i"), h("i"), h("i", { class: "s" }), h("i"),
+        h("span", { class: "pin" }), h("span", { class: "bub" }), h("span", { class: "bub r" })])
+    ]);
+  }
+  var SEQ = [[animMark, 2800], [animStack, 3600], [animPage, 3400]];
+
+  function stopAnim() {
+    clearTimeout(S.seqT); clearInterval(S.verbT);
+    S.seqT = null; S.verbT = null;
+  }
+  // Each animation plays once, in turn: fade out, a short blank, fade in.
+  function startAnim(slot, word) {
+    if (reduced()) {
+      slot.classList.add("in");
+      slot.replaceChildren(animMark());
+      return;
+    }
+    var si = 0, vi = 0;
+    function step() {
+      var e = SEQ[si];
+      slot.replaceChildren(e[0]());
+      slot.classList.remove("in"); void slot.offsetWidth; slot.classList.add("in");
+      si = (si + 1) % SEQ.length;
+      S.seqT = setTimeout(function () {
+        slot.classList.remove("in");
+        S.seqT = setTimeout(step, 900);
+      }, e[1]);
+    }
+    step();
+    S.verbT = setInterval(function () {
+      vi = (vi + 1) % VERBS.length;
+      var n = word.cloneNode(false);
+      n.textContent = VERBS[vi];
+      word.replaceWith(n);
+      word = n;
+    }, 2200);
+  }
+
+  function pendingLabel(g) {
+    if (g.stage === "waiting_cap") return "Lots of people are signing up right now. You're in line, and it starts on its own.";
+    return "Creating " + g.slug + "." + S.cfg.appDomain + "…";
+  }
+
+  // The animation and verbs are built once and survive status updates: only
+  // the status line (and the lost-connection notice) change in place.
+  function viewLoading() {
+    var g = S.signup, hostName = g.host;
+    if (!refs.ld || !document.body.contains(refs.ld)) {
+      stopAnim();
+      var slot = h("div", { class: "slot", id: "slot" });
+      var word = h("span", { class: "w" }, [VERBS[0]]);
+      refs.lab = h("p", { class: "addr", "aria-live": "polite" });
+      refs.live = h("div", { role: "status" });
+      refs.ld = h("div", { class: "panel ld" }, [
+        h("h1", { class: "sr" }, ["Setting up ", nw(hostName)]),
+        refs.live,
+        h("div", { class: "seq" }, [slot]),
+        h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
+        refs.lab
+      ]);
+      shell(refs.ld);
+      startAnim(slot, word);
+    }
+    refs.lab.textContent = pendingLabel(g);
+    paintLive();
+  }
+
   function viewSetup() {
     var g = S.signup, hostName = g.host, st = g.stage;
+    if (st !== "ready" && st !== "failed") { viewLoading(); return; }
     var steps, label, head, body = [];
     var reserve = step("done", "Reserve your address");
     var create = "Create your instance", email = "Send your welcome email";
-    var pending = [
-      h("h1", {}, ["Setting up ", nw(hostName)])
-    ];
-    head = pending;
-    refs.live = h("div", { role: "status" });
-    pending.push(refs.live);
     if (st === "ready") {
       label = "Ready";
       head = [h("h1", {}, [nw(hostName), " is ready"])];
       steps = [reserve, step("done", create), step("done", email)];
       body = [h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])];
-    } else if (st === "failed") {
+    } else {
       label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
       steps = [reserve, step("fail", create, "This didn't finish."), step("todo", email)];
@@ -474,15 +558,6 @@ export const CLIENT_JS = String.raw`(function () {
           h("button", { class: "btn", type: "button", onclick: startOver }, ["Try again"])
         ])
       ];
-    } else if (st === "waiting_cap") {
-      label = "Lots of people are signing up right now. You're in line, and it starts on its own.";
-      steps = [reserve, step("wait", create), step("todo", email)];
-    } else if (st === "creating") {
-      label = "Creating " + g.slug + "." + S.cfg.appDomain + "\u2026";
-      steps = [reserve, step("now", create), step("todo", email)];
-    } else {
-      label = "Creating " + g.slug + "." + S.cfg.appDomain + "\u2026";
-      steps = [reserve, step("now", create), step("todo", email)];
     }
     shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
@@ -541,13 +616,15 @@ export const CLIENT_JS = String.raw`(function () {
 
   // ---------- routing ----------
   function render() {
+    var pend = S.view === "setup" && S.signup && S.signup.stage !== "ready" && S.signup.stage !== "failed";
+    if (!pend || !refs.ld || !document.body.contains(refs.ld)) stopAnim();
     if (S.view === "closed") viewClosed();
     else if (S.view === "setup") viewSetup();
     else if (S.view === "address") viewAddress();
     else viewSignin();
   }
   function route() {
-    stopPoll();
+    stopPoll(); stopAnim();
     refs = {};
     if (S.me && S.signup) {
       S.view = "setup";

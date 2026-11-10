@@ -117,7 +117,9 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
     expect(await panel.evaluate((p) => p.firstElementChild?.tagName)).toBe(
       "H1",
     );
-    await expect(panel.locator(".steps li")).toHaveCount(3);
+    if (stage === "ready" || stage === "failed")
+      await expect(panel.locator(".steps li")).toHaveCount(3);
+    else await expect(panel.locator(".steps")).toHaveCount(0);
     if (stage === "ready") {
       await expect(panel.locator("> :last-child")).toHaveText(
         "Open your instance",
@@ -172,7 +174,7 @@ test("poll: skips while hidden, polls at once when the tab returns", async ({
       return creating(stage);
     },
   });
-  await expect(page.locator(".state .lab")).toHaveText(
+  await expect(page.locator(".panel .addr")).toHaveText(
     "Creating acme.open-artifacts.app\u2026",
   );
   await setHidden(page, true);
@@ -181,7 +183,7 @@ test("poll: skips while hidden, polls at once when the tab returns", async ({
   expect(calls).toBe(hiddenAt);
   stage = "waiting_cap";
   await setHidden(page, false);
-  await expect(page.locator(".state .lab")).toHaveText(
+  await expect(page.locator(".panel .addr")).toHaveText(
     "Lots of people are signing up right now. You're in line, and it starts on its own.",
   );
 });
@@ -196,7 +198,7 @@ test("poll: notice after 3 failures, cleared on the next success", async ({
     stage: "queued",
     signup: () => (fail ? { status: 503 } : creating("queued")),
   });
-  await expect(page.locator(".state .lab")).toHaveText(
+  await expect(page.locator(".panel .addr")).toHaveText(
     "Creating acme.open-artifacts.app\u2026",
   );
   fail = true;
@@ -265,7 +267,7 @@ test("poll: a 401 goes to sign-in", async ({ page }) => {
     stage: "queued",
     signup: () => (expired ? { status: 401 } : creating("queued")),
   });
-  await expect(page.locator(".state .lab")).toHaveText(
+  await expect(page.locator(".panel .addr")).toHaveText(
     "Creating acme.open-artifacts.app\u2026",
   );
   expired = true;
@@ -422,6 +424,50 @@ test("address step: create starts from here", async ({ page }) => {
     /^Setting up acme\.open-artifacts\.app$/,
   );
   expect(posted).toMatchObject({ slug: "acme", turnstile: "tok" });
+});
+
+test("loading: status line follows the stage, no step list", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "queued";
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => creating(stage),
+  });
+  await expect(page.locator(".panel .addr")).toHaveText(
+    "Creating acme.open-artifacts.app\u2026",
+  );
+  await expect(page.locator(".steps")).toHaveCount(0);
+  await expect(page.locator(".anim")).toHaveCount(1);
+  stage = "waiting_cap";
+  await tick(page);
+  await expect(page.locator(".panel .addr")).toHaveText(
+    "Lots of people are signing up right now. You're in line, and it starts on its own.",
+  );
+  // the animation survives a status update (not rebuilt)
+  await expect(page.locator(".anim")).toHaveCount(1);
+  await expect(page.locator(".verb")).toContainText("Margin-noting");
+  await page.clock.runFor(2300);
+  await expect(page.locator(".verb")).toContainText("Inking");
+});
+
+test("loading: reduced motion shows the static mark, no rotation", async ({
+  page,
+}) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.clock.install();
+  await mount(page, { me: true, stage: "creating" });
+  await expect(page.locator(".slot .a1")).toHaveCount(1);
+  await expect(page.locator(".slot")).toHaveClass(/\bin\b/);
+  await page.clock.runFor(10000);
+  await expect(page.locator(".slot .a1")).toHaveCount(1);
+  await expect(page.locator(".verb")).toContainText("Bookbinding");
+  const anim = await page
+    .locator(".a1 .fr, .a1 .sq, .a1 .cn, .verb .w")
+    .evaluateAll((els) => els.map((e) => getComputedStyle(e).animationName));
+  expect(anim.every((a) => a === "none")).toBe(true);
 });
 
 const SHOTS = process.env.SHOTS_DIR;
