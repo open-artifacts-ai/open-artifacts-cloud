@@ -95,7 +95,7 @@ esac`;
     HEAD_SHA: SHA,
   };
 
-  it("after release-please: the release at the run's head commit, to both envs", () => {
+  it("after release-please: the release at the run's head commit, to staging only (prod waits for the red-line, #1412)", () => {
     const r = resolve(run, {
       releases: [release("v0.81.0"), release("v0.80.0")],
       commits: { "v0.81.0": OTHER, "v0.80.0": SHA },
@@ -106,8 +106,9 @@ esac`;
       tag: "v0.80.0",
       floor_run_id: "",
       staging: "true",
-      prod: "true",
+      prod: "false",
     });
+    expect(r.out).toContain("::notice title=Prod publish waits::");
   });
   it("a failed release-please run (v0.122.0, npm only) still resolves the release; the gate decides", () => {
     for (const CONCLUSION of ["failure", "timed_out", ""]) {
@@ -122,7 +123,7 @@ esac`;
       expect(r.o.kind, CONCLUSION).toBe("release");
       expect(r.o.tag).toBe("v0.80.0");
       expect(r.o.staging).toBe("true");
-      expect(r.o.prod).toBe("true");
+      expect(r.o.prod).toBe("false");
     }
   });
   it("a failed run with no release at the commit: nothing", () => {

@@ -3,7 +3,9 @@
 # which env's releases bucket, as GITHUB_OUTPUT lines kind (release, floor or
 # none), tag, floor_run_id, staging and prod (true or false).
 #   workflow_run (release-please on main, any conclusion but cancelled): the
-#     release whose tag's commit is the run's head_sha, to staging then prod;
+#     release whose tag's commit is the run's head_sha, to staging only: prod
+#     waits for staging's red-line (#1412) and is published by
+#     prod-release-chain.yml, so this run never fails red on prod;
 #     none is kind=none (most pushes cut no release), exit 0. A failed run is
 #     not refused here: the publish jobs' tag-passed-checks.sh decides, and
 #     fails closed on any required job that did not succeed (v0.122.0: only
@@ -96,7 +98,8 @@ case "${EVENT:-}" in
       out none "" "" false false
       exit 0
     fi
-    out release "$found" "" true true
+    echo "::notice title=Prod publish waits::$found goes to staging now; prod's bucket gets it after staging's red-line passes (prod-release-chain.yml)"
+    out release "$found" "" true false
     ;;
   workflow_dispatch)
     tag="${TAG:-}"

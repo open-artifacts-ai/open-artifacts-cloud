@@ -24,7 +24,10 @@
 # matches the one run it started and waits for it, failing closed), so all its
 # gates and the platform-tags.sh read-back run unchanged, every secret comes
 # from its own Environment, and its concurrency group serializes the chain
-# against a manual deploy; require_newer re-checks the tag against prod once
+# against a manual deploy; before it, the publish job dispatches
+# hosted-publish.yml for the tag (env prod) unless prod's bucket has the
+# release already (#1412: hosted-publish publishes staging alone after a
+# release; prod's bucket waits for this red-line); require_newer re-checks the tag against prod once
 # the run holds that group, so a manual deploy of a newer tag is never
 # downgraded. The scheduler deploys last there, so a run
 # that stops before the scheduler step never moves the fleet; once that step's
@@ -138,8 +141,48 @@ jobs:
   # pass each secret by name or it resolves empty (run 42109047045), and a
   # `uses:` job cannot set an Environment, so the caller's repo-level token
   # would cross in. See chain-dispatch.ts.
-  deploy:
+  # #1412: the release is published to prod's bucket only after this red-line
+  # (hosted-publish.yml publishes staging alone after a release and its
+  # publish-prod job re-checks the red-line). Before the deploy, so the fleet
+  # never targets a release prod cannot create from. Skipped inside the job
+  # when prod already has it (publishing is create-only).
+  publish:
     needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    # actions: write is this job's alone: it dispatches the workflow.
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 45
+    outputs:
+      url: ${{ steps.dispatch.outputs.deploy_url }}
+      note: ${{ steps.dispatch.outputs.deploy_note }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: published
+        name: Prod's bucket already has the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo "$GITHUB_REPOSITORY" --tag "$TAG" >> "$GITHUB_OUTPUT"
+      - id: dispatch
+        name: Dispatch the prod publish and wait for its run
+        if: steps.published.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          CHAIN_ID: p${{ github.run_id }}-${{ github.run_attempt }}
+        run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
+  deploy:
+    needs: [gate, publish]
     if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     # actions: write is this job's alone: it dispatches the workflow.
@@ -168,7 +211,7 @@ jobs:
           CHAIN_ID: c${{ github.run_id }}-${{ github.run_attempt }}
         run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
   report:
-    needs: [gate, deploy]
+    needs: [gate, publish, deploy]
     if: ${{ always() && vars.PROD_RELEASE_CHAIN == 'on' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -190,10 +233,10 @@ jobs:
           TAG: ${{ needs.gate.outputs.tag }}
           # A failed gate is reported too: the chain never fails quietly. A
           # skip (go false) leaves deploy "skipped", which leaves the issue.
-          RESULT: ${{ needs.gate.result == 'success' && needs.deploy.result || needs.gate.result }}
+          RESULT: ${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # The dispatched deploy run (empty when it never started).
-          DEPLOY_RUN: ${{ needs.deploy.outputs.url }}
+          DEPLOY_RUN: ${{ needs.deploy.outputs.url || needs.publish.outputs.url }}
           # Why the dispatch step failed, e.g. that it cancelled the run.
-          DEPLOY_NOTE: ${{ needs.deploy.outputs.note }}
+          DEPLOY_NOTE: ${{ needs.deploy.outputs.note || needs.publish.outputs.note }}
         run: node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"

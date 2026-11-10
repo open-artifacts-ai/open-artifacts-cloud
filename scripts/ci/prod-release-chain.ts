@@ -12,6 +12,7 @@
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts fresh --repo owner/name --tag vX.Y.Z --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag vX.Y.Z --current vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts require-newer --tag vX.Y.Z --current vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo owner/name --tag vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo owner/name --tag vX.Y.Z --result success --run <url>
 // Every other failure throws (exit 1): the chain fails closed. Needs GH_TOKEN for
 // fresh and report.
@@ -110,6 +111,53 @@ export function fresh(o: {
     .at(-1);
   if (!newest) throw new Error(`no green redline-staging run for ${o.tag}`);
   return { run: newest.id, go: newest.head_sha === o.headSha };
+}
+
+/**
+ * Whether `tag`'s release is already in prod's bucket (#1412): a completed
+ * hosted-publish.yml run on main, of this repository, whose publish-prod job
+ * for the release succeeded (the job is named "publish-prod release <tag>").
+ * Publishing is create-only, so the chain must not publish it twice. An API
+ * error or an unparsable answer throws.
+ */
+export function published(o: {
+  exec: Exec;
+  repo: string;
+  tag: string;
+}): boolean {
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  const body = JSON.parse(
+    gh(o.exec, [
+      "api",
+      "-X",
+      "GET",
+      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed&per_page=100`,
+    ]),
+  ) as { workflow_runs?: Run[] };
+  if (!Array.isArray(body.workflow_runs))
+    throw new Error("unparsable hosted-publish.yml runs");
+  const name = `publish-prod release ${o.tag}`;
+  for (const r of body.workflow_runs) {
+    if (
+      r.head_branch !== "main" ||
+      r.status !== "completed" ||
+      (r.head_repository?.full_name ?? "") !== o.repo
+    )
+      continue;
+    const jobs = JSON.parse(
+      gh(o.exec, [
+        "api",
+        "-X",
+        "GET",
+        `repos/${o.repo}/actions/runs/${r.id}/jobs?per_page=100`,
+      ]),
+    ) as { jobs?: { name?: string; conclusion?: string | null }[] };
+    if (!Array.isArray(jobs.jobs))
+      throw new Error(`unparsable jobs of run ${r.id}`);
+    if (jobs.jobs.some((j) => j.name === name && j.conclusion === "success"))
+      return true;
+  }
+  return false;
 }
 
 export type Report =
@@ -283,6 +331,14 @@ function main(argv: string[]) {
     console.log(`go=${r.go}`);
     return;
   }
+  if (mode === "published") {
+    const go = published({ exec: realExec, repo, tag: flag(argv, "tag") });
+    console.error(
+      `prod-release-chain: ${flag(argv, "tag")} is ${go ? "" : "not "}in prod's bucket`,
+    );
+    console.log(`published=${go}`);
+    return;
+  }
   if (mode === "report") {
     const r = report({
       exec: realExec,
@@ -297,7 +353,7 @@ function main(argv: string[]) {
     return;
   }
   throw new Error(
-    "usage: prod-release-chain.ts <tag|fresh|newer|require-newer|report> ...",
+    "usage: prod-release-chain.ts <tag|fresh|newer|require-newer|published|report> ...",
   );
 }
 
