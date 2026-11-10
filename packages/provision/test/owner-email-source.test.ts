@@ -78,6 +78,12 @@ const ALLOWED: Record<string, RegExp[]> = {
     /^\s*"i\.owner_email",$/,
     /^\s*"\(SELECT ss\.owner_email FROM signup_secret ss WHERE ss\.signup_id = st\.signup_id\)",$/,
   ],
+  // The claim free's email lookup matches in SQL and reads out only subs; the
+  // body's email is at least 3 chars, so a purged '' never matches.
+  "apps/provisioning/src/routes/claim-free.ts": [
+    /^WHERE s\.owner_sub IS NOT NULL AND lower\(i\.owner_email\) = lower\(\?1\)$/,
+    /^WHERE s\.owner_sub IS NOT NULL AND lower\(k\.owner_email\) = lower\(\?1\)`,$/,
+  ],
   "apps/provisioning/src/routes/create.ts": [
     // The create's write of the signup's email.
     /^\s*"INSERT INTO signup_secret \(signup_id, owner_email\) VALUES \(\?1, \?2\)",$/,
