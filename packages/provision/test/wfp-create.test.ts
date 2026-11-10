@@ -348,6 +348,8 @@ function setup(o: SetupOpts = {}) {
     now: clock.now,
     sleep: clock.sleep,
     turnstile: TS[env],
+    // The suites pin their own bytes: no hosted Solo caps unless a test sets them.
+    defaultVars: {},
     ...over,
   });
   const mk = (over: Partial<WfpOptions> = {}) => {

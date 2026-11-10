@@ -469,6 +469,8 @@ function setup(o: { env?: Env; specs?: Record<string, Spec> } = {}) {
     // T8 M1: google needs the broker, so the lifecycle suite runs with it on
     // (staging only: prod has no broker Google client yet).
     brokerEnabled: env === "staging",
+    // The suites pin their own bytes: no hosted Solo caps unless a test sets them.
+    defaultVars: {},
     ...over,
   });
   const mk = (over: Partial<WfpOptions> = {}) => {
@@ -6680,8 +6682,8 @@ describe("SS1e: the free-plan caps and the per-env create defaults", () => {
   ] as const;
   const DEFAULTS = {
     FREE_STORAGE_BYTES: "1073741824",
-    FREE_DATA_DOCS: "100",
-    FREE_DATA_DAILY_WRITES: "5000",
+    FREE_DATA_DOCS: "10000",
+    FREE_DATA_DAILY_WRITES: "1000",
   };
   const plainOf = (s: S, from = 0) => {
     const meta = metaOf(uploads(s.fake, from).at(-1)?.body as string);
@@ -6703,14 +6705,15 @@ describe("SS1e: the free-plan caps and the per-env create defaults", () => {
     }
   });
 
-  it("the defaults are off today in both envs (empty: nothing rendered)", () => {
+  it("the defaults are the hosted Solo caps in both envs", () => {
     for (const e of ["staging", "prod"] as const) {
       expect(Object.keys(HOSTED_DEFAULT_VARS[e]).sort()).toEqual(
         [...CAPS].sort(),
       );
-      expect(Object.values(HOSTED_DEFAULT_VARS[e])).toEqual(["", "", ""]);
+      expect(HOSTED_DEFAULT_VARS[e]).toEqual(DEFAULTS);
       expect(withDefaultVars({ A: "1" }, HOSTED_DEFAULT_VARS[e])).toEqual({
         A: "1",
+        ...DEFAULTS,
       });
     }
   });
