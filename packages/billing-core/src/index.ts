@@ -13,6 +13,7 @@ export {
   createCustomer,
   createPortalSession,
   createSoloTrialSubscription,
+  createTestClock,
   expireCheckoutSession,
   type PortalInput,
   retrieveSubscription,
