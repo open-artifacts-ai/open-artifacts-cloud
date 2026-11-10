@@ -836,6 +836,36 @@ VALUES (?, ?, ?, ?, 'o@x.test', 8000008, 'h', 'deleted', 1, ?)`,
     });
   });
 
+  it("a create that fails after reserve leaves the dead row renamed with its purge time", async () => {
+    const old = purged("finqore", "sub-a", 10 * 60 * 1000);
+    const at = w.clock.t - 10 * 60 * 1000;
+    const s = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-a",
+    });
+    const r = stepRunner(w.clock, {
+      onStep: (n) => {
+        if (n === "release_gate")
+          w.db
+            .prepare(
+              "UPDATE jobs SET status = 'failed', error_code = 'canceled', error_message = 'x', finished_at = 1 WHERE id = ?",
+            )
+            .run(s.jobId);
+      },
+    });
+    await runCreate(w.ctx, event(s.jobId), r.step).catch((x) => x);
+    // The tombstone still says when it was purged, so the API's slugState
+    // keeps another account in "cooling" for 30 days from `at`.
+    expect(w.install(old)).toMatchObject({
+      slug: `finqore~${old}`,
+      state: "deleted",
+      updated_at: at,
+    });
+    expect(w.install(s.installId)).toBeUndefined();
+  });
+
   it("inside the 2 minute HOSTS settle nobody takes it, and an admin create has no owner to match", async () => {
     const old = purged("finqore", "sub-a", 30 * 1000);
     const s = seedCreate(w, {

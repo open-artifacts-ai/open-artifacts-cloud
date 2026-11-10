@@ -17,7 +17,7 @@ import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
-import { SLUG_UNMAP_SETTLE_MS, slugState } from "./reads.js";
+import { releaseDeletedSignupSlug, slugState } from "./reads.js";
 import { claimAccount, resolveRelease } from "./writes.js";
 
 // R4 POST /installs (3.3, 3.6, 4.2, 7). One D1 batch writes the job, the
@@ -98,25 +98,6 @@ async function selfServePolicy(
     );
   if (await liveClaim(env, p.sub)) throw new ApiError("signup_limit");
   return { hd: p.hd ?? null, email: p.email };
-}
-
-/**
- * Frees a purged install's signup slug for a new create (cloud #108).
- * signups_live_slug is unique over non-failed signups, so the dead signup's
- * slug gains `~<signup_id>` in the create batch (a lost race rolls it back).
- * The install row's own unique keys are released by the provisioner's
- * reserve step, because the API never writes installs (layout test).
- */
-export function releaseDeletedSignupSlug(
-  env: Env,
-  slug: string,
-  now: number,
-): D1PreparedStatement {
-  return env.PLATFORM_DB.prepare(
-    `UPDATE signups SET slug = slug || '~' || signup_id
-WHERE slug = ?1 AND status <> 'failed'
-  AND install_id IN (SELECT id FROM installs WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2)`,
-  ).bind(slug, now - SLUG_UNMAP_SETTLE_MS);
 }
 
 export async function createInstall(a: HandlerArgs): Promise<RouteResult> {

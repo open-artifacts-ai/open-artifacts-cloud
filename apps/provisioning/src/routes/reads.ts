@@ -281,6 +281,7 @@ export type SlugState = "free" | "taken" | "cooling";
 
 type Holder = {
   kind: "install" | "signup";
+  id: string;
   state: string | null;
   updated_at: number | null;
   owner: string | null;
@@ -294,7 +295,8 @@ type Holder = {
  * "free" to the same owner (owner_sub, the Google account) at once, and to
  * anyone else once SLUG_REUSE_COOLDOWN_MS has passed since the purge; before
  * that it is "cooling". The purge time is the deleted install's updated_at:
- * the provisioner's release("deleted") writes it last
+ * the provisioner's release("deleted") writes it last, and the rename to
+ * "<slug>~<id>" leaves updated_at alone, so a tombstone keeps its purge time
  * (packages/provision/src/platform.ts release, wfp.ts delete).
  */
 export async function slugState(
@@ -305,38 +307,62 @@ export async function slugState(
   now: number = Date.now(),
 ): Promise<SlugState> {
   const rows = await env.PLATFORM_DB.prepare(
-    `SELECT 'install' AS kind, i.state AS state, i.updated_at AS updated_at,
+    `SELECT 'install' AS kind, i.id AS id, i.state AS state, i.updated_at AS updated_at,
   COALESCE((SELECT l.owner_sub FROM install_lifecycle l WHERE l.install_id = i.id),
            (SELECT s.owner_sub FROM signups s WHERE s.install_id = i.id)) AS owner
-FROM installs i WHERE i.slug = ?1 AND i.id IS NOT ?2
+FROM installs i WHERE (i.slug = ?1 OR substr(i.slug, 1, length(?1) + 1) = ?1 || '~') AND i.id IS NOT ?2
 UNION ALL
-SELECT 'signup', i.state, i.updated_at, s.owner_sub
+SELECT 'signup', s.signup_id, i.state, i.updated_at, s.owner_sub
 FROM signups s LEFT JOIN installs i ON i.id = s.install_id
-WHERE s.slug = ?1 AND s.status <> 'failed' AND s.signup_id IS NOT ?3`,
+WHERE (s.slug = ?1 OR substr(s.slug, 1, length(?1) + 1) = ?1 || '~') AND s.status <> 'failed' AND s.signup_id IS NOT ?3`,
   )
     .bind(slug, except?.installId ?? null, except?.signupId ?? null)
     .all<Holder>();
   if (rows.results.length === 0) return "free";
+  // Renamed tombstones ("<slug>~<id>", see releaseDeletedSignupSlug and the
+  // provisioner's reserve step) still count, so a create that fails after
+  // the rename never frees the address early. "~" is not a slug character
+  // (slugRule), so no valid slug can collide with a tombstone, and the
+  // match is a prefix compare, never LIKE, so "%" and "_" mean nothing.
+  // The newest purge decides: its time and its owner.
   let purgedAt = 0;
-  let mine = false;
+  let owner: string | null = null;
+  let newest = "";
   for (const h of rows.results) {
     // A live install, or a signup with no deleted install behind it.
     if (h.state !== "deleted") return "taken";
-    purgedAt = Math.max(purgedAt, h.updated_at ?? now);
-    if (ownerSub !== null && h.owner === ownerSub) mine = true;
+    const at = h.updated_at ?? now;
+    // Ties break on the larger id, so the pick never depends on row order.
+    const key = `${h.kind}:${h.id}`;
+    if (at > purgedAt || (at === purgedAt && key > newest)) {
+      purgedAt = at;
+      owner = h.owner;
+      newest = key;
+    }
   }
+  const mine = ownerSub !== null && owner === ownerSub;
   if (now - purgedAt < SLUG_UNMAP_SETTLE_MS) return "taken";
   if (mine || now - purgedAt >= SLUG_REUSE_COOLDOWN_MS) return "free";
   return "cooling";
 }
 
-/** True when the slug is not free; the R12 retry's check (no owner). */
-export async function slugHeld(
+/**
+ * Frees a purged install's signup slug for a new create (cloud #108).
+ * signups_live_slug is unique over non-failed signups, so the dead signup's
+ * slug gains `~<signup_id>` in the create batch (a lost race rolls it back).
+ * The install row's own unique keys are released by the provisioner's
+ * reserve step, because the API never writes installs (layout test).
+ */
+export function releaseDeletedSignupSlug(
   env: Env,
   slug: string,
-  except: { installId: string; signupId: string } | null = null,
-): Promise<boolean> {
-  return (await slugState(env, slug, null, except)) !== "free";
+  now: number,
+): D1PreparedStatement {
+  return env.PLATFORM_DB.prepare(
+    `UPDATE signups SET slug = slug || '~' || signup_id
+WHERE slug = ?1 AND status <> 'failed'
+  AND install_id IN (SELECT id FROM installs WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2)`,
+  ).bind(slug, now - SLUG_UNMAP_SETTLE_MS);
 }
 
 // R17 (4.9, 9A.8): admin_audit, hosted_audit and audit_refusals merged,
