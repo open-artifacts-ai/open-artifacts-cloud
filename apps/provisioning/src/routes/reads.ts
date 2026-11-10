@@ -253,27 +253,90 @@ export async function checkSlug(a: HandlerArgs): Promise<RouteResult> {
     if (r) throw new ApiError(r.code);
   }
   const rule = slugRule(slug);
-  let status: SlugCheck["status"] = rule;
-  if (rule === "ok" && (await slugHeld(a.env, slug))) status = "taken";
-  return ok({ slug, status } satisfies SlugCheck);
+  // "cooling" is wider than the public contract's SlugCheck status enum; the
+  // contract is public, so it widens there on its next release (cloud #108).
+  let status: SlugCheck["status"] | "cooling" = rule;
+  if (rule === "ok") {
+    const held = await slugState(
+      a.env,
+      slug,
+      a.principal.kind === "user" ? (a.principal.sub ?? null) : null,
+    );
+    if (held !== "free") status = held;
+  }
+  return ok({ slug, status } satisfies { slug: string; status: string });
 }
 
+/** How long a purged install's address stays unavailable to anyone but its owner (cloud #108). */
+export const SLUG_REUSE_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
 /**
- * A live install or a live signup holds the slug (3.5 slug_taken); `except`
- * leaves out a retry's own install and signup (R12).
+ * Dispatch reads HOSTS with cacheTtl 60 s, so a reuse waits 2 minutes after
+ * the unmap (docs/ops/hosted.md, "Unmapping and slug purges"). installs
+ * .updated_at of a deleted row is written after the teardown's unmap, so
+ * counting from it is safe.
  */
+export const SLUG_UNMAP_SETTLE_MS = 2 * 60 * 1000;
+
+export type SlugState = "free" | "taken" | "cooling";
+
+type Holder = {
+  kind: "install" | "signup";
+  state: string | null;
+  updated_at: number | null;
+  owner: string | null;
+};
+
+/**
+ * Who holds a slug (3.5 slug_taken); `except` leaves out a retry's own
+ * install and signup (R12). A live install (any state but deleted), a live
+ * signup, or a deleted install inside the 2 minute unmap settle holds it:
+ * "taken". A slug held only by deleted installs (and their signups) is
+ * "free" to the same owner (owner_sub, the Google account) at once, and to
+ * anyone else once SLUG_REUSE_COOLDOWN_MS has passed since the purge; before
+ * that it is "cooling". The purge time is the deleted install's updated_at:
+ * the provisioner's release("deleted") writes it last
+ * (packages/provision/src/platform.ts release, wfp.ts delete).
+ */
+export async function slugState(
+  env: Env,
+  slug: string,
+  ownerSub: string | null = null,
+  except: { installId: string; signupId: string } | null = null,
+  now: number = Date.now(),
+): Promise<SlugState> {
+  const rows = await env.PLATFORM_DB.prepare(
+    `SELECT 'install' AS kind, i.state AS state, i.updated_at AS updated_at,
+  COALESCE((SELECT l.owner_sub FROM install_lifecycle l WHERE l.install_id = i.id),
+           (SELECT s.owner_sub FROM signups s WHERE s.install_id = i.id)) AS owner
+FROM installs i WHERE i.slug = ?1 AND i.id IS NOT ?2
+UNION ALL
+SELECT 'signup', i.state, i.updated_at, s.owner_sub
+FROM signups s LEFT JOIN installs i ON i.id = s.install_id
+WHERE s.slug = ?1 AND s.status <> 'failed' AND s.signup_id IS NOT ?3`,
+  )
+    .bind(slug, except?.installId ?? null, except?.signupId ?? null)
+    .all<Holder>();
+  if (rows.results.length === 0) return "free";
+  let purgedAt = 0;
+  let mine = false;
+  for (const h of rows.results) {
+    // A live install, or a signup with no deleted install behind it.
+    if (h.state !== "deleted") return "taken";
+    purgedAt = Math.max(purgedAt, h.updated_at ?? now);
+    if (ownerSub !== null && h.owner === ownerSub) mine = true;
+  }
+  if (now - purgedAt < SLUG_UNMAP_SETTLE_MS) return "taken";
+  if (mine || now - purgedAt >= SLUG_REUSE_COOLDOWN_MS) return "free";
+  return "cooling";
+}
+
+/** True when the slug is not free; the R12 retry's check (no owner). */
 export async function slugHeld(
   env: Env,
   slug: string,
   except: { installId: string; signupId: string } | null = null,
 ): Promise<boolean> {
-  const r = await env.PLATFORM_DB.prepare(
-    `SELECT 1 AS x FROM installs WHERE slug = ?1 AND id IS NOT ?2
-UNION ALL SELECT 1 FROM signups WHERE slug = ?1 AND status <> 'failed' AND signup_id IS NOT ?3 LIMIT 1`,
-  )
-    .bind(slug, except?.installId ?? null, except?.signupId ?? null)
-    .first();
-  return r !== null;
+  return (await slugState(env, slug, null, except)) !== "free";
 }
 
 // R17 (4.9, 9A.8): admin_audit, hosted_audit and audit_refusals merged,

@@ -39,6 +39,8 @@ const SLUG_COPY = {
   invalid: "Use lowercase letters, numbers and hyphens.",
   reserved: "That name is reserved.",
   taken: "That name is taken.",
+  /** A purged address inside its 30 days (cloud #108); the API sends it ahead of the public contract's enum. */
+  cooling: "That name was used recently and isn't available yet.",
 } as const;
 /** The test admin's rule (R4's field rules for its principal). */
 const TEST_SLUG = `Use an ${OIDC_LIMITS.slugPrefix} slug. This session can only create those.`;
@@ -46,7 +48,13 @@ const TEST_OWNER = `Use an owner at ${STAGING_TEST_DOMAIN}, the staging test dom
 /** Slug answers shown as an error (red help, red border). */
 const NO_PLATFORM_CREATE =
   "The platform has no stable release yet, so new installs are paused.";
-const BAD_SLUG = new Set(["invalid", "reserved", "taken", "test_rule"]);
+const BAD_SLUG = new Set([
+  "invalid",
+  "reserved",
+  "taken",
+  "cooling",
+  "test_rule",
+]);
 const APP_DOMAIN = {
   prod: "open-artifacts.app",
   staging: "open-artifacts-staging.app",

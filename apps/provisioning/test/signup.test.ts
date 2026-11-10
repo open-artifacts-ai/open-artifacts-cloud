@@ -766,3 +766,154 @@ describe("CSP: no inline styles on the sign-up page", () => {
     expect(CLIENT_JS).not.toContain("? [] :");
   });
 });
+
+describe("a purged address (cloud #108)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  /** A deleted self-serve install and its ready signup, purged `ago` ms ago. */
+  const purged = async (slug: string, sub: string, ago: number) => {
+    const { id } = await seedInstall({
+      slug,
+      state: "deleted",
+      source: "self-serve",
+      ownerSub: sub,
+    });
+    await db
+      .prepare("UPDATE installs SET updated_at = ? WHERE id = ?")
+      .bind(Date.now() - ago, id)
+      .run();
+    const sid = jobId();
+    await insert("signups", {
+      signup_id: sid,
+      source: "self-serve",
+      owner_sub: sub,
+      slug,
+      install_id: id,
+      job_id: sid,
+      vars: "{}",
+      status: "ready",
+      created_at: 1,
+      updated_at: 1,
+    });
+    return { id, sid };
+  };
+  const check = async (e: E, sid: string, slug: string) =>
+    (
+      (await (
+        await call(e, `${SIGNUP}/api/v1/slugs/${slug}`, {
+          headers: { cookie: `${SIGNUP_COOKIE}=${sid}` },
+        })
+      ).json()) as { status: string }
+    ).status;
+  const errOf = async (r: Response) =>
+    ((await r.json()) as { error: { code: string; message: string } }).error;
+
+  it("the same Google account takes its old address back at once, and the old row's keys are released", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const old = await purged("acme", "g-100", 10 * 60 * 1000);
+    expect(await check(e, sid, "acme")).toBe("ok");
+    expect((await create(e, sid)).status).toBe(202);
+    const live = await db
+      .prepare("SELECT slug, status FROM signups WHERE signup_id <> ?")
+      .bind(old.sid)
+      .first<{ slug: string; status: string }>();
+    expect(live).toEqual({ slug: "acme", status: "pending" });
+    const dead = await db
+      .prepare(
+        "SELECT slug, app_host, content_host, state FROM installs WHERE id = ?",
+      )
+      .bind(old.id)
+      .first<{
+        slug: string;
+        app_host: string;
+        content_host: string;
+        state: string;
+      }>();
+    expect(dead).toEqual({
+      slug: `acme~${old.id}`,
+      app_host: `acme.${APP}~${old.id}`,
+      content_host: `acme.content.test~${old.id}`,
+      state: "deleted",
+    });
+    expect(await check(e, sid, "acme")).toBe("taken");
+  });
+
+  it("the unmap settles first: inside 2 minutes it is taken, even for its owner", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await purged("acme", "g-100", 30 * 1000);
+    expect(await check(e, sid, "acme")).toBe("taken");
+    await expect(errOf(await create(e, sid))).resolves.toMatchObject({
+      code: "slug_taken",
+      message: "slug_taken",
+    });
+  });
+
+  it("another account is refused within 30 days (cooling) and allowed after", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e, { sub: "g-200", email: "bo@acme.test" });
+    await purged("acme", "g-100", 29 * DAY);
+    expect(await check(e, sid, "acme")).toBe("cooling");
+    expect(await errOf(await create(e, sid))).toMatchObject({
+      code: "slug_taken",
+      message: "slug_cooling",
+    });
+    await db
+      .prepare("UPDATE installs SET updated_at = ?")
+      .bind(Date.now() - 31 * DAY)
+      .run();
+    expect(await check(e, sid, "acme")).toBe("ok");
+    expect((await create(e, sid)).status).toBe(202);
+  });
+
+  it("a live install stays taken, for its own account too", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await seedInstall({
+      slug: "acme",
+      state: "active",
+      source: "self-serve",
+      ownerSub: "g-100",
+    });
+    expect(await check(e, sid, "acme")).toBe("taken");
+    expect(await errOf(await create(e, sid))).toMatchObject({
+      code: "slug_taken",
+      message: "slug_taken",
+    });
+  });
+
+  it("a live signup whose install is not deleted stays taken", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const { id } = await seedInstall({
+      slug: "acme",
+      state: "deleted",
+      ownerSub: "g-100",
+    });
+    await db.prepare("UPDATE installs SET updated_at = 1").run();
+    const live = await seedInstall({ slug: "other", state: "active" });
+    const s = jobId();
+    await insert("signups", {
+      signup_id: s,
+      source: "self-serve",
+      owner_sub: "g-100",
+      slug: "acme",
+      install_id: live.id,
+      job_id: s,
+      vars: "{}",
+      status: "creating",
+      created_at: 1,
+      updated_at: 1,
+    });
+    expect(id).toBeTruthy();
+    expect(await check(e, sid, "acme")).toBe("taken");
+  });
+
+  it("the client shows Product's copy for cooling and keeps the suggestions", () => {
+    expect(CLIENT_JS).toContain(
+      "was used recently and isn't available yet. Pick another address.",
+    );
+    expect(CLIENT_JS).toMatch(/a === "taken" \|\| a === "cooling"/);
+    expect(CLIENT_JS).toContain('r.message === "slug_cooling"');
+  });
+});

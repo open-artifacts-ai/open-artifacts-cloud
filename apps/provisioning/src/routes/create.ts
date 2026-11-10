@@ -17,7 +17,7 @@ import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
-import { slugHeld } from "./reads.js";
+import { SLUG_UNMAP_SETTLE_MS, slugState } from "./reads.js";
 import { claimAccount, resolveRelease } from "./writes.js";
 
 // R4 POST /installs (3.3, 3.6, 4.2, 7). One D1 batch writes the job, the
@@ -100,6 +100,37 @@ async function selfServePolicy(
   return { hd: p.hd ?? null, email: p.email };
 }
 
+/**
+ * Frees a deleted install's slug, hosts and signup slug for a new create
+ * (cloud #108). The deleted row keeps its id, state and times (its audit,
+ * jobs and per-id resources are keyed by id); only the three unique keys
+ * gain `~<id>`. Only a deleted row past the unmap settle is touched.
+ */
+export function releaseDeletedSlug(
+  env: Env,
+  slug: string,
+  now: number,
+): D1PreparedStatement[] {
+  const db = env.PLATFORM_DB;
+  const cutoff = now - SLUG_UNMAP_SETTLE_MS;
+  return [
+    // The signup first: it finds its install by the install's slug.
+    db
+      .prepare(
+        `UPDATE signups SET slug = slug || '~' || signup_id
+WHERE slug = ?1 AND status <> 'failed'
+  AND install_id IN (SELECT id FROM installs WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2)`,
+      )
+      .bind(slug, cutoff),
+    db
+      .prepare(
+        `UPDATE installs SET slug = slug || '~' || id, app_host = app_host || '~' || id, content_host = content_host || '~' || id
+WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2`,
+      )
+      .bind(slug, cutoff),
+  ];
+}
+
 export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const { env } = a;
   const p = factsOf(a.principal);
@@ -130,7 +161,11 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
     body.version,
     testHooks ? "redline" : "release",
   );
-  if (await slugHeld(env, body.slug)) throw new ApiError("slug_taken");
+  const held = await slugState(env, body.slug, ss ? (p.sub as string) : null);
+  // "cooling" is a purged address inside its 30 days (cloud #108); the
+  // code stays slug_taken (the contract is public) and the message says why.
+  if (held === "cooling") throw new ApiError("slug_taken", "slug_cooling");
+  if (held === "taken") throw new ApiError("slug_taken");
 
   // checkCreateFields required these for every principal but U.
   const tier: Tier = ss ? env.SELF_SERVE_TIER : (body.tier as Tier);
@@ -146,6 +181,11 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const db = env.PLATFORM_DB;
   // The signup's id is its first create job's id (0007).
   const after = (jobId: string): D1PreparedStatement[] => [
+    // A purged install still holds its slug and hosts in unique columns
+    // (installs.slug, app_host, content_host, signups_live_slug), so a reuse
+    // renames the dead row's keys first, in this batch: if the create then
+    // loses a race the rename rolls back with it.
+    ...releaseDeletedSlug(env, body.slug, now),
     db
       .prepare(
         `INSERT INTO signups (signup_id, source, owner_sub, slug, job_id, vars, version, test_hooks, send_welcome, status, admitted_at, created_at, updated_at)
