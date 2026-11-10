@@ -17,7 +17,7 @@ describe("welcomeEmail", () => {
     const m = welcomeEmail({ ...base, trialEndsAt: Date.UTC(2026, 11, 9, 23) });
     for (const part of [m.text, m.html.replace(/&#39;/g, "'")])
       expect(part).toContain(
-        "You're on Solo: free until Dec 9, then $1/month or $12/year.",
+        "You're on Solo: free until Dec 9, then $1/month or $10/year.",
       );
   });
 

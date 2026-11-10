@@ -71,7 +71,7 @@ describe(".github/hosted/<env>.json", () => {
   it("staging's price ids are the sandbox's four, each a price id", () => {
     expect(read("staging")).toMatchObject({
       stripe_price_solo_monthly: "price_1UYx2tJuK8jgC2cZS0mg3Uiz",
-      stripe_price_solo_yearly: "price_1UYx2uJuK8jgC2cZdLlkeOdN",
+      stripe_price_solo_yearly: "price_1UaImwJuK8jgC2cZKiXgN6nX",
       stripe_price_team: "price_1UYx2vJuK8jgC2cZAcUMAQpw",
       stripe_price_business: "price_1UYx2vJuK8jgC2cZr02sKqwQ",
     });
@@ -368,7 +368,7 @@ describe("hosted-constants.sh", () => {
       "STRIPE_PRICE_TEAM=price_1UYx2vJuK8jgC2cZAcUMAQpw",
       "STRIPE_PRICE_BUSINESS=price_1UYx2vJuK8jgC2cZr02sKqwQ",
       "STRIPE_PRICE_SOLO_MONTHLY=price_1UYx2tJuK8jgC2cZS0mg3Uiz",
-      "STRIPE_PRICE_SOLO_YEARLY=price_1UYx2uJuK8jgC2cZdLlkeOdN",
+      "STRIPE_PRICE_SOLO_YEARLY=price_1UaImwJuK8jgC2cZKiXgN6nX",
     ])
       expect(st.ghEnv).toContain(`${l}\n`);
     for (const k of STRIPE_KEYS) {
