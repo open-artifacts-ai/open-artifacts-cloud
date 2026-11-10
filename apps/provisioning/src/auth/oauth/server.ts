@@ -12,12 +12,12 @@ import {
   type AgentTokenRow,
   getToken,
   OAUTH_ACCESS_TTL_S,
-  OAUTH_GRANT_MAX_MS,
   type RevokedGrant,
   type SessionRow,
   type TokenRefusalReason,
   tokenPrincipal,
 } from "../../services/tokens.js";
+import { adminSessionTtlMs } from "../session-ttl.js";
 import { oauthAudit } from "./audit.js";
 
 // The MCP OAuth authorization server (design v7 9A.3.1): workers-oauth-
@@ -29,8 +29,10 @@ import { oauthAudit } from "./audit.js";
 
 /** The five TokenScope values, in the enum's order. */
 export const OAUTH_SCOPES = [...TokenScopeSchema.options];
-/** The refresh chain's cap: the admin cookie's 8 h (Q3). */
-export const REFRESH_CAP_S = OAUTH_GRANT_MAX_MS / 1000;
+/** The refresh chain's cap: the admin session's length (8 h, Q3). */
+export const refreshCapS = (
+  env: Pick<Env, "OA_ENV"> & { ADMIN_SESSION_TTL_HOURS?: unknown },
+) => adminSessionTtlMs(env) / 1000;
 /** 30 days (the library's default is 90): a secret grants nothing without a live grant. */
 export const CLIENT_REGISTRATION_TTL_S = 2_592_000;
 /** The library's KV floor: a shorter refresh TTL cannot be stored. */
@@ -46,9 +48,12 @@ export const mcpResource = (env: Pick<Env, "APP_DOMAIN">) =>
 export const resourceMetadataUrl = (env: Pick<Env, "APP_DOMAIN">) =>
   `${apiOrigin(env)}/.well-known/oauth-protected-resource/mcp`;
 
-/** Seconds of refresh chain left: the time to `endsAt`, capped at 8 h (Q3). */
-export const refreshTtlFor = (endsAt: number, now: number) =>
-  Math.min(REFRESH_CAP_S, Math.floor((endsAt - now) / 1000));
+/** Seconds of refresh chain left: the time to `endsAt`, capped at the session length (Q3). */
+export const refreshTtlFor = (
+  env: Pick<Env, "OA_ENV"> & { ADMIN_SESSION_TTL_HOURS?: unknown },
+  endsAt: number,
+  now: number,
+) => Math.min(refreshCapS(env), Math.floor((endsAt - now) / 1000));
 
 /** `http://127.0.0.1:<port>`, `http://localhost:<port>`, `http://[::1]:<port>`. */
 export const isLoopbackRedirect = (u: URL) =>
@@ -153,7 +158,7 @@ async function onTokenExchange(
     const p = tokenPrincipal(row, session, env, "oauth");
     if (isRefusal(p))
       throw invalidGrant("The grant was revoked or the admin session ended");
-    const ttl = refreshTtlFor(row.expires_at, now);
+    const ttl = refreshTtlFor(env, row.expires_at, now);
     if (ttl < MIN_REFRESH_TTL_S)
       throw invalidGrant("The admin session ends too soon");
     const set = await env.PLATFORM_DB.prepare(
@@ -198,12 +203,15 @@ const servers = new Map<string, OAuthAuthorizationServer<Env>>();
 /**
  * The AS for this env's hosts and redirect allowlist. Options are fixed per
  * construction (the registration callback gets no env), so one per
- * (APP_DOMAIN, MCP_REDIRECT_URIS).
+ * (APP_DOMAIN, MCP_REDIRECT_URIS, refresh cap), the cap being the session
+ * length for this env (adminSessionTtlMs).
  */
 export function authServer(
-  env: Pick<Env, "APP_DOMAIN" | "MCP_REDIRECT_URIS">,
+  env: Pick<Env, "APP_DOMAIN" | "MCP_REDIRECT_URIS" | "OA_ENV"> & {
+    ADMIN_SESSION_TTL_HOURS?: unknown;
+  },
 ): OAuthAuthorizationServer<Env> {
-  const key = `${env.APP_DOMAIN}\n${env.MCP_REDIRECT_URIS}`;
+  const key = `${env.APP_DOMAIN}\n${env.MCP_REDIRECT_URIS}\n${refreshCapS(env)}`;
   let s = servers.get(key);
   if (s) return s;
   const api = apiOrigin(env);
@@ -216,7 +224,7 @@ export function authServer(
     resources: [mcpResource(env)],
     defaultResource: mcpResource(env),
     accessTokenTTL: OAUTH_ACCESS_TTL_S,
-    refreshTokenTTL: REFRESH_CAP_S,
+    refreshTokenTTL: refreshCapS(env),
     clientRegistrationTTL: CLIENT_REGISTRATION_TTL_S,
     scopesSupported: OAUTH_SCOPES,
     disallowPublicClientRegistration: false,

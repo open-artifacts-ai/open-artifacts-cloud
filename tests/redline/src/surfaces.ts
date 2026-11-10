@@ -297,6 +297,10 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "owner-only (the broker check): no admin success leg",
   "POST /api/v1/notices/guest_summary/dismiss":
     "owner-only (the guest summary notice, parity 2): no admin success leg",
+  "GET /api/v1/onboarding":
+    "owner-only (the first-run checklist state): no admin success leg",
+  "PUT /api/v1/onboarding":
+    "owner-only (the first-run checklist state): no admin success leg",
   "GET /api/v1/bus/ping":
     "bus-off: 404 on every hosted install (the bus is off until #1299), the same as a refusal; no success leg",
   "GET /api/v1/directory/callback":
@@ -384,6 +388,10 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "GET /bus/links/confirm",
   "POST /bus/links/confirm/view",
   "POST /bus/links/confirm",
+  // #1346: the reach confirm page, the same kind (PUBLIC_ROUTES).
+  "GET /bus/reach/confirm",
+  "POST /bus/reach/confirm/view",
+  "POST /bus/reach/confirm",
   // Hosted billing: Checkout, Portal and the usage report open Stripe or
   // reach billing only for a person in a browser session (billing.ts
   // requireBillingManager), so a hook-minted session is 404 here.
@@ -476,6 +484,28 @@ export const DROPPED: Readonly<
         file: "apps/server/test/notices.test.ts",
         describe: "Me.notices.guestSummary (parity 2)",
         test: "only the uncapped org owner sees it; others get 404 on dismiss",
+      },
+    ],
+  },
+  "org GET /api/v1/onboarding": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/onboarding.test.ts",
+        describe: "R.onboarding",
+        test: "refuses everyone but the owner, and writes nothing",
+      },
+    ],
+  },
+  "org PUT /api/v1/onboarding": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/onboarding.test.ts",
+        describe: "R.onboarding",
+        test: "refuses everyone but the owner, and writes nothing",
       },
     ],
   },

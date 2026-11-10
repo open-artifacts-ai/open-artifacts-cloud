@@ -12,7 +12,10 @@ import {
   parseManifest,
 } from "../src/report.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
-import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
+import {
+  ACCEPTED_UNPROVEN_ADDED_SINCE_1730,
+  CASES_ADDED_SINCE_1730,
+} from "./cases-added.ts";
 
 // #1730 changes when and beside what the cases run, never which cases there
 // are or what passes. test/fixtures/main-cases.json is main's required cases
@@ -26,6 +29,7 @@ const main = JSON.parse(
   readFileSync(join(import.meta.dirname, "fixtures/main-cases.json"), "utf8"),
 ) as Main;
 const pkg = join(import.meta.dirname, "..");
+
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
@@ -47,7 +51,9 @@ describe("the same cases", () => {
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set(main.manifest.map((c) => c.file));
+    const files = new Set(
+      [...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file),
+    );
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });
@@ -82,15 +88,36 @@ describe("the same cases", () => {
 });
 
 describe("the same pass bar", () => {
-  it("ACCEPTED_UNPROVEN is main's four entries, by name, reason and file", () => {
+  it("ACCEPTED_UNPROVEN is main's four entries plus exactly the declared additions, by name, reason and file", () => {
     expect(
       ACCEPTED_UNPROVEN.map((e) => ({
         name: e.name,
         reason: e.reason,
         file: e.file,
       })),
-    ).toEqual(main.acceptedUnproven);
+    ).toEqual([
+      ...main.acceptedUnproven,
+      ...ACCEPTED_UNPROVEN_ADDED_SINCE_1730,
+    ]);
     expect(main.acceptedUnproven).toHaveLength(4);
+    expect(ACCEPTED_UNPROVEN_ADDED_SINCE_1730).toHaveLength(2);
+  });
+
+  it("the gate accepts each declared provisioner probe as unproven-live, by exact name, file and reason, and no sibling", () => {
+    const pass: CaseResult = { name: "x", level: "pass" };
+    for (const e of ACCEPTED_UNPROVEN_ADDED_SINCE_1730) {
+      const c: CaseResult = {
+        name: e.name,
+        file: `live/${e.file}`,
+        level: "unproven-live",
+        reason: e.reason,
+      };
+      expect(gatePasses([pass, c]), e.name).toBe(true);
+      expect(gatePasses([pass, { ...c, reason: "other" }]), e.name).toBe(false);
+      expect(gatePasses([pass, { ...c, name: `${e.name} ` }]), e.name).toBe(
+        false,
+      );
+    }
   });
 
   it("MAX_RETRIED_CASES is 5 and the gate is read from --gate or REDLINE_GATE=1", () => {

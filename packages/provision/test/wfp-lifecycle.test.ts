@@ -3553,8 +3553,9 @@ describe("fix round 4 (T8): every server precondition for hosted google", () => 
       "BROKER_SIGNING_KEY",
       /BROKER_SIGNING_KEY isn't/,
     ],
-    // AUTH_DOMAINS is not here: the server accepts google with none (owner and
-    // invites only); apps/provisioner/test/node/gmail-signup-owner.test.ts.
+    // No AUTH_DOMAINS row: the server stopped refusing google on an empty
+    // list (public #1825, owner and invites only). Provision still refuses to
+    // render it; that is the "google needs AUTH_DOMAINS" tests above.
   ];
   it.each(RENDERED)(
     "rendered by provision: %s (without %s the server refuses google)",
@@ -6845,5 +6846,38 @@ describe("every same-state claim: the holding job re-takes, another job is refus
     );
     expect(mine[0]).toMatchObject({ ok: true });
     expect(s.row(inst.id).lease).toBeNull();
+  });
+});
+
+describe("stagingBusSlugs reaches the rendered metadata (#1299 part 6)", () => {
+  const featuresOf = (s: S, id: string): string =>
+    String(
+      (
+        (s.scriptOf(id)?.metadata.bindings ?? []) as {
+          name: string;
+          text?: string;
+        }[]
+      ).find((b) => b.name === "FEATURES")?.text,
+    );
+
+  it("staging and listed: a real create and a var change send bus; unlisted does not", async () => {
+    const s = setup();
+    const p = s.mk({ stagingBusSlugs: ["finqore"] });
+    const inst = keep(await p.create(input("finqore")));
+    expect(featuresOf(s, inst.id).split(",")).toContain("bus");
+    expect((await p.updateVars(inst.id, { FEATURES: "beta" })).ok).toBe(true);
+    expect(featuresOf(s, inst.id).split(",")).toContain("bus");
+    const other = keep(await p.create(input("other")));
+    expect(featuresOf(s, other.id).split(",")).not.toContain("bus");
+  });
+
+  it("without the option, or on prod with it, no bus", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input("finqore")));
+    expect(featuresOf(s, inst.id).split(",")).not.toContain("bus");
+    const prod = setup({ env: "prod" });
+    const pp = prod.mk({ stagingBusSlugs: ["finqore"] });
+    const pi = keep(await pp.create(input("finqore")));
+    expect(featuresOf(prod, pi.id).split(",")).not.toContain("bus");
   });
 });

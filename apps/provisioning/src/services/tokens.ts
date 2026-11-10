@@ -8,6 +8,7 @@ import {
 } from "@oa/provisioning-contract";
 import { hmac16, sameString, sha256Hex } from "../auth/crypto.js";
 import { isAdminIdentity } from "../auth/identities.js";
+import { adminSessionTtlMs } from "../auth/session-ttl.js";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
 import { countD1, D1_LIMITS } from "../limits.js";
@@ -35,8 +36,6 @@ export const TOKEN_LIVE_LIMIT = 5;
 /** oat lifetimes (4.1): 15 min default (the R19 schema), 5 to 60. */
 export const OAT_TTL_MIN_MINUTES = 5;
 export const OAT_TTL_MAX_MINUTES = 60;
-/** An OAuth grant chain ends with the admin session, at most 8 h (Q3). */
-export const OAUTH_GRANT_MAX_MS = 8 * 3_600_000;
 /** OAuth access tokens (the library's accessTokenTTL, W13b): 15 minutes. */
 export const OAUTH_ACCESS_TTL_S = 15 * 60;
 /** `oat_` + 32 random bytes, base64url (43 chars). */
@@ -315,7 +314,7 @@ export async function mintAgentToken(
       oauth_user: oauthUser,
       grant_id: null,
       created_at: now,
-      expires_at: Math.min(s.expires_at, now + OAUTH_GRANT_MAX_MS),
+      expires_at: Math.min(s.expires_at, now + adminSessionTtlMs(env)),
     };
   }
   // oat: `token.mint` (4.9). oauth: `oauth.grant` with the 9A.8 fields.

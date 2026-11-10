@@ -47,6 +47,8 @@ export interface Env {
    */
   TURNSTILE_SITEKEY?: string;
   OA_ENV: ProvisioningEnv;
+  /** Staging only (honoured by adminSessionTtlMs); prod ignores it. */
+  ADMIN_SESSION_TTL_HOURS?: string;
   /** Committed `email:sub` comma list (4.1), read on every request. */
   ADMIN_IDENTITIES: string;
   APP_DOMAIN: string;

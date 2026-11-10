@@ -207,6 +207,11 @@ export interface WfpOptions {
    */
   releaseVersions?: () => Promise<string[]>;
   /**
+   * Staging only (#1299 part 6): slugs whose installs get the `bus` feature
+   * (metadata's busSlugs). Prod ignores it, in provision's code.
+   */
+  stagingBusSlugs?: readonly string[];
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -2300,6 +2305,7 @@ export class WfpProvisioner {
         rlNs: r.rlNs,
         doMigrationTag: r.tag,
         env: this.env,
+        busSlugs: this.o.stagingBusSlugs,
         target: this.target.kind,
         mode: r.mode,
         secrets: known,

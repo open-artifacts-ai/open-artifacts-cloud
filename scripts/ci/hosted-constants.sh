@@ -12,6 +12,11 @@
 # committed (#1084), it comes from OA_OWNER_EMAIL (the Actions secret) when
 # set, goes to $GITHUB_ENV only and is never printed. Unset, no ALERT_TO is
 # written, and a scheduler deploy refuses (deploy-hosted-platform.sh).
+# STAGING ONLY (#1568): the billing service's four Stripe test-mode price ids
+# (stripe_price_team, _business, _solo_monthly, _solo_yearly: not secrets) load
+# as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS, STRIPE_PRICE_SOLO_MONTHLY and
+# STRIPE_PRICE_SOLO_YEARLY, each a price id. Prod's file must hold no stripe_*
+# key (prod has no billing Worker, and no Stripe value reaches its run).
 # Usage: scripts/ci/hosted-constants.sh staging|prod <dir>
 set -euo pipefail
 
@@ -51,6 +56,24 @@ signup_daily_cap SIGNUP_DAILY_CAP $cap
 signups_enabled SIGNUPS_ENABLED $onoff
 welcome_from WELCOME_FROM $email
 EOF
+# Billing's prices: staging only. Prod refuses any stripe_* key.
+if [ "$1" = staging ]; then
+  price='^price_[A-Za-z0-9]{1,255}$'
+  while read -r k name rule; do
+    v="$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else "" end' "$file")" || exit 1
+    [ -n "$v" ] || { echo "$file: $k is missing" >&2; exit 1; }
+    [[ "$v" =~ $rule ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
+    lines+="$name=$v"$'\n'
+  done << LIST
+stripe_price_team STRIPE_PRICE_TEAM $price
+stripe_price_business STRIPE_PRICE_BUSINESS $price
+stripe_price_solo_monthly STRIPE_PRICE_SOLO_MONTHLY $price
+stripe_price_solo_yearly STRIPE_PRICE_SOLO_YEARLY $price
+LIST
+else
+  [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
+    { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }
+fi
 owner=""
 if [ -n "${OA_OWNER_EMAIL:-}" ]; then
   [[ "$OA_OWNER_EMAIL" != *$'\n'* && "$OA_OWNER_EMAIL" =~ $email ]] || { echo "OA_OWNER_EMAIL is not a valid address" >&2; exit 1; }

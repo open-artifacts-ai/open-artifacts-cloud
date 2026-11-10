@@ -29,7 +29,12 @@ ok() { printf '{"success":true,"result":%s}' "$1"; }
 case "$path" in
   /accounts/*/workers/scripts/*/settings)
     w="\${path#*/workers/scripts/}"; w="\${w%%/*}"
-    [ "$tok" = ok ] && grep -qx "$w" "$STATE/workers" && ok '{}' || echo '{"success":false}' ;;
+    # Like Cloudflare: 10007 is "not found"; any other failure is another code.
+    if [ "$tok" != ok ]; then echo '{"success":false,"errors":[{"code":10000}]}'
+    elif [ -f "$STATE/neterr-$w" ]; then echo "curl: (6) Could not resolve host" >&2; exit 6
+    elif [ -f "$STATE/fail-$w" ]; then echo '{"success":false,"errors":[{"code":10001,"message":"boom"}]}'
+    elif grep -qx "$w" "$STATE/workers"; then ok '{}'
+    else echo '{"success":false,"errors":[{"code":10007,"message":"not found"}]}'; fi ;;
   /user/tokens/verify) [ "$tok" = ok ] && ok '{"status":"active"}' || echo '{"success":false}' ;;
   "/zones?name="*)
     [ "$tok" = ok ] || { echo '{"success":false}'; exit 0; }
@@ -282,5 +287,173 @@ describe("hosted-zones.sh", () => {
     expect(r.out).toContain(
       "route api.open-artifacts-staging.app/* -> oa-s-provisioning: add",
     );
+  });
+
+  describe("billing's webhook route (staging only, state-based, #1568)", () => {
+    const BASE = [
+      "oa-s-dispatch",
+      "oa-s-auth-broker",
+      "oa-s-directory-broker",
+      "oa-s-provisioning",
+    ];
+    const STG = [...BASE, "oa-s-billing"];
+    const ROUTE = "billing.open-artifacts-staging.app/stripe/webhook";
+    const billingLookups = (log: string[]) =>
+      log.filter((l) => l.includes("/workers/scripts/oa-s-billing/settings"));
+
+    it("oa-s-billing exists: plan and apply carry exactly one more route, an exact path to it", () => {
+      const plan = setup({}, STG).run("plan", "staging");
+      expect(plan.code, plan.err).toBe(0);
+      expect(plan.out).toContain(`route ${ROUTE} -> oa-s-billing: add`);
+      expect(plan.writes).toEqual([]);
+      const apply = setup({}, STG).run("apply", "staging");
+      expect(apply.code, apply.err).toBe(0);
+      const routes = apply.writes.filter((w) => w.includes("/workers/routes "));
+      expect(routes).toHaveLength(7);
+      expect(routes.filter((w) => w.includes("billing"))).toEqual([
+        `WRITE POST /zones/${APPZ}/workers/routes {"pattern":"${ROUTE}","script":"oa-s-billing"}`,
+      ]);
+      expect(
+        apply.writes.filter((w) => w.includes("/dns_records ")),
+      ).toHaveLength(2);
+      expect(apply.out).toContain(
+        "applied and read back: matches the expected set",
+      );
+    });
+
+    it("oa-s-billing does not exist: the route is left out, the plan and summary say so, and the run does not refuse", () => {
+      for (const mode of ["plan", "apply"]) {
+        const r = setup({}, BASE).run(mode, "staging");
+        expect(r.code, `${mode} ${r.err}`).toBe(0);
+        const line =
+          "oa-s-billing does not exist yet: its webhook route (billing.open-artifacts-staging.app/stripe/webhook) is left out";
+        expect(r.out, mode).toContain(line);
+        expect(r.summary, mode).toContain(line);
+        expect(r.out).not.toContain("-> oa-s-billing");
+        expect(
+          r.writes.filter((w) => w.includes("billing")),
+          mode,
+        ).toEqual([]);
+        if (mode === "apply")
+          expect(
+            r.writes.filter((w) => w.includes("/workers/routes ")),
+          ).toHaveLength(6);
+      }
+    });
+
+    it("a later run keeps the route: with the Worker up and the route live both modes write nothing, and it is not seen as foreign", () => {
+      const wired = {
+        ...DONE,
+        [`routes-${APPZ}.json`]: JSON.stringify([
+          ...JSON.parse(DONE[`routes-${APPZ}.json`] as string).map(
+            (r: { pattern: string; script: string }) => ({
+              pattern: r.pattern.replace(
+                "open-artifacts.app",
+                "open-artifacts-staging.app",
+              ),
+              script: r.script.replace("oa-p-", "oa-s-"),
+            }),
+          ),
+          { pattern: ROUTE, script: "oa-s-billing" },
+        ]),
+        [`routes-${PAGEZ}.json`]: JSON.stringify([
+          {
+            pattern: "*.open-artifacts-staging.page/*",
+            script: "oa-s-dispatch",
+          },
+        ]),
+      };
+      for (const mode of ["plan", "apply"]) {
+        const r = setup(wired, STG).run(mode, "staging");
+        expect(r.code, `${mode} ${r.err}`).toBe(0);
+        expect(r.out).toContain(`route ${ROUTE} -> oa-s-billing ok`);
+        expect(
+          r.writes.filter((w) => w.includes("/workers/routes ")),
+          mode,
+        ).toEqual([]);
+      }
+      // The Worker gone but its route still live: that route is a foreign one
+      // our wildcard matches, so the run refuses rather than hiding it.
+      const gone = setup(wired, BASE).run("plan", "staging");
+      expect(gone.code).toBe(1);
+      expect(gone.err).toContain(
+        `route ${ROUTE} is not ours but matches *.open-artifacts-staging.app/*`,
+      );
+    });
+
+    it("a lookup that fails is not 'does not exist': another API error, a network error or an unparsable answer fails the run, writing nothing", () => {
+      for (const mode of ["plan", "apply"]) {
+        for (const [why, file] of [
+          ["api error", "fail-oa-s-billing"],
+          ["network error", "neterr-oa-s-billing"],
+        ] as const) {
+          const r = setup({ [file]: "" }, BASE).run(mode, "staging");
+          expect(r.code, `${mode} ${why}`).toBe(1);
+          expect(r.err, why).toContain("look up oa-s-billing failed");
+          expect(r.writes, why).toEqual([]);
+          expect(r.out, why).not.toContain("left out");
+        }
+      }
+    });
+
+    it("prod never looks: no lookup of oa-p-billing, no billing route, even if that Worker exists", () => {
+      for (const workers of [
+        undefined,
+        [
+          "oa-p-dispatch",
+          "oa-p-auth-broker",
+          "oa-p-directory-broker",
+          "oa-p-provisioning",
+          "oa-p-billing",
+        ],
+      ]) {
+        const r = setup({}, workers).run("apply", "prod");
+        expect(r.code, r.err).toBe(0);
+        expect(r.log.filter((l) => l.includes("billing"))).toEqual([]);
+        expect(r.out).not.toContain("billing");
+        expect(
+          r.writes.filter((w) => w.includes("/workers/routes ")),
+        ).toHaveLength(6);
+      }
+    });
+
+    it("a billing route that already points at another Worker is refused, in plan and apply", () => {
+      for (const mode of ["plan", "apply"]) {
+        const r = setup(
+          {
+            [`routes-${APPZ}.json`]: JSON.stringify([
+              { pattern: ROUTE, script: "someone-else" },
+            ]),
+          },
+          STG,
+        ).run(mode, "staging");
+        expect(r.code, mode).toBe(1);
+        expect(r.err).toContain(
+          `route ${ROUTE} points at someone-else, not oa-s-billing`,
+        );
+        expect(r.writes, mode).toEqual([]);
+      }
+    });
+
+    it("a foreign route on the billing host is refused like any our patterns match, before any write", () => {
+      for (const mode of ["plan", "apply"]) {
+        const r = setup(
+          {
+            [`routes-${APPZ}.json`]: JSON.stringify([
+              {
+                pattern: "billing.open-artifacts-staging.app/stripe/*",
+                script: "x",
+              },
+            ]),
+          },
+          STG,
+        ).run(mode, "staging");
+        expect(r.code, mode).toBe(1);
+        expect(r.err).toContain(
+          "route billing.open-artifacts-staging.app/stripe/* is not ours but matches *.open-artifacts-staging.app/*",
+        );
+        expect(r.writes, mode).toEqual([]);
+      }
+    });
   });
 });

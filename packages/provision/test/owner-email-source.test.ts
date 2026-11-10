@@ -54,6 +54,10 @@ const ALLOWED: Record<string, RegExp[]> = {
   "apps/provisioner/src/workflow.ts": [
     /^\s*"SELECT owner_email AS email FROM signup_secret WHERE signup_id = \?";$/,
   ],
+  // The trial reminder's mailable-install read (goes through ownerEmailOf).
+  "apps/scheduler/src/trial-reminder.ts": [
+    /^\s*"SELECT i\.id AS id, i\.app_host AS app_host, i\.owner_email AS owner_email FROM installs i";$/,
+  ],
   // The purge (a write).
   "apps/scheduler/src/index.ts": [
     /^\s*"UPDATE installs SET owner_email = '', inputs_hash = '' WHERE state='deleted' AND updated_at < \?1 AND owner_email <> '' RETURNING id";$/,
@@ -73,6 +77,12 @@ const ALLOWED: Record<string, RegExp[]> = {
   "apps/provisioning/src/routes/reads.ts": [
     /^\s*"i\.owner_email",$/,
     /^\s*"\(SELECT ss\.owner_email FROM signup_secret ss WHERE ss\.signup_id = st\.signup_id\)",$/,
+  ],
+  // The claim free's email lookup matches in SQL and reads out only subs; the
+  // body's email is at least 3 chars, so a purged '' never matches.
+  "apps/provisioning/src/routes/claim-free.ts": [
+    /^WHERE s\.owner_sub IS NOT NULL AND lower\(i\.owner_email\) = lower\(\?1\)$/,
+    /^WHERE s\.owner_sub IS NOT NULL AND lower\(k\.owner_email\) = lower\(\?1\)`,$/,
   ],
   "apps/provisioning/src/routes/create.ts": [
     // The create's write of the signup's email.

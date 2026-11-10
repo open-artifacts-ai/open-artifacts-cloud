@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HOSTED_DOMAINS, NAMESPACES, platformNames } from "@oa/provision";
 import { describe, expect, it } from "vitest";
+import { HOSTED_BUS_LIFTED } from "../../../../tests/redline/src/bus-gate.ts";
 
 const app = join(dirname(fileURLToPath(import.meta.url)), "../..");
 // Strip // and /* */ comments outside strings.
@@ -53,6 +54,10 @@ describe("wrangler.jsonc", () => {
         FLEET_SMOKE: env === "staging" ? "off" : "required",
         // The share check is on in both: an explicit, committed choice.
         FLEET_SMOKE_SHARE: "on",
+        // #1299: on exactly when red-line's flag says the /bus routes are
+        // lifted on hosted installs (tests/redline/src/bus-gate.ts), so part 6
+        // can't flip one and forget the other.
+        FLEET_SMOKE_BUS: HOSTED_BUS_LIFTED ? "on" : "off",
         // ... and keeps the passive soak: 15 min on staging, 60 on prod.
         FLEET_SOAK_MIN: env === "staging" ? "15" : "60",
       });
@@ -62,15 +67,20 @@ describe("wrangler.jsonc", () => {
       const provisioner = names.provisioner;
       // BrokerGate's bindings: this env's two brokers, never the other env's;
       // and the provisioner's ProvisionerRpc entrypoint (tokenStatus).
-      expect(JSON.stringify(e.services)).not.toContain("BILLING");
+      // BILLING on STAGING only (#1568), with dispatch's: the calls then carry
+      // the billing gate and the */2 health check runs. Prod has none.
+      expect(JSON.stringify(e.services).includes("BILLING")).toBe(
+        env === "staging",
+      );
       expect(e.services).toEqual([
         { binding: "AUTH_BROKER", service: platformNames(env).broker },
         {
           binding: "DIRECTORY_BROKER",
           service: platformNames(env).directoryBroker,
         },
-        // No BILLING binding yet: it and the billing deploy target land
-        // together in the cloud repo. Without it no billing gate is built.
+        ...(env === "staging"
+          ? [{ binding: "BILLING", service: platformNames(env).billing }]
+          : []),
         {
           binding: "PROVISIONER",
           service: provisioner,
@@ -227,6 +237,8 @@ describe("BILLING is bound on dispatch and the scheduler together (#1514)", () =
       const s = bound(cfg);
       expect(d).toEqual(s);
       expect(d.length).toBeLessThanOrEqual(1);
+      // Staging binds it on both; prod on neither (#1568).
+      expect(d.length).toBe(env === "staging" ? 1 : 0);
       for (const b of [...d, ...s])
         expect(b).toEqual({
           binding: "BILLING",

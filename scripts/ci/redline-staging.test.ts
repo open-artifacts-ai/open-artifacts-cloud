@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,7 +36,11 @@ const t19Job: any = w.jobs.t19;
 const t19Steps: Record<string, any>[] = t19Job.steps;
 const SHA_PIN =
   /^(actions\/(checkout|upload-artifact|setup-node)|pnpm\/action-setup)@[0-9a-f]{40}$/;
-const SECRETS = ["REDLINE_PROD_R2_TOKEN", "REDLINE_PROD_SCRIPTS_TOKEN"];
+const SECRETS = [
+  "REDLINE_PROD_R2_TOKEN",
+  "REDLINE_PROD_SCRIPTS_TOKEN",
+  "REDLINE_STG_PROVISIONER_TOKEN",
+];
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const pick = (
   list: Record<string, any>[],
@@ -169,7 +174,7 @@ describe("redline-staging.yml", () => {
     }
   });
 
-  it("no stored red-line or inventory key: only the prod probe's two tokens are secrets", () => {
+  it("no stored red-line or inventory key: only the prod probe's two tokens and the provisioner probes' token are secrets", () => {
     expect(text).not.toMatch(/INVENTORY_KEY|REDLINE_RL_/);
     const withSecrets = steps.filter((s) =>
       JSON.stringify(s).includes("secrets."),
@@ -224,6 +229,77 @@ describe("redline-staging.yml", () => {
     const partial = write({ PROD_R2_TOKEN: "r" });
     expect(partial.code).toBe(1);
     expect(partial.out).toContain("empty secret file: REDLINE_PROD_");
+  });
+
+  it("the provisioner probes' token: a 0600 file built in the job, its path put into REDLINE_STG_PROVISIONER, nothing from a var", () => {
+    const sec = named("Write the suite's secrets as 0600 files");
+    const tg = named("Set the targets");
+    const mk = () => mkdtempSync(join(tmpdir(), "rl-prov-"));
+    const base = {
+      PROD_R2_TOKEN: "",
+      PROD_SCRIPTS_TOKEN: "",
+    };
+    // Token set: the file exists, mode 0600, and is not echoed.
+    const tmp = mk();
+    try {
+      const r = runBash(String(sec.run), {
+        RUNNER_TEMP: tmp,
+        ...base,
+        STG_PROVISIONER_TOKEN: "tok-123",
+      });
+      expect(r.status).toBe(0);
+      const f = join(tmp, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN");
+      expect(readFileSync(f, "utf8")).toBe("tok-123");
+      expect(statSync(f).mode & 0o777).toBe(0o600);
+      expect(r.stdout).toContain("::add-mask::tok-123");
+      expect(r.stdout.replace("::add-mask::tok-123", "")).not.toContain(
+        "tok-123",
+      );
+      // The targets step adds tokenFile (built here) to the var's ids.
+      const ghEnv = join(tmp, "env");
+      writeFileSync(ghEnv, "");
+      const t = runBash(String(tg.run), {
+        RUNNER_TEMP: tmp,
+        GITHUB_ENV: ghEnv,
+        TAG: "v0.82.0",
+        RUN_ID: "1-1",
+        REDLINE_TARGETS_BASE: '{"mode":"staging","a":{},"b":{}}',
+        REDLINE_STG_PROVISIONER_BASE: '{"accountId":"x","tokenFile":"/evil"}',
+      });
+      expect(t.status).toBe(0);
+      const line = readFileSync(ghEnv, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("REDLINE_STG_PROVISIONER="));
+      expect(JSON.parse(String(line).slice("REDLINE_STG_PROVISIONER=".length)))
+        .toEqual({ accountId: "x", tokenFile: f });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+    // No token: no file, and the config is not exported (probes unproven-live).
+    const t2 = mk();
+    try {
+      const r = runBash(String(sec.run), { RUNNER_TEMP: t2, ...base });
+      expect(r.status).toBe(0);
+      expect(existsSync(join(t2, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN"))).toBe(false);
+      const ghEnv = join(t2, "env");
+      writeFileSync(ghEnv, "");
+      const t = runBash(String(tg.run), {
+        RUNNER_TEMP: t2,
+        GITHUB_ENV: ghEnv,
+        TAG: "v0.82.0",
+        RUN_ID: "1-1",
+        REDLINE_TARGETS_BASE: '{"mode":"staging","a":{},"b":{}}',
+        REDLINE_STG_PROVISIONER_BASE: '{"accountId":"x"}',
+      });
+      expect(t.status).toBe(0);
+      expect(readFileSync(ghEnv, "utf8")).not.toContain("REDLINE_STG_PROVISIONER=");
+    } finally {
+      rmSync(t2, { recursive: true, force: true });
+    }
+    // The suite step takes the config from GITHUB_ENV, not from a var.
+    expect(JSON.stringify(named("Run the suite").env)).not.toContain(
+      "REDLINE_STG_PROVISIONER",
+    );
   });
 
   it("checks the input before anything else, then runs from exactly the tag's checkout (#1137)", () => {

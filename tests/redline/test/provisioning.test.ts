@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Job } from "@oa/provisioning-contract";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
@@ -155,13 +155,17 @@ const level = (o: Outcome | string | undefined) =>
       : `fail: ${o}`
     : o?.level;
 
+// P51 runs its full assertions here; the not-lifted behaviour is in
+// test/bus-gated.test.ts.
+vi.mock("../src/bus-gate.ts", () => ({ HOSTED_BUS_LIFTED: true }));
+
 describe("the probes on a conforming staging fake", () => {
-  it("covers P1-P50 exactly once: a probe, or removed with the issue that says why", () => {
+  it("covers P1-P51 exactly once: a probe, or removed with the issue that says why", () => {
     const removed = Object.keys(REMOVED_PROBES);
     const ids = [...PROBES.map((p) => p.id), ...removed]
       .map((id) => Number(id.slice(1)))
       .sort((a, b) => a - b);
-    expect(ids).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+    expect(ids).toEqual(Array.from({ length: 51 }, (_, i) => i + 1));
     expect(removed.sort()).toEqual(["P35", "P50"]);
     expect(REMOVED_PROBES.P35).toMatch(/^#1260: /);
     expect(REMOVED_PROBES.P50).toMatch(/^#1078: /);
@@ -809,7 +813,7 @@ describe("each probe fails on the behaviour it guards", () => {
 
       it("a thrown recheck keeps the class and the page log", async () => {
         const out = (
-          await runAll(stuckPage(503, CLOSED_HTML, { throwAfter: 28 }))
+          await runAll(stuckPage(503, CLOSED_HTML, { throwAfter: 41 }))
         ).get("P22");
         expect(out).toMatch(/\(other\)|\(dispatch-closed-lag\)/);
         expect(out).toMatch(
@@ -819,7 +823,7 @@ describe("each probe fails on the behaviour it guards", () => {
 
       it("a recheck that returns 200 says it came up on recheck, and still fails", async () => {
         const out = (
-          await runAll(stuckPage(503, CLOSED_HTML, { okAfter: 28 }))
+          await runAll(stuckPage(503, CLOSED_HTML, { okAfter: 41 }))
         ).get("P22");
         expect(level(out)).toMatch(/^fail: /);
         expect(out).toMatch(/the page came up on the recheck/);
@@ -1312,6 +1316,8 @@ describe("each probe fails on the behaviour it guards", () => {
         note: expect.stringMatching(/refused as designed.*D1 0002_b\.sql/),
       });
       expect(rollbackJob(f)?.status).toBe("failed");
+      // The row exists, but the run's own-reach R17 never returns it, and
+      // the case passes without reading it.
       expect(
         f.audit.filter((a) => a.action === "job.failed").map((a) => a.code),
       ).toContain("invalid_state");
@@ -1361,14 +1367,6 @@ describe("each probe fails on the behaviour it guards", () => {
       f.faults.add("refusal_old_healthz");
       expect((await runAll(f)).get("P31")).toMatch(
         /after the refusal \/healthz is not ok on 0\.82\.0/,
-      );
-    });
-
-    it("a refusal without its job.failed audit row fails the case", async () => {
-      const f = setup(D1);
-      f.faults.add("no_failed_audit");
-      expect((await runAll(f)).get("P31")).toMatch(
-        /P31: the refused rollback has no job\.failed audit row/,
       );
     });
 
@@ -2350,15 +2348,20 @@ describe("the chains run at once (startChains)", () => {
     // Each chain removed its own install (rl-l by its tail): the run's
     // cleanup had nothing left to do.
     expect(liveAtSettle).toEqual([]);
-    // Overlap: rl-l is suspended before rl-p's rollback (in PROBES order
-    // P31 comes first, so a one-at-a-time run can't do this).
+    // Overlap: rl-l's chain is under way (its created install is read)
+    // before rl-p's rollback (in PROBES order P31 comes first, so a
+    // one-at-a-time run can't do this). Not P51's suspend: P51 first seals
+    // creds with WebCrypto, a real await, which lets every other chain of
+    // this microtask-only fake run ahead.
     const rll = bySlug(f, "rl-l-");
     const rlp = bySlug(f, "rl-p-");
     const at = (s: string) => f.log.findIndex((l) => l.endsWith(s));
     expect(at(`/installs/${rll?.id}/suspend`)).toBeGreaterThan(-1);
-    expect(at(`/installs/${rll?.id}/suspend`)).toBeLessThan(
-      at(`/installs/${rlp?.id}/rollback`),
+    const firstRead = f.log.findIndex((l) =>
+      l.endsWith(`/installs/${rll?.id}`),
     );
+    expect(firstRead).toBeGreaterThan(-1);
+    expect(firstRead).toBeLessThan(at(`/installs/${rlp?.id}/rollback`));
     // rl-l: rl-p's create body, but at the release under test (rl-p's is
     // the previous one, so P45 has an upgrade to make).
     const create = (slug?: string) => f.creates.find((b) => b.slug === slug);
@@ -2407,6 +2410,7 @@ describe("the chains run at once (startChains)", () => {
     f.faults.add("rll_create_failed");
     const { out, run } = await runChains(f);
     const infra = out.get("P20") as string;
+    expect(out.get("P51")).toBe(infra);
     expect(infra).toMatch(
       /^infra: rl-l setup: rl-l create: job failed \(cf_api_error\)/,
     );
@@ -2419,7 +2423,7 @@ describe("the chains run at once (startChains)", () => {
     const rll = bySlug(f, "rl-l-");
     expect(infra).not.toContain(rll?.id);
     expect(infra).not.toContain("open-artifacts");
-    const rllChain = ["P20", "P21", "P22"];
+    const rllChain = ["P51", "P20", "P21", "P22"];
     expect(without(levels(out), rllChain)).toEqual(without(HAPPY, rllChain));
     expect(rll?.state).toBe("deleted");
     expect(live(f)).toEqual([]);
@@ -2433,6 +2437,9 @@ describe("the chains run at once (startChains)", () => {
     expect(out.get("P20")).toBe(
       `P20: rl-l runs 0.81.0, want the release under test ${CONFIG.version}`,
     );
+    expect(out.get("P51")).toBe(
+      `P51: rl-l runs 0.81.0, want the release under test ${CONFIG.version}`,
+    );
     expect(out.get("P21")).toEqual({
       level: "blocked",
       reason: "blocked by P20",
@@ -2441,8 +2448,8 @@ describe("the chains run at once (startChains)", () => {
     expect(f.log.some((l) => l.endsWith(`/installs/${rll?.id}/suspend`))).toBe(
       false,
     );
-    expect(without(levels(out), ["P20", "P21"])).toEqual(
-      without(HAPPY, ["P20", "P21"]),
+    expect(without(levels(out), ["P51", "P20", "P21"])).toEqual(
+      without(HAPPY, ["P51", "P20", "P21"]),
     );
     expect(rll?.state).toBe("deleted");
     expect(live(f)).toEqual([]);
@@ -2456,6 +2463,86 @@ describe("the chains run at once (startChains)", () => {
     expect(without(levels(out), ["P22"])).toEqual(without(HAPPY, ["P22"]));
     expect(bySlug(f, "rl-l-")?.state).toBe("deleted");
     expect(live(f)).toEqual([]);
+  });
+
+  describe("P51: the bus on rl-l (#1299)", () => {
+    const suspends = (f: FakeApi) =>
+      f.log.filter((l) => l.endsWith("/suspend")).length;
+    const P51 = "P51" as const;
+    const rllOf = (f: FakeApi) => bySlug(f, "rl-l-");
+
+    it("conforming: a held socket ends on the suspend, a new connect is refused while paused, and the same token connects after the resume", async () => {
+      const f = fakeApi();
+      const { out } = await runChains(f);
+      expect(out.get(P51)).toEqual({ level: "pass" });
+      expect(f.bus.opened).toEqual([rllOf(f)?.id]);
+      // Paused: 503; after the resume: the same token, 101.
+      expect(f.bus.connects).toEqual([503, 101]);
+      expect(f.bus.cleaned).toBe(1);
+      // P51's own suspend and resume, then P20's: two suspends, and rl-l
+      // served again before P20 ran (P20 passes on a serving install).
+      expect(suspends(f)).toBe(2);
+      expect(out.get("P20")).toEqual({ level: "pass" });
+    });
+
+    it("the socket stays open after the suspend: fails, and rl-l is still resumed", async () => {
+      const f = fakeApi();
+      f.bus.mode = "stays_open";
+      const { out } = await runChains(f);
+      expect(out.get(P51)).toBe(
+        "P51: the bus socket was still open 360 s after the suspend",
+      );
+      expect(out.get("P20")).toEqual({ level: "pass" });
+      expect(out.get("P21")).toEqual({ level: "pass" });
+      expect(f.bus.connects).toEqual([]);
+      expect(f.bus.cleaned).toBe(1);
+    });
+
+    it("a suspended install still upgrades a new socket: fails", async () => {
+      const f = fakeApi();
+      f.bus.mode = "connects_suspended";
+      const { out } = await runChains(f);
+      expect(out.get(P51)).toBe(
+        "P51: a suspended install upgraded a bus socket",
+      );
+      expect(out.get("P21")).toEqual({ level: "pass" });
+    });
+
+    it("the same token refused after the resume: fails (the refusal was not the suspend's)", async () => {
+      const f = fakeApi();
+      f.bus.mode = "dead_token";
+      const { out } = await runChains(f);
+      expect(out.get(P51)).toBe(
+        "P51: after the resume the same machine token got 401, want 101",
+      );
+      expect(f.bus.cleaned).toBe(1);
+    });
+
+    it("the bus off (404) after the lift is a failure, and P51 suspends nothing", async () => {
+      const f = fakeApi();
+      f.bus.mode = "off";
+      const { out } = await runChains(f);
+      expect(out.get(P51)).toBe("P51: rl-l's bus answers 404 after the lift");
+      expect(suspends(f)).toBe(1);
+    });
+
+    it("no bus seam (the local pair): not-applicable, never a pass", async () => {
+      const f = fakeApi();
+      const io = { ...f.io };
+      delete io.bus;
+      const run = new Run(CONFIG, io);
+      const p = PROBES.find((x) => x.id === P51);
+      expect(await p?.run(run)).toMatchObject({ level: "not-applicable" });
+    });
+
+    it("rl-l's creds never reach a log line or an outcome", async () => {
+      const f = fakeApi();
+      const masked: string[] = [];
+      f.io.mask = (v) => masked.push(v);
+      const { out } = await runChains(f);
+      expect(masked.length).toBeGreaterThanOrEqual(2);
+      for (const v of masked) expect(JSON.stringify([...out])).not.toContain(v);
+    });
   });
 
   it("a probe past its bound fails naming it and blocks its dependants; another chain and the after step still run", async () => {

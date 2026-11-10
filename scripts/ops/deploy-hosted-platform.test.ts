@@ -22,6 +22,16 @@ const REG = "126a6ed45b8842ccb42b8c55a9467760";
 const DIRREG = "55d5f7d77ef240e5a2255fe43f2c5170";
 const HOSTS = "32737a5cd6224418bf14e15fa2732bab";
 const DB = "6ca9103e-507e-4541-b3bb-2485e699512b";
+const BDB = "7d7d7d7d-7d7d-4d7d-8d7d-7d7d7d7d7d7d";
+// Billing's Stripe secrets, marked so a leak shows; test-mode shapes.
+const STRIPE_KEY = "rk_test_NEVERAPPEARstripekey0123456789";
+const STRIPE_WH = "whsec_NEVERAPPEARwebhooksecret0123456789";
+const PRICES = {
+  STRIPE_PRICE_TEAM: "price_1TeamAbc",
+  STRIPE_PRICE_BUSINESS: "price_1BizXyz",
+  STRIPE_PRICE_SOLO_MONTHLY: "price_1SoloMo",
+  STRIPE_PRICE_SOLO_YEARLY: "price_1SoloYr",
+};
 const ZONE = "eb90975c0a329d0c743fa4f33f917934";
 const CLIENT =
   "206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com";
@@ -49,6 +59,7 @@ case "$*" in
     v="$(cat)"
     echo "stdin-len $5 \${#v}" >> "$STUB_LOG"
     [ -f "$STATE/fail-put-$5" ] && exit 1
+    [ -f "$STATE/fail-put-once-$5" ] && { rm "$STATE/fail-put-once-$5"; exit 1; }
     touch "$STATE/$w.secrets"; grep -qx "$5" "$STATE/$w.secrets" || echo "$5" >> "$STATE/$w.secrets"
     ;;
 esac`;
@@ -128,8 +139,12 @@ const wrapperStub = (dir: string) => {
   writeFileSync(
     p,
     `#!/usr/bin/env bash
-echo "wrapper $* reg=\${BROKER_REGISTRY_ID:-}\${DIRECTORY_REGISTRY_ID:-} client=\${GOOGLE_CLIENT_ID_PROD:-}\${GOOGLE_DIRECTORY_CLIENT_ID_PROD:-} hosts=\${HOSTS_KV_ID:-} db=\${PLATFORM_DB_ID:-} tag=\${DEPLOY_TAG:-}" >> "$STUB_LOG"
+echo "wrapper $* reg=\${BROKER_REGISTRY_ID:-}\${DIRECTORY_REGISTRY_ID:-} client=\${GOOGLE_CLIENT_ID_PROD:-}\${GOOGLE_DIRECTORY_CLIENT_ID_PROD:-} hosts=\${HOSTS_KV_ID:-} db=\${PLATFORM_DB_ID:-} bdb=\${BILLING_DB_ID:-} tag=\${DEPLOY_TAG:-}" >> "$STUB_LOG"
 w="oa-$([ "$2" = staging ] && echo s || echo p)-$1"
+n=$(( $(cat "$STATE/wrapper-count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE/wrapper-count"
+# fail-wrapper-from: every call from that number on fails; fail-wrapper-at: just that call.
+[ -f "$STATE/fail-wrapper-from" ] && [ "$n" -ge "$(cat "$STATE/fail-wrapper-from")" ] && exit 1
+[ -f "$STATE/fail-wrapper-at" ] && [ "$n" -eq "$(cat "$STATE/fail-wrapper-at")" ] && exit 1
 touch "$STATE/$w.exists"
 [ -f "$STATE/$w.next.json" ] && cp "$STATE/$w.next.json" "$STATE/$w.settings.json"
 exit 0
@@ -185,6 +200,9 @@ function schedulerBindings(
       service: `oa-${p}-provisioner`,
       entrypoint: "ProvisionerRpc",
     },
+    ...(p === "s"
+      ? [{ type: "service", name: "BILLING", service: "oa-s-billing" }]
+      : []),
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
@@ -239,6 +257,18 @@ const NEXT: Record<string, string> = {
       service: "oa-p-directory-broker",
     },
     { type: "plain_text", name: "OA_ENV", text: "prod" },
+  ]),
+  "oa-s-dispatch": settings([
+    { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+    { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-staging" },
+    { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
+    {
+      type: "service",
+      name: "DIRECTORY_BROKER",
+      service: "oa-s-directory-broker",
+    },
+    { type: "service", name: "BILLING", service: "oa-s-billing" },
+    { type: "plain_text", name: "OA_ENV", text: "staging" },
   ]),
   "oa-p-inventory": settings([
     { type: "d1", name: "PLATFORM_DB", id: DB },
@@ -341,10 +371,37 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
 ];
+NEXT["oa-s-billing"] = settings([
+  { type: "d1", name: "BILLING_DB", id: BDB },
+  { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
+  ...Object.entries(
+    committedVars(
+      readFileSync(join(root, "apps/billing/wrangler.jsonc"), "utf8"),
+      "staging",
+      PRICES,
+    ),
+  ).map(([name, text]) => ({ type: "plain_text", name, text })),
+  { type: "secret_text", name: "STRIPE_SECRET_KEY" },
+  { type: "secret_text", name: "STRIPE_WEBHOOK_SECRET" },
+]);
 NEXT["oa-p-provisioner"] = provisionerSettings();
+// Staging's provisioner, with its BILLING binding to billing's RPC entrypoint
+// (#1568; the tag declares it).
+NEXT["oa-s-provisioner"] = (() => {
+  const o = JSON.parse(provisionerSettings("s", "staging"));
+  o.result.bindings.push({
+    type: "service",
+    name: "BILLING",
+    service: "oa-s-billing",
+    entrypoint: "BillingProvisionerRpc",
+  });
+  return JSON.stringify(o);
+})();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
 
 const ENV = {
+  // The put's retry waits (#55) cost nothing here.
+  PUT_RETRY_SLEEP: "0",
   // Not in CI by default (CI sets these, and prod there needs main).
   GITHUB_ACTIONS: "",
   GITHUB_REF: "",
@@ -373,13 +430,20 @@ const ENV = {
   WELCOME_FROM: FILLS.WELCOME_FROM,
   GITHUB_REPOSITORY_ID: REPO_ID,
   NEW_KV: OAUTH,
+  BILLING_DB_ID: BDB,
+  MAIN_BILLING_MIGRATION_LOCK: join(root, "apps/billing/migration-lock.json"),
+  STRIPE_SECRET_KEY: STRIPE_KEY,
+  STRIPE_WEBHOOK_SECRET: STRIPE_WH,
+  ...PRICES,
 };
 
 // What the scheduler needs deployed first.
+// Staging also needs oa-s-billing: its BILLING binding (#1568).
 const SCHED_DEPS = (p: "s" | "p") => [
   `oa-${p}-auth-broker`,
   `oa-${p}-directory-broker`,
   `oa-${p}-provisioner`,
+  ...(p === "s" ? ["oa-s-billing"] : []),
 ];
 
 // The scheduler's config: #915's placeholders (the repo's own once it carries
@@ -419,8 +483,8 @@ const setup = (
     pins?: { staging?: string | null; prod?: string | null };
     /** Extra state files (name -> content). */
     files?: Record<string, string>;
-    /** Stub node (logs its argv, exits $NODE_EXIT). */
-    node?: boolean;
+    /** Stub node (logs its argv, exits $NODE_EXIT); "billing": only billing-db.ts is stubbed. */
+    node?: boolean | "billing";
     // The account's queue listing; null: the listing fails.
     queues?: string | null;
   } = {},
@@ -429,12 +493,25 @@ const setup = (
     pnpm,
     curl,
     openssl,
-    ...(opts.node ? { node: `exit "\${NODE_EXIT:-0}"` } : {}),
+    ...(opts.node === "billing"
+      ? {
+          node: `case "$*" in *billing-db.ts*) exit "\${NODE_EXIT:-0}" ;; esac\nexec "$REAL_NODE" "$@"`,
+        }
+      : opts.node
+        ? { node: `exit "\${NODE_EXIT:-0}"` }
+        : {}),
   });
   const state = join(sb.dir, "state");
   mkdirSync(state);
   for (const [w, s] of Object.entries({ ...NEXT, ...opts.next }))
     writeFileSync(join(state, `${w}.next.json`), s);
+  writeFileSync(
+    join(state, "oa-s-billing.schedules.json"),
+    JSON.stringify({
+      success: true,
+      result: { schedules: [{ cron: "17 3 * * *" }] },
+    }),
+  );
   for (const p of ["s", "p"])
     writeFileSync(
       join(state, `oa-${p}-scheduler.schedules.json`),
@@ -480,6 +557,7 @@ const setup = (
       env: {
         ...ENV,
         STATE: state,
+        REAL_NODE: process.execPath,
         DEPLOY_WRAPPER: wrapperStub(sb.dir),
         BROKER_PIN_FILE: pinFile,
         ...env,
@@ -493,7 +571,15 @@ const setup = (
 // Nothing secret in any argv, stdout or stderr.
 const clean = (r: { out: string; err: string; log: string[] }) => {
   const all = [r.out, r.err, ...r.log].join("\n");
-  for (const s of [TOKEN, SECRET, DSECRET, "k".repeat(64), "c3RhdGVrZXlz"])
+  for (const s of [
+    TOKEN,
+    SECRET,
+    DSECRET,
+    STRIPE_KEY,
+    STRIPE_WH,
+    "k".repeat(64),
+    "c3RhdGVrZXlz",
+  ])
     expect(all).not.toContain(s);
 };
 // Nothing deployed or set: no wrapper, pnpm or wrangler call.
@@ -604,6 +690,300 @@ describe("deploy-hosted-platform.sh", () => {
       clean(ok);
     });
   }
+  describe("the BILLING binding (#1568): staging only", () => {
+    const DEPS_S = ["oa-s-auth-broker", "oa-s-directory-broker"];
+    it("staging dispatch and scheduler refuse until oa-s-billing exists, before any deploy", () => {
+      for (const t of ["dispatch", "scheduler"]) {
+        const exists =
+          t === "scheduler"
+            ? SCHED_DEPS("s").filter((w) => w !== "oa-s-billing")
+            : DEPS_S;
+        const r = setup({ exists }).run(t, {}, "staging");
+        expect(r.code, t).toBe(1);
+        expect(r.err).toContain("oa-s-billing does not exist: deploy it first");
+        expect(r.log.some((l) => l.startsWith("wrapper"))).toBe(false);
+      }
+    });
+    it("staging dispatch deploys and verifies its BILLING service binding", () => {
+      const ok = setup({ exists: [...DEPS_S, "oa-s-billing"] }).run(
+        "dispatch",
+        {},
+        "staging",
+      );
+      expect(ok.err).toBe("");
+      expect(ok.code).toBe(0);
+      expect(ok.out).toContain("staging dispatch: deployed and verified");
+      // A missing, wrong or non-service BILLING binding fails the read-back.
+      for (const [why, mut] of [
+        [
+          "missing",
+          (b: Record<string, unknown>[]) =>
+            b.filter((x) => x.name !== "BILLING"),
+        ],
+        [
+          "the wrong Worker",
+          (b: Record<string, unknown>[]) =>
+            b.map((x) =>
+              x.name === "BILLING" ? { ...x, service: "oa-p-billing" } : x,
+            ),
+        ],
+      ] as const) {
+        const next = JSON.parse(NEXT["oa-s-dispatch"] as string);
+        next.result.bindings = mut(next.result.bindings);
+        const bad = setup({
+          exists: [...DEPS_S, "oa-s-billing"],
+          next: { "oa-s-dispatch": JSON.stringify(next) },
+        }).run("dispatch", {}, "staging");
+        expect(bad.code, why).toBe(1);
+        expect(bad.err, why).toContain("dispatch BILLING binding: got");
+      }
+    });
+    it("staging scheduler verifies its BILLING binding too", () => {
+      const next = JSON.parse(NEXT["oa-s-scheduler"] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "BILLING",
+      );
+      const bad = setup({
+        exists: SCHED_DEPS("s"),
+        next: { "oa-s-scheduler": JSON.stringify(next) },
+      }).run("scheduler", {}, "staging");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("scheduler BILLING binding: got");
+    });
+    it("prod needs no billing Worker and refuses any BILLING binding on dispatch or the scheduler", () => {
+      for (const t of ["dispatch", "scheduler"]) {
+        // No oa-p-billing exists, and none is asked for.
+        const ok = setup({ exists: SCHED_DEPS("p") }).run(t);
+        expect(ok.code, `${t} ${ok.err}`).toBe(0);
+        const key = t === "dispatch" ? "oa-p-dispatch" : "oa-p-scheduler";
+        const next = JSON.parse(NEXT[key] as string);
+        next.result.bindings.push({
+          type: "service",
+          name: "BILLING",
+          service: "oa-p-billing",
+        });
+        const bad = setup({
+          exists: SCHED_DEPS("p"),
+          next: { [key]: JSON.stringify(next) },
+        }).run(t);
+        expect(bad.code, t).toBe(1);
+        expect(bad.err, t).toContain(`${t} BILLING binding: got`);
+      }
+    });
+  });
+
+  describe("the BILLING binding follows the tag's own wrangler (#1568): required only when the tag declares it", () => {
+    // main's scripts run against the tag's Workers: an older tag whose wrangler
+    // has no BILLING must deploy on staging as before, and a tag that declares
+    // it must not deploy without it.
+    const DEPS = {
+      dispatch: ["oa-s-auth-broker", "oa-s-directory-broker"],
+      scheduler: SCHED_DEPS("s").filter((w) => w !== "oa-s-billing"),
+      provisioner: [] as string[],
+    } as const;
+    const APP_CONFIG = (app: string) =>
+      app === "scheduler"
+        ? SCHED_CONFIG
+        : readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8");
+    // The same config with its staging BILLING binding taken out (an older tag).
+    const withoutBilling = (src: string) =>
+      src.replace(/,?\s*\{\s*"binding":\s*"BILLING"[^}]*\}/g, "");
+    // The same config with the binding replaced.
+    const withBilling = (src: string, binding: string) =>
+      src.replace(/\{\s*"binding":\s*"BILLING"[^}]*\}/g, binding);
+    const liveWithout = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "BILLING",
+      );
+      return JSON.stringify(next);
+    };
+    const ENTRY = {
+      dispatch: "",
+      scheduler: "",
+      provisioner: "BillingProvisionerRpc",
+    } as const;
+    const APPS = ["dispatch", "scheduler", "provisioner"] as const;
+    // The staging provisioner's verify-only run reads an existing bucket.
+    const VERIFY_FILES = { "r2-oa-s-releases": "" };
+
+    it("the repo's staging configs declare it: dispatch and scheduler on the default entrypoint, the provisioner on BillingProvisionerRpc; prod's declare none", () => {
+      for (const app of APPS) {
+        const src = APP_CONFIG(app);
+        const staging = src.slice(
+          src.indexOf('"staging"'),
+          src.indexOf('"prod"'),
+        );
+        expect(staging, app).toMatch(/"binding": "BILLING"/);
+        expect(staging, app).toMatch(/"service": "oa-s-billing"/);
+        expect(/BillingProvisionerRpc/.test(staging), app).toBe(
+          app === "provisioner",
+        );
+        expect(src.slice(src.indexOf('"prod"')), app).not.toMatch(/"BILLING"/);
+      }
+    });
+
+    for (const app of APPS) {
+      it(`${app}, a tag that declares it: refuses until oa-s-billing exists (before any deploy), then deploys and verifies`, () => {
+        const none = setup({ exists: DEPS[app] }).run(app, {}, "staging");
+        expect(none.code, app).toBe(1);
+        expect(none.err).toContain(
+          "oa-s-billing does not exist: deploy it first",
+        );
+        expect(none.log.some((l) => l.startsWith("wrapper"))).toBe(false);
+        const ok = setup({ exists: [...DEPS[app], "oa-s-billing"] }).run(
+          app,
+          {},
+          "staging",
+        );
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+        expect(ok.out).toContain(`staging ${app}: deployed and verified`);
+      });
+
+      it(`${app}, a tag that declares it but deploys without the binding fails the read-back`, () => {
+        const bad = setup({
+          exists: [...DEPS[app], "oa-s-billing"],
+          next: { [`oa-s-${app}`]: liveWithout(`oa-s-${app}`) },
+        }).run(app, {}, "staging");
+        expect(bad.code, app).toBe(1);
+        expect(bad.err).toContain(`${app} BILLING binding: got`);
+      });
+
+      it(`${app}, an older tag with no BILLING in its wrangler: no oa-s-billing needed, deploys and verifies; a BILLING binding the tag did not declare fails`, () => {
+        const configs = { [app]: withoutBilling(APP_CONFIG(app)) };
+        // oa-s-billing does not exist, and none is asked for.
+        const ok = setup({
+          configs,
+          exists: DEPS[app],
+          next: { [`oa-s-${app}`]: liveWithout(`oa-s-${app}`) },
+        }).run(app, {}, "staging");
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+        expect(ok.log.some((l) => l.startsWith(`wrapper ${app} staging`))).toBe(
+          true,
+        );
+        // A live BILLING the tag never declared is not tolerated either.
+        const bound = setup({ configs, exists: DEPS[app] }).run(
+          app,
+          {},
+          "staging",
+        );
+        expect(bound.code, app).toBe(1);
+        expect(bound.err).toContain(`${app} BILLING binding: got`);
+      });
+
+      it(`${app}, verify only: a tag that declares it needs it live; an older one needs none`, () => {
+        // Verify only reads the live Worker (its settings file), deploys nothing.
+        const base = {
+          exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
+          queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+        };
+        const live = setup({ ...base, files: VERIFY_FILES }).run(
+          app,
+          { VERIFY_ONLY: "1" },
+          "staging",
+        );
+        expect(live.code, `${app} ${live.err}`).toBe(0);
+        expect(noDeploy(live.log)).toEqual([]);
+        const missing = setup({
+          ...base,
+          files: {
+            ...VERIFY_FILES,
+            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+          },
+        }).run(app, { VERIFY_ONLY: "1" }, "staging");
+        expect(missing.code, app).toBe(1);
+        expect(missing.err).toContain(`${app} BILLING binding: got`);
+        // An older tag: no BILLING declared, none live: verified without oa-s-billing.
+        const old = setup({
+          configs: { [app]: withoutBilling(APP_CONFIG(app)) },
+          exists: [...DEPS[app], `oa-s-${app}`],
+          queues: base.queues,
+          files: {
+            ...VERIFY_FILES,
+            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+          },
+        }).run(app, { VERIFY_ONLY: "1" }, "staging");
+        expect(old.code, `${app} ${old.err}`).toBe(0);
+      });
+
+      it(`${app}, a tag that binds the wrong service or entrypoint is refused before any deploy`, () => {
+        for (const [why, binding] of [
+          [
+            "wrong service",
+            '{ "binding": "BILLING", "service": "oa-p-billing" }',
+          ],
+          [
+            "wrong entrypoint",
+            `{ "binding": "BILLING", "service": "oa-s-billing", "entrypoint": "${app === "provisioner" ? "Other" : "BillingProvisionerRpc"}" }`,
+          ],
+        ] as const) {
+          const configs = { [app]: withBilling(APP_CONFIG(app), binding) };
+          const r = setup({
+            configs,
+            exists: [...DEPS[app], "oa-s-billing"],
+          }).run(app, {}, "staging");
+          expect(r.code, `${app} ${why}`).toBe(1);
+          expect(r.err).toMatch(/BILLING binding (is|has)/);
+          expect(noDeploy(r.log)).toEqual([]);
+        }
+      });
+
+      it(`${app}, prod: a tag whose prod config binds BILLING is refused before any deploy; the live read-back asserts none`, () => {
+        // Splice a BILLING binding into the prod block of the tag's config.
+        const src = APP_CONFIG(app);
+        const at = src.indexOf('"prod"');
+        const head = src.slice(0, at);
+        const rest = src.slice(at);
+        const entry = '{ "binding": "BILLING", "service": "oa-p-billing" }';
+        const prod = /"services":\s*\[/.test(rest)
+          ? rest.replace(/"services":\s*\[/, `"services": [ ${entry},`)
+          : rest.replace(/"prod":\s*\{/, `"prod": { "services": [ ${entry} ],`);
+        const configs = { [app]: head + prod };
+        const r = setup({ configs, exists: SCHED_DEPS("p") }).run(
+          app,
+          {},
+          "prod",
+        );
+        expect(r.code, app).toBe(1);
+        expect(r.err).toContain("it is staging only");
+        expect(noDeploy(r.log)).toEqual([]);
+      });
+    }
+
+    it("the provisioner's read-back also confirms the entrypoint, and a staging binding to another entrypoint fails", () => {
+      const wrongEntry = JSON.parse(NEXT["oa-s-provisioner"] as string);
+      for (const b of wrongEntry.result.bindings)
+        if (b.name === "BILLING") b.entrypoint = "default";
+      const r = setup({
+        exists: ["oa-s-billing"],
+        next: { "oa-s-provisioner": JSON.stringify(wrongEntry) },
+      }).run("provisioner", {}, "staging");
+      expect(r.code).toBe(1);
+      expect(r.err).toContain(
+        "provisioner BILLING binding: got 'service oa-s-billing default', want 'service oa-s-billing BillingProvisionerRpc'",
+      );
+    });
+
+    it("prod's provisioner needs no billing Worker and asserts no BILLING binding", () => {
+      const ok = setup({}).run("provisioner");
+      expect(ok.code, ok.err).toBe(0);
+      const next = JSON.parse(NEXT["oa-p-provisioner"] as string);
+      next.result.bindings.push({
+        type: "service",
+        name: "BILLING",
+        service: "oa-p-billing",
+        entrypoint: "BillingProvisionerRpc",
+      });
+      const bad = setup({
+        next: { "oa-p-provisioner": JSON.stringify(next) },
+      }).run("provisioner");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("provisioner BILLING binding: got");
+    });
+  });
+
   it("the scheduler also refuses until the provisioner exists", () => {
     const noProv = setup({
       exists: ["oa-p-auth-broker", "oa-p-directory-broker"],
@@ -650,9 +1030,16 @@ describe("deploy-hosted-platform.sh", () => {
       vars: Record<string, string> = {},
     ) => {
       const p = env[0] as "s" | "p";
+      // A config that does not declare BILLING is an older tag: its Worker
+      // is deployed without the binding (#1568).
+      const live = JSON.parse(next);
+      if (!/"BILLING"/.test(config))
+        live.result.bindings = live.result.bindings.filter(
+          (b: { name: string }) => b.name !== "BILLING",
+        );
       const s = setup({
         exists: SCHED_DEPS(p),
-        next: { [`oa-${p}-scheduler`]: next },
+        next: { [`oa-${p}-scheduler`]: JSON.stringify(live) },
       });
       const r = s.sb.run(
         ["bash", tree({ scheduler: config }), env, "scheduler"],
@@ -1266,6 +1653,199 @@ describe("deploy-hosted-platform.sh", () => {
       const bad = setup({ node: true }).run("platform-db", { NODE_EXIT: "1" });
       expect(bad.code).toBe(1);
       expect(bad.out).not.toContain("verified");
+    });
+  });
+
+  describe("billing (staging only)", () => {
+    const stg = (opts: Parameters<typeof setup>[0] = {}) =>
+      setup({ node: "billing", ...opts });
+    const BAD = (r: { log: string[]; err: string }) => {
+      // Nothing was deployed, set or migrated.
+      expect(noDeploy(r.log)).toEqual([]);
+      expect(
+        r.log.filter((l) => l.startsWith("node") && l.includes("billing-db")),
+      ).toEqual([]);
+    };
+
+    it("prod refuses before anything: no Cloudflare call, no wrapper, no secret", () => {
+      for (const VERIFY_ONLY of ["", "1"]) {
+        const r = setup({ node: "billing" }).run(
+          "billing",
+          { VERIFY_ONLY },
+          "prod",
+        );
+        expect(r.code, VERIFY_ONLY).toBe(2);
+        expect(r.err).toContain("billing target is staging only");
+        expect(
+          r.log.filter((l) => /^(pnpm|wrapper|curl|node) /.test(l)),
+        ).toEqual([]);
+        clean(r);
+      }
+    });
+
+    it("migrates the D1 first, deploys with its ids and the four prices, puts both secrets, deploys again, then verifies", () => {
+      const r = stg().run("billing", {}, "staging");
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      // The schema before the Worker.
+      const order = r.log.filter((l) =>
+        /^(node .*billing-db|wrapper|stdin-len)/.test(l),
+      );
+      expect(order[0]).toBe(
+        `node --experimental-strip-types --no-warnings ${join(root, "scripts/ops/billing-db.ts")} staging`,
+      );
+      expect(order.slice(1).map((l) => l.split(" ")[0])).toEqual([
+        "wrapper",
+        "stdin-len",
+        "stdin-len",
+        "wrapper",
+      ]);
+      const w = r.log.filter((l) => l.startsWith("wrapper billing staging "));
+      expect(w).toHaveLength(2);
+      expect(w[0]).toContain(`bdb=${BDB}`);
+      expect(w[0]).toContain(`reg=${REG}`);
+      expect(puts(r.log)).toEqual([
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+      ]);
+      expect(r.out).toContain("staging billing: deployed and verified");
+      clean(r);
+    });
+
+    it("a run without the Stripe key, the webhook secret or a price fails clearly before anything is migrated, deployed or put", () => {
+      for (const k of [
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        ...Object.keys(PRICES),
+        "BILLING_DB_ID",
+        "MAIN_BILLING_MIGRATION_LOCK",
+      ])
+        for (const v of ["", "unset"]) {
+          const env: Record<string, string> = { [k]: "" };
+          const r = stg().run("billing", env, "staging");
+          expect(r.code, `${k} ${v}`).toBe(2);
+          expect(r.err).toContain(`${k} is required for billing`);
+          BAD(r);
+          expect(puts(r.log)).toEqual([]);
+          clean(r);
+        }
+    });
+
+    it("a live key, a non-test key or a malformed secret or price is refused without printing it", () => {
+      for (const [k, v, want] of [
+        ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "rk_live_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "pk_test_abcdefgh12345678", "test-mode key"],
+        ["STRIPE_SECRET_KEY", "sk_test_short", "test-mode key"],
+        [
+          "STRIPE_WEBHOOK_SECRET",
+          "NEVERAPPEARnoprefix0123456789",
+          "signing secret",
+        ],
+        ["STRIPE_PRICE_TEAM", "prod_1Abc", "price id"],
+        ["STRIPE_PRICE_SOLO_YEARLY", "price_1 Abc", "price id"],
+      ] as const) {
+        const r = stg().run("billing", { [k]: v }, "staging");
+        expect(r.code, `${k}=${v}`).toBe(2);
+        expect(r.err).toContain(want);
+        BAD(r);
+        expect([r.out, r.err, ...r.log].join("\n")).not.toContain(v);
+      }
+    });
+
+    it("a migration that fails stops the run before the Worker is deployed", () => {
+      const r = stg().run("billing", { NODE_EXIT: "1" }, "staging");
+      expect(r.code).toBe(1);
+      expect(r.log.filter((l) => l.startsWith("wrapper"))).toEqual([]);
+      expect(puts(r.log)).toEqual([]);
+    });
+
+    it("verify only: migrations are only verified, nothing deployed or put, no secret needed, every check runs", () => {
+      const env = {
+        VERIFY_ONLY: "1",
+        STRIPE_SECRET_KEY: "",
+        STRIPE_WEBHOOK_SECRET: "",
+      };
+      const s = stg({
+        exists: ["oa-s-billing"],
+        secrets: {
+          "oa-s-billing": ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"],
+        },
+      });
+      const r = s.run("billing", env, "staging");
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      expect(noDeploy(r.log)).toEqual([]);
+      expect(puts(r.log)).toEqual([]);
+      expect(r.log.filter((l) => l.includes("billing-db"))).toHaveLength(1);
+      expect(r.out).toContain("staging billing: verified (verify only)");
+    });
+
+    it("the read-back refuses a wrong D1, registry, var or price, an extra or missing secret, and a wrong schedule", () => {
+      const live = (mut: (b: Record<string, unknown>[]) => void) => {
+        const b = JSON.parse(NEXT["oa-s-billing"] as string).result.bindings;
+        mut(b);
+        return settings(b);
+      };
+      for (const [why, next, want] of [
+        [
+          "D1",
+          live((b) => {
+            (b[0] as { id: string }).id = DB;
+          }),
+          "BILLING_DB: got",
+        ],
+        [
+          "registry",
+          live((b) => {
+            (b[1] as { namespace_id: string }).namespace_id = DIRREG;
+          }),
+          "BROKER_REGISTRY: got",
+        ],
+        [
+          "price",
+          live((b) => {
+            (
+              b.find((x) => x.name === "STRIPE_PRICE_TEAM") as { text: string }
+            ).text = "price_1Other";
+          }),
+          "billing vars: got",
+        ],
+        [
+          "extra binding",
+          live((b) => {
+            b.push({
+              type: "kv_namespace",
+              name: "HOSTS",
+              namespace_id: HOSTS,
+            });
+          }),
+          "bindings: got",
+        ],
+      ] as const) {
+        const s = stg({ next: { "oa-s-billing": next } });
+        const r = s.run("billing", {}, "staging");
+        expect(r.code, why).toBe(1);
+        expect(r.err, why).toContain(want);
+      }
+      const extra = stg({ secrets: { "oa-s-billing": ["EXTRA_SECRET"] } }).run(
+        "billing",
+        {},
+        "staging",
+      );
+      expect(extra.code).toBe(1);
+      expect(extra.err).toContain("oa-s-billing secrets are");
+      const sched = stg();
+      writeFileSync(
+        join(sched.state, "oa-s-billing.schedules.json"),
+        JSON.stringify({
+          success: true,
+          result: { schedules: [{ cron: "*/5 * * * *" }] },
+        }),
+      );
+      const bad = sched.run("billing", {}, "staging");
+      expect(bad.code).toBe(1);
+      expect(bad.err).toContain("oa-s-billing schedules are");
     });
   });
 
@@ -2117,7 +2697,8 @@ describe("deploy-hosted-platform.sh", () => {
           expect(ok.err).toBe("");
           expect(ok.code).toBe(0);
           // W8's refs as the Manager approved them (6.3 amended).
-          const base = "open-artifacts-ai/open-artifacts-cloud/.github/workflows";
+          const base =
+            "open-artifacts-ai/open-artifacts-cloud/.github/workflows";
           expect(VARS.OIDC_JOB_WORKFLOW_REFS).toBe(
             env === "prod"
               ? `${base}/redline-staging.yml@refs/heads/main,${base}/prodclean-monitor.yml@refs/heads/main`
@@ -2424,6 +3005,117 @@ describe("the canary smoke's secrets (#1343)", () => {
     expect(wrappers[1]).toBeGreaterThan(lastPut);
     hidden(r);
     clean(r);
+  });
+
+  // #55: run 42647320740's put failed after the tagged deploy and the run went
+  // red. The order stays deploy, puts, deploy (#1040: a put makes an untagged
+  // version, and the chain reads the scheduler's tag, so it may never be left
+  // untagged): a put that still fails after its retries is followed by the
+  // last tagged deploy anyway, and then the run is red.
+  describe("the smoke secrets' retry and the last tagged deploy (#55)", () => {
+    const wrappers = (log: string[]) =>
+      log.flatMap((l, i) => (l.startsWith("wrapper") ? [i] : []));
+    const lastPut = (log: string[]) =>
+      log.reduce((m, l, i) => (l.startsWith("stdin-len") ? i : m), -1);
+    const live = () => ({ exists: SCHED_DEPS("p") });
+
+    it("one transient put failure is retried: the second try succeeds and the run goes on", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-put-once-FLEET_SMOKE_TOKEN": "" },
+      }).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_SHARE_TO",
+      ]);
+      // Every try carried the whole value.
+      expect(
+        r.log.filter((l) => l === `stdin-len FLEET_SMOKE_TOKEN ${PAT.length}`),
+      ).toHaveLength(2);
+      expect(wrappers(r.log)).toHaveLength(2);
+      hidden(r);
+    });
+
+    it("put 1 ok, put 2 fails every try: the last tagged deploy still runs, then the run is red", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-put-FLEET_SMOKE_SHARE_TO": "" },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      expect(puts(r.log)).toEqual([
+        "FLEET_SMOKE_TOKEN",
+        "FLEET_SMOKE_SHARE_TO",
+        "FLEET_SMOKE_SHARE_TO",
+        "FLEET_SMOKE_SHARE_TO",
+      ]);
+      const w = wrappers(r.log);
+      expect(w).toHaveLength(2);
+      expect(w[1]).toBeGreaterThan(lastPut(r.log));
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_SHARE_TO failed (attempt 1 of 3)",
+      );
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_SHARE_TO failed; the tagged deploy ran again, so the scheduler serves the tag, and the run stays red",
+      );
+      hidden(r);
+    });
+
+    it("all puts ok, the last deploy fails: three bounded tries, then red, naming it", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-wrapper-from": "2" },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      // The first deploy, then three tries of the last one.
+      expect(wrappers(r.log)).toHaveLength(4);
+      expect(r.err).toContain(
+        "the tagged deploy after the secrets failed (attempt 2 of 3)",
+      );
+      expect(r.err).toContain(
+        "the tagged deploy after the secrets failed: the scheduler may serve an untagged version",
+      );
+      hidden(r);
+    });
+
+    it("a last deploy that fails once is retried and the run is green", () => {
+      const r = setup({
+        ...live(),
+        files: { "fail-wrapper-at": "2" },
+      }).run("scheduler", SMOKE);
+      expect(r.code, r.err).toBe(0);
+      expect(wrappers(r.log)).toHaveLength(3);
+    });
+
+    it("a put and the last deploy both fail: both are named, the run is red", () => {
+      const r = setup({
+        ...live(),
+        files: {
+          "fail-put-FLEET_SMOKE_TOKEN": "",
+          "fail-wrapper-from": "2",
+        },
+      }).run("scheduler", SMOKE);
+      expect(r.code).toBe(1);
+      expect(wrappers(r.log)).toHaveLength(4);
+      expect(r.err).toContain(
+        "oa-p-scheduler: putting FLEET_SMOKE_TOKEN failed\n",
+      );
+      expect(r.err).toContain(
+        "putting FLEET_SMOKE_TOKEN failed, and the tagged deploy after it failed too: the scheduler may serve an untagged version",
+      );
+      hidden(r);
+    });
+
+    it("a bad PUT_RETRY_SLEEP is refused before any deploy or put", () => {
+      const r = setup(live()).run("scheduler", {
+        ...SMOKE,
+        PUT_RETRY_SLEEP: "soon",
+      });
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("PUT_RETRY_SLEEP must be 0 to 999 seconds");
+      expect(noDeploy(r.log)).toEqual([]);
+    });
   });
 
   it("absent: nothing put, one deploy (the smoke then reports itself unconfigured)", () => {

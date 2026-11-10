@@ -1,6 +1,15 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
+import {
+  BusError,
+  busState,
+  connectRequest,
+  mintMachine,
+  openBusSocket,
+  revokeMachines,
+} from "./bus.ts";
 import { boundFetch } from "./fetch-timeout.ts";
 import {
   AUDIENCES,
@@ -11,9 +20,11 @@ import {
   writeSecretFile,
 } from "./oidc.ts";
 import {
+  type BusIo,
   bringUpgrade,
   type CredsOut,
   mintCreds,
+  ProbeFail,
   type ProvIo,
   provConfig,
   Run,
@@ -23,6 +34,7 @@ import {
 import { gitSchemaOf } from "./schema.ts";
 import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 import { readSecretFile, secretFileName } from "./targets.ts";
+import { holdSocket } from "./ws.ts";
 
 // The live wiring of src/provisioning.ts: real fetch (bounded), the wall
 // clock, and the OIDC JWT files in secretsDir. Used by the live suite
@@ -78,6 +90,82 @@ const out = (s: string) => process.stdout.write(s);
 
 export { mask };
 
+const SESSION_COOKIE = "__Host-oa_session";
+
+/**
+ * The live bus seam of P51 (src/provisioning.ts BusIo): on rl-l, with the
+ * creds R26 sealed for it. The session is the suite's admin test user's
+ * (POST /__test/session with rl-l's hook key), the machine the device flow's
+ * (approved in the browser form by that session), the socket a real
+ * GET /bus/connect held open. No token is ever put in a message.
+ */
+export function liveBusIo(
+  env: Record<string, string | undefined>,
+  fetchImpl: typeof fetch = boundFetch(globalThis.fetch),
+): BusIo {
+  const m = mask(env);
+  return {
+    async open({ app, pat, hookKey }) {
+      const site = { app, fetch: fetchImpl };
+      if ((await busState(site, pat)) === "off") return "off";
+      const res = await fetchImpl(`${app}/__test/session`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          authorization: `Bearer ${hookKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: `redline-admin@${STAGING_TEST_DOMAIN}`,
+          role: "admin",
+        }),
+      });
+      const j = (await res.json().catch(() => null)) as {
+        cookie?: unknown;
+      } | null;
+      if (res.status !== 200 || typeof j?.cookie !== "string")
+        throw new ProbeFail(`P51: rl-l's session hook answered ${res.status}`);
+      m(j.cookie);
+      const label = `redline-p51-${Date.now().toString(36)}`;
+      const token = await mintMachine(
+        site,
+        `${SESSION_COOKIE}=${j.cookie}`,
+        label,
+      ).catch((e) => {
+        throw new ProbeFail(
+          e instanceof BusError ? `P51: ${e.message}` : "P51: no machine token",
+        );
+      });
+      m(token);
+      const held = await openBusSocket(app, token).catch((e) => {
+        throw new ProbeFail(
+          e instanceof BusError ? `P51: ${e.message}` : "P51: no bus socket",
+        );
+      });
+      if (held.status !== 101)
+        throw new ProbeFail(
+          `P51: before the suspend, rl-l's bus upgrade answered ${held.status}, want 101`,
+        );
+      const extra: { destroy: () => void }[] = [];
+      return {
+        closed: held.closed,
+        async connect() {
+          const h = await holdSocket(connectRequest(app, token));
+          extra.push(h);
+          return h.status;
+        },
+        async cleanup() {
+          held.destroy();
+          for (const h of extra) h.destroy();
+          // rl-l is deleted by the chain's tail; this only keeps the
+          // machine list tidy while it lives. Never fails the case.
+          await revokeMachines(site, pat, label).catch(() => 0);
+        },
+      };
+    },
+  };
+}
+
 export function liveRun(
   env: Record<string, string | undefined>,
   t: RawTargets,
@@ -97,6 +185,7 @@ export function liveRun(
     jwt: src("provisioning"),
     stgInventoryJwt: src("stagingInventory"),
     schemaOf: gitSchemaOf,
+    bus: liveBusIo(env),
     rlAPat: existsSync(patFile)
       ? () => readSecretFile(patFile, secretFileName(t.a.name, "PAT"))
       : undefined,

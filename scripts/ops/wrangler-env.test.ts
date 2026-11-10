@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { brokerKey } from "./broker-key.ts";
 import {
   alertPinProblems,
+  committedBilling,
   committedRateLimits,
   committedSignups,
   committedVars,
@@ -154,5 +155,54 @@ describe("broker-key.ts", () => {
       expect(alertPinProblems(conf({ vars, send_email }), "prod")).toEqual([
         "send_email ALERT_EMAIL needs destination_address {{ALERT_TO_PROD}}",
       ]);
+  });
+});
+
+describe("committedBilling", () => {
+  const conf = (staging: unknown[] | undefined, prod?: unknown[]) =>
+    JSON.stringify({
+      env: { staging: { services: staging }, prod: { services: prod } },
+    });
+  it("reads the service and entrypoint of the env block's BILLING binding", () => {
+    const src = conf([
+      { binding: "OTHER", service: "oa-s-x" },
+      { binding: "BILLING", service: "oa-s-billing", entrypoint: "E" },
+    ]);
+    expect(committedBilling(src, "staging")).toEqual({
+      service: "oa-s-billing",
+      entrypoint: "E",
+    });
+    expect(
+      committedBilling(
+        conf([{ binding: "BILLING", service: "oa-s-billing" }]),
+        "staging",
+      ),
+    ).toEqual({ service: "oa-s-billing", entrypoint: null });
+  });
+  it("is null when the block declares none, per env", () => {
+    expect(committedBilling(conf(undefined), "staging")).toBeNull();
+    expect(
+      committedBilling(
+        conf([{ binding: "BILLING", service: "oa-s-billing" }]),
+        "prod",
+      ),
+    ).toBeNull();
+  });
+  it("refuses two BILLING bindings", () => {
+    const b = { binding: "BILLING", service: "oa-s-billing" };
+    expect(() => committedBilling(conf([b, b]), "staging")).toThrow(
+      /more than one/,
+    );
+  });
+  it("the real apps: staging binds BILLING, prod does not", () => {
+    for (const app of ["dispatch", "scheduler", "provisioner"]) {
+      expect(committedBilling(cfg(app), "staging")?.service, app).toBe(
+        "oa-s-billing",
+      );
+      expect(committedBilling(cfg(app), "prod"), app).toBeNull();
+    }
+    expect(committedBilling(cfg("provisioner"), "staging")?.entrypoint).toBe(
+      "BillingProvisionerRpc",
+    );
   });
 });

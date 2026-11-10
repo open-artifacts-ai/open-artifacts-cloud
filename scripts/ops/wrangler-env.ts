@@ -45,6 +45,7 @@ export interface RateLimit {
 interface Block {
   vars?: Record<string, unknown>;
   send_email?: { name?: string; destination_address?: string }[];
+  services?: { binding?: string; service?: string; entrypoint?: string }[];
   ratelimits?: {
     name: string;
     namespace_id: string | number;
@@ -119,6 +120,27 @@ export const ALERT_VARS = [
 ] as const;
 
 /**
+ * The env block's BILLING service binding as the tag commits it (#1568): the
+ * service and the entrypoint (null for the default one), or null when the block
+ * has none. The deploy requires the binding on the live Worker only when the
+ * tag being deployed declares it.
+ */
+export function committedBilling(
+  src: string,
+  env: Env,
+): { service: string; entrypoint: string | null } | null {
+  const b = (block(src, env).services ?? []).filter(
+    (x) => x.binding === "BILLING",
+  );
+  if (b.length === 0) return null;
+  if (b.length > 1) throw new Error("more than one BILLING binding");
+  return {
+    service: String(b[0]?.service ?? ""),
+    entrypoint: b[0]?.entrypoint === undefined ? null : String(b[0].entrypoint),
+  };
+}
+
+/**
  * Whether the env block wires the scheduler's alerts at all: true when any
  * alert var or ALERT_EMAIL's destination_address is present.
  */
@@ -164,7 +186,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing",
     );
     process.exit(2);
   }
@@ -174,6 +196,7 @@ if (
     if (what === "vars") out = committedVars(src, env, process.env);
     else if (what === "ratelimits") out = committedRateLimits(src, env);
     else if (what === "signups") out = committedSignups(src, env, process.env);
+    else if (what === "billing") out = committedBilling(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";
       else {

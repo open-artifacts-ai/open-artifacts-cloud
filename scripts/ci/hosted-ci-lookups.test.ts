@@ -327,6 +327,69 @@ describe("hosted-resource-ids.sh", () => {
     }
   });
 
+  it("billing (staging only): the D1 oa-s-billing by exact name, only when TARGETS names it", () => {
+    const BUUID = "99999999-9999-4999-8999-999999999999";
+    const stg = (
+      extra: unknown[] = [],
+      TARGETS = "directory-broker,billing,dispatch",
+    ) =>
+      run(
+        ["bash", script("hosted-resource-ids.sh"), "staging"],
+        {
+          d1: [
+            ok([
+              { uuid: UUID, name: "oa-s-platform" },
+              {
+                uuid: "1".repeat(8) + "-1111-4111-8111-111111111111",
+                name: "oa-s-billing-old",
+              },
+              ...extra,
+            ]),
+          ],
+          kv: [
+            ok([
+              { id: KV.hosts, title: "oa-s-hosts" },
+              { id: KV.broker, title: "oa-s-broker-registry" },
+              { id: KV.directory, title: "oa-s-directory-registry" },
+            ]),
+          ],
+          zones: [ok(zones())],
+          stores: [ok(stores())],
+        },
+        { TARGETS },
+      );
+    const one = { uuid: BUUID, name: "oa-s-billing" };
+    const r = stg([one]);
+    expect(r.code, r.err).toBe(0);
+    expect(r.ghEnv).toContain(`BILLING_DB_ID=${BUUID}\n`);
+    expect(r.out).toContain(`oa-s-billing: ${BUUID}`);
+    // Not named: not looked up, not written.
+    const none = stg([one], "dispatch,scheduler");
+    expect(none.code, none.err).toBe(0);
+    expect(none.ghEnv).not.toContain("BILLING_DB_ID");
+    // Absent or ambiguous: fails, naming it, writing nothing.
+    const missing = stg([]);
+    expect(missing.code).toBe(1);
+    expect(missing.err).toContain("oa-s-billing");
+    expect(missing.ghEnv).toBe("");
+    const two = stg([
+      one,
+      { uuid: "98989898-9898-4898-8898-989898989898", name: "oa-s-billing" },
+    ]);
+    expect(two.code).toBe(1);
+    expect(two.ghEnv).toBe("");
+  });
+
+  it("billing is refused for prod before any call", () => {
+    const r = run(["bash", script("hosted-resource-ids.sh"), "prod"], good(), {
+      TARGETS: "billing",
+    });
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("staging-only");
+    expect(r.sb.log().filter((l) => l.startsWith("curl"))).toEqual([]);
+    expect(r.ghEnv).toBe("");
+  });
+
   it("the sending zone: a zone of that name on another account never counts", () => {
     const o = good();
     o.zones = [ok(zones().slice(1))];

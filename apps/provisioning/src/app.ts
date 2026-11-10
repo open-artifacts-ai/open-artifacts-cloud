@@ -31,6 +31,7 @@ import { handleMcp } from "./mcp/index.js";
 import { isRefusal } from "./principal.js";
 import { refuse } from "./refuse.js";
 import { bodyKeys, invokeRoute } from "./routes/invoke.js";
+import { CLAIM_FREE_PATH, freeClaim } from "./routes/claim-free.js";
 import { matchRoute } from "./routes/table.js";
 import { ipKeyOf } from "./services/counters.js";
 import {
@@ -143,6 +144,11 @@ async function route(
     }
   }
 
+  if (host === "admin" && path === CLAIM_FREE_PATH) {
+    if (req.method !== "POST") return methodNotAllowed("POST");
+    return claimFreeRoute(req, env, clientIp(req));
+  }
+
   const m = matchRoute(host, req.method, path);
   if (m)
     return isApiRoute(m.route)
@@ -196,6 +202,31 @@ async function apiRoute(
         "cache-control": "no-store",
         ...r.headers,
       },
+    });
+  });
+}
+
+/**
+ * Operator-only: free a kept sign-up claim (#52). Admin host, so Origin was
+ * checked; authn, CSRF and the write limit run here like apiRoute, and
+ * freeClaim admits an admin session only.
+ */
+async function claimFreeRoute(
+  req: Request,
+  env: Env,
+  ip: string,
+): Promise<Response> {
+  const p = await authenticate(req, env, "admin");
+  if (isRefusal(p)) return refuse(env, "auth", p.code, req);
+  const c = checkCsrf(req, env, p);
+  if (c) return refuse(env, "csrf", c.code, req);
+  return guard(async () => {
+    const rl = await limit(env, "write", p.rateKey);
+    if (rl) throw new ApiError(rl.code);
+    const r = await freeClaim(env, p, await readJsonBody(req), ip);
+    return new Response(JSON.stringify(r.body), {
+      status: r.status,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
   });
 }
