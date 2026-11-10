@@ -70,9 +70,16 @@ describe("Gmail sign-up: the owner can sign in", () => {
   it("create succeeds with no AUTH_DOMAINS and the uploaded config admits only the owner", async () => {
     // What create.ts stores for a personal Gmail account (ss.hd is null).
     const vars = JSON.parse(
-      signupVars({ providers: ["google"], domains: [] }, "trial", false),
+      signupVars(
+        { providers: ["google", "email"], domains: [] },
+        "trial",
+        false,
+      ),
     ) as Record<string, string>;
-    expect(vars).toMatchObject({ AUTH_PROVIDERS: "google", AUTH_DOMAINS: "" });
+    expect(vars).toMatchObject({
+      AUTH_PROVIDERS: "google,email",
+      AUTH_DOMAINS: "",
+    });
 
     const s = seedCreate(w, {
       slug: "gmailowner",
@@ -98,7 +105,7 @@ describe("Gmail sign-up: the owner can sign in", () => {
         .map((b) => [b.name, b.text as string]),
     );
     expect(plain).toMatchObject({
-      AUTH_PROVIDERS: "google",
+      AUTH_PROVIDERS: "google,email",
       AUTH_DOMAIN_JOIN: "invite",
       OWNER_EMAIL: OWNER,
       AUTH_BROKER_URL: `https://auth.${HOSTED_DOMAINS[ENV].app}`,
@@ -110,8 +117,12 @@ describe("Gmail sign-up: the owner can sign in", () => {
     const sqlite = new DatabaseSync(":memory:");
     for (const m of FIX.MIGRATION_FILES)
       sqlite.exec(new TextDecoder().decode(m.bytes));
+    // The install's send_email binding (EMAIL) and the Turnstile secret are
+    // not plain text; stand in for both.
     const env = {
       ...plain,
+      EMAIL: { send: async () => {} },
+      TURNSTILE_SECRET: "turnstile-secret",
       BROKER_SIGNING_KEY: generateKeyPairSync("ed25519")
         .privateKey.export({ type: "pkcs8", format: "der" })
         .toString("base64url"),
@@ -120,6 +131,9 @@ describe("Gmail sign-up: the owner can sign in", () => {
     const cfg = authConfig(env);
     expect(cfg.problems).toEqual([]);
     expect(cfg.google).not.toBeNull();
+    // Owner email codes, not domain codes.
+    expect(cfg.emailCodes).toBe(true);
+    expect(cfg.domainCodes).toBe(false);
     expect(cfg.domains).toEqual([]);
     expect(cfg.domainJoin).toBe("invite");
 

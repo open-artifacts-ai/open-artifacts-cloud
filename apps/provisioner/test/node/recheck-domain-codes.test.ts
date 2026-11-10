@@ -93,14 +93,34 @@ describe("strictVars: google without a domain", () => {
     AUTH_DOMAINS: "",
     TIER: "trial",
   });
+  const ss = JSON.stringify({
+    AUTH_PROVIDERS: "google,email",
+    AUTH_DOMAINS: "",
+    TIER: "trial",
+  });
+  const selfServe = {
+    ...opts,
+    source: "self-serve" as const,
+    selfServeTier: "trial",
+  };
   it("is allowed for self-serve (a personal Google account has no hd)", () => {
-    expect(
-      strictVars(g, {
-        ...opts,
-        source: "self-serve",
-        selfServeTier: "trial",
-      }),
-    ).not.toHaveProperty("AUTH_DOMAINS");
+    const v = strictVars(ss, selfServe);
+    expect(v).not.toHaveProperty("AUTH_DOMAINS");
+    expect(v.AUTH_PROVIDERS).toBe("google,email");
+    expect(v).not.toHaveProperty("EMAIL_CODE_DOMAIN");
+  });
+  it("refuses a self-serve google-only or email-only set", () => {
+    for (const p of ["google", "email"])
+      expect(() =>
+        strictVars(
+          JSON.stringify({
+            AUTH_PROVIDERS: p,
+            AUTH_DOMAINS: "",
+            TIER: "trial",
+          }),
+          selfServe,
+        ),
+      ).toThrow();
   });
   it("is still refused for an admin create", () => {
     expect(why(g)).toBe("google needs at least one domain");

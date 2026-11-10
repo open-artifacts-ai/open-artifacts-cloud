@@ -493,7 +493,7 @@ describe("create from the sign-up host (R4, self-serve policy)", () => {
       .first<{ owner_sub: string; vars: string }>();
     expect(s?.owner_sub).toBe("g-300");
     expect(JSON.parse(s?.vars ?? "{}")).toMatchObject({
-      AUTH_PROVIDERS: "google",
+      AUTH_PROVIDERS: "google,email",
       AUTH_DOMAINS: "",
     });
     expect(e.queued).toHaveLength(1);

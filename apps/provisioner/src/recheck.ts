@@ -134,7 +134,7 @@ const DOMAIN = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/;
  * AUTH_DOMAINS, TIER, TEST_DOMAIN (equal to STAGING_TEST_DOMAIN) only on a
  * staging test-hook row, and EMAIL_CODE_DOMAIN=on only on an admin create with
  * email, no google and a domain (#1088). Self-serve also needs TIER = SELF_SERVE_TIER,
- * providers exactly google and at most one domain (with google, at most
+ * providers exactly google and email (owner codes) and at most one domain (with google, at most
  * one: a personal Google account has none). Returns the vars create renders: AUTH_DOMAIN_JOIN=invite forced,
  * an empty AUTH_DOMAINS dropped.
  */
@@ -204,8 +204,12 @@ export function strictVars(
   if (o.source === "self-serve") {
     if (tier.data !== o.selfServeTier)
       throw refused("a self-serve TIER must be SELF_SERVE_TIER");
-    if (providers.length !== 1 || providers[0] !== "google")
-      throw refused("self-serve providers must be google");
+    if (
+      providers.length !== 2 ||
+      !providers.includes("google") ||
+      !providers.includes("email")
+    )
+      throw refused("self-serve providers must be google and email");
     if (domains.length > 1) throw refused("self-serve has at most one domain");
   }
   return {
