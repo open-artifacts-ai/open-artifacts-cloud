@@ -34,7 +34,18 @@ describe("ALLOW_SIGNUPS", () => {
     expect(job.env.ALLOW_SIGNUPS).toBe(
       "${{ inputs.env == 'staging' && '1' || '' }}",
     );
-    for (const st of steps) expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
+    for (const st of steps)
+      expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
+  });
+});
+
+describe("PROD_SIGNUP_DEPLOY (#40)", () => {
+  it("is set once at job level: 1 only on prod with the repo variable 'on', else empty; no step sets it", () => {
+    expect(job.env.PROD_SIGNUP_DEPLOY).toBe(
+      "${{ inputs.env == 'prod' && vars.PROD_SIGNUP_DEPLOY == 'on' && '1' || '' }}",
+    );
+    for (const st of steps)
+      expect(st.env?.PROD_SIGNUP_DEPLOY, st.name).toBeUndefined();
   });
 });
 
@@ -352,7 +363,10 @@ describe("deploy-hosted-platform.yml", () => {
       expect(runsFor(t), t).toBe(true);
     for (const t of ["zones"]) expect(runsFor(t), t).toBe(false);
     // Everything the user used to copy into the Environment comes from these.
-    expect(text).not.toContain("vars.");
+    // The one variable is the prod sign-up switch (#40), a flag, not an id.
+    expect(text.match(/vars\.[A-Za-z_]+/g)).toEqual([
+      "vars.PROD_SIGNUP_DEPLOY",
+    ]);
     for (const k of [
       "CLOUDFLARE_ACCOUNT_ID",
       "PLATFORM_DB_ID",

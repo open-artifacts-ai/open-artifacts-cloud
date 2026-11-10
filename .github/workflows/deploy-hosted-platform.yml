@@ -108,6 +108,11 @@ jobs:
       # level: every step that reads the signups constant (Deploy and verify,
       # Scheduler, last) sees it.
       ALLOW_SIGNUPS: ${{ inputs.env == 'staging' && '1' || '' }}
+      # Prod's sign-up steps (#40): the signup.<app> route, the i00000signup
+      # broker entry, SIGNUP_BROKER_KEY and TURNSTILE_SITEKEY, only while the
+      # repo variable PROD_SIGNUP_DEPLOY is "on" (unset: off). Read only on
+      # prod; staging always does them (the scripts decide by env).
+      PROD_SIGNUP_DEPLOY: ${{ inputs.env == 'prod' && vars.PROD_SIGNUP_DEPLOY == 'on' && '1' || '' }}
     timeout-minutes: 30
     steps:
       - name: Check the inputs

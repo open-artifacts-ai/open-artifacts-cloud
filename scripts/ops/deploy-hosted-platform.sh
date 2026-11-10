@@ -484,13 +484,16 @@ case "$target" in
     fi
     # Every deploy: the list can change, and the deployed value can't be read.
     printf '%s' "$ADMIN_IDENTITIES" | put_secret "$W" provisioning ADMIN_IDENTITIES
-    # The sign-up host's broker key (signup.<app>, cloud #35, #40): STAGING
-    # ONLY, made like the admin's (entry first, a failed put deletes it). Prod
-    # gets none: its sign-in stays unavailable (503) and its sign-ups stay
-    # closed; opening prod is a separate change.
+    # The sign-up host's broker key (signup.<app>, cloud #35, #40): staging,
+    # and prod only with PROD_SIGNUP_DEPLOY=1 (the workflow sets it from the
+    # repo variable of the same name being "on"; off by default). Made like the
+    # admin's (entry first, a failed put deletes it). Without it prod gets none:
+    # its sign-in stays unavailable (503) and its sign-ups stay closed.
     SKEY="install:i00000signup"
     SIGNUP_KEY_WANTED=""
-    if [ "$env" = staging ]; then
+    SIGNUP_DEPLOY=""
+    if [ "$env" = staging ] || { [ "$env" = prod ] && [ "${PROD_SIGNUP_DEPLOY:-}" = 1 ]; }; then SIGNUP_DEPLOY=1; fi
+    if [ -n "$SIGNUP_DEPLOY" ]; then
       SIGNUP_KEY_WANTED=1
       rc=0
       entry="$(kv_get "$BROKER_REGISTRY_ID" "$SKEY")" || rc=$?
@@ -515,11 +518,11 @@ case "$target" in
       echo "$W: no SIGNUP_BROKER_KEY on $env: signup.<app> sign-in stays unavailable (503)"
     fi
     # The Turnstile site key (public): the env's one widget oa-<p>-turnstile
-    # (its domain [<app>] covers signup.<app>), found by exact name; STAGING
-    # ONLY like the broker key. The widget's secret is never read here. Zero or
+    # (its domain [<app>] covers signup.<app>), found by exact name; under the
+    # same switch as the broker key. The widget's secret is never read here. Zero or
     # several widgets, or a failed listing: say so and leave it unset (the page
     # then says sign-ups are unavailable); never fails the deploy.
-    if [ "$env" = staging ]; then
+    if [ -n "$SIGNUP_DEPLOY" ]; then
       widgets="$(list_all "/challenges/widgets?" "list Turnstile widgets")" || widgets=""
       sitekeys="$(jq -r --arg n "oa-$P-turnstile" '[.[]? | select(.name == $n) | .sitekey] | join(" ")' <<< "$widgets" 2> /dev/null)" || sitekeys=""
       if [[ "$sitekeys" =~ ^[0-9A-Za-z_-]{1,64}$ ]]; then

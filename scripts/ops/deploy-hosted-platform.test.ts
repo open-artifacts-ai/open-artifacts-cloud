@@ -2130,6 +2130,49 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.out).toContain("prod provisioning: deployed and verified");
       clean(r);
     });
+    it("prod sign-up steps are off by default: PROD_SIGNUP_DEPLOY unset, empty or anything but 1 leaves no entry, key or sitekey (#40)", () => {
+      for (const extra of [
+        {},
+        { PROD_SIGNUP_DEPLOY: "" },
+        { PROD_SIGNUP_DEPLOY: "on" },
+      ]) {
+        const r = setup({ exists: brokers }).run("provisioning", extra);
+        expect(r.code, r.err).toBe(0);
+        expect(r.writes.some((w) => w.includes("i00000signup"))).toBe(false);
+        expect(puts(r.log)).toEqual([
+          "ADMIN_SESSION_KEY",
+          "ADMIN_BROKER_KEY",
+          "ADMIN_IDENTITIES",
+        ]);
+        expect(r.out).toContain("no SIGNUP_BROKER_KEY on prod");
+      }
+    });
+    it("PROD_SIGNUP_DEPLOY=1: prod does what staging does, with the oa-p-turnstile sitekey (#40)", () => {
+      const r = setup({
+        exists: brokers,
+        files: {
+          "widgets.json": JSON.stringify([
+            { name: "oa-s-turnstile", sitekey: "0xSTAGING" },
+            { name: "oa-p-turnstile", sitekey: "0x4AAAAAAAprod_key-1" },
+          ]),
+        },
+      }).run("provisioning", { PROD_SIGNUP_DEPLOY: "1" });
+      expect(r.code, r.err).toBe(0);
+      const sp = r.writes.find((w) =>
+        w.includes("/values/install:i00000signup "),
+      ) as string;
+      expect(sp).toContain('"installId":"i00000signup"');
+      expect(sp).toContain('"origin":"https://signup.open-artifacts.app"');
+      expect(puts(r.log)).toEqual([
+        "ADMIN_SESSION_KEY",
+        "ADMIN_BROKER_KEY",
+        "ADMIN_IDENTITIES",
+        "SIGNUP_BROKER_KEY",
+        "TURNSTILE_SITEKEY",
+      ]);
+      expect(r.out).toContain("prod provisioning: deployed and verified");
+      clean(r);
+    });
     it("a rerun writes nothing but the admin list; a missing entry gets a new key, entry first", () => {
       const again = setup({
         exists: brokers,

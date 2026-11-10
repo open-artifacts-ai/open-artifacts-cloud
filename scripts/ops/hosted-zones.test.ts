@@ -159,9 +159,30 @@ describe("hosted-zones.sh", () => {
       expect(r.out).toContain(line);
       expect(r.summary).toContain(line);
     }
-    // Prod keeps signup.<app> on dispatch (#40: the route is staging only).
+    // Prod keeps signup.<app> on dispatch (#40: off unless PROD_SIGNUP_DEPLOY=1).
     expect(r.out).not.toContain("signup.");
     clean(r);
+  });
+  it("prod: the signup route is planned and added only with PROD_SIGNUP_DEPLOY=1 (#40)", () => {
+    const line = "route signup.open-artifacts.app/* -> oa-p-provisioning: add";
+    for (const extra of [
+      {},
+      { PROD_SIGNUP_DEPLOY: "" },
+      { PROD_SIGNUP_DEPLOY: "on" },
+    ]) {
+      const r = setup().run("apply", "prod", extra);
+      expect(r.code, r.err).toBe(0);
+      expect(r.out).not.toContain("signup.");
+      expect(
+        r.writes.filter((w) => w.includes("/workers/routes ")),
+      ).toHaveLength(6);
+    }
+    const on = setup().run("apply", "prod", { PROD_SIGNUP_DEPLOY: "1" });
+    expect(on.code, on.err).toBe(0);
+    expect(on.out).toContain(line);
+    expect(
+      on.writes.filter((w) => w.includes("/workers/routes ")),
+    ).toHaveLength(7);
   });
   it("apply makes exactly the planned writes: 2 records, 6 settings, 6 routes", () => {
     const r = setup().run("apply");
