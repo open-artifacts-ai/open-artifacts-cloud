@@ -192,6 +192,15 @@
           "period": 60
         },
         "type": "ratelimit"
+      },
+      {
+        "name": "RL_ANON_WRITES",
+        "namespace_id": "1000003",
+        "simple": {
+          "limit": 120,
+          "period": 60
+        },
+        "type": "ratelimit"
       }
     ],
     "compatibility_date": "2026-01-01",
