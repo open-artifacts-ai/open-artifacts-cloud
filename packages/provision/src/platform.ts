@@ -529,9 +529,10 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
   }
 
   /**
-   * #1931: the newest `upgrade.restore_point` bookmark this job (its job part)
+   * #1931: the oldest `upgrade.restore_point` bookmark this job (its job part)
    * recorded for an upgrade to `to`: the true pre-upgrade restore point, taken
-   * before the first attempt applied any file. Null if none.
+   * before the first attempt applied any file (later rows only repeat it).
+   * Filtered in SQL, so older rows of other jobs never crowd it out. Null if none.
    */
   async restorePointOf(
     id: InstallId,
@@ -540,24 +541,11 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
   ): Promise<string | null> {
     const r = await this.cf.d1Query(
       this.db.id,
-      "SELECT detail FROM hosted_audit WHERE install_id = ?1 AND action = 'upgrade.restore_point' ORDER BY id ASC LIMIT 50",
-      [id],
+      "SELECT json_extract(detail, '$.bookmark') AS bookmark FROM hosted_audit WHERE install_id = ?1 AND action = 'upgrade.restore_point' AND json_extract(detail, '$.job') = ?2 AND json_extract(detail, '$.to') = ?3 AND json_type(detail, '$.bookmark') = 'text' AND json_extract(detail, '$.bookmark') != '' ORDER BY id ASC LIMIT 1",
+      [id, jobPart, to],
     );
-    // Oldest first: the first attempt's bookmark is the one taken before
-    // any file ran; later rows only repeat it.
-    for (const x of r[0]?.results ?? []) {
-      try {
-        const d = JSON.parse(String(x.detail)) as Record<string, unknown>;
-        if (
-          d.job === jobPart &&
-          d.to === to &&
-          typeof d.bookmark === "string" &&
-          d.bookmark !== ""
-        )
-          return d.bookmark;
-      } catch {}
-    }
-    return null;
+    const b = r[0]?.results?.[0]?.bookmark;
+    return typeof b === "string" && b !== "" ? b : null;
   }
 
   /** H-DV: one install's revoke state, read only (delete's phase-2 poll). */

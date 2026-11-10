@@ -7179,10 +7179,8 @@ describe("a killed upgrade, rollback or vars change: its own job's retry re-take
           String(init?.body).includes("list_artifacts")
         ) {
           taken = true;
-          // The same job's second attempt, while the first is mid-run.
-          s.db()
-            .prepare("UPDATE installs SET lease = ? WHERE id = ?")
-            .run(holderLease(A), inst.id);
+          // The same job's second attempt, while the first is mid-run: its
+          // claim re-takes the live lease through the resume path.
           keep(await second.updateVars(inst.id, { FEATURES: "beta" }));
         }
         return s.fake.fetch(u, init);
@@ -7195,6 +7193,89 @@ describe("a killed upgrade, rollback or vars change: its own job's retry re-take
     expect(log).toContain("vars.lost_lease");
     expect(log.filter((a) => a === "vars.done")).toHaveLength(1);
     expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+
+  it("a live duplicate upgrade with a non-additive migration: the second takes over and reuses the first's restore point; the first is refused", async () => {
+    const s = setup();
+    s.fake.bookmarkNumbered = true;
+    const inst = keep(await s.p.create(input()));
+    let taken = false;
+    const second = s.mk({ leaseHolder: A });
+    const first = s.mk({
+      leaseHolder: A,
+      cf: s.cfWith((async (u: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          !taken &&
+          String(init?.body).includes(
+            "CREATE TABLE IF NOT EXISTS d1_migrations",
+          )
+        ) {
+          taken = true;
+          keep(await second.upgrade(inst.id, "0.24.6", { nonAdditive: true }));
+        }
+        return s.fake.fetch(u, init);
+      }) as typeof fetch),
+    });
+    const e = await fails(
+      first.upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(taken).toBe(true);
+    expect(e).toBeInstanceOf(LostLease);
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.6",
+      lease: null,
+    });
+    const rows = restorePoints(s, inst.id).map((r) => r.bookmark);
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toBe(rows[0]);
+    const log = s.audit(inst.id);
+    expect(log).toContain("upgrade.lost_lease");
+    expect(log).not.toContain("upgrade.restore_point_first_missing");
+  });
+
+  it("restorePointOf is not crowded out by more than 50 older rows of other jobs", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    for (let i = 0; i < 60; i++)
+      restorePointRow(s, inst.id, B, `bookmark-b${i}`);
+    restorePointRow(s, inst.id, A, "bookmark-first");
+    kill(s, inst.id);
+    const w = s.fake.log.length;
+    keep(
+      await s
+        .mk({ leaseHolder: A })
+        .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(bookmarkCalls(s, w)).toBe(1);
+    expect(restorePoints(s, inst.id).at(-1)?.bookmark).toBe("bookmark-first");
+  });
+
+  it("with two matching rows, the oldest wins", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    restorePointRow(s, inst.id, A, "bookmark-oldest");
+    restorePointRow(s, inst.id, A, "bookmark-newer");
+    kill(s, inst.id);
+    keep(
+      await s
+        .mk({ leaseHolder: A })
+        .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(restorePoints(s, inst.id).at(-1)?.bookmark).toBe("bookmark-oldest");
+  });
+
+  it("a different job's retry is refused and writes no restore-point audit", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    kill(s, inst.id);
+    const before = s.audit(inst.id);
+    await fails(
+      s
+        .mk({ leaseHolder: B })
+        .upgrade(inst.id, "0.24.6", { nonAdditive: true }),
+    );
+    expect(s.audit(inst.id)).toEqual(before);
   });
 
   const restorePointRow = (

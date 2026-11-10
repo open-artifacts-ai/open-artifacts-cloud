@@ -3542,7 +3542,11 @@ export class WfpProvisioner {
     d1Id: string,
     o: { nonAdditive?: boolean },
     retry = false,
-  ): Promise<{ bookmark: string; files: string } | null> {
+  ): Promise<{
+    bookmark: string;
+    files: string;
+    firstMissing?: true;
+  } | null> {
     const r = await this.cf.d1Query(d1Id, "SELECT name FROM d1_migrations");
     const done = new Set((r[0]?.results ?? []).map((x) => String(x.name)));
     const held = rel.migrations.flatMap((f) => {
@@ -3564,6 +3568,7 @@ export class WfpProvisioner {
     }
     // #1931: a retry of this job after files were partly applied must keep the
     // first attempt's bookmark: one taken now is after those files.
+    let missing = false;
     if (retry && this.o.leaseHolder !== undefined) {
       const first = await this.platform.restorePointOf(
         id,
@@ -3571,12 +3576,14 @@ export class WfpProvisioner {
         rel.rec.version,
       );
       if (first !== null) return { bookmark: first, files };
-      await this.platform.audit(id, "upgrade.restore_point_first_missing", {
-        to: rel.rec.version,
-      });
+      missing = true;
     }
     try {
-      return { bookmark: await this.cf.d1Bookmark(d1Id), files };
+      return {
+        bookmark: await this.cf.d1Bookmark(d1Id),
+        files,
+        ...(missing ? { firstMissing: true as const } : {}),
+      };
     } catch (e) {
       await this.platform.audit(id, "upgrade.held", {
         to: rel.rec.version,
@@ -3777,6 +3784,9 @@ export class WfpProvisioner {
         await this.platform.raiseFloorSeq(rel.floor.seq);
       }
       await this.logged("upgrade.start", { from, to });
+      // After the claim and under the lease: a refused attempt writes nothing.
+      if (restorePoint?.firstMissing)
+        await this.logged("upgrade.restore_point_first_missing", { to });
       if (restorePoint)
         await this.logged("upgrade.restore_point", {
           bookmark: restorePoint.bookmark,
