@@ -88,7 +88,7 @@ export interface Env {
   /** The env's Stripe price ids, one per paid plan (placeholders, filled at deploy). */
   STRIPE_PRICE_TEAM: string;
   STRIPE_PRICE_BUSINESS: string;
-  /** Solo's two prices (#1568): $1/month and $12/year, one per interval. */
+  /** Solo's two prices (#1568): $1/month and $10/year, one per interval. */
   STRIPE_PRICE_SOLO_MONTHLY: string;
   STRIPE_PRICE_SOLO_YEARLY: string;
   /**

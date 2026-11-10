@@ -84,8 +84,8 @@ export function welcomeEmail(o: {
     plan: !selfServe
       ? null
       : end
-        ? `You're on Solo: free until ${end}, then $1/month or $12/year. No card on file; we'll remind you a week before.`
-        : "You're on Solo: free for your first month, then $1/month or $12/year. No card on file; we'll remind you a week before.",
+        ? `You're on Solo: free until ${end}, then $1/month or $10/year. No card on file; we'll remind you a week before.`
+        : "You're on Solo: free for your first month, then $1/month or $10/year. No card on file; we'll remind you a week before.",
     why: selfServe
       ? `You got this because you signed up and created ${host}.`
       : "You got this because you signed up for Open Artifacts.",
