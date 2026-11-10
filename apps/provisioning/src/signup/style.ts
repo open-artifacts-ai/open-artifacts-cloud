@@ -89,7 +89,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .panel .verb{color:var(--text);margin:0}
 .verb .w{display:inline-block;animation:vin .35s ease-out}
 @keyframes vin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.panel .addr{font:14px ui-monospace,Menlo,monospace;color:var(--muted);margin:0;text-align:center}
+.panel .addr{font:14px Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--muted);margin:0;text-align:center}
 .a1 .fr{fill:none;stroke:var(--text);stroke-width:1.2;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 2.8s ease-in-out infinite}
 .a1 .cn{fill:var(--accent);opacity:0;animation:fade 2.8s ease-in-out infinite}
 .a1 .sq{fill:var(--accent);transform-origin:16px 16px;transform:scale(0);animation:land 2.8s cubic-bezier(.3,1.6,.5,1) infinite}
