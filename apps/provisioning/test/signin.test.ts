@@ -847,6 +847,16 @@ describe("reauth (4.3 step 4, R11)", () => {
     ]);
   });
 
+  it("reauth=1 on the callback query without a reauth flow does not count as recent", async () => {
+    await signIn(env(), {
+      cb: "&reauth=1",
+      claims: { auth_time: NOW / 1000 - 86_400 },
+    });
+    expect(
+      (await db.prepare("SELECT auth_at FROM sessions").first())?.auth_at,
+    ).toBe(NOW - 86_400_000);
+  });
+
   it("without reauth, an old auth_time stays auth_at, so it is never recent", async () => {
     await signIn(env(), { claims: { auth_time: NOW / 1000 - 86_400 } });
     expect(
@@ -1009,6 +1019,35 @@ describe("a session already in the browser (4.5: logout ends every grant)", () =
     const again = await consent(sid);
     expect(again.status).toBe(200);
     expect(await again.text()).toContain(">Approve<");
+  });
+
+  it("a reauth by another identity starts a new session with auth_at now and ends the old one", async () => {
+    const e = env({
+      ADMIN_IDENTITIES: `${EMAIL}:${SUB},you@example.com:456`,
+    });
+    const b = await createSession(
+      e.env,
+      { email: "you@example.com", sub: "456", authAt: NOW - 3600_000 },
+      NOW - 60_000,
+    );
+    const bh = await sessionHash(b.sid);
+    const { res } = await signIn(e, { q: "?reauth=1", sid: b.sid });
+    const sid = cookieValue(cookieOf(res, SESSION_COOKIE));
+    expect(sid).not.toBe(b.sid);
+    expect(
+      await db
+        .prepare("SELECT revoked_at FROM sessions WHERE id_hash = ?")
+        .bind(bh)
+        .first("revoked_at"),
+    ).toBe(NOW);
+    expect(
+      await db
+        .prepare(
+          "SELECT auth_at FROM sessions WHERE id_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(await sessionHash(sid))
+        .first("auth_at"),
+    ).toBe(NOW);
   });
 
   it("a live session of another identity is revoked with its tokens before the new one", async () => {
