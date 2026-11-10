@@ -140,6 +140,63 @@ test("form and closed pages have no inline styles and no CSP violations", async 
   }
 });
 
+test("closed view reads exactly, newcomer first", async ({ page }) => {
+  await mount(page, { open: false });
+  await expect(page.locator("h1")).toHaveText("Sign-ups are closed for now");
+  await expect(page.locator(".panel > p").first()).toHaveText(
+    "We're not opening new instances yet. You can run Open Artifacts yourself today, free and open source.",
+  );
+  const run = page.getByRole("link", { name: "Run it yourself" });
+  await expect(run).toHaveAttribute(
+    "href",
+    "https://github.com/open-artifacts-ai/open-artifacts",
+  );
+  await expect(run).toHaveClass(/pri/);
+  await expect(page.locator(".or")).toHaveText("or");
+  await expect(page.getByLabel("Already have an instance?")).toBeVisible();
+  const go = page.getByRole("button", { name: "Go to it" });
+  await expect(go).not.toHaveClass(/pri/);
+  await expect(page.locator(".panel .muted.small")).toHaveText(
+    "It runs on your own Cloudflare account.",
+  );
+  // Focus order follows the visual order: link, field, button.
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  const order = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("a,input,button")).map(
+      (e) => e.textContent || e.id,
+    ),
+  );
+  expect(order.slice(-3)).toEqual(["Run it yourself", "go", "Go to it"]);
+  // Today's behaviour: a bad slug shows the hint and stays put.
+  await page.locator("#go").fill("-bad-");
+  await go.click();
+  await expect(page.locator("#go-help")).toHaveText(
+    "Use letters, numbers and hyphens.",
+  );
+});
+
+test("closed view: field and Go to it read as one group (10px)", async ({
+  page,
+}) => {
+  for (const size of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(size);
+    await mount(page, { open: false });
+    const f = await page.locator(".field .inp").boundingBox();
+    const b = await page
+      .getByRole("button", { name: "Go to it" })
+      .boundingBox();
+    if (!f || !b) throw new Error("no boxes");
+    expect(Math.round(b.y - (f.y + f.height))).toBe(10);
+  }
+});
+
 test("form price line reads exactly", async ({ page }) => {
   await mount(page, { me: false });
   await expect(page.locator(".panel .muted.small")).toHaveText(

@@ -76,17 +76,17 @@ export const CLIENT_JS = String.raw`(function () {
     rate_limited: "Too many attempts. Wait a few minutes and try again."
   };
 
-  // ---------- sign-ups closed (design: sign-ups closed, option A) ----------
+  // ---------- sign-ups closed (design: sign-ups closed, option B) ----------
   function viewClosed() {
     var inp = h("input", {
       type: "text", id: "go", autocomplete: "off", autocapitalize: "none",
       spellcheck: "false", placeholder: "acme", "aria-describedby": "go-help"
     });
-    var help = h("p", { class: "help", id: "go-help", "aria-live": "polite" });
+    var help = h("p", { class: "help tight", id: "go-help", "aria-live": "polite" });
     function go() {
       var v = inp.value.trim().toLowerCase();
       if (!SLUG_RE.test(v)) {
-        help.className = "help err";
+        help.className = "help tight err";
         help.textContent = "Use letters, numbers and hyphens.";
         return;
       }
@@ -94,17 +94,17 @@ export const CLIENT_JS = String.raw`(function () {
     }
     inp.addEventListener("keydown", function (e) { if (e.key === "Enter") go(); });
     shell(h("div", { class: "panel" }, [
-      h("h1", {}, ["New sign-ups are closed right now"]),
-      h("p", {}, ["You can't create a new instance at the moment. Nothing has changed for instances that already exist."]),
-      h("div", { class: "field" }, [
-        h("label", { for: "go" }, ["Already have one? Go to your instance"]),
+      h("h1", {}, ["Sign-ups are closed for now"]),
+      h("p", {}, ["We're not opening new instances yet. You can run Open Artifacts yourself today, free and open source."]),
+      h("a", { class: "btn pri", href: S.cfg.githubUrl, rel: "noopener" }, ["Run it yourself"]),
+      h("div", { class: "or" }, ["or"]),
+      h("div", { class: "field tight" }, [
+        h("label", { for: "go" }, ["Already have an instance?"]),
         h("div", { class: "inp" }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]),
         help
       ]),
-      h("button", { class: "btn pri", type: "button", onclick: go }, ["Go to my instance"]),
-      h("div", { class: "or" }, ["or"]),
-      h("a", { class: "btn", href: S.cfg.githubUrl, rel: "noopener" }, ["Run Open Artifacts yourself"]),
-      h("p", { class: "muted small mt" }, ["Open source; it runs on your own Cloudflare account."])
+      h("button", { class: "btn", type: "button", onclick: go }, ["Go to it"]),
+      h("p", { class: "muted small mt" }, ["It runs on your own Cloudflare account."])
     ]));
   }
 
