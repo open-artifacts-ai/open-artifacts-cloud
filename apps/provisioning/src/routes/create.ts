@@ -101,34 +101,22 @@ async function selfServePolicy(
 }
 
 /**
- * Frees a deleted install's slug, hosts and signup slug for a new create
- * (cloud #108). The deleted row keeps its id, state and times (its audit,
- * jobs and per-id resources are keyed by id); only the three unique keys
- * gain `~<id>`. Only a deleted row past the unmap settle is touched.
+ * Frees a purged install's signup slug for a new create (cloud #108).
+ * signups_live_slug is unique over non-failed signups, so the dead signup's
+ * slug gains `~<signup_id>` in the create batch (a lost race rolls it back).
+ * The install row's own unique keys are released by the provisioner's
+ * reserve step, because the API never writes installs (layout test).
  */
-export function releaseDeletedSlug(
+export function releaseDeletedSignupSlug(
   env: Env,
   slug: string,
   now: number,
-): D1PreparedStatement[] {
-  const db = env.PLATFORM_DB;
-  const cutoff = now - SLUG_UNMAP_SETTLE_MS;
-  return [
-    // The signup first: it finds its install by the install's slug.
-    db
-      .prepare(
-        `UPDATE signups SET slug = slug || '~' || signup_id
+): D1PreparedStatement {
+  return env.PLATFORM_DB.prepare(
+    `UPDATE signups SET slug = slug || '~' || signup_id
 WHERE slug = ?1 AND status <> 'failed'
   AND install_id IN (SELECT id FROM installs WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2)`,
-      )
-      .bind(slug, cutoff),
-    db
-      .prepare(
-        `UPDATE installs SET slug = slug || '~' || id, app_host = app_host || '~' || id, content_host = content_host || '~' || id
-WHERE slug = ?1 AND state = 'deleted' AND updated_at <= ?2`,
-      )
-      .bind(slug, cutoff),
-  ];
+  ).bind(slug, now - SLUG_UNMAP_SETTLE_MS);
 }
 
 export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
@@ -181,11 +169,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const db = env.PLATFORM_DB;
   // The signup's id is its first create job's id (0007).
   const after = (jobId: string): D1PreparedStatement[] => [
-    // A purged install still holds its slug and hosts in unique columns
-    // (installs.slug, app_host, content_host, signups_live_slug), so a reuse
-    // renames the dead row's keys first, in this batch: if the create then
-    // loses a race the rename rolls back with it.
-    ...releaseDeletedSlug(env, body.slug, now),
+    releaseDeletedSignupSlug(env, body.slug, now),
     db
       .prepare(
         `INSERT INTO signups (signup_id, source, owner_sub, slug, job_id, vars, version, test_hooks, send_welcome, status, admitted_at, created_at, updated_at)

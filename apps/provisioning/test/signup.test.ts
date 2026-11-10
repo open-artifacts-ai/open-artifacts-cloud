@@ -807,7 +807,7 @@ describe("a purged address (cloud #108)", () => {
   const errOf = async (r: Response) =>
     ((await r.json()) as { error: { code: string; message: string } }).error;
 
-  it("the same Google account takes its old address back at once, and the old row's keys are released", async () => {
+  it("the same Google account takes its old address back at once, and the dead signup's slug is released", async () => {
     const e = env({ SIGNUPS_ENABLED: "true" });
     const { sid } = await signIn(e);
     const old = await purged("acme", "g-100", 10 * 60 * 1000);
@@ -818,24 +818,21 @@ describe("a purged address (cloud #108)", () => {
       .bind(old.sid)
       .first<{ slug: string; status: string }>();
     expect(live).toEqual({ slug: "acme", status: "pending" });
+    // The API frees only the signup's unique slug; the install row is the
+    // provisioner's to release (the API never writes installs).
     const dead = await db
-      .prepare(
-        "SELECT slug, app_host, content_host, state FROM installs WHERE id = ?",
-      )
-      .bind(old.id)
-      .first<{
-        slug: string;
-        app_host: string;
-        content_host: string;
-        state: string;
-      }>();
-    expect(dead).toEqual({
-      slug: `acme~${old.id}`,
-      app_host: `acme.${APP}~${old.id}`,
-      content_host: `acme.content.test~${old.id}`,
-      state: "deleted",
-    });
-    expect(await check(e, sid, "acme")).toBe("taken");
+      .prepare("SELECT slug FROM signups WHERE signup_id = ?")
+      .bind(old.sid)
+      .first<{ slug: string }>();
+    expect(dead?.slug).toBe(`acme~${old.sid}`);
+    expect(
+      (
+        await db
+          .prepare("SELECT slug FROM installs WHERE id = ?")
+          .bind(old.id)
+          .first<{ slug: string }>()
+      )?.slug,
+    ).toBe("acme");
   });
 
   it("the unmap settles first: inside 2 minutes it is taken, even for its owner", async () => {
