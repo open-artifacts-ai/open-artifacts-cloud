@@ -1907,8 +1907,10 @@ export class WfpProvisioner {
           : undefined;
       if (old) {
         // A run hashed under an earlier default set: continue with its own
-        // vars, dropping only keys the current defaults added.
-        for (const k of Object.keys(vars)) if (!(k in old.vars)) delete vars[k];
+        // vars exactly (a default whose value changed resumes with the
+        // first run's value; keys the current defaults added are dropped).
+        for (const k of Object.keys(vars)) delete vars[k];
+        Object.assign(vars, old.vars);
         hash = old.hash;
       }
       if (row.inputs_hash !== hash)

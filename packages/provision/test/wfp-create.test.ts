@@ -802,6 +802,20 @@ describe("WfpProvisioner.create", () => {
         expect(bound(s, inst.id)).toEqual(ALL);
       });
 
+      it("a default whose value changed still resumes with the first run's value", async () => {
+        const s = setup();
+        s.fake.inject((m, p) => m === "POST" && p.endsWith("/r2/buckets"));
+        await fails(
+          s
+            .mk({ defaultVars: THREE })
+            .create(input("finqore", { installId: ID })),
+        );
+        const inst = await s
+          .mk({ defaultVars: { ...ALL, FREE_DATA_DOCS: "20000" } })
+          .create(input("finqore", { installId: ID }));
+        expect(bound(s, inst.id)).toEqual(THREE);
+      });
+
       for (const [name, set] of sets) {
         it(`a creating install first run under ${name} resumes with its own vars`, async () => {
           const s = setup();
