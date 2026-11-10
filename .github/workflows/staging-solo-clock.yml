@@ -60,7 +60,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version-file: .nvmrc
+          # The cloud repo has no .nvmrc of its own (the public tree brings it in
+          # overlay runs); this job runs only node: built-ins, so pin the major.
+          node-version: "22"
       - name: Load the hosted constants
         run: bash scripts/ci/hosted-constants.sh staging .github/hosted
       - name: Resolve the billing database
