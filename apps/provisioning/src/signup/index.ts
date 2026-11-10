@@ -92,12 +92,22 @@ const STAGES = new Set([
 /**
  * The caller's newest self-serve sign-up: `stage` is the signups.status
  * (`pending` shows as queued). A failed one frees the address; the page shows
- * it so the person is told, and a new sign-up replaces it.
+ * it so the person is told, and a new sign-up replaces it. A sign-up whose claim
+ * is freed, or whose ready/creating install is deleting or deleted (a purge
+ * leaves the row as it was), is not live: the page gets `none` and shows the form.
  */
 export async function signupStatus(env: Env, p: Principal): Promise<Response> {
   const row = await env.PLATFORM_DB.prepare(
-    `SELECT status, slug FROM signups WHERE source = 'self-serve' AND owner_sub = ?
-     ORDER BY created_at DESC, signup_id DESC LIMIT 1`,
+    `SELECT s.status AS status, s.slug AS slug FROM signups s
+     LEFT JOIN signup_accounts a ON a.signup_id = s.signup_id
+     LEFT JOIN installs i ON i.id = s.install_id
+     WHERE s.signup_id = (SELECT signup_id FROM signups
+       WHERE source = 'self-serve' AND owner_sub = ?1
+       ORDER BY created_at DESC, signup_id DESC LIMIT 1)
+     AND (s.status = 'failed' OR (
+       (a.signup_id IS NULL OR a.freed_at IS NULL)
+       AND (s.status NOT IN ('ready', 'creating')
+         OR i.id IS NULL OR i.state NOT IN ('deleting', 'deleted'))))`,
   )
     .bind(p.sub ?? "")
     .first<Row>();
