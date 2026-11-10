@@ -376,10 +376,10 @@ export const CLIENT_JS = String.raw`(function () {
       label = "Lots of people are signing up right now. You're in line, and it starts on its own.";
       steps = [reserve, step("wait", create), step("todo", email)];
     } else if (st === "creating") {
-      label = "Building your instance\u2026";
+      label = "Creating " + g.slug + "." + S.cfg.appDomain + "\u2026";
       steps = [reserve, step("now", create), step("todo", email)];
     } else {
-      label = "Getting your instance started\u2026";
+      label = "Creating " + g.slug + "." + S.cfg.appDomain + "\u2026";
       steps = [reserve, step("now", create), step("todo", email)];
     }
     shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([

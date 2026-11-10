@@ -161,16 +161,16 @@ test("poll: skips while hidden, polls at once when the tab returns", async ({
     },
   });
   await expect(page.locator(".state .lab")).toHaveText(
-    "Getting your instance started\u2026",
+    "Creating acme.open-artifacts.app\u2026",
   );
   await setHidden(page, true);
   const hiddenAt = calls;
   await page.clock.runFor(15000);
   expect(calls).toBe(hiddenAt);
-  stage = "creating";
+  stage = "waiting_cap";
   await setHidden(page, false);
   await expect(page.locator(".state .lab")).toHaveText(
-    "Building your instance\u2026",
+    "Lots of people are signing up right now. You're in line, and it starts on its own.",
   );
 });
 
@@ -185,7 +185,7 @@ test("poll: notice after 3 failures, cleared on the next success", async ({
     signup: () => (fail ? { status: 503 } : creating("queued")),
   });
   await expect(page.locator(".state .lab")).toHaveText(
-    "Getting your instance started\u2026",
+    "Creating acme.open-artifacts.app\u2026",
   );
   fail = true;
   await tick(page);
@@ -209,7 +209,7 @@ test("poll: a 401 goes to sign-in", async ({ page }) => {
     signup: () => (expired ? { status: 401 } : creating("queued")),
   });
   await expect(page.locator(".state .lab")).toHaveText(
-    "Getting your instance started\u2026",
+    "Creating acme.open-artifacts.app\u2026",
   );
   expired = true;
   await tick(page);
