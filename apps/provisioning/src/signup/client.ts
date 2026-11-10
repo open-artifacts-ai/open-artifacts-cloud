@@ -82,11 +82,11 @@ export const CLIENT_JS = String.raw`(function () {
       type: "text", id: "go", autocomplete: "off", autocapitalize: "none",
       spellcheck: "false", placeholder: "acme", "aria-describedby": "go-help"
     });
-    var help = h("p", { class: "help", id: "go-help", "aria-live": "polite" });
+    var help = h("p", { class: "help tight", id: "go-help", "aria-live": "polite" });
     function go() {
       var v = inp.value.trim().toLowerCase();
       if (!SLUG_RE.test(v)) {
-        help.className = "help err";
+        help.className = "help tight err";
         help.textContent = "Use letters, numbers and hyphens.";
         return;
       }

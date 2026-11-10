@@ -39,6 +39,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .inp:focus-within{outline:2px solid var(--accent);outline-offset:1px}
 .inp .suf{color:var(--muted);padding-right:10px;white-space:nowrap}
 .help{font-size:12px;margin:0;min-height:18px;color:var(--muted)}
+.help.tight:empty{min-height:0;margin-top:-4px}
 .help.ok{color:var(--ok)}
 .help.err{color:var(--danger)}
 .sugg{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
