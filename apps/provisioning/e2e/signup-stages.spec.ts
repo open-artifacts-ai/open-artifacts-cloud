@@ -15,10 +15,13 @@ type Sc = {
   avail?: string;
   createCode?: string;
   path?: string;
+  // per-request override of GET /api/v1/signup (n counts calls, from 1)
+  signup?: (n: number) => { status: number; body?: unknown };
 };
 
 async function mount(page: Page, sc: Sc): Promise<string[]> {
   const violations: string[] = [];
+  let signupCalls = 0;
   page.on("console", (m) => {
     if (/Content Security Policy|Refused to/i.test(m.text()))
       violations.push(m.text());
@@ -59,6 +62,10 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
       return sc.me
         ? json({ principal: "user", email: "ada@acme.com", csrf: "c" })
         : json({ error: { code: "unauthorized" } }, 401);
+    if (url.pathname === "/api/v1/signup" && sc.signup) {
+      const o = sc.signup(++signupCalls);
+      return json(o.body ?? {}, o.status);
+    }
     if (url.pathname === "/api/v1/signup")
       return json(
         sc.stage
@@ -106,7 +113,7 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
     }
     if (stage === "failed") {
       await expect(
-        page.getByRole("button", { name: "Start over" }),
+        page.getByRole("button", { name: "Try again" }),
       ).toBeVisible();
     }
     expect(await page.locator("[style]").count()).toBe(0);
@@ -114,10 +121,102 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
   });
 }
 
-test("failed: Start over returns to the form", async ({ page }) => {
+test("failed: Try again returns to the form", async ({ page }) => {
   await mount(page, { me: true, stage: "failed" });
-  await page.getByRole("button", { name: "Start over" }).click();
+  await page.getByRole("button", { name: "Try again" }).click();
   await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+});
+
+const creating = (stage: string) => ({
+  status: 200,
+  body: { stage, slug: "acme", host: "acme.open-artifacts.app" },
+});
+const setHidden = (page: Page, hidden: boolean) =>
+  page.evaluate((hd) => {
+    Object.defineProperty(document, "hidden", {
+      value: hd,
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, hidden);
+
+// one poll interval, then a real pause so the mocked response is handled
+const tick = async (page: Page) => {
+  await page.clock.runFor(5000);
+  await new Promise((r) => setTimeout(r, 250));
+};
+
+test("poll: skips while hidden, polls at once when the tab returns", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "queued";
+  let calls = 0;
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => {
+      calls++;
+      return creating(stage);
+    },
+  });
+  await expect(page.locator(".state .lab")).toHaveText(
+    "Getting your instance started\u2026",
+  );
+  await setHidden(page, true);
+  const hiddenAt = calls;
+  await page.clock.runFor(15000);
+  expect(calls).toBe(hiddenAt);
+  stage = "creating";
+  await setHidden(page, false);
+  await expect(page.locator(".state .lab")).toHaveText(
+    "Building your instance\u2026",
+  );
+});
+
+test("poll: notice after 3 failures, cleared on the next success", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let fail = false;
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => (fail ? { status: 503 } : creating("queued")),
+  });
+  await expect(page.locator(".state .lab")).toHaveText(
+    "Getting your instance started\u2026",
+  );
+  fail = true;
+  await tick(page);
+  await tick(page);
+  await expect(page.getByRole("status")).toHaveCount(0);
+  await tick(page);
+  await expect(page.getByRole("status")).toHaveText(
+    "Can't reach the server. Retrying\u2026",
+  );
+  fail = false;
+  await tick(page);
+  await expect(page.getByRole("status")).toHaveCount(0);
+});
+
+test("poll: a 401 goes to sign-in", async ({ page }) => {
+  await page.clock.install();
+  let expired = false;
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => (expired ? { status: 401 } : creating("queued")),
+  });
+  await expect(page.locator(".state .lab")).toHaveText(
+    "Getting your instance started\u2026",
+  );
+  expired = true;
+  await tick(page);
+  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(
+    page.getByRole("link", { name: "Continue with Google" }),
+  ).toBeVisible();
 });
 
 test("taken: suggestions appear once, as chips", async ({ page }) => {

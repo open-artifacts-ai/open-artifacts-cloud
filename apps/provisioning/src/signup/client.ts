@@ -350,17 +350,17 @@ export const CLIENT_JS = String.raw`(function () {
     var reserve = step("done", "Reserve your address");
     var create = "Create your instance", email = "Send your welcome email";
     var pending = [
-      h("h1", {}, ["Setting up ", nw(hostName)]),
-      h("p", { class: "muted lead" }, ["We'll email you when it's ready. You can close this page."])
+      h("h1", {}, ["Setting up ", nw(hostName)])
     ];
     head = pending;
+    if (S.offline) pending.push(h("div", { class: "note warn", role: "status" }, ["Can't reach the server. Retrying\u2026"]));
     if (st === "ready") {
       label = "Ready";
       head = [h("h1", {}, [nw(hostName), " is ready"])];
       steps = [reserve, step("done", create), step("done", email)];
       body = [h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])];
     } else if (st === "failed") {
-      label = "Failed";
+      label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
       steps = [reserve, step("fail", create, "This didn't finish."), step("todo", email)];
       body = [
@@ -369,18 +369,18 @@ export const CLIENT_JS = String.raw`(function () {
         ]),
         h("div", { class: "stack" }, [
           h("a", { class: "btn", href: "mailto:" + S.cfg.supportEmail }, ["Email support"]),
-          h("button", { class: "btn", type: "button", onclick: startOver }, ["Start over"])
+          h("button", { class: "btn", type: "button", onclick: startOver }, ["Try again"])
         ])
       ];
     } else if (st === "waiting_cap") {
-      label = "Waiting for capacity";
-      steps = [reserve, step("wait", create, "Waiting for capacity. We're adding room, no need to do anything."), step("todo", email)];
+      label = "Lots of people are signing up right now. You're in line, and it starts on its own.";
+      steps = [reserve, step("wait", create), step("todo", email)];
     } else if (st === "creating") {
-      label = "Creating";
-      steps = [reserve, step("now", create, "This is the longest step."), step("todo", email)];
+      label = "Building your instance\u2026";
+      steps = [reserve, step("now", create), step("todo", email)];
     } else {
-      label = "Queued";
-      steps = [reserve, step("now", create, "Waiting for a free slot."), step("todo", email)];
+      label = "Getting your instance started\u2026";
+      steps = [reserve, step("now", create), step("todo", email)];
     }
     shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
@@ -389,23 +389,47 @@ export const CLIENT_JS = String.raw`(function () {
 
   function loadSignup() {
     return api("GET", "/api/v1/signup").then(function (r) {
+      if (r.status === 401) return "unauth";
       if (r.status === 200 && r.body && r.body.stage !== "none") {
         S.signup = { stage: r.body.stage, slug: r.body.slug, host: r.body.host };
       } else { S.signup = null; }
-    }, function () {});
+      return r.status === 200 || r.status < 500 ? "ok" : "error";
+    }, function () { return "error"; });
+  }
+  function stopPoll() { clearInterval(S.poll); S.polling = false; }
+  function pollOnce() {
+    if (document.hidden || S.inflight || S.view !== "setup") return;
+    S.inflight = true;
+    var before = S.signup && S.signup.stage;
+    var wasOffline = S.offline;
+    var keep = S.signup;
+    loadSignup().then(function (res) {
+      S.inflight = false;
+      if (S.view !== "setup") return;
+      if (res === "unauth") {
+        stopPoll(); S.me = null; S.signup = null; S.offline = false;
+        S.notice = NOTICES.expired; route(); return;
+      }
+      if (res === "error") {
+        S.signup = keep;
+        S.fails = (S.fails || 0) + 1;
+        if (S.fails >= 3 && !S.offline) { S.offline = true; render(); }
+        return;
+      }
+      S.fails = 0; S.offline = false;
+      if (!S.signup) return;
+      if (S.signup.stage !== before || wasOffline) render();
+      if (S.signup.stage === "ready" || S.signup.stage === "failed") stopPoll();
+    });
   }
   function startPoll() {
     clearInterval(S.poll);
-    S.poll = setInterval(function () {
-      if (document.hidden) return;
-      var before = S.signup && S.signup.stage;
-      loadSignup().then(function () {
-        if (S.view !== "setup" || !S.signup) return;
-        if (S.signup.stage !== before) render();
-        if (S.signup.stage === "ready" || S.signup.stage === "failed") clearInterval(S.poll);
-      });
-    }, 5000);
+    S.polling = true; S.fails = 0; S.offline = false;
+    S.poll = setInterval(pollOnce, 5000);
   }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && S.polling) pollOnce();
+  });
 
   // ---------- routing ----------
   function render() {
@@ -414,7 +438,7 @@ export const CLIENT_JS = String.raw`(function () {
     else if (S.view === "form") viewForm();
   }
   function route() {
-    clearInterval(S.poll);
+    stopPoll();
     refs = {};
     if (S.me && S.signup) {
       S.view = "setup";
