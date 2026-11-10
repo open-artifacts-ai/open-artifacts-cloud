@@ -957,29 +957,94 @@ describe("D: publishRelease", () => {
     ).toEqual(files.sig);
   });
 
-  it("a second publish of the same version is refused with zero writes", async () => {
+  it("a second publish of the identical release is a no-op success with zero writes", async () => {
     const s = await probed(setup());
     seedFloor(s);
-    await publishRelease({
-      cf: s.cf,
-      r2: s.r2.staging,
-      env: "staging",
-      version: "0.34.0",
-      files: good(),
-    });
-    const before = r2Writes(s.fake).length;
-    const e = await fails(
+    const files = good();
+    const pub = () =>
       publishRelease({
         cf: s.cf,
         r2: s.r2.staging,
         env: "staging",
         version: "0.34.0",
-        files: good(),
-      }),
-    );
-    expect(e).toBeInstanceOf(PublishRefused);
-    expect(e.message).toMatch(/already/);
+        files,
+      });
+    const first = await pub();
+    expect(first.status).toBe("published");
+    const before = r2Writes(s.fake).length;
+    const again = await pub();
+    expect(again.status).toBe("already-published");
+    expect(again.keys).toEqual([...first.keys].sort());
     expect(r2Writes(s.fake).length).toBe(before);
+  });
+
+  describe("a record is present but the release differs", () => {
+    const published = async () => {
+      const s = await probed(setup());
+      seedFloor(s);
+      await publishRelease({
+        cf: s.cf,
+        r2: s.r2.staging,
+        env: "staging",
+        version: "0.34.0",
+        files: good(),
+      });
+      return s;
+    };
+    const again = (s: Awaited<ReturnType<typeof published>>, files = good()) =>
+      publishRelease({
+        cf: s.cf,
+        r2: s.r2.staging,
+        env: "staging",
+        version: "0.34.0",
+        files,
+      });
+    const refused = async (
+      s: Awaited<ReturnType<typeof published>>,
+      files?: ReturnType<typeof good>,
+    ) => {
+      const before = r2Writes(s.fake).length;
+      const e = await fails(again(s, files));
+      expect(e).toBeInstanceOf(PublishRefused);
+      expect(e.message).toMatch(/already published/);
+      expect(r2Writes(s.fake).length).toBe(before);
+    };
+
+    it("one object differs: refused, zero writes", async () => {
+      const s = await published();
+      s.fake.r2Seed(
+        s.bucket,
+        "releases/0.34.0/release/welcome/welcome.md",
+        enc("evil"),
+      );
+      await refused(s);
+    });
+
+    it("an extra object: refused, zero writes", async () => {
+      const s = await published();
+      s.fake.r2Seed(
+        s.bucket,
+        "releases/0.34.0/release/assets/extra.js",
+        enc("x"),
+      );
+      await refused(s);
+    });
+
+    it("a missing object: refused, zero writes", async () => {
+      const s = await published();
+      const first = tarEntries()[0];
+      s.fake.r2Objects
+        .get(s.bucket)
+        ?.delete(`releases/0.34.0/release/${first.path}`);
+      await refused(s);
+    });
+
+    it("another record than this publish would write: refused, zero writes", async () => {
+      const s = await published();
+      const other = good();
+      other.sig = enc(`${new TextDecoder().decode(other.sig)} `);
+      await refused(s, other);
+    });
   });
 
   it("an object written concurrently is never overwritten (If-None-Match)", async () => {
