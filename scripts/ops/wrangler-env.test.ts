@@ -23,8 +23,11 @@ describe("wrangler-env.ts", () => {
     const v = committedVars(cfg("provisioning"), "staging", {
       GITHUB_REPOSITORY_ID: "123456",
       SIGNUP_DAILY_CAP: "20",
+      SIGNUPS_ENABLED: "true",
     });
     expect(v.SIGNUP_DAILY_CAP).toBe("20");
+    // Staging's gate is the constant, not a literal (open for the M2 walk).
+    expect(v.SIGNUPS_ENABLED).toBe("true");
     expect(v.OA_ENV).toBe("staging");
     expect(v.OIDC_REPOSITORY_ID).toBe("123456");
     expect(v.MCP_REDIRECT_URIS).toBe("https://claude.ai/api/mcp/auth_callback");
@@ -38,6 +41,11 @@ describe("wrangler-env.ts", () => {
   it("signups: the committed SIGNUPS_ENABLED, a literal or as filled; null when absent", () => {
     expect(committedSignups(cfg("provisioning"), "prod", {})).toBe("false");
     expect(
+      committedSignups(cfg("provisioning"), "staging", {
+        SIGNUPS_ENABLED: "true",
+      }),
+    ).toBe("true");
+    expect(
       committedSignups(cfg("provisioner"), "prod", { SIGNUPS_ENABLED: "true" }),
     ).toBe("true");
     expect(() => committedSignups(cfg("provisioner"), "prod", {})).toThrow(
@@ -47,7 +55,10 @@ describe("wrangler-env.ts", () => {
   });
   it("refuses a placeholder with no value, or another env's", () => {
     expect(() =>
-      committedVars(cfg("provisioning"), "staging", { SIGNUP_DAILY_CAP: "20" }),
+      committedVars(cfg("provisioning"), "staging", {
+        SIGNUP_DAILY_CAP: "20",
+        SIGNUPS_ENABLED: "false",
+      }),
     ).toThrow(
       /OIDC_REPOSITORY_ID: \{\{GITHUB_REPOSITORY_ID_STAGING\}\} has no value/,
     );
