@@ -17,6 +17,7 @@ import {
   event,
   seedCreate,
   seedJob,
+  seedToken,
   stepRunner,
   ulid,
   type World,
@@ -203,17 +204,16 @@ async function realInstall(o: { keys: number; staleKey?: number }) {
 }
 
 function grant(): string {
-  const id = ulid();
-  w.db
-    .prepare(
-      `INSERT INTO agent_tokens (id, kind, session_hash, admin_email, label, scopes, client_id, oauth_user, created_at, expires_at)
-VALUES (?, 'oauth', 'sh', 'a@example.com', 'x', '["installs:write"]', 'client', 'adm_x', 1, 9)`,
-    )
-    .run(id);
-  return id;
+  return seedToken(w);
 }
 async function run(installId: string, args: Record<string, unknown>) {
-  const id = seedJob(w, { kind: "update", installId, args, actor: "token" });
+  const id = seedJob(w, {
+    kind: "update",
+    installId,
+    args,
+    actor: "token",
+    tokenId: null,
+  });
   w.db.prepare("UPDATE jobs SET token_id = ? WHERE id = ?").run(grant(), id);
   await runManage(w.ctx, event(id), stepRunner(w.clock).step).catch(() => {});
   return w.job(id) as Record<string, unknown>;

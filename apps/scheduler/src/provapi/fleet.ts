@@ -139,7 +139,18 @@ export const FLEET_RETRY_PREFIX = "fleet_retry:";
 /** `fleet_behind:<id>`: when the duty first saw it off the target. */
 export const FLEET_BEHIND_PREFIX = "fleet_behind:";
 
+/**
+ * `platform_verified:<version>` (#1229): written by the platform deploy once
+ * every Worker's read-back passed (scripts/ops/platform-verified.ts). A target
+ * without it starts no fleet job.
+ */
+export const FLEET_VERIFIED_PREFIX = "platform_verified:";
+/** `fleet_unverified:<version>`: when the duty first held for want of that mark. */
+export const FLEET_UNVERIFIED_PREFIX = "fleet_unverified:";
+
 const VERSIONED_PREFIXES = [
+  FLEET_VERIFIED_PREFIX,
+  FLEET_UNVERIFIED_PREFIX,
   FLEET_HALT_PREFIX,
   FLEET_FAIL_PREFIX,
   FLEET_PASS_PREFIX,
@@ -230,7 +241,7 @@ const HALT_JOBS = `SELECT j.install_id AS install_id, j.id AS job_id, j.kind AS 
 FROM jobs j WHERE ${FLEET_UP} AND ${FAILED} AND (COALESCE(j.error_code, '') <> 'migration_held' OR j.install_id = ?1)`;
 // The fleet upgrade behind a mark, for the alert.
 const MARK_JOB = `SELECT j.id AS id, j.kind AS kind FROM jobs j WHERE ${FLEET_UP} AND j.install_id = ?1 AND json_extract(j.args, '$.to') = ?2 LIMIT 1`;
-const STATE = `SELECT key, value, updated_at FROM platform_state WHERE key GLOB 'fleet_*'`;
+const STATE = `SELECT key, value, updated_at FROM platform_state WHERE key GLOB 'fleet_*' OR key GLOB 'platform_verified:*'`;
 // The watch: installs still on an upgrade to the target (?1) that is done,
 // serving, active and idle, not yet soaked, on a version not halted. Only the
 // target's, so it never outgrows a batch and old marks can go.
@@ -520,6 +531,10 @@ export async function fleetDue(
     console.log("provapi fleet no_canary");
     return;
   }
+  if (!(await verified(db, now, st, target))) {
+    console.log("provapi fleet holding: platform not verified");
+    return;
+  }
   await trackBehind(db, now, st, target);
   await trackCanary(db, now, st, target, canaryId, mode);
   if (isHalted(st, target)) {
@@ -633,6 +648,32 @@ async function stamp(
   if (st.rows.has(key)) return;
   await d1(db.prepare(SET_ONCE).bind(key, now).run());
   st.rows.set(key, { key, value: now, updated_at: now });
+}
+
+/**
+ * True once the deploy marked the target verified (#1229), and the first-seen
+ * stamp of a hold is gone. Unmarked, the stamp is set once.
+ */
+async function verified(
+  db: D1Database,
+  now: number,
+  st: FleetState,
+  target: string,
+): Promise<boolean> {
+  const stampKey = `${FLEET_UNVERIFIED_PREFIX}${target}`;
+  if (st.rows.has(`${FLEET_VERIFIED_PREFIX}${target}`)) {
+    for (const k of [...st.rows.keys()])
+      if (k.startsWith(FLEET_UNVERIFIED_PREFIX)) {
+        await d1(db.prepare(CLEAR).bind(k).run());
+        st.rows.delete(k);
+      }
+    return true;
+  }
+  if (!st.rows.has(stampKey)) {
+    await d1(db.prepare(SET_ONCE).bind(stampKey, now).run());
+    st.rows.set(stampKey, { key: stampKey, value: now, updated_at: now });
+  }
+  return false;
 }
 
 async function clearBlocked(db: D1Database, st: FleetState): Promise<void> {
@@ -1144,6 +1185,25 @@ export async function fleetConditions(
           since:
             st.rows.get(`${FLEET_SMOKE_CONFIG_PREFIX}${target}:${unconfigured}`)
               ?.value ?? now,
+        }),
+      );
+    const unverifiedAt =
+      canary !== null &&
+      target !== null &&
+      !st.rows.has(`${FLEET_VERIFIED_PREFIX}${target}`)
+        ? st.rows.get(`${FLEET_UNVERIFIED_PREFIX}${target}`)?.value
+        : undefined;
+    if (
+      target !== null &&
+      unverifiedAt !== undefined &&
+      now - unverifiedAt >= FLEET_BLOCKED_MS
+    )
+      rows.push(
+        row({
+          install_id: canary,
+          code: "platform_unverified",
+          since: unverifiedAt,
+          version: target,
         }),
       );
     if (canary !== null && since !== null && now - since >= fleetBlockedMs(env))

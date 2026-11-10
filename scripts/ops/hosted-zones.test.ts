@@ -159,6 +159,8 @@ describe("hosted-zones.sh", () => {
       expect(r.out).toContain(line);
       expect(r.summary).toContain(line);
     }
+    // Prod keeps signup.<app> on dispatch (#40: the route is staging only).
+    expect(r.out).not.toContain("signup.");
     clean(r);
   });
   it("apply makes exactly the planned writes: 2 records, 6 settings, 6 routes", () => {
@@ -287,6 +289,9 @@ describe("hosted-zones.sh", () => {
     expect(r.out).toContain(
       "route api.open-artifacts-staging.app/* -> oa-s-provisioning: add",
     );
+    expect(r.out).toContain(
+      "route signup.open-artifacts-staging.app/* -> oa-s-provisioning: add",
+    );
   });
 
   describe("billing's webhook route (staging only, state-based, #1568)", () => {
@@ -309,7 +314,7 @@ describe("hosted-zones.sh", () => {
       const apply = setup({}, STG).run("apply", "staging");
       expect(apply.code, apply.err).toBe(0);
       const routes = apply.writes.filter((w) => w.includes("/workers/routes "));
-      expect(routes).toHaveLength(7);
+      expect(routes).toHaveLength(8);
       expect(routes.filter((w) => w.includes("billing"))).toEqual([
         `WRITE POST /zones/${APPZ}/workers/routes {"pattern":"${ROUTE}","script":"oa-s-billing"}`,
       ]);
@@ -337,7 +342,7 @@ describe("hosted-zones.sh", () => {
         if (mode === "apply")
           expect(
             r.writes.filter((w) => w.includes("/workers/routes ")),
-          ).toHaveLength(6);
+          ).toHaveLength(7);
       }
     });
 
@@ -354,6 +359,10 @@ describe("hosted-zones.sh", () => {
               script: r.script.replace("oa-p-", "oa-s-"),
             }),
           ),
+          {
+            pattern: "signup.open-artifacts-staging.app/*",
+            script: "oa-s-provisioning",
+          },
           { pattern: ROUTE, script: "oa-s-billing" },
         ]),
         [`routes-${PAGEZ}.json`]: JSON.stringify([
