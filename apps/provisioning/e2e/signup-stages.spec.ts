@@ -254,7 +254,7 @@ for (const [name, gonesResp] of [
     );
     gone = true;
     await tick(page);
-    await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+    await expect(page.locator("h1")).toHaveText("Choose your address");
   });
 
 test("poll: a 401 goes to sign-in", async ({ page }) => {
