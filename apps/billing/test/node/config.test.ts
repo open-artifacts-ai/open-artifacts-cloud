@@ -61,6 +61,9 @@ describe("wrangler.jsonc", () => {
       // env's own price placeholders; the Stripe key is a secret, never here.
       const up = env.toUpperCase();
       expect(e.vars).toEqual({
+        ...(env === "staging"
+          ? { STAGING_TEST_CLOCK_INSTALLS: "m2-walk" }
+          : {}),
         OA_ENV: env,
         STRIPE_PRICE_TEAM: `{{STRIPE_PRICE_TEAM_${up}}}`,
         STRIPE_PRICE_BUSINESS: `{{STRIPE_PRICE_BUSINESS_${up}}}`,
@@ -103,12 +106,13 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier and 0003_solo_checked_out are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out and 0004_test_clock are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
       "0002_solo_tier.sql",
       "0003_solo_checked_out.sql",
+      "0004_test_clock.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -155,6 +159,16 @@ describe("migrations", () => {
     );
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN solo_checked_out INTEGER;/,
+    );
+  });
+
+  it("0004 adds stripe_test_clock_id to tiers", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0004_test_clock.sql"),
+      "utf8",
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
     );
   });
 
@@ -213,7 +227,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 64 KB per env", () => {
+  it("wrangler deploy --dry-run is under 72 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -221,8 +235,9 @@ describe("bundle", () => {
         .filter((f) => f.endsWith(".js"))
         .reduce((n, f) => n + statSync(join(out, f)).size, 0);
       expect(bytes).toBeGreaterThan(0);
-      // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths.
-      expect(bytes).toBeLessThan(64 * 1024);
+      // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths;
+      // 64 KB until the staging test clocks (the clock call and its gate).
+      expect(bytes).toBeLessThan(72 * 1024);
     }
   });
 });

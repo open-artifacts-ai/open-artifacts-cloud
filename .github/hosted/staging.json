@@ -12,7 +12,7 @@
   "signups_enabled": "test-users",
   "stripe_price_business": "price_1UYx2vJuK8jgC2cZr02sKqwQ",
   "stripe_price_solo_monthly": "price_1UYx2tJuK8jgC2cZS0mg3Uiz",
-  "stripe_price_solo_yearly": "price_1UYx2uJuK8jgC2cZdLlkeOdN",
+  "stripe_price_solo_yearly": "price_1UaImwJuK8jgC2cZKiXgN6nX",
   "stripe_price_team": "price_1UYx2vJuK8jgC2cZAcUMAQpw",
   "welcome_from": "welcome@mail.open-artifacts-staging.app",
   "deploy_token_id": "02543528cc914cbde61db08c45b0b4ee"
