@@ -43,7 +43,8 @@ set -uo pipefail
 # public's release-alert.yml so the two never share a path in the overlay.
 # And the billing database's migration runner for the staging deploy (#1568):
 # a script and its test that public never had (the deploy scripts that call it
-# are in the private list, this pair is not).
+# are in the private list, this pair is not). The same for the platform_verified
+# mark writer (#1229): a script and its test, absent from public's list.
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
@@ -54,6 +55,8 @@ ALLOW=(
   scripts/ci/hosted-release-alert.test.ts
   scripts/ops/billing-db.ts
   scripts/ops/billing-db.test.ts
+  scripts/ops/platform-verified.ts
+  scripts/ops/platform-verified.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

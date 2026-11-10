@@ -96,8 +96,6 @@ scripts/ops/hosted-zones.sh
 scripts/ops/hosted-zones.test.ts
 scripts/ops/platform-db.test.ts
 scripts/ops/platform-db.ts
-scripts/ops/platform-verified.test.ts
-scripts/ops/platform-verified.ts
 scripts/ops/staging-test-admin.test.ts
 scripts/ops/staging-test-admin.ts
 scripts/ops/staging-test-member.test.ts
