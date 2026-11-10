@@ -1005,6 +1005,81 @@ describe("upgrade", () => {
   });
 });
 
+describe("#1106: the test seam that fails an upgrade's health check", () => {
+  const rl = (slug = "rl-seam") =>
+    input(slug, { testHooks: true, bundle: "redline", vars: HOOK_VARS });
+
+  it("on a staging rl- test-hooks install, fails after the upload and stays on `to`", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(rl()));
+    const r = keep(
+      await s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
+    );
+    expect(r).toMatchObject({ ok: false, rolledBack: false, forwardFix: true });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.0",
+      previous_version: "0.23.0",
+      lease: null,
+    });
+    expect(modulesText(s, inst.id)).toContain("0.24.0");
+    const a = s.audit(inst.id);
+    expect(a).toContain("upgrade.failed");
+    expect(a).toContain("upgrade.forward_fix");
+    expect(a).not.toContain("rollback.start");
+    expect(a).not.toContain("upgrade.done");
+  });
+
+  it("is refused, with nothing uploaded, on a non-rl- install", async () => {
+    const s = setup();
+    const inst = keep(
+      await s.p.create(
+        input("redqa", { testHooks: true, bundle: "redline", vars: HOOK_VARS }),
+      ),
+    );
+    const w = s.fake.writes().length;
+    const e = await fails(
+      s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
+    );
+    expect(e).toBeInstanceOf(ProvisionRefused);
+    expect(e.code).toBe("invalid_state");
+    expect(s.fake.writes().length).toBe(w);
+    expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
+  });
+
+  it("is refused on an rl- install without test hooks", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input("rl-plain")));
+    const e = await fails(
+      s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
+    );
+    expect(e).toBeInstanceOf(ProvisionRefused);
+    expect(e.code).toBe("invalid_state");
+    expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
+  });
+
+  it("is refused on prod", async () => {
+    const s = setup({ env: "prod" });
+    const inst = keep(await s.p.create(input("rl-prod")));
+    const e = await fails(
+      s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
+    );
+    expect(e).toBeInstanceOf(ProvisionRefused);
+    expect(e.code).toBe("invalid_state");
+    expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
+  });
+
+  it("without the option an upgrade is unchanged", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(rl()));
+    expect(keep(await s.p.upgrade(inst.id, "0.24.0"))).toMatchObject({
+      ok: true,
+      to: "0.24.0",
+    });
+    expect(s.audit(inst.id)).toContain("upgrade.done");
+  });
+});
+
 async function withGate(v: boolean, fn: () => Promise<void>) {
   const before = G.PROD_UNLOCKED;
   G.PROD_UNLOCKED = v;

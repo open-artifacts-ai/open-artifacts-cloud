@@ -1,3 +1,4 @@
+import { TEST_FAIL_HEALTH_PREFIX } from "@oa/provision/names";
 import {
   ADMIN_TOOL_NAMES,
   JOB_STEPS,
@@ -153,7 +154,11 @@ export type Fault =
   /** After a refused rollback /healthz says ok: false. */
   | "refusal_unhealthy"
   /** After a refused rollback /healthz names the previous release. */
-  | "refusal_old_healthz";
+  | "refusal_old_healthz"
+  /** P52: the failed upgrade leaves the install on the old version. */
+  | "p52_not_forward"
+  /** P52: the failed upgrade fails with another code. */
+  | "p52_wrong_code";
 
 export interface FakeApi {
   fetch: typeof fetch;
@@ -396,7 +401,11 @@ export function fakeApi(): FakeApi {
         i.activeJobId = null;
         // A refused rollback releases the install active (planRollback
         // refuses before the claim); every other failure leaves it failed.
-        if (j.kind !== "rollback" || faults.has("refusal_breaks_install"))
+        // An upgrade_incomplete leaves the install active, on `to` (#1106).
+        if (
+          j.failAt.code !== "upgrade_incomplete" &&
+          (j.kind !== "rollback" || faults.has("refusal_breaks_install"))
+        )
           i.state = "failed";
       }
       audit.push({
@@ -635,7 +644,25 @@ export function fakeApi(): FakeApi {
         const to = (body.version as string | undefined) ?? PLATFORM;
         if (ahead(to)) return err(409, "release_ahead_of_platform");
         if (i.version && to <= i.version) return err(409, "downgrade_refused");
+        // #1106: the provisioner's seam, by request id, on a staging rl- test install.
+        const seam =
+          String(body.requestId ?? "").startsWith(TEST_FAIL_HEALTH_PREFIX) &&
+          i.testHooks &&
+          i.slug.startsWith("rl-");
+        if (seam && !faults.has("p52_not_forward")) {
+          // The upload took: the install is on `to` before the health check fails.
+          i.previousVersion = i.version;
+          i.version = to;
+        }
         const j = startJob(i, "upgrade", p, {
+          failAt: seam
+            ? {
+                step: "health",
+                code: faults.has("p52_wrong_code")
+                  ? "internal"
+                  : "upgrade_incomplete",
+              }
+            : undefined,
           onDone: () => {
             i.previousVersion = i.version;
             i.version = to;

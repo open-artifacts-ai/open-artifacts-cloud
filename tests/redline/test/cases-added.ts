@@ -16,6 +16,11 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/provisioning.test.ts",
       name: "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",
     },
+    // #1106: a failed upgrade stays on the new version (staging proof of the forward-fix leg).
+    {
+      file: "live/provisioning.test.ts",
+      name: "provisioning > P52: a failed upgrade stays forward (#1106): rl-f's health check is failed after the upload, and it stays on the new version",
+    },
     // #1346 role reach, ported with the v0.140.0 pin bump.
     ...[
       "org GET /api/v1/bus/reach [session]",
