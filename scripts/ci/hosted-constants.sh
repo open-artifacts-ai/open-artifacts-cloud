@@ -32,10 +32,11 @@ zone='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
 limit='^[1-9][0-9]{0,8}$'
 google_id='^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$'
 # deploy-platform-worker.sh's cap, onoff (staging also test-users, design v7
-# 7; true needs ALLOW_SIGNUPS there, so it is never a committed constant) and
-# email.
+# 7; staging may commit true, open for the M2 walk (user decision 2026-11-10):
+# the deploy workflow sets ALLOW_SIGNUPS=1 for staging only, prod stays false)
+# and email.
 cap='^[1-9][0-9]{0,3}$'
-if [ "$1" = staging ]; then onoff='^(false|test-users)$'; else onoff='^false$'; fi
+if [ "$1" = staging ]; then onoff='^(false|test-users|true)$'; else onoff='^false$'; fi
 email='^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$'
 lines=""
 # key ENV_NAME rule, one per line.
