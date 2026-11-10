@@ -14,6 +14,7 @@ import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
   CF_429_MAX_WAIT_MS,
+  CF_429_MIN_WAIT_MS,
   cfApiFetch,
   forEachLimit,
   guardProdClean,
@@ -306,11 +307,7 @@ describe("prodClean (spec 2026-10-26)", () => {
   it("a clean prod (signed release, clean install) passes", async () => {
     const w = cleanWorld();
     publish(w, { version: "1.2.3" });
-    expect(await check(w)).toMatchObject({
-      level: "pass",
-      releases: 1,
-      installs: 1,
-    });
+    expect(await check(w)).toEqual({ level: "pass", releases: 1, installs: 1 });
   });
 
   it("a missing bucket fails bucket_missing, never pass", async () => {
@@ -322,11 +319,7 @@ describe("prodClean (spec 2026-10-26)", () => {
   it("configured with an empty bucket and 0 rows passes", async () => {
     const w = cleanWorld();
     w.installs = [];
-    expect(await check(w)).toMatchObject({
-      level: "pass",
-      releases: 0,
-      installs: 0,
-    });
+    expect(await check(w)).toEqual({ level: "pass", releases: 0, installs: 0 });
   });
 
   it("an inventory that is not the installs schema fails inventory_bad", async () => {
@@ -464,7 +457,7 @@ describe("prodClean (spec 2026-10-26)", () => {
           ...bearerOf({ inventory: c.inv }),
         });
         if (want === "pass")
-          expect(await r).toMatchObject({
+          expect(await r).toEqual({
             level: "pass",
             releases: c.bucket === "releases" ? 1 : 0,
             installs: c.rows,
@@ -509,7 +502,7 @@ describe("prodClean (spec 2026-10-26)", () => {
       const w = cleanWorld();
       publish(w, { version: "1.2.3" });
       w.inventoryStalls = 1;
-      expect(await guard(w)).toMatchObject({
+      expect(await guard(w)).toEqual({
         level: "pass",
         releases: 1,
         installs: 1,
@@ -609,7 +602,7 @@ describe("prodClean (spec 2026-10-26)", () => {
       const r = await guardProdClean({ mode: "staging", prod: p }, (x) =>
         prodClean(x, { fetch, pubkey: PUB }),
       );
-      expect(r).toMatchObject({ level: "pass", releases: 1, installs: 1 });
+      expect(r).toEqual({ level: "pass", releases: 1, installs: 1 });
       expect(w.inventoryAuth).toEqual([`Bearer ${JWT}`]);
     });
     it("an explicit opts.inventoryBearer wins over the secrets-dir JWT", async () => {
@@ -691,7 +684,7 @@ describe("prodClean (spec 2026-10-26)", () => {
 
       it("after the prod deploy (#1014): a clean inventory runs for real and passes, no DNS probe", async () => {
         const a = admin({ code: "ENOTFOUND" });
-        expect(await guard(undefined, a)).toMatchObject({
+        expect(await guard(undefined, a)).toEqual({
           level: "pass",
           releases: 0,
           installs: 1,
@@ -821,7 +814,7 @@ describe("prodClean (spec 2026-10-26)", () => {
         w.installs = [row(state, mode)];
         w.healthzStatus = 503;
         w.scriptMissing = true;
-        expect(await check(w)).toMatchObject({
+        expect(await check(w)).toEqual({
           level: "pass",
           releases: 0,
           installs: 1,
@@ -869,7 +862,7 @@ describe("prodClean (spec 2026-10-26)", () => {
     it("clean data passes with no /healthz request, but its script is still read", async () => {
       const w = cleanWorld();
       w.installs = [hostless()];
-      expect(await check(w)).toMatchObject({
+      expect(await check(w)).toEqual({
         level: "pass",
         releases: 0,
         installs: 1,
@@ -1055,7 +1048,7 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
       pubkey: PUB,
       ...bearerOf({}),
     });
-    expect(r).toMatchObject({ level: "pass", releases: 12, installs: 1 });
+    expect(r).toEqual({ level: "pass", releases: 12, installs: 1 });
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(PROD_CLEAN_CONCURRENCY);
     const records = (w.seen ?? [])
@@ -1116,7 +1109,7 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
   });
 });
 
-describe("Cloudflare API requests and 429 (#64)", () => {
+describe("a Cloudflare 429 (#64)", () => {
   const CF = "https://api.cloudflare.com/client/v4/x";
   const res = (status: number, h: Record<string, string> = {}) =>
     new Response("{}", { status, headers: h });
@@ -1130,65 +1123,61 @@ describe("Cloudflare API requests and 429 (#64)", () => {
       (x: unknown) => x,
     );
 
-  it("counts Cloudflare API requests only (retries included), as a plain number", async () => {
-    const w = cleanWorld();
-    publish(w, { version: "1.2.3" });
-    const { fetch } = await serve(w);
-    const r = await prodClean(probe(), {
-      fetch,
-      pubkey: PUB,
-      inventoryBearer: JWT,
-    });
-    const cf = (w.urls ?? []).filter((u) =>
-      u.startsWith("https://api.cloudflare.com/"),
-    ).length;
-    expect(cf).toBeGreaterThan(0);
-    expect((w.urls ?? []).length).toBeGreaterThan(cf);
-    expect(r.cfRequests).toBe(cf);
-    expect(Number.isInteger(r.cfRequests)).toBe(true);
-  });
-
-  it("retryAfterMs reads seconds or a date; nothing else", () => {
+  it("retryAfterMs: digits as seconds or a real HTTP date; nothing else", () => {
     expect(retryAfterMs("3")).toBe(3000);
     expect(retryAfterMs(" 0 ")).toBe(0);
     expect(retryAfterMs(null)).toBeUndefined();
-    expect(retryAfterMs("soon")).toBeUndefined();
-    expect(
-      retryAfterMs(
-        "Wed, 21 Oct 2015 07:28:05 GMT",
-        Date.parse("Wed, 21 Oct 2015 07:28:00 GMT"),
-      ),
-    ).toBe(5000);
+    for (const bad of ["soon", "-5", "1.5", "+2", "1e3", "", "5 s"])
+      expect(retryAfterMs(bad), bad).toBeUndefined();
+    const at = "Wed, 21 Oct 2015 07:28:05 GMT";
+    expect(retryAfterMs(at, Date.parse("Wed, 21 Oct 2015 07:28:00 GMT"))).toBe(
+      5000,
+    );
+    expect(retryAfterMs(at, Date.parse("Thu, 22 Oct 2015 07:28:00 GMT"))).toBe(
+      0,
+    );
   });
 
-  it("a 429 waits Retry-After, retries, and the request counts each time", async () => {
+  it("a 429 waits Retry-After, then retries", async () => {
     const { waited, sleep } = sleeps();
     const answers = [res(429, { "retry-after": "2" }), res(200)];
     const a = cfApiFetch(async () => answers.shift() as Response, { sleep });
     expect((await a.fetch(CF)).status).toBe(200);
     expect(waited).toEqual([2000]);
-    expect(a.requests()).toBe(2);
     expect(a.limited()).toBeUndefined();
   });
 
-  it("without Retry-After it backs off; one wait is capped", async () => {
+  it("every wait is at least 1 s and at most the cap", async () => {
     const { waited, sleep } = sleeps();
-    const answers = [res(429), res(429, { "retry-after": "9999" }), res(200)];
+    const answers = [
+      res(429, { "retry-after": "0" }),
+      res(429, { "retry-after": "-5" }),
+      res(429, { "retry-after": "9999" }),
+      res(200),
+    ];
     const a = cfApiFetch(async () => answers.shift() as Response, {
       sleep,
       waitBudgetMs: 1e9,
     });
     await a.fetch(CF);
-    expect(waited).toEqual([1000, CF_429_MAX_WAIT_MS]);
+    // "0" floors to 1 s; "-5" is no Retry-After, so the backoff (2 s here).
+    expect(waited).toEqual([CF_429_MIN_WAIT_MS, 2000, CF_429_MAX_WAIT_MS]);
+    // No Retry-After: the backoff, from 1 s.
+    const w2 = sleeps();
+    const b = [res(429), res(429), res(200)];
+    await cfApiFetch(async () => b.shift() as Response, {
+      sleep: w2.sleep,
+    }).fetch(CF);
+    expect(w2.waited).toEqual([1000, 2000]);
   });
 
-  it("a request outside the Cloudflare API is not counted or retried", async () => {
-    const { sleep } = sleeps();
+  it("a request outside the Cloudflare API is not retried", async () => {
+    const { waited, sleep } = sleeps();
     const a = cfApiFetch(async () => res(429), { sleep });
     expect((await a.fetch("https://inventory.example/installs")).status).toBe(
       429,
     );
-    expect(a.requests()).toBe(0);
+    expect(waited).toEqual([]);
   });
 
   it("retries out: InfraError, and later Cloudflare requests are refused unsent", async () => {
@@ -1220,10 +1209,31 @@ describe("Cloudflare API requests and 429 (#64)", () => {
     });
     await expect(a.fetch(CF)).rejects.toBeInstanceOf(InfraError);
     expect(waited).toEqual([]);
-    expect(a.requests()).toBe(1);
   });
 
-  it("prodClean with a 429 that never lifts: infra through the guard, not a fail", async () => {
+  it("the read's abort signal ends a 429 wait as infra, not as a timeout", async () => {
+    const ac = new AbortController();
+    // A wait that never ends on its own; the abort must cut it short.
+    const sleep = () => new Promise<void>(() => {});
+    const a = cfApiFetch(async () => res(429, { "retry-after": "5" }), {
+      sleep,
+    });
+    const p = a.fetch(CF, { signal: ac.signal });
+    queueMicrotask(() => ac.abort(new DOMException("t", "TimeoutError")));
+    const e = await p.then(
+      () => null,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect((e as Error).name).not.toBe("TimeoutError");
+    // An already-aborted signal does not start the wait either.
+    const b = cfApiFetch(async () => res(429), { sleep });
+    await expect(
+      b.fetch(CF, { signal: AbortSignal.abort() }),
+    ).rejects.toBeInstanceOf(InfraError);
+  });
+
+  const limitedWorld = async () => {
     const w = cleanWorld();
     publish(w, { version: "1.2.3" });
     const { fetch } = await serve(w);
@@ -1231,6 +1241,11 @@ describe("Cloudflare API requests and 429 (#64)", () => {
       String(i).startsWith("https://api.cloudflare.com/")
         ? Promise.resolve(res(429, { "retry-after": "1" }))
         : fetch(i, init);
+    return { w, limited };
+  };
+
+  it("prodClean with a 429 that never lifts: infra through the guard, not a fail", async () => {
+    const { limited } = await limitedWorld();
     const { waited, sleep } = sleeps();
     const e = await guard(() =>
       prodClean(probe(), {
@@ -1267,7 +1282,32 @@ describe("Cloudflare API requests and 429 (#64)", () => {
       inventoryBearer: JWT,
       sleep,
     });
-    expect(r).toMatchObject({ level: "pass", releases: 1, installs: 1 });
+    expect(r).toEqual({ level: "pass", releases: 1, installs: 1 });
     expect(waited).toEqual([1000]);
+  });
+
+  it("a finding beside a 429 wins; so does a non-verdict fail", async () => {
+    const dirty = new ProdDirty("install_dirty", "x");
+    const unreachable = new ProdDirty("unreachable", "y");
+    const limited = new InfraError("429");
+    const cf0 = new CfError("GET", "/x", 0, "network: InfraError");
+    const run = (errs: unknown[]) =>
+      forEachLimit(
+        errs,
+        errs.length,
+        async (e) => {
+          throw e;
+        },
+        (e) => e instanceof ProdDirty && e.code === "install_dirty",
+      ).then(
+        () => null,
+        (x: unknown) => x,
+      );
+    // Index order must not decide: the 429 comes first every time.
+    expect(await run([limited, dirty])).toBe(dirty);
+    expect(await run([cf0, dirty])).toBe(dirty);
+    expect(await run([limited, unreachable])).toBe(unreachable);
+    expect(await run([cf0, unreachable, dirty])).toBe(dirty);
+    expect(await run([limited, cf0])).toBe(limited);
   });
 });

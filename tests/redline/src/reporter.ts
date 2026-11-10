@@ -6,7 +6,6 @@ import {
   applyManifest,
   buildReport,
   type CaseResult,
-  detailOf,
   failReason,
   formatReport,
   infraOf,
@@ -110,7 +109,6 @@ export function collect(
             }
         : levelOf(state, t.meta(), errors);
       const label = labelOf(t.meta());
-      const detail = detailOf(t.meta());
       const notes = notesOf(t.meta());
       cases.push({
         name: t.fullName,
@@ -118,7 +116,6 @@ export function collect(
         level,
         ...(reason ? { reason } : {}),
         ...(label ? { label } : {}),
-        ...(detail ? { detail } : {}),
         ...(notes.length ? { notes } : {}),
         ...(level === "pass" ? {} : legOf(setupFailed ? setup : errors)),
       });
