@@ -482,13 +482,23 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
     id: InstallId | "-",
     action: string,
     detail: Record<string, string | number> = {},
-  ): Promise<void> {
+    lease?: string,
+  ): Promise<boolean> {
     if (typeof actor !== "string" || actor === "" || actor.length > 300)
       throw new Error("an audit actor is required");
+    if (lease !== undefined) {
+      // #1930: the row lands only while this lease still holds the install.
+      const r = await this.write(
+        "INSERT INTO hosted_audit (at, actor, install_id, action, detail) SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM installs WHERE id = ?3 AND lease = ?6) RETURNING id",
+        [this.now(), actor, id, action, canonicalJson(detail), lease],
+      );
+      return one(r);
+    }
     await this.write(
       "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
       [this.now(), actor, id, action, canonicalJson(detail)],
     );
+    return true;
   }
 
   /**
@@ -577,12 +587,21 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
     id: InstallId,
     action: string,
     detail: Record<string, string | number> = {},
-  ): Promise<void> {
+    lease?: string,
+  ): Promise<boolean> {
     if (this.actor !== null)
-      return this.auditAs(this.actor, id, action, detail);
+      return this.auditAs(this.actor, id, action, detail, lease);
+    if (lease !== undefined) {
+      const r = await this.write(
+        "INSERT INTO hosted_audit (at, install_id, action, detail) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM installs WHERE id = ?2 AND lease = ?5) RETURNING id",
+        [this.now(), id, action, canonicalJson(detail), lease],
+      );
+      return one(r);
+    }
     await this.write(
       "INSERT INTO hosted_audit (at, install_id, action, detail) VALUES (?1, ?2, ?3, ?4)",
       [this.now(), id, action, canonicalJson(detail)],
     );
+    return true;
   }
 }
