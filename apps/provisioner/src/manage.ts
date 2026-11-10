@@ -121,7 +121,7 @@ export type ManageJob = {
     force?: boolean;
     /** upgrade: a person chose to cross a held migration (MIG-2). */
     nonAdditive?: boolean;
-    /** upgrade: the #1106 test seam (request id prefix; staging rl- only). */
+    /** upgrade: the #1106 test seam (request id prefix; staging rl-f- only). */
     testFailCheck?: "health";
     /** redline_creds: the R26 variant (C6 RedlineCredsSchema; never the key). */
     revoke?: boolean;
@@ -687,10 +687,14 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         kind === "upgrade" &&
         job.request_id.startsWith(TEST_FAIL_HEALTH_PREFIX)
       ) {
-        // #1106: the seam only on a staging rl- test-hooks install.
-        if (env !== "staging" || !out.testHooks || !out.slug?.startsWith("rl-"))
+        // #1106: the seam only on a staging rl-f- test-hooks install.
+        if (
+          env !== "staging" ||
+          !out.testHooks ||
+          !out.slug?.startsWith("rl-f-")
+        )
           throw refused(
-            "the failhealth test seam is for staging rl- test installs",
+            "the failhealth test seam is for staging rl-f- test installs",
           );
         out.args.testFailCheck = "health";
       }

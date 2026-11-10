@@ -1006,10 +1006,10 @@ describe("upgrade", () => {
 });
 
 describe("#1106: the test seam that fails an upgrade's health check", () => {
-  const rl = (slug = "rl-seam") =>
+  const rl = (slug = "rl-f-seam") =>
     input(slug, { testHooks: true, bundle: "redline", vars: HOOK_VARS });
 
-  it("on a staging rl- test-hooks install, fails after the upload and stays on `to`", async () => {
+  it("on a staging rl-f- test-hooks install, fails after the upload and stays on `to`", async () => {
     const s = setup();
     const inst = keep(await s.p.create(rl()));
     const r = keep(
@@ -1047,9 +1047,20 @@ describe("#1106: the test seam that fails an upgrade's health check", () => {
     expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
   });
 
-  it("is refused on an rl- install without test hooks", async () => {
+  it("is refused on a shared rl- install that is not rl-f-", async () => {
     const s = setup();
-    const inst = keep(await s.p.create(input("rl-plain")));
+    const inst = keep(await s.p.create(rl("rl-p-seam")));
+    const e = await fails(
+      s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
+    );
+    expect(e).toBeInstanceOf(ProvisionRefused);
+    expect(e.code).toBe("invalid_state");
+    expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
+  });
+
+  it("is refused on an rl-f- install without test hooks", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input("rl-f-plain")));
     const e = await fails(
       s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
     );
@@ -1060,12 +1071,19 @@ describe("#1106: the test seam that fails an upgrade's health check", () => {
 
   it("is refused on prod", async () => {
     const s = setup({ env: "prod" });
-    const inst = keep(await s.p.create(input("rl-prod")));
+    const inst = keep(await s.p.create(input("rl-f-prod")));
+    // Hooks and slug fit, so only the env refuses.
+    s.db()
+      .prepare("UPDATE installs SET test_hooks = 1 WHERE id = ?")
+      .run(inst.id);
+    const w = s.fake.writes().length;
     const e = await fails(
       s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "health" }),
     );
     expect(e).toBeInstanceOf(ProvisionRefused);
     expect(e.code).toBe("invalid_state");
+    expect(e.message).toContain("testFailCheck");
+    expect(s.fake.writes().length).toBe(w);
     expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
   });
 

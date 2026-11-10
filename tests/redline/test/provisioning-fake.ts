@@ -644,11 +644,11 @@ export function fakeApi(): FakeApi {
         const to = (body.version as string | undefined) ?? PLATFORM;
         if (ahead(to)) return err(409, "release_ahead_of_platform");
         if (i.version && to <= i.version) return err(409, "downgrade_refused");
-        // #1106: the provisioner's seam, by request id, on a staging rl- test install.
+        // #1106: the provisioner's seam, by request id, on a staging rl-f- test install.
         const seam =
           String(body.requestId ?? "").startsWith(TEST_FAIL_HEALTH_PREFIX) &&
           i.testHooks &&
-          i.slug.startsWith("rl-");
+          i.slug.startsWith("rl-f-");
         if (seam && !faults.has("p52_not_forward")) {
           // The upload took: the install is on `to` before the health check fails.
           i.previousVersion = i.version;

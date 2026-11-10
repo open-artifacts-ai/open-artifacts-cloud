@@ -414,8 +414,12 @@ describe("upgrade and rollback (5.4)", () => {
         action,
       );
 
-    it("on a staging rl- test-hooks install: upgrade_incomplete, on `to`, forward_fix, no rollback", async () => {
-      const s = await active({ slug: "rl-seam", testHooks: true, version: V1 });
+    it("on a staging rl-f- test-hooks install: upgrade_incomplete, on `to`, forward_fix, no rollback", async () => {
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
       const r = await manage("upgrade", s.installId, {
         args: { from: V1, to: V2 },
         requestId: rid,
@@ -434,7 +438,11 @@ describe("upgrade and rollback (5.4)", () => {
 
     it.each([
       ["a non-rl- install", { slug: "seamco", testHooks: true }],
-      ["an rl- install without test hooks", { slug: "rl-plain" }],
+      [
+        "an rl- install that is not rl-f-",
+        { slug: "rl-a-seam", testHooks: true },
+      ],
+      ["an rl-f- install without test hooks", { slug: "rl-f-plain" }],
     ])("is refused on %s, nothing uploaded", async (_n, seed) => {
       const s = await active({ ...seed, version: V1 });
       const r = await manage("upgrade", s.installId, {
@@ -442,13 +450,36 @@ describe("upgrade and rollback (5.4)", () => {
         requestId: rid,
       });
       expect(r.job).toMatchObject({ status: "failed" });
-      expect(r.job?.error_code).not.toBe("upgrade_incomplete");
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
+      expect(w.install(s.installId)).toMatchObject({ version: V1 });
+      expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
+    });
+
+    it("is refused in prod, even on a test-hooks rl-f- row", async () => {
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
+      (w.ctx.env as { OA_ENV: string }).OA_ENV = "prod";
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: rid,
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
       expect(w.install(s.installId)).toMatchObject({ version: V1 });
       expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
     });
 
     it("an ordinary request id on an rl- install is an ordinary upgrade", async () => {
-      const s = await active({ slug: "rl-seam", testHooks: true, version: V1 });
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
       const r = await manage("upgrade", s.installId, {
         args: { from: V1, to: V2 },
       });

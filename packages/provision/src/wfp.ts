@@ -1051,7 +1051,7 @@ export type UpgradeOptions = {
   /**
    * #1106 test seam: fail the post-upgrade health check after the upload, so
    * the forward-fix path runs for real. Refused unless the env is staging and
-   * the install is an rl- test-hooks install.
+   * the install is an rl-f- test-hooks install.
    */
   testFailCheck?: "health";
 };
@@ -3673,18 +3673,22 @@ export class WfpProvisioner {
         `install ${id} is already at ${to}`,
         "downgrade_refused",
       );
-    await this.storedOf(row, from);
-    const vars = this.currentVars(row);
-    const m = this.renderInputs(row, vars);
     // #1106 test seam: refused before any claim or upload anywhere else.
     if (
       o.testFailCheck !== undefined &&
-      !(this.env === "staging" && m.testHooks && row.slug.startsWith("rl-"))
+      !(
+        this.env === "staging" &&
+        row.test_hooks === 1 &&
+        row.slug.startsWith("rl-f-")
+      )
     )
       throw new ProvisionRefused(
-        "testFailCheck is only for a test-hooks rl- install on staging",
+        "testFailCheck is only for a test-hooks rl-f- install on staging",
         "invalid_state",
       );
+    await this.storedOf(row, from);
+    const vars = this.currentVars(row);
+    const m = this.renderInputs(row, vars);
     const rel = await this.readRelease({
       version: to,
       bundle: m.testHooks ? "redline" : "release",
