@@ -541,6 +541,8 @@ interface Checked {
 }
 
 const SECRET_BYTES = 48;
+/** Release assets fetched and checked at once. */
+const ASSET_READ_CONCURRENCY = 8;
 /** Secrets every install gets in its first upload (TEST_HOOK_KEY added on test installs). */
 export const CREATE_SECRETS = [
   ...KNOWN_SECRETS,
@@ -1072,6 +1074,7 @@ export class WfpProvisioner {
   readonly notes: string[] = [];
   /** Each verified asset's assetHash, by its record sha256 and path. */
   private readonly assetHashes = new Map<string, string>();
+  private readonly assetBytes = new Map<string, Uint8Array>();
   private readonly cf: Cf;
   private readonly env: Env;
   private readonly target: Target;
@@ -1437,7 +1440,7 @@ export class WfpProvisioner {
    * copy checked against the record's size and sha256, so a file changed
    * since an earlier read is refused. Each file's assetHash comes from its
    * verify read: with `verify` (pre-flight, rollback apply) every file is
-   * read and checked now, one at a time, and dropped; without, only a file
+   * read and checked now, 8 at a time, and kept for the upload; without, only a file
    * not verified yet in this run is.
    */
   private async readAssets(
@@ -1461,26 +1464,58 @@ export class WfpProvisioner {
     }
     if (canonicalJson(got) !== canonicalJson(rec.assets))
       this.refuse(rec, "assets", "an extra, missing or changed file");
+    // A verify pass starts from nothing kept: it fetches every file again.
+    if (verify) this.assetBytes.clear();
+    // Every file is fetched and checked once per run: the checked bytes are
+    // kept and are the very bytes the upload sends (the upload still checks
+    // them against the manifest hash).
     const read = async (a: ReleaseAssetEntry) => {
+      const key = `${a.sha256}\0${a.path}`;
+      const kept = this.assetBytes.get(key);
+      if (kept) return kept;
       const bytes = new Uint8Array(
         (await this.o.release.assetBytes(rec.version, rec.variant, a.path)) ??
           [],
       );
       if (bytes.byteLength !== a.size || sha256Hex(bytes) !== a.sha256)
         this.refuse(rec, "assets", `${a.path} changed`);
+      this.assetBytes.set(key, bytes);
       return bytes;
     };
-    const files: AssetFile[] = [];
-    for (const a of rec.assets) {
-      // The hash is of the bytes with this sha256, so it is reused safely.
-      const key = `${a.sha256}\0${a.path}`;
-      let hash = this.assetHashes.get(key);
-      if (verify || hash === undefined) {
-        hash = assetHash(await read(a), a.path);
-        this.assetHashes.set(key, hash);
+    // Reads run ASSET_READ_CONCURRENCY at a time; the error thrown is the
+    // first failing file in manifest order, not the first to finish.
+    const todo = rec.assets.filter(
+      (a) => verify || !this.assetHashes.has(`${a.sha256}\0${a.path}`),
+    );
+    const errors = new Map<number, unknown>();
+    let next = 0;
+    const worker = async () => {
+      while (errors.size === 0 && next < todo.length) {
+        const i = next++;
+        try {
+          const a = todo[i] as ReleaseAssetEntry;
+          this.assetHashes.set(
+            `${a.sha256}\0${a.path}`,
+            assetHash(await read(a), a.path),
+          );
+        } catch (e) {
+          errors.set(i, e);
+        }
       }
-      files.push({ path: a.path, size: a.size, hash, bytes: () => read(a) });
-    }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(ASSET_READ_CONCURRENCY, todo.length) },
+        worker,
+      ),
+    );
+    if (errors.size > 0) throw errors.get(Math.min(...errors.keys()));
+    const files: AssetFile[] = rec.assets.map((a) => ({
+      path: a.path,
+      size: a.size,
+      hash: this.assetHashes.get(`${a.sha256}\0${a.path}`) as string,
+      bytes: () => read(a),
+    }));
     return files;
   }
 
