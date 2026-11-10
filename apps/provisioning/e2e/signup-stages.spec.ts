@@ -15,6 +15,8 @@ type Sc = {
   avail?: string;
   // when set, only these names are free (others read as taken)
   free?: string[];
+  // delay (ms) on the slug-check answers
+  slugDelay?: number;
   createCode?: string;
   path?: string;
   // per-request override of GET /api/v1/signup (n counts calls, from 1)
@@ -78,7 +80,8 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
             }
           : { stage: "none" },
       );
-    if (url.pathname.startsWith("/api/v1/slugs/"))
+    if (url.pathname.startsWith("/api/v1/slugs/")) {
+      if (sc.slugDelay) await new Promise((r) => setTimeout(r, sc.slugDelay));
       return json({
         status: sc.free
           ? sc.free.includes(url.pathname.split("/").pop() ?? "")
@@ -86,6 +89,7 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
             : "taken"
           : (sc.avail ?? "ok"),
       });
+    }
     if (url.pathname === "/api/v1/installs" && req.method() === "POST")
       return json({ error: { code: sc.createCode ?? "forbidden" } }, 403);
     return route.fulfill({ status: 404, body: "" });
@@ -200,15 +204,60 @@ test("poll: notice after 3 failures, cleared on the next success", async ({
   fail = true;
   await tick(page);
   await tick(page);
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("status")).toHaveText("");
   await tick(page);
   await expect(page.getByRole("status")).toHaveText(
     "Can't reach the server. Retrying\u2026",
   );
   fail = false;
   await tick(page);
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("status")).toHaveText("");
 });
+
+test("poll: a 429 counts as a failure and keeps the stage", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let bad = false;
+  await mount(page, {
+    me: true,
+    stage: "queued",
+    signup: () => (bad ? { status: 429 } : creating("queued")),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  bad = true;
+  await tick(page);
+  await tick(page);
+  await tick(page);
+  await expect(page.getByRole("status")).toHaveText(
+    "Can't reach the server. Retrying\u2026",
+  );
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+});
+
+for (const [name, gonesResp] of [
+  ["stage none", { status: 200, body: { stage: "none" } }],
+  ["404", { status: 404 }],
+] as const)
+  test(`poll: ${name} (signup gone) returns to the form`, async ({ page }) => {
+    await page.clock.install();
+    let gone = false;
+    await mount(page, {
+      me: true,
+      stage: "queued",
+      signup: () => (gone ? gonesResp : creating("queued")),
+    });
+    await expect(page.locator("h1")).toHaveText(
+      "Setting up acme.open-artifacts.app",
+    );
+    gone = true;
+    await tick(page);
+    await expect(page.locator("h1")).toHaveText("Choose your address");
+  });
 
 test("poll: a 401 goes to sign-in", async ({ page }) => {
   await page.clock.install();
@@ -335,6 +384,16 @@ test("address step: only free suggestions show, the first is prefilled", async (
   await expect(page.locator(".chip.sel")).toHaveText("ada");
   await page.getByRole("button", { name: "acme-team" }).click();
   await expect(page.locator("#slug")).toHaveValue("acme-team");
+});
+
+test("address step: late suggestions never overwrite what you typed or cleared", async ({
+  page,
+}) => {
+  await mount(page, { me: true, free: ["acme", "ada"], slugDelay: 700 });
+  await page.locator("#slug").fill("mine");
+  await page.locator("#slug").fill("");
+  await expect(page.locator(".chips .chip")).toHaveCount(2);
+  await expect(page.locator("#slug")).toHaveValue("");
 });
 
 test("address step: back keeps you signed in", async ({ page }) => {
