@@ -135,7 +135,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   // checkCreateFields required these for every principal but U.
   const tier: Tier = ss ? env.SELF_SERVE_TIER : (body.tier as Tier);
   const auth = ss
-    ? { providers: ["google"], domains: ss.hd ? [ss.hd] : [] }
+    ? { providers: ["google", "email"], domains: ss.hd ? [ss.hd] : [] }
     : (body.auth as NonNullable<Body["auth"]>);
   const ownerEmail = ss ? ss.email : (body.ownerEmail as string);
   const sendWelcome = ss ? true : body.sendWelcome === true;

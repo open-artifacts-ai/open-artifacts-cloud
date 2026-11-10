@@ -307,7 +307,7 @@ export function seedCreate(w: World, o: CreateSeed) {
   const actor = o.actor ?? (source === "self-serve" ? "user" : "admin");
   const sub = source === "self-serve" ? `sub-${jobId}` : null;
   const vars = o.vars ?? {
-    AUTH_PROVIDERS: "google",
+    AUTH_PROVIDERS: source === "self-serve" ? "google,email" : "google",
     AUTH_DOMAINS: "finqore.test",
     TIER: o.tier ?? "business",
     ...(o.testHooks ? { TEST_DOMAIN: "oa-redline-a.fyi" } : {}),

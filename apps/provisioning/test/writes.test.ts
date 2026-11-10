@@ -604,7 +604,7 @@ describe("R4 self-serve policy (4.2 order)", () => {
       send_welcome: 1,
     });
     expect(JSON.parse(s?.vars as string)).toEqual({
-      AUTH_PROVIDERS: "google",
+      AUTH_PROVIDERS: "google,email",
       AUTH_DOMAINS: "acme.test",
       TIER: "trial",
     });
