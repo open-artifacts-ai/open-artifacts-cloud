@@ -29,7 +29,6 @@ import {
 import { BROKER_GOOGLE_CLIENT_ID } from "./google.js";
 import { matchIdentity } from "./identities.js";
 import { revokeLibraryGrants } from "./oauth/server.js";
-import { REAUTH_MAX_AGE_MS } from "./reauth.js";
 import {
   adminOrigin,
   clearSessionCookie,
@@ -167,7 +166,8 @@ async function start(req: Request, env: Env, d: SigninDeps): Promise<Response> {
     nonce,
     code_challenge: challenge,
     ticket,
-    // The broker sends Google max_age=0; the callback checks auth_time.
+    // The broker sends Google max_age=0, which Google ignores; the callback
+    // trusts the completed flow (state, PKCE, nonce, FLOW_TTL), not auth_time.
     ...(reauth ? { reauth: "1" } : {}),
   }).toString();
   return redirect(u.toString(), 302, [flowCookie(flow)]);
@@ -319,32 +319,30 @@ async function callback(
     return noAccess(env, match, id.sub);
   }
 
-  // A fresh sign-in (R11 purge): Google must have authenticated just now.
-  if (
-    flow.reauth &&
-    !(id.authTime !== null && now - id.authTime <= REAUTH_MAX_AGE_MS)
-  ) {
-    await d.audit(env, {
-      action: "signin.refused",
-      actor: { kind: "signin", email: id.email, sub: id.sub },
-      outcome: "refused",
-      route: "R23",
-      code: "token_invalid",
-      ip,
-      detail: { stage: "auth_time" },
-    });
-    return signInError(env, "expired");
-  }
-
-  // No auth_time: 0, never a recent sign-in, so R11 purge always goes
-  // through /auth/start?reauth=1 (hasRecentAuth).
-  const authAt = id.authTime ?? 0;
+  // A fresh sign-in (R11 purge): the proof is that this interactive flow
+  // just completed (the account chooser from prompt=select_account, a flow
+  // cookie bound by state, PKCE and nonce, inside FLOW_TTL), so authAt is
+  // now. Google ignores max_age, so its auth_time stays at the user's last
+  // real Google login and cannot prove freshness; it is only audited. A
+  // plain sign-in keeps authAt = auth_time (0 when absent), never recent,
+  // so R11 purge always goes through /auth/start?reauth=1 (hasRecentAuth).
+  const authAt = flow.reauth ? now : (id.authTime ?? 0);
   const ok: AuditEntry = {
     action: "signin.ok",
     actor: { kind: "signin", email: id.email, sub: id.sub },
     outcome: "ok",
     route: "R23",
     ip,
+    ...(flow.reauth
+      ? {
+          detail: {
+            auth_time_age_s:
+              id.authTime === null
+                ? null
+                : Math.round((now - id.authTime) / 1000),
+          },
+        }
+      : {}),
   };
   // The session already in the browser (4.5): for the same pair it is kept
   // (reauth moves auth_at), so its tokens and grants stay bound to the sid
