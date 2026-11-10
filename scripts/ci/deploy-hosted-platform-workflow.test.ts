@@ -372,6 +372,8 @@ describe("deploy-hosted-platform.yml", () => {
       "Zones",
       "Scheduler, last",
       "Every platform Worker runs the tag",
+      "Mark the platform verified",
+      "Clear the platform verified marks (break-glass)",
       "The deploy token's expiry",
     ]);
     // One Cloudflare token for everything; the old names are gone.
@@ -739,20 +741,26 @@ describe("deploy-hosted-platform.yml", () => {
       TAG: "${{ inputs.tag }}",
       GH_TOKEN: "${{ github.token }}",
     });
-    // No filter on the target list; only verify_only (it deploys nothing,
-    // it reads prod back) and staging runs skip the gates.
-    expect(g.if).toBe("${{ inputs.env == 'prod' && !inputs.verify_only }}");
-    expect(g.if).not.toContain("targets");
-    const runsFor = (env: string, verify_only: boolean) =>
+    // No filter on a target list, but #1229: a verify_only run with the FULL
+    // list is gated too (it can write the platform_verified mark); a partial
+    // verify_only run (deploys nothing) and staging runs skip the gates.
+    expect(g.if).toBe(
+      `\${{ inputs.env == 'prod' && (!inputs.verify_only || (inputs.targets == '${FULL}' || inputs.targets == '${FULLB}')) }}`,
+    );
+    const runsFor = (env: string, verify_only: boolean, targets = FULL) =>
       new Function(
         "inputs",
         `return (${(g.if as string)
           .replace(/^\$\{\{\s*/, "")
           .replace(/\s*\}\}$/, "")});`,
-      )({ env, verify_only }) as boolean;
+      )({ env, verify_only, targets }) as boolean;
     expect(runsFor("prod", false)).toBe(true);
-    expect(runsFor("prod", true)).toBe(false);
+    expect(runsFor("prod", false, "scheduler")).toBe(true);
+    expect(runsFor("prod", true)).toBe(true);
+    expect(runsFor("prod", true, FULLB)).toBe(true);
+    expect(runsFor("prod", true, "scheduler")).toBe(false);
     expect(runsFor("staging", false)).toBe(false);
+    expect(runsFor("staging", true)).toBe(false);
     const i = (n: string) => steps.indexOf(named(n));
     expect(i("Use main's deploy scripts")).toBeLessThan(
       i("Staging passed this tag"),
@@ -815,6 +823,146 @@ describe("deploy-hosted-platform.yml", () => {
     expect(steps.indexOf(t)).toBeLessThan(
       steps.indexOf(named("The deploy token's expiry")),
     );
+  });
+
+  // #1229: a fleet rollout starts only after the read-back passed.
+  const evalIf = (
+    step: Record<string, any>,
+    inputs: Record<string, unknown>,
+    outcomes: Record<string, string> = {},
+    ok = true,
+  ) =>
+    new Function(
+      "inputs",
+      "steps",
+      "success",
+      "cancelled",
+      `return (${(step.if as string)
+        .replace(/^\$\{\{\s*/, "")
+        .replace(/\s*\}\}$/, "")});`,
+    )(
+      inputs,
+      Object.fromEntries(
+        Object.entries(outcomes).map(([k, v]) => [k, { outcome: v }]),
+      ),
+      () => ok,
+      () => false,
+    ) as boolean;
+  const ran = {
+    deploy: "success",
+    scheduler: "success",
+    platform_tags: "success",
+  };
+
+  it("marks the platform verified only after a green read-back of a full-list run, verify_only included", () => {
+    const m = named("Mark the platform verified");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i("Mark the platform verified")).toBe(
+      i("Every platform Worker runs the tag") + 1,
+    );
+    expect(named("Every platform Worker runs the tag").id).toBe(
+      "platform_tags",
+    );
+    expect(m.run).toBe(
+      'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts mark-verified "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(m.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    // platform-db.ts is already main's copy (the deploy-scripts loop).
+    expect(text).not.toContain("platform-verified");
+    for (const verify_only of [false, true])
+      for (const targets of [FULL, FULLB])
+        expect(evalIf(m, { verify_only, targets }, ran), targets).toBe(true);
+    // A partial list, verify_only or not, never marks.
+    for (const verify_only of [false, true])
+      expect(evalIf(m, { verify_only, targets: "scheduler" }, ran)).toBe(false);
+    // A failed step before it, a failed read-back or a failed gate (success()
+    // is false) means no mark.
+    expect(evalIf(m, { verify_only: false, targets: FULL }, ran, false)).toBe(
+      false,
+    );
+    expect(
+      evalIf(
+        m,
+        { verify_only: false, targets: FULL },
+        {
+          ...ran,
+          platform_tags: "failure",
+        },
+      ),
+    ).toBe(false);
+  });
+
+  it("prod verify_only with the full list runs both staging gates before the mark; partial verify_only runs neither gate nor mark; other runs unchanged", () => {
+    const i = (n: string) => steps.indexOf(named(n));
+    const gates = [
+      named("Staging passed this tag"),
+      named("Staging's smoke is green at or after this tag"),
+    ];
+    const m = named("Mark the platform verified");
+    for (const g of gates) {
+      expect(i(g.name)).toBeLessThan(i("Mark the platform verified"));
+      expect(evalIf(g, { env: "prod", verify_only: true, targets: FULL })).toBe(
+        true,
+      );
+      expect(
+        evalIf(g, { env: "prod", verify_only: true, targets: "zones" }),
+      ).toBe(false);
+      expect(
+        evalIf(g, { env: "prod", verify_only: false, targets: "zones" }),
+      ).toBe(true);
+      expect(
+        evalIf(g, { env: "staging", verify_only: true, targets: FULL }),
+      ).toBe(false);
+    }
+    // A failed gate fails the job: nothing after it runs under success().
+    expect(
+      evalIf(m, { env: "prod", verify_only: true, targets: FULL }, ran, false),
+    ).toBe(false);
+    expect(
+      evalIf(m, { env: "prod", verify_only: true, targets: "zones" }, ran),
+    ).toBe(false);
+  });
+
+  it("a break-glass run that deployed clears every mark after its deploy, whatever the outcome; full and verify_only runs do not", () => {
+    const u = named("Clear the platform verified marks (break-glass)");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i(u.name)).toBeGreaterThan(i("Mark the platform verified"));
+    expect(i(u.name)).toBeGreaterThan(i("Scheduler, last"));
+    expect(u.run).toBe(
+      'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts unmark-verified "$DEPLOY_ENV"',
+    );
+    expect(u.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    const ev = (o: Record<string, unknown>, out: Record<string, string>) =>
+      evalIf(u, o, out, false);
+    const skipped = { deploy: "skipped", scheduler: "skipped" };
+    // Even after a failed step (success() is false here).
+    expect(
+      ev(
+        { verify_only: false, targets: "scheduler" },
+        { deploy: "skipped", scheduler: "failure" },
+      ),
+    ).toBe(true);
+    expect(
+      ev(
+        { verify_only: false, targets: "provisioner,dispatch" },
+        { deploy: "failure", scheduler: "skipped" },
+      ),
+    ).toBe(true);
+    // No deploy step ran, zones only, a full list, or verify_only: untouched.
+    expect(ev({ verify_only: false, targets: "scheduler" }, skipped)).toBe(
+      false,
+    );
+    expect(ev({ verify_only: false, targets: "zones" }, ran)).toBe(false);
+    expect(ev({ verify_only: false, targets: FULL }, ran)).toBe(false);
+    expect(ev({ verify_only: false, targets: FULLB }, ran)).toBe(false);
+    expect(ev({ verify_only: true, targets: "scheduler" }, ran)).toBe(false);
   });
 
   it("passes the repository id for the OIDC principals, and reads back the token's expiry last", () => {
