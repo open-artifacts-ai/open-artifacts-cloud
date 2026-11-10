@@ -73,6 +73,9 @@ describe("src/mcp is only a transport adapter (9A.4)", () => {
   const allowed = (target: string) =>
     target.startsWith("src/mcp/") ||
     target === "src/routes/invoke.ts" ||
+    // The hosted-only tool table (#66): the adapter registers each entry and
+    // holds none of its logic.
+    target === "src/hosted-tools.ts" ||
     target.startsWith("src/auth/");
   // Packages: the tool table (@oa/provisioning-contract) and the MCP SDK.
   const allowedPkg = (spec: string) =>

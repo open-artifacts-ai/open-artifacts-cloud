@@ -419,6 +419,10 @@ case "$target" in
       { echo "can't read provisioning's committed vars" >&2; exit 1; }
     [ "$committed_ids" = false ] || { echo "this tag commits ADMIN_IDENTITIES as a var; it is a secret since #1007: deploy a later tag" >&2; exit 1; }
     need_workers oa-$P-provisioner oa-$P-auth-broker
+    # BILLING (#66, staging only, when the tag declares it): an operator sets
+    # an install's tier through billing's BillingOperatorRpc. Unbound, the tool
+    # answers unavailable, so a tag that declares it must not deploy without it.
+    billing_pre provisioning BillingOperatorRpc
     # Prod, before anything is deployed: the tag's committed vars carry no OIDC
     # principal and no test-users gate (4.4); the read-back checks them again.
     if [ "$env" = prod ]; then
@@ -498,7 +502,8 @@ case "$target" in
     [ -n "$want" ] || { echo "can't read provisioning's committed rate limits" >&2; exit 1; }
     got="$(jq -c '[.result.bindings[] | select(.type == "ratelimit") | {name, namespace_id: (.namespace_id | tostring), limit: .simple.limit, period: .simple.period}] | sort_by(.name)' <<< "$S")"
     [ "$got" = "$want" ] || { echo "rate limits: got $got, want $want" >&2; exit 1; }
-    names_are "$S" "$(jq -r '[.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] | sort | join(",")' <<< "$want")"
+    billing_bound "$S" provisioning BillingOperatorRpc
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }

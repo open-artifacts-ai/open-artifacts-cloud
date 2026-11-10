@@ -5,6 +5,40 @@ import type {
   WorkflowLike,
 } from "@oa/provisioning-contract";
 
+/**
+ * Billing's operator entrypoint (BillingOperatorRpc, #66), as this Worker
+ * sees it: a structural copy of @oa/billing-core's SetTierResult, which this
+ * package does not depend on. Billing never throws for an expected outcome.
+ */
+export type BillingSetTierResult =
+  | {
+      ok: true;
+      tier: "team" | "business" | "solo";
+      status: "active";
+      version: number;
+      updatedAt: number;
+      previous: {
+        tier: string | null;
+        status: string | null;
+        version: number;
+      } | null;
+    }
+  | {
+      ok: false;
+      error:
+        | "bad_install"
+        | "bad_tier"
+        | "unknown_install"
+        | "subscription_active"
+        | "unavailable";
+    };
+export interface BillingOperatorRpc {
+  setTier(
+    install: string,
+    tier: "team" | "business" | "solo",
+  ): Promise<BillingSetTierResult>;
+}
+
 /** The bindings of oa-<p>-provisioning (design v7 2.4, wrangler.jsonc). */
 export interface Env {
   PLATFORM_DB: D1Database;
@@ -15,6 +49,11 @@ export interface Env {
   MANAGE_INSTALL: WorkflowLike;
   /** Entrypoint ProvisionerRpc: exactly three read-only methods (2.6). */
   PROVISIONER: ProvisionerRpc;
+  /**
+   * Billing's operator entrypoint (#66). Staging only for now (prod has no
+   * billing Worker bound anywhere); unbound, set-tier answers `unavailable`.
+   */
+  BILLING?: BillingOperatorRpc;
   /** Broker redeem only (4.3). */
   AUTH_BROKER: Fetcher;
   /** Self-serve producer (post-M1). */

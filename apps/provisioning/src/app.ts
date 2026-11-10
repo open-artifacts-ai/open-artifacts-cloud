@@ -28,8 +28,9 @@ import { limit } from "./limits.js";
 import { handleMcp } from "./mcp/index.js";
 import { isRefusal } from "./principal.js";
 import { refuse } from "./refuse.js";
-import { bodyKeys, invokeRoute } from "./routes/invoke.js";
 import { CLAIM_FREE_PATH, freeClaim } from "./routes/claim-free.js";
+import { bodyKeys, invokeRoute } from "./routes/invoke.js";
+import { SET_TIER_PATH_RE, setTier } from "./routes/set-tier.js";
 import { matchRoute } from "./routes/table.js";
 import { ipKeyOf } from "./services/counters.js";
 
@@ -119,6 +120,12 @@ async function route(
     return claimFreeRoute(req, env, clientIp(req));
   }
 
+  const tierPath = host === "admin" ? SET_TIER_PATH_RE.exec(path) : null;
+  if (tierPath) {
+    if (req.method !== "POST") return methodNotAllowed("POST");
+    return setTierRoute(req, env, clientIp(req), tierPath[1]);
+  }
+
   const m = matchRoute(host, req.method, path);
   if (m)
     return isApiRoute(m.route)
@@ -196,7 +203,43 @@ async function claimFreeRoute(
     const r = await freeClaim(env, p, await readJsonBody(req), ip);
     return new Response(JSON.stringify(r.body), {
       status: r.status,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    });
+  });
+}
+
+/**
+ * Operator-only: set an install's billing tier (#66). Admin host, so Origin
+ * was checked; authn, CSRF and the write limit run here like apiRoute, and
+ * setTier admits an admin session only on this surface (bearers never
+ * authenticate on the admin host).
+ */
+async function setTierRoute(
+  req: Request,
+  env: Env,
+  ip: string,
+  installId: string | undefined,
+): Promise<Response> {
+  const p = await authenticate(req, env, "admin");
+  if (isRefusal(p)) return refuse(env, "auth", p.code, req);
+  const c = checkCsrf(req, env, p);
+  if (c) return refuse(env, "csrf", c.code, req);
+  return guard(async () => {
+    const rl = await limit(env, "write", p.rateKey);
+    if (rl) throw new ApiError(rl.code);
+    const r = await setTier(env, p, installId, await readJsonBody(req), {
+      kind: "http",
+      ip,
+    });
+    return new Response(JSON.stringify(r.body), {
+      status: r.status,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
     });
   });
 }

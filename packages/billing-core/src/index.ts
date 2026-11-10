@@ -5,10 +5,10 @@
 // routes. No Stripe
 // SDK; Stripe test mode only.
 export {
-  cancelSubscription,
   type CheckoutInput,
   type CheckoutTier,
   type CustomerInput,
+  cancelSubscription,
   createCheckoutSession,
   createCustomer,
   createPortalSession,
@@ -25,12 +25,25 @@ export {
   type StripeSession,
 } from "./sessions.js";
 export {
+  SET_TIER_TIERS,
+  type SetTierError,
+  type SetTierPrevious,
+  type SetTierResult,
+  type SetTierTier,
+} from "./set-tier.js";
+export {
   parseSignatureHeader,
   type SignatureCheck,
   STRIPE_TOLERANCE_S,
   signStripePayload,
   verifyStripeSignature,
 } from "./signature.js";
+export {
+  SOLO_START_RETRYABLE,
+  type SoloStartError,
+  type SoloStartResult,
+  type SoloStartView,
+} from "./solo-start.js";
 export {
   changeFor,
   customerOf,
@@ -40,21 +53,16 @@ export {
   handleStripeWebhook,
   MAX_WEBHOOK_BODY,
   type PaidTier,
-  parseEvent,
   type PriceIds,
+  parseEvent,
   pricesOf,
   pruneStripeEvents,
   STRIPE_EVENT_RETENTION_MS,
   type StripeEvent,
+  SUBSCRIPTION_LIVE_SQL,
   statusFromSubscription,
   streamOf,
   type TierStatus,
   tierFromSubscription,
   type WebhookEnv,
 } from "./webhook.js";
-export {
-  SOLO_START_RETRYABLE,
-  type SoloStartError,
-  type SoloStartResult,
-  type SoloStartView,
-} from "./solo-start.js";

@@ -94,7 +94,7 @@ describe("wrangler.jsonc", () => {
         ]);
       });
 
-      it("binds PROVISIONER (ProvisionerRpc) and AUTH_BROKER", () => {
+      it("binds PROVISIONER (ProvisionerRpc) and AUTH_BROKER, and on staging BILLING (BillingOperatorRpc)", () => {
         expect(e.services).toEqual([
           {
             binding: "PROVISIONER",
@@ -102,6 +102,16 @@ describe("wrangler.jsonc", () => {
             entrypoint: "ProvisionerRpc",
           },
           { binding: "AUTH_BROKER", service: `${p}auth-broker` },
+          // Staging only (#66): billing's operator entrypoint; prod has none.
+          ...(env === "staging"
+            ? [
+                {
+                  binding: "BILLING",
+                  service: "oa-s-billing",
+                  entrypoint: "BillingOperatorRpc",
+                },
+              ]
+            : []),
         ]);
       });
 

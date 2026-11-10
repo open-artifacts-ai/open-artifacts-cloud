@@ -241,8 +241,9 @@ const PAID = "tier IN ('solo', 'team', 'business')";
  * or (during the 14-day Business trial) the Solo subscription under it, whose
  * state lives in solo_status.
  */
-const PREV_LIVE =
+export const SUBSCRIPTION_LIVE_SQL =
   "(stripe_subscription_id IS NOT NULL AND ((tier = 'trial' AND coalesce(solo_status, '') IN ('active', 'past_due')) OR (tier IN ('solo', 'team', 'business') AND status IN ('active', 'past_due', 'suspended'))))";
+const PREV_LIVE = SUBSCRIPTION_LIVE_SQL;
 /** The row is live on a Team or Business subscription. */
 const HOLD =
   "(tier IN ('team', 'business') AND stripe_subscription_id IS NOT NULL AND status IN ('active', 'past_due', 'suspended'))";

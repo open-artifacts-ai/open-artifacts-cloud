@@ -350,6 +350,17 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
     entrypoint: "ProvisionerRpc",
   },
   { type: "service", name: "AUTH_BROKER", service: `oa-${p}-auth-broker` },
+  // Staging's tag declares billing's operator entrypoint (#66).
+  ...(p === "s"
+    ? [
+        {
+          type: "service",
+          name: "BILLING",
+          service: "oa-s-billing",
+          entrypoint: "BillingOperatorRpc",
+        },
+      ]
+    : []),
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
   ...[
@@ -398,6 +409,7 @@ NEXT["oa-s-provisioner"] = (() => {
   return JSON.stringify(o);
 })();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
+NEXT["oa-s-provisioning"] = settings(provisioningBindings("s", "staging"));
 
 const ENV = {
   // The put's retry waits (#55) cost nothing here.
@@ -780,6 +792,7 @@ describe("deploy-hosted-platform.sh", () => {
       dispatch: ["oa-s-auth-broker", "oa-s-directory-broker"],
       scheduler: SCHED_DEPS("s").filter((w) => w !== "oa-s-billing"),
       provisioner: [] as string[],
+      provisioning: ["oa-s-provisioner", "oa-s-auth-broker"],
     } as const;
     const APP_CONFIG = (app: string) =>
       app === "scheduler"
@@ -802,8 +815,14 @@ describe("deploy-hosted-platform.sh", () => {
       dispatch: "",
       scheduler: "",
       provisioner: "BillingProvisionerRpc",
+      provisioning: "BillingOperatorRpc",
     } as const;
-    const APPS = ["dispatch", "scheduler", "provisioner"] as const;
+    const APPS = [
+      "dispatch",
+      "scheduler",
+      "provisioner",
+      "provisioning",
+    ] as const;
     // The staging provisioner's verify-only run reads an existing bucket.
     const VERIFY_FILES = { "r2-oa-s-releases": "" };
 
@@ -818,6 +837,9 @@ describe("deploy-hosted-platform.sh", () => {
         expect(staging, app).toMatch(/"service": "oa-s-billing"/);
         expect(/BillingProvisionerRpc/.test(staging), app).toBe(
           app === "provisioner",
+        );
+        expect(/BillingOperatorRpc/.test(staging), app).toBe(
+          app === "provisioning",
         );
         expect(src.slice(src.indexOf('"prod"')), app).not.toMatch(/"BILLING"/);
       }
@@ -916,7 +938,7 @@ describe("deploy-hosted-platform.sh", () => {
           ],
           [
             "wrong entrypoint",
-            `{ "binding": "BILLING", "service": "oa-s-billing", "entrypoint": "${app === "provisioner" ? "Other" : "BillingProvisionerRpc"}" }`,
+            `{ "binding": "BILLING", "service": "oa-s-billing", "entrypoint": "${app === "provisioner" || app === "provisioning" ? "Other" : "BillingProvisionerRpc"}" }`,
           ],
         ] as const) {
           const configs = { [app]: withBilling(APP_CONFIG(app), binding) };
@@ -2505,7 +2527,8 @@ describe("deploy-hosted-platform.sh", () => {
     });
     it("staging: the staging names and OIDC vars, the staging admin origin", () => {
       const s = setup({
-        exists: ["oa-s-provisioner", "oa-s-auth-broker"],
+        // The staging tag declares BILLING (#66), so oa-s-billing must exist.
+        exists: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
         next: {
           "oa-s-provisioning": settings(provisioningBindings("s", "staging")),
         },

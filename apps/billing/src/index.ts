@@ -48,6 +48,10 @@ import {
   expireCheckoutSession,
   handleStripeWebhook,
   pruneStripeEvents,
+  SET_TIER_TIERS,
+  type SetTierError,
+  type SetTierResult,
+  type SetTierTier,
   SOLO_START_RETRYABLE,
   SOLO_TRIAL_DAYS,
   type SoloStartError,
@@ -56,6 +60,7 @@ import {
   StripeApiError,
   type StripeConfig,
   StripeConfigError,
+  SUBSCRIPTION_LIVE_SQL,
 } from "@oa/billing-core";
 import {
   ASSERTION_SKEW_MS,
@@ -803,6 +808,81 @@ async function provisionerSoloStart(
 export class BillingProvisionerRpc extends WorkerEntrypoint<Env> {
   soloStart(install: string): Promise<SoloStartResult> {
     return provisionerSoloStart(this.env, install);
+  }
+}
+
+// An operator comp (#66): the row's tier and status are set, whatever they
+// were, unless a live Stripe subscription owns them (one statement, so a
+// webhook cannot slip between check and write). Trial dates stay (the
+// 14-day Business trial is still used up); the Solo-under-trial and grace
+// state go, as the tier no longer depends on them. A missing row is made.
+const SET_TIER_PREV_SQL =
+  "SELECT tier, status, version FROM tiers WHERE install_id = ?1";
+const SET_TIER_SQL = `INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, ?2, 'active', 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = ?2, status = 'active', grace_until = NULL, solo_status = NULL, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE NOT ${SUBSCRIPTION_LIVE_SQL} RETURNING tier, status, version, updated_at`;
+
+const setTierFail = (error: SetTierError): SetTierResult => ({
+  ok: false,
+  error,
+});
+
+/**
+ * The operator's call (BillingOperatorRpc.setTier), as a module function like
+ * provisionerSoloStart: validates, requires the install in BROKER_REGISTRY,
+ * writes, and answers a result; it never throws.
+ */
+async function operatorSetTier(
+  env: Env,
+  install: unknown,
+  tier: unknown,
+): Promise<SetTierResult> {
+  if (typeof install !== "string" || !INSTALL_ID.test(install))
+    return setTierFail("bad_install");
+  if (!SET_TIER_TIERS.includes(tier as SetTierTier))
+    return setTierFail("bad_tier");
+  const now = Date.now();
+  try {
+    if (!(await lookupInstall(env.BROKER_REGISTRY, install, now)))
+      return setTierFail("unknown_install");
+    const db = env.BILLING_DB;
+    const prev = await db.prepare(SET_TIER_PREV_SQL).bind(install).first<{
+      tier: string | null;
+      status: string | null;
+      version: number;
+    }>();
+    const row = await db
+      .prepare(SET_TIER_SQL)
+      .bind(install, tier, now)
+      .first<{ version: number; updated_at: number }>();
+    if (!row) {
+      console.log("billing set_tier subscription_active", install);
+      return setTierFail("subscription_active");
+    }
+    console.log("billing set_tier", install, tier);
+    return {
+      ok: true,
+      tier: tier as SetTierTier,
+      status: "active",
+      version: row.version,
+      updatedAt: row.updated_at,
+      previous: prev
+        ? { tier: prev.tier, status: prev.status, version: prev.version }
+        : null,
+    };
+  } catch {
+    console.error("billing set_tier db_error", install);
+    return setTierFail("unavailable");
+  }
+}
+
+/**
+ * The Provisioning API's operator RPC (a service binding with
+ * `entrypoint: "BillingOperatorRpc"`): its own entrypoint, so the one Worker
+ * that may comp a tier cannot start a Solo trial and the provisioner cannot
+ * comp. Exactly one method (a test pins the prototype).
+ */
+export class BillingOperatorRpc extends WorkerEntrypoint<Env> {
+  setTier(install: string, tier: SetTierTier): Promise<SetTierResult> {
+    return operatorSetTier(this.env, install, tier);
   }
 }
 
