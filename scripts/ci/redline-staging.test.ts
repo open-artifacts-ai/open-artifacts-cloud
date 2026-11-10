@@ -81,7 +81,12 @@ describe("redline-staging.yml", () => {
     });
     expect(w.on.workflow_dispatch.inputs.tag.required).toBe(true);
     expect(w.permissions).toEqual({ contents: "read" });
-    expect(Object.keys(w.jobs)).toEqual(["platform-tags", "t19", "redline"]);
+    expect(Object.keys(w.jobs)).toEqual([
+      "platform-tags",
+      "t19",
+      "redline",
+      "replay-fixture",
+    ]);
     expect(job.environment).toBe("redline-staging");
     // `actions: read` is for the t19 hand-off (this run's artifacts and jobs).
     expect(job.permissions).toEqual({
@@ -152,12 +157,129 @@ describe("redline-staging.yml", () => {
   });
 
   it("names each run after its tag, the shape staging-first-gate.sh matches", () => {
-    expect(w["run-name"]).toBe("redline-staging ${{ inputs.tag }}");
+    expect(w["run-name"]).toBe(
+      "${{ inputs.make_replay_fixture && 'redline-replay-fixture' || format('redline-staging {0}', inputs.tag) }}",
+    );
     const gateTest = readFileSync(
       join(root, "scripts/ci/staging-first-gate.test.ts"),
       "utf8",
     );
     expect(gateTest).toContain("display_title: `redline-staging ${TAG}`");
+  });
+
+  describe("the replay fixture (#59)", () => {
+    const rf = w.jobs["replay-fixture"];
+    const step = pick(rf.steps, "Make the replay signup");
+
+    it("is a dispatch input that skips the suite jobs and runs only its own job", () => {
+      expect(w.on.workflow_dispatch.inputs.make_replay_fixture).toMatchObject({
+        type: "boolean",
+        default: false,
+      });
+      // t19 and redline need platform-tags, so one skip covers all three.
+      expect(w.jobs["platform-tags"].if).toBe(
+        "${{ !inputs.make_replay_fixture }}",
+      );
+      expect(job.needs).toBe("platform-tags");
+      expect(t19Job.needs).toBe("platform-tags");
+      expect(job.if).toBeUndefined();
+      expect(t19Job.if).toBeUndefined();
+      expect(rf.if).toBe("${{ inputs.make_replay_fixture }}");
+      expect(rf.needs).toBeUndefined();
+    });
+
+    it("runs in the redline-staging Environment with id-token on the job only, no checkout and no secret", () => {
+      expect(rf.environment).toBe("redline-staging");
+      expect(rf.permissions).toEqual({ contents: "read", "id-token": "write" });
+      expect(rf.steps).toHaveLength(1);
+      expect(JSON.stringify(rf)).not.toContain("secrets.");
+      expect(JSON.stringify(rf)).not.toContain("actions/checkout");
+      expect(step.run).toContain('[ "$REF" = refs/heads/main ]');
+    });
+
+    // A fake curl on PATH: answers R4 and R15 and records its stdin config and args.
+    const run = (opts: { r15?: string[]; r4?: number; ref?: string }) => {
+      const tmp = mkdtempSync(join(tmpdir(), "replay-"));
+      const bin = join(tmp, "bin");
+      mkdirSync(bin);
+      const log = join(tmp, "log");
+      writeFileSync(log, "");
+      const seq = join(tmp, "r15");
+      writeFileSync(seq, (opts.r15 ?? ["done"]).join("\n"));
+      const id = "01HZZZZZZZZZZZZZZZZZZZZZZZ";
+      writeFileSync(
+        join(bin, "curl"),
+        `#!/bin/bash
+args="$*"
+out=""; code=200
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift;; esac; shift; done
+cfg=$(cat 2>/dev/null || true)
+echo "$args" >> "${log}"
+echo "CFG: $cfg" >> "${log}"
+case "$args" in
+  *ACTIONS_*|*oidc-req*) echo '{"value":"jwt-secret-xyz"}'; exit 0;;
+  *"-X POST"*) echo '{"job":{"id":"${id}"},"install":{"id":"i"}}' > "$out"; printf '${opts.r4 ?? 202}'; exit 0;;
+  *"/v1/jobs/"*) s=$(head -1 "${seq}"); sed -i.bak 1d "${seq}"; printf '{"status":"%s"}' "$s" > "$out"; printf 200; exit 0;;
+esac
+exit 1
+`,
+        { mode: 0o755 },
+      );
+      const summary = join(tmp, "summary");
+      writeFileSync(summary, "");
+      const r = runBash(step.run, {
+        PATH: `${bin}:${process.env.PATH}`,
+        REF: opts.ref ?? "refs/heads/main",
+        AUDIENCE: "https://api.open-artifacts-staging.app",
+        RUN_ID: "123456789012",
+        RUN_ATTEMPT: "1",
+        RUNNER_TEMP: tmp,
+        GITHUB_STEP_SUMMARY: summary,
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req-tok",
+        ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc-req.invalid/t?x=1",
+        POLL_S: "0",
+      });
+      return {
+        r,
+        id,
+        summary: readFileSync(summary, "utf8"),
+        log: readFileSync(log, "utf8"),
+        tmp,
+      };
+    };
+
+    it("creates once as test user c with the dummy Turnstile token, polls until done, and writes only the job id", () => {
+      const t = run({ r15: ["running", "running", "done"] });
+      expect(t.r.status, t.r.stdout + t.r.stderr).toBe(0);
+      expect(t.summary).toBe(`replaySignupId: ${t.id}\n`);
+      // The mask command is the one line that carries it, by design.
+      expect(
+        t.r.stdout.replace("::add-mask::jwt-secret-xyz", ""),
+      ).not.toContain("jwt-secret-xyz");
+      expect(t.r.stderr).not.toContain("jwt-secret-xyz");
+      expect(t.log).toContain("x-oa-test-user: c");
+      expect(t.log).toContain("XXXX.DUMMY.TOKEN.XXXX");
+      expect(t.log).toContain('"slug":"rl-replay-789012"');
+      expect(t.log.match(/-X POST/g)).toHaveLength(1);
+      // The bearer is on stdin, never in argv.
+      expect(
+        t.log
+          .split("\n")
+          .filter((l) => !l.startsWith("CFG:") && l.includes("jwt-secret-xyz")),
+      ).toEqual([]);
+    });
+
+    it("fails closed: not on main, a refused create, or a failed job writes no id", () => {
+      for (const o of [
+        { ref: "refs/heads/x" },
+        { r4: 409 },
+        { r15: ["failed"] },
+      ]) {
+        const t = run(o);
+        expect(t.r.status).not.toBe(0);
+        expect(t.summary).toBe("");
+      }
+    });
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
@@ -270,8 +392,9 @@ describe("redline-staging.yml", () => {
       const line = readFileSync(ghEnv, "utf8")
         .split("\n")
         .find((l) => l.startsWith("REDLINE_STG_PROVISIONER="));
-      expect(JSON.parse(String(line).slice("REDLINE_STG_PROVISIONER=".length)))
-        .toEqual({ accountId: "x", tokenFile: f });
+      expect(
+        JSON.parse(String(line).slice("REDLINE_STG_PROVISIONER=".length)),
+      ).toEqual({ accountId: "x", tokenFile: f });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -280,7 +403,11 @@ describe("redline-staging.yml", () => {
     try {
       const r = runBash(String(sec.run), { RUNNER_TEMP: t2, ...base });
       expect(r.status).toBe(0);
-      expect(existsSync(join(t2, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN"))).toBe(false);
+      expect(
+        existsSync(
+          join(t2, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN"),
+        ),
+      ).toBe(false);
       const ghEnv = join(t2, "env");
       writeFileSync(ghEnv, "");
       const t = runBash(String(tg.run), {
@@ -292,7 +419,9 @@ describe("redline-staging.yml", () => {
         REDLINE_STG_PROVISIONER_BASE: '{"accountId":"x"}',
       });
       expect(t.status).toBe(0);
-      expect(readFileSync(ghEnv, "utf8")).not.toContain("REDLINE_STG_PROVISIONER=");
+      expect(readFileSync(ghEnv, "utf8")).not.toContain(
+        "REDLINE_STG_PROVISIONER=",
+      );
     } finally {
       rmSync(t2, { recursive: true, force: true });
     }

@@ -53,7 +53,9 @@
 # every job does, t19 included.
 name: redline-staging
 # scripts/ci/staging-first-gate.sh finds this run by the tag in its name.
-run-name: redline-staging ${{ inputs.tag }}
+# A replay-fixture run (make_replay_fixture) is named apart, so the gate and
+# the nightly never take it for a red-line run of the tag.
+run-name: ${{ inputs.make_replay_fixture && 'redline-replay-fixture' || format('redline-staging {0}', inputs.tag) }}
 
 on:
   workflow_dispatch:
@@ -61,6 +63,13 @@ on:
       tag:
         description: "The release under test (vX.Y.Z): rl-a and rl-b are upgraded to it"
         required: true
+      # #59: makes the provisioner probes' replay signup once and runs nothing
+      # else (docs/ops/hosted.md, "Red-line provisioner probes"). The tag is
+      # still required and is ignored.
+      make_replay_fixture:
+        description: "Only make the replay signup as test user c and print its id; run no suite"
+        type: boolean
+        default: false
   # The nightly (redline-nightly.yml). Not a prod gate: the gate reads this
   # file's own runs, event workflow_dispatch, and a called run is neither.
   workflow_call:
@@ -82,6 +91,8 @@ jobs:
   # scripts/ci/platform-tags.sh). Read-only, with main's script and constants
   # and the staging deploy Environment's token; no other job sees it.
   platform-tags:
+    # Skipped in a replay-fixture run, and with it t19 and redline (needs).
+    if: ${{ !inputs.make_replay_fixture }}
     runs-on: ubuntu-latest
     environment: hosted-staging-deploy
     permissions:
@@ -559,3 +570,61 @@ jobs:
         run: |
           echo "the t19 job got no key from this attempt, so T19 did not run against this release: re-run all jobs, not only the failed ones"
           exit 1
+
+  # #59: the replay signup for the provisioner probes, made once. R4 as the
+  # staging test user c (no probe uses it) with the dummy Turnstile token, then
+  # R15 until the job is done. Only the job id (= the signup id) is written, to
+  # the step summary; no other suite runs. The JWT is minted like
+  # staging-test-admin.yml does, and masked.
+  replay-fixture:
+    if: ${{ inputs.make_replay_fixture }}
+    runs-on: ubuntu-latest
+    environment: redline-staging
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 30
+    steps:
+      - name: Make the replay signup
+        env:
+          REF: ${{ github.ref }}
+          # apps/provisioning/wrangler.jsonc env.staging OIDC_AUDIENCE.
+          AUDIENCE: https://api.open-artifacts-staging.app
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set +x
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "dispatch redline-staging on main"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9]{6,20}$ && "$RUN_ATTEMPT" =~ ^[0-9]{1,3}$ ]] || { echo "bad run id"; exit 1; }
+          jwt="$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)"
+          if [ -z "$jwt" ] || [ "$jwt" = null ]; then echo "no OIDC token"; exit 1; fi
+          echo "::add-mask::$jwt"
+          slug="rl-replay-${RUN_ID: -6}"
+          body="$(jq -nc --arg r "rlreplay-${RUN_ID}-${RUN_ATTEMPT}" --arg s "$slug" \
+            '{requestId: $r, slug: $s, turnstile: "XXXX.DUMMY.TOKEN.XXXX"}')"
+          out="$RUNNER_TEMP/replay-out"
+          # The bearer goes in a curl config on stdin, never argv.
+          call() {
+            printf 'header = "Authorization: Bearer %s"\nheader = "x-oa-test-user: c"\n' "$jwt" |
+              curl -sS -K - -o "$out" -w '%{http_code}' --max-time 30 "$@"
+          }
+          code="$(call -X POST -H "content-type: application/json" --data "$body" "$AUDIENCE/v1/installs")"
+          [ "$code" = 202 ] || { echo "R4 create answered $code"; exit 1; }
+          id="$(jq -r '.job.id // empty' "$out")"
+          [[ "$id" =~ ^[0-7][0-9A-HJKMNP-TV-Z]{25}$ ]] || { echo "R4 answered no job id"; exit 1; }
+          # The suite's own bound: 20 minutes (JOB_WITHIN_MS), polled every 3 s.
+          deadline=$(( $(date +%s) + 1200 ))
+          while :; do
+            code="$(call "$AUDIENCE/v1/jobs/$id" || true)"
+            if [ "$code" = 200 ]; then
+              st="$(jq -r '.status // empty' "$out")"
+              [ "$st" != done ] || break
+              [ "$st" != failed ] || { echo "the job failed"; exit 1; }
+            fi
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "the job is not done after 20 minutes"; exit 1; }
+            sleep "${POLL_S:-3}"
+          done
+          rm -f "$out"
+          echo "replaySignupId: $id" >> "$GITHUB_STEP_SUMMARY"
