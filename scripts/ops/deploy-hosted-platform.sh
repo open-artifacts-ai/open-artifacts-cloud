@@ -419,6 +419,31 @@ case "$target" in
       { echo "can't read provisioning's committed vars" >&2; exit 1; }
     [ "$committed_ids" = false ] || { echo "this tag commits ADMIN_IDENTITIES as a var; it is a secret since #1007: deploy a later tag" >&2; exit 1; }
     need_workers oa-$P-provisioner oa-$P-auth-broker
+    # The sign-up steps (#40): staging always; prod only when main's
+    # .github/hosted/prod.json says signup_deploy "on" (hosted-constants.sh
+    # loads it as PROD_SIGNUP_DEPLOY, exactly on or off; unset means off).
+    SKEY="install:i00000signup"
+    SIGNUP_DEPLOY=""
+    if [ "$env" = staging ] || { [ "$env" = prod ] && [ "${PROD_SIGNUP_DEPLOY:-}" = on ]; }; then SIGNUP_DEPLOY=1; fi
+    # Off after on fails closed, before anything changes (verify_only too):
+    # nothing is deleted here. Each leftover is named with its removal.
+    if [ -z "$SIGNUP_DEPLOY" ]; then
+      PW="oa-$P-provisioning"
+      left=""
+      if worker_exists "$PW" && grep -qx SIGNUP_BROKER_KEY <<< "$(secret_names "$PW")"; then
+        left+="  - the secret SIGNUP_BROKER_KEY on $PW: delete it with: wrangler secret delete SIGNUP_BROKER_KEY --name $PW"$'\n'
+      fi
+      rc=0
+      kv_get "$BROKER_REGISTRY_ID" "$SKEY" > /dev/null || rc=$?
+      [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit 1
+      if [ "$rc" -eq 0 ]; then
+        left+="  - the registry entry $SKEY in oa-$P-broker-registry: delete it with: wrangler kv key delete $SKEY --namespace-id $BROKER_REGISTRY_ID --remote"$'\n'
+      fi
+      if [ -n "$left" ]; then
+        printf '%s: signup_deploy is off in .github/hosted/%s.json, but sign-up leftovers exist; refusing. Remove them by hand (and the route signup.%s/* if hosted-zones.sh names it), or set signup_deploy to on:\n%s' "$PW" "$env" "$ZONE" "$left" >&2
+        exit 1
+      fi
+    fi
     # BILLING (#66, staging only, when the tag declares it): an operator sets
     # an install's tier through billing's BillingOperatorRpc. Unbound, the tool
     # answers unavailable, so a tag that declares it must not deploy without it.
@@ -485,14 +510,10 @@ case "$target" in
     # Every deploy: the list can change, and the deployed value can't be read.
     printf '%s' "$ADMIN_IDENTITIES" | put_secret "$W" provisioning ADMIN_IDENTITIES
     # The sign-up host's broker key (signup.<app>, cloud #35, #40): staging,
-    # and prod only with PROD_SIGNUP_DEPLOY=1 (the workflow sets it from the
-    # repo variable of the same name being "on"; off by default). Made like the
-    # admin's (entry first, a failed put deletes it). Without it prod gets none:
-    # its sign-in stays unavailable (503) and its sign-ups stay closed.
-    SKEY="install:i00000signup"
+    # and prod only with signup_deploy "on" (SIGNUP_DEPLOY, set above). Made like
+    # the admin's (entry first, a failed put deletes it). Without it prod gets
+    # none: its sign-in stays unavailable (503) and its sign-ups stay closed.
     SIGNUP_KEY_WANTED=""
-    SIGNUP_DEPLOY=""
-    if [ "$env" = staging ] || { [ "$env" = prod ] && [ "${PROD_SIGNUP_DEPLOY:-}" = 1 ]; }; then SIGNUP_DEPLOY=1; fi
     if [ -n "$SIGNUP_DEPLOY" ]; then
       SIGNUP_KEY_WANTED=1
       rc=0

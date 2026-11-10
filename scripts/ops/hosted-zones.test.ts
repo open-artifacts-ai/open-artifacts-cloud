@@ -159,16 +159,17 @@ describe("hosted-zones.sh", () => {
       expect(r.out).toContain(line);
       expect(r.summary).toContain(line);
     }
-    // Prod keeps signup.<app> on dispatch (#40: off unless PROD_SIGNUP_DEPLOY=1).
+    // Prod keeps signup.<app> on dispatch (#40: off unless signup_deploy is on).
     expect(r.out).not.toContain("signup.");
     clean(r);
   });
-  it("prod: the signup route is planned and added only with PROD_SIGNUP_DEPLOY=1 (#40)", () => {
+  it("prod: the signup route is planned and added only with PROD_SIGNUP_DEPLOY=on (#40)", () => {
     const line = "route signup.open-artifacts.app/* -> oa-p-provisioning: add";
     for (const extra of [
       {},
       { PROD_SIGNUP_DEPLOY: "" },
-      { PROD_SIGNUP_DEPLOY: "on" },
+      { PROD_SIGNUP_DEPLOY: "off" },
+      { PROD_SIGNUP_DEPLOY: "1" },
     ]) {
       const r = setup().run("apply", "prod", extra);
       expect(r.code, r.err).toBe(0);
@@ -177,12 +178,33 @@ describe("hosted-zones.sh", () => {
         r.writes.filter((w) => w.includes("/workers/routes ")),
       ).toHaveLength(6);
     }
-    const on = setup().run("apply", "prod", { PROD_SIGNUP_DEPLOY: "1" });
+    const on = setup().run("apply", "prod", { PROD_SIGNUP_DEPLOY: "on" });
     expect(on.code, on.err).toBe(0);
     expect(on.out).toContain(line);
     expect(
       on.writes.filter((w) => w.includes("/workers/routes ")),
     ).toHaveLength(7);
+  });
+  it("prod with signup_deploy off and a leftover signup route: refused naming the switch, nothing written (#40)", () => {
+    const files = {
+      ...DONE,
+      [`routes-${APPZ}.json`]: JSON.stringify([
+        ...JSON.parse(DONE[`routes-${APPZ}.json`] as string),
+        {
+          pattern: "signup.open-artifacts.app/*",
+          script: "oa-p-provisioning",
+        },
+      ]),
+    };
+    for (const mode of ["plan", "apply"]) {
+      const r = setup(files).run(mode, "prod", { PROD_SIGNUP_DEPLOY: "off" });
+      expect(r.code, mode).toBe(1);
+      expect(r.err).toContain("signup_deploy is off");
+      expect(r.err).toContain("remove the route by hand");
+      expect(r.writes).toEqual([]);
+    }
+    const on = setup(files).run("plan", "prod", { PROD_SIGNUP_DEPLOY: "on" });
+    expect(on.code, on.err).toBe(0);
   });
   it("apply makes exactly the planned writes: 2 records, 6 settings, 6 routes", () => {
     const r = setup().run("apply");

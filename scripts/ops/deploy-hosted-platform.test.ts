@@ -2130,11 +2130,13 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.out).toContain("prod provisioning: deployed and verified");
       clean(r);
     });
-    it("prod sign-up steps are off by default: PROD_SIGNUP_DEPLOY unset, empty or anything but 1 leaves no entry, key or sitekey (#40)", () => {
+    it("prod sign-up steps are off by default: PROD_SIGNUP_DEPLOY unset, empty or anything but exactly on leaves no entry, key or sitekey (#40)", () => {
       for (const extra of [
         {},
         { PROD_SIGNUP_DEPLOY: "" },
-        { PROD_SIGNUP_DEPLOY: "on" },
+        { PROD_SIGNUP_DEPLOY: "off" },
+        { PROD_SIGNUP_DEPLOY: "1" },
+        { PROD_SIGNUP_DEPLOY: "ON" },
       ]) {
         const r = setup({ exists: brokers }).run("provisioning", extra);
         expect(r.code, r.err).toBe(0);
@@ -2147,7 +2149,7 @@ describe("deploy-hosted-platform.sh", () => {
         expect(r.out).toContain("no SIGNUP_BROKER_KEY on prod");
       }
     });
-    it("PROD_SIGNUP_DEPLOY=1: prod does what staging does, with the oa-p-turnstile sitekey (#40)", () => {
+    it("PROD_SIGNUP_DEPLOY=on: prod does what staging does, with the oa-p-turnstile sitekey (#40)", () => {
       const r = setup({
         exists: brokers,
         files: {
@@ -2156,7 +2158,7 @@ describe("deploy-hosted-platform.sh", () => {
             { name: "oa-p-turnstile", sitekey: "0x4AAAAAAAprod_key-1" },
           ]),
         },
-      }).run("provisioning", { PROD_SIGNUP_DEPLOY: "1" });
+      }).run("provisioning", { PROD_SIGNUP_DEPLOY: "on" });
       expect(r.code, r.err).toBe(0);
       const sp = r.writes.find((w) =>
         w.includes("/values/install:i00000signup "),
@@ -2172,6 +2174,64 @@ describe("deploy-hosted-platform.sh", () => {
       ]);
       expect(r.out).toContain("prod provisioning: deployed and verified");
       clean(r);
+    });
+    describe("signup_deploy off after on: each leftover fails closed, names its removal, deletes nothing (#40)", () => {
+      const SKEY = "install:i00000signup";
+      const signupEntry = JSON.stringify({
+        installId: "i00000signup",
+        origin: "https://signup.open-artifacts.app",
+        keys: [{ kid: "k".repeat(16), x: "x".repeat(43) }],
+        domains: [],
+      });
+      const cases: [string, Record<string, string>, string[], string, string][] = [
+        [
+          "the SIGNUP_BROKER_KEY secret",
+          live,
+          [...liveSecrets["oa-p-provisioning"], "SIGNUP_BROKER_KEY"],
+          "wrangler secret delete SIGNUP_BROKER_KEY --name oa-p-provisioning",
+          SKEY,
+        ],
+        [
+          "the install:i00000signup registry entry",
+          { ...live, [`kv-${REG}-${SKEY}`]: signupEntry },
+          liveSecrets["oa-p-provisioning"],
+          `wrangler kv key delete ${SKEY} --namespace-id ${REG}`,
+          "SIGNUP_BROKER_KEY on",
+        ],
+      ];
+      for (const [name, files, secrets, hint, other] of cases) {
+        for (const extra of [{}, { VERIFY_ONLY: "1" }]) {
+          it(`${name}${extra.VERIFY_ONLY ? " (verify only)" : ""}`, () => {
+            const r = setup({
+              exists: [...brokers, "oa-p-provisioning"],
+              files,
+              secrets: { "oa-p-provisioning": secrets },
+            }).run("provisioning", { PROD_SIGNUP_DEPLOY: "off", ...extra });
+            expect(r.code).toBe(1);
+            expect(r.err).toContain("signup_deploy is off");
+            expect(r.err).toContain(hint);
+            expect(r.err).not.toContain(other);
+            expect(r.writes).toEqual([]);
+            expect(r.log.some((l) => l.startsWith("wrapper "))).toBe(false);
+            expect(puts(r.log)).toEqual([]);
+          });
+        }
+      }
+      it("both at once are both named", () => {
+        const r = setup({
+          exists: [...brokers, "oa-p-provisioning"],
+          files: { ...live, [`kv-${REG}-${SKEY}`]: signupEntry },
+          secrets: {
+            "oa-p-provisioning": [
+              ...liveSecrets["oa-p-provisioning"],
+              "SIGNUP_BROKER_KEY",
+            ],
+          },
+        }).run("provisioning", { PROD_SIGNUP_DEPLOY: "off" });
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("wrangler secret delete SIGNUP_BROKER_KEY");
+        expect(r.err).toContain("wrangler kv key delete");
+      });
     });
     it("a rerun writes nothing but the admin list; a missing entry gets a new key, entry first", () => {
       const again = setup({

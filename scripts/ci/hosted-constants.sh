@@ -17,6 +17,11 @@
 # as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS, STRIPE_PRICE_SOLO_MONTHLY and
 # STRIPE_PRICE_SOLO_YEARLY, each a price id. Prod's file must hold no stripe_*
 # key (prod has no billing Worker, and no Stripe value reaches its run).
+# PROD ONLY (#40): signup_deploy, exactly "on" or "off" (case-sensitive, a
+# string), loads as PROD_SIGNUP_DEPLOY: prod's sign-up steps (the signup.<app>
+# route, the i00000signup registry entry, SIGNUP_BROKER_KEY and
+# TURNSTILE_SITEKEY). Committed "off"; going live is a reviewed PR. Staging's
+# file must not hold it (staging always does the steps).
 # Usage: scripts/ci/hosted-constants.sh staging|prod <dir>
 set -euo pipefail
 
@@ -74,6 +79,14 @@ LIST
 else
   [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
     { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }
+fi
+if [ "$1" = prod ]; then
+  sd="$(jq -r '.signup_deploy | if type == "string" then . else "" end' "$file")" || exit 1
+  [ "$sd" = on ] || [ "$sd" = off ] || { echo "$file: signup_deploy must be exactly \"on\" or \"off\"" >&2; exit 1; }
+  lines+="PROD_SIGNUP_DEPLOY=$sd"$'\n'
+else
+  [ "$(jq -r 'has("signup_deploy")' "$file")" = false ] ||
+    { echo "$file: staging holds no signup_deploy (it always does the sign-up steps)" >&2; exit 1; }
 fi
 owner=""
 if [ -n "${OA_OWNER_EMAIL:-}" ]; then
