@@ -70,6 +70,18 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .dot.now{border-color:var(--accent);border-top-color:transparent;animation:spin 1s linear infinite}
 .dot.wait{border-color:var(--warn);border-style:dashed}
 .dot.fail{background:var(--danger);border-color:var(--danger);color:var(--accent-text)}
+.stepbar{display:flex;gap:6px;margin-bottom:18px}
+.stepbar i{flex:1;height:3px;border-radius:2px;background:var(--divider)}
+.stepbar i.on{background:var(--accent)}
+.who .av{width:24px;height:24px;border-radius:50%;background:#1e7a5a;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
+.who .wt{flex:1;min-width:0}
+.panel .lead{color:var(--text2);margin:8px 0 0}
+.help.ok{display:flex;align-items:center;gap:6px}
+.help svg{width:14px;height:14px;flex:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.chip{border:1px solid var(--border);border-radius:99px;padding:3px 11px;font:inherit;font-size:13px;background:var(--surface);color:var(--text);cursor:pointer}
+.chip.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-fg)}
+.back{margin-top:12px;display:flex;margin-inline:auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.dot.now{animation:none}}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
