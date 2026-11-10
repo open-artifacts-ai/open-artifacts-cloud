@@ -279,7 +279,8 @@ async function checkFloor(
  * not by RELEASE_PUBKEY[env], another env, version or variant, redline for
  * prod, a tar with anything but plain regular files, a file set other than
  * exactly the record's, a version under the floor, and a version that is
- * already published (its record exists). A partial version (objects present
+ * already published with anything different (its record exists; an identical
+ * release is a no-op success, status "already-published"). A partial version (objects present
  * and byte-identical to the tar, no record) is resumed; any other object
  * there is refused. A 412 on a create-once PUT (the object appeared since the
  * listing, or a lost reply of our own write) is accepted only when the object
@@ -293,7 +294,12 @@ export async function publishRelease(o: {
   env: Env;
   version: string;
   files: { tar: Uint8Array; sig: Uint8Array };
-}): Promise<{ variant: BundleVariant; keys: string[] }> {
+}): Promise<{
+  variant: BundleVariant;
+  keys: string[];
+  /** "already-published": the identical release was there; nothing written. */
+  status?: "published" | "already-published";
+}> {
   const { cf, env, version } = o;
   const bucket = bucketOf(env);
   const r2 = assertProbed(o.r2, env);
@@ -405,10 +411,36 @@ export async function publishRelease(o: {
   // a byte-identical object of this tar (a resumed partial publish).
   const prefix = releaseKey(version, variant, "");
   const present = await listAll(cf, bucket, prefix, ASSET_LIMITS.files + 2000);
-  if (present.some((x) => x.name === RECORD_FILE))
-    throw new PublishRefused(
-      `release ${version} (${variant}) is already published to ${bucket}; a version is never overwritten`,
+  if (present.some((x) => x.name === RECORD_FILE)) {
+    // A record means published. Succeed as a no-op only when every object
+    // there is byte-identical to this tar's files and the record to the
+    // record this publish would write: same names, none extra, none missing.
+    const want = new Map<string, Uint8Array>(
+      files.map((f) => [f.path, f.bytes]),
     );
+    want.set(RECORD_FILE, o.files.sig);
+    let identical = present.length === want.size;
+    for (const x of present) {
+      if (!identical) break;
+      const b = want.get(x.name);
+      if (!b || x.size !== b.length) {
+        identical = false;
+        break;
+      }
+      // null is not-found (differs); any other error (transient, auth) throws.
+      const cur = await r2.get(x.key, { maxBytes: b.length });
+      if (!cur || !same(cur.bytes, b)) identical = false;
+    }
+    if (!identical)
+      throw new PublishRefused(
+        `release ${version} (${variant}) is already published to ${bucket} and differs from this tar; a version is never overwritten`,
+      );
+    return {
+      variant,
+      keys: [...want.keys()].sort().map((n) => prefix + n),
+      status: "already-published",
+    };
+  }
   const byName = new Map(files.map((f) => [f.path, f]));
   const done = new Set<string>();
   for (const x of present) {
@@ -454,7 +486,7 @@ export async function publishRelease(o: {
     "with another record (already published)",
   );
   keys.push(prefix + RECORD_FILE);
-  return { variant, keys };
+  return { variant, keys, status: "published" };
 }
 
 /**
