@@ -7,6 +7,8 @@
 #   routes: *.<app>/* and *.<page>/* -> oa-<p>-dispatch; auth.<app>/* ->
 #           oa-<p>-auth-broker; directory.<app>/* -> oa-<p>-directory-broker;
 #           admin.<app>/* and api.<app>/* -> oa-<p>-provisioning
+#   signup.<app>/* -> oa-<p>-provisioning: staging, and prod only with
+#           signup_deploy on (#40)
 #   staging only (#1568), while oa-s-billing EXISTS: the exact route
 #           billing.<app>/stripe/webhook -> oa-s-billing (Stripe's webhook). It is
 #           state-based, never keyed on a target list: with the Worker deployed
@@ -106,9 +108,13 @@ SETTINGS=('ssl:"strict"' 'always_use_https:"on"' 'min_tls_version:"1.2"')
 ROUTES=("$APP_ZONE auth.$APP/* oa-$P-auth-broker" "$APP_ZONE directory.$APP/* oa-$P-directory-broker"
   "$APP_ZONE *.$APP/* oa-$P-dispatch" "$PAGE_ZONE *.$PAGE/* oa-$P-dispatch"
   "$APP_ZONE admin.$APP/* oa-$P-provisioning" "$APP_ZONE api.$APP/* oa-$P-provisioning")
-# Staging only (#40): the sign-up host, to the provisioning Worker. Prod keeps
-# signup.<app> on dispatch until it is opened by a separate change.
-[ "$env" != staging ] || ROUTES+=("$APP_ZONE signup.$APP/* oa-$P-provisioning")
+# The sign-up host, to the provisioning Worker (#40): staging, and prod only
+# with signup_deploy "on" in prod.json (PROD_SIGNUP_DEPLOY=on, from
+# hosted-constants.sh; off by default). Otherwise prod keeps signup.<app> on
+# dispatch, and an existing signup route is refused below, naming the switch.
+if [ "$env" = staging ] || { [ "$env" = prod ] && [ "${PROD_SIGNUP_DEPLOY:-}" = on ]; }; then
+  ROUTES+=("$APP_ZONE signup.$APP/* oa-$P-provisioning")
+fi
 # Staging only (#1568), while oa-s-billing exists: Stripe's webhook, one exact
 # path, to the billing Worker. The wildcard AAAA above already makes
 # billing.<app> resolve, and an exact pattern beats *.<app>/* (dispatch) for it;
@@ -179,7 +185,11 @@ inspect() {
         [ "$rz" = "$zid" ] || continue
         # shellcheck disable=SC2053 # $pat is a glob on purpose
         if [[ "$foreign" == $pat ]]; then
-          echo "route $foreign is not ours but matches $pat; refusing" >&2
+          if [ "$foreign" = "signup.$APP/*" ] && [ "$env" = prod ]; then
+            echo "route $foreign exists, but signup_deploy is off in .github/hosted/prod.json (it was on): remove the route by hand (dashboard > $APP > Workers Routes), or set signup_deploy to on; refusing" >&2
+          else
+            echo "route $foreign is not ours but matches $pat; refusing" >&2
+          fi
           exit 1
         fi
       done

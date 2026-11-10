@@ -61,7 +61,9 @@ const brokerPin = (env: string): string => {
 
 describe(".github/hosted/<env>.json", () => {
   it("prod and staging hold the same keys; staging adds billing's four price ids, prod holds none", () => {
-    expect(Object.keys(read("prod")).sort()).toEqual(KEYS);
+    expect(Object.keys(read("prod")).sort()).toEqual(
+      [...KEYS, "signup_deploy"].sort(),
+    );
     expect(Object.keys(read("staging")).sort()).toEqual(
       [...KEYS, ...STRIPE_KEYS].sort(),
     );
@@ -234,6 +236,7 @@ describe("hosted-constants.sh", () => {
         "SIGNUP_DAILY_CAP=50",
         "SIGNUPS_ENABLED=false",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
+        "PROD_SIGNUP_DEPLOY=off",
         "ALERT_TO=me@test.invalid",
         "",
       ].join("\n"),
@@ -259,7 +262,10 @@ describe("hosted-constants.sh", () => {
       expect(r.code, r.err).toBe(0);
       const lines = readFileSync(ghEnv, "utf8").split("\n");
       expect(lines).toHaveLength(
-        LOADED.length + (env === "staging" ? STRIPE_KEYS.length : 0) + 1,
+        LOADED.length +
+          (env === "staging" ? STRIPE_KEYS.length : 0) +
+          (env === "prod" ? 1 : 0) +
+          1,
       );
     }
   });
@@ -346,6 +352,42 @@ describe("hosted-constants.sh", () => {
     expect(bad.ghEnv).toBe("");
   });
 
+  it("prod commits signup_deploy off; it loads as PROD_SIGNUP_DEPLOY, exactly on or off, prod only (#40)", () => {
+    expect(read("prod").signup_deploy).toBe("off");
+    const off = load(PROD());
+    expect(off.code, off.err).toBe(0);
+    expect(off.ghEnv).toContain("PROD_SIGNUP_DEPLOY=off\n");
+    const on = load({ ...PROD(), signup_deploy: "on" });
+    expect(on.code, on.err).toBe(0);
+    expect(on.ghEnv).toContain("PROD_SIGNUP_DEPLOY=on\n");
+    for (const v of [
+      "ON",
+      "On",
+      "true",
+      "1",
+      "yes",
+      " on",
+      "on ",
+      "",
+      null,
+      true,
+      1,
+    ]) {
+      const r = load({ ...PROD(), signup_deploy: v });
+      expect(r.code, JSON.stringify(v)).toBe(1);
+      expect(r.err).toContain('signup_deploy must be exactly "on" or "off"');
+      expect(r.ghEnv).toBe("");
+    }
+    const { signup_deploy: _, ...missing } = PROD();
+    expect(load(missing).code).toBe(1);
+    const st = load({ ...read("staging"), signup_deploy: "on" }, "staging");
+    expect(st.code).toBe(1);
+    expect(st.err).toContain("staging holds no signup_deploy");
+    expect(load(read("staging"), "staging").ghEnv).not.toContain(
+      "PROD_SIGNUP_DEPLOY",
+    );
+  });
+
   it("SIGNUPS_ENABLED test-users loads for staging only", () => {
     const st = load(
       { ...read("staging"), signups_enabled: "test-users" },
@@ -353,7 +395,10 @@ describe("hosted-constants.sh", () => {
     );
     expect(st.code, st.err).toBe(0);
     expect(st.ghEnv).toContain("SIGNUPS_ENABLED=test-users\n");
-    const open = load({ ...read("staging"), signups_enabled: "true" }, "staging");
+    const open = load(
+      { ...read("staging"), signups_enabled: "true" },
+      "staging",
+    );
     expect(open.code, open.err).toBe(0);
     expect(open.ghEnv).toContain("SIGNUPS_ENABLED=true\n");
     expect(
