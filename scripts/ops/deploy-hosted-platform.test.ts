@@ -474,7 +474,12 @@ const SCHED_CONFIG = pinned(REAL_SCHED) ? REAL_SCHED : F915;
 /** The repo's deploy script and wrangler-env.ts beside these app configs (app -> wrangler.jsonc). */
 const tree = (configs: Record<string, string>) => {
   const t = mkdtempSync(join(tmpdir(), "oa-hosted-tree-"));
-  for (const f of ["deploy-hosted-platform.sh", "wrangler-env.ts"])
+  for (const f of [
+    "deploy-hosted-platform.sh",
+    "wrangler-env.ts",
+    // The provisioning target mints its admin broker key with it.
+    "broker-key.ts",
+  ])
     write(
       join(t, "scripts/ops", f),
       readFileSync(join(root, "scripts/ops", f), "utf8"),
@@ -875,11 +880,13 @@ describe("deploy-hosted-platform.sh", () => {
       it(`${app}, an older tag with no BILLING in its wrangler: no oa-s-billing needed, deploys and verifies; a BILLING binding the tag did not declare fails`, () => {
         const configs = { [app]: withoutBilling(APP_CONFIG(app)) };
         // oa-s-billing does not exist, and none is asked for.
+        // The provisioning target also needs its OAuth KV namespace id.
+        const extra = app === "provisioning" ? { NEW_KV: OAUTH } : {};
         const ok = setup({
           configs,
           exists: DEPS[app],
           next: { [`oa-s-${app}`]: liveWithout(`oa-s-${app}`) },
-        }).run(app, {}, "staging");
+        }).run(app, extra, "staging");
         expect(ok.err, app).toBe("");
         expect(ok.code, app).toBe(0);
         expect(ok.log.some((l) => l.startsWith(`wrapper ${app} staging`))).toBe(
@@ -888,47 +895,53 @@ describe("deploy-hosted-platform.sh", () => {
         // A live BILLING the tag never declared is not tolerated either.
         const bound = setup({ configs, exists: DEPS[app] }).run(
           app,
-          {},
+          extra,
           "staging",
         );
         expect(bound.code, app).toBe(1);
         expect(bound.err).toContain(`${app} BILLING binding: got`);
       });
 
-      it(`${app}, verify only: a tag that declares it needs it live; an older one needs none`, () => {
-        // Verify only reads the live Worker (its settings file), deploys nothing.
-        const base = {
-          exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
-          queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
-        };
-        const live = setup({ ...base, files: VERIFY_FILES }).run(
-          app,
-          { VERIFY_ONLY: "1" },
-          "staging",
-        );
-        expect(live.code, `${app} ${live.err}`).toBe(0);
-        expect(noDeploy(live.log)).toEqual([]);
-        const missing = setup({
-          ...base,
-          files: {
-            ...VERIFY_FILES,
-            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
-          },
-        }).run(app, { VERIFY_ONLY: "1" }, "staging");
-        expect(missing.code, app).toBe(1);
-        expect(missing.err).toContain(`${app} BILLING binding: got`);
-        // An older tag: no BILLING declared, none live: verified without oa-s-billing.
-        const old = setup({
-          configs: { [app]: withoutBilling(APP_CONFIG(app)) },
-          exists: [...DEPS[app], `oa-s-${app}`],
-          queues: base.queues,
-          files: {
-            ...VERIFY_FILES,
-            [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
-          },
-        }).run(app, { VERIFY_ONLY: "1" }, "staging");
-        expect(old.code, `${app} ${old.err}`).toBe(0);
-      });
+      // The provisioning target's verify-only run also reads its KV namespace,
+      // admin key and secrets, which its own describe fixtures; the deploy
+      // read-back tests above cover its BILLING binding.
+      it.skipIf(app === "provisioning")(
+        `${app}, verify only: a tag that declares it needs it live; an older one needs none`,
+        () => {
+          // Verify only reads the live Worker (its settings file), deploys nothing.
+          const base = {
+            exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
+            queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+          };
+          const live = setup({ ...base, files: VERIFY_FILES }).run(
+            app,
+            { VERIFY_ONLY: "1" },
+            "staging",
+          );
+          expect(live.code, `${app} ${live.err}`).toBe(0);
+          expect(noDeploy(live.log)).toEqual([]);
+          const missing = setup({
+            ...base,
+            files: {
+              ...VERIFY_FILES,
+              [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+            },
+          }).run(app, { VERIFY_ONLY: "1" }, "staging");
+          expect(missing.code, app).toBe(1);
+          expect(missing.err).toContain(`${app} BILLING binding: got`);
+          // An older tag: no BILLING declared, none live: verified without oa-s-billing.
+          const old = setup({
+            configs: { [app]: withoutBilling(APP_CONFIG(app)) },
+            exists: [...DEPS[app], `oa-s-${app}`],
+            queues: base.queues,
+            files: {
+              ...VERIFY_FILES,
+              [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
+            },
+          }).run(app, { VERIFY_ONLY: "1" }, "staging");
+          expect(old.code, `${app} ${old.err}`).toBe(0);
+        },
+      );
 
       it(`${app}, a tag that binds the wrong service or entrypoint is refused before any deploy`, () => {
         for (const [why, binding] of [
