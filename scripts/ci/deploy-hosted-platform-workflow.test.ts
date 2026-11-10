@@ -731,7 +731,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(order.at(-1)).toBe("scheduler");
   });
 
-  it("prod's platform-db, provisioner and provisioning wait for a green staging run of the tag, before anything deploys", () => {
+  it("every prod deploy waits for a green staging run of the tag, whatever its targets, before anything deploys (#1412)", () => {
     const g = named("Staging passed this tag");
     expect(g.run).toBe(
       'bash "$RUNNER_TEMP/main-ci/staging-first-gate.sh" "$TAG"',
@@ -740,28 +740,20 @@ describe("deploy-hosted-platform.yml", () => {
       TAG: "${{ inputs.tag }}",
       GH_TOKEN: "${{ github.token }}",
     });
-    const runsFor = (env: string, targets: string) =>
+    // No filter on the target list; only verify_only (it deploys nothing,
+    // it reads prod back) and staging runs skip the gates.
+    expect(g.if).toBe("${{ inputs.env == 'prod' && !inputs.verify_only }}");
+    expect(g.if).not.toContain("targets");
+    const runsFor = (env: string, verify_only: boolean) =>
       new Function(
         "inputs",
         `return (${(g.if as string)
           .replace(/^\$\{\{\s*/, "")
-          .replace(/\s*\}\}$/, "")
-          .replace(
-            /contains\(format\(',\{0\},', inputs\.targets\), '([^']*)'\)/g,
-            (_, t) => JSON.stringify(`,${targets},`.includes(t)),
-          )});`,
-      )({ env }) as boolean;
-    expect(runsFor("prod", "provisioner")).toBe(true);
-    expect(runsFor("prod", "platform-db,provisioning,zones")).toBe(true);
-    // prod platform-db alone is held to staging first too.
-    expect(runsFor("prod", "platform-db")).toBe(true);
-    expect(runsFor("prod", "platform-db,auth-broker")).toBe(true);
-    expect(runsFor("staging", "platform-db")).toBe(false);
-    // The scheduler's tag is the fleet target (#955): break-glass included.
-    expect(runsFor("prod", "scheduler")).toBe(true);
-    expect(runsFor("staging", "scheduler")).toBe(false);
-    expect(runsFor("prod", "provision-token,dispatch")).toBe(false);
-    expect(runsFor("staging", "provisioner,provisioning")).toBe(false);
+          .replace(/\s*\}\}$/, "")});`,
+      )({ env, verify_only }) as boolean;
+    expect(runsFor("prod", false)).toBe(true);
+    expect(runsFor("prod", true)).toBe(false);
+    expect(runsFor("staging", false)).toBe(false);
     const i = (n: string) => steps.indexOf(named(n));
     expect(i("Use main's deploy scripts")).toBeLessThan(
       i("Staging passed this tag"),

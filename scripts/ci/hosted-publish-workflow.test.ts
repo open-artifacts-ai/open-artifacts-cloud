@@ -29,6 +29,7 @@ describe("hosted-publish.yml", () => {
       branches: ["main"],
     });
     expect(Object.keys(w.on.workflow_dispatch.inputs).sort()).toEqual([
+      "chain_id",
       "env",
       "floor_run_id",
       "tag",
@@ -106,6 +107,31 @@ describe("hosted-publish.yml", () => {
     expect(runs("true", "true", "skipped")).toBe(false);
     expect(runs("false", "true", "skipped")).toBe(true);
     expect(runs("true", "false", "success")).toBe(false);
+  });
+
+  it("a release reaches prod's bucket only after staging's red-line passed the tag (#1412), before any token is read", () => {
+    const g = named("publish-prod", "Staging passed this tag");
+    expect(g.if).toBe("${{ needs.resolve.outputs.kind == 'release' }}");
+    expect(g.run).toBe('bash scripts/ci/staging-first-gate.sh "$TAG"');
+    expect(g.env).toEqual({
+      TAG: "${{ needs.resolve.outputs.tag }}",
+      GH_TOKEN: "${{ github.token }}",
+    });
+    const i = (n: string) =>
+      steps("publish-prod").indexOf(named("publish-prod", n));
+    expect(i("Staging passed this tag")).toBeLessThan(
+      i("Write the token files"),
+    );
+    // Staging's job has no such gate: staging is where the red-line runs.
+    expect(
+      steps("publish-staging").find(
+        (s) => s.name === "Staging passed this tag",
+      ),
+    ).toBeUndefined();
+    // The prod job is named like the staging one: the chain reads the record.
+    expect(w.jobs["publish-prod"].name).toBe(
+      "publish-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
+    );
   });
 
   for (const [job, env] of Object.entries(ENVS)) {
