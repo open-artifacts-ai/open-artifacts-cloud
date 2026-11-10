@@ -131,7 +131,7 @@ describe("Gmail sign-up: the owner can sign in", () => {
     const cfg = authConfig(env);
     expect(cfg.problems).toEqual([]);
     expect(cfg.google).not.toBeNull();
-    // Owner email codes, not domain codes.
+    // Guest email codes, not domain codes.
     expect(cfg.emailCodes).toBe(true);
     expect(cfg.domainCodes).toBe(false);
     expect(cfg.domains).toEqual([]);
