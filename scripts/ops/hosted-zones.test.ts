@@ -77,7 +77,6 @@ const DONE: Record<string, string> = {
     { pattern: "*.open-artifacts.app/*", script: "oa-p-dispatch" },
     { pattern: "admin.open-artifacts.app/*", script: "oa-p-provisioning" },
     { pattern: "api.open-artifacts.app/*", script: "oa-p-provisioning" },
-    { pattern: "signup.open-artifacts.app/*", script: "oa-p-provisioning" },
   ]),
   [`routes-${PAGEZ}.json`]: JSON.stringify([
     { pattern: "*.open-artifacts.page/*", script: "oa-p-dispatch" },
@@ -155,15 +154,16 @@ describe("hosted-zones.sh", () => {
       "route auth.open-artifacts.app/* -> oa-p-auth-broker: add",
       "route admin.open-artifacts.app/* -> oa-p-provisioning: add",
       "route api.open-artifacts.app/* -> oa-p-provisioning: add",
-      "route signup.open-artifacts.app/* -> oa-p-provisioning: add",
       "plan only: nothing changed",
     ]) {
       expect(r.out).toContain(line);
       expect(r.summary).toContain(line);
     }
+    // Prod keeps signup.<app> on dispatch (#40: the route is staging only).
+    expect(r.out).not.toContain("signup.");
     clean(r);
   });
-  it("apply makes exactly the planned writes: 2 records, 6 settings, 7 routes", () => {
+  it("apply makes exactly the planned writes: 2 records, 6 settings, 6 routes", () => {
     const r = setup().run("apply");
     expect(r.code).toBe(0);
     expect(r.writes.filter((w) => w.includes("/dns_records "))).toHaveLength(2);
@@ -173,7 +173,7 @@ describe("hosted-zones.sh", () => {
       ),
     ).toHaveLength(6);
     expect(r.writes.filter((w) => w.includes("/workers/routes "))).toHaveLength(
-      7,
+      6,
     );
     expect(r.writes.join("\n")).toContain(
       '{"type":"AAAA","name":"*","content":"100::","proxied":true}',
@@ -359,6 +359,10 @@ describe("hosted-zones.sh", () => {
               script: r.script.replace("oa-p-", "oa-s-"),
             }),
           ),
+          {
+            pattern: "signup.open-artifacts-staging.app/*",
+            script: "oa-s-provisioning",
+          },
           { pattern: ROUTE, script: "oa-s-billing" },
         ]),
         [`routes-${PAGEZ}.json`]: JSON.stringify([
@@ -418,7 +422,7 @@ describe("hosted-zones.sh", () => {
         expect(r.out).not.toContain("billing");
         expect(
           r.writes.filter((w) => w.includes("/workers/routes ")),
-        ).toHaveLength(7);
+        ).toHaveLength(6);
       }
     });
 

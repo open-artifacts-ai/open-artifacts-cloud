@@ -105,8 +105,10 @@ WILD='[{"type":"AAAA","content":"100::","proxied":true}]'
 SETTINGS=('ssl:"strict"' 'always_use_https:"on"' 'min_tls_version:"1.2"')
 ROUTES=("$APP_ZONE auth.$APP/* oa-$P-auth-broker" "$APP_ZONE directory.$APP/* oa-$P-directory-broker"
   "$APP_ZONE *.$APP/* oa-$P-dispatch" "$PAGE_ZONE *.$PAGE/* oa-$P-dispatch"
-  "$APP_ZONE admin.$APP/* oa-$P-provisioning" "$APP_ZONE api.$APP/* oa-$P-provisioning"
-  "$APP_ZONE signup.$APP/* oa-$P-provisioning")
+  "$APP_ZONE admin.$APP/* oa-$P-provisioning" "$APP_ZONE api.$APP/* oa-$P-provisioning")
+# Staging only (#40): the sign-up host, to the provisioning Worker. Prod keeps
+# signup.<app> on dispatch until it is opened by a separate change.
+[ "$env" != staging ] || ROUTES+=("$APP_ZONE signup.$APP/* oa-$P-provisioning")
 # Staging only (#1568), while oa-s-billing exists: Stripe's webhook, one exact
 # path, to the billing Worker. The wildcard AAAA above already makes
 # billing.<app> resolve, and an exact pattern beats *.<app>/* (dispatch) for it;
