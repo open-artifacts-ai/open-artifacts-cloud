@@ -71,10 +71,9 @@ export const PROD_CLEAN_CONCURRENCY = 4;
 /**
  * Runs fn over every item, at most `limit` at once, in the order given. Every
  * item is run or the call throws: after the first failure nothing new starts,
- * the ones in flight finish, and one failure is thrown: the lowest-numbered
- * one that isVerdict says is a finding, else the lowest-numbered failure (the
- * sequential loop threw the first). A partial result
- * is never returned.
+ * the ones in flight finish, and one failure is thrown, by kind then index: a
+ * finding (isVerdict) first, then any other failure, then infra (InfraError,
+ * or a Cloudflare read with no response). A partial result is never returned.
  */
 export async function forEachLimit<T>(
   items: readonly T[],
@@ -103,10 +102,19 @@ export async function forEachLimit<T>(
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, worker),
   );
-  failures.sort((a, b) => a.at - b.at);
-  // A verdict (the probe found something dirty) outranks a transient failure
-  // that happened beside it: never trade a known dirty result for an infra one.
-  const first = failures.find((f) => isVerdict(f.error)) ?? failures[0];
+  // Rank by kind, then by index: a finding (the probe found something dirty)
+  // first, then any other failure, then infra (no verdict either way: an
+  // InfraError, or a Cloudflare read that got no response, which includes a
+  // 429 cfClient saw as "network"). Never trade a known dirty result for an
+  // infra one.
+  const tier = (e: unknown) =>
+    isVerdict(e)
+      ? 0
+      : e instanceof InfraError || (e instanceof CfError && e.status === 0)
+        ? 2
+        : 1;
+  failures.sort((a, b) => tier(a.error) - tier(b.error) || a.at - b.at);
+  const first = failures[0];
   if (first) throw first.error;
 }
 
@@ -191,6 +199,116 @@ export const PROD_CLEAN_LINE_RE =
 
 export type ProdResult = { level: "pass"; releases: number; installs: number };
 
+/** A 429 is retried this many times per request (Retry-After honoured). */
+export const CF_429_RETRIES = 3;
+/** Every 429 wait is at least this long, whatever Retry-After says. */
+export const CF_429_MIN_WAIT_MS = 1000;
+/** One 429 wait never exceeds this, whatever Retry-After says. */
+export const CF_429_MAX_WAIT_MS = 20_000;
+/**
+ * All 429 waits of one scan together never exceed this: with the guard's
+ * 180 s case limit (LIVE_TEST_TIMEOUT_MS) a scan that waits longer would
+ * time out as a plain failure, so past the budget a 429 is infra at once.
+ */
+export const CF_429_WAIT_BUDGET_MS = 40_000;
+
+const HTTP_DATE_RE =
+  /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Retry-After as milliseconds: only digits (delta-seconds) or an HTTP date
+ * (IMF-fixdate); anything else, a sign or a fraction included, is undefined.
+ */
+export function retryAfterMs(
+  v: string | null,
+  now: number = Date.now(),
+): number | undefined {
+  if (v === null) return undefined;
+  const t = v.trim();
+  if (/^\d{1,9}$/.test(t)) return Number(t) * 1000;
+  if (!HTTP_DATE_RE.test(t)) return undefined;
+  const at = Date.parse(t);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/** Sleeps `ms`; true if `signal` aborted first (or already had). */
+async function sleepOrAbort(
+  sleep: (ms: number) => Promise<void>,
+  ms: number,
+  signal: AbortSignal | null | undefined,
+): Promise<boolean> {
+  if (!signal) return sleep(ms).then(() => false);
+  if (signal.aborted) return true;
+  let onAbort = () => {};
+  const aborted = new Promise<true>((r) => {
+    onAbort = () => r(true);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([sleep(ms).then(() => false as const), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * The fetch every prodClean request goes through. On a 429 from the
+ * Cloudflare API it waits Retry-After (else 1 s, 2 s, 4 s; never under 1 s,
+ * never over a cap, and within a budget for the whole scan) and retries. The
+ * wait honours the caller's abort signal. When the retries or the budget run
+ * out, or the signal aborts during a wait, it throws an InfraError and
+ * refuses every later Cloudflare request unsent, so the scan stops at once
+ * instead of hammering a limited API: a 429 is no verdict on prod.
+ */
+export function cfApiFetch(
+  f: typeof fetch,
+  o: { sleep?: (ms: number) => Promise<void>; waitBudgetMs?: number } = {},
+) {
+  const sleep =
+    o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let budget = o.waitBudgetMs ?? CF_429_WAIT_BUDGET_MS;
+  let limited: InfraError | undefined;
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (!url.startsWith(`${API}/`)) return f(input, init);
+    for (let i = 0; ; i++) {
+      if (limited) throw limited;
+      const res = await f(input, init);
+      if (res.status !== 429) return res;
+      await res.body?.cancel().catch(() => {});
+      const asked = retryAfterMs(res.headers.get("retry-after"));
+      const wait = Math.max(
+        CF_429_MIN_WAIT_MS,
+        Math.min(asked ?? 1000 * 2 ** i, CF_429_MAX_WAIT_MS),
+      );
+      if (i >= CF_429_RETRIES || wait > budget) {
+        limited = new InfraError(
+          `prodClean Cloudflare API answered 429 (rate limited) after ${i} ${i === 1 ? "retry" : "retries"}`,
+        );
+        throw limited;
+      }
+      budget -= wait;
+      note(`${RETRIED_REQUEST_PREFIX}429 GET (prodClean Cloudflare API)`);
+      if (await sleepOrAbort(sleep, wait, init?.signal)) {
+        limited = new InfraError(
+          "prodClean Cloudflare API answered 429 (rate limited) and the read's time ran out while waiting",
+        );
+        throw limited;
+      }
+    }
+  }) as typeof fetch;
+  return {
+    fetch: wrapped,
+    /** The InfraError a spent 429 budget raised, if one did. */
+    limited: () => limited,
+  };
+}
+
 export interface ProdCleanOpts {
   /** Every request (Cloudflare API, inventory, /healthz) goes through this (tests). */
   fetch?: typeof fetch;
@@ -206,6 +324,10 @@ export interface ProdCleanOpts {
   inventoryBearer?: string | (() => Promise<string>);
   /** Each try's bound on an inventory, /healthz or settings read (tests). */
   readMs?: number;
+  /** The 429 wait (tests). */
+  sleep?: (ms: number) => Promise<void>;
+  /** All 429 waits of the scan together (tests; default CF_429_WAIT_BUDGET_MS). */
+  waitBudgetMs?: number;
 }
 
 async function listKeys(cf: Cf, bucket: string): Promise<string[]> {
@@ -438,8 +560,31 @@ export async function prodClean(
   o: ProdCleanOpts = {},
 ): Promise<ProdResult> {
   if (!p) throw new ProdDirty("not_configured", "prod probe not configured");
+  const api = cfApiFetch(o.fetch ?? fetch, {
+    ...(o.sleep ? { sleep: o.sleep } : {}),
+    ...(o.waitBudgetMs !== undefined ? { waitBudgetMs: o.waitBudgetMs } : {}),
+  });
+  try {
+    const r = await scan(p, o, api.fetch);
+    // A 429 that was swallowed on the way must not leave a pass behind.
+    const spent = api.limited();
+    if (spent) throw spent;
+    return r;
+  } catch (e) {
+    // A spent 429 budget is infra, whatever error it caused on the way
+    // (cfClient turns a throwing fetch into "network"); a finding outranks it.
+    const infra = api.limited();
+    if (infra && !(e instanceof ProdDirty)) throw infra;
+    throw e;
+  }
+}
+
+async function scan(
+  p: ProdProbe,
+  o: ProdCleanOpts,
+  f: typeof fetch,
+): Promise<ProdResult> {
   const s = prodSecretsOf(p);
-  const f = o.fetch ?? fetch;
   const get: Get = (url, token, what, fail) =>
     getJson(f, url, token, what, fail, o.readMs);
   const pubkey = o.pubkey ?? [

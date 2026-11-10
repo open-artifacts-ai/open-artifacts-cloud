@@ -13,6 +13,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
+  CF_429_MAX_WAIT_MS,
+  CF_429_MIN_WAIT_MS,
+  cfApiFetch,
   forEachLimit,
   guardProdClean,
   HOOK_SQL_MARKERS,
@@ -21,6 +24,7 @@ import {
   PROD_CLEAN_LINE_RE,
   ProdDirty,
   prodClean,
+  retryAfterMs,
 } from "../src/prod.ts";
 import {
   buildReport,
@@ -1102,5 +1106,208 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
       id: ID,
     });
     await expect(failCode(check(w))).resolves.toBe("install_dirty");
+  });
+});
+
+describe("a Cloudflare 429 (#64)", () => {
+  const CF = "https://api.cloudflare.com/client/v4/x";
+  const res = (status: number, h: Record<string, string> = {}) =>
+    new Response("{}", { status, headers: h });
+  const sleeps = () => {
+    const waited: number[] = [];
+    return { waited, sleep: async (ms: number) => void waited.push(ms) };
+  };
+  const guard = (check: () => Promise<unknown>) =>
+    guardProdClean({ mode: "staging", prod: probe() }, check as never).then(
+      () => null,
+      (x: unknown) => x,
+    );
+
+  it("retryAfterMs: digits as seconds or a real HTTP date; nothing else", () => {
+    expect(retryAfterMs("3")).toBe(3000);
+    expect(retryAfterMs(" 0 ")).toBe(0);
+    expect(retryAfterMs(null)).toBeUndefined();
+    for (const bad of ["soon", "-5", "1.5", "+2", "1e3", "", "5 s"])
+      expect(retryAfterMs(bad), bad).toBeUndefined();
+    const at = "Wed, 21 Oct 2015 07:28:05 GMT";
+    expect(retryAfterMs(at, Date.parse("Wed, 21 Oct 2015 07:28:00 GMT"))).toBe(
+      5000,
+    );
+    expect(retryAfterMs(at, Date.parse("Thu, 22 Oct 2015 07:28:00 GMT"))).toBe(
+      0,
+    );
+  });
+
+  it("a 429 waits Retry-After, then retries", async () => {
+    const { waited, sleep } = sleeps();
+    const answers = [res(429, { "retry-after": "2" }), res(200)];
+    const a = cfApiFetch(async () => answers.shift() as Response, { sleep });
+    expect((await a.fetch(CF)).status).toBe(200);
+    expect(waited).toEqual([2000]);
+    expect(a.limited()).toBeUndefined();
+  });
+
+  it("every wait is at least 1 s and at most the cap", async () => {
+    const { waited, sleep } = sleeps();
+    const answers = [
+      res(429, { "retry-after": "0" }),
+      res(429, { "retry-after": "-5" }),
+      res(429, { "retry-after": "9999" }),
+      res(200),
+    ];
+    const a = cfApiFetch(async () => answers.shift() as Response, {
+      sleep,
+      waitBudgetMs: 1e9,
+    });
+    await a.fetch(CF);
+    // "0" floors to 1 s; "-5" is no Retry-After, so the backoff (2 s here).
+    expect(waited).toEqual([CF_429_MIN_WAIT_MS, 2000, CF_429_MAX_WAIT_MS]);
+    // No Retry-After: the backoff, from 1 s.
+    const w2 = sleeps();
+    const b = [res(429), res(429), res(200)];
+    await cfApiFetch(async () => b.shift() as Response, {
+      sleep: w2.sleep,
+    }).fetch(CF);
+    expect(w2.waited).toEqual([1000, 2000]);
+  });
+
+  it("a request outside the Cloudflare API is not retried", async () => {
+    const { waited, sleep } = sleeps();
+    const a = cfApiFetch(async () => res(429), { sleep });
+    expect((await a.fetch("https://inventory.example/installs")).status).toBe(
+      429,
+    );
+    expect(waited).toEqual([]);
+  });
+
+  it("retries out: InfraError, and later Cloudflare requests are refused unsent", async () => {
+    const { sleep } = sleeps();
+    let sent = 0;
+    const a = cfApiFetch(
+      async () => {
+        sent++;
+        return res(429, { "retry-after": "1" });
+      },
+      { sleep },
+    );
+    const e = await a.fetch(CF).then(
+      () => null,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect(a.limited()).toBe(e);
+    const before = sent;
+    await expect(a.fetch(CF)).rejects.toBe(e);
+    expect(sent).toBe(before);
+  });
+
+  it("a Retry-After past the scan's wait budget is infra at once", async () => {
+    const { waited, sleep } = sleeps();
+    const a = cfApiFetch(async () => res(429, { "retry-after": "30" }), {
+      sleep,
+      waitBudgetMs: 10_000,
+    });
+    await expect(a.fetch(CF)).rejects.toBeInstanceOf(InfraError);
+    expect(waited).toEqual([]);
+  });
+
+  it("the read's abort signal ends a 429 wait as infra, not as a timeout", async () => {
+    const ac = new AbortController();
+    // A wait that never ends on its own; the abort must cut it short.
+    const sleep = () => new Promise<void>(() => {});
+    const a = cfApiFetch(async () => res(429, { "retry-after": "5" }), {
+      sleep,
+    });
+    const p = a.fetch(CF, { signal: ac.signal });
+    queueMicrotask(() => ac.abort(new DOMException("t", "TimeoutError")));
+    const e = await p.then(
+      () => null,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect((e as Error).name).not.toBe("TimeoutError");
+    // An already-aborted signal does not start the wait either.
+    const b = cfApiFetch(async () => res(429), { sleep });
+    await expect(
+      b.fetch(CF, { signal: AbortSignal.abort() }),
+    ).rejects.toBeInstanceOf(InfraError);
+  });
+
+  const limitedWorld = async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    const { fetch } = await serve(w);
+    const limited: typeof fetch = (i, init) =>
+      String(i).startsWith("https://api.cloudflare.com/")
+        ? Promise.resolve(res(429, { "retry-after": "1" }))
+        : fetch(i, init);
+    return { w, limited };
+  };
+
+  it("prodClean with a 429 that never lifts: infra through the guard, not a fail", async () => {
+    const { limited } = await limitedWorld();
+    const { waited, sleep } = sleeps();
+    const e = await guard(() =>
+      prodClean(probe(), {
+        fetch: limited,
+        pubkey: PUB,
+        inventoryBearer: JWT,
+        sleep,
+      }),
+    );
+    expect(e).toBeInstanceOf(InfraError);
+    expect(String((e as Error).message)).toMatch(/429/);
+    expect(
+      levelOf("failed", undefined, [e as { message?: unknown }]).level,
+    ).toBe("infra");
+    expect(waited.length).toBe(3);
+  });
+
+  it("a 429 that lifts after Retry-After still passes", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    const { fetch } = await serve(w);
+    let first = true;
+    const once: typeof fetch = (i, init) => {
+      if (first && String(i).startsWith("https://api.cloudflare.com/")) {
+        first = false;
+        return Promise.resolve(res(429, { "retry-after": "1" }));
+      }
+      return fetch(i, init);
+    };
+    const { waited, sleep } = sleeps();
+    const r = await prodClean(probe(), {
+      fetch: once,
+      pubkey: PUB,
+      inventoryBearer: JWT,
+      sleep,
+    });
+    expect(r).toEqual({ level: "pass", releases: 1, installs: 1 });
+    expect(waited).toEqual([1000]);
+  });
+
+  it("a finding beside a 429 wins; so does a non-verdict fail", async () => {
+    const dirty = new ProdDirty("install_dirty", "x");
+    const unreachable = new ProdDirty("unreachable", "y");
+    const limited = new InfraError("429");
+    const cf0 = new CfError("GET", "/x", 0, "network: InfraError");
+    const run = (errs: unknown[]) =>
+      forEachLimit(
+        errs,
+        errs.length,
+        async (e) => {
+          throw e;
+        },
+        (e) => e instanceof ProdDirty && e.code === "install_dirty",
+      ).then(
+        () => null,
+        (x: unknown) => x,
+      );
+    // Index order must not decide: the 429 comes first every time.
+    expect(await run([limited, dirty])).toBe(dirty);
+    expect(await run([cf0, dirty])).toBe(dirty);
+    expect(await run([limited, unreachable])).toBe(unreachable);
+    expect(await run([cf0, unreachable, dirty])).toBe(dirty);
+    expect(await run([limited, cf0])).toBe(limited);
   });
 });
