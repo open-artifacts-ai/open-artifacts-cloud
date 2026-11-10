@@ -82,6 +82,41 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .chip{border:1px solid var(--border);border-radius:99px;padding:3px 11px;font:inherit;font-size:13px;background:var(--surface);color:var(--text);cursor:pointer}
 .chip.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-fg)}
 .back{margin-top:12px;display:flex;margin-inline:auto}
+.panel.ld{background:none;border:0;box-shadow:none;min-height:480px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:24px 0}
+.panel.ld .note{margin:0}
+.anim{width:132px;height:132px}
+.verb{font-size:22px;font-weight:500;letter-spacing:-.01em;color:var(--text);min-height:32px;margin:0;text-align:center}
+.panel .verb{color:var(--text);margin:0}
+.verb .w{display:inline-block;animation:vin .35s ease-out}
+@keyframes vin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.panel .addr{font:14px ui-monospace,Menlo,monospace;color:var(--muted);margin:0;text-align:center}
+.a1 .fr{fill:none;stroke:var(--text);stroke-width:1.2;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 2.8s ease-in-out infinite}
+.a1 .cn{fill:var(--accent);opacity:0;animation:fade 2.8s ease-in-out infinite}
+.a1 .sq{fill:var(--accent);transform-origin:16px 16px;transform:scale(0);animation:land 2.8s cubic-bezier(.3,1.6,.5,1) infinite}
+@keyframes draw{0%{stroke-dashoffset:1}45%,85%{stroke-dashoffset:0}100%{stroke-dashoffset:-1}}
+@keyframes fade{0%,40%{opacity:0}55%,85%{opacity:1}100%{opacity:0}}
+@keyframes land{0%,45%{transform:scale(0)}60%,85%{transform:scale(1)}100%{transform:scale(0)}}
+.a2{position:relative}
+.a2 i{position:absolute;left:22px;width:88px;height:64px;border-radius:8px;background:var(--surface);border:1.5px solid var(--border);box-shadow:0 6px 14px -8px rgba(20,24,30,.35);opacity:0;animation:stack 3.2s ease-in-out infinite}
+.a2 i::before{content:"";position:absolute;left:10px;right:24px;top:12px;height:5px;border-radius:3px;background:var(--divider)}
+.a2 i::after{content:"";position:absolute;left:10px;right:40px;top:24px;height:5px;border-radius:3px;background:var(--divider)}
+.a2 i:nth-child(1){top:58px;animation-delay:0s}
+.a2 i:nth-child(2){top:44px;animation-delay:.35s}
+.a2 i:nth-child(3){top:30px;animation-delay:.7s}
+.a2 i:nth-child(4){top:16px;animation-delay:1.05s;border-color:var(--accent)}
+.a2 i:nth-child(4)::before{background:var(--accent)}
+@keyframes stack{0%{opacity:0;transform:translateY(-28px) rotate(-6deg)}14%{opacity:1;transform:none}80%{opacity:1;transform:none}100%{opacity:0;transform:translateY(6px)}}
+.pg3{position:relative;width:100px;height:124px;margin:4px auto 0;border-radius:8px;background:var(--surface);border:1.5px solid var(--border);padding:14px 12px}
+.pg3 i{display:block;height:5px;border-radius:3px;background:var(--divider);margin-bottom:9px}
+.pg3 i.s{width:60%}
+.pg3 .pin{position:absolute;left:58px;top:40px;width:14px;height:14px;border-radius:50% 50% 50% 0;transform:rotate(-45deg) scale(0);background:var(--warn);animation:pin 3.4s ease-in-out infinite}
+.pg3 .bub{position:absolute;right:-30px;top:58px;width:46px;height:20px;border-radius:10px 10px 10px 3px;background:var(--accent-soft);border:1.5px solid var(--accent);opacity:0;animation:bub 3.4s ease-in-out infinite}
+.pg3 .bub.r{right:auto;left:-26px;top:86px;border-radius:10px 10px 3px 10px;background:var(--ok-soft);border-color:var(--ok);animation-name:bub2}
+@keyframes pin{0%,8%{transform:rotate(-45deg) scale(0)}18%,90%{transform:rotate(-45deg) scale(1)}100%{transform:rotate(-45deg) scale(0)}}
+@keyframes bub{0%,25%{opacity:0;transform:translateY(6px)}35%,90%{opacity:1;transform:none}100%{opacity:0}}
+@keyframes bub2{0%,50%{opacity:0;transform:translateY(6px)}60%,90%{opacity:1;transform:none}100%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.a1 .fr{animation:none;stroke-dashoffset:0}.a1 .cn{animation:none;opacity:1}.a1 .sq{animation:none;transform:none}.a2 i{animation:none;opacity:1}.pg3 .pin{animation:none;transform:rotate(-45deg)}.pg3 .bub{animation:none;opacity:1}.verb .w{animation:none}}
+.seq{width:132px;height:132px}.slot{width:132px;height:132px;opacity:0;transition:opacity .5s ease}.slot.in{opacity:1}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.dot.now{animation:none}}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
