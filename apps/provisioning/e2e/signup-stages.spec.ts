@@ -15,6 +15,8 @@ type Sc = {
   avail?: string;
   // when set, only these names are free (others read as taken)
   free?: string[];
+  // delay (ms) on the slug-check answers
+  slugDelay?: number;
   createCode?: string;
   path?: string;
   // per-request override of GET /api/v1/signup (n counts calls, from 1)
@@ -78,7 +80,8 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
             }
           : { stage: "none" },
       );
-    if (url.pathname.startsWith("/api/v1/slugs/"))
+    if (url.pathname.startsWith("/api/v1/slugs/")) {
+      if (sc.slugDelay) await new Promise((r) => setTimeout(r, sc.slugDelay));
       return json({
         status: sc.free
           ? sc.free.includes(url.pathname.split("/").pop() ?? "")
@@ -86,6 +89,7 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
             : "taken"
           : (sc.avail ?? "ok"),
       });
+    }
     if (url.pathname === "/api/v1/installs" && req.method() === "POST")
       return json({ error: { code: sc.createCode ?? "forbidden" } }, 403);
     return route.fulfill({ status: 404, body: "" });
@@ -333,6 +337,16 @@ test("address step: only free suggestions show, the first is prefilled", async (
   await expect(page.locator(".chip.sel")).toHaveText("ada");
   await page.getByRole("button", { name: "acme-team" }).click();
   await expect(page.locator("#slug")).toHaveValue("acme-team");
+});
+
+test("address step: late suggestions never overwrite what you typed or cleared", async ({
+  page,
+}) => {
+  await mount(page, { me: true, free: ["acme", "ada"], slugDelay: 700 });
+  await page.locator("#slug").fill("mine");
+  await page.locator("#slug").fill("");
+  await expect(page.locator(".chips .chip")).toHaveCount(2);
+  await expect(page.locator("#slug")).toHaveValue("");
 });
 
 test("address step: back keeps you signed in", async ({ page }) => {

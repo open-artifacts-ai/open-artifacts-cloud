@@ -161,6 +161,7 @@ export const CLIENT_JS = String.raw`(function () {
       "aria-describedby": "slug-help", value: S.slug
     });
     inp.addEventListener("input", function () {
+      S.edited = true;
       S.slug = inp.value.trim().toLowerCase();
       S.err = "";
       checkSlug();
@@ -236,7 +237,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function prefill() {
     if (!refs.inp) return;
-    if (!S.slug && S.chips.length) {
+    if (!S.edited && !S.slug && S.chips.length) {
       S.slug = S.chips[0]; S.avail = "ok"; S.availSlug = S.slug;
       refs.inp.value = S.slug;
     }
@@ -421,11 +422,11 @@ export const CLIENT_JS = String.raw`(function () {
 
   function signOut() {
     return api("POST", "/auth/logout").then(function () {
-      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; S.chips = []; S.chipsFor = ""; S.step = "address"; route();
+      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; S.chips = []; S.chipsFor = ""; S.edited = false; S.step = "address"; route();
     });
   }
   function startOver() {
-    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.token = null; S.step = "address";
+    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.token = null; S.step = "address"; S.edited = false;
     route();
   }
 
