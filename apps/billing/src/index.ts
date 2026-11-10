@@ -45,6 +45,7 @@ import {
   createCustomer,
   createPortalSession,
   createSoloTrialSubscription,
+  createTestClock,
   expireCheckoutSession,
   handleStripeWebhook,
   pruneStripeEvents,
@@ -72,6 +73,7 @@ import {
   GATE_INSTALL_HEADER,
 } from "@oa/broker-core/gate-header";
 import { isAppHost, type Env as OaEnv, TRIAL_MS } from "@oa/provision/names";
+import { isClockInstall } from "./test-clock.js";
 
 export interface Env {
   BILLING_DB: D1Database;
@@ -89,6 +91,12 @@ export interface Env {
   /** Solo's two prices (#1568): $1/month and $12/year, one per interval. */
   STRIPE_PRICE_SOLO_MONTHLY: string;
   STRIPE_PRICE_SOLO_YEARLY: string;
+  /**
+   * Staging only: comma list of exact install ids whose customer is made on a
+   * Stripe test clock (test-clock.ts). Absent in prod; ignored unless staging
+   * with a test key.
+   */
+  STAGING_TEST_CLOCK_INSTALLS?: string;
 }
 
 export { TRIAL_MS };
@@ -286,6 +294,11 @@ const CUSTOMER_SQL =
 const SUBSCRIPTION_SQL =
   "SELECT stripe_subscription_id, status, tier, solo_trial_ends_at, solo_status FROM tiers WHERE install_id = ?1";
 // Only where none is mapped yet: a concurrent winner's id is kept.
+const CLOCK_SQL =
+  "SELECT stripe_customer_id, stripe_test_clock_id FROM tiers WHERE install_id = ?1";
+// Only where none is stored: one clock per install, a concurrent winner's kept.
+const SET_CLOCK_SQL =
+  "UPDATE tiers SET stripe_test_clock_id = ? WHERE install_id = ? AND stripe_test_clock_id IS NULL";
 const MAP_CUSTOMER_SQL =
   "UPDATE tiers SET stripe_customer_id = ? WHERE install_id = ? AND stripe_customer_id IS NULL";
 
@@ -353,20 +366,54 @@ async function customerFor(
   install: string,
   cfg: StripeConfig,
   now: number,
+  /** Staging test clocks (test-clock.ts): this install's customer is on one. */
+  clocked = false,
 ): Promise<string> {
   const read = async () =>
-    (
-      await db
-        .prepare(CUSTOMER_SQL)
-        .bind(install)
-        .first<{ stripe_customer_id: string | null }>()
-    )?.stripe_customer_id ?? null;
+    (await db.prepare(CLOCK_SQL).bind(install).first<{
+      stripe_customer_id: string | null;
+      stripe_test_clock_id: string | null;
+    }>()) ?? { stripe_customer_id: null, stripe_test_clock_id: null };
   const mapped = await read();
-  if (mapped) return mapped;
+  if (mapped.stripe_customer_id) {
+    // A listed install never reuses a customer that is not on a clock: the
+    // trial could not be advanced, and a silent fallback would hide it.
+    if (clocked && !mapped.stripe_test_clock_id) {
+      console.error("billing test_clock refused_existing_customer", install);
+      throw new StripeFailure(bad("config", 500), "config");
+    }
+    return mapped.stripe_customer_id;
+  }
   await db.prepare(ENSURE_ROW_SQL).bind(install, now).run();
+  let testClockId: string | undefined;
+  if (clocked) {
+    // The clock first, kept on the row before the customer is made: a retry
+    // after a failed customer call finds it, so there is one clock per install.
+    testClockId = (await read()).stripe_test_clock_id ?? undefined;
+    if (!testClockId) {
+      const clock = await stripe(install, () =>
+        createTestClock(
+          {
+            installId: install,
+            frozenTime: Math.floor(now / 1000),
+            idempotencyKey: `clock-${install}`,
+          },
+          cfg,
+        ),
+      );
+      await db.prepare(SET_CLOCK_SQL).bind(clock.id, install).run();
+      testClockId = (await read()).stripe_test_clock_id ?? undefined;
+      if (!testClockId) throw new Error("test clock missing after write");
+      console.log("billing test_clock mapped", install);
+    }
+  }
   const { id } = await stripe(install, () =>
     createCustomer(
-      { installId: install, idempotencyKey: `cust-${install}` },
+      {
+        installId: install,
+        idempotencyKey: `cust-${install}`,
+        ...(testClockId ? { testClockId } : {}),
+      },
       cfg,
     ),
   );
@@ -381,7 +428,7 @@ async function customerFor(
     wrote.meta.changes === 1 ? "mapped" : "kept",
     install,
   );
-  const winner = await read();
+  const winner = (await read()).stripe_customer_id;
   if (!winner) throw new Error("customer mapping missing after write");
   return winner;
 }
@@ -476,6 +523,7 @@ async function checkout(
     install,
     cfg,
     Date.now(),
+    isClockInstall(env, env.STAGING_TEST_CLOCK_INSTALLS, install),
   );
   const base = `https://${appHost}/settings/billing`;
   // Paying during the no-card Solo trial keeps the free days: the new
@@ -713,7 +761,13 @@ async function soloStartCore(
   if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
     return unchanged();
   const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
-  const customerId = await customerFor(db, install, cfg, now);
+  const customerId = await customerFor(
+    db,
+    install,
+    cfg,
+    now,
+    isClockInstall(env, env.STAGING_TEST_CLOCK_INSTALLS, install),
+  );
   const sub = await stripe(install, () =>
     createSoloTrialSubscription(
       { customerId, priceId, idempotencyKey: `solo-trial-${install}` },

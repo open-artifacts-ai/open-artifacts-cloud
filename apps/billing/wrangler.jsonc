@@ -34,7 +34,10 @@
         "STRIPE_PRICE_TEAM": "{{STRIPE_PRICE_TEAM_STAGING}}",
         "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_STAGING}}",
         "STRIPE_PRICE_SOLO_MONTHLY": "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}",
-        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_STAGING}}"
+        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_STAGING}}",
+        // Exact install ids whose customer is made on a Stripe test clock
+        // (M2 step 8; test-clock.ts). Staging only; empty by default.
+        "STAGING_TEST_CLOCK_INSTALLS": ""
       },
       "workers_dev": false,
       "preview_urls": false,

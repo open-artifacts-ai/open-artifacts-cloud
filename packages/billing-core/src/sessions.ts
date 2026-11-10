@@ -57,6 +57,11 @@ export interface CustomerInput {
   installId: string;
   /** Billing's key for this install, e.g. cust-<installId>: a retry is one customer. */
   idempotencyKey: string;
+  /**
+   * A Stripe test clock to attach the customer to (staging only: the Solo
+   * trial can then be advanced instead of waited out).
+   */
+  testClockId?: string;
 }
 
 /** A refused input or key, before any call. */
@@ -84,6 +89,7 @@ const PRICE = /^price_[A-Za-z0-9]{1,255}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9_:.-]{8,255}$/;
 const INSTALL = /^i[a-z0-9]{11}$/;
 const CHECKOUT_SESSION = /^cs_[A-Za-z0-9_]{1,255}$/;
+const TEST_CLOCK = /^clock_[A-Za-z0-9]{1,255}$/;
 const SUBSCRIPTION = /^sub_[A-Za-z0-9]{1,255}$/;
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
 const PORTAL_URL = /^https:\/\/billing\.stripe\.com\//;
@@ -251,11 +257,42 @@ export async function createCustomer(
   const { status, out } = await post(
     cfg,
     "/v1/customers",
-    { "metadata[install_id]": check(INSTALL, "installId", input.installId) },
+    {
+      "metadata[install_id]": check(INSTALL, "installId", input.installId),
+      ...(input.testClockId === undefined
+        ? {}
+        : { test_clock: check(TEST_CLOCK, "testClockId", input.testClockId) }),
+    },
     input.idempotencyKey,
   );
   const id = out?.id;
   if (typeof id !== "string" || !CUSTOMER.test(id))
+    throw new StripeApiError(status, "bad_answer");
+  return { id };
+}
+
+/**
+ * A Stripe test clock frozen at `frozenTime` (epoch seconds), named for the
+ * install. Test mode only (the key check); a live key can't make one. Answers
+ * the clock_ id only.
+ */
+export async function createTestClock(
+  input: { installId: string; frozenTime: number; idempotencyKey: string },
+  cfg: StripeConfig,
+): Promise<{ id: string }> {
+  if (!Number.isSafeInteger(input.frozenTime) || input.frozenTime <= 0)
+    throw new StripeConfigError("frozenTime");
+  const { status, out } = await post(
+    cfg,
+    "/v1/test_helpers/test_clocks",
+    {
+      frozen_time: String(input.frozenTime),
+      name: check(INSTALL, "installId", input.installId),
+    },
+    input.idempotencyKey,
+  );
+  const id = out?.id;
+  if (typeof id !== "string" || !TEST_CLOCK.test(id))
     throw new StripeApiError(status, "bad_answer");
   return { id };
 }
