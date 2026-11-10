@@ -100,6 +100,10 @@ describe("wrangler.jsonc", () => {
         ACCOUNT_ID: `{{ACCOUNT_ID_${E}}}`,
         // Literal, not filled: the Workflow refuses anything but these two.
         OA_ENV: env,
+        // #1299 part 6: staging only, exact slugs; prod has no such key.
+        ...(env === "staging"
+          ? { STAGING_BUS_SLUGS: "rl-agents,bus1299-b" }
+          : {}),
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
@@ -109,8 +113,19 @@ describe("wrangler.jsonc", () => {
       expect(e.vars.OA_ENV).toBe(api.env[env].vars.OA_ENV);
       // Workers Logs would record message bodies' context.
       expect(e.observability).toEqual({ enabled: false });
-      for (const k of ["services", "durable_objects", "triggers", "assets"])
+      for (const k of ["durable_objects", "triggers", "assets"])
         expect(e).not.toHaveProperty(k);
+      // The one service binding (#1568): billing's BillingProvisionerRpc, on
+      // STAGING only, to start an install's Solo trial. Prod has none.
+      if (env === "staging")
+        expect(e.services).toEqual([
+          {
+            binding: "BILLING",
+            service: platformNames("staging").billing,
+            entrypoint: "BillingProvisionerRpc",
+          },
+        ]);
+      else expect(e).not.toHaveProperty("services");
     }
   });
 

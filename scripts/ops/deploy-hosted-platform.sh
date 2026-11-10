@@ -22,7 +22,17 @@
 #   directory-broker DIRECTORY_REGISTRY_ID GOOGLE_DIRECTORY_CLIENT_ID GOOGLE_DIRECTORY_CLIENT_SECRET
 #   provision-token  SECRETS_STORE_ID (reads only: the user pastes the secret)
 #   provisioner      PLATFORM_DB_ID SECRETS_STORE_ID SIGNUP_DAILY_CAP SIGNUPS_ENABLED WELCOME_FROM
-#   dispatch         HOSTS_KV_ID (both brokers must exist)
+#   billing          STAGING ONLY. BILLING_DB_ID (D1 oa-s-billing, which must exist)
+#                    BROKER_REGISTRY_ID MAIN_BILLING_MIGRATION_LOCK (main's
+#                    apps/billing/migration-lock.json; migrations,
+#                    scripts/ops/billing-db.ts) the four Stripe price ids
+#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY)
+#                    and, unless VERIFY_ONLY, STRIPE_SECRET_KEY and
+#                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
+#                    only, both put on the Worker, a run without them fails
+#                    before anything changes)
+#   dispatch         HOSTS_KV_ID (both brokers must exist; on staging, when the
+#                    tag declares a BILLING binding, oa-s-billing too, #1568)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
 #                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
@@ -39,7 +49,7 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 staging|prod platform-db|auth-broker|directory-broker|provision-token|provisioner|dispatch|scheduler|inventory|provisioning" >&2
+  echo "usage: $0 staging|prod platform-db|auth-broker|directory-broker|billing|provision-token|provisioner|dispatch|scheduler|inventory|provisioning" >&2
   exit 2
 fi
 env="$1"
@@ -50,6 +60,12 @@ case "$env" in
   *) echo "env must be staging or prod" >&2; exit 2 ;;
 esac
 NS="oa-$env"
+# The billing service is staging only (no prod Worker, binding, route or
+# Stripe secret): refused before anything is read or changed.
+if [ "$target" = billing ] && [ "$env" != staging ]; then
+  echo "the billing target is staging only; refusing for $env" >&2
+  exit 2
+fi
 # In CI, prod runs only from main, in the prod deploy Environment.
 if [ "${GITHUB_ACTIONS:-}" = true ] && [ "$env" = prod ]; then
   [ "${GITHUB_REF:-}" = refs/heads/main ] || { echo "prod deploys run only from main (GITHUB_REF is ${GITHUB_REF:-unset})" >&2; exit 2; }
@@ -110,17 +126,40 @@ need() { # name: a required, non-empty env var
   [ -n "${!1:-}" ] || { echo "$1 is required for $target" >&2; exit 2; }
 }
 secret_names() { cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name'; }
-# put_secret <worker> <app dir> <name>: the value comes on stdin.
+# put_secret <worker> <app dir> <name>: the value comes on stdin. A failed put
+# is tried PUT_ATTEMPTS (3) times in all, PUT_RETRY_SLEEP seconds (default 5)
+# after the first failure and three times that after the second: Cloudflare
+# answers an unknown 10013 now and then (run 42647320740, #55). The value is
+# held in a shell variable and fed to each attempt by the printf builtin, so it
+# is never in argv, the log or a file.
+PUT_ATTEMPTS=3
 put_secret() {
   if [ -n "$VERIFY_ONLY" ]; then
     cat > /dev/null
     echo "$1: verify only, not setting $3"
     return
   fi
-  # A failure returns 1 (an `if` caller turns set -e off).
-  (cd "$root/apps/$2" && pnpm exec wrangler secret put "$3" --env "$env" > /dev/null) ||
-    { echo "$1: putting $3 failed" >&2; return 1; }
-  echo "$1: $3 set"
+  local pause="${PUT_RETRY_SLEEP:-5}" v a
+  [[ "$pause" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; return 1; }
+  # The whole stdin, trailing newlines kept (as the one-shot put read it).
+  v="$(cat; printf x)"
+  v="${v%x}"
+  for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+    # A failure returns 1 (an `if` caller turns set -e off).
+    if printf '%s' "$v" | (cd "$root/apps/$2" && pnpm exec wrangler secret put "$3" --env "$env" > /dev/null); then
+      v=""
+      echo "$1: $3 set"
+      return 0
+    fi
+    if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+      echo "$1: putting $3 failed (attempt $a of $PUT_ATTEMPTS); trying again" >&2
+      sleep "$pause"
+      pause=$((pause * 3))
+    fi
+  done
+  v=""
+  echo "$1: putting $3 failed" >&2
+  return 1
 }
 # A secret put deploys a new, untagged Worker version, and the release tag
 # (#1040) must be on the version that serves. A Worker that takes secrets
@@ -238,6 +277,42 @@ expect_private() {
   [ "$got" = "$3" ] || { echo "$4: not the expected value" >&2; exit 1; }
 }
 
+# The BILLING service binding (#1568) is staging only, and required only when
+# the tag being deployed declares it: main's scripts run against the tag's
+# Workers, so a staging run of an older tag (whose wrangler has none) must not
+# fail for lack of it, and a tag that declares it must not deploy without it.
+# billing_pre <app> <entrypoint>, before deploying: reads the tag's committed
+# env block (wrangler-env.ts billing). Prod refuses a tag that binds BILLING.
+# Staging: a declared binding must be exactly oa-s-billing with this app's
+# entrypoint ("" for the default one, BillingProvisionerRpc for the
+# provisioner), and the Worker must exist (a binding needs its service
+# deployed first); sets BILLING_DECLARED=1. Not declared: BILLING_DECLARED="" and
+# nothing is required.
+BILLING_DECLARED=""
+billing_pre() {
+  local c service entry
+  BILLING_DECLARED=""
+  c="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/wrangler-env.ts" "$root/apps/$1/wrangler.jsonc" "$env" billing)" ||
+    { echo "can't read $1's committed BILLING binding" >&2; exit 1; }
+  [ "$c" != null ] || return 0
+  [ "$env" = staging ] || { echo "the tag's $env $1 config binds BILLING; it is staging only; refusing" >&2; exit 1; }
+  service="$(jq -r '.service' <<< "$c")"
+  entry="$(jq -r '.entrypoint // ""' <<< "$c")"
+  [ "$service" = "oa-$P-billing" ] || { echo "the tag's $1 BILLING binding is '$service', want oa-$P-billing; refusing" >&2; exit 1; }
+  [ "$entry" = "$2" ] || { echo "the tag's $1 BILLING binding has entrypoint '$entry', want '$2'; refusing" >&2; exit 1; }
+  need_workers "oa-$P-billing"
+  BILLING_DECLARED=1
+}
+# billing_bound <settings json> <app> <entrypoint>, after deploying (or verify
+# only): when the tag declared it, the live binding is a service oa-s-billing
+# with the entrypoint; otherwise (an older tag, or prod) there is none.
+billing_bound() {
+  local want=""
+  [ -z "$BILLING_DECLARED" ] || want="service oa-$P-billing $3"
+  expect "$1" '[.result.bindings[] | select(.name == "BILLING") | "\(.type) \(.service) \(.entrypoint // "")"] | join(",")' \
+    "$want" "$2 BILLING binding"
+}
+
 # broker_pin: provision's BROKER_GOOGLE_CLIENT_ID[$env] from $BROKER_PIN_FILE
 # (main's wfp.ts), or "null". Exit 1 when the pin can't be read.
 # shellcheck disable=SC2016 # the JS template literal is single-quoted on purpose
@@ -278,6 +353,11 @@ case "$target" in
   provisioner)
     need PLATFORM_DB_ID; need SECRETS_STORE_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED; need WELCOME_FROM
     signups_committed provisioner
+    # BILLING (#1568, staging only, when the tag declares it): the provisioner
+    # starts an install's Solo trial through billing's BillingProvisionerRpc.
+    # Unbound it would silently skip the free month, so a tag that declares the
+    # binding must not deploy without it (read back below).
+    billing_pre provisioner BillingProvisionerRpc
     # Check first, create only when absent; a failed listing stops the run.
     queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
     for q in "oa-$P-signups" "oa-$P-signups-dlq"; do
@@ -308,7 +388,8 @@ case "$target" in
       "oa-$P-provision-install ProvisionInstall" "PROVISION_INSTALL"
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
-    names_are "$S" "DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
+    billing_bound "$S" provisioner BillingProvisionerRpc
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     expect "$S" '.result.observability.enabled // false' false "observability"
@@ -516,15 +597,65 @@ case "$target" in
     names="$(secret_names oa-$P-directory-broker | sort | tr '\n' ' ')"
     [ "$names" = "DIRECTORY_STATE_KEY GOOGLE_DIRECTORY_CLIENT_SECRET " ] || { echo "oa-$P-directory-broker secrets are '$names'" >&2; exit 1; }
     ;;
+  billing)
+    # Staging only (checked above). Everything is checked before anything
+    # changes, so a Worker is never left half configured.
+    need BILLING_DB_ID; need BROKER_REGISTRY_ID; need MAIN_BILLING_MIGRATION_LOCK
+    for k in STRIPE_PRICE_TEAM STRIPE_PRICE_BUSINESS STRIPE_PRICE_SOLO_MONTHLY STRIPE_PRICE_SOLO_YEARLY; do
+      need "$k"
+      [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
+    done
+    if [ -z "$VERIFY_ONLY" ]; then
+      need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
+      # Test mode only (billing-core refuses a live key too); never printed.
+      [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] ||
+        { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_); a live key is refused" >&2; exit 2; }
+      [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] ||
+        { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)" >&2; exit 2; }
+    fi
+    # The schema first: the Worker never runs on a stale one. billing-db.ts
+    # applies each pinned file once (a frozen lock, main's pins kept) and reads
+    # it back; VERIFY_ONLY passes through and fails while one is pending.
+    BILLING_DB_ID="$BILLING_DB_ID" MAIN_BILLING_MIGRATION_LOCK="$MAIN_BILLING_MIGRATION_LOCK" \
+      node --experimental-strip-types --no-warnings "$root/scripts/ops/billing-db.ts" "$env"
+    billing_deploy() {
+      BILLING_DB_ID="$BILLING_DB_ID" BROKER_REGISTRY_ID="$BROKER_REGISTRY_ID" \
+        STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
+        STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
+        deploy billing
+    }
+    billing_deploy
+    # Both secrets every run (a rotation is a re-run), then deploy again so the
+    # serving version carries the tag (#1040). Never in argv or the log.
+    if [ -z "$VERIFY_ONLY" ]; then
+      printf '%s' "$STRIPE_SECRET_KEY" | put_secret oa-$P-billing billing STRIPE_SECRET_KEY || exit 1
+      printf '%s' "$STRIPE_WEBHOOK_SECRET" | put_secret oa-$P-billing billing STRIPE_WEBHOOK_SECRET || exit 1
+      billing_deploy
+    fi
+    S="$(settings oa-$P-billing)"
+    expect "$S" '.result.bindings[] | select(.name == "BILLING_DB") | .id' "$BILLING_DB_ID" "BILLING_DB"
+    expect "$S" '.result.bindings[] | select(.name == "BROKER_REGISTRY") | .namespace_id' "$BROKER_REGISTRY_ID" "BROKER_REGISTRY"
+    names_are "$S" "BILLING_DB,BROKER_REGISTRY"
+    # OA_ENV and the four price ids, as the tag commits them (filled from env).
+    vars_are "$S" billing
+    expect "$S" '.result.observability.enabled // false' false "observability"
+    names="$(secret_names oa-$P-billing | sort | tr '\n' ' ')"
+    [ "$names" = "STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET " ] || { echo "oa-$P-billing secrets are '$names'" >&2; exit 1; }
+    crons="$(cf_get /workers/scripts/oa-$P-billing/schedules | must "read oa-$P-billing schedules" | jq -r '[.result.schedules[].cron] | sort | join(",")')"
+    [ "$crons" = "17 3 * * *" ] || { echo "oa-$P-billing schedules are '$crons'" >&2; exit 1; }
+    ;;
   dispatch)
     need HOSTS_KV_ID
     need_workers oa-$P-auth-broker oa-$P-directory-broker
+    # BILLING (#1568, staging only, when the tag declares it).
+    billing_pre dispatch ""
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
     expect "$S" '.result.bindings[] | select(.name == "HOSTS") | .namespace_id' "$HOSTS_KV_ID" "HOSTS"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' oa-$P-auth-broker "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
+    billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
     expect "$S" '.result.observability.enabled // false' false "observability"
     ;;
@@ -535,6 +666,8 @@ case "$target" in
     # Its Workflows, RPC and producer bindings point at these: deploying first
     # would ship a scheduler bound to nothing.
     need_workers oa-$P-auth-broker oa-$P-directory-broker oa-$P-provisioner
+    # BILLING (#1568, staging only, when the tag declares it).
+    billing_pre scheduler ""
     need_queue oa-$P-signups
     # The tag's alert wiring (#915) must be "pinned": every alert var and
     # ALERT_EMAIL's destination is this env's placeholder. "absent" (none of
@@ -560,21 +693,55 @@ case "$target" in
     if [ -n "${FLEET_SMOKE_SHARE_TO:-}" ] && ! [[ "$FLEET_SMOKE_SHARE_TO" =~ ^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$ ]]; then
       echo "FLEET_SMOKE_SHARE_TO must be one lowercase address; refusing" >&2; exit 1
     fi
+    # The retry wait is checked before any deploy: a bad value must not leave
+    # the run half done.
+    [[ "${PUT_RETRY_SLEEP:-5}" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; exit 1; }
     sched_deploy() {
       PLATFORM_DB_ID="$PLATFORM_DB_ID" EMAIL_ZONE_TAGS="$EMAIL_ZONE_TAGS" EMAIL_DAILY_LIMIT="$EMAIL_DAILY_LIMIT" \
         ALERT_TO="$ALERT_TO" ALERT_FROM="$ALERT_FROM" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" \
         deploy scheduler
     }
+    # The tag order (#1040): a secret put makes an untagged version, so a
+    # tagged deploy follows the puts (deploys keep secrets). The scheduler's
+    # tag is read by the chain (worker-tag.sh exits on an untagged scheduler),
+    # so it must never be left untagged: if a put still fails after its
+    # retries, the last tagged deploy runs anyway (an earlier put may already
+    # have made an untagged version), and then the run is red (#55). That
+    # deploy is retried the same bounded way. The Environment always provides
+    # the values and a secret's value can't be read back (only its name is
+    # listed), so "only when changed" can't be known: they are put every run.
     sched_deploy
-    # Put only when given (a rotation); secrets survive deploys. Then deploy
-    # again so the serving version carries the tag (#1040).
     if [ -n "$smoke_puts" ]; then
+      put_failed=""
       for k in $smoke_puts; do
-        printf '%s' "${!k}" | put_secret oa-$P-scheduler scheduler "$k" || exit 1
+        if ! printf '%s' "${!k}" | put_secret oa-$P-scheduler scheduler "$k"; then
+          put_failed="$k"
+          break
+        fi
       done
-      sched_deploy
+      final_pause="${PUT_RETRY_SLEEP:-5}"
+      final_ok=""
+      for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+        if sched_deploy; then final_ok=1; break; fi
+        if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+          echo "oa-$P-scheduler: the tagged deploy after the secrets failed (attempt $a of $PUT_ATTEMPTS); trying again" >&2
+          sleep "$final_pause"
+          final_pause=$((final_pause * 3))
+        fi
+      done
+      if [ -n "$put_failed" ] && [ -z "$final_ok" ]; then
+        echo "oa-$P-scheduler: putting $put_failed failed, and the tagged deploy after it failed too: the scheduler may serve an untagged version" >&2
+        exit 1
+      elif [ -n "$put_failed" ]; then
+        echo "oa-$P-scheduler: putting $put_failed failed; the tagged deploy ran again, so the scheduler serves the tag, and the run stays red" >&2
+        exit 1
+      elif [ -z "$final_ok" ]; then
+        echo "oa-$P-scheduler: the tagged deploy after the secrets failed: the scheduler may serve an untagged version" >&2
+        exit 1
+      fi
     fi
     S="$(settings oa-$P-scheduler)"
+    billing_bound "$S" scheduler ""
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .type' service "PROVISIONER type"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .service' oa-$P-provisioner "PROVISIONER"
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .entrypoint' ProvisionerRpc "PROVISIONER entrypoint"

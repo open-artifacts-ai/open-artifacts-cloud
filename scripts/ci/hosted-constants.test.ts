@@ -21,6 +21,13 @@ const KEYS = [
   "signups_enabled",
   "welcome_from",
 ];
+// Billing's four Stripe price ids (#1568): staging's file only, not secrets.
+const STRIPE_KEYS = [
+  "stripe_price_business",
+  "stripe_price_solo_monthly",
+  "stripe_price_solo_yearly",
+  "stripe_price_team",
+];
 // Read by provapi-spikes.sh and provapi-token-verify.sh only; hosted-constants.sh does not load them.
 const SPIKE_KEYS = [
   "app_zone",
@@ -53,9 +60,23 @@ const brokerPin = (env: string): string => {
 };
 
 describe(".github/hosted/<env>.json", () => {
-  it("prod and staging hold exactly the same keys", () => {
+  it("prod and staging hold the same keys; staging adds billing's four price ids, prod holds none", () => {
     expect(Object.keys(read("prod")).sort()).toEqual(KEYS);
-    expect(Object.keys(read("staging")).sort()).toEqual(KEYS);
+    expect(Object.keys(read("staging")).sort()).toEqual(
+      [...KEYS, ...STRIPE_KEYS].sort(),
+    );
+  });
+
+  // From the user's Stripe sandbox page (test mode); a price id is not a secret.
+  it("staging's price ids are the sandbox's four, each a price id", () => {
+    expect(read("staging")).toMatchObject({
+      stripe_price_solo_monthly: "price_1UYx2tJuK8jgC2cZS0mg3Uiz",
+      stripe_price_solo_yearly: "price_1UYx2uJuK8jgC2cZdLlkeOdN",
+      stripe_price_team: "price_1UYx2vJuK8jgC2cZAcUMAQpw",
+      stripe_price_business: "price_1UYx2vJuK8jgC2cZr02sKqwQ",
+    });
+    for (const k of STRIPE_KEYS)
+      expect(read("staging")[k], k).toMatch(/^price_[A-Za-z0-9]+$/);
   });
 
   // Read by provapi-spikes.sh (the staging spikes); pinned to provision's
@@ -236,7 +257,9 @@ describe("hosted-constants.sh", () => {
       );
       expect(r.code, r.err).toBe(0);
       const lines = readFileSync(ghEnv, "utf8").split("\n");
-      expect(lines).toHaveLength(LOADED.length + 1);
+      expect(lines).toHaveLength(
+        LOADED.length + (env === "staging" ? STRIPE_KEYS.length : 0) + 1,
+      );
     }
   });
 
@@ -336,6 +359,53 @@ describe("hosted-constants.sh", () => {
       load({ ...read("staging"), signups_enabled: "TEST-USERS" }, "staging")
         .code,
     ).toBe(1);
+  });
+
+  it("staging loads the four prices as STRIPE_PRICE_*; a missing or malformed one fails and writes nothing", () => {
+    const st = load(read("staging"), "staging");
+    expect(st.code, st.err).toBe(0);
+    for (const l of [
+      "STRIPE_PRICE_TEAM=price_1UYx2vJuK8jgC2cZAcUMAQpw",
+      "STRIPE_PRICE_BUSINESS=price_1UYx2vJuK8jgC2cZr02sKqwQ",
+      "STRIPE_PRICE_SOLO_MONTHLY=price_1UYx2tJuK8jgC2cZS0mg3Uiz",
+      "STRIPE_PRICE_SOLO_YEARLY=price_1UYx2uJuK8jgC2cZdLlkeOdN",
+    ])
+      expect(st.ghEnv).toContain(`${l}\n`);
+    for (const k of STRIPE_KEYS) {
+      for (const v of [
+        null,
+        "",
+        "prod_1Abc",
+        "price_1 Abc",
+        "price_{{X}}",
+        ["price_1"],
+        "price_1\nX=y",
+      ]) {
+        const files = { ...read("staging"), [k]: v };
+        const r = load(files, "staging");
+        expect(r.code, `${k}=${JSON.stringify(v)}`).toBe(1);
+        expect(r.err).toContain(k);
+        expect(r.ghEnv).toBe("");
+      }
+      const missing = read("staging");
+      delete missing[k];
+      expect(load(missing, "staging").code, k).toBe(1);
+    }
+  });
+
+  it("prod loads no Stripe value and refuses a file that holds one", () => {
+    const ok = load(PROD(), "prod");
+    expect(ok.code, ok.err).toBe(0);
+    expect(ok.ghEnv).not.toContain("STRIPE");
+    for (const k of [...STRIPE_KEYS, "stripe_secret_key"]) {
+      const r = load(
+        { ...PROD(), [k]: "price_1UYx2tJuK8jgC2cZS0mg3Uiz" },
+        "prod",
+      );
+      expect(r.code, k).toBe(1);
+      expect(r.err).toContain("prod holds no stripe_* constant");
+      expect(r.ghEnv).toBe("");
+    }
   });
 
   it("refuses a bad account id, a missing file, bad JSON and a bad env", () => {

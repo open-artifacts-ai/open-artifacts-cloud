@@ -9,11 +9,7 @@ import { describe, expect, it } from "vitest";
 import { createPat } from "../../../server/src/auth/pat.js";
 import { login } from "../../../server/test/helpers.js";
 import { callWorker, E } from "../../../server/test/mcp-helpers.js";
-import {
-  SMOKE_BUS_SKIPPED,
-  SMOKE_TITLE_PREFIX,
-  smoke,
-} from "../../src/provapi/smoke.js";
+import { SMOKE_TITLE_PREFIX, smoke } from "../../src/provapi/smoke.js";
 
 const INSTALL = "icanary00001";
 const HOST = "app.localhost";
@@ -97,8 +93,10 @@ describe("the canary smoke against the real server (#1343)", () => {
     });
     expect(r, log.join(" | ")).toEqual({
       ok: true,
-      notes: [SMOKE_BUS_SKIPPED],
+      notes: [],
     });
+    // The bus check read the real route's answer (#1299).
+    expect(log).toContain("GET /api/v1/bus/ping 200");
     // Every call it made, in order, on real routes.
     expect(log.map((l) => l.split(" ").slice(0, 2).join(" "))).toEqual(
       expect.arrayContaining(["GET /healthz", "GET /api/v1/me", "POST /mcp"]),
@@ -121,5 +119,51 @@ describe("the canary smoke against the real server (#1343)", () => {
       .bind(a.userId)
       .all<{ id: string }>();
     expect(left.results.map((x) => x.id)).toEqual([keepMine]);
+  });
+
+  it("a canary whose bus is off (hosted, bus not featured) fails the bus check and still cleans up (#1299)", async () => {
+    const tag = newId().slice(0, 6).toLowerCase();
+    const a = await login(`smoke-${tag}@smoke.test`, "member");
+    const { token } = await createPat(env, a.userId, "fleet-smoke");
+    const e = E({ INSTALL_ID: INSTALL });
+    // Only the ping sees the bus off: every other route is the plain install,
+    // so the failure is the bus check's and nothing else's.
+    const off = E({ INSTALL_ID: INSTALL, HOSTED: "1" });
+    const hz = (await (
+      await callWorker(new Request(`https://${HOST}/healthz`), e)
+    ).json()) as { version: string; testHooks?: boolean };
+    const r = await smoke({
+      fetch: async (url, init) => {
+        const path = new URL(url).pathname;
+        const res = await callWorker(
+          new Request(url, init),
+          path === "/api/v1/bus/ping" ? off : e,
+        );
+        if (path === "/healthz" && hz.testHooks) {
+          const { testHooks: _, ...rest } = (await res.json()) as Record<
+            string,
+            unknown
+          >;
+          return Response.json(rest, { status: res.status });
+        }
+        return res;
+      },
+      installId: INSTALL,
+      appHost: HOST,
+      token,
+      shareTo: undefined,
+      share: false,
+      brokerOrigin: undefined,
+      version: hz.version,
+      callMs: 10_000,
+      budgetMs: 60_000,
+    });
+    expect(r).toEqual({ ok: false, kind: "assert", check: "bus" });
+    const left = await env.DB.prepare(
+      "select a.id as id from artifacts a where a.owner_id = ? and a.deleted_at is null",
+    )
+      .bind(a.userId)
+      .all<{ id: string }>();
+    expect(left.results).toEqual([]);
   });
 });

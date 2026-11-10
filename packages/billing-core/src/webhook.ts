@@ -348,6 +348,10 @@ export function changeFor(
         // live subscription from it: the row switches when the payment
         // succeeds (async_payment_succeeded). With no live one it records
         // the pending id, so that subscription's invoices apply (N9c).
+        // A paid (or nothing-to-pay) Checkout means a card is on file: the
+        // no-card trial reminder must skip this install (it keeps
+        // solo_trial_ends_at when the Checkout kept the free days).
+        if (payNow) sets.push({ sql: "solo_checked_out = 1", args: [] });
         sets.push(
           payNow
             ? { sql: "stripe_subscription_id = ?", args: [sub] }

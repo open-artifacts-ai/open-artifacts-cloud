@@ -1,5 +1,9 @@
 {
-  "_doc": "Billing D1 migration lock (scripts/ops/check-migration-lock.mjs). Not frozen: billing has never been deployed, so 0001 may still change. The PR that first deploys oa-s-billing sets frozen to true and pins every migration's sha256; from then on a pinned file never changes (add a new migration) and the deploy wrapper refuses an unfrozen or mismatched lock.",
-  "frozen": false,
-  "pins": {}
+  "_doc": "Billing D1 migration lock (scripts/ops/check-migration-lock.mjs). Frozen: the staging deploy (deploy-hosted-platform.sh billing) applies these files to oa-s-billing and records each by sha256 in billing_migrations; from now on a pinned file never changes (add a new migration) and main's lock must keep every pin (scripts/ops/billing-db.ts).",
+  "frozen": true,
+  "pins": {
+    "0001_init.sql": "b26b1a629812f69fc82c21507b8d962cb5f027d176c84073ca61a633f0a2b581",
+    "0002_solo_tier.sql": "0fc4b2e69e41f3da18b6b2da7f15a49126d92f500db7b2dfda5dbcea989a5b97",
+    "0003_solo_checked_out.sql": "2e22121ee046811c2e5be4b023978934c39946e014896f0b40eb0b9f567ba917"
+  }
 }

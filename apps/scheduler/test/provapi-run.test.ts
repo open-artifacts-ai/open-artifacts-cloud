@@ -93,6 +93,7 @@ describe("runDuties", () => {
     expect(DUTY_NAMES).toEqual([
       "sweep",
       "signups",
+      "reminders",
       "purge",
       "health",
       "fleet",

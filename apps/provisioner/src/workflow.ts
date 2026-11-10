@@ -72,7 +72,7 @@ import {
   jobStep,
   readJob,
 } from "./steps.js";
-import { welcomeEmail } from "./welcome.js";
+import { type Welcome, welcomeEmail } from "./welcome.js";
 
 /**
  * What BillingProvisionerRpc.soloStart answers (OA Billing's contract):
@@ -591,6 +591,27 @@ async function notify(
 ): Promise<{ sent: boolean }> {
   if (!job.sendWelcome) return { sent: false };
   const db = ctx.env.PLATFORM_DB;
+  const to = await ownerEmail(ctx, job.signupId);
+  if (to === null) throw new NonRetryableError("internal");
+  // Build before claiming: a throw here leaves the claim free. The install is
+  // fine, so the job still finishes; the row stays send_welcome = 1 with no
+  // welcome_sent_at, and the scheduler's welcome_unsent alert (owed and not
+  // sent once ready) surfaces it. A later notify can still send.
+  let message: Welcome;
+  try {
+    message = welcomeEmail({
+      from: ctx.env.WELCOME_FROM,
+      to,
+      appHost,
+      selfServe: job.source === "self-serve",
+    });
+  } catch (e) {
+    console.error("welcome email not built", {
+      signupId: job.signupId,
+      error: e instanceof Error ? e.name : "unknown",
+    });
+    return { sent: false };
+  }
   const claim = await transient(
     db
       .prepare(
@@ -600,12 +621,8 @@ async function notify(
       .run(),
   );
   if (claim.meta.changes !== 1) return { sent: false };
-  const to = await ownerEmail(ctx, job.signupId);
   // Claimed, never sent: the scheduler's welcome_unsent alert says so.
-  if (to === null) throw new NonRetryableError("internal");
-  await ctx.env.WELCOME_EMAIL.send(
-    welcomeEmail({ from: ctx.env.WELCOME_FROM, to, appHost }),
-  );
+  await ctx.env.WELCOME_EMAIL.send(message);
   await transient(
     db
       .prepare(

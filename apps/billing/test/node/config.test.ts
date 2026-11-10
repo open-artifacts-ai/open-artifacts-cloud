@@ -103,11 +103,12 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init and 0002_solo_tier are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier and 0003_solo_checked_out are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
       "0002_solo_tier.sql",
+      "0003_solo_checked_out.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -147,6 +148,16 @@ describe("migrations", () => {
     );
   });
 
+  it("0003 adds solo_checked_out to tiers", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0003_solo_checked_out.sql"),
+      "utf8",
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE tiers ADD COLUMN solo_checked_out INTEGER;/,
+    );
+  });
+
   it("is the schema @oa/billing-core tests against, byte for byte", () => {
     for (const f of readdirSync(join(app, "migrations")))
       expect(readFileSync(join(app, "migrations", f), "utf8"), f).toBe(
@@ -155,6 +166,32 @@ describe("migrations", () => {
           "utf8",
         ),
       );
+  });
+});
+
+describe("migration lock", () => {
+  it("is frozen and pins every migration by its sha256 (the staging deploy applies and records them; a pinned file never changes)", () => {
+    const lock = JSON.parse(
+      readFileSync(join(app, "migration-lock.json"), "utf8"),
+    );
+    expect(lock.frozen).toBe(true);
+    expect(Object.keys(lock.pins).sort()).toEqual(
+      readdirSync(join(app, "migrations")).sort(),
+    );
+    // The deploy's own checker (scripts/ops/check-migration-lock.mjs, also run
+    // by the wrapper): exit 0 means frozen, every file pinned, every pin held.
+    // Run as a script, not imported: it is untyped JavaScript.
+    expect(() =>
+      execFileSync(
+        "node",
+        [
+          join(app, "../../scripts/ops/check-migration-lock.mjs"),
+          join(app, "migrations"),
+          join(app, "migration-lock.json"),
+        ],
+        { stdio: "pipe" },
+      ),
+    ).not.toThrow();
   });
 });
 

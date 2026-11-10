@@ -852,6 +852,51 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     expect(claim(sub)).toEqual({ signup_id: "signup-2", freed_at: null });
   });
 
+  it("an admin purge of a suspended self-serve install keeps its claim, and logs it (#1046)", async () => {
+    const s = await active({
+      slug: "banco",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const sub = s.sub as string;
+    await manage("suspend", s.installId, { args: { reason: "abuse" } });
+    await manage("delete", s.installId);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect((await manage("purge", s.installId)).error).toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.any(String), s.installId);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(w.install(s.installId)?.state).toBe("deleted");
+    expect(claim(sub)?.freed_at).toBeNull();
+    expect(await signUpAgain(sub, "signup-ban")).toBe("signup_limit");
+  });
+
+  it("purging one self-serve install leaves another install's live claim held", async () => {
+    const a = await active({
+      slug: "twina",
+      source: "self-serve",
+      tier: "trial",
+    });
+    const b = await active({
+      slug: "twinb",
+      source: "self-serve",
+      tier: "trial",
+    });
+    expect(a.sub).not.toBe(b.sub);
+    await manage("delete", a.installId);
+    w.clock.t += GRACE_MS;
+    expect(
+      (await manage("purge", a.installId, { actor: "system" })).error,
+    ).toBeNull();
+    expect(claim(a.sub as string)?.freed_at).toEqual(expect.any(Number));
+    expect(claim(b.sub as string)?.freed_at).toBeNull();
+    expect(await signUpAgain(b.sub as string, "signup-b2")).toBe(
+      "signup_limit",
+    );
+  });
+
   it("the purge's free step re-run after a new signup took the account does not free that claim", async () => {
     const s = await active({
       slug: "replayco",
@@ -2182,6 +2227,29 @@ describe("audit, lease and dirty-pause edges (4.9, 5.4, 3.6)", () => {
         }),
       },
     ]);
+  });
+
+  it("a rollback the product refuses (no previous version) fails invalid_state: one job.failed row with that code, as job:<id>, and the install unchanged", async () => {
+    const s = await active({ slug: "norollco", version: V1 });
+    const before = w.install(s.installId);
+    const r = await manage("rollback", s.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(r.job).toMatchObject({
+      status: "failed",
+      error_code: "invalid_state",
+    });
+    expect(jobAudits(s.installId, "rollback", "job.failed")).toEqual([
+      {
+        actor: `job:${r.id}`,
+        detail: JSON.stringify({
+          code: "invalid_state",
+          jobId: r.id,
+          kind: "rollback",
+        }),
+      },
+    ]);
+    expect(w.install(s.installId)).toEqual(before);
   });
 
   it("a failed create is audited job.failed", async () => {

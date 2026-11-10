@@ -42,6 +42,8 @@
         "ACCOUNT_ID": "{{ACCOUNT_ID_STAGING}}",
         // The Workflow's env: it refuses any other value.
         "OA_ENV": "staging",
+        // #1299 part 6: installs (exact slugs) that get the bus feature. Staging only.
+        "STAGING_BUS_SLUGS": "rl-agents,bus1299-b",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },
@@ -66,6 +68,18 @@
           "name": "oa-s-manage-install",
           "binding": "MANAGE_INSTALL",
           "class_name": "ManageInstall"
+        }
+      ],
+      // STAGING ONLY (#1568): billing's BillingProvisionerRpc entrypoint, how the
+      // provisioner starts an install's 30-day no-card Solo trial. oa-s-billing
+      // must be deployed first (the billing target), and the deploy reads the
+      // binding back when the tag declares it: unbound, the free month would
+      // silently be skipped. Prod has no BILLING binding.
+      "services": [
+        {
+          "binding": "BILLING",
+          "service": "oa-s-billing",
+          "entrypoint": "BillingProvisionerRpc"
         }
       ],
       "dispatch_namespaces": [

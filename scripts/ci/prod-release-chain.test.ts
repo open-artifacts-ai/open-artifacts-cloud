@@ -281,11 +281,18 @@ describe("prod-release-chain.yml", () => {
     expect(deploy.on.workflow_dispatch.inputs.targets.default).toBe(FULL);
     const steps = deploy.jobs.deploy.steps as Record<string, string>[];
     const ifOf = (n: string) => steps.find((s) => s.name === n)?.if;
+    // Prod's list is unchanged; staging's full list adds billing (#1568), a
+    // staging-only target that prod refuses, so the chain never carries it.
+    const FULLB = FULL.replace(
+      "directory-broker,",
+      "directory-broker,billing,",
+    );
+    expect(sh).not.toContain("billing");
     expect(ifOf("Every platform Worker runs the tag")).toBe(
-      `\${{ inputs.targets == '${FULL}' }}`,
+      `\${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == '${FULL}' || inputs.targets == '${FULLB}') }}`,
     );
     expect(ifOf("Record the break-glass deploy")).toBe(
-      `\${{ !inputs.verify_only && inputs.targets != '${FULL}' }}`,
+      `\${{ !inputs.verify_only && inputs.targets != '${FULL}' && inputs.targets != '${FULLB}' }}`,
     );
     // Its Environment and concurrency group resolve from inputs.env.
     expect(deploy.jobs.deploy.environment).toBe(
@@ -515,6 +522,17 @@ describe("report: one blocker issue while red", () => {
         run: RUN,
       }),
     ).toEqual({ action: "refreshed", issue: 4 });
+  });
+
+  it("a red issue never claims the fleet stayed put: it points at the read-back that runs after a failed deploy (#55)", () => {
+    const a = world([]);
+    report({ exec: a.exec, repo: REPO, tag: TAG, result: "failure", run: RUN });
+    const create = a.calls.find((c) => c[1] === "create") ?? [];
+    const body = create[create.indexOf("--body") + 1] ?? "";
+    expect(body).not.toMatch(/did not move|never moves|stayed/);
+    expect(body).toContain("Every platform Worker runs the tag");
+    expect(body).toContain("the fleet follows it");
+    expect(body).toContain("require_newer false");
   });
 
   it("a neutral skip (stale event, a release prod has) neither opens, refreshes nor closes it", () => {

@@ -110,13 +110,18 @@ function detailOf(e: AuditEntry): Record<string, unknown> | null {
 export async function auditStatement(
   env: Env,
   e: AuditEntry,
+  /**
+   * Insert only if the previous statement in the same batch changed a row
+   * (`changes() > 0`): the row records a write that may have matched nothing.
+   */
+  onlyIfChanged = false,
 ): Promise<D1PreparedStatement> {
   const a = actorOf(e);
   const detail = detailOf(e);
   const email = emailOf(e);
   return env.PLATFORM_DB.prepare(
     `INSERT INTO admin_audit (at, actor_kind, actor_label, token_id, action, install_id, job_id, request_id, outcome, code, ip_hmac, email_hmac, detail)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+${onlyIfChanged ? "SELECT" : "VALUES ("}?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13${onlyIfChanged ? " WHERE changes() > 0" : ")"}`,
   ).bind(
     Date.now(),
     a.kind,

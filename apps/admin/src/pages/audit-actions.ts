@@ -29,6 +29,7 @@ const VERB: Record<string, string> = {
   "oauth.refresh_refused": "had a token refresh refused",
   "oauth.client_expired": "had an agent client expire",
   "test_admin.session": "started a test admin session",
+  "signup_claim.free": "freed a sign-up claim",
   // The provisioner's step rows (#1136); job.done and job.failed sum them up.
   "create.start": "started creating the install",
   "create.resume": "resumed creating the install",

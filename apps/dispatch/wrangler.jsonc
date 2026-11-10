@@ -26,13 +26,15 @@
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts-staging.app"
       },
       // Installs reach the brokers only through BrokerGate stubs built on
-      // these (a same-zone fetch to a broker Route fails; see the gates).
-      // No BILLING binding yet: it and the billing deploy target land
-      // together in the cloud repo. Without it dispatch hands installs no
-      // billing gate.
+      // these (a same-zone fetch to a broker Route fails; see the gates), and
+      // billing through BillingGate on BILLING (#1568): STAGING ONLY, bound with
+      // the scheduler's together (an install call without the gate has no plan
+      // at all). oa-s-billing must be deployed first (the billing target).
+      // Prod has no BILLING binding: its installs get no billing gate.
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-s-auth-broker" },
-        { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" }
+        { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
+        { "binding": "BILLING", "service": "oa-s-billing" }
       ],
       "observability": { "enabled": false },
       "dispatch_namespaces": [

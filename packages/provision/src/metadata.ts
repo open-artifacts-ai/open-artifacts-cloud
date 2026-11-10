@@ -241,6 +241,24 @@ export interface ResourceMetaInput {
   keepAssets?: boolean;
   /** The release's server template (verified against the signed record). */
   template: Template;
+  /**
+   * Staging only (#1299 part 6): exact slugs of installs that get the `bus`
+   * feature on top of what their tier grants. Never read when env is prod.
+   */
+  busSlugs?: readonly string[];
+}
+
+/** One install slug as STAGING_BUS_SLUGS lists it: lowercase, no "--". */
+const BUS_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const busSlugOk = (s: string) => BUS_SLUG_RE.test(s) && !s.includes("--");
+
+/**
+ * STAGING_BUS_SLUGS: a comma list of exact slugs. Strict, no trimming or case
+ * folding: an entry that is not a plain slug (space, empty, uppercase, "*",
+ * a dot) is dropped, so it can never match anything.
+ */
+export function parseBusSlugs(raw: string | undefined): string[] {
+  return (raw ?? "").split(",").filter(busSlugOk);
 }
 
 const ASSET_CONFIG_KEYS = [
@@ -382,6 +400,11 @@ export function userWorkerMetadata(
     throw new Error(
       "FEATURES is derived from TIER: pass one or the other, never both",
     );
+  // #1299 part 6: `bus` for a named staging install, never anywhere else. The
+  // env check is here, in code, not only in the provisioner's config.
+  const slug = i.appHost.split(".")[0] ?? "";
+  const bus =
+    r.env === "staging" && busSlugOk(slug) && (r.busSlugs ?? []).includes(slug);
   const features = [
     ...new Set(
       (tier ? TIER_FEATURES[tier].join(",") : (i.vars.FEATURES ?? ""))
@@ -389,7 +412,7 @@ export function userWorkerMetadata(
         .map((x) => x.trim())
         .filter(Boolean)
         // Hosted M1 is the spaces product (Manager ruling 2026-10-26): always on.
-        .concat("spaces", "usage_off"),
+        .concat("spaces", "usage_off", ...(bus ? ["bus"] : [])),
     ),
   ].join(",");
 
