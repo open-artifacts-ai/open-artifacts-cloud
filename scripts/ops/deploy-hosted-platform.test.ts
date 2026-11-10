@@ -84,6 +84,7 @@ bad() { echo '{"success":false,"errors":[{"code":1}]}'; }
 case "$path" in
   # queues.json: a whole listing (an envelope) or just its result array; no
   # file is a failed listing.
+  challenges/widgets\\?*) ok "$(cat "$STATE/widgets.json" 2>/dev/null || echo '[{"name":"oa-s-turnstile","sitekey":"0x4AAAAAAAdefault"}]')"; exit 0 ;;
   queues\\?*) [ -f "$STATE/fail-queues" ] && { bad; exit 0; }
     if [ ! -f "$STATE/queues.json" ]; then bad
     elif jq -e 'type == "object"' "$STATE/queues.json" > /dev/null 2>&1; then cat "$STATE/queues.json"
@@ -2542,6 +2543,11 @@ describe("deploy-hosted-platform.sh", () => {
       const s = setup({
         // The staging tag declares BILLING (#66), so oa-s-billing must exist.
         exists: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
+        files: {
+          "widgets.json": JSON.stringify([
+            { name: "oa-s-turnstile", sitekey: "0x4AAAAAAAtest_key-1" },
+          ]),
+        },
         next: {
           "oa-s-provisioning": settings(provisioningBindings("s", "staging")),
         },
@@ -2554,16 +2560,22 @@ describe("deploy-hosted-platform.sh", () => {
         '"origin":"https://admin.open-artifacts-staging.app"',
       );
     });
-    it("staging also makes the sign-up host's key and entry; a given Turnstile sitekey is put, and prod gets neither (#40)", () => {
+    it("staging also makes the sign-up host's key and entry and puts the env's one Turnstile widget's sitekey; prod gets neither (#40)", () => {
       const exists = ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"];
       const next = {
         "oa-s-provisioning": settings(provisioningBindings("s", "staging")),
       };
-      const r = setup({ exists, next }).run(
-        "provisioning",
-        { NEW_KV: OAUTH, TURNSTILE_SITEKEY: "0x4AAAAAAAtest_key-1" },
-        "staging",
-      );
+      const widgets = (l: { name: string; sitekey: string }[]) => ({
+        files: { "widgets.json": JSON.stringify(l) },
+      });
+      const r = setup({
+        exists,
+        next,
+        ...widgets([
+          { name: "other", sitekey: "0xOTHER" },
+          { name: "oa-s-turnstile", sitekey: "0x4AAAAAAAtest_key-1" },
+        ]),
+      }).run("provisioning", { NEW_KV: OAUTH }, "staging");
       expect(r.err).toBe("");
       expect(r.code).toBe(0);
       const sp = r.writes.find((w) =>
@@ -2581,14 +2593,23 @@ describe("deploy-hosted-platform.sh", () => {
         "SIGNUP_BROKER_KEY",
         "TURNSTILE_SITEKEY",
       ]);
-      const none = setup({ exists, next }).run(
-        "provisioning",
-        { NEW_KV: OAUTH },
-        "staging",
-      );
-      expect(none.code, none.err).toBe(0);
-      expect(puts(none.log)).not.toContain("TURNSTILE_SITEKEY");
-      expect(none.out).toContain("no TURNSTILE_SITEKEY given");
+      // Zero or two widgets of that name: said, left unset, the deploy goes on.
+      for (const l of [
+        [],
+        [
+          { name: "oa-s-turnstile", sitekey: "0xA" },
+          { name: "oa-s-turnstile", sitekey: "0xB" },
+        ],
+      ]) {
+        const none = setup({ exists, next, ...widgets(l) }).run(
+          "provisioning",
+          { NEW_KV: OAUTH },
+          "staging",
+        );
+        expect(none.code, none.err).toBe(0);
+        expect(puts(none.log)).not.toContain("TURNSTILE_SITEKEY");
+        expect(none.err).toContain("TURNSTILE_SITEKEY not set");
+      }
     });
   });
 

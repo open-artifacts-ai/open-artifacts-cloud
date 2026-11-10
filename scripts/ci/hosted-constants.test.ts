@@ -241,19 +241,6 @@ describe("hosted-constants.sh", () => {
     expect(r.out).not.toContain("me@test.invalid");
   });
 
-  it("turnstile_sitekey is optional: absent or empty writes nothing, a good one loads, a bad one refuses (#40)", () => {
-    expect(load(PROD(), "prod").ghEnv).not.toContain("TURNSTILE_SITEKEY");
-    expect(
-      load({ ...PROD(), turnstile_sitekey: "" }, "prod").ghEnv,
-    ).not.toContain("TURNSTILE_SITEKEY");
-    expect(
-      load({ ...PROD(), turnstile_sitekey: "0x4AAAAAAA_test-1" }, "prod").ghEnv,
-    ).toContain("TURNSTILE_SITEKEY=0x4AAAAAAA_test-1\n");
-    const bad = load({ ...PROD(), turnstile_sitekey: "a b" }, "prod");
-    expect(bad.code).toBe(1);
-    expect(bad.err).toContain("turnstile_sitekey");
-  });
-
   it("the committed files both load", () => {
     for (const env of ["prod", "staging"]) {
       const sb = sandbox({});

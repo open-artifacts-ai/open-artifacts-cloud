@@ -514,13 +514,21 @@ case "$target" in
     else
       echo "$W: no SIGNUP_BROKER_KEY on $env: signup.<app> sign-in stays unavailable (503)"
     fi
-    # The Turnstile site key (public, per env in .github/hosted): put when
-    # given, left as it is when empty (the page then says sign-ups are
-    # unavailable).
-    if [ -n "${TURNSTILE_SITEKEY:-}" ]; then
-      printf '%s' "$TURNSTILE_SITEKEY" | put_secret "$W" provisioning TURNSTILE_SITEKEY
+    # The Turnstile site key (public): the env's one widget oa-<p>-turnstile
+    # (its domain [<app>] covers signup.<app>), found by exact name; STAGING
+    # ONLY like the broker key. The widget's secret is never read here. Zero or
+    # several widgets, or a failed listing: say so and leave it unset (the page
+    # then says sign-ups are unavailable); never fails the deploy.
+    if [ "$env" = staging ]; then
+      widgets="$(list_all "/challenges/widgets?" "list Turnstile widgets")" || widgets=""
+      sitekeys="$(jq -r --arg n "oa-$P-turnstile" '[.[]? | select(.name == $n) | .sitekey] | join(" ")' <<< "$widgets" 2> /dev/null)" || sitekeys=""
+      if [[ "$sitekeys" =~ ^[0-9A-Za-z_-]{1,64}$ ]]; then
+        printf '%s' "$sitekeys" | put_secret "$W" provisioning TURNSTILE_SITEKEY
+      else
+        echo "$W: TURNSTILE_SITEKEY not set: want exactly one Turnstile widget named oa-$P-turnstile (found: '${sitekeys:-none}', or the listing failed); the sign-up page says sign-ups are unavailable until it is" >&2
+      fi
     else
-      echo "$W: no TURNSTILE_SITEKEY given: leaving it as it is; the sign-up page says sign-ups are unavailable until one is set"
+      echo "$W: no TURNSTILE_SITEKEY on $env: the sign-up page says sign-ups are unavailable"
     fi
     # Again after the secrets: the serving version carries the tag.
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \

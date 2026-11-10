@@ -12,7 +12,6 @@
 # committed (#1084), it comes from OA_OWNER_EMAIL (the Actions secret) when
 # set, goes to $GITHUB_ENV only and is never printed. Unset, no ALERT_TO is
 # written, and a scheduler deploy refuses (deploy-hosted-platform.sh).
-# turnstile_sitekey (optional, #40) loads as TURNSTILE_SITEKEY.
 # STAGING ONLY (#1568): the billing service's four Stripe test-mode price ids
 # (stripe_price_team, _business, _solo_monthly, _solo_yearly: not secrets) load
 # as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS, STRIPE_PRICE_SOLO_MONTHLY and
@@ -74,15 +73,6 @@ LIST
 else
   [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
     { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }
-fi
-# The sign-up page's Turnstile site key (turnstile_sitekey, #40): public and
-# optional. Absent or empty writes nothing (the deploy leaves the Worker's value
-# as it is and the page says sign-ups are unavailable); present, it must look
-# like a site key.
-sitekey="$(jq -r '.turnstile_sitekey | if type == "string" then . else "" end' "$file")" || exit 1
-if [ -n "$sitekey" ]; then
-  [[ "$sitekey" =~ ^[0-9A-Za-z_-]{1,64}$ ]] || { echo "$file: turnstile_sitekey is not a valid site key" >&2; exit 1; }
-  lines+="TURNSTILE_SITEKEY=$sitekey"$'\n'
 fi
 owner=""
 if [ -n "${OA_OWNER_EMAIL:-}" ]; then
