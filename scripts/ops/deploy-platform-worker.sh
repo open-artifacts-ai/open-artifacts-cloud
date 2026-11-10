@@ -179,6 +179,9 @@ case "$app" in
     fill "PROVISIONING_OAUTH_KV_ID_${up}" "${PROVISIONING_OAUTH_KV_ID:-}" "$hex32"
     # The API's per-day signup cap, the provisioner's value (#893).
     fill "SIGNUP_DAILY_CAP_${up}" "${SIGNUP_DAILY_CAP:-}" "$cap"
+    # Staging's gate is the constant (open for the M2 walk); prod's block pins
+    # a literal false, so this fill only checks the value there.
+    fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"

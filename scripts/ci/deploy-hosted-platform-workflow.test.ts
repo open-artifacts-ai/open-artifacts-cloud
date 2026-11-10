@@ -29,6 +29,15 @@ const steps: Record<string, any>[] = job.steps;
 const named = (n: string) =>
   steps.find((s) => s.name === n) as Record<string, any>;
 
+describe("ALLOW_SIGNUPS", () => {
+  it("is set once at job level, for staging only, so every step that reads the signups constant sees it; prod gets none", () => {
+    expect(job.env.ALLOW_SIGNUPS).toBe(
+      "${{ inputs.env == 'staging' && '1' || '' }}",
+    );
+    for (const st of steps) expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
+  });
+});
+
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
 // The gate on billing's Stripe secrets: staging and the billing target (#1568).

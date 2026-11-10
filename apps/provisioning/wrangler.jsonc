@@ -45,7 +45,7 @@
         "OA_ENV": "staging",
         "ADMIN_SESSION_TTL_HOURS": "168",
         "APP_DOMAIN": "open-artifacts-staging.app",
-        "SIGNUPS_ENABLED": "test-users",
+        "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_STAGING}}",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
