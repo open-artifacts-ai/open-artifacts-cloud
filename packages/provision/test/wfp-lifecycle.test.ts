@@ -6783,11 +6783,13 @@ describe("SS1e: the free-plan caps and the per-env create defaults", () => {
     "FREE_STORAGE_BYTES",
     "FREE_DATA_DOCS",
     "FREE_DATA_DAILY_WRITES",
+    "FREE_DATA_DAILY_WRITES_TOTAL",
   ] as const;
   const DEFAULTS = {
     FREE_STORAGE_BYTES: "1073741824",
     FREE_DATA_DOCS: "10000",
     FREE_DATA_DAILY_WRITES: "1000",
+    FREE_DATA_DAILY_WRITES_TOTAL: "5000",
   };
   const plainOf = (s: S, from = 0) => {
     const meta = metaOf(uploads(s.fake, from).at(-1)?.body as string);

@@ -110,7 +110,8 @@ export const TRIAL_MS = 14 * 86_400_000;
  * Platform-wide var defaults per env, rendered at create for a name the
  * caller does not pass (a caller value wins; updateVars changes or clears
  * them). An empty value is no default. The hosted Solo caps are 1 GiB,
- * 10,000 data docs and 1,000 daily writes (decided by the user 2026-11-10).
+ * 10,000 data docs and 1,000 daily writes, plus a 5,000 install-wide daily
+ * write total (decided by the user 2026-11-10).
  * Change a default only when no install is in `creating`: the defaults are
  * part of create's inputs hash, so a resume would refuse.
  */
@@ -121,13 +122,31 @@ export const HOSTED_DEFAULT_VARS: Readonly<
     FREE_STORAGE_BYTES: "1073741824",
     FREE_DATA_DOCS: "10000",
     FREE_DATA_DAILY_WRITES: "1000",
+    FREE_DATA_DAILY_WRITES_TOTAL: "5000",
   }),
   prod: Object.freeze({
     FREE_STORAGE_BYTES: "1073741824",
     FREE_DATA_DOCS: "10000",
     FREE_DATA_DAILY_WRITES: "1000",
+    FREE_DATA_DAILY_WRITES_TOTAL: "5000",
   }),
 });
+
+/**
+ * Every default set a create once rendered, oldest first: none (before the
+ * Solo caps) and cloud #68's three caps. A run hashed under one of them
+ * still resumes and replays; see WfpProvisioner.create.
+ */
+export const PREVIOUS_DEFAULT_VARS: readonly Readonly<
+  Record<string, string>
+>[] = Object.freeze([
+  Object.freeze({}),
+  Object.freeze({
+    FREE_STORAGE_BYTES: "1073741824",
+    FREE_DATA_DOCS: "10000",
+    FREE_DATA_DAILY_WRITES: "1000",
+  }),
+]);
 
 /** The caller's vars plus each non-empty default it does not set. */
 export function withDefaultVars(

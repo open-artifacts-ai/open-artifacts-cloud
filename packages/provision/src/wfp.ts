@@ -92,6 +92,7 @@ import {
   names,
   newInstallId,
   ownerEmailOf,
+  PREVIOUS_DEFAULT_VARS,
   parseHostsValue,
   platformNames,
   type RegistryEntry,
@@ -105,10 +106,10 @@ import {
   canonicalJson,
   type DirectoryRevoke,
   holderLease,
-  leaseJobPart,
   type InstallRow,
   type InstallState,
   inputsHash,
+  leaseJobPart,
   PlatformDb,
   RL_BASE,
   type StoredVersion,
@@ -1817,14 +1818,17 @@ export class WfpProvisioner {
     if (this.o.brokerEnabled) this.registryDomainsOf(vars);
     // Without the version: replayOf compares it; a resume only refuses a downgrade.
     let hash = inputsHash({ ownerEmail, vars, testHooks });
-    // Before the Solo cap defaults existed, no default was rendered: a run
-    // started then hashed the caller's vars alone. Resume and replay accept
-    // that hash too, and a resume keeps those first-run vars.
-    const noDefaultsHash = inputsHash({
-      ownerEmail,
-      vars: i.vars ?? {},
-      testHooks,
+    // Earlier defaults hashed differently. A run started under one of them
+    // hashes the caller's vars plus that set; resume and replay accept
+    // those hashes too, and a resume keeps that run's own vars.
+    const legacy = PREVIOUS_DEFAULT_VARS.map((d) => {
+      const lv = withDefaultVars(i.vars ?? {}, d);
+      return {
+        vars: lv,
+        hash: inputsHash({ ownerEmail, vars: lv, testHooks }),
+      };
     });
+    const legacyHashes = legacy.map((l) => l.hash);
     // 5.7 replay, before the release pre-flight (a fixed id only): the
     // create finished but its step result was lost, so a release pulled
     // since must not fail it. No release read, no write, no PAT re-minted.
@@ -1834,7 +1838,7 @@ export class WfpProvisioner {
       await this.resolvePlatform();
       this.checkDirect(appHost, i.installId);
       row = await this.findRow(i);
-      const done = this.replayOf(row, i, hash, noDefaultsHash);
+      const done = this.replayOf(row, i, hash, legacyHashes);
       if (done) return done;
     }
     const rel = await this.readRelease(i);
@@ -1897,11 +1901,15 @@ export class WfpProvisioner {
           `install ${row.id} is ${row.state}; only a creating install can be resumed (a deleted install keeps its slug and hosts until a purge)`,
           "invalid_state",
         );
-      if (row.inputs_hash !== hash && row.inputs_hash === noDefaultsHash) {
-        // A run hashed without defaults: continue with its own vars.
-        const first = i.vars ?? {};
-        for (const k of Object.keys(vars)) if (!(k in first)) delete vars[k];
-        hash = noDefaultsHash;
+      const old =
+        row.inputs_hash !== hash
+          ? legacy.find((l) => l.hash === row?.inputs_hash)
+          : undefined;
+      if (old) {
+        // A run hashed under an earlier default set: continue with its own
+        // vars, dropping only keys the current defaults added.
+        for (const k of Object.keys(vars)) if (!(k in old.vars)) delete vars[k];
+        hash = old.hash;
       }
       if (row.inputs_hash !== hash)
         throw new ProvisionRefused(
@@ -1993,12 +2001,12 @@ export class WfpProvisioner {
     row: InstallRow | undefined,
     i: WfpCreateInput,
     hash: string,
-    noDefaultsHash: string,
+    legacyHashes: readonly string[],
   ): Install | undefined {
     if (row?.state !== "active" || row.id !== i.installId) return undefined;
     // The version is part of the replay check only (not the hash).
     if (
-      (row.inputs_hash !== hash && row.inputs_hash !== noDefaultsHash) ||
+      (row.inputs_hash !== hash && !legacyHashes.includes(row.inputs_hash)) ||
       row.version !== i.version
     )
       throw new ProvisionRefused(
