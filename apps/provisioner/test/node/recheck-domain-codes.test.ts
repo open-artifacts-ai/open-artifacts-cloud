@@ -103,14 +103,17 @@ describe("strictVars: google without a domain", () => {
     source: "self-serve" as const,
     selfServeTier: "trial",
   };
-  it("is allowed for self-serve (a personal Google account has no hd)", () => {
+  it("is allowed for self-serve with guest email codes (a personal Google account has no hd)", () => {
     const v = strictVars(ss, selfServe);
     expect(v).not.toHaveProperty("AUTH_DOMAINS");
     expect(v.AUTH_PROVIDERS).toBe("google,email");
     expect(v).not.toHaveProperty("EMAIL_CODE_DOMAIN");
   });
-  it("refuses a self-serve google-only or email-only set", () => {
-    for (const p of ["google", "email"])
+  it("still passes a persisted google-only self-serve row, vars unchanged", () => {
+    expect(strictVars(g, selfServe).AUTH_PROVIDERS).toBe("google");
+  });
+  it("refuses a self-serve email-only or duplicated set", () => {
+    for (const p of ["email", "google,google", "email,email"])
       expect(() =>
         strictVars(
           JSON.stringify({

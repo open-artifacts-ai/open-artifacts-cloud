@@ -376,17 +376,12 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
     }
   });
 
-  it("self-serve: TIER must be SELF_SERVE_TIER, google and email, one domain", async () => {
+  it("self-serve: TIER must be SELF_SERVE_TIER, google or google+email, one domain", async () => {
     for (const [i, vars] of [
       {
         AUTH_PROVIDERS: "google",
         AUTH_DOMAINS: "finqore.test",
         TIER: "business",
-      },
-      {
-        AUTH_PROVIDERS: "google",
-        AUTH_DOMAINS: "finqore.test",
-        TIER: "trial",
       },
       {
         AUTH_PROVIDERS: "email",
