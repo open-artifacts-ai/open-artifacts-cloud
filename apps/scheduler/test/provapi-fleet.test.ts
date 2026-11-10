@@ -30,6 +30,8 @@ import {
   FLEET_SOAK_MS,
   FLEET_SOAK_OFF_MS,
   FLEET_SOAKED_PREFIX,
+  FLEET_UNVERIFIED_PREFIX,
+  FLEET_VERIFIED_PREFIX,
   fleetBlockedMs,
   fleetConditions,
   fleetDue,
@@ -61,6 +63,17 @@ import {
 
 beforeAll(migrate);
 beforeEach(reset);
+// #1229: the deploy marks a version verified once every Worker's read-back
+// passed. The rollout tests run on verified versions; the gate has its own.
+beforeEach(async () => {
+  for (const v of ["0.93.0", "0.93.1", "0.93.2"])
+    await db
+      .prepare(
+        "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+      )
+      .bind(`${FLEET_VERIFIED_PREFIX}${v}`, 1)
+      .run();
+});
 afterEach(() => vi.restoreAllMocks());
 
 const NOW = Date.UTC(2026, 10, 2, 12, 0);
@@ -275,6 +288,107 @@ describe("the target and request ids", () => {
     expect(canTransition("active", "upgrade", "S")).toBe(true);
     expect(canTransition("suspended", "upgrade", "S")).toBe(false);
     expect(canTransition("active", "rollback", "S")).toBe(false);
+  });
+});
+
+describe("the platform_verified gate (#1229)", () => {
+  const unverify = () =>
+    db
+      .prepare(
+        "DELETE FROM platform_state WHERE key LIKE 'platform_verified:%'",
+      )
+      .run();
+
+  it("a target without the mark starts no job, and says why", async () => {
+    await unverify();
+    const canary = await on("0.92.0");
+    await on("0.92.0");
+    const f = fakes({ canary });
+    const lines = captureLogs(vi.spyOn);
+    await fleetDue(f.env, NOW, f.opts);
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect(await fleetJobs()).toEqual([]);
+    expect(f.manage.created).toEqual([]);
+    expect(lines).toEqual([
+      "provapi fleet holding: platform not verified",
+      "provapi fleet holding: platform not verified",
+    ]);
+  });
+
+  it("the mark lets the canary through on the next tick", async () => {
+    await unverify();
+    const canary = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    expect(await fleetJobs()).toEqual([]);
+    await db
+      .prepare(
+        "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+      )
+      .bind(`${FLEET_VERIFIED_PREFIX}${TARGET}`, NOW)
+      .run();
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect((await fleetJobs()).map((j) => j.install_id)).toEqual([canary]);
+  });
+
+  it("another version's mark does not count", async () => {
+    await unverify();
+    await db
+      .prepare(
+        "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+      )
+      .bind(`${FLEET_VERIFIED_PREFIX}0.92.0`, NOW)
+      .run();
+    const canary = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    expect(await fleetJobs()).toEqual([]);
+  });
+
+  it("no canary: nothing to hold, and no unverified stamp", async () => {
+    await unverify();
+    const f = fakes({ canary: "" });
+    await fleetDue(f.env, NOW, f.opts);
+    expect(await stateKeys(FLEET_UNVERIFIED_PREFIX)).toEqual([]);
+  });
+
+  it("the hold is stamped once and opens fleet_halted (platform_unverified) after FLEET_BLOCKED_MS", async () => {
+    await unverify();
+    const canary = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect(await stateKeys(FLEET_UNVERIFIED_PREFIX)).toEqual([
+      `${FLEET_UNVERIFIED_PREFIX}${TARGET}`,
+    ]);
+    const env = f.env as unknown as Parameters<typeof fleetConditions>[0];
+    const early = await fleetConditions(env, NOW + FLEET_BLOCKED_MS - MIN);
+    expect(early.fleet_halted.rows).toEqual([]);
+    const late = await fleetConditions(env, NOW + FLEET_BLOCKED_MS);
+    expect(late.fleet_halted).toMatchObject({
+      open: true,
+      rows: [{ code: "platform_unverified", since: NOW, version: TARGET }],
+    });
+  });
+
+  it("the mark clears the stamp and the alert", async () => {
+    await unverify();
+    const canary = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    await db
+      .prepare(
+        "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+      )
+      .bind(`${FLEET_VERIFIED_PREFIX}${TARGET}`, NOW)
+      .run();
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect(await stateKeys(FLEET_UNVERIFIED_PREFIX)).toEqual([]);
+    const env = f.env as unknown as Parameters<typeof fleetConditions>[0];
+    const c = await fleetConditions(env, NOW + 2 * FLEET_BLOCKED_MS);
+    expect(
+      c.fleet_halted.rows.some((r) => r.code === "platform_unverified"),
+    ).toBe(false);
   });
 });
 
@@ -1342,7 +1456,9 @@ describe("item 6: a canary that can't take the release", () => {
       installId(),
     ];
     for (const canary of cases) {
-      await db.prepare("DELETE FROM platform_state").run();
+      await db
+        .prepare("DELETE FROM platform_state WHERE key GLOB 'fleet_*'")
+        .run();
       const f = fakes({ canary });
       await fleetDue(f.env, NOW, f.opts);
       expect(await stateKeys(blocked), canary).toEqual([blocked]);

@@ -247,7 +247,7 @@ describe("deploy-hosted-platform.yml", () => {
     });
     const use = named("Use main's deploy scripts").run as string;
     expect(use).toContain(
-      "for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
+      "for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts platform-verified.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
     );
     // The broker's Google client pin is main's, never the tag's.
     expect(use).toContain(
@@ -372,6 +372,7 @@ describe("deploy-hosted-platform.yml", () => {
       "Zones",
       "Scheduler, last",
       "Every platform Worker runs the tag",
+      "Mark the platform verified",
       "The deploy token's expiry",
     ]);
     // One Cloudflare token for everything; the old names are gone.
@@ -823,6 +824,31 @@ describe("deploy-hosted-platform.yml", () => {
     expect(steps.indexOf(t)).toBeLessThan(
       steps.indexOf(named("The deploy token's expiry")),
     );
+  });
+
+  // #1229: a fleet rollout starts only after the read-back passed.
+  it("marks the platform verified only after a green full-list run's read-back, never on verify_only", () => {
+    const m = named("Mark the platform verified");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i("Mark the platform verified")).toBe(
+      i("Every platform Worker runs the tag") + 1,
+    );
+    expect(m.if).toBe(
+      `\${{ success() && steps.platform_tags.outcome == 'success' && !inputs.verify_only && (inputs.targets == '${w.on.workflow_dispatch.inputs.targets.default}' || inputs.targets == '${FULLB}') }}`,
+    );
+    expect(named("Every platform Worker runs the tag").id).toBe(
+      "platform_tags",
+    );
+    expect(m.run).toBe(
+      'node --experimental-strip-types --no-warnings scripts/ops/platform-verified.ts "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(m.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    // main's copy of the script, like platform-db.ts.
+    expect(text).toContain("platform-db.ts platform-verified.ts billing-db.ts");
   });
 
   it("passes the repository id for the OIDC principals, and reads back the token's expiry last", () => {
