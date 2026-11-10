@@ -13,7 +13,7 @@ import type {
 export type BillingSetTierResult =
   | {
       ok: true;
-      tier: "team" | "business" | "solo";
+      tier: "team" | "business";
       status: "active";
       version: number;
       updatedAt: number;
@@ -35,7 +35,7 @@ export type BillingSetTierResult =
 export interface BillingOperatorRpc {
   setTier(
     install: string,
-    tier: "team" | "business" | "solo",
+    tier: "team" | "business",
   ): Promise<BillingSetTierResult>;
 }
 

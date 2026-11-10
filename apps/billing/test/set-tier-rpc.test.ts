@@ -125,14 +125,14 @@ describe("setTier", () => {
   });
 
   it("bumps version by one, sets updated_at, and reports the previous row", async () => {
-    await seed({ tier: "solo" });
+    await seed({ tier: "team" });
     expect(await set(A, "business")).toEqual({
       ok: true,
       tier: "business",
       status: "active",
       version: 4,
       updatedAt: NOW,
-      previous: { tier: "solo", status: "active", version: 3 },
+      previous: { tier: "team", status: "active", version: 3 },
     });
     expect(await rowOf()).toMatchObject({
       tier: "business",
@@ -141,8 +141,8 @@ describe("setTier", () => {
     });
   });
 
-  it("accepts each of team, business and solo, and a repeat bumps again", async () => {
-    for (const [i, t] of ["team", "business", "solo", "solo"].entries()) {
+  it("accepts team and business, and a repeat bumps again", async () => {
+    for (const [i, t] of ["team", "business", "team", "team"].entries()) {
       const r = await set(A, t);
       expect(r).toMatchObject({ ok: true, tier: t, version: i + 1 });
     }
@@ -172,8 +172,8 @@ describe("setTier", () => {
 
   it("leaves Stripe's own columns alone and calls no Stripe", async () => {
     const f = vi.spyOn(globalThis, "fetch");
-    await seed({ tier: "solo", sub: null });
-    await set(A, "team");
+    await seed({ tier: "team", sub: null });
+    await set(A, "business");
     expect(f).not.toHaveBeenCalled();
     expect(await rowOf()).toMatchObject({ stripe_customer_id: "cus_x" });
   });
@@ -196,17 +196,24 @@ describe("setTier", () => {
     }
   });
 
+  it("drops the dead subscription id, so the comp reads as not live: a second comp works", async () => {
+    await seed({ tier: "team", status: "lapsed", sub: "sub_1" });
+    expect(await set(A, "team")).toMatchObject({ ok: true });
+    expect((await rowOf())?.stripe_subscription_id).toBeNull();
+    expect(await set(A, "business")).toMatchObject({ ok: true, version: 5 });
+  });
+
   it("is allowed when the stored subscription is no longer live", async () => {
     // lapsed: the subscription ended; a trial with no live Solo under it.
     await seed({ tier: "team", status: "lapsed", sub: "sub_1" });
-    expect(await set(A, "solo")).toMatchObject({ ok: true, tier: "solo" });
+    expect(await set(A, "business")).toMatchObject({ ok: true });
     await db.prepare("DELETE FROM tiers").run();
     await seed({ tier: "trial", sub: "sub_1", soloStatus: "lapsed" });
     expect(await set(A, "team")).toMatchObject({ ok: true });
   });
 
   it("refuses a tier outside team, business and solo (free, trial, junk) without writing", async () => {
-    for (const t of ["free", "trial", "TEAM", "", "enterprise"])
+    for (const t of ["solo", "free", "trial", "TEAM", "", "enterprise"])
       expect(await set(A, t), t).toEqual({ ok: false, error: "bad_tier" });
     expect(await set(A, undefined as unknown as string)).toEqual({
       ok: false,

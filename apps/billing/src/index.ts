@@ -818,7 +818,7 @@ export class BillingProvisionerRpc extends WorkerEntrypoint<Env> {
 // state go, as the tier no longer depends on them. A missing row is made.
 const SET_TIER_PREV_SQL =
   "SELECT tier, status, version FROM tiers WHERE install_id = ?1";
-const SET_TIER_SQL = `INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, ?2, 'active', 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = ?2, status = 'active', grace_until = NULL, solo_status = NULL, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE NOT ${SUBSCRIPTION_LIVE_SQL} RETURNING tier, status, version, updated_at`;
+const SET_TIER_SQL = `INSERT INTO tiers (install_id, tier, status, version, updated_at) VALUES (?1, ?2, 'active', 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = ?2, status = 'active', stripe_subscription_id = NULL, grace_until = NULL, solo_status = NULL, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE NOT ${SUBSCRIPTION_LIVE_SQL} RETURNING tier, status, version, updated_at`;
 
 const setTierFail = (error: SetTierError): SetTierResult => ({
   ok: false,

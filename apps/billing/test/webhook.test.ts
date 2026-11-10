@@ -1,4 +1,4 @@
-import { applyD1Migrations } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
 import { env as testEnv } from "cloudflare:workers";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { signStripePayload } from "@oa/billing-core";
@@ -11,7 +11,7 @@ import {
   it,
   vi,
 } from "vitest";
-import billing, { type Env } from "../src/index.js";
+import billing, { BillingOperatorRpc, type Env } from "../src/index.js";
 
 // POST /stripe/webhook, mounted from @oa/billing-core: the one route an
 // internet request (cf-connecting-ip) reaches. Payloads are signed here with
@@ -351,6 +351,62 @@ describe("Solo prices (#1568)", () => {
       status: "lapsed",
       graceUntil: null,
     });
+  });
+});
+
+describe("an operator comp is not undone by the old subscription's events (#66)", () => {
+  const evt = (id: string, type: string, status: string) =>
+    JSON.stringify({
+      id,
+      object: "event",
+      type,
+      livemode: false,
+      created: T,
+      data: {
+        object: {
+          id: "sub_dead1",
+          object: "subscription",
+          customer: CUS_A,
+          status,
+          metadata: { tier: "business" },
+        },
+      },
+    });
+  it("deleted and updated for the dropped sub_dead1 leave the comp alone", async () => {
+    await db
+      .prepare(
+        "UPDATE tiers SET tier = 'team', status = 'lapsed', stripe_subscription_id = 'sub_dead1' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    await registry.put(
+      `install:${A}`,
+      JSON.stringify({ installId: A, origin: "https://x.test", keys: [] }),
+    );
+    const set = await new BillingOperatorRpc(
+      createExecutionContext(),
+      env,
+    ).setTier(A, "business");
+    expect(set).toMatchObject({ ok: true });
+    const comp = await rowOf(A);
+    expect(comp).toMatchObject({
+      tier: "business",
+      status: "active",
+      stripe_subscription_id: null,
+    });
+    for (const [id, type, status] of [
+      ["evt_CompDel1", "customer.subscription.deleted", "canceled"],
+      ["evt_CompUpd1", "customer.subscription.updated", "paused"],
+      ["evt_CompUpd2", "customer.subscription.updated", "canceled"],
+    ] as const) {
+      const r = await call(await hook(evt(id, type, status)));
+      expect(r.status, id).toBe(200);
+      expect(await rowOf(A), id).toMatchObject({
+        tier: "business",
+        status: "active",
+        stripe_subscription_id: null,
+      });
+    }
   });
 });
 

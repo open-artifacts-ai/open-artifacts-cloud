@@ -2,8 +2,8 @@
 // plain, serialisable union. It never throws for an expected outcome; anything
 // unexpected is { ok: false, error: "unavailable" }.
 
-/** The tiers an operator may comp an install onto. */
-export const SET_TIER_TIERS = ["team", "business", "solo"] as const;
+/** The tiers an operator may comp an install onto (not solo: the trial and Solo-start paths would flip it back). */
+export const SET_TIER_TIERS = ["team", "business"] as const;
 export type SetTierTier = (typeof SET_TIER_TIERS)[number];
 
 /** The row as it was before the write (null: the install had no row). */
@@ -16,7 +16,7 @@ export interface SetTierPrevious {
 /**
  * Fixed error codes:
  *  - bad_install: not an install id billing accepts.
- *  - bad_tier: not team, business or solo.
+ *  - bad_tier: not team or business.
  *  - unknown_install: not in billing's registry (the install does not exist
  *    or its entry is not visible yet).
  *  - subscription_active: the row holds a live Stripe subscription; Stripe

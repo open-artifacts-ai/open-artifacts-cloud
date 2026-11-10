@@ -184,12 +184,12 @@ describe("the write", () => {
     });
   });
 
-  it("each of team, business and solo goes through", async () => {
+  it("each of team and business goes through", async () => {
     const { id } = await seed();
     const b = billing();
-    for (const tier of ["team", "business", "solo"])
+    for (const tier of ["team", "business"])
       await run(admin(), id, { tier, reason: REASON }, b);
-    expect(b.calls.map((c) => c.tier)).toEqual(["team", "business", "solo"]);
+    expect(b.calls.map((c) => c.tier)).toEqual(["team", "business"]);
   });
 
   it("an MCP call is audited with its surface, tool and the grant's client", async () => {
@@ -292,10 +292,50 @@ describe("refusals (each audited, none writes an ok row)", () => {
     expect(b.calls).toEqual([]);
   });
 
-  it("a bad body is invalid_input: tier outside team/business/solo, short or missing reason, extra keys", async () => {
+  it("a deleting install is invalid_state and billing is never called", async () => {
+    const gone = await seed({ state: "deleting" });
+    const b = billing();
+    expect(
+      await code(run(admin(), gone.id, { tier: "team", reason: REASON }, b)),
+    ).toBe("invalid_state");
+    expect(b.calls).toEqual([]);
+    expect(await refusedRows()).toHaveLength(1);
+  });
+
+  it("reauth_required, invalid_input and a malformed id each leave a refused audit row", async () => {
+    const all = () =>
+      db
+        .prepare(
+          "SELECT code FROM admin_audit WHERE action = ? AND outcome = 'refused' ORDER BY id",
+        )
+        .bind(SET_TIER_ACTION)
+        .all<{ code: string }>()
+        .then((r) => r.results.map((x) => x.code));
+    const { id } = await seed();
+    const n = (await all()).length;
+    expect(
+      await code(
+        run(admin({ authAt: null }), id, { tier: "team", reason: REASON }),
+      ),
+    ).toBe("reauth_required");
+    expect(await code(run(admin(), id, { tier: "solo", reason: REASON }))).toBe(
+      "invalid_input",
+    );
+    expect(
+      await code(run(admin(), "../x", { tier: "team", reason: REASON })),
+    ).toBe("not_found");
+    expect((await all()).slice(n)).toEqual([
+      "reauth_required",
+      "invalid_input",
+      "not_found",
+    ]);
+  });
+
+  it("a bad body is invalid_input: tier outside team/business (solo too), short or missing reason, extra keys", async () => {
     const { id } = await seed();
     const b = billing();
     for (const body of [
+      { tier: "solo", reason: REASON },
       { tier: "free", reason: REASON },
       { tier: "trial", reason: REASON },
       { tier: "enterprise", reason: REASON },
@@ -539,7 +579,7 @@ describe("the hosted-only admin MCP tool", () => {
     expect(r.structuredContent.error.code).toBe("invalid_state");
   });
 
-  it("a tier outside team/business/solo never reaches the tool body", async () => {
+  it("a tier outside team/business never reaches the tool body", async () => {
     const { client, b } = await connectAs("oauth", ["installs:write"]);
     const { id } = await seed();
     const r = await callIt(client, { id, tier: "free", reason: REASON }).catch(

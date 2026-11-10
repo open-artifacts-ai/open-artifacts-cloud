@@ -22,7 +22,7 @@ export const SET_TIER_TOOL = "set_install_tier";
 
 export const SetTierSchema = z
   .object({
-    tier: z.enum(["team", "business", "solo"]),
+    tier: z.enum(["team", "business"]),
     reason: z.string().trim().min(8).max(500),
   })
   .strict();
@@ -114,39 +114,54 @@ export async function setTier(
     });
     throw new ApiError("forbidden");
   }
+  // Every refusal below is audited. tier and reason are added once known.
+  let known: Record<string, unknown> = {};
+  const refuse = async (
+    code:
+      | "not_found"
+      | "invalid_state"
+      | "unavailable"
+      | "invalid_input"
+      | "reauth_required",
+    message: string,
+    detail: Record<string, unknown> = {},
+    details?: unknown,
+  ): Promise<never> => {
+    await tryAudit(env, entry("refused", { ...known, ...detail }, { code }));
+    throw new ApiError(code, message, details);
+  };
+
   // A session needs a recent sign-in (as purge and claim-free do); a grant
   // has no sign-in time, and its authority is the admin's consent.
   if (
     p.kind === "admin" &&
     (p.authAt == null || Date.now() - p.authAt > PURGE_REAUTH_MS)
   )
-    throw new ApiError("reauth_required", "sign in again to set a tier", {
-      reauthUrl: `https://admin.${env.APP_DOMAIN}/auth/start?reauth=1&return=${encodeURIComponent("/")}`,
-    });
-  const parsed = SetTierSchema.safeParse(body);
-  if (typeof installId !== "string" || !INSTALL_ID_RE.test(installId))
-    throw new ApiError("not_found");
-  if (!parsed.success)
-    throw new ApiError("invalid_input", "invalid input", {
-      fields: parsed.error.issues.map((i) => i.path.join(".") || "body"),
-    });
-  const { tier, reason } = parsed.data;
-
-  const refuse = async (
-    code: "not_found" | "invalid_state" | "unavailable" | "invalid_input",
-    message: string,
-    detail: Record<string, unknown> = {},
-  ): Promise<never> => {
-    await tryAudit(
-      env,
-      entry("refused", { tier, reason, ...detail }, { code }),
+    return refuse(
+      "reauth_required",
+      "sign in again to set a tier",
+      {},
+      {
+        reauthUrl: `https://admin.${env.APP_DOMAIN}/auth/start?reauth=1&return=${encodeURIComponent("/")}`,
+      },
     );
-    throw new ApiError(code, message);
-  };
+  if (typeof installId !== "string" || !INSTALL_ID_RE.test(installId))
+    return refuse("not_found", "not_found", { badId: true });
+  const parsed = SetTierSchema.safeParse(body);
+  if (!parsed.success) {
+    const fields = parsed.error.issues.map((i) => i.path.join(".") || "body");
+    return refuse("invalid_input", "invalid input", { fields }, { fields });
+  }
+  const { tier, reason } = parsed.data;
+  known = { tier, reason };
 
   const row = await loadStatus(env, installId);
   if (!row) return refuse("not_found", "no such install");
-  if (row.install_state === null || row.install_state === "deleted")
+  if (
+    row.install_state === null ||
+    row.install_state === "deleted" ||
+    row.install_state === "deleting"
+  )
     return refuse("invalid_state", "the install is not live", {
       state: row.state,
     });

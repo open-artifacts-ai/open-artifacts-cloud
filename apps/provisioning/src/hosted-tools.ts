@@ -37,7 +37,7 @@ export const HOSTED_TOOLS: readonly HostedTool[] = [
   {
     name: SET_TIER_TOOL,
     description:
-      "Set an install's billing tier (team, business or solo) as an operator comp, through billing. Refused while the install has a live Stripe subscription. Needs a reason; audited.",
+      "Set an install's billing tier (team or business) as an operator comp, through billing. Refused while the install has a live Stripe subscription. Needs a reason; audited.",
     input: SetTierInputSchema,
     annotations: {
       readOnlyHint: false,
