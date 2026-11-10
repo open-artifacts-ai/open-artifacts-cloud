@@ -2,10 +2,10 @@
 // No imports.
 
 /**
- * Whether the HOSTED=1 gate on the /bus routes is lifted (part 6). While
- * false, the bus cases assert the design as it is: the bus is OFF on every
- * hosted install (its ping route answers 404), and a bus that is on is a
- * FAIL. Part 6 sets this to true in the same change that lifts the gate;
- * the cases then run their full assertions (a bus that is off is a FAIL).
+ * Whether the HOSTED=1 gate on the /bus routes is lifted. True since part 6:
+ * the public release that made busOn "BUS_HUB bound", which PUBLIC_PIN must
+ * name or be newer than. The cases run their full assertions and a bus that
+ * is off (404) is a FAIL. Set false only to test a pin from before the lift,
+ * where the bus is OFF on hosted and a bus that is on is a FAIL.
  */
-export const HOSTED_BUS_LIFTED = false;
+export const HOSTED_BUS_LIFTED = true;

@@ -10,6 +10,13 @@ vi.mock("../src/bus-gate.ts", () => ({
 }));
 
 describe("P51 after the lift", () => {
+  it("the committed flag is true (part 6)", async () => {
+    const real =
+      await vi.importActual<typeof import("../src/bus-gate.ts")>(
+        "../src/bus-gate.ts",
+      );
+    expect(real.HOSTED_BUS_LIFTED).toBe(true);
+  });
   it("rl-l's bus off (404) is a failure, not unproven", async () => {
     const f = fakeApi();
     f.bus.mode = "off";
