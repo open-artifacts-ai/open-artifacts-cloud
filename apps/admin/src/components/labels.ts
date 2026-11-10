@@ -13,7 +13,7 @@ export const STATE_LABEL: Record<InstallState, string> = {
   active: "Active",
   suspended: "Paused",
   deleting: "Deleted, restorable",
-  deleted: "Deleted",
+  deleted: "Purged",
   failed: "Create failed",
 };
 export const JOB_STATUS_LABEL: Record<JobStatus, string> = {
@@ -212,4 +212,15 @@ export const fmtAgo = (ms: number | null, now: number) => {
   if (d < 60_000) return "just now";
   if (d < 3_600_000) return `${Math.round(d / 60_000)} min ago`;
   return d < 86_400_000 ? fmtClock(ms) : fmtDay(ms);
+};
+
+/** Who did it, for a job or audit row. A token with no label is shown by its id. */
+export const actorName = (a: {
+  kind: string;
+  label: string;
+  tokenId: string | null;
+}): string => {
+  if (a.kind === "token" && (a.label === "" || a.label === "unnamed"))
+    return a.tokenId ? `agent token ${a.tokenId.slice(0, 8)}` : "agent token";
+  return a.label;
 };

@@ -9,6 +9,7 @@ import { installQuery, jobIsTerminal, jobQuery } from "../api/queries";
 import { ActionDialog } from "../components/ActionDialog";
 import { ErrorLine } from "../components/Bits";
 import {
+  actorName,
   fmtClock,
   fmtIn,
   JOB_VERB,

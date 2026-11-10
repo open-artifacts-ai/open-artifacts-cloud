@@ -876,3 +876,30 @@ describe("R17 audit", () => {
 });
 
 void db;
+
+describe("purged installs (#2021)", () => {
+  it("R3: a purged install reports no version and unknown health; a deleting one keeps them", async () => {
+    const e = fakeEnv();
+    const p = await seedInstall({
+      state: "deleted",
+      lifecycle: { health: "ok", health_at: NOW - 1 },
+    });
+    const r = await call(e, ADMIN_P, "R3", { params: { id: p.id } });
+    expect(r.body).toMatchObject({
+      state: "deleted",
+      version: null,
+      previousVersion: null,
+      health: "unknown",
+    });
+    const d = await seedInstall({
+      state: "deleting",
+      lifecycle: { health: "ok", deleted_at: NOW - 1, purge_at: NOW + 1000 },
+    });
+    const rd = await call(e, ADMIN_P, "R3", { params: { id: d.id } });
+    expect(rd.body).toMatchObject({
+      state: "deleting",
+      version: "1.41.2",
+      health: "ok",
+    });
+  });
+});

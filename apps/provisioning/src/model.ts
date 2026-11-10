@@ -173,6 +173,9 @@ export function mismatchOf(row: StatusRow): string | null {
 
 export function summaryOf(env: Env, row: StatusRow): InstallSummary {
   const auth = authOf(row);
+  // A purged install ('deleted') has no Worker: nothing is served and there is
+  // nothing to check, whatever the last health probe and deploy left behind.
+  const purged = row.state === "deleted";
   return {
     id: row.install_id,
     slug: row.slug,
@@ -182,10 +185,10 @@ export function summaryOf(env: Env, row: StatusRow): InstallSummary {
     contentHost: row.content_host ?? "",
     state: row.state,
     servingMode: row.serving_mode ?? "unmapped",
-    version: version(row.version),
+    version: purged ? null : version(row.version),
     tier: row.tier,
     auth: { providers: auth.providers, domainCount: auth.domains.length },
-    health: row.health,
+    health: purged ? "unknown" : row.health,
     source: row.source,
     activeJobId: row.active_job_id,
     createdAt: row.created_at,
@@ -239,7 +242,8 @@ export async function detailOf(
     ...summaryOf(env, row),
     ownerEmail: showEmail ? await ownerEmailFor(env, row) : null,
     auth: authOf(row),
-    previousVersion: version(row.previous_version),
+    previousVersion:
+      row.state === "deleted" ? null : version(row.previous_version),
     suspendedAt: row.suspended_at,
     suspendReason: row.suspend_reason,
     deletedAt: row.deleted_at,

@@ -850,3 +850,68 @@ it("recent jobs: says No jobs yet. when there are none", async () => {
   expect(await screen.findByText("No jobs yet.")).toBeInTheDocument();
   expect(screen.queryByRole("table")).toBeNull();
 });
+
+it("a purged install shows Purged, with Health and Serving n/a", async () => {
+  const i = {
+    ...installsByState.deleted,
+    version: null,
+    health: "unknown" as const,
+  };
+  await open(i);
+  expect(screen.getByTestId("state")).toHaveTextContent("Purged");
+  const facts = within(screen.getByRole("region", { name: "Facts" }));
+  expect(facts.getByText("Health").nextElementSibling).toHaveTextContent(
+    "n/a",
+  );
+  expect(facts.getByText("Serving").nextElementSibling).toHaveTextContent(
+    "n/a",
+  );
+});
+
+it("a purged install hides a stale version and health the API sent", async () => {
+  const i = {
+    ...installsByState.deleted,
+    version: "0.147.0",
+    previousVersion: "0.146.0",
+    health: "ok" as const,
+  };
+  await open(i);
+  const facts = within(screen.getByRole("region", { name: "Facts" }));
+  expect(facts.queryByText("OK")).toBeNull();
+  expect(facts.queryByText("0.147.0")).toBeNull();
+  expect(facts.queryByText(/0\.146\.0/)).toBeNull();
+});
+
+it("a deleted install in its grace window is unchanged", async () => {
+  const i = installsByState.deleting;
+  await open(i);
+  expect(screen.getByTestId("state")).toHaveTextContent("Deleted, restorable");
+  const facts = within(screen.getByRole("region", { name: "Facts" }));
+  expect(facts.getByText("Health").nextElementSibling).toHaveTextContent("OK");
+  expect(facts.getByText("Serving").nextElementSibling).not.toHaveTextContent(
+    "n/a",
+  );
+});
+
+it("recent jobs: an unlabeled agent token shows its id, not unnamed", async () => {
+  const i = installsByState.active;
+  const job = {
+    ...jobsByStatus.done,
+    actor: {
+      kind: "token" as const,
+      label: "unnamed",
+      tokenId: FIXTURE_IDS.token,
+    },
+  };
+  use(
+    http.get(`*/api/v1/installs/${i.id}/jobs`, () =>
+      json({ items: [job], nextCursor: null }),
+    ),
+  );
+  await open(i);
+  const cell = await screen.findByText(
+    `agent token ${FIXTURE_IDS.token.slice(0, 8)}`,
+  );
+  expect(cell).toBeInTheDocument();
+  expect(screen.queryByText("unnamed")).toBeNull();
+});
