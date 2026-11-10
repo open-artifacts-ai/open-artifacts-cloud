@@ -9,7 +9,7 @@ export const CLIENT_JS = String.raw`(function () {
   var S = {
     cfg: null, me: null, signup: null, view: "loading",
     slug: "", avail: null, availSlug: "", seq: 0,
-    token: null, busy: false, err: "", notice: "", widget: null, poll: null
+    token: null, busy: false, step: "address", chips: [], chipsFor: "", err: "", notice: "", widget: null, poll: null
   };
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -108,14 +108,57 @@ export const CLIENT_JS = String.raw`(function () {
     ]));
   }
 
-  // ---------- sign-up form (design: sign-up, option A) ----------
+  // ---------- sign-in, then the address (design: round 2, address option A) ----------
   var refs = {};
-  function viewForm() {
-    var signedIn = !!S.me;
+  var PRICE = "Solo: free for your first month, then $1/month or $10/year. No card needed.";
+
+  function initials(email) {
+    var l = String(email).split("@")[0].replace(/[^a-z0-9]+/gi, " ").trim().split(" ");
+    var t = (l[0] || "?").charAt(0) + (l.length > 1 ? l[l.length - 1].charAt(0) : (l[0] || "").charAt(1));
+    return t.toUpperCase();
+  }
+
+  // First screen: only Google. Back from the address step lands here still
+  // signed in, with Continue in place of the Google button.
+  function viewSignin() {
+    var action;
+    if (S.me) {
+      action = h("div", {}, [
+        h("div", { class: "who" }, [
+          h("span", {}, ["Signed in as ", h("b", {}, [S.me.email])]),
+          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
+        ]),
+        h("button", { class: "btn pri", type: "button", onclick: function () { S.step = "address"; route(); } }, ["Continue"])
+      ]);
+    } else {
+      action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
+    }
+    shell(h("div", { class: "panel" }, [
+      h("h1", {}, ["Create your Open Artifacts"]),
+      S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
+      action,
+      h("p", { class: "muted small mt" }, [PRICE])
+    ]));
+  }
+
+  function checkIcon() {
+    var ns = "http://www.w3.org/2000/svg";
+    var s = document.createElementNS(ns, "svg");
+    s.setAttribute("viewBox", "0 0 24 24"); s.setAttribute("fill", "none");
+    s.setAttribute("stroke", "currentColor"); s.setAttribute("stroke-width", "2.6");
+    s.setAttribute("stroke-linecap", "round"); s.setAttribute("stroke-linejoin", "round");
+    s.setAttribute("aria-hidden", "true");
+    var p = document.createElementNS(ns, "path");
+    p.setAttribute("d", "M5 12l5 5 9-10");
+    s.appendChild(p);
+    return s;
+  }
+
+  function viewAddress() {
     var inp = h("input", {
       type: "text", id: "slug", autocomplete: "off", autocapitalize: "none",
       spellcheck: "false", placeholder: "acme", maxlength: "32",
-      "aria-describedby": "slug-help", disabled: !signedIn, value: S.slug
+      "aria-describedby": "slug-help", value: S.slug
     });
     inp.addEventListener("input", function () {
       S.slug = inp.value.trim().toLowerCase();
@@ -124,34 +167,91 @@ export const CLIENT_JS = String.raw`(function () {
     });
     inp.addEventListener("keydown", function (e) { if (e.key === "Enter") create(); });
     refs.inp = inp;
-    refs.box = h("div", { class: "inp" + (signedIn ? "" : " off") }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]);
+    refs.box = h("div", { class: "inp" }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]);
     refs.help = h("p", { class: "help", id: "slug-help", "aria-live": "polite" });
     refs.sugg = h("div", { class: "sugg" });
+    refs.chips = h("div", { class: "chips" });
     refs.err = h("div", { "aria-live": "polite" });
-    refs.btn = h("button", { class: "btn pri cta", type: "button", onclick: create }, ["Create"]);
+    refs.btn = h("button", { class: "btn pri cta", type: "button", onclick: create }, ["Create my instance"]);
     refs.ts = h("div", { class: "ts" });
 
-    var who = signedIn
-      ? h("div", { class: "who" }, [
-          h("span", {}, ["Signed in as ", h("b", {}, [S.me.email])]),
-          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
-        ])
-      : h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Continue with Google"]);
-
     shell(h("div", { class: "panel" }, [
-      h("h1", {}, ["Create your Open Artifacts"]),
+      h("div", { class: "stepbar", "aria-hidden": "true" }, [h("i", { class: "on" }), h("i", { class: "on" }), h("i")]),
+      h("div", { class: "who" }, [
+        h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
+        h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
+        h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
+      ]),
+      h("h1", {}, ["Choose your address"]),
+      h("p", { class: "lead" }, ["It's where you and your team open your artifacts. You can't change it later."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
-      who,
-      h("div", { class: "field" }, [h("label", { for: "slug" }, ["Your address"]), refs.box, refs.help, refs.sugg]),
+      h("div", { class: "field" }, [h("label", { for: "slug" }, ["Address"]), refs.box, refs.help, refs.sugg, refs.chips]),
       refs.err, refs.ts, refs.btn,
-      h("p", { class: "muted small mt" }, [
-        "Solo: free for your first month, then $1/month or $10/year. No card needed."
-      ])
+      h("button", { class: "btn link back", type: "button", onclick: function () { S.step = "signin"; route(); } }, ["Back"]),
+      h("p", { class: "muted small mt" }, [PRICE])
     ]));
     paintAvail();
+    paintChips();
     paintCreate();
     mountTurnstile();
-    if (signedIn) inp.focus();
+    inp.focus();
+    loadChips();
+  }
+
+  // Suggestions: the Google Workspace domain (the sign-in's hd, which is the
+  // email's domain whenever there is one; Gmail has none) and the email's
+  // local part. Each is checked first; only free ones show.
+  function slugify(x) {
+    return String(x).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 26).replace(/-+$/, "");
+  }
+  function companyOf(email) {
+    var d = String(email).split("@")[1] || "";
+    if (/^(gmail|googlemail)\.com$/i.test(d)) return "";
+    var p = d.toLowerCase().split(".");
+    if (p.length >= 3 && /^(co|com|org|net|ac|gov|edu)$/.test(p[p.length - 2])) return slugify(p[p.length - 3]);
+    return p.length >= 2 ? slugify(p[p.length - 2]) : "";
+  }
+  function candidates(email) {
+    var co = companyOf(email), me = slugify(String(email).split("@")[0]);
+    var base = co || me;
+    var out = [];
+    [co, me, base ? slugify(base) + "-team" : ""].forEach(function (c) {
+      if (c && out.indexOf(c) < 0 && SLUG_RE.test(c) && c.slice(2, 4) !== "--") out.push(c);
+    });
+    return out;
+  }
+  function loadChips() {
+    if (S.chipsFor === S.me.email) { prefill(); return; }
+    var email = S.me.email;
+    Promise.all(candidates(email).map(function (c) {
+      return api("GET", "/api/v1/slugs/" + encodeURIComponent(c)).then(function (r) {
+        return r.status === 200 && r.body && r.body.status === "ok" ? c : null;
+      }, function () { return null; });
+    })).then(function (all) {
+      if (!S.me || S.me.email !== email) return;
+      S.chips = all.filter(Boolean);
+      S.chipsFor = email;
+      prefill();
+    });
+  }
+  function prefill() {
+    if (!refs.inp) return;
+    if (!S.slug && S.chips.length) {
+      S.slug = S.chips[0]; S.avail = "ok"; S.availSlug = S.slug;
+      refs.inp.value = S.slug;
+    }
+    paintAvail();
+    paintChips();
+  }
+  function paintChips() {
+    if (!refs.chips) return;
+    refs.chips.replaceChildren();
+    (S.chips || []).forEach(function (c) {
+      refs.chips.appendChild(h("button", {
+        type: "button", class: "chip" + (c === S.slug ? " sel" : ""), "aria-pressed": c === S.slug ? "true" : "false",
+        onclick: function () { S.slug = c; refs.inp.value = c; checkSlug(); refs.inp.focus(); }
+      }, [c]));
+    });
   }
 
   function googleMark() {
@@ -180,12 +280,11 @@ export const CLIENT_JS = String.raw`(function () {
   function paintAvail() {
     if (!refs.help) return;
     var s = S.slug, a = S.avail;
-    var cls = "help", text = "", box = "inp" + (S.me ? "" : " off");
+    var cls = "help", text = "", box = "inp", good = false;
     refs.sugg.replaceChildren();
-    if (!S.me) text = "Sign in with Google first.";
-    else if (!s) text = "Pick the address your team will use.";
+    if (!s) text = "Pick the address your team will use.";
     else if (a === null || S.availSlug !== s) text = "Checking...";
-    else if (a === "ok") { cls += " ok"; box += " ok"; text = host(s) + " is available."; }
+    else if (a === "ok") { cls += " ok"; box += " ok"; good = true; text = host(s) + " is available"; }
     else if (a === "taken") {
       cls += " err"; box += " err";
       var base = s.slice(0, 26);
@@ -200,8 +299,9 @@ export const CLIENT_JS = String.raw`(function () {
     else if (a === "error") { cls += " err"; text = "Couldn't check that address. Try again."; }
     else { cls += " err"; box += " err"; text = AVAIL_MSG[a] || AVAIL_MSG.invalid; }
     refs.help.className = cls;
-    refs.help.textContent = text;
+    refs.help.replaceChildren.apply(refs.help, good ? [checkIcon(), text] : [text]);
     refs.box.className = box;
+    paintChips();
     paintCreate();
   }
 
@@ -239,7 +339,7 @@ export const CLIENT_JS = String.raw`(function () {
   function paintCreate() {
     if (!refs.btn) return;
     refs.btn.disabled = !canCreate();
-    refs.btn.textContent = S.busy ? "Creating..." : "Create";
+    refs.btn.textContent = S.busy ? "Creating..." : "Create my instance";
     refs.err.replaceChildren();
     var msg = S.err;
     if (S.me && !S.cfg.turnstileSiteKey) msg = "Sign-ups are temporarily unavailable. Try again later.";
@@ -250,7 +350,7 @@ export const CLIENT_JS = String.raw`(function () {
 
   function mountTurnstile() {
     S.widget = null;
-    if (!S.me || !S.cfg.turnstileSiteKey || !refs.ts) return;
+    if (S.view !== "address" || !S.me || !S.cfg.turnstileSiteKey || !refs.ts) return;
     function render() {
       if (!window.turnstile || !document.body.contains(refs.ts)) return;
       S.widget = window.turnstile.render(refs.ts, {
@@ -299,7 +399,7 @@ export const CLIENT_JS = String.raw`(function () {
       if (r.code === "signup_limit") {
         loadSignup().then(function () {
           route();
-          if (S.view === "form") { S.err = LIMIT_ERR; paintCreate(); }
+          if (S.view === "address") { S.err = LIMIT_ERR; paintCreate(); }
         });
         return;
       }
@@ -321,11 +421,11 @@ export const CLIENT_JS = String.raw`(function () {
 
   function signOut() {
     return api("POST", "/auth/logout").then(function () {
-      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; route();
+      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; S.chips = []; S.chipsFor = ""; S.step = "address"; route();
     });
   }
   function startOver() {
-    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.token = null;
+    S.signup = null; S.slug = ""; S.avail = null; S.err = ""; S.token = null; S.step = "address";
     route();
   }
 
@@ -435,7 +535,8 @@ export const CLIENT_JS = String.raw`(function () {
   function render() {
     if (S.view === "closed") viewClosed();
     else if (S.view === "setup") viewSetup();
-    else if (S.view === "form") viewForm();
+    else if (S.view === "address") viewAddress();
+    else viewSignin();
   }
   function route() {
     stopPoll();
@@ -444,7 +545,7 @@ export const CLIENT_JS = String.raw`(function () {
       S.view = "setup";
       if (S.signup.stage !== "ready" && S.signup.stage !== "failed") startPoll();
     } else if (!S.cfg.open) S.view = "closed";
-    else S.view = "form";
+    else S.view = S.me && S.step !== "signin" ? "address" : "signin";
     render();
   }
 

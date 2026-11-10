@@ -13,6 +13,8 @@ type Sc = {
   stage?: string;
   slug?: string;
   avail?: string;
+  // when set, only these names are free (others read as taken)
+  free?: string[];
   createCode?: string;
   path?: string;
   // per-request override of GET /api/v1/signup (n counts calls, from 1)
@@ -77,7 +79,13 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
           : { stage: "none" },
       );
     if (url.pathname.startsWith("/api/v1/slugs/"))
-      return json({ status: sc.avail ?? "ok" });
+      return json({
+        status: sc.free
+          ? sc.free.includes(url.pathname.split("/").pop() ?? "")
+            ? "ok"
+            : "taken"
+          : (sc.avail ?? "ok"),
+      });
     if (url.pathname === "/api/v1/installs" && req.method() === "POST")
       return json({ error: { code: sc.createCode ?? "forbidden" } }, 403);
     return route.fulfill({ status: 404, body: "" });
@@ -124,7 +132,7 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
 test("failed: Try again returns to the form", async ({ page }) => {
   await mount(page, { me: true, stage: "failed" });
   await page.getByRole("button", { name: "Try again" }).click();
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Choose your address");
 });
 
 const creating = (stage: string) => ({
@@ -215,7 +223,7 @@ test("poll: a 401 goes to sign-in", async ({ page }) => {
   await tick(page);
   await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
   await expect(
-    page.getByRole("link", { name: "Continue with Google" }),
+    page.getByRole("link", { name: "Sign in with Google" }),
   ).toBeVisible();
 });
 
@@ -303,12 +311,67 @@ test("form price line reads exactly", async ({ page }) => {
   );
 });
 
+test("first screen: only Google, no address field", async ({ page }) => {
+  await mount(page, { me: false });
+  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(
+    page.getByRole("link", { name: "Sign in with Google" }),
+  ).toBeVisible();
+  await expect(page.locator("input")).toHaveCount(0);
+});
+
+test("address step: only free suggestions show, the first is prefilled", async ({
+  page,
+}) => {
+  await mount(page, { me: true, free: ["ada", "acme-team"] });
+  await expect(page.locator("h1")).toHaveText("Choose your address");
+  await expect(page.locator(".chips .chip")).toHaveText(["ada", "acme-team"]);
+  await expect(page.locator("#slug")).toHaveValue("ada");
+  await expect(page.locator(".help")).toHaveText(
+    "ada.open-artifacts.app is available",
+  );
+  await expect(page.locator(".chip.sel")).toHaveText("ada");
+  await page.getByRole("button", { name: "acme-team" }).click();
+  await expect(page.locator("#slug")).toHaveValue("acme-team");
+});
+
+test("address step: back keeps you signed in", async ({ page }) => {
+  await mount(page, { me: true, free: ["acme"] });
+  await expect(page.locator("#slug")).toHaveValue("acme");
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator(".who")).toContainText("ada@acme.com");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.locator("h1")).toHaveText("Choose your address");
+});
+
+test("address step: create starts from here", async ({ page }) => {
+  await mount(page, { me: true, free: ["acme"] });
+  let posted: unknown = null;
+  await page.route(`${ORIGIN}/api/v1/installs`, (r) => {
+    posted = r.request().postDataJSON();
+    return r.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: "{}",
+    });
+  });
+  const btn = page.getByRole("button", { name: "Create my instance" });
+  await expect(btn).toBeEnabled();
+  await btn.click();
+  await expect(page.locator("h1")).toHaveText(
+    /^Setting up acme\.open-artifacts\.app$/,
+  );
+  expect(posted).toMatchObject({ slug: "acme", turnstile: "tok" });
+});
+
 const SHOTS = process.env.SHOTS_DIR;
 const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   closed: { open: false },
   "form-signed-out": { me: false },
   "form-notice-expired": { me: false, path: "/?error=expired" },
-  "form-signed-in-empty": { me: true },
+  "form-signed-in-empty": { me: true, free: [] },
+  "address-suggestions": { me: true, free: ["acme", "ada", "acme-team"] },
   "form-invalid": { me: true, act: (p) => p.locator("#slug").fill("-bad-") },
   "form-available": {
     me: true,
