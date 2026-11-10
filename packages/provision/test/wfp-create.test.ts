@@ -1464,6 +1464,9 @@ describe("WfpProvisioner.create", () => {
       "BUS_HUB",
       "RL_ANON",
       "RL_AUTH",
+      // public #1937: install-wide per-IP ceiling for anonymous writes. Bound
+      // from the template at rlNs + 3 like the other limiters.
+      "RL_ANON_WRITES",
       "PLAN",
     ]);
     for (const b of meta.bindings) expect(known.has(b.name), b.name).toBe(true);
