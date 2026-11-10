@@ -405,6 +405,89 @@ describe("upgrade and rollback (5.4)", () => {
     expect(audited("rollback.done")).toHaveLength(0);
   });
 
+  describe("the #1106 failhealth test seam (request id prefix)", () => {
+    const rid = "rl-failhealth-0123456789abcdef";
+    const audited = (id: string, action: string) =>
+      w.all(
+        "SELECT 1 FROM hosted_audit WHERE install_id = ? AND action = ?",
+        id,
+        action,
+      );
+
+    it("on a staging rl-f- test-hooks install: upgrade_incomplete, on `to`, forward_fix, no rollback", async () => {
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: rid,
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("upgrade_incomplete");
+      expect(w.install(s.installId)).toMatchObject({
+        version: V2,
+        state: "active",
+        lease: null,
+      });
+      expect(audited(s.installId, "upgrade.failed")).toHaveLength(1);
+      expect(audited(s.installId, "upgrade.forward_fix")).toHaveLength(1);
+      expect(audited(s.installId, "rollback.start")).toHaveLength(0);
+    });
+
+    it.each([
+      ["a non-rl- install", { slug: "seamco", testHooks: true }],
+      [
+        "an rl- install that is not rl-f-",
+        { slug: "rl-a-seam", testHooks: true },
+      ],
+      ["an rl-f- install without test hooks", { slug: "rl-f-plain" }],
+    ])("is refused on %s, nothing uploaded", async (_n, seed) => {
+      const s = await active({ ...seed, version: V1 });
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: rid,
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
+      expect(w.install(s.installId)).toMatchObject({ version: V1 });
+      expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
+    });
+
+    it("is refused in prod, even on a test-hooks rl-f- row", async () => {
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
+      (w.ctx.env as { OA_ENV: string }).OA_ENV = "prod";
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: rid,
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
+      expect(w.install(s.installId)).toMatchObject({ version: V1 });
+      expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
+    });
+
+    it("an ordinary request id on an rl- install is an ordinary upgrade", async () => {
+      const s = await active({
+        slug: "rl-f-seam",
+        testHooks: true,
+        version: V1,
+      });
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+      });
+      expect(r.job).toMatchObject({ status: "done" });
+      expect(audited(s.installId, "upgrade.forward_fix")).toHaveLength(0);
+    });
+  });
+
   it("an upgrade whose script fails verify_clean: paused, prod_dirty, still on `to`", async () => {
     const s = await active({ slug: "dirtyup", version: V1 });
     w.fake.settingsEdit = (_x, b) => [...b, { name: "EXTRA", type: "service" }];

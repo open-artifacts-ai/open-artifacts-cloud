@@ -1046,6 +1046,17 @@ export function fenceWrites(cf: Cf, fence: () => Promise<void>): Cf {
   });
 }
 
+/** upgrade's options. */
+export type UpgradeOptions = {
+  nonAdditive?: boolean;
+  /**
+   * #1106 test seam: fail the post-upgrade health check after the upload, so
+   * the forward-fix path runs for real. Refused unless the env is staging and
+   * the install is an rl-f- test-hooks install.
+   */
+  testFailCheck?: "health";
+};
+
 export class WfpProvisioner {
   readonly notes: string[] = [];
   /** Each verified asset's assetHash, by its record sha256 and path. */
@@ -3645,7 +3656,7 @@ export class WfpProvisioner {
   async upgrade(
     id: InstallId,
     toVersion: string,
-    o: { nonAdditive?: boolean } = {},
+    o: UpgradeOptions = {},
   ): Promise<UpgradeResult> {
     return this.guarded(() => this.runUpgrade(id, toVersion, o));
   }
@@ -3653,7 +3664,7 @@ export class WfpProvisioner {
   private async runUpgrade(
     id: InstallId,
     to: string,
-    o: { nonAdditive?: boolean },
+    o: UpgradeOptions,
   ): Promise<UpgradeResult> {
     const row = await this.openInstall(id, ["active"], "refuse", ["upgrading"]);
     this.checkDirect(row.app_host, row.id);
@@ -3687,6 +3698,19 @@ export class WfpProvisioner {
       throw new ProvisionRefused(
         `install ${id} is already at ${to}`,
         "downgrade_refused",
+      );
+    // #1106 test seam: refused before any claim or upload anywhere else.
+    if (
+      o.testFailCheck !== undefined &&
+      !(
+        this.env === "staging" &&
+        row.test_hooks === 1 &&
+        row.slug.startsWith("rl-f-")
+      )
+    )
+      throw new ProvisionRefused(
+        "testFailCheck is only for a test-hooks rl-f- install on staging",
+        "invalid_state",
       );
     await this.storedOf(row, from);
     const vars = this.currentVars(row);
@@ -3781,6 +3805,9 @@ export class WfpProvisioner {
           },
           { d1Id, kvId, template: rel.template },
         );
+        // #1106 test seam (gated above): the health check fails for real.
+        if (o.testFailCheck === "health")
+          throw new Error("injected health failure (testFailCheck)");
         await this.step("health");
         await this.health(
           id,

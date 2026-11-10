@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
+import {
+  STAGING_TEST_DOMAIN,
+  TEST_FAIL_HEALTH_PREFIX,
+} from "@oa/provision/names";
 import {
   ADMIN_TOOL_NAMES,
   type InstallDetail,
@@ -483,6 +486,8 @@ export interface RunState {
   clientId?: string;
   /** rl-l-<run>, the install P20 to P22 run on (lifecycleInstall). */
   rll?: Promise<RlP>;
+  /** rl-f-<run>, the install P52 fails an upgrade on (forwardFixInstall); null: no older release. */
+  rlf?: Promise<RlP | null>;
 }
 
 const bare = (h: string) => h.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
@@ -927,6 +932,12 @@ export const CHAINS: readonly Chain[] = [
     tail: removeLifecycle,
   },
   {
+    // #1106: its own install, so the failed upgrade touches no other chain's.
+    name: "rl-f",
+    probes: ["P52"],
+    tail: removeForwardFix,
+  },
+  {
     name: "api",
     probes: [
       "P1",
@@ -1210,6 +1221,88 @@ async function makeLifecycle(run: Run): Promise<RlP> {
       `rl-l setup: ${e instanceof ProbeFail ? e.message : `error ${(e as Error)?.name ?? "unknown"}`}`,
       { cause: e },
     );
+  }
+}
+
+/**
+ * #1106: the request id that makes the provisioner fail an upgrade's health
+ * check after the upload (TEST_FAIL_HEALTH_PREFIX; staging rl- test-hooks
+ * installs only). Not run.rid(): the prefix must come first.
+ */
+const failHealthRid = (run: Run): string =>
+  `${TEST_FAIL_HEALTH_PREFIX}${run.c.runId}`
+    .replace(/[^A-Za-z0-9_-]/g, "-")
+    .slice(0, 64)
+    .padEnd(16, "0");
+
+/**
+ * rl-f-<run>: the install P52 fails an upgrade on, created at the newest
+ * installable release below the one under test (null when there is none).
+ * Setup as for rl-l: a failure is infra. Listed for cleanup before its
+ * create; the chain's tail removes it. Memoized.
+ */
+export function forwardFixInstall(run: Run): Promise<RlP | null> {
+  run.s.rlf ??= makeForwardFix(run);
+  return run.s.rlf;
+}
+
+async function makeForwardFix(run: Run): Promise<RlP | null> {
+  const slug = run.slug("f");
+  try {
+    const version = await previous(run);
+    if (!version) return null;
+    run.s.cleanup.push({ slug });
+    const a = run.accepted(
+      await run.v1("/installs", {
+        body: oidcCreate(run, slug, run.rid("rlf"), version),
+      }),
+      "rl-f create",
+    );
+    await run.done(a.job.id, "rl-f create");
+    const dj = (await ownDetail(run, a.install.id)).json as InstallDetail;
+    if (dj.testHooks !== true)
+      throw new ProbeFail("rl-f: testHooks is not true");
+    if (!dj.appHost || !dj.contentHost)
+      throw new ProbeFail(
+        "rl-f: the finished install has no app or content host",
+      );
+    await run.within(PAGE_WITHIN_MS, "rl-f redline /healthz", async () => {
+      const h = await run.page(dj.appHost);
+      const hz = h.json as
+        | { testHooks?: unknown; version?: unknown }
+        | undefined;
+      return h.status === 200 && hz?.testHooks === true;
+    });
+    return {
+      id: a.install.id,
+      slug,
+      appHost: dj.appHost,
+      contentHost: dj.contentHost,
+      createdAt: version,
+      version,
+    };
+  } catch (e) {
+    if (e instanceof InfraError) throw e;
+    throw new InfraError(
+      `rl-f setup: ${e instanceof ProbeFail ? e.message : `error ${(e as Error)?.name ?? "unknown"}`}`,
+      { cause: e },
+    );
+  }
+}
+
+/** The rl-f chain's tail: deletes and purges rl-f so the alert clears; a failure leaves it for cleanupInstalls. */
+export async function removeForwardFix(run: Run): Promise<void> {
+  const slug = run.slug("f");
+  const at = run.s.cleanup.findIndex((e) => e.slug === slug);
+  if (at < 0) return;
+  try {
+    await removeInstall(run, slug, "rl-f cleanup");
+    run.s.cleanup.splice(
+      run.s.cleanup.findIndex((e) => e.slug === slug),
+      1,
+    );
+  } catch {
+    // Left on run.s.cleanup for cleanupInstalls.
   }
 }
 
@@ -1990,6 +2083,60 @@ export const PROBES: readonly Probe[] = [
         throw new ProbeFail(`P31: version ${v}, want ${p.createdAt}`);
       p.version = v;
       return pass();
+    },
+  },
+  {
+    id: "P52",
+    title:
+      "a failed upgrade stays forward (#1106): rl-f's health check is failed after the upload, and it stays on the new version",
+    timeoutMs: 3 * JOB_WITHIN_MS + 10 * 60_000,
+    run: async (run) => {
+      const p = await forwardFixInstall(run);
+      if (!p) return na("no older installable release, so no upgrade to fail");
+      const a = run.accepted(
+        await run.v1(`/installs/${p.id}/upgrade`, {
+          body: { requestId: failHealthRid(run), version: run.c.version },
+        }),
+        "P52 upgrade",
+      );
+      run.s.jobIds.push(a.job.id);
+      const j = await run.waitJob(a.job.id);
+      const code = j.lastErrorCode ?? j.error?.code;
+      if (code === "migration_held")
+        return unproven(
+          "the release holds a migration that can lose data: a person crosses it, so the failed-check leg cannot run unattended",
+        );
+      if (j.status !== "failed" || code !== "upgrade_incomplete")
+        throw new ProbeFail(
+          `P52: the upgrade with a failed health check must fail upgrade_incomplete, got job ${j.status} (${code ?? "no code"})`,
+        );
+      const now = (await ownDetail(run, p.id)).json as InstallDetail;
+      if (
+        now.state !== "active" ||
+        now.version !== run.c.version ||
+        now.previousVersion !== p.createdAt
+      )
+        throw new ProbeFail(
+          `P52: after the failed upgrade the install is ${now.state} ${now.version} (previous ${now.previousVersion}), want active ${run.c.version} (previous ${p.createdAt}): it must stay forward, never revert`,
+        );
+      const hz = await run.page(p.appHost, "/healthz", true);
+      const body = hz.json as { ok?: unknown; version?: unknown } | undefined;
+      if (
+        hz.status !== 200 ||
+        body?.ok !== true ||
+        body.version !== run.c.version
+      )
+        throw new ProbeFail(
+          `P52: after the failed upgrade /healthz is not ok on ${run.c.version} (${desc(hz)})`,
+        );
+      // Not read live, as in P31: the upgrade.failed and upgrade.forward_fix
+      // rows are `provision` rows (actor job:<id>) that R17 never returns to
+      // this actor, and no fleet_halt key exists to read: the job is not a
+      // fleet-% request from the system actor, so it cannot halt the fleet
+      // (apps/scheduler/src/provapi/fleet.ts FLEET_UP). The audit rows are
+      // proved by apps/provisioner/test/node/manage.test.ts ("the #1106
+      // failhealth test seam") and packages/provision/test/wfp-lifecycle.test.ts.
+      return pass(`stayed on ${run.c.version}, job upgrade_incomplete`);
     },
   },
   {

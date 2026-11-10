@@ -368,3 +368,10 @@ export function ownerEmailOf(row: { owner_email?: unknown }): string | null {
   const v = row.owner_email;
   return typeof v === "string" && !isPurgedEmail(v) ? v : null;
 }
+
+/**
+ * #1106 test seam, by request id: an upgrade job whose requestId starts with
+ * this runs with testFailCheck "health". The provisioner refuses it unless
+ * the env is staging and the install is an rl-f- test-hooks install.
+ */
+export const TEST_FAIL_HEALTH_PREFIX = "rl-failhealth-";
