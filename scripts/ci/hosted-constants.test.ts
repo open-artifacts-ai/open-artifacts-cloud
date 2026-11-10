@@ -163,13 +163,14 @@ describe(".github/hosted/<env>.json", () => {
   });
   // The Manager's values (2026-10-31), filled into the provisioner's and the
   // scheduler's placeholders.
-  // Design 155 and M4: prod stays closed; staging opens self-serve to the
-  // OIDC test users only (#1012, P29).
-  it("prod signups stay closed, staging admits test users only; the caps and alert addresses are the Manager's", () => {
+  // Design 155 and M4: prod stays closed. User decision 2026-11-10 (option
+  // A): staging sign-ups are open to anyone, capped at 20 a day, for the M2
+  // exit-test walk (it was test-users only, #1012, P29).
+  it("prod signups stay closed, staging is open with a cap of 20 for the M2 walk; the caps and alert addresses are the Manager's", () => {
     expect(read("prod").signup_daily_cap).toBe(50);
     expect(read("staging").signup_daily_cap).toBe(20);
     expect(read("prod").signups_enabled).toBe("false");
-    expect(read("staging").signups_enabled).toBe("test-users");
+    expect(read("staging").signups_enabled).toBe("true");
     // #1084: the alert address is the owner's: never committed, it comes
     // from the OA_OWNER_EMAIL secret (hosted-constants.sh).
     for (const env of ["prod", "staging"])
@@ -352,9 +353,9 @@ describe("hosted-constants.sh", () => {
     );
     expect(st.code, st.err).toBe(0);
     expect(st.ghEnv).toContain("SIGNUPS_ENABLED=test-users\n");
-    expect(
-      load({ ...read("staging"), signups_enabled: "true" }, "staging").code,
-    ).toBe(1);
+    const open = load({ ...read("staging"), signups_enabled: "true" }, "staging");
+    expect(open.code, open.err).toBe(0);
+    expect(open.ghEnv).toContain("SIGNUPS_ENABLED=true\n");
     expect(
       load({ ...read("staging"), signups_enabled: "TEST-USERS" }, "staging")
         .code,

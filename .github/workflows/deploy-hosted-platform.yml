@@ -102,6 +102,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ inputs.env == 'prod' && 'hosted-prod-deploy' || 'hosted-staging-deploy' }}
+    env:
+      # Staging sign-ups are open for the M2 walk (user decision 2026-11-10,
+      # cap 20/day); prod never gets it, so prod's true still refuses. Job
+      # level: every step that reads the signups constant (Deploy and verify,
+      # Scheduler, last) sees it.
+      ALLOW_SIGNUPS: ${{ inputs.env == 'staging' && '1' || '' }}
     timeout-minutes: 30
     steps:
       - name: Check the inputs

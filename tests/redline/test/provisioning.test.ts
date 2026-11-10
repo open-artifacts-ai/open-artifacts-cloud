@@ -1284,7 +1284,7 @@ describe("each probe fails on the behaviour it guards", () => {
     const f = fakeApi();
     f.faults.add("signups_closed");
     expect((await runAll(f)).get("P29")).toMatch(
-      /P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be test-users/,
+      /P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be true or test-users/,
     );
   });
 

@@ -40,7 +40,7 @@
 #                    smoke's secrets: put on this Worker only, when given)
 #   inventory        PLATFORM_DB_ID HOSTS_KV_ID GITHUB_REPOSITORY_ID GITHUB_REPOSITORY
 #                    (owner/repo: the OIDC principal, design v7 6.3)
-#   provisioning     PLATFORM_DB_ID BROKER_REGISTRY_ID DIRECTORY_REGISTRY_ID
+#   provisioning     PLATFORM_DB_ID BROKER_REGISTRY_ID DIRECTORY_REGISTRY_ID SIGNUPS_ENABLED
 #                    GITHUB_REPOSITORY_ID SIGNUP_DAILY_CAP ADMIN_IDENTITIES (the
 #                    Environment secret `email:sub,...`, #1007; the provisioner
 #                    and auth broker must exist)
@@ -398,7 +398,7 @@ case "$target" in
     [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
     ;;
   provisioning)
-    need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP
+    need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
     # ADMIN_IDENTITIES (#1007): the `email:sub` list is the Environment's
     # secret, never committed. Fail closed: no list, no deploy; each entry is
     # checked here and the value is never printed.
@@ -451,7 +451,7 @@ case "$target" in
     [[ "$found" =~ ^[0-9a-f]{32}$ ]] || { echo "KV namespace $ns: want exactly one, with a 32 hex id" >&2; exit 1; }
     OAUTH_KV_ID="$found"
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
-      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" deploy provisioning
+      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" deploy provisioning
     W="oa-$P-provisioning"
     have="$(secret_names "$W")"
     if ! grep -qx ADMIN_SESSION_KEY <<< "$have"; then
@@ -532,7 +532,7 @@ case "$target" in
     fi
     # Again after the secrets: the serving version carries the tag.
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
-      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" deploy provisioning
+      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" deploy provisioning
     S="$(settings "$W")"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "OAUTH_KV") | .namespace_id' "$OAUTH_KV_ID" "OAUTH_KV"

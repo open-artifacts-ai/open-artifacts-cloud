@@ -2490,10 +2490,10 @@ export const PROBES: readonly Probe[] = [
         testUser: "b",
         body: { requestId: run.rid("p29"), slug, turnstile: DUMMY_TURNSTILE },
       });
-      // 7 and 12.2: staging runs SIGNUPS_ENABLED=test-users; closed is drift.
+      // 7 and 12.2: staging runs SIGNUPS_ENABLED=true (open for the M2 walk, 2026-11-10; was test-users); closed is drift.
       if (c.status === 503 && errCode(c) === "signups_closed")
         throw new ProbeFail(
-          "P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be test-users (7)",
+          "P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be true or test-users (7)",
         );
       // Design gap: no principal can purge a test user's install within a
       // run (U's R11 is 403, O cannot reach a self-serve install, the

@@ -698,6 +698,7 @@ describe("deploy-platform-worker.sh", () => {
       PROVISIONING_OAUTH_KV_ID: KV,
       GITHUB_REPOSITORY_ID: "1012345678",
       SIGNUP_DAILY_CAP: "20",
+      SIGNUPS_ENABLED: "false",
     };
     /** A tree with this config and, unless `assets` is false, the admin build's index.html. */
     const tree = (config: string, assets = true) => {
@@ -798,6 +799,28 @@ describe("deploy-platform-worker.sh", () => {
         expect(bare.err).toContain("{{EXTRA}}");
         expect(bare.log).toEqual([]);
       }
+    });
+
+    it("staging fills SIGNUPS_ENABLED from the constant (true needs ALLOW_SIGNUPS=1); prod keeps its literal false", () => {
+      const script = tree(CONFIG);
+      const open = { ...OK, SIGNUPS_ENABLED: "true" };
+      const no = run(["provisioning", "staging"], open, script);
+      expect(no.code).toBe(1);
+      expect(no.log).toEqual([]);
+      const ok = run(
+        ["provisioning", "staging"],
+        { ...open, ALLOW_SIGNUPS: "1" },
+        script,
+      );
+      expect(ok.code, ok.err).toBe(0);
+      expect(readFileSync(ok.snap, "utf8")).toContain(
+        '"SIGNUPS_ENABLED": "true"',
+      );
+      const closed = run(["provisioning", "prod"], OK, script);
+      expect(closed.code, closed.err).toBe(0);
+      expect(readFileSync(closed.snap, "utf8")).toContain(
+        '"SIGNUPS_ENABLED": "false"',
+      );
     });
 
     it("refuses a provisioning config that names the provision token", () => {
