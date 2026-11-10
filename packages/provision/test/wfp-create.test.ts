@@ -348,6 +348,8 @@ function setup(o: SetupOpts = {}) {
     now: clock.now,
     sleep: clock.sleep,
     turnstile: TS[env],
+    // The suites pin their own bytes: no hosted Solo caps unless a test sets them.
+    defaultVars: {},
     ...over,
   });
   const mk = (over: Partial<WfpOptions> = {}) => {
@@ -774,6 +776,77 @@ describe("WfpProvisioner.create", () => {
         );
       },
     );
+
+    describe("runs hashed before the Solo cap defaults existed", () => {
+      const ID = "iabcdefghjkm";
+      const CAPS = [
+        "FREE_STORAGE_BYTES",
+        "FREE_DATA_DOCS",
+        "FREE_DATA_DAILY_WRITES",
+      ];
+      const bound = (s: ReturnType<typeof setup>, id: string) =>
+        (s.scriptOf(id)?.metadata.bindings ?? [])
+          .filter((b: { name: string }) => CAPS.includes(b.name))
+          .map((b: { name: string }) => b.name);
+
+      it("a create with no defaultVars override renders the three hosted caps", async () => {
+        const s = setup();
+        const inst = await s.mk({ defaultVars: undefined }).create(input());
+        expect(bound(s, inst.id).sort()).toEqual([...CAPS].sort());
+        const text = (n: string) =>
+          s
+            .scriptOf(inst.id)
+            ?.metadata.bindings.find((b: { name: string }) => b.name === n)
+            .text;
+        expect(text("FREE_STORAGE_BYTES")).toBe("1073741824");
+        expect(text("FREE_DATA_DOCS")).toBe("10000");
+        expect(text("FREE_DATA_DAILY_WRITES")).toBe("1000");
+      });
+
+      it("a creating install resumes with its first-run vars, no caps added", async () => {
+        const s = setup();
+        s.fake.inject((m, p) => m === "POST" && p.endsWith("/r2/buckets"));
+        await fails(s.p.create(input("finqore", { installId: ID })));
+        const inst = await s
+          .mk({ defaultVars: undefined })
+          .create(input("finqore", { installId: ID }));
+        expect(inst.id).toBe(ID);
+        expect(bound(s, ID)).toEqual([]);
+        expect(s.rows()[0].inputs_hash).toBe(
+          inputsHash({ ownerEmail: OWNER, vars: {}, testHooks: false }),
+        );
+      });
+
+      it("a lost-step replay of an active install returns it with no write", async () => {
+        const s = setup();
+        const first = await s.p.create(input("finqore", { installId: ID }));
+        const n = s.fake.writes().length;
+        const again = await s
+          .mk({ defaultVars: undefined })
+          .create(input("finqore", { installId: ID }));
+        expect(again.id).toBe(first.id);
+        expect(nonReads(s.fake, n)).toEqual([]);
+      });
+
+      it("a genuinely different input is still refused under the new defaults", async () => {
+        const s = setup();
+        s.fake.inject((m, p) => m === "POST" && p.endsWith("/r2/buckets"));
+        await fails(s.p.create(input("finqore", { installId: ID })));
+        const n = s.fake.writes().length;
+        const e = await fails(
+          s
+            .mk({ defaultVars: undefined })
+            .create(
+              input("finqore", {
+                installId: ID,
+                vars: { EMAIL_DAILY_CAP: "5" },
+              }),
+            ),
+        );
+        expect(e.message).toMatch(/inputs/);
+        expect(nonReads(s.fake, n)).toEqual([]);
+      });
+    });
 
     it("the inputs hash leaves the version out (a resume may move up; replay checks it)", () => {
       const base = { ownerEmail: OWNER, vars: {}, testHooks: false };

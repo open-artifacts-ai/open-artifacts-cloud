@@ -109,8 +109,8 @@ export const TRIAL_MS = 14 * 86_400_000;
 /**
  * Platform-wide var defaults per env, rendered at create for a name the
  * caller does not pass (a caller value wins; updateVars changes or clears
- * them). An empty value is no default. The free-plan caps are off until
- * their numbers are picked.
+ * them). An empty value is no default. The hosted Solo caps are 1 GiB,
+ * 10,000 data docs and 1,000 daily writes (decided by the user 2026-11-10).
  * Change a default only when no install is in `creating`: the defaults are
  * part of create's inputs hash, so a resume would refuse.
  */
@@ -118,14 +118,14 @@ export const HOSTED_DEFAULT_VARS: Readonly<
   Record<Env, Readonly<Record<string, string>>>
 > = Object.freeze({
   staging: Object.freeze({
-    FREE_STORAGE_BYTES: "",
-    FREE_DATA_DOCS: "",
-    FREE_DATA_DAILY_WRITES: "",
+    FREE_STORAGE_BYTES: "1073741824",
+    FREE_DATA_DOCS: "10000",
+    FREE_DATA_DAILY_WRITES: "1000",
   }),
   prod: Object.freeze({
-    FREE_STORAGE_BYTES: "",
-    FREE_DATA_DOCS: "",
-    FREE_DATA_DAILY_WRITES: "",
+    FREE_STORAGE_BYTES: "1073741824",
+    FREE_DATA_DOCS: "10000",
+    FREE_DATA_DAILY_WRITES: "1000",
   }),
 });
 
