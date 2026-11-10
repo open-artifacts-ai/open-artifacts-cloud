@@ -179,6 +179,24 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   );
 });
 
+test("closed view: field and Go to it read as one group (10px)", async ({
+  page,
+}) => {
+  for (const size of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(size);
+    await mount(page, { open: false });
+    const f = await page.locator(".field .inp").boundingBox();
+    const b = await page
+      .getByRole("button", { name: "Go to it" })
+      .boundingBox();
+    if (!f || !b) throw new Error("no boxes");
+    expect(Math.round(b.y - (f.y + f.height))).toBe(10);
+  }
+});
+
 test("form price line reads exactly", async ({ page }) => {
   await mount(page, { me: false });
   await expect(page.locator(".panel .muted.small")).toHaveText(

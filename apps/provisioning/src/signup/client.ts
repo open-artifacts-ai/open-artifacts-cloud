@@ -98,7 +98,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("p", {}, ["We're not opening new instances yet. You can run Open Artifacts yourself today, free and open source."]),
       h("a", { class: "btn pri", href: S.cfg.githubUrl, rel: "noopener" }, ["Run it yourself"]),
       h("div", { class: "or" }, ["or"]),
-      h("div", { class: "field" }, [
+      h("div", { class: "field tight" }, [
         h("label", { for: "go" }, ["Already have an instance?"]),
         h("div", { class: "inp" }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]),
         help
