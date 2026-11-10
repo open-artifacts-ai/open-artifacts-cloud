@@ -393,8 +393,12 @@ describe("server identity, tools, resources, prompts (9A.5)", () => {
     const c = await caller();
     const client = await connect(c, c.bearer);
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual([...ADMIN_TOOL_NAMES]);
-    for (const t of tools) {
+    // ADMIN_TOOLS, then the hosted-only set_install_tier (#66; set-tier.test.ts).
+    expect(tools.map((t) => t.name)).toEqual([
+      ...ADMIN_TOOL_NAMES,
+      "set_install_tier",
+    ]);
+    for (const t of tools.filter((x) => x.name !== "set_install_tier")) {
       const def = toolOf(t.name as AdminToolName);
       expect(t.description).toBe(def.description);
       expect(t.annotations).toMatchObject(def.annotations);

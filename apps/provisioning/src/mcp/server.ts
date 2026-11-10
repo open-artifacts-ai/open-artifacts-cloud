@@ -15,6 +15,7 @@ import {
 import type { z } from "zod";
 import { refusalOf } from "../auth/mcp-gate.js";
 import type { Env } from "../env.js";
+import { HOSTED_TOOLS } from "../hosted-tools.js";
 import type { Principal } from "../principal.js";
 import { invokeRoute, type RouteInput } from "../routes/invoke.js";
 
@@ -147,6 +148,28 @@ export function createAdminServer(
           structuredContent: r.body as Record<string, unknown>,
           ...(replayed ? { _meta: { "oa/replayed": true } } : {}),
         };
+      },
+    );
+
+  // Hosted-only tools (hosted-tools.ts): not contract routes, so no authz row;
+  // each entry authorizes, charges and audits itself.
+  for (const t of HOSTED_TOOLS)
+    server.registerTool(
+      t.name,
+      {
+        description: t.description,
+        inputSchema: t.input,
+        annotations: t.annotations,
+      },
+      async (args: Record<string, unknown>): Promise<CallToolResult> => {
+        try {
+          const r = await t.run(env, principal, args, {
+            version: clientVersion(),
+          });
+          return { content: text(r.text), structuredContent: r.body };
+        } catch (e) {
+          return errorResult(e);
+        }
       },
     );
 

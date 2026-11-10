@@ -1,4 +1,4 @@
-import { applyD1Migrations } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
 import { env as testEnv } from "cloudflare:workers";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { keyId, publicFromPkcs8, signRequest } from "@oa/auth-core";
@@ -13,7 +13,7 @@ import {
   it,
   vi,
 } from "vitest";
-import billing, { type Env } from "../src/index.js";
+import billing, { BillingOperatorRpc, type Env } from "../src/index.js";
 
 // POST /checkout and POST /portal: signed like the other POSTs, redirect URLs
 // built only from the gate's app host, the Stripe customer created and mapped
@@ -342,6 +342,35 @@ describe("POST /checkout", () => {
       ).toBe(200);
       await db.prepare("DELETE FROM tiers").run();
     }
+  });
+
+  it("after an operator comp the dead subscription id is gone: Team checkout is allowed (#66)", async () => {
+    await seed(A, "cus_existingA", "team");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = 'sub_dead1', status = 'lapsed' WHERE install_id = ?1",
+      )
+      .bind(A)
+      .run();
+    const set = await new BillingOperatorRpc(
+      createExecutionContext(),
+      env,
+    ).setTier(A, "team");
+    expect(set).toMatchObject({ ok: true });
+    expect(
+      (
+        await db
+          .prepare(
+            "SELECT stripe_subscription_id AS s FROM tiers WHERE install_id = ?1",
+          )
+          .bind(A)
+          .first<{ s: string | null }>()
+      )?.s,
+    ).toBeNull();
+    const s = fakeStripe();
+    const r = await call(req("/checkout", { install: A, plan: "team" }));
+    expect(r.status).toBe(200);
+    expect(s.calls.map((c) => c.path)).toContain(CHECKOUT);
   });
 
   it("a suspended row with a subscription is refused too (N10)", async () => {

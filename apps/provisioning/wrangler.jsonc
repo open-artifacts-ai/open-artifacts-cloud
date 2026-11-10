@@ -78,6 +78,10 @@
       ],
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      // BILLING is STAGING ONLY (#66): billing's BillingOperatorRpc entrypoint,
+      // how an operator sets an install's tier (set_install_tier). oa-s-billing
+      // must be deployed first, and the deploy reads the binding back when the
+      // tag declares it. Prod has no BILLING binding.
       "services": [
         {
           "binding": "PROVISIONER",
@@ -87,6 +91,11 @@
         {
           "binding": "AUTH_BROKER",
           "service": "oa-s-auth-broker"
+        },
+        {
+          "binding": "BILLING",
+          "service": "oa-s-billing",
+          "entrypoint": "BillingOperatorRpc"
         }
       ],
       "queues": {

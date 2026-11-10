@@ -171,6 +171,8 @@ describe("OIDC on staging /mcp (9A.10)", () => {
     const client = await connect(env, bearer);
     expect((await client.listTools()).tools.map((t) => t.name)).toEqual([
       ...ADMIN_TOOL_NAMES,
+      // Hosted-only (#66); an OIDC caller sees it listed and is forbidden.
+      "set_install_tier",
     ]);
     const rl = await seedInstall({ slug: "rl-p1", testHooks: true });
     const other = await seedInstall({ slug: "acme" });
