@@ -1020,6 +1020,16 @@ describe("D: publishRelease", () => {
       await refused(s);
     });
 
+    it("one byte changed at the same length: refused, zero writes", async () => {
+      const s = await published();
+      const key = "releases/0.34.0/release/welcome/welcome.md";
+      const cur = s.fake.r2Object(s.bucket, key)?.bytes as Uint8Array;
+      const flipped = cur.slice();
+      flipped[0] ^= 1;
+      s.fake.r2Seed(s.bucket, key, flipped);
+      await refused(s);
+    });
+
     it("an extra object: refused, zero writes", async () => {
       const s = await published();
       s.fake.r2Seed(

@@ -427,7 +427,8 @@ export async function publishRelease(o: {
         identical = false;
         break;
       }
-      const cur = await r2.get(x.key, { maxBytes: b.length }).catch(() => null);
+      // null is not-found (differs); any other error (transient, auth) throws.
+      const cur = await r2.get(x.key, { maxBytes: b.length });
       if (!cur || !same(cur.bytes, b)) identical = false;
     }
     if (!identical)
