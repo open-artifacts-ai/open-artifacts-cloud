@@ -5,7 +5,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { d1, loadMigrations, pinDrift, run } from "./platform-db.ts";
+import {
+  FLEET_VERIFIED_PREFIX,
+  fleetTarget,
+} from "../../apps/scheduler/src/provapi/fleet.ts";
+import {
+  d1,
+  loadMigrations,
+  markVerified,
+  pinDrift,
+  Refused,
+  run,
+  unmarkVerified,
+} from "./platform-db.ts";
 
 // platform-db.ts (design v7 8.4) against a local SQLite standing in for D1:
 // bootstrap by schema, the shape check before any record, apply in order,
@@ -629,5 +641,184 @@ describe("platform-db.ts", () => {
       "utf8",
     );
     expect(src).not.toMatch(/console\.\w+\([^)]*TOKEN/);
+  });
+
+  // #1229: the deploy's mark that every Worker's read-back passed.
+  describe("the platform_verified mark", () => {
+    const stateDb = () => {
+      const sqlite = new DatabaseSync(":memory:");
+      sqlite.exec(
+        "CREATE TABLE platform_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+      );
+      let failures = 0;
+      const sleeps: number[] = [];
+      return {
+        sqlite,
+        sleeps,
+        failNext: (n: number) => {
+          failures = n;
+        },
+        sleep: async (ms: number) => {
+          sleeps.push(ms);
+        },
+        db: {
+          all: async (sql: string, params?: SQLInputValue[]) => {
+            if (failures > 0) {
+              failures--;
+              throw new Refused("D1 query failed: network error");
+            }
+            return sqlite.prepare(sql).all(...(params ?? []));
+          },
+          exec: async (sql: string) => sqlite.exec(sql),
+        },
+      };
+    };
+    const keys = (s: DatabaseSync) =>
+      s.prepare("SELECT key, value FROM platform_state ORDER BY key").all();
+
+    it("writes the key the scheduler reads, and logs no counts", async () => {
+      const f = stateDb();
+      const log: string[] = [];
+      await markVerified({
+        db: f.db,
+        tag: "v0.150.0",
+        now: () => 1_000,
+        sleep: f.sleep,
+        log: (s) => log.push(s),
+      });
+      const target = fleetTarget({ tag: "v0.150.0" });
+      expect(keys(f.sqlite)).toEqual([
+        { key: `${FLEET_VERIFIED_PREFIX}${target}`, value: 1_000 },
+      ]);
+      expect(log).toEqual(["platform_verified:0.150.0 written"]);
+    });
+
+    it("a rerun keeps the first time", async () => {
+      const f = stateDb();
+      for (const t of [1_000, 2_000])
+        await markVerified({
+          db: f.db,
+          tag: "v0.150.0",
+          now: () => t,
+          sleep: f.sleep,
+          log: () => {},
+        });
+      expect(keys(f.sqlite)).toEqual([
+        { key: "platform_verified:0.150.0", value: 1_000 },
+      ]);
+    });
+
+    it("refuses a tag that is not a stable release", async () => {
+      const f = stateDb();
+      for (const tag of ["0.150.0", "v0.150", "v0.150.0-rc.1", ""])
+        await expect(
+          markVerified({
+            db: f.db,
+            tag,
+            now: () => 1,
+            sleep: f.sleep,
+            log: () => {},
+          }),
+        ).rejects.toThrow(/stable/);
+      expect(keys(f.sqlite)).toEqual([]);
+    });
+
+    it("retries D1 errors (3 attempts, 1 s then 2 s), then fails", async () => {
+      const f = stateDb();
+      f.failNext(2);
+      await markVerified({
+        db: f.db,
+        tag: "v0.150.0",
+        now: () => 1,
+        sleep: f.sleep,
+        log: () => {},
+      });
+      expect(f.sleeps).toEqual([1_000, 2_000]);
+      expect(keys(f.sqlite)).toHaveLength(1);
+      const g = stateDb();
+      g.failNext(3);
+      await expect(
+        markVerified({
+          db: g.db,
+          tag: "v0.150.0",
+          now: () => 1,
+          sleep: g.sleep,
+          log: () => {},
+        }),
+      ).rejects.toThrow(/D1 query failed/);
+      expect(g.sleeps).toEqual([1_000, 2_000]);
+      expect(keys(g.sqlite)).toEqual([]);
+    });
+
+    it("fails when the read-back finds no row", async () => {
+      const f = stateDb();
+      const db = {
+        ...f.db,
+        all: async (sql: string) => (sql.startsWith("SELECT") ? [] : []),
+      };
+      await expect(
+        markVerified({
+          db,
+          tag: "v0.150.0",
+          now: () => 1,
+          sleep: f.sleep,
+          log: () => {},
+        }),
+      ).rejects.toThrow(/read back/);
+    });
+
+    it("unmark deletes every platform_verified key and nothing else, with retries", async () => {
+      const f = stateDb();
+      f.sqlite.exec(
+        "INSERT INTO platform_state VALUES ('platform_verified:0.1.0',1,1),('platform_verified:0.2.0',1,1),('fleet_halt:0.1.0:x',1,1)",
+      );
+      f.failNext(1);
+      const log: string[] = [];
+      await unmarkVerified({
+        db: f.db,
+        sleep: f.sleep,
+        log: (s) => log.push(s),
+      });
+      expect(keys(f.sqlite)).toEqual([{ key: "fleet_halt:0.1.0:x", value: 1 }]);
+      expect(f.sleeps).toEqual([1_000]);
+      expect(log).toEqual(["platform_verified marks cleared"]);
+    });
+
+    it("the CLI modes refuse bad usage before any call, and never print the token", () => {
+      const cli = (args: string[], env: Record<string, string>) =>
+        spawnSync(
+          "node",
+          [
+            "--experimental-strip-types",
+            "--no-warnings",
+            join(import.meta.dirname, "platform-db.ts"),
+            ...args,
+          ],
+          {
+            env: { PATH: process.env.PATH as string, ...env },
+            encoding: "utf8",
+          },
+        );
+      const ok = {
+        CLOUDFLARE_API_TOKEN: "tok-secret-1",
+        CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
+        PLATFORM_DB_ID: "6ca9103e-507e-4541-b3bb-2485e699512b",
+      };
+      for (const args of [
+        ["mark-verified", "dev", "v1.2.3"],
+        ["mark-verified", "prod"],
+        ["unmark-verified", "dev"],
+      ]) {
+        const r = cli(args, ok);
+        expect(r.status, args.join(" ")).toBe(2);
+        expect(r.stdout + r.stderr).not.toContain("tok-secret-1");
+      }
+      expect(
+        cli(["mark-verified", "prod", "v1.2.3"], {
+          ...ok,
+          PLATFORM_DB_ID: "x",
+        }).status,
+      ).toBe(2);
+    });
   });
 });

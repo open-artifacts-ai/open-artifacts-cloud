@@ -371,6 +371,50 @@ describe("the platform_verified gate (#1229)", () => {
     });
   });
 
+  it("the watch and the failed-job halt go on during the hold", async () => {
+    await unverify();
+    const canary = await on(TARGET, { created: 0 });
+    await soaked(canary);
+    const id = await on(TARGET, { created: 5 });
+    await fleetJob(id, { finished_at: NOW - MIN });
+    const f = fakes({ canary, answers: new Map([[id, "down"]]) });
+    const lines = captureLogs(vi.spyOn);
+    await fleetDue(f.env, NOW, f.opts);
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    // The upgraded install was probed, failed twice and halted the version.
+    expect(f.probed).toContain(id);
+    expect(await stateKeys(`fleet_halt:${TARGET}:`)).toHaveLength(1);
+    expect(lines).toContain("provapi fleet holding: platform not verified");
+    // A job failed in the hold halts too.
+    const bad = await on("0.92.0");
+    await fleetJob(bad, { status: "failed", error_code: "upgrade_incomplete" });
+    await fleetDue(f.env, NOW + 4 * MIN, f.opts);
+    expect(await stateKeys(`fleet_halt:${TARGET}:${bad}`)).toHaveLength(1);
+  });
+
+  it("prune removes old versions' platform_verified marks, never the target's or a newer one's", async () => {
+    const ins = (k: string, at: number) =>
+      db
+        .prepare(
+          "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+        )
+        .bind(k, at)
+        .run();
+    await ins(`${FLEET_VERIFIED_PREFIX}0.91.0`, NOW - FLEET_KEEP_MS - MIN);
+    await ins(`${FLEET_VERIFIED_PREFIX}0.92.0`, NOW - FLEET_KEEP_MS + MIN);
+    const canary = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    const left = (
+      await rows(
+        "SELECT key FROM platform_state WHERE key GLOB 'platform_verified:*'",
+      )
+    ).map((r) => r.key);
+    expect(left).toContain(`${FLEET_VERIFIED_PREFIX}0.92.0`);
+    expect(left).toContain(`${FLEET_VERIFIED_PREFIX}${TARGET}`);
+    expect(left).not.toContain(`${FLEET_VERIFIED_PREFIX}0.91.0`);
+  });
+
   it("the mark clears the stamp and the alert", async () => {
     await unverify();
     const canary = await on("0.92.0");
