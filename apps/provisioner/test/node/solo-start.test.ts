@@ -39,7 +39,7 @@ beforeEach(async () => {
 const OK: SoloStartResult = {
   ok: true,
   tier: "solo",
-  status: "trialing",
+  status: "active",
   trialEndsAt: null,
   graceUntil: null,
   soloTrialEndsAt: 1,

@@ -21,6 +21,10 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import type {
+  SoloStartError,
+  SoloStartResult,
+} from "../../../packages/billing-core/src/solo-start.js";
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   type BundleVariant,
@@ -74,35 +78,9 @@ import {
 } from "./steps.js";
 import { type Welcome, welcomeEmail } from "./welcome.js";
 
-/**
- * What BillingProvisionerRpc.soloStart answers (OA Billing's contract):
- * expected outcomes are values, never throws; a throw is transport.
- * TODO: replace with Billing's export once its PR lands.
- */
-export type SoloStartError =
-  | "bad_install"
-  | "unknown_install"
-  | "plan_conflict"
-  | "not_active"
-  | "config"
-  | "upstream"
-  | "bad_upstream"
-  | "retry"
-  | "unavailable"
-  | "stripe_refused";
-
-export type SoloStartResult =
-  | {
-      ok: true;
-      tier: string;
-      status: string;
-      trialEndsAt: number | null;
-      graceUntil: number | null;
-      soloTrialEndsAt: number | null;
-      version: number;
-      asOf: number;
-    }
-  | { ok: false; error: SoloStartError; retryable: boolean };
+// What BillingProvisionerRpc.soloStart answers is Billing's contract, imported
+// from @oa/billing-core (types only).
+export type { SoloStartError, SoloStartResult };
 
 /** The BILLING service binding, entrypoint BillingProvisionerRpc. */
 export interface BillingProvisionerRpc {
