@@ -3,7 +3,8 @@ import type { Principal } from "../principal.js";
 // Recent sign-in for R11 purge of a `deleting` install (design v7 4.2, 4.3):
 // the session's authAt within 10 min; else 403 `reauth_required`, and the
 // panel sends the admin to /auth/start?reauth=1 (the broker asks Google for
-// max_age=0; the callback checks auth_time).
+// max_age=0, which Google ignores; the callback sets authAt to now once the
+// interactive flow completes, and auth_time is only audited).
 
 export const REAUTH_MAX_AGE_MS = 10 * 60_000;
 
