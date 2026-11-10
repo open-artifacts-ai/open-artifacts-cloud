@@ -22,6 +22,7 @@ import {
   event,
   seedCreate,
   seedJob,
+  seedToken,
   stepRunner,
   ulid,
   V1,
@@ -184,24 +185,8 @@ const refusal = (reason: string) =>
   );
 const keyBodies = (calls: Call[]) => calls.map((c) => c.body);
 
-/** An agent_tokens row of `kind`; its id. */
-function agentToken(kind: "oauth" | "oat"): string {
-  const id = ulid();
-  const oauth = kind === "oauth";
-  w.db
-    .prepare(
-      `INSERT INTO agent_tokens (id, kind, token_hash, session_hash, admin_email, label, scopes, client_id, oauth_user, created_at, expires_at)
-VALUES (?, ?, ?, 'sh', 'a@example.com', 'x', '["installs:write"]', ?, ?, 1, 9)`,
-    )
-    .run(
-      id,
-      kind,
-      oauth ? null : `hash-${id}`,
-      oauth ? "client" : null,
-      oauth ? "adm_x" : null,
-    );
-  return id;
-}
+/** A live agent_tokens row of `kind` (and its session); its id. */
+const agentToken = (kind: "oauth" | "oat"): string => seedToken(w, { kind });
 
 /** Runs a job to its end; the failure, if any, as the engine's error. */
 async function run(
@@ -221,6 +206,7 @@ async function run(
     installId,
     args,
     actor: "token",
+    tokenId: null,
     ...o,
   } as Parameters<typeof seedJob>[1]);
   const grant = o.grant === undefined ? "oauth" : o.grant;

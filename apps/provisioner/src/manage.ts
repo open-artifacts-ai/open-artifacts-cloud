@@ -59,6 +59,7 @@ import { deployEnv, transient } from "./provisioner.js";
 import {
   checkJob,
   checkOidcScope,
+  checkTokenLive,
   checkTransition,
   readStatus,
   refused,
@@ -643,6 +644,7 @@ const STRING = (v: unknown, max: number): v is string =>
 async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
   const env = deployEnv(ctx.env.OA_ENV);
   const job = checkJob(await readJob(ctx, jobId), "manage_install", KINDS);
+  await checkTokenLive(ctx, job);
   const kind = job.kind as ManageKind;
   const st = await readStatus(ctx, job.install_id);
   if (!st) throw refused("no lifecycle row");

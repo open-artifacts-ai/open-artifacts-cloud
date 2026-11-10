@@ -295,6 +295,8 @@ export type CreateSeed = {
   version?: string;
   email?: string;
   tier?: string;
+  /** A token actor's jobs.token_id; default a live token (seedToken). */
+  tokenId?: string | null;
 };
 
 /** What R4 writes (W4 create.ts): job, signup, secret, lifecycle. */
@@ -368,7 +370,70 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
       jobId,
       now,
     );
+  if (actor === "token")
+    run(
+      "UPDATE jobs SET token_id = ? WHERE id = ?",
+      o.tokenId === undefined ? seedToken(w) : o.tokenId,
+      jobId,
+    );
   return { jobId, installId, signupId: jobId, sub };
+}
+
+/**
+ * A live token (#1168): an agent_tokens row and the admin session it was
+ * minted under, both unexpired at the world's clock. `revoked`, `expired`,
+ * `sessionRevoked`, `sessionExpired`, `sessionKind` and `sessionEmail` make
+ * it stale in one rule each. Returns the token's id.
+ */
+export function seedToken(
+  w: World,
+  o: {
+    kind?: "oat" | "oauth";
+    revoked?: boolean;
+    expired?: boolean;
+    noSession?: boolean;
+    sessionRevoked?: boolean;
+    sessionExpired?: boolean;
+    sessionKind?: "admin" | "user";
+    sessionEmail?: string;
+  } = {},
+): string {
+  const id = ulid();
+  const now = w.clock.t;
+  const kind = o.kind ?? "oauth";
+  const oauth = kind === "oauth";
+  if (!o.noSession)
+    w.db
+      .prepare(
+        `INSERT INTO sessions (id_hash, kind, host, email, sub, auth_at, created_at, expires_at, revoked_at)
+VALUES (?, ?, 'h', ?, 'sub', ?, ?, ?, ?)`,
+      )
+      .run(
+        `sh-${id}`,
+        o.sessionKind ?? "admin",
+        o.sessionEmail ?? "a@example.com",
+        now,
+        now,
+        o.sessionExpired ? now : now + 3_600_000,
+        o.sessionRevoked ? now - 1 : null,
+      );
+  w.db
+    .prepare(
+      `INSERT INTO agent_tokens (id, kind, token_hash, session_hash, admin_email, label, scopes, client_id, oauth_user, created_at, expires_at, revoked_at)
+VALUES (?, ?, ?, ?, 'A@Example.com', 'x', '["installs:write"]', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      kind,
+      oauth ? null : `hash-${id}`,
+      `sh-${id}`,
+      oauth ? "client" : null,
+      oauth ? "adm_x" : null,
+      now,
+      o.expired ? now : now + 3_600_000,
+      o.revoked ? now - 1 : null,
+    );
+  return id;
 }
 
 /** A ManageInstall job row, as W4's accept writes it. */
@@ -386,6 +451,8 @@ export function seedJob(
     status?: string;
     /** jobs.request_id; default `req-<id>`. */
     requestId?: string;
+    /** A token actor's jobs.token_id; default a live token (seedToken). */
+    tokenId?: string | null;
   },
 ) {
   const id = ulid();
@@ -411,6 +478,10 @@ VALUES (?, ?, 'manage_install', ?, ?, ?, ?, ?, ?, ?, 'h', ?, ?, ?, ?)`,
       now,
       now,
     );
+  if (actor === "token") {
+    const tokenId = o.tokenId === undefined ? seedToken(w) : o.tokenId;
+    w.db.prepare("UPDATE jobs SET token_id = ? WHERE id = ?").run(tokenId, id);
+  }
   return id;
 }
 
