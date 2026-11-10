@@ -1320,27 +1320,21 @@ describe("rollback", () => {
     });
   });
 
-  it("rollback refuses an asset changed between plan and its bucket read before the script upload", async () => {
+  it("rollback uploads the bytes it verified: a file changed after the plan is not fetched again", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input()));
     await s.p.upgrade(inst.id, "0.24.0");
-    // Cloudflare asks for app.js again, so the apply reads it for its bucket.
+    // Cloudflare asks for app.js again, so the apply sends it in a bucket.
     s.fake.assetHashes.clear();
     const good = s.rel.reader.assetBytes;
-    let reads = 0;
-    // The plan's pre-flight read is good; the bucket read is not.
-    s.rel.reader.assetBytes = async (version, variant, path) =>
-      path === "app.js" && ++reads >= 2
-        ? enc("console.log(2)")
-        : good(version, variant, path);
-    const from = s.fake.log.length;
-    const e = await fails(s.p.rollback(inst.id));
-    expect(e).toBeInstanceOf(ProvisionRefused);
-    expect(e.message).toMatch(/assets do not match the signed record/);
-    expect(provisionErrorCode(e)).toBe("release_unverified");
-    expect(reads).toBe(2);
-    expect(uploads(s.fake, from)).toHaveLength(0);
-    expect(s.audit(inst.id)).not.toContain("rollback.incomplete");
+    const reads = new Map<string, number>();
+    s.rel.reader.assetBytes = async (version, variant, path) => {
+      reads.set(path, (reads.get(path) ?? 0) + 1);
+      return good(version, variant, path);
+    };
+    const r = keep(await s.p.rollback(inst.id));
+    expect(r).toMatchObject({ ok: true, rolledBack: true, to: "0.23.0" });
+    expect(Object.fromEntries(reads)).toEqual({ "index.html": 1, "app.js": 1 });
   });
 
   it("#882: rollback reads each asset once (the plan's verify), not again at apply", async () => {
