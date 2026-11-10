@@ -2175,10 +2175,8 @@ describe("WfpProvisioner.create", () => {
       };
     };
 
-    it("assets are read one at a time", async () => {
-      // Every read is held until the test releases it, so a second read that
-      // started before the first was released would be seen in flight.
-      const files = Array.from({ length: 16 }, (_, i) => ({
+    it("assets are read at most 8 at a time, each exactly once on create", async () => {
+      const files = Array.from({ length: 40 }, (_, i) => ({
         path: `f${String(i).padStart(2, "0")}.bin`,
         bytes: enc(`asset ${i}`),
       }));
@@ -2187,82 +2185,77 @@ describe("WfpProvisioner.create", () => {
       );
       let inFlight = 0;
       let maxInFlight = 0;
-      const events: string[] = [];
-      const held: { path: string; release: () => void }[] = [];
-      let wake: (() => void) | undefined;
       const s = setup({
         release: makeRelease(
           { assets: files },
           {
-            assetBytes: (v, b, path) => {
+            assetBytes: async (v, b, path) => {
               inFlight++;
               maxInFlight = Math.max(maxInFlight, inFlight);
-              events.push(`start ${path}`);
-              return new Promise<Uint8Array>((resolve, reject) => {
-                held.push({
-                  path,
-                  release: () => {
-                    inFlight--;
-                    events.push(`release ${path}`);
-                    r.assetBytes(v, b, path).then(resolve, reject);
-                  },
-                });
-                wake?.();
-              });
+              await new Promise((w) => setTimeout(w, 2));
+              inFlight--;
+              return r.assetBytes(v, b, path);
             },
           },
         ),
       });
-      let settled = false;
-      let failure: unknown;
-      const run = s.p.create(input()).then(
-        () => {
-          settled = true;
-          wake?.();
-        },
-        (e) => {
-          failure = e;
-          settled = true;
-          wake?.();
-        },
+      await s.p.create(input());
+      expect(maxInFlight).toBeGreaterThan(1);
+      expect(maxInFlight).toBeLessThanOrEqual(8);
+      expect(Object.fromEntries(r.reads)).toEqual(
+        Object.fromEntries(files.map((f) => [f.path, 1])),
       );
-      let released = 0;
-      for (;;) {
-        const next = held.shift();
-        if (next) {
-          expect(inFlight).toBe(1);
-          expect(held).toEqual([]);
-          released++;
-          next.release();
-          continue;
-        }
-        if (settled) break;
-        await new Promise<void>((w) => {
-          wake = w;
-        });
-        wake = undefined;
-      }
-      await run;
-      expect(failure).toBeUndefined();
-      expect(maxInFlight).toBe(1);
-      // Read k+1 starts only after read k is released.
-      const paired = events.flatMap((e, k) =>
-        k % 2 === 0 && e.startsWith("start ")
-          ? [e, `release ${e.slice("start ".length)}`]
-          : [],
-      );
-      expect(events).toEqual(paired);
-      // Pre-flight, and the bucket Cloudflare asked for.
-      expect(released).toBe(files.length * 2);
-      expect([...r.reads.values()]).toEqual(files.map(() => 2));
+    });
+
+    it("a bad hash on a late asset is refused with that asset named, even when an earlier one finishes later", async () => {
+      const files = Array.from({ length: 30 }, (_, i) => ({
+        path: `f${String(i).padStart(2, "0")}.bin`,
+        bytes: enc(`asset ${i}`),
+      }));
+      const bad = new Set(["f03.bin", "f27.bin"]);
+      const s = setup({
+        release: makeRelease(
+          { assets: files },
+          {
+            assetBytes: async (_v, _b, path) => {
+              // The earlier bad file is the slowest to answer.
+              await new Promise((w) =>
+                setTimeout(w, path === "f03.bin" ? 30 : 1),
+              );
+              return bad.has(path)
+                ? enc("tampered")
+                : (files.find((x) => x.path === path) as ReleaseAsset).bytes;
+            },
+          },
+        ),
+      });
+      const e = await fails(s.p.create(input()));
+      expect(e).toBeInstanceOf(ProvisionRefused);
+      expect(e.message).toMatch(/f03\.bin changed/);
+      expect(s.fake.log).toEqual([]);
+
+      const only = setup({
+        release: makeRelease(
+          { assets: files },
+          {
+            assetBytes: async (_v, _b, path) =>
+              path === "f27.bin"
+                ? enc("tampered")
+                : (files.find((x) => x.path === path) as ReleaseAsset).bytes,
+          },
+        ),
+      });
+      const e2 = await fails(only.p.create(input()));
+      expect(e2.message).toMatch(/f27\.bin changed/);
+      expect(only.fake.log).toEqual([]);
     });
 
     it.each([
-      ["10 missing, in one bucket", 10, 162],
-      ["none missing", 0, 152],
+      ["10 missing, in one bucket", 10],
+      ["none missing", 0],
     ])(
-      "152 assets with %s are read %i + 152 times: once to verify, once per bucket file",
-      async (_n, missing, total) => {
+      "152 assets with %s are read 152 times: once, the bytes verified are the bytes uploaded",
+      async (_n, missing) => {
         const files = Array.from({ length: 152 }, (_, i) => ({
           path: `a${String(i).padStart(3, "0")}.js`,
           bytes: enc(`export const n = ${i};`),
@@ -2273,7 +2266,7 @@ describe("WfpProvisioner.create", () => {
         s.fake.assetsPerBucket = 10;
         await s.p.create(input());
         const c = (s.release as ReturnType<typeof makeRelease>).calls;
-        expect(c.assetBytes).toBe(total);
+        expect(c.assetBytes).toBe(152);
         expect(
           s.fake.log.filter((e) => e.path.includes("/workers/assets/upload"))
             .length,
@@ -2313,27 +2306,6 @@ describe("WfpProvisioner.create", () => {
       expect(e.message).toMatch(/assets do not match the signed record/);
       expect(s.fake.log).toEqual([]);
     });
-
-    it.each([["between verify and its bucket", 2]])(
-      "a file changed %s is refused before the script upload",
-      async (_n, at) => {
-        const r = counting((path, n) =>
-          path === "app.js" && n >= at
-            ? enc("console.log(2)")
-            : (ASSETS.find((a) => a.path === path) as ReleaseAsset).bytes,
-        );
-        const s = setup({
-          release: makeRelease({}, { assetBytes: r.assetBytes }),
-        });
-        const e = await fails(s.p.create(input()));
-        expect(e).toBeInstanceOf(ProvisionRefused);
-        expect(e.message).toMatch(/assets do not match the signed record/);
-        expect(uploads(s.fake)).toHaveLength(0);
-        expect(
-          s.fake.log.some((x) => x.path.endsWith("/assets-upload-session")),
-        ).toBe(true);
-      },
-    );
 
     it("cf.assetsUpload refuses a file changed since its manifest hash, before its bucket is posted", async () => {
       const fake = new FakeCf();
