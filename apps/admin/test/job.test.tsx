@@ -423,3 +423,16 @@ it("says a missing job is not found", async () => {
   renderApp("/jobs/01JD7Z9W5Q8X3N4M2K1H0G9F00");
   expect(await screen.findByText("Job not found")).toBeInTheDocument();
 });
+
+it("an unlabeled agent token shows its id in the byline", async () => {
+  serve({
+    ...jobsByStatus.running,
+    actor: { kind: "token", label: "unnamed", tokenId: FIXTURE_IDS.token },
+  });
+  renderApp(`/jobs/${JOB}`);
+  expect(
+    await screen.findByText(
+      new RegExp(`by agent token ${FIXTURE_IDS.token.slice(-8)}`),
+    ),
+  ).toBeInTheDocument();
+});

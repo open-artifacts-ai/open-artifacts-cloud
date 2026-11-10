@@ -96,7 +96,12 @@ export async function world(a: HandlerArgs): Promise<RouteResult> {
     byState[r.state] += r.n;
     byServingMode[ServingModeSchema.catch("unmapped").parse(r.serving_mode)] +=
       r.n;
-    byHealth[HealthSchema.catch("unknown").parse(r.health)] += r.n;
+    // A purged install has no Worker to check: unknown, as summaryOf says.
+    byHealth[
+      r.state === "deleted"
+        ? "unknown"
+        : HealthSchema.catch("unknown").parse(r.health)
+    ] += r.n;
   }
 
   const kv = new Map(
@@ -280,7 +285,7 @@ WHERE j.status = 'failed' AND j.install_id IN (SELECT value FROM json_each(?1))
           since: r.updated_at,
         }),
       );
-    else if (r.health === "failing")
+    else if (r.health === "failing" && r.state !== "deleted")
       out.push(
         item("health_failing", r.install_id, {
           code: "health_failing",

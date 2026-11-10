@@ -42,6 +42,7 @@ import { fmtTime } from "../components/format";
 import {
   fmtClock,
   fmtDay,
+  actorName,
   HEALTH_LABEL,
   HEALTH_TONE,
   JOB_VERB,
@@ -708,20 +709,26 @@ export function InstallDetail({ id }: { id: string }) {
             <div>
               <dt>Health</dt>
               <dd>
-                <span className="oa-st" data-tone={HEALTH_TONE[i.health]}>
-                  {HEALTH_LABEL[i.health]}
-                </span>
+                {i.state === "deleted" ? (
+                  "n/a"
+                ) : (
+                  <span className="oa-st" data-tone={HEALTH_TONE[i.health]}>
+                    {HEALTH_LABEL[i.health]}
+                  </span>
+                )}
               </dd>
             </div>
             <div>
               <dt>Serving</dt>
               <dd>
-                {i.version ? (
+                {i.state === "deleted" ? (
+                  "n/a"
+                ) : i.version ? (
                   <span className="oa-mono">{i.version}</span>
                 ) : (
                   "nothing"
                 )}
-                {i.previousVersion && (
+                {i.state !== "deleted" && i.previousVersion && (
                   <>
                     {" "}
                     (previous{" "}
@@ -807,7 +814,7 @@ export function InstallDetail({ id }: { id: string }) {
                       {fmtDay(j.startedAt ?? j.createdAt)}{" "}
                       {fmtClock(j.startedAt ?? j.createdAt)}
                     </TableCell>
-                    <TableCell className="oa-note">{j.actor.label}</TableCell>
+                    <TableCell className="oa-note">{actorName(j.actor)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>

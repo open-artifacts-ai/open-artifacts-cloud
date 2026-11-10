@@ -18,7 +18,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { auditQuery, installQuery, tokensQuery } from "../api/queries";
 import { Pager } from "../components/Bits";
-import { fmtDayClock, shortId } from "../components/labels";
+import { actorName, fmtDayClock, shortId } from "../components/labels";
 import { useCan, useMe } from "../hooks/useEnv";
 import { usePaging } from "../hooks/usePaging";
 import { LoadError } from "../layout/LoadError";
@@ -191,7 +191,10 @@ export function Audit({
       actors.set(e.actor.label, e.actor.label);
   for (const [v, l] of SYSTEM_ACTORS) actors.set(v, l);
   for (const t of tokens.data?.items ?? [])
-    actors.set(`token:${t.id}`, `token: ${t.label}`);
+    actors.set(
+      `token:${t.id}`,
+      `token: ${actorName({ kind: "token", label: t.label, tokenId: t.id })}`,
+    );
   if (actor && !actors.has(actor)) actors.set(actor, actor);
   const go = (s: { installId?: string; actor?: string; action?: string }) => {
     paging.reset();
