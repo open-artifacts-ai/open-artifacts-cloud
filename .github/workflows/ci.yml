@@ -247,3 +247,93 @@ jobs:
           test ! -e _public
           test -d _cloud/.git
           test "$(git rev-parse HEAD)" = "$(sed -n 's/^sha=//p' _cloud/PUBLIC_PIN)"
+
+  # Biome (error level), actionlint and tsc over the cloud scripts and
+  # workflows (#17). Runs on the overlay tree (the action above), where the
+  # root biome.json, tsconfig and node_modules are. tsc uses
+  # scripts/audit/tsconfig.json: the root tsconfig also pulls in
+  # scripts/hosted and the scheduler, which have their own typecheck; it
+  # excludes scripts/ops/platform-db.test.ts, which imports scheduler source.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: biome (error level)
+        run: pnpm exec biome check --diagnostic-level=error scripts/ci scripts/ops scripts/audit .github/workflows
+      - name: tsc (scripts/ci, scripts/ops, scripts/audit)
+        run: pnpm exec tsc --noEmit -p scripts/audit/tsconfig.json
+      # Public's undeclared-workspace-read check, over the overlay so the
+      # hosted packages are covered (#17). Prints the cloud packages it read.
+      - name: undeclared workspace reads (overlay, hosted packages included)
+        run: node --experimental-strip-types --no-warnings scripts/audit/workspace-reads-overlay.ts
+      - name: actionlint (runs shellcheck on run blocks)
+        run: |
+          set -euo pipefail
+          command -v shellcheck
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
+          cd _cloud
+          "$RUNNER_TEMP/actionlint/actionlint" -color .github/workflows/*.yml
+
+  # The provisioning and admin Playwright suites (#17), on the overlay. Both
+  # start their own server (provisioning: the Worker in Miniflare; admin: vite
+  # on the mock API), so they need no secrets and no wrangler. The image is
+  # public's e2e image (browsers and OS deps baked in, so no install step);
+  # the tag must match @playwright/test in both apps.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:47b510dd9230bf0b9bfc9b20102241e577ea7a99334ab4c3ca19f19770e9b8ea
+      options: --ipc=host
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [provisioning, admin]
+    env:
+      PLAYWRIGHT_IMAGE_VERSION: 1.64.1
+    # The container's default shell is sh; the steps use bash (pipefail).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: the image matches @playwright/test
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./apps/$APP/node_modules/@playwright/test/package.json').version")"
+          [ "$v" = "$PLAYWRIGHT_IMAGE_VERSION" ] || { echo "::error::@playwright/test is $v but the image is $PLAYWRIGHT_IMAGE_VERSION: bump the image in ci.yml"; exit 1; }
+      - name: e2e (@oa/${{ matrix.app }})
+        env:
+          APP: ${{ matrix.app }}
+        run: pnpm --filter "@oa/$APP" test:e2e

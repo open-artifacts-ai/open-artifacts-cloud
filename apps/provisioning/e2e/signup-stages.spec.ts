@@ -287,6 +287,17 @@ test("taken: suggestions appear once, as chips", async ({ page }) => {
   await expect(page.locator(".sugg button")).toHaveCount(2);
 });
 
+test("cooling: Product's copy, with suggestions as for taken (cloud #108)", async ({
+  page,
+}) => {
+  await mount(page, { me: true, avail: "cooling" });
+  await page.locator("#slug").fill("acme");
+  await expect(page.locator(".help")).toHaveText(
+    "acme.open-artifacts.app was used recently and isn't available yet. Pick another address.",
+  );
+  await expect(page.locator(".sugg button")).toHaveCount(2);
+});
+
 test("form and closed pages have no inline styles and no CSP violations", async ({
   page,
 }) => {

@@ -18,6 +18,33 @@ export class CfError extends Error {
   }
 }
 
+/** An audit row must never carry an email, so Cloudflare's text is scrubbed of them. */
+const EMAIL = /[^\s@<>"'(),;:]+@[^\s@<>"'(),;:]+\.[^\s@<>"'(),;:]+/g;
+
+/** The Cloudflare call that failed, as an audit row and a log line carry it. */
+export type CfAuditDetail = {
+  method: string;
+  route: string;
+  status: number;
+  message: string;
+};
+
+/**
+ * What a CfError says about the call that failed: method, API path (no query;
+ * cf.ts strips it), status and Cloudflare's own error codes and messages. The
+ * request body, headers and token never reach a CfError, so none is here.
+ * `message` has email addresses replaced by "<email>" and is capped at 500 chars. Undefined for any other error.
+ */
+export function cfAuditDetail(e: unknown): CfAuditDetail | undefined {
+  if (!(e instanceof CfError)) return undefined;
+  return {
+    method: e.method,
+    route: e.route,
+    status: e.status,
+    message: e.cfMessage.replace(EMAIL, "<email>").slice(0, 500),
+  };
+}
+
 /**
  * Every job error code (design v7 3.5, `JobErrorCode`): a ProvisionRefused
  * carries one where it is thrown, and classification reads that property,

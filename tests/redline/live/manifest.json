@@ -1238,6 +1238,10 @@
     },
     {
       "file": "live/provisioning.test.ts",
+      "name": "provisioning > P53: a killed upgrade is retried by its own job (#1501): rl-f-k's first attempt dies after its version write with the row upgrading, the job's retry takes the lease and finishes active on the new version"
+    },
+    {
+      "file": "live/provisioning.test.ts",
       "name": "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume"
     },
     {

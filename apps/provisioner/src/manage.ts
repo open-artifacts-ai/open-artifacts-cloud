@@ -19,6 +19,7 @@ import {
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   bucketVersions,
+  leaseJobPart,
   ProvisionRefused,
   ProvisionRetry,
   type R2CatalogBucket,
@@ -26,6 +27,8 @@ import {
   releaseGate,
   settleFailedStatements,
   TEST_FAIL_HEALTH_PREFIX,
+  TEST_KILL_AFTER_WRITE_PREFIX,
+  TEST_KILL_UPGRADE_PREFIX,
   type UpgradeResult,
 } from "@oa/provision";
 import {
@@ -56,7 +59,7 @@ import {
   storedVars,
   sweepTokens,
 } from "./ops.js";
-import { deployEnv, transient } from "./provisioner.js";
+import { deployEnv, jobHolder, transient } from "./provisioner.js";
 import {
   checkJob,
   checkOidcScope,
@@ -123,7 +126,7 @@ export type ManageJob = {
     /** upgrade: a person chose to cross a held migration (MIG-2). */
     nonAdditive?: boolean;
     /** upgrade: the #1106 test seam (request id prefix; staging rl-f- only). */
-    testFailCheck?: "health";
+    testFailCheck?: "health" | "kill" | "kill_after_write";
     /** redline_creds: the R26 variant (C6 RedlineCredsSchema; never the key). */
     revoke?: boolean;
   };
@@ -462,6 +465,33 @@ async function record(
 }
 
 /**
+ * #1501: this job's dead attempt left the row upgrading on `to` (it died
+ * after the version write). Its lease carries this job's part and its
+ * previous_version is the job's from: render again, never "the version
+ * moved". Any other row on `to` (another job's lease, another previous
+ * version, not upgrading) stays refused.
+ */
+function killedOnTarget(
+  row: {
+    state: string;
+    version: string | null;
+    previous_version: string | null;
+    lease: string | null;
+  },
+  jobId: string,
+  from: string,
+  to: string,
+): boolean {
+  return (
+    row.state === "upgrading" &&
+    row.version === to &&
+    row.previous_version === from &&
+    row.lease !== null &&
+    row.lease.startsWith(leaseJobPart(jobHolder(jobId)))
+  );
+}
+
+/**
  * upgrade or rollback with the CLI's derived options (5.4) and the outcome
  * mapping: ok is done; a dirty serving script is returned (the step result
  * carries it to pause_dirty, and on a replay too); a forward fix is
@@ -484,6 +514,9 @@ async function render(
   const row = await installRow(ctx, job.installId);
   if (!row) throw refused("no installs row");
   const onTo = row.version === to && row.state === "active";
+  const killedOnTo =
+    kind === "upgrade" &&
+    killedOnTarget(row, job.jobId, job.args.from as string, to);
   const done = await renderOutcome(ctx, job, kind);
   if (done === "dirty") {
     run.dirty = true;
@@ -493,7 +526,8 @@ async function render(
   if (done === "rolled_back") throw rolledBack(to, job.args.from as string);
   if (done === "incomplete") throw incomplete(kind, to);
   if (onTo) return { version: to, dirty: true };
-  if (row.version !== job.args.from) throw refused("the version moved");
+  if (row.version !== job.args.from && !killedOnTo)
+    throw refused("the version moved");
   const w = await renderOptions(ctx, {
     jobId: job.jobId,
     label: labelOf(job),
@@ -510,7 +544,9 @@ async function render(
     kind === "upgrade"
       ? await w.upgrade(job.installId, to, {
           nonAdditive: job.args.nonAdditive === true,
-          ...(job.args.testFailCheck ? { testFailCheck: "health" } : {}),
+          ...(job.args.testFailCheck
+            ? { testFailCheck: job.args.testFailCheck }
+            : {}),
         })
       : await w.rollback(job.installId);
   if (r.ok) return { version: r.to };
@@ -685,11 +721,18 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
           ? { nonAdditive: true }
           : {}),
       };
-      if (
-        kind === "upgrade" &&
-        job.request_id.startsWith(TEST_FAIL_HEALTH_PREFIX)
-      ) {
-        // #1106: the seam only on a staging rl-f- test-hooks install.
+      const seam =
+        kind !== "upgrade"
+          ? null
+          : job.request_id.startsWith(TEST_FAIL_HEALTH_PREFIX)
+            ? "health"
+            : job.request_id.startsWith(TEST_KILL_AFTER_WRITE_PREFIX)
+              ? "kill_after_write"
+              : job.request_id.startsWith(TEST_KILL_UPGRADE_PREFIX)
+                ? "kill"
+                : null;
+      if (seam !== null) {
+        // #1106, #1501: the seams only on a staging rl-f- test-hooks install.
         if (
           env !== "staging" ||
           !out.testHooks ||
@@ -698,7 +741,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
           throw refused(
             "the failhealth test seam is for staging rl-f- test installs",
           );
-        out.args.testFailCheck = "health";
+        out.args.testFailCheck = seam;
       }
       if (
         kind === "rollback" &&
@@ -707,7 +750,11 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       )
         throw refused("to is not the previous version");
       if (row.version === args.to && row.state === "active") out.already = true;
-      else if (row.version !== args.from) throw refused("the version moved");
+      else if (
+        row.version !== args.from &&
+        !(kind === "upgrade" && killedOnTarget(row, jobId, args.from, args.to))
+      )
+        throw refused("the version moved");
       break;
     }
     case "suspend":

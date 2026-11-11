@@ -24,6 +24,7 @@ import {
 } from "../src/auth/signup-session.js";
 import type { Env } from "../src/env.js";
 import { hostKind } from "../src/hosts.js";
+import { slugState } from "../src/routes/reads.js";
 import { CLIENT_JS } from "../src/signup/client.js";
 import { platformDb } from "./db.js";
 import {
@@ -35,6 +36,7 @@ import {
   insert,
   jobId,
   resetDb,
+  seedFailedCreate,
   SIGNUP,
   SIGNUP_BROKER_KEY,
   seedInstall,
@@ -764,5 +766,261 @@ describe("CSP: no inline styles on the sign-up page", () => {
     ])
       expect(CLIENT_JS).toContain(t);
     expect(CLIENT_JS).not.toContain("? [] :");
+  });
+});
+
+describe("a purged address (cloud #108)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  /** A deleted self-serve install and its ready signup, purged `ago` ms ago. */
+  const purged = async (slug: string, sub: string, ago: number) => {
+    const { id } = await seedInstall({
+      slug,
+      state: "deleted",
+      source: "self-serve",
+      ownerSub: sub,
+    });
+    await db
+      .prepare("UPDATE installs SET updated_at = ? WHERE id = ?")
+      .bind(Date.now() - ago, id)
+      .run();
+    const sid = jobId();
+    await insert("signups", {
+      signup_id: sid,
+      source: "self-serve",
+      owner_sub: sub,
+      slug,
+      install_id: id,
+      job_id: sid,
+      vars: "{}",
+      status: "ready",
+      created_at: 1,
+      updated_at: 1,
+    });
+    return { id, sid };
+  };
+  const check = async (e: E, sid: string, slug: string) =>
+    (
+      (await (
+        await call(e, `${SIGNUP}/api/v1/slugs/${slug}`, {
+          headers: { cookie: `${SIGNUP_COOKIE}=${sid}` },
+        })
+      ).json()) as { status: string }
+    ).status;
+  const errOf = async (r: Response) =>
+    ((await r.json()) as { error: { code: string; message: string } }).error;
+
+  it("the same Google account takes its old address back at once, and the dead signup's slug is released", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const old = await purged("acme", "g-100", 10 * 60 * 1000);
+    expect(await check(e, sid, "acme")).toBe("ok");
+    expect((await create(e, sid)).status).toBe(202);
+    const live = await db
+      .prepare("SELECT slug, status FROM signups WHERE signup_id <> ?")
+      .bind(old.sid)
+      .first<{ slug: string; status: string }>();
+    expect(live).toEqual({ slug: "acme", status: "pending" });
+    // The API frees only the signup's unique slug; the install row is the
+    // provisioner's to release (the API never writes installs).
+    const dead = await db
+      .prepare("SELECT slug FROM signups WHERE signup_id = ?")
+      .bind(old.sid)
+      .first<{ slug: string }>();
+    expect(dead?.slug).toBe(`acme~${old.sid}`);
+    expect(
+      (
+        await db
+          .prepare("SELECT slug FROM installs WHERE id = ?")
+          .bind(old.id)
+          .first<{ slug: string }>()
+      )?.slug,
+    ).toBe("acme");
+  });
+
+  it("the unmap settles first: inside 2 minutes it is taken, even for its owner", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await purged("acme", "g-100", 30 * 1000);
+    expect(await check(e, sid, "acme")).toBe("taken");
+    await expect(errOf(await create(e, sid))).resolves.toMatchObject({
+      code: "slug_taken",
+      message: "slug_taken",
+    });
+  });
+
+  it("another account is refused within 30 days (cooling) and allowed after", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e, { sub: "g-200", email: "bo@acme.test" });
+    await purged("acme", "g-100", 29 * DAY);
+    expect(await check(e, sid, "acme")).toBe("cooling");
+    expect(await errOf(await create(e, sid))).toMatchObject({
+      code: "slug_taken",
+      message: "slug_cooling",
+    });
+    await db
+      .prepare("UPDATE installs SET updated_at = ?")
+      .bind(Date.now() - 31 * DAY)
+      .run();
+    expect(await check(e, sid, "acme")).toBe("ok");
+    expect((await create(e, sid)).status).toBe(202);
+  });
+
+  it("a create that fails after the rename never frees the address early", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const a = await signIn(e);
+    const old = await purged("acme", "g-100", 10 * 60 * 1000);
+    // What the API batch and the provisioner's reserve step leave behind, and
+    // the new signup failed before it had an installs row.
+    await db
+      .prepare("UPDATE signups SET slug = ? WHERE signup_id = ?")
+      .bind(`acme~${old.sid}`, old.sid)
+      .run();
+    await db
+      .prepare(
+        "UPDATE installs SET slug = ?, app_host = ?, content_host = ? WHERE id = ?",
+      )
+      .bind(`acme~${old.id}`, `a~${old.id}`, `c~${old.id}`, old.id)
+      .run();
+    await seedFailedCreate({ slug: "acme", ownerSub: "g-100" });
+    const b = await signIn(e, { sub: "g-200", email: "bo@acme.test" });
+    expect(await check(e, b.sid, "acme")).toBe("cooling");
+    expect(await check(e, a.sid, "acme")).toBe("ok");
+    await db
+      .prepare("UPDATE installs SET updated_at = ?")
+      .bind(Date.now() - 31 * DAY)
+      .run();
+    expect(await check(e, b.sid, "acme")).toBe("ok");
+  });
+
+  it("'%' and '_' are not wildcards: slugRule refuses '_' as invalid, '%' never routes, and slugState matches by prefix", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await purged("acme", "g-100", 10 * 60 * 1000);
+    expect(await check(e, sid, "a_me")).toBe("invalid");
+    const r = await call(e, `${SIGNUP}/api/v1/slugs/ac%25`, {
+      headers: { cookie: `${SIGNUP_COOKIE}=${sid}` },
+    });
+    expect(r.status).toBe(404);
+    for (const wild of ["ac%", "a_me", "%", "_"])
+      expect(await slugState(e.env, wild, "g-100")).toBe("free");
+  });
+
+  it("prefix isolation: a purged acme-team~id does not hold acme", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const t = await purged("acme-team", "g-100", DAY);
+    await db
+      .prepare("UPDATE installs SET slug = ? WHERE id = ?")
+      .bind(`acme-team~${t.id}`, t.id)
+      .run();
+    await db
+      .prepare("UPDATE signups SET slug = ? WHERE signup_id = ?")
+      .bind(`acme-team~${t.sid}`, t.sid)
+      .run();
+    expect(await check(e, sid, "acme")).toBe("ok");
+    expect(await check(e, sid, "acme-team")).toBe("ok");
+  });
+
+  it("only the newest purge decides: A purges, B reuses and purges, A is cooling again", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const a = await signIn(e);
+    const b = await signIn(e, { sub: "g-200", email: "bo@acme.test" });
+    const first = await purged("acme", "g-100", 40 * DAY);
+    await db
+      .prepare(
+        "UPDATE installs SET slug = ?1, app_host = ?1 || '.a', content_host = ?1 || '.c' WHERE id = ?2",
+      )
+      .bind(`acme~${first.id}`, first.id)
+      .run();
+    await db
+      .prepare("UPDATE signups SET slug = ? WHERE signup_id = ?")
+      .bind(`acme~${first.sid}`, first.sid)
+      .run();
+    await purged("acme", "g-200", 5 * DAY);
+    expect(await check(e, a.sid, "acme")).toBe("cooling");
+    expect(await check(e, b.sid, "acme")).toBe("ok");
+  });
+
+  it("two accounts racing for one freed address: one 202, one slug_taken", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const b = await signIn(e, { sub: "g-200", email: "bo@acme.test" });
+    const c = await signIn(e, { sub: "g-300", email: "cy@acme.test" });
+    await purged("acme", "g-100", 31 * DAY);
+    const got = await Promise.all([
+      create(e, b.sid, {}, { requestId: "su-bbbbbbbbbbbbbbbbbbbb" }),
+      create(e, c.sid, {}, { requestId: "su-cccccccccccccccccccc" }),
+    ]);
+    const codes = await Promise.all(
+      got.map(async (r) => (r.status === 202 ? 202 : (await errOf(r)).code)),
+    );
+    expect(codes.filter((x) => x === 202)).toHaveLength(1);
+    expect(codes.filter((x) => x === "slug_taken")).toHaveLength(1);
+  });
+
+  it("a replayed create (same requestId) after the release changes nothing", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await purged("acme", "g-100", 10 * 60 * 1000);
+    const first = await create(e, sid);
+    const again = await create(e, sid);
+    expect([first.status, again.status]).toEqual([202, 202]);
+    const rows = await db
+      .prepare("SELECT slug FROM signups ORDER BY slug")
+      .all<{ slug: string }>();
+    expect(
+      rows.results.map((r) => r.slug).filter((x) => x === "acme"),
+    ).toHaveLength(1);
+    expect(rows.results).toHaveLength(2);
+  });
+
+  it("a live install stays taken, for its own account too", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    await seedInstall({
+      slug: "acme",
+      state: "active",
+      source: "self-serve",
+      ownerSub: "g-100",
+    });
+    expect(await check(e, sid, "acme")).toBe("taken");
+    expect(await errOf(await create(e, sid))).toMatchObject({
+      code: "slug_taken",
+      message: "slug_taken",
+    });
+  });
+
+  it("a live signup whose install is not deleted stays taken", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const { id } = await seedInstall({
+      slug: "acme",
+      state: "deleted",
+      ownerSub: "g-100",
+    });
+    await db.prepare("UPDATE installs SET updated_at = 1").run();
+    const live = await seedInstall({ slug: "other", state: "active" });
+    const s = jobId();
+    await insert("signups", {
+      signup_id: s,
+      source: "self-serve",
+      owner_sub: "g-100",
+      slug: "acme",
+      install_id: live.id,
+      job_id: s,
+      vars: "{}",
+      status: "creating",
+      created_at: 1,
+      updated_at: 1,
+    });
+    expect(id).toBeTruthy();
+    expect(await check(e, sid, "acme")).toBe("taken");
+  });
+
+  it("the client shows Product's copy for cooling and keeps the suggestions", () => {
+    expect(CLIENT_JS).toContain(
+      "was used recently and isn't available yet. Pick another address.",
+    );
+    expect(CLIENT_JS).toMatch(/a === "taken" \|\| a === "cooling"/);
+    expect(CLIENT_JS).toContain('r.message === "slug_cooling"');
   });
 });
