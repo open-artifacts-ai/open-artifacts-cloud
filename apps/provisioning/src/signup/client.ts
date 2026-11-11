@@ -96,15 +96,15 @@ export const CLIENT_JS = String.raw`(function () {
     shell(h("div", { class: "panel" }, [
       h("h1", {}, ["Sign-ups are closed for now"]),
       h("p", {}, ["We're not opening new instances yet. You can run Open Artifacts yourself today, free and open source."]),
-      h("a", { class: "btn pri", href: S.cfg.githubUrl, rel: "noopener" }, ["Run it yourself"]),
+      h("a", { class: "btn pri", href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself"]),
+      h("p", { class: "muted small mt" }, ["It runs on your own Cloudflare account."]),
       h("div", { class: "or" }, ["or"]),
       h("div", { class: "field tight" }, [
         h("label", { for: "go" }, ["Already have an instance?"]),
         h("div", { class: "inp" }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]),
         help
       ]),
-      h("button", { class: "btn", type: "button", onclick: go }, ["Go to it"]),
-      h("p", { class: "muted small mt" }, ["It runs on your own Cloudflare account."])
+      h("button", { class: "btn", type: "button", onclick: go }, ["Go to it"])
     ]));
   }
 
