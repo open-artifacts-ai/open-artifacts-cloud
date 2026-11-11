@@ -997,6 +997,80 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       expect(holds("success", "success")).toBe(false);
     });
 
+    it("the redline job stops waiting once the t19 job has ended without a key, and otherwise keeps waiting", () => {
+      const key = named("t19-key");
+      const running =
+        '{"jobs":[{"name":"t19","status":"in_progress","conclusion":null}]}';
+      const failed =
+        '{"jobs":[{"name":"t19","status":"completed","conclusion":"failure"}]}';
+      const statuses =
+        (...lines: string[]) =>
+        (sb: ReturnType<typeof sandbox>) =>
+          writeFileSync(join(sb.state, "statuses"), `${lines.join("\n")}\n`);
+      const tryKey = (lines: string[], env: Record<string, string>) => {
+        const sb = sandbox();
+        try {
+          statuses(...lines)(sb);
+          mkdirSync(join(sb.temp, "redline-staged"));
+          writeFileSync(join(sb.temp, "redline-staged", "version.txt"), "1\n");
+          const r = runBash(
+            String(key.run),
+            sb.env({
+              REDLINE_TARGETS: JSON.stringify({
+                mode: "staging",
+                a: { name: "a", installId: "i", app: "u", testDomain: "d" },
+                b: { name: "b", installId: "j", app: "v" },
+              }),
+              ...env,
+            }),
+          );
+          return { r, log: sb.read("log"), pnpm: sb.read("pnpm") };
+        } finally {
+          rmSync(sb.dir, { recursive: true, force: true });
+        }
+      };
+      const downloads = (log: string) =>
+        log.split("\n").filter((l) => l.startsWith("run download")).length;
+      // t19 failed (call 1 is the partial-re-run check): ends early, with a note.
+      const early = tryKey([running, failed], { FAIL_N: "999", WAIT_S: "600" });
+      expect(early.r.status).toBe(1);
+      expect(early.r.stdout).toContain("ended without sending a public key");
+      expect(early.r.stdout).not.toContain("within");
+      expect(early.pnpm).toBe("");
+      // The key lands in the same poll the job ends: it is taken, not dropped.
+      const late = tryKey([running, failed], {
+        FAIL_N: "1",
+        FILES: "public-key",
+      });
+      expect(late.r.status, late.r.stdout + late.r.stderr).toBe(0);
+      expect(late.pnpm).toContain("t19-seal");
+      // t19 still running: keeps waiting until the deadline.
+      const wait = tryKey([running], { FAIL_N: "999", WAIT_S: "0" });
+      expect(wait.r.stdout).toContain(
+        "no public key from the t19 job within 0 s",
+      );
+      const polls = tryKey([running, running, running, failed], {
+        FAIL_N: "999",
+        WAIT_S: "600",
+      });
+      expect(polls.r.stdout).toContain("ended without sending");
+      expect(downloads(polls.log)).toBeGreaterThan(3);
+      // An API error is not an end: keeps waiting, then times out as before.
+      const err = tryKey([running, "ERROR", "ERROR"], {
+        FAIL_N: "999",
+        WAIT_S: "0",
+      });
+      expect(err.r.stdout).toContain(
+        "no public key from the t19 job within 0 s",
+      );
+      // The key arrives: unchanged.
+      const ok = tryKey([running, running], {
+        FAIL_N: "1",
+        FILES: "public-key",
+      });
+      expect(ok.r.status, ok.r.stdout + ok.r.stderr).toBe(0);
+    }, 30_000);
+
     it("the redline job seals to the downloaded public key and copies the staged version; no public key fails the step", () => {
       const key = named("t19-key");
       const sb = sandbox();
