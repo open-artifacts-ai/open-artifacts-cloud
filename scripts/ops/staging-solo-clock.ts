@@ -197,7 +197,16 @@ export async function inspect(
     log(
       `invoice ${String(i.id)}: status ${String(i.status)}, total ${String(i.total)}, amount_paid ${String(i.amount_paid)}, starting_balance ${String(i.starting_balance)}, ending_balance ${String(i.ending_balance)}, billing_reason ${String(i.billing_reason)}`,
     );
-  const evs = await call("GET", "/v1/events?limit=100");
+  let evs: Obj;
+  try {
+    evs = await call("GET", "/v1/events?limit=100");
+  } catch (e) {
+    if (e instanceof Refused && /: 403 /.test(e.message)) {
+      log("events: not readable with this key (needs Events read); skipped");
+      return;
+    }
+    throw e;
+  }
   const mine = ((evs.data as Obj[] | undefined) ?? [])
     .filter((e) => {
       const o = ((e.data as Obj | undefined)?.object ?? {}) as Obj;
@@ -208,7 +217,7 @@ export async function inspect(
     log(
       `event ${String(e.type)} ${iso(e.created)} pending_webhooks ${String(e.pending_webhooks)}`,
     );
-  if (mine.length === 0) log("no recent events for the customer");
+  if (mine.length === 0) log("no matching event in the account's last 100");
 }
 
 export async function advance(
