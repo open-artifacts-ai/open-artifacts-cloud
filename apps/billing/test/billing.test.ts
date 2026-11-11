@@ -1,4 +1,4 @@
-import { applyD1Migrations } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
 import { env as testEnv } from "cloudflare:workers";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { keyId, publicFromPkcs8, signRequest } from "@oa/auth-core";
@@ -12,7 +12,12 @@ import {
   it,
   vi,
 } from "vitest";
-import billing, { type Env, MAX_CREATORS, TRIAL_MS } from "../src/index.js";
+import billing, {
+  BillingOperatorRpc,
+  type Env,
+  MAX_CREATORS,
+  TRIAL_MS,
+} from "../src/index.js";
 
 // The tier store's routes. Gate routes answer only over a binding (no
 // cf-connecting-ip) and only for the install in x-oa-gate-install; every
@@ -458,6 +463,49 @@ describe("the POSTs carry the gate install's signature", () => {
     expect((await call(gated("GET", "/tier"))).status).toBe(200);
     expect((await call(gated("GET", "/health"))).status).toBe(200);
   });
+});
+
+describe("tiersOf matches GET /tier for an ended trial, and writes nothing (#2058)", () => {
+  const cases: [string, string, string | null][] = [
+    ["solo active", "active", "active"],
+    ["solo past_due", "past_due", "active"],
+    ["no solo subscription", "", "active"],
+    ["suspended", "active", "suspended"],
+  ];
+  for (const [name, soloStatus, status] of cases)
+    it(name, async () => {
+      at();
+      await seed([
+        {
+          install: A,
+          tier: "trial",
+          trialEndsAt: NOW - 1,
+          status: status ?? "active",
+        },
+      ]);
+      await db
+        .prepare("UPDATE tiers SET solo_status = ?2 WHERE install_id = ?1")
+        .bind(A, soloStatus === "" ? null : soloStatus)
+        .run();
+      const before = await rowOf(A);
+      const rpc = new BillingOperatorRpc(createExecutionContext(), env);
+      const r = await rpc.tiersOf([A]);
+      expect(await rowOf(A)).toEqual(before);
+      expect(before).toMatchObject({
+        tier: "trial",
+        version: 1,
+        updated_at: 0,
+      });
+      const got = (await (await call(gated("GET", "/tier"))).json()) as {
+        tier: string;
+        status: string;
+      };
+      expect(r).toEqual({
+        ok: true,
+        tiers: { [A]: { tier: got.tier, status: got.status } },
+      });
+      expect(got.tier).toBe("solo");
+    });
 });
 
 describe("GET /tier", () => {
