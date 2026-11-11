@@ -163,7 +163,21 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/playwright-install.log"
-          pnpm --filter @oa/dashboard exec playwright install --with-deps chromium > "$log" 2>&1 &
+          # The system deps come from apt, which a runner's DNS can fail
+          # (v0.154.0, security.ubuntu.com): three tries with backoff, then
+          # Chromium alone. That drops only the apt deps, never the browser
+          # check: T19's playwright test fails if Chromium can't launch.
+          pw_install() {
+            local i
+            for i in 1 2 3; do
+              pnpm --filter @oa/dashboard exec playwright install --with-deps chromium && return 0
+              echo "playwright install --with-deps failed (try $i of 3)"
+              [ "$i" -lt 3 ] && sleep "$((${PW_RETRY_S:-15} * i))"
+            done
+            echo "::warning title=T19 browser deps::apt deps did not install after 3 tries; installing Chromium without them. T19 still fails if it can't launch."
+            pnpm --filter @oa/dashboard exec playwright install chromium
+          }
+          pw_install > "$log" 2>&1 &
           pw=$!
           b=0
           { pnpm --filter @oa/provision build && pnpm --filter @oa/shared build; } || b=$?
