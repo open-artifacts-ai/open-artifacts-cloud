@@ -232,6 +232,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const CHECKOUT = "/v1/checkout/sessions";
@@ -1761,7 +1762,11 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
     ]);
     expect(s.calls.map((c) => [c.method, c.path, c.key])).toEqual([
       ["GET", SUBS, null],
-      ["POST", ITEM, `qty-${A}-${closed}-3`],
+      [
+        "POST",
+        ITEM,
+        expect.stringMatching(new RegExp(`^qty-${A}-${closed}-3-\\d+$`)),
+      ],
     ]);
     expect(s.calls[1]?.form).toEqual({
       quantity: "3",
@@ -1903,7 +1908,11 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
     expect((await call(report(closed, 3))).status).toBe(200);
     expect(s.calls.map((c) => [c.method, c.path, c.key])).toEqual([
       ["GET", SUBS, null],
-      ["POST", ITEM, `qty-${A}-${closed}-3`],
+      [
+        "POST",
+        ITEM,
+        expect.stringMatching(new RegExp(`^qty-${A}-${closed}-3-\\d+$`)),
+      ],
     ]);
     expect(await usageRow(closed)).toMatchObject({
       applied_quantity: 3,
@@ -1958,13 +1967,77 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
     });
   });
 
+  it("a Stripe 401 or 403 (a revoked or rotated key) is retried: 502, never a 200 that moves the server past the month", async () => {
+    await live();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const status of [401, 403]) {
+      const s = fakeStripe(() =>
+        Response.json({ error: { type: "invalid_request_error" } }, { status }),
+      );
+      const r = await call(report(closed, 3));
+      expect([r.status, await r.json()], String(status)).toEqual([
+        502,
+        { error: "upstream" },
+      ]);
+      expect(await usageRow(closed)).toMatchObject({
+        count: 3,
+        applied_quantity: null,
+        apply_outcome: "failed",
+      });
+      s.spy.mockRestore();
+    }
+  });
+
+  it("3 -> 5 -> 3 within a day ends at 3 in Stripe: each report's write has its own key", async () => {
+    await live();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const t0 = Date.UTC(2026, 10, 11, 12, 0);
+    vi.setSystemTime(t0);
+    const month = "2026-10";
+    // Stripe as it is: the item's quantity, and a key's first answer replayed
+    // for 24 hours without applying the write again.
+    let quantity = 1;
+    const seen = new Set<string>();
+    const s = fakeStripe((c) => {
+      if (c.method === "GET" && c.path === SUBS)
+        return subscription({ quantity });
+      if (c.method === "POST" && c.path === ITEM) {
+        if (!seen.has(c.key as string)) {
+          seen.add(c.key as string);
+          quantity = Number(c.form.quantity);
+        }
+        return Response.json({ id: "si_itemA", quantity });
+      }
+      return undefined;
+    });
+    for (const [i, n] of [3, 5, 3].entries()) {
+      vi.setSystemTime(t0 + i * 3_600_000);
+      expect((await call(report(month, n))).status).toBe(200);
+      expect(quantity).toBe(n);
+      expect(await usageRow(month)).toMatchObject({
+        applied_quantity: n,
+        applied_at: t0 + i * 3_600_000,
+        apply_outcome: "updated",
+      });
+    }
+    const keys = s.calls.filter((c) => c.method === "POST").map((c) => c.key);
+    expect(keys).toEqual([
+      `qty-${A}-${month}-3-${t0}`,
+      `qty-${A}-${month}-5-${t0 + 3_600_000}`,
+      `qty-${A}-${month}-3-${t0 + 7_200_000}`,
+    ]);
+    vi.useRealTimers();
+  });
+
   it("a changed count for an applied month is applied again", async () => {
     await live();
     const s = fake();
     await call(report(closed, 3));
     s.calls.length = 0;
     expect((await call(report(closed, 5))).status).toBe(200);
-    expect(s.calls.at(-1)?.key).toBe(`qty-${A}-${closed}-5`);
+    expect(s.calls.at(-1)?.key).toMatch(
+      new RegExp(`^qty-${A}-${closed}-5-\\d+$`),
+    );
     expect(await usageRow(closed)).toMatchObject({ applied_quantity: 5 });
   });
 });

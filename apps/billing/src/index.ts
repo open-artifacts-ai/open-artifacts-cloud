@@ -1054,14 +1054,16 @@ const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
  * count (at least 1), with no proration, so the next invoice bills that
  * many. Runs after the report is stored, so a failure here never loses it.
  * Idempotent per (install, month): a month already applied at this quantity
- * changes nothing, and the Stripe write is keyed qty-<install>-<month>-<n>.
+ * changes nothing. The Stripe write is keyed per report
+ * (qty-<install>-<month>-<n>-<received_at>) and sets an absolute quantity.
  * Skipped, with the reason in usage.apply_outcome: the current (or a future)
  * month, a month older than one already applied, no row or subscription, and
  * Solo, trial, lapsed or suspended rows. billing-core leaves a subscription
  * whose price is not the tier's monthly price alone (not_monthly): a yearly
  * prepaid-seat price recurs yearly and is recognised there (PR 4b bills its
  * overage). Answers null when the route's 200 stands, or the refusal: a
- * Stripe failure the install should retry (network, 5xx, 409, 429, config)
+ * Stripe failure the install should retry (network, 5xx, 401, 403, 409,
+ * 429, config)
  * is that failure's 5xx, and the instance's usage tick re-sends the month
  * (every 2 minutes) until it is accepted. A Stripe 4xx that a retry can't
  * fix is recorded (failed) and logged, and the 200 stands so later months
@@ -1117,7 +1119,11 @@ async function applyQuantity(
           subscriptionId,
           quantity,
           monthlyPriceIds: typeof priceId === "string" ? [priceId] : [],
-          idempotencyKey: `qty-${install}-${month}-${quantity}`,
+          // One key per report (its received_at): Stripe replays a key's
+          // first answer for 24 hours without applying it again, so a
+          // month-and-quantity key would leave 3 -> 5 -> 3 at 5. The write
+          // sets an absolute quantity, so a new key per attempt is safe.
+          idempotencyKey: `qty-${install}-${month}-${quantity}-${now}`,
         },
         cfg,
       ),
@@ -1126,12 +1132,16 @@ async function applyQuantity(
     if (!(e instanceof StripeFailure)) throw e;
     await db.prepare(USAGE_OUTCOME_SQL).bind(install, month, "failed").run();
     console.error("billing usage quantity failed", install);
+    // 401 and 403 (a revoked or rotated key) are billing's own config, like
+    // config: retried, never a 200 that lets the server move past the month.
     const permanent =
       e.code === "bad_upstream" ||
       (e.code === "upstream" &&
         e.status !== undefined &&
         e.status >= 400 &&
         e.status < 500 &&
+        e.status !== 401 &&
+        e.status !== 403 &&
         e.status !== 429);
     return permanent ? null : e.res;
   }
