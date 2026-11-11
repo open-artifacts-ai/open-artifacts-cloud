@@ -276,6 +276,10 @@ jobs:
         run: pnpm exec biome check --diagnostic-level=error scripts/ci scripts/ops scripts/audit .github/workflows
       - name: tsc (scripts/ci, scripts/ops, scripts/audit)
         run: pnpm exec tsc --noEmit -p scripts/audit/tsconfig.json
+      # Public's undeclared-workspace-read check, over the overlay so the
+      # hosted packages are covered (#17). Prints the cloud packages it read.
+      - name: undeclared workspace reads (overlay, hosted packages included)
+        run: node --experimental-strip-types --no-warnings scripts/audit/workspace-reads-overlay.ts
       - name: actionlint (runs shellcheck on run blocks)
         run: |
           set -euo pipefail
