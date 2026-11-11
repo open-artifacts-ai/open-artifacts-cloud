@@ -295,6 +295,8 @@ export type CreateSeed = {
   version?: string;
   email?: string;
   tier?: string;
+  /** A self-serve signup's owner_sub; default one per job. */
+  sub?: string;
   /** A token actor's jobs.token_id; default a live token (seedToken). */
   tokenId?: string | null;
 };
@@ -305,7 +307,7 @@ export function seedCreate(w: World, o: CreateSeed) {
   const installId = newInstallId();
   const source = o.source ?? "admin";
   const actor = o.actor ?? (source === "self-serve" ? "user" : "admin");
-  const sub = source === "self-serve" ? `sub-${jobId}` : null;
+  const sub = source === "self-serve" ? (o.sub ?? `sub-${jobId}`) : null;
   const vars = o.vars ?? {
     AUTH_PROVIDERS: source === "self-serve" ? "google,email" : "google",
     AUTH_DOMAINS: "finqore.test",

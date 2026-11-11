@@ -5,7 +5,9 @@ import { parse } from "yaml";
 import {
   advance,
   cleanup,
+  getOnly,
   type Io,
+  inspect,
   Refused,
   stripeClient,
 } from "./staging-solo-clock.ts";
@@ -207,6 +209,170 @@ describe("cleanup", () => {
     const del = w.calls.filter((c) => c.method === "DELETE");
     expect(del).toHaveLength(2);
     expect(w.queries.some((q) => q.startsWith("DELETE"))).toBe(false);
+  });
+});
+
+describe("inspect", () => {
+  function iw(
+    row: Record<string, unknown>,
+    events?: { status: number; body: unknown },
+  ) {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      const u = new URL(url);
+      calls.push(`${init.method} ${u.pathname}${u.search}`);
+      const j = (o: unknown) => Response.json(o);
+      if (u.pathname === "/v1/subscriptions")
+        return j({
+          data: [
+            {
+              id: "sub_1",
+              status: "active",
+              created: 1_800_000_000,
+              canceled_at: null,
+              cancel_at_period_end: false,
+              metadata: { tier: "solo" },
+              items: {
+                data: [
+                  {
+                    quantity: 2,
+                    price: {
+                      id: "price_solo",
+                      recurring: { interval: "year" },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      if (u.pathname === "/v1/customers/cus_1")
+        return j({ balance: -500, currency: "usd" });
+      if (u.pathname === "/v1/invoices")
+        return j({
+          data: [
+            {
+              id: "in_1",
+              status: "paid",
+              total: 100,
+              amount_paid: 100,
+              starting_balance: 0,
+              ending_balance: -500,
+              billing_reason: "subscription_update",
+            },
+          ],
+        });
+      if (u.pathname === "/v1/events" && events)
+        return Response.json(events.body, { status: events.status });
+      if (u.pathname === "/v1/events")
+        return j({
+          data: [
+            {
+              type: "invoice.paid",
+              created: 1_800_000_100,
+              pending_webhooks: 0,
+              data: { object: { customer: "cus_1" } },
+            },
+            {
+              type: "invoice.paid",
+              created: 1_800_000_200,
+              pending_webhooks: 1,
+              data: { object: { customer: "cus_other" } },
+            },
+          ],
+        });
+      return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+    const lines: string[] = [];
+    const queries: string[] = [];
+    const io: Io = {
+      fetch: f,
+      sleep: async () => {},
+      now: () => 0,
+      log: (s) => lines.push(s),
+      db: {
+        all: async (sql) => {
+          queries.push(sql);
+          return sql.includes("solo_status")
+            ? [{ tier: "solo", version: 3 }]
+            : [row];
+        },
+        exec: async (sql) => {
+          queries.push(sql);
+        },
+      },
+    };
+    return { io, calls, lines, queries, f };
+  }
+
+  it("prints the row, subscriptions, balance, invoices and this customer's events, with GETs and SELECTs only", async () => {
+    const w = iw({
+      stripe_customer_id: "cus_1",
+      stripe_test_clock_id: null,
+      stripe_subscription_id: "sub_1",
+    });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.calls.every((c) => c.startsWith("GET "))).toBe(true);
+    expect(w.queries.every((q) => /^\s*SELECT/i.test(q))).toBe(true);
+    const out = w.lines.join("\n");
+    expect(out).toContain('"stripe_subscription_id":"sub_1"');
+    expect(out).toContain("price_solo per year");
+    expect(out).toContain("metadata.tier solo");
+    expect(out).toContain("customer balance: -500");
+    expect(out).toContain("billing_reason subscription_update");
+    expect(out).toContain("event invoice.paid");
+    expect(out).toContain("pending_webhooks 0");
+    expect(out).not.toContain("pending_webhooks 1");
+    expect(out).not.toContain(KEY);
+  });
+
+  const CUS = {
+    stripe_customer_id: "cus_1",
+    stripe_test_clock_id: null,
+    stripe_subscription_id: "sub_1",
+  };
+
+  it("a 403 on the event list is skipped with a message and does not fail", async () => {
+    const w = iw(CUS, {
+      status: 403,
+      body: { error: { code: "more_permissions_required" } },
+    });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.lines.at(-1)).toBe(
+      "events: not readable with this key (needs Events read); skipped",
+    );
+  });
+
+  it("a 500 on the event list still fails", async () => {
+    const w = iw(CUS, { status: 500, body: { error: { type: "api_error" } } });
+    await expect(
+      inspect(w.io, stripeClient(KEY, getOnly(w.f)), A),
+    ).rejects.toThrow(/: 500 /);
+  });
+
+  it("no matching event says so for the account's last 100", async () => {
+    const w = iw(CUS, { status: 200, body: { data: [] } });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.lines.at(-1)).toBe("no matching event in the account's last 100");
+  });
+
+  it("a row without a customer prints the row and no customer, with no Stripe call", async () => {
+    const w = iw({ stripe_customer_id: null });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.lines.at(-1)).toBe("no customer");
+    expect(w.calls).toEqual([]);
+  });
+
+  it("the inspect client refuses non-GET before any request", async () => {
+    const w = iw({});
+    const call = stripeClient(KEY, getOnly(w.f));
+    await expect(
+      call("POST", "/v1/customers/cus_1", { a: "b" }),
+    ).rejects.toThrow(/read-only/);
+    await expect(call("DELETE", "/v1/customers/cus_1")).rejects.toThrow(
+      /read-only/,
+    );
+    expect(w.calls).toEqual([]);
   });
 });
 

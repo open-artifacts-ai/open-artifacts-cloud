@@ -58,7 +58,9 @@ import {
   RELEASE_PUBKEY_PLACEHOLDER,
 } from "./internal/gates.js";
 import {
+  type CfAuditDetail,
   CfError,
+  cfAuditDetail,
   DoStepRequired,
   NEAR_EXPIRY_MODE,
   PROVISION_JOB_KINDS,
@@ -1067,7 +1069,7 @@ export type UpgradeOptions = {
    * the forward-fix path runs for real. Refused unless the env is staging and
    * the install is an rl-f- test-hooks install.
    */
-  testFailCheck?: "health";
+  testFailCheck?: "health" | "kill" | "kill_after_write";
 };
 
 export class WfpProvisioner {
@@ -2974,7 +2976,7 @@ export class WfpProvisioner {
   /** An audit row for the held install, after the lock is renewed. */
   private async logged(
     action: string,
-    detail: Record<string, string | number> = {},
+    detail: Record<string, string | number | CfAuditDetail> = {},
   ): Promise<void> {
     await this.hold();
     const h = this.held as { id: InstallId; lease: string };
@@ -3006,10 +3008,19 @@ export class WfpProvisioner {
     if (h) await this.revokeCiToken();
     this.held = null;
     if (!h) return;
-    if (e !== undefined)
+    if (e !== undefined) {
+      // The operation's redaction set first (it scrubs a CfError's cfMessage and route in place).
+      const cf = cfAuditDetail(this.scrub(e));
+      // One line for `wrangler tail`: the provisioner has no other trace of which call failed.
+      if (cf) console.warn(JSON.stringify({ evt: "cf_error", ...cf }));
       await this.platform
-        .audit(h.id, `${h.op}.aborted`, { state, error: errCode(e) })
+        .audit(h.id, `${h.op}.aborted`, {
+          state,
+          error: errCode(e),
+          ...(cf ? { cf } : {}),
+        })
         .catch(() => {});
+    }
     await this.platform.finish(h.id, h.lease, state).catch(() => false);
   }
 
@@ -3842,6 +3853,10 @@ export class WfpProvisioner {
         });
       await this.hold();
       await this.migrate(rel.rec, d1Id, n.d1);
+      // #1501 test seam (gated above): the first attempt dies with the row
+      // upgrading under its lease; the job's retry sees it upgrading and runs.
+      if (o.testFailCheck === "kill" && row.state !== "upgrading")
+        throw new LostLease("injected kill (testFailCheck)");
       const out: UploadOut = { reached: null, maybe: false };
       await this.hold();
       const sent = await this.uploadRelease({
@@ -3874,6 +3889,11 @@ export class WfpProvisioner {
         previous_version: from,
         do_migration_tag: reached,
       });
+      // #1501 test seam, second point (gated above): dies upgrading on `to`.
+      if (o.testFailCheck === "kill_after_write" && row.state !== "upgrading")
+        throw new LostLease(
+          "injected kill after the version write (testFailCheck)",
+        );
       await this.settleCutOrDefer(cut, vars, d1Id, n.d1, to);
       try {
         // 5.4: verify_clean right after the upload, before health.
@@ -4628,7 +4648,12 @@ export class WfpProvisioner {
         // stalled create) still maps a host to this deleted id; clear it.
         // deleted is terminal, so no operation can claim the row meanwhile.
         let stale = 0;
-        for (const h of [row.app_host, row.content_host]) {
+        // A reused address renames the row's hosts to "<host>~<id>" (cloud
+        // #108); the real host is the part before the "~", which no host
+        // name contains.
+        for (const h of [row.app_host, row.content_host].map((x) =>
+          x.replace(/~.*$/, ""),
+        )) {
           const cur = await this.cf.kvGet(this.hostsKv.id, h);
           if (parseHostsValue(cur)?.installId !== id) continue;
           assertOwnResource(this.hostsKv.title, this.env);

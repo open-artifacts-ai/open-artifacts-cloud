@@ -46,6 +46,12 @@ export {
   type SoloStartView,
 } from "./solo-start.js";
 export {
+  TIERS_OF_MAX,
+  type TierOfView,
+  type TiersOfError,
+  type TiersOfResult,
+} from "./tiers-of.js";
+export {
   changeFor,
   customerOf,
   type EventStream,

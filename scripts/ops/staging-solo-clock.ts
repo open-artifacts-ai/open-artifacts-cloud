@@ -13,12 +13,16 @@
 //            subscriptions) and reset its billing rows (the tiers row, which
 //            holds the customer map) through the billing D1.
 //
-// Env: INSTALL_ID, ACTION (advance|cleanup), STRIPE_SECRET_KEY (test key only),
+//   inspect  read-only (GET to Stripe, SELECT to D1): print the tiers row, the
+//            customer's subscriptions, balance, last invoices and last events.
+//            Works on any install with a customer, clock or not.
+//
+// Env: INSTALL_ID, ACTION (advance|cleanup|inspect), STRIPE_SECRET_KEY (test key only),
 // CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, BILLING_DB_ID. Secrets are
 // never printed.
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { d1, type Db, Refused } from "./platform-db.ts";
+import { type Db, d1, Refused } from "./platform-db.ts";
 
 export { Refused };
 
@@ -119,6 +123,101 @@ async function tierView(db: Db, install: string) {
     )
   )[0];
   return r ?? null;
+}
+
+/** A fetch that refuses everything but GET (the inspect path's guard). */
+export function getOnly(f: typeof fetch): typeof fetch {
+  return ((url: string, init?: RequestInit) => {
+    if ((init?.method ?? "GET") !== "GET")
+      throw new Refused("inspect is read-only: only GET is allowed");
+    return f(url, init);
+  }) as unknown as typeof fetch;
+}
+
+/** A Db that refuses everything but SELECT. */
+export function selectOnly(db: Db): Db {
+  return {
+    all: async (sql, params) => {
+      if (!/^\s*SELECT\b/i.test(sql))
+        throw new Refused("inspect is read-only: only SELECT is allowed");
+      return db.all(sql, params);
+    },
+    exec: async () => {
+      throw new Refused("inspect is read-only: no writes");
+    },
+  };
+}
+
+const iso = (v: unknown) =>
+  typeof v === "number" ? new Date(v * 1000).toISOString() : String(v ?? null);
+
+export async function inspect(
+  io: Io,
+  call: ReturnType<typeof stripeClient>,
+  install: string,
+): Promise<void> {
+  const { log } = io;
+  const db = selectOnly(io.db);
+  const row = await rowOf(db, install);
+  if (!row) {
+    log("no billing row");
+    return;
+  }
+  log(
+    `tier row: ${JSON.stringify({ ...(await tierView(db, install)), stripe_subscription_id: row.subscription })}`,
+  );
+  log(`customer: ${row.customer ?? "none"} clock: ${row.clock ?? "none"}`);
+  if (!row.customer) {
+    log("no customer");
+    return;
+  }
+  const cus = row.customer;
+  const subs = await call(
+    "GET",
+    `/v1/subscriptions?customer=${cus}&status=all&limit=100`,
+  );
+  for (const s of (subs.data as Obj[] | undefined) ?? []) {
+    const items = ((s.items as { data?: Obj[] } | undefined)?.data ?? []).map(
+      (i) => {
+        const p = (i.price ?? {}) as Obj;
+        return `${String(p.id)} per ${String((p.recurring as Obj | undefined)?.interval)}`;
+      },
+    );
+    const qty = ((s.items as { data?: Obj[] } | undefined)?.data ?? []).map(
+      (i) => String(i.quantity),
+    );
+    log(
+      `subscription ${String(s.id)}: status ${String(s.status)}, prices [${items.join(", ")}], quantity [${qty.join(", ")}], created ${iso(s.created)}, canceled_at ${iso(s.canceled_at)}, cancel_at_period_end ${String(s.cancel_at_period_end)}, metadata.tier ${String((s.metadata as Obj | undefined)?.tier ?? null)}`,
+    );
+  }
+  const c = await call("GET", `/v1/customers/${cus}`);
+  log(`customer balance: ${String(c.balance)} ${String(c.currency ?? "")}`);
+  const invs = await call("GET", `/v1/invoices?customer=${cus}&limit=5`);
+  for (const i of (invs.data as Obj[] | undefined) ?? [])
+    log(
+      `invoice ${String(i.id)}: status ${String(i.status)}, total ${String(i.total)}, amount_paid ${String(i.amount_paid)}, starting_balance ${String(i.starting_balance)}, ending_balance ${String(i.ending_balance)}, billing_reason ${String(i.billing_reason)}`,
+    );
+  let evs: Obj;
+  try {
+    evs = await call("GET", "/v1/events?limit=100");
+  } catch (e) {
+    if (e instanceof Refused && /: 403 /.test(e.message)) {
+      log("events: not readable with this key (needs Events read); skipped");
+      return;
+    }
+    throw e;
+  }
+  const mine = ((evs.data as Obj[] | undefined) ?? [])
+    .filter((e) => {
+      const o = ((e.data as Obj | undefined)?.object ?? {}) as Obj;
+      return o.customer === cus || o.id === cus;
+    })
+    .slice(0, 15);
+  for (const e of mine)
+    log(
+      `event ${String(e.type)} ${iso(e.created)} pending_webhooks ${String(e.pending_webhooks)}`,
+    );
+  if (mine.length === 0) log("no matching event in the account's last 100");
 }
 
 export async function advance(
@@ -267,8 +366,8 @@ if (
   const install = e.INSTALL_ID ?? "";
   const action = e.ACTION ?? "";
   if (!INSTALL.test(install)) fail("INSTALL_ID is not an install id");
-  if (action !== "advance" && action !== "cleanup")
-    fail("ACTION is advance or cleanup");
+  if (action !== "advance" && action !== "cleanup" && action !== "inspect")
+    fail("ACTION is advance, cleanup or inspect");
   if (!e.CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required");
   if (!/^[0-9a-f]{32}$/.test(e.CLOUDFLARE_ACCOUNT_ID ?? ""))
     fail("CLOUDFLARE_ACCOUNT_ID must be 32 hex");
@@ -288,8 +387,12 @@ if (
       now: () => Date.now(),
       log: (s) => console.log(`staging-solo-clock: ${s}`),
     };
-    const call = stripeClient(e.STRIPE_SECRET_KEY ?? "", fetch);
-    if (action === "advance") await advance(io, call, install);
+    const call = stripeClient(
+      e.STRIPE_SECRET_KEY ?? "",
+      action === "inspect" ? getOnly(fetch) : fetch,
+    );
+    if (action === "inspect") await inspect(io, call, install);
+    else if (action === "advance") await advance(io, call, install);
     else await cleanup(io, call, install);
   } catch (err) {
     fail(err instanceof Refused ? err.message : "failed");

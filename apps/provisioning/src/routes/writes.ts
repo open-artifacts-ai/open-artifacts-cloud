@@ -41,7 +41,7 @@ import {
 } from "../services/jobs.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
-import { slugHeld } from "./reads.js";
+import { releaseDeletedSignupSlug, slugState } from "./reads.js";
 
 // The lifecycle writes R5-R13 and R26 (3.4, 5.4-5.6), R25 cancel (3.6).
 // After invokeRoute's authz and schema: reach (404) -> policy (field rules)
@@ -229,7 +229,11 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
       sub && (await claimedByOther(env, sub, sid))
         ? new ApiError("signup_limit")
         : new ApiError("slug_taken");
-    if (await slugHeld(env, row.slug, except)) throw new ApiError("slug_taken");
+    // The create's rule (slugState, owner included): a purged install's
+    // address is the same account's at once and others' after 30 days.
+    const held = await slugState(env, row.slug, sub, except);
+    if (held === "cooling") throw new ApiError("slug_taken", "slug_cooling");
+    if (held === "taken") throw new ApiError("slug_taken");
     if (sub && (await claimedByOther(env, sub, sid)))
       throw new ApiError("signup_limit");
     return {
@@ -240,6 +244,7 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
       // signups.job_id is the current create or retry job (8.2); a live
       // status puts the slug back under signups_live_slug.
       after: (jobId) => [
+        releaseDeletedSignupSlug(env, row.slug, Date.now()),
         db
           .prepare(
             "UPDATE signups SET job_id = ?2, status = 'queued', error = NULL, updated_at = ?3 WHERE signup_id = ?1 AND status = 'failed'",
@@ -253,7 +258,7 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
         ),
         guard(
           env,
-          "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM installs WHERE slug = ? AND id <> ?)",
+          "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM installs WHERE slug = ? AND id <> ? AND state <> 'deleted')",
           row.slug,
           row.install_id,
         ),

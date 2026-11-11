@@ -286,11 +286,13 @@ export const CLIENT_JS = String.raw`(function () {
     if (!s) text = "Pick the address your team will use.";
     else if (a === null || S.availSlug !== s) text = "Checking...";
     else if (a === "ok") { cls += " ok"; box += " ok"; good = true; text = host(s) + " is available"; }
-    else if (a === "taken") {
+    else if (a === "taken" || a === "cooling") {
       cls += " err"; box += " err";
       var base = s.slice(0, 26);
       var opts = [base + "-team", base + "-labs"];
-      text = host(s) + " is taken.";
+      text = a === "cooling"
+        ? host(s) + " was used recently and isn't available yet. Pick another address."
+        : host(s) + " is taken.";
       opts.forEach(function (o) {
         refs.sugg.appendChild(h("button", { type: "button", onclick: function () {
           S.slug = o; refs.inp.value = o; checkSlug(); refs.inp.focus();
@@ -404,7 +406,7 @@ export const CLIENT_JS = String.raw`(function () {
         });
         return;
       }
-      if (r.code === "slug_taken") { S.avail = "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
+      if (r.code === "slug_taken") { S.avail = r.message === "slug_cooling" ? "cooling" : "taken"; S.availSlug = slug; S.err = ""; paintAvail(); return; }
       if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
       S.err = CREATE_ERR[r.code] || (r.code === "forbidden" && r.message && r.message !== "forbidden" ? r.message : null) || "We couldn't create your instance. Try again in a few minutes.";
       paintCreate();

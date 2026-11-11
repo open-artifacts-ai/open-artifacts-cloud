@@ -48,7 +48,9 @@ it("shows Design's labels, the pause reason and the fields", async () => {
   expect(screen.getByText(/Reason: Unpaid invoice/)).toBeInTheDocument();
   expect(screen.getByText("owner@example.com")).toBeInTheDocument();
   expect(screen.getByText("Tier · Sign-in")).toBeInTheDocument();
-  expect(screen.getByText("Team · Google · 1 domain")).toBeInTheDocument();
+  expect(
+    screen.getByText("Created as Team · Google · 1 domain"),
+  ).toBeInTheDocument();
   expect(screen.getByText("Install id")).toBeInTheDocument();
   expect(screen.getAllByText("Paused").length).toBeGreaterThan(0);
 });
@@ -683,6 +685,38 @@ it("a missing tier reads – as in the list", async () => {
   const row = (await screen.findByText("Tier · Sign-in")).parentElement;
   expect(row).toHaveTextContent(/^Tier · Sign-in– · /);
   expect(row).not.toHaveTextContent("None");
+});
+
+it("shows the billing tier when the API has it, else Created as (#2058)", async () => {
+  await open({ ...installsByState.active, billingTier: "solo" });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inSolo · /);
+});
+
+it("a billing trial reads Business trial; a lapsed or past-due plan says so (#2058)", async () => {
+  await open({ ...installsByState.active, billingTier: "trial" });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inBusiness trial · Google/);
+});
+
+it("a non-active billing status follows the tier", async () => {
+  await open({
+    ...installsByState.active,
+    billingTier: "team",
+    billingStatus: "lapsed",
+  });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inTeam · lapsed · Google/);
+});
+
+it("billingTier null reads Created as <tier>, never the bare tier (#2058)", async () => {
+  await open({ ...installsByState.active, billingTier: null, tier: "trial" });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inCreated as Trial · /);
 });
 
 it("purge with a fresh sign-in is type-to-confirm", async () => {

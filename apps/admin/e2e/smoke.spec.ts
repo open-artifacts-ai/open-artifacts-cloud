@@ -216,7 +216,7 @@ test.describe("lifecycle", () => {
     ).toBeVisible();
     await jobDone(page);
     await page.getByRole("link", { name: "leo" }).first().click();
-    await expect(page.getByTestId("state")).toHaveText("Deleted");
+    await expect(page.getByTestId("state")).toHaveText("Purged");
   });
 
   test("retry a failed create from its job", async ({ page }) => {

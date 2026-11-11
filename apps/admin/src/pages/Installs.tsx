@@ -37,7 +37,7 @@ import {
   STATE_LABEL,
   STATE_TONE,
   stepCount,
-  TIER_LABEL,
+  tierText,
 } from "../components/labels";
 import { canSeePii, useCan, useEnv, useMe } from "../hooks/useEnv";
 import { usePaging } from "../hooks/usePaging";
@@ -463,11 +463,7 @@ export function Installs() {
                         {i.version ?? <span className="oa-note">–</span>}
                       </TableCell>
                       <TableCell>
-                        {i.tier ? (
-                          TIER_LABEL[i.tier]
-                        ) : (
-                          <span className="oa-note">–</span>
-                        )}
+                        {tierText(i) ?? <span className="oa-note">–</span>}
                       </TableCell>
                       <TableCell>
                         {i.auth.providers.map(providerLabel).join(" · ")}

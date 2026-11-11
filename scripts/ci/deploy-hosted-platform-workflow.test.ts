@@ -34,7 +34,8 @@ describe("ALLOW_SIGNUPS", () => {
     expect(job.env.ALLOW_SIGNUPS).toBe(
       "${{ inputs.env == 'staging' && '1' || '' }}",
     );
-    for (const st of steps) expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
+    for (const st of steps)
+      expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
   });
 });
 

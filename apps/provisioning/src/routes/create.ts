@@ -17,7 +17,7 @@ import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
-import { slugHeld } from "./reads.js";
+import { releaseDeletedSignupSlug, slugState } from "./reads.js";
 import { claimAccount, resolveRelease } from "./writes.js";
 
 // R4 POST /installs (3.3, 3.6, 4.2, 7). One D1 batch writes the job, the
@@ -130,7 +130,11 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
     body.version,
     testHooks ? "redline" : "release",
   );
-  if (await slugHeld(env, body.slug)) throw new ApiError("slug_taken");
+  const held = await slugState(env, body.slug, ss ? (p.sub as string) : null);
+  // "cooling" is a purged address inside its 30 days (cloud #108); the
+  // code stays slug_taken (the contract is public) and the message says why.
+  if (held === "cooling") throw new ApiError("slug_taken", "slug_cooling");
+  if (held === "taken") throw new ApiError("slug_taken");
 
   // checkCreateFields required these for every principal but U.
   const tier: Tier = ss ? env.SELF_SERVE_TIER : (body.tier as Tier);
@@ -146,6 +150,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const db = env.PLATFORM_DB;
   // The signup's id is its first create job's id (0007).
   const after = (jobId: string): D1PreparedStatement[] => [
+    releaseDeletedSignupSlug(env, body.slug, now),
     db
       .prepare(
         `INSERT INTO signups (signup_id, source, owner_sub, slug, job_id, vars, version, test_hooks, send_welcome, status, admitted_at, created_at, updated_at)

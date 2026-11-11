@@ -263,9 +263,72 @@ describe("setTier", () => {
     });
   });
 
-  it("is a named export with exactly constructor and setTier (every public method is callable over RPC)", () => {
+  it("is a named export with exactly constructor, setTier and tiersOf (every public method is callable over RPC)", () => {
     expect(
       Object.getOwnPropertyNames(BillingOperatorRpc.prototype).sort(),
-    ).toEqual(["constructor", "setTier"]);
+    ).toEqual(["constructor", "setTier", "tiersOf"]);
+  });
+});
+
+const tiersOf = (installs: unknown, e: Env = baseEnv()) =>
+  new BillingOperatorRpc(createExecutionContext(), e).tiersOf(
+    installs as string[],
+  );
+
+describe("tiersOf (#2058)", () => {
+  it("answers tier and status per install, solo/active for no row, and writes nothing", async () => {
+    await seed({ tier: "team", status: "past_due" });
+    const before = await rowOf();
+    expect(await tiersOf([A, B, A])).toEqual({
+      ok: true,
+      tiers: {
+        [A]: { tier: "team", status: "past_due" },
+        [B]: { tier: "solo", status: "active" },
+      },
+    });
+    expect(await rowOf()).toEqual(before);
+    expect(await rowOf(B)).toBeNull();
+  });
+
+  it("a running trial stays trial", async () => {
+    await seed({ tier: "trial", trialEndsAt: NOW + 1000 });
+    const before = await rowOf();
+    expect(await tiersOf([A])).toEqual({
+      ok: true,
+      tiers: { [A]: { tier: "trial", status: "active" } },
+    });
+    expect(await rowOf()).toEqual(before);
+  });
+
+  it("refuses a bad list: not an array, empty, over the cap, a bad id", async () => {
+    const ok = Array.from(
+      { length: 100 },
+      (_, i) => `i${String(i).padStart(11, "0")}`,
+    );
+    expect((await tiersOf(ok)).ok).toBe(true);
+    for (const bad of [
+      "iabc123def45",
+      [],
+      [...ok, A],
+      [A, "nope"],
+      [A, 5],
+      null,
+    ])
+      expect(await tiersOf(bad)).toEqual({ ok: false, error: "bad_installs" });
+  });
+
+  it("a D1 error is unavailable, with no detail", async () => {
+    const broken: Env = {
+      ...baseEnv(),
+      BILLING_DB: {
+        prepare: () => {
+          throw new Error("D1_ERROR: secret detail");
+        },
+      } as unknown as D1Database,
+    };
+    expect(await tiersOf([A], broken)).toEqual({
+      ok: false,
+      error: "unavailable",
+    });
   });
 });

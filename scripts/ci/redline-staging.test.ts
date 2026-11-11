@@ -270,8 +270,9 @@ describe("redline-staging.yml", () => {
       const line = readFileSync(ghEnv, "utf8")
         .split("\n")
         .find((l) => l.startsWith("REDLINE_STG_PROVISIONER="));
-      expect(JSON.parse(String(line).slice("REDLINE_STG_PROVISIONER=".length)))
-        .toEqual({ accountId: "x", tokenFile: f });
+      expect(
+        JSON.parse(String(line).slice("REDLINE_STG_PROVISIONER=".length)),
+      ).toEqual({ accountId: "x", tokenFile: f });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -280,7 +281,11 @@ describe("redline-staging.yml", () => {
     try {
       const r = runBash(String(sec.run), { RUNNER_TEMP: t2, ...base });
       expect(r.status).toBe(0);
-      expect(existsSync(join(t2, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN"))).toBe(false);
+      expect(
+        existsSync(
+          join(t2, "redline-secrets", "REDLINE_STG_PROVISIONER_TOKEN"),
+        ),
+      ).toBe(false);
       const ghEnv = join(t2, "env");
       writeFileSync(ghEnv, "");
       const t = runBash(String(tg.run), {
@@ -292,7 +297,9 @@ describe("redline-staging.yml", () => {
         REDLINE_STG_PROVISIONER_BASE: '{"accountId":"x"}',
       });
       expect(t.status).toBe(0);
-      expect(readFileSync(ghEnv, "utf8")).not.toContain("REDLINE_STG_PROVISIONER=");
+      expect(readFileSync(ghEnv, "utf8")).not.toContain(
+        "REDLINE_STG_PROVISIONER=",
+      );
     } finally {
       rmSync(t2, { recursive: true, force: true });
     }

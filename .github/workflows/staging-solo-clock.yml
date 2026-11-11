@@ -5,6 +5,8 @@
 #   advance: attach pm_card_visa, advance the clock to trial_end + 1h, wait for
 #            it, and print the proof (subscription status, invoice amount_paid,
 #            currency, the Solo price, the tiers row billing's /tier answers from).
+#   inspect: read-only (GET to Stripe, SELECT to D1): the tiers row, the
+#            customer's subscriptions, balance, invoices and events.
 #   cleanup: delete the install's clock (Stripe deletes its customers) and reset
 #            its billing rows.
 # The Stripe test key is hosted-staging-deploy's STRIPE_SECRET_KEY; it never
@@ -20,12 +22,13 @@ on:
         required: true
         type: string
       action:
-        description: "advance the clock past the trial, or cleanup"
+        description: "advance the clock past the trial, cleanup, or inspect (read-only)"
         required: true
         type: choice
         options:
           - advance
           - cleanup
+          - inspect
 
 permissions:
   contents: read
@@ -49,7 +52,7 @@ jobs:
           set -euo pipefail
           [ "$REF" = refs/heads/main ] || { echo "dispatch staging-solo-clock on main"; exit 1; }
           [[ "$INSTALL_ID" =~ ^i[a-z0-9]{11}$ ]] || { echo "install_id is not an install id"; exit 1; }
-          case "$ACTION" in advance | cleanup) ;; *) echo "action is advance or cleanup"; exit 1 ;; esac
+          case "$ACTION" in advance | cleanup | inspect) ;; *) echo "action is advance, cleanup or inspect"; exit 1 ;; esac
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
@@ -60,7 +63,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version-file: .nvmrc
+          # The cloud repo has no .nvmrc of its own (the public tree brings it in
+          # overlay runs); this job runs only node: built-ins, so pin the major.
+          node-version: "22"
       - name: Load the hosted constants
         run: bash scripts/ci/hosted-constants.sh staging .github/hosted
       - name: Resolve the billing database

@@ -534,7 +534,7 @@ describe("A: buildBundle builds both variants from one dry-run config", () => {
   const GENERATED =
     existsSync(new URL("apps/server/src/version.gen.ts", ROOT)) &&
     existsSync(new URL("apps/server/dist-assets", ROOT));
-  // N5: the no-test-hooks CI job sets OA_REQUIRE_REAL_BUILD=1, so it never skips there.
+  // N5: the overlay job in ci.yml (this repo) sets OA_REQUIRE_REAL_BUILD=1, so it never skips there.
   it.skipIf(!GENERATED && process.env.OA_REQUIRE_REAL_BUILD !== "1")(
     "real build: the bundles differ and release holds no hook route string",
     async () => {

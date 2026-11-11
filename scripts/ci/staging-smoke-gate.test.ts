@@ -78,7 +78,11 @@ const gate = (
     w(`jobs-${id}.json`, typeof j === "string" ? j : { jobs: j });
   if (opts.fail) w(opts.fail, "");
   const r = sb.run(["bash", SCRIPT, opts.tag ?? TAG], {
-    env: { STATE: sb.dir, GH_TOKEN: "t", GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud" },
+    env: {
+      STATE: sb.dir,
+      GH_TOKEN: "t",
+      GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
+    },
   });
   return { ...r, log: sb.log() };
 };

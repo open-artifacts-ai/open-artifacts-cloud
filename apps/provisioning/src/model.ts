@@ -20,6 +20,7 @@ import {
 } from "@oa/provisioning-contract";
 import { TEST_HOOK_REFUSALS, type TestHookRefusal } from "@oa/shared";
 import { z } from "zod";
+import { billingTiersOf } from "./billing-tiers.js";
 import type { Env } from "./env.js";
 import { ApiError } from "./errors.js";
 import type { Principal } from "./principal.js";
@@ -238,8 +239,13 @@ export async function detailOf(
   showEmail: boolean,
 ): Promise<InstallDetail> {
   const now = Date.now();
+  const billing = (await billingTiersOf(env, [row.install_id])).get(
+    row.install_id,
+  );
   return {
     ...summaryOf(env, row),
+    billingTier: billing?.billingTier ?? null,
+    billingStatus: billing?.billingStatus ?? null,
     ownerEmail: showEmail ? await ownerEmailFor(env, row) : null,
     auth: authOf(row),
     previousVersion:

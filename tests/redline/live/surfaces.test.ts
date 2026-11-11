@@ -8,6 +8,7 @@ import {
   cleanup,
   coverageGaps,
   dispose,
+  inShard,
   probeCases,
   probeCred,
   readRepoFile,
@@ -15,6 +16,7 @@ import {
   seedWorld,
   settle,
   snapshot,
+  surfaceShard,
   sweep,
   type Throwaway,
   throwaway,
@@ -72,14 +74,19 @@ const world = (t: Target): World => {
 };
 const side = (t: Target): Side => (t === T.a ? A : B);
 
-describe("surface probes (cross-install)", () => {
-  it("every ROUTE_POLICY route, MCP tool and content route has a case", () => {
-    expect(coverageGaps()).toEqual([]);
-    // Every drop's covering tests exist (file, describe and test names).
-    expect(citationGaps(readRepoFile)).toEqual([]);
-  });
+// #26: REDLINE_SURFACES_SHARD "a" or "b" runs half of the cases (the plan's
+// two surfaces lanes); unset runs them all. The coverage case is shard a's.
+const shard = surfaceShard();
 
-  for (const c of probeCases())
+describe("surface probes (cross-install)", () => {
+  if (shard !== "b")
+    it("every ROUTE_POLICY route, MCP tool and content route has a case", () => {
+      expect(coverageGaps()).toEqual([]);
+      // Every drop's covering tests exist (file, describe and test names).
+      expect(citationGaps(readRepoFile)).toEqual([]);
+    });
+
+  for (const c of probeCases().filter((c) => inShard(c.name, shard)))
     it(
       c.name,
       async (ctx) => {

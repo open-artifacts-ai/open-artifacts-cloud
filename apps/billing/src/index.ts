@@ -62,6 +62,9 @@ import {
   type StripeConfig,
   StripeConfigError,
   SUBSCRIPTION_LIVE_SQL,
+  TIERS_OF_MAX,
+  type TierOfView,
+  type TiersOfResult,
 } from "@oa/billing-core";
 import {
   ASSERTION_SKEW_MS,
@@ -74,6 +77,9 @@ import {
 } from "@oa/broker-core/gate-header";
 import { isAppHost, type Env as OaEnv, TRIAL_MS } from "@oa/provision/names";
 import { isClockInstall } from "./test-clock.js";
+
+/** Dashboard page Checkout and the portal return to. */
+const PLAN_PATH = "/settings/plan";
 
 export interface Env {
   BILLING_DB: D1Database;
@@ -185,7 +191,14 @@ const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, v
 // passing, so it bumps version here: the install stores an answer only when
 // its version is higher. One UPDATE, idempotent (it needs tier trial), run at
 // the start of every read and answer. A suspended row stays suspended.
-const MATERIALIZE_SQL = `UPDATE tiers SET tier = 'solo', status = CASE WHEN status = 'suspended' THEN status WHEN solo_status IN ('active', 'past_due') THEN solo_status ELSE 'lapsed' END, grace_until = CASE WHEN status = 'suspended' THEN grace_until WHEN solo_status = 'past_due' THEN solo_grace_until END, version = version + 1, updated_at = ?2 WHERE install_id = ?1 AND tier = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at <= ?2`;
+// The pieces tiersOf projects without writing (one source, so the two cannot
+// drift): when the trial has ended (?n is now), and the status the Solo row
+// takes then.
+const trialEnded = (now: string) =>
+  `tier = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at <= ${now}`;
+const ENDED_STATUS_SQL =
+  "CASE WHEN status = 'suspended' THEN status WHEN solo_status IN ('active', 'past_due') THEN solo_status ELSE 'lapsed' END";
+const MATERIALIZE_SQL = `UPDATE tiers SET tier = 'solo', status = ${ENDED_STATUS_SQL}, grace_until = CASE WHEN status = 'suspended' THEN grace_until WHEN solo_status = 'past_due' THEN solo_grace_until END, version = version + 1, updated_at = ?2 WHERE install_id = ?1 AND ${trialEnded("?2")}`;
 const materialize = (db: D1Database, install: string, now: number) =>
   db.prepare(MATERIALIZE_SQL).bind(install, now).run();
 const OPEN_SQL =
@@ -542,7 +555,7 @@ async function checkout(
       (await lookupInstall(env.BROKER_REGISTRY, install, Date.now()))?.origin,
     ),
   );
-  const base = `https://${appHost}/settings/billing`;
+  const base = `https://${appHost}${PLAN_PATH}`;
   // Paying during the no-card Solo trial keeps the free days: the new
   // subscription's trial ends where the old one's does, so no money moves
   // until then and the card is collected. Stripe needs trial_end at least 48
@@ -639,7 +652,7 @@ async function portal(
     createPortalSession(
       {
         customerId,
-        returnUrl: `https://${appHost}/settings/billing`,
+        returnUrl: `https://${appHost}${PLAN_PATH}`,
         idempotencyKey: `portal-${install}-${body.ts}`,
       },
       cfg,
@@ -950,15 +963,63 @@ async function operatorSetTier(
   }
 }
 
+// The read side of the operator RPC (#2058): the tier GET /tier shows, for
+// many installs, in one SELECT, and no write at all (no materialize, no
+// version bump, no last_read_at, no Stripe). An ended Business trial is
+// projected as MATERIALIZE_SQL would leave it (same fragments). No row: solo,
+// active.
+// now is inlined (an integer from Date.now()): D1 allows 100 bound values and
+// TIERS_OF_MAX ids use them all.
+const TIERS_OF_SQL = (n: number, now: number) =>
+  `SELECT install_id, CASE WHEN ${trialEnded(String(Math.trunc(now)))} THEN 'solo' ELSE tier END AS tier, CASE WHEN ${trialEnded(String(Math.trunc(now)))} THEN ${ENDED_STATUS_SQL} ELSE status END AS status FROM tiers WHERE install_id IN (${Array.from({ length: n }, () => "?").join(",")})`;
+type TiersOfRow = {
+  install_id: string;
+  tier: string | null;
+  status: string | null;
+};
+async function operatorTiersOf(
+  env: Env,
+  installs: unknown,
+): Promise<TiersOfResult> {
+  if (
+    !Array.isArray(installs) ||
+    installs.length < 1 ||
+    installs.length > TIERS_OF_MAX ||
+    !installs.every((i) => typeof i === "string" && INSTALL_ID.test(i))
+  )
+    return { ok: false, error: "bad_installs" };
+  const ids = [...new Set(installs as string[])];
+  const now = Date.now();
+  try {
+    const rows = (
+      await env.BILLING_DB.prepare(TIERS_OF_SQL(ids.length, now))
+        .bind(...ids)
+        .all<TiersOfRow>()
+    ).results;
+    const tiers: Record<string, TierOfView> = {};
+    for (const id of ids) tiers[id] = { tier: "solo", status: "active" };
+    for (const r of rows)
+      tiers[r.install_id] = { tier: r.tier, status: r.status };
+    return { ok: true, tiers };
+  } catch {
+    console.error("billing tiers_of db_error");
+    return { ok: false, error: "unavailable" };
+  }
+}
+
 /**
  * The Provisioning API's operator RPC (a service binding with
  * `entrypoint: "BillingOperatorRpc"`): its own entrypoint, so the one Worker
  * that may comp a tier cannot start a Solo trial and the provisioner cannot
- * comp. Exactly one method (a test pins the prototype).
+ * comp. Exactly two methods (a test pins the prototype).
  */
 export class BillingOperatorRpc extends WorkerEntrypoint<Env> {
   setTier(install: string, tier: SetTierTier): Promise<SetTierResult> {
     return operatorSetTier(this.env, install, tier);
+  }
+
+  tiersOf(installs: string[]): Promise<TiersOfResult> {
+    return operatorTiersOf(this.env, installs);
   }
 }
 
