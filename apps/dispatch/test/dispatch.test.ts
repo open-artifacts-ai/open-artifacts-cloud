@@ -104,6 +104,16 @@ const NOT_FOUND = {
   body: [...new TextEncoder().encode("Not found")],
 };
 
+const UNAVAILABLE = {
+  status: 503,
+  headers: [
+    ["cache-control", "no-store"],
+    ["content-type", "text/plain;charset=UTF-8"],
+    ["retry-after", "5"],
+  ],
+  body: [...new TextEncoder().encode("Service unavailable")],
+};
+
 describe("dispatch", () => {
   it("unmapped host → 404 with a generic body and nothing dispatched", async () => {
     const f = fakes(MAP);
@@ -188,14 +198,14 @@ describe("dispatch", () => {
     }
   });
 
-  it("an unknown OA_ENV → 404, nothing dispatched", async () => {
+  it("an unknown OA_ENV (a misconfigured deploy) → 503, nothing dispatched", async () => {
     const f = fakes(MAP);
     (f.env as { OA_ENV: string }).OA_ENV = "dev";
     expect(
       await observe(
         await call(f.env, "https://acme.open-artifacts-staging.app/"),
       ),
-    ).toEqual(NOT_FOUND);
+    ).toEqual(UNAVAILABLE);
     expect(f.scripts).toEqual([]);
   });
 
@@ -324,31 +334,31 @@ describe("dispatch", () => {
     expect(r.webSocket).not.toBeNull();
   });
 
-  it("a throwing DISPATCHER.get → 404, not 500 with a stack", async () => {
+  it("a throwing DISPATCHER.get → 503, not 500 with a stack", async () => {
     const f = fakes(MAP, {
       get: () => {
         throw new Error("namespace binding broken");
       },
     });
     const r = await call(f.env, "https://acme.open-artifacts-staging.app/");
-    expect(await observe(r)).toEqual(NOT_FOUND);
+    expect(await observe(r)).toEqual(UNAVAILABLE);
   });
 
-  it("a rejected .fetch() (the install's script was deleted) → 404", async () => {
+  it("a rejected .fetch() (the install's script was deleted) → 503 with Retry-After", async () => {
     const f = fakes(MAP, {
       fetch: async () => {
         throw new Error(`Worker not found: oa-s-${A}`);
       },
     });
     const r = await call(f.env, "https://acme.open-artifacts-staging.app/");
-    expect(await observe(r)).toEqual(NOT_FOUND);
+    expect(await observe(r)).toEqual(UNAVAILABLE);
     expect(f.scripts).toEqual([`oa-s-${A}`]);
   });
 
-  it("a HOSTS.get that throws → 404", async () => {
+  it("a HOSTS.get that throws → 503 with Retry-After", async () => {
     const f = fakes(MAP, { kvThrows: true });
     const r = await call(f.env, "https://acme.open-artifacts-staging.app/");
-    expect(await observe(r)).toEqual(NOT_FOUND);
+    expect(await observe(r)).toEqual(UNAVAILABLE);
     expect(f.scripts).toEqual([]);
   });
 
@@ -373,7 +383,7 @@ describe("dispatch", () => {
     expect(f.scripts).toEqual([]);
   });
 
-  it("every failure kind is the same byte-identical 404", async () => {
+  it("every unmapped or bad-host kind is the same byte-identical 404, a served-host failure the same 503", async () => {
     const throwGet = fakes(MAP, {
       get: () => {
         throw new Error("x");
@@ -384,6 +394,11 @@ describe("dispatch", () => {
         throw new Error("x");
       },
     });
+    const UNAVAILABLE_KINDS = new Set([
+      "get throws",
+      "dispatcher throws",
+      "fetch rejects",
+    ]);
     const kinds: [string, Env, string | Request][] = [
       ["miss", fakes(MAP).env, "https://nope.open-artifacts-staging.app/"],
       [
@@ -417,7 +432,9 @@ describe("dispatch", () => {
     for (const [i, o] of seen.entries())
       expect({ kind: kinds[i]?.[0], ...o }).toEqual({
         kind: kinds[i]?.[0],
-        ...NOT_FOUND,
+        ...(UNAVAILABLE_KINDS.has(kinds[i]?.[0] ?? "")
+          ? UNAVAILABLE
+          : NOT_FOUND),
       });
   });
 

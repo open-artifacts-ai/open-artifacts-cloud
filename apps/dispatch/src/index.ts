@@ -56,10 +56,21 @@ export function hostOf(req: Request): string | null {
 }
 
 /**
- * Every failure is this one response: a miss, a bad value, a binding error or
- * a deleted script look the same, and nothing reaches another install.
+ * A host no install holds, or a HOSTS value that isn't one: the one 404, so
+ * nothing reaches another install and a probe learns nothing.
  */
 const notFound = () => new Response("Not found", { status: 404 });
+
+/**
+ * A host that resolved but could not be served (a KV read error, a binding
+ * error, a deleted script or a crashing install): retryable, so a transient
+ * blip is not read as a permanent "not found". A fixed body, no install detail.
+ */
+const unavailableNow = () =>
+  new Response("Service unavailable", {
+    status: 503,
+    headers: { "retry-after": "5", "cache-control": "no-store" },
+  });
 
 /** A fixed log category; never the error text (it can carry names or URLs). */
 const category = (e: unknown) =>
@@ -82,7 +93,7 @@ export default {
       value = await env.HOSTS.get(host, { cacheTtl: 60 });
     } catch {
       console.error("dispatch failed", "kv", host);
-      return notFound();
+      return unavailableNow();
     }
     // The one parser; null (a bad value or a platform principal) is the 404.
     const parsed = parseHostsValue(value);
@@ -108,10 +119,10 @@ export default {
         props,
       }).fetch(req);
     } catch (e) {
-      // A deleted script, a crashing install or a binding error: still the
-      // one 404, with only the host and a fixed category logged.
+      // A deleted script, a crashing install or a binding error: a 503, with
+      // only the host and a fixed category logged.
       console.error("dispatch failed", category(e), host);
-      return notFound();
+      return unavailableNow();
     }
   },
 } satisfies ExportedHandler<Env>;
