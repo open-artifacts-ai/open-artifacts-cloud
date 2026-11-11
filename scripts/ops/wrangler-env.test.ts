@@ -24,8 +24,11 @@ describe("wrangler-env.ts", () => {
       GITHUB_REPOSITORY_ID: "123456",
       SIGNUP_DAILY_CAP: "20",
       SIGNUPS_ENABLED: "true",
+      WELCOME_FROM: "welcome@mail.example.app",
     });
     expect(v.SIGNUP_DAILY_CAP).toBe("20");
+    // The approval email's sender (#2096), the provisioner's value.
+    expect(v.WELCOME_FROM).toBe("welcome@mail.example.app");
     // Staging's gate is the constant, not a literal (open for the M2 walk).
     expect(v.SIGNUPS_ENABLED).toBe("true");
     expect(v.OA_ENV).toBe("staging");
@@ -35,6 +38,7 @@ describe("wrangler-env.ts", () => {
     // Prod has no OIDC_* and needs only the cap.
     const p = committedVars(cfg("provisioning"), "prod", {
       SIGNUP_DAILY_CAP: "50",
+      WELCOME_FROM: "welcome@mail.example.app",
     });
     expect(Object.keys(p).filter((k) => k.startsWith("OIDC_"))).toEqual([]);
   });
@@ -58,6 +62,7 @@ describe("wrangler-env.ts", () => {
       committedVars(cfg("provisioning"), "staging", {
         SIGNUP_DAILY_CAP: "20",
         SIGNUPS_ENABLED: "false",
+        WELCOME_FROM: "welcome@mail.example.app",
       }),
     ).toThrow(
       /OIDC_REPOSITORY_ID: \{\{GITHUB_REPOSITORY_ID_STAGING\}\} has no value/,

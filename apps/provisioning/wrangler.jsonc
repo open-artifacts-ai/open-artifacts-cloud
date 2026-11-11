@@ -48,6 +48,8 @@
         "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_STAGING}}",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
+        // The sender of the approval email (#2096), the provisioner's value.
+        "WELCOME_FROM": "{{WELCOME_FROM_STAGING}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
         "OIDC_AUDIENCE": "https://api.open-artifacts-staging.app",
         "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
@@ -78,6 +80,8 @@
       ],
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      // The approval email (#2096): the provisioner's sender, no fixed destination.
+      "send_email": [{ "name": "WELCOME_EMAIL" }],
       // BILLING is STAGING ONLY (#66): billing's BillingOperatorRpc entrypoint,
       // how an operator sets an install's tier (set_install_tier). oa-s-billing
       // must be deployed first, and the deploy reads the binding back when the
@@ -204,6 +208,8 @@
         "SIGNUPS_ENABLED": "false",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
+        // The sender of the approval email (#2096), the provisioner's value.
+        "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback"
       },
       "d1_databases": [
@@ -229,6 +235,8 @@
       ],
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      // The approval email (#2096): the provisioner's sender, no fixed destination.
+      "send_email": [{ "name": "WELCOME_EMAIL" }],
       "services": [
         {
           "binding": "PROVISIONER",
