@@ -450,6 +450,9 @@ test("loading: status line follows the stage, no step list", async ({
   await expect(page.locator(".panel .addr")).toHaveText(
     "Creating acme.open-artifacts.app\u2026",
   );
+  await expect(page.locator(".panel .hint")).toHaveText(
+    "This usually takes a minute or two. Keep this tab open, and it tells you when it's ready.",
+  );
   await expect(page.locator(".steps")).toHaveCount(0);
   await expect(page.locator(".anim")).toHaveCount(1);
   stage = "waiting_cap";

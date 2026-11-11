@@ -70,9 +70,6 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .dot.now{border-color:var(--accent);border-top-color:transparent;animation:spin 1s linear infinite}
 .dot.wait{border-color:var(--warn);border-style:dashed}
 .dot.fail{background:var(--danger);border-color:var(--danger);color:var(--accent-text)}
-.stepbar{display:flex;gap:6px;margin-bottom:18px}
-.stepbar i{flex:1;height:3px;border-radius:2px;background:var(--divider)}
-.stepbar i.on{background:var(--accent)}
 .who .av{width:24px;height:24px;border-radius:50%;background:#1e7a5a;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
 .who .wt{flex:1;min-width:0}
 .panel .lead{color:var(--text2);margin:8px 0 0}
@@ -90,6 +87,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .verb .w{display:inline-block;animation:vin .35s ease-out}
 @keyframes vin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .panel .addr{font:14px Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--muted);margin:0;text-align:center}
+.panel .hint{font-size:13.5px;color:var(--muted);margin:0;text-align:center;max-width:38ch}
 .a1 .fr{fill:none;stroke:var(--text);stroke-width:1.2;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 2.8s ease-in-out infinite}
 .a1 .cn{fill:var(--accent);opacity:0;animation:fade 2.8s ease-in-out infinite}
 .a1 .sq{fill:var(--accent);transform-origin:16px 16px;transform:scale(0);animation:land 2.8s cubic-bezier(.3,1.6,.5,1) infinite}
