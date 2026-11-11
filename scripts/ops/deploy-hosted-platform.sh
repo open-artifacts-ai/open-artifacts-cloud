@@ -393,9 +393,10 @@ case "$target" in
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     expect "$S" '.result.observability.enabled // false' true "observability"
-    # Invocation logs off (#164): fails only on an explicit true. The settings
+    # Invocation logs off (#164): an explicit false is required (a missing field
+    # is "null" and fails; Cloudflare defaults it to on). The settings
     # API's key for query-string redaction is not recorded, so it is not read.
-    expect "$S" '.result.observability.logs.invocation_logs // false' false "observability invocation_logs"
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     no_secret_bindings "$S" oa-$P-provisioner
     names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
     [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
@@ -586,9 +587,10 @@ case "$target" in
     # MCP_REDIRECT_URIS among them; ADMIN_IDENTITIES is a secret, by name only.
     vars_are "$S" provisioning
     expect "$S" '.result.observability.enabled // false' true "observability"
-    # Invocation logs off (#164): fails only on an explicit true. The settings
+    # Invocation logs off (#164): an explicit false is required (a missing field
+    # is "null" and fails; Cloudflare defaults it to on). The settings
     # API's key for query-string redaction is not recorded, so it is not read.
-    expect "$S" '.result.observability.logs.invocation_logs // false' false "observability invocation_logs"
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"

@@ -159,13 +159,16 @@ exit 0
 const settings = (
   bindings: Record<string, unknown>[],
   obs = true,
-  invocation = false,
+  invocation: boolean | null = false,
 ) =>
   JSON.stringify({
     success: true,
     result: {
       bindings,
-      observability: { enabled: obs, logs: { invocation_logs: invocation } },
+      observability: {
+        enabled: obs,
+        logs: { invocation_logs: invocation ?? undefined },
+      },
     },
   });
 const settingsOff = (bindings: Record<string, unknown>[]) =>
@@ -2033,6 +2036,11 @@ describe("deploy-hosted-platform.sh", () => {
           "observability",
           settings(JSON.parse(base).result.bindings, false),
           "observability",
+        ],
+        [
+          "invocation logs missing",
+          settings(JSON.parse(base).result.bindings, true, null),
+          "observability invocation_logs",
         ],
         [
           "invocation logs",
