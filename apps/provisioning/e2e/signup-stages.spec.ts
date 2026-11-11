@@ -318,7 +318,7 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   const run = page.getByRole("link", { name: "Run it yourself" });
   await expect(run).toHaveAttribute(
     "href",
-    "https://github.com/open-artifacts-ai/open-artifacts",
+    "https://open-artifacts.com/docs/setup/",
   );
   await expect(run).toHaveClass(/pri/);
   await expect(page.locator(".or")).toHaveText("or");
@@ -326,6 +326,10 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   const go = page.getByRole("button", { name: "Go to it" });
   await expect(go).not.toHaveClass(/pri/);
   await expect(page.locator(".panel .muted.small")).toHaveText(
+    "It runs on your own Cloudflare account.",
+  );
+  // The Cloudflare line sits right under "Run it yourself", before "or".
+  await expect(run.locator("xpath=following-sibling::*[1]")).toHaveText(
     "It runs on your own Cloudflare account.",
   );
   // Focus order follows the visual order: link, field, button.
@@ -460,11 +464,16 @@ test("loading: status line follows the stage, no step list", async ({
   await expect(page.locator(".panel .addr")).toHaveText(
     "Lots of people are signing up right now. You're in line, and it starts on its own.",
   );
+  await expect(page.locator(".panel .hint")).toHaveCount(0);
   // the animation survives a status update (not rebuilt)
   await expect(page.locator(".anim")).toHaveCount(1);
   await expect(page.locator(".verb")).toContainText("Margin-noting");
   await page.clock.runFor(2300);
   await expect(page.locator(".verb")).toContainText("Inking");
+  // the wait-time line returns once the signup leaves the line
+  stage = "queued";
+  await tick(page);
+  await expect(page.locator(".panel .hint")).toHaveCount(1);
 });
 
 test("loading: reduced motion shows the static mark, no rotation", async ({
