@@ -3,6 +3,10 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import {
+  claimHookSlot,
+  HookBudgetError,
+} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+import {
   BusError,
   busState,
   connectRequest,
@@ -10,7 +14,8 @@ import {
   openBusSocket,
   revokeMachines,
 } from "./bus.ts";
-import { boundFetch } from "./fetch-timeout.ts";
+import { boundFetch, InfraError } from "./fetch-timeout.ts";
+import { hookReason } from "./http.ts";
 import {
   AUDIENCES,
   type AudienceKey,
@@ -24,6 +29,7 @@ import {
   bringUpgrade,
   type CredsOut,
   mintCreds,
+  POLL_MS,
   ProbeFail,
   type ProvIo,
   provConfig,
@@ -210,6 +216,70 @@ export async function mintFiles(
   }
 }
 
+/** How long a new TEST_HOOK_KEY may take to reach the edge (#bring-up). */
+export const HOOK_KEY_WITHIN_MS = 90_000;
+
+/**
+ * R26 rotates the install's TEST_HOOK_KEY secret; the edge can serve the old
+ * one for a while, and a hook answers 404 on a key mismatch. Polls the
+ * install with the new key until it is accepted, within HOOK_KEY_WITHIN_MS;
+ * an InfraError otherwise.
+ *
+ * The call is POST /__test/key_check, a path that names no hook: the server
+ * checks the key first, so a right key gets the 404 refusal "bad_route"
+ * (apps/server/src/test-hooks: audit row "refused" under hook "unknown", no
+ * user, session or state touched), and a wrong key gets the bare 404 (audit
+ * "denied", under "unknown", so the guard's session denied-row count is
+ * unaffected). Each call takes a slot of the install's hook ledger
+ * (`pace`), so the polls count against the same budget as the suite's.
+ */
+export async function waitHookKey(
+  run: Run,
+  app: string,
+  key: string,
+  pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
+    claimHookSlot(a, { deadline }),
+  within: number = HOOK_KEY_WITHIN_MS,
+): Promise<void> {
+  // One deadline for the whole wait: a ledger claim gives up at it, and each
+  // request is cut off at it, so the total never runs past `within`.
+  const deadline = run.io.now() + within;
+  const fail = () =>
+    new InfraError(
+      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 (hooks answer 404 on a key mismatch)`,
+    );
+  for (;;) {
+    if (deadline - run.io.now() <= 0) throw fail();
+    try {
+      await pace(app, deadline);
+    } catch (e) {
+      if (e instanceof HookBudgetError) throw fail();
+      throw e;
+    }
+    const left = deadline - run.io.now();
+    if (left <= 0) throw fail();
+    try {
+      const res = await run.io.fetch(`${app}/__test/key_check`, {
+        method: "POST",
+        redirect: "manual",
+        signal: AbortSignal.timeout(left),
+        headers: {
+          authorization: `Bearer ${key}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      const text = await res.text();
+      if (res.status === 404 && hookReason(text) === "bad_route") return;
+    } catch {
+      // No answer (or cut off at the deadline): try again until it.
+    }
+    const rest = deadline - run.io.now();
+    if (rest <= 0) throw fail();
+    await run.io.wait(Math.min(POLL_MS, rest));
+  }
+}
+
 /**
  * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
  * creds, the two installs at the same time (#1730: the two upgrades are about
@@ -223,6 +293,7 @@ export async function bringUp(
   env: Record<string, string | undefined>,
   t: RawTargets,
   run: Run = liveRun(env, t),
+  pace?: (app: string, deadline: number) => Promise<unknown>,
 ): Promise<void> {
   const m = mask(env);
   const r = await newRecipient();
@@ -244,6 +315,9 @@ export async function bringUp(
       writeSecretFile(credFile(t, name, "PAT"), c.pat);
       writeSecretFile(credFile(t, name, "HOOK_KEY"), c.hookKey);
       out(`${slug}: R26 creds written\n`);
+      // Before the suite or the t19 hand-off reads the key.
+      await waitHookKey(run, side.app, c.hookKey, pace);
+      out(`${slug}: the new hook key is accepted\n`);
     } catch (e) {
       const msg = errText(e);
       if (!(e instanceof Error)) throw new Error(`${slug}: ${msg}`);

@@ -168,6 +168,10 @@ export type Fault =
   | "refusal_old_healthz"
   /** P52: the failed upgrade leaves the install on the old version. */
   | "p52_not_forward"
+  /** Bring-up: an install's first 3 key_check calls still see the old hook key. */
+  | "hook_key_stale"
+  /** Bring-up: the new hook key never reaches the edge. */
+  | "hook_key_never"
   /** P52: /healthz shows the old version for 3 reads after the failed upgrade. */
   | "p52_stale_healthz"
   /** P52: /healthz never shows the new version after the failed upgrade. */
@@ -270,6 +274,8 @@ export function fakeApi(): FakeApi {
   const authStarts = new Map<number, number>();
   /** Dispatch's 60 s HOSTS cache: a new host's /healthz 404s until then. */
   const hostsCachedUntil = new Map<string, number>();
+  /** Calls to /__test/key_check by host. */
+  const keyChecks = new Map<string, number>();
   /** P52: installs whose /healthz still serves the old script, and for how many reads. */
   const staleHealthz = new Map<string, number>();
   const signin: FakeApi["signin"] = { limit: 10 };
@@ -996,6 +1002,22 @@ export function fakeApi(): FakeApi {
     const host = url.hostname;
     log.push(`${req.method} ${url.origin}${url.pathname}`);
     if (url.pathname === "/mcp") return mcp(req, host);
+    // The server's hook gate: the key first (404 on a mismatch), then the
+    // route (404 with reason bad_route for a path that names no hook).
+    if (url.pathname === "/__test/key_check") {
+      const seen = (keyChecks.get(host) ?? 0) + 1;
+      keyChecks.set(host, seen);
+      const fresh =
+        req.headers.get("authorization") === `Bearer ${"h".repeat(43)}` &&
+        !faults.has("hook_key_never") &&
+        !(faults.has("hook_key_stale") && seen <= 3);
+      return fresh
+        ? ok(
+            { error: { code: "not_found", details: { reason: "bad_route" } } },
+            404,
+          )
+        : ok({ error: { code: "not_found" } }, 404);
+    }
     if (host === "api.open-artifacts-staging.app") {
       if (url.pathname === "/.well-known/oauth-protected-resource/mcp")
         return ok({
