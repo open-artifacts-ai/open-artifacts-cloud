@@ -719,6 +719,8 @@ describe("deploy-platform-worker.sh", () => {
       GITHUB_REPOSITORY_ID: "1012345678",
       SIGNUP_DAILY_CAP: "20",
       SIGNUPS_ENABLED: "false",
+      // The approval email's sender (#2096), the provisioner's value.
+      WELCOME_FROM: "welcome@mail.open-artifacts.app",
     };
     /** A tree with this config and, unless `assets` is false, the admin build's index.html. */
     const tree = (config: string, assets = true) => {
@@ -755,6 +757,7 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`"database_id": "${DB}"`);
         expect(snap).toContain(`"id": "${KV}"`);
         expect(snap).toContain('"SIGNUP_DAILY_CAP": "20"');
+        expect(snap).toContain('"WELCOME_FROM": "welcome@mail.open-artifacts.app"');
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         if (env === "staging")
           expect(snap).toContain('"OIDC_REPOSITORY_ID": "1012345678"');
@@ -768,6 +771,7 @@ describe("deploy-platform-worker.sh", () => {
         PROVISIONING_OAUTH_KV_ID: ["", DB, KV.toUpperCase()],
         GITHUB_REPOSITORY_ID: ["", "0123", "12a", "1/2"],
         SIGNUP_DAILY_CAP: ["", "0", "10000", "1e3"],
+        WELCOME_FROM: ["", "a@b", "x y@mail.open-artifacts.app"],
       };
       for (const env of ["staging", "prod"])
         for (const [key, values] of Object.entries(bad))

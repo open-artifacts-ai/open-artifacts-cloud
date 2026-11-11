@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
-import { FileText, KeyRound, Server } from "lucide-react";
+import { FileText, KeyRound, Server, Users } from "lucide-react";
 import { useEffect } from "react";
+import { betaStatsQuery } from "../api/beta";
 import { api } from "../api/client";
 import { worldQuery } from "../api/queries";
 import { signOut } from "../auth/signOut";
@@ -30,6 +31,14 @@ export function Shell() {
     enabled: isAdmin && mayWorld,
     retry: false,
   });
+  // The Beta tab (#2096) is the API's own admin-session route, not a contract
+  // route: a staging test admin has no tab. The badge counts people waiting.
+  const mayBeta = isAdmin && me.data?.principal === "admin";
+  const beta = useQuery({
+    ...betaStatsQuery(),
+    enabled: mayBeta,
+    retry: false,
+  });
   // Nav follows the shared authz table (#1074): tokens are R20.
   const mayTokens = useCan("R20");
   const left = me.data?.sessionExpiresAt
@@ -52,6 +61,20 @@ export function Shell() {
           <Link to="/installs">
             <Server size={14} aria-hidden /> Installs
           </Link>
+          {mayBeta && (
+            <Link to="/beta">
+              <Users size={14} aria-hidden /> Beta
+              {(beta.data?.waiting ?? 0) > 0 && (
+                <span
+                  className="oa-navcnt"
+                  data-testid="beta-count"
+                  title={`${beta.data?.waiting} waiting`}
+                >
+                  {beta.data?.waiting}
+                </span>
+              )}
+            </Link>
+          )}
           <Link to="/audit">
             <FileText size={14} strokeWidth={2} aria-hidden /> Audit log
           </Link>

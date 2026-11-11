@@ -29,7 +29,8 @@ const navLinks = async () =>
   (await screen.findByText(/Signed in as/)) &&
   within(screen.getByRole("navigation", { name: "Main" }))
     .getAllByRole("link")
-    .map((a) => a.textContent?.trim());
+    // The Beta link carries a count of people waiting once it loads (#2096).
+    .map((a) => a.textContent?.trim().replace(/(?<=Beta)\d+$/, ""));
 const openDetail = async (i: InstallDetail) => {
   use(http.get(`*/api/v1/installs/${i.id}`, () => json(i)));
   renderApp(`/installs/${i.id}`);
@@ -203,7 +204,12 @@ it("a real admin sees the Owner row", async () => {
 it("real admin: Agent tokens nav, the email search and Create install", async () => {
   signIn("admin");
   renderApp("/installs");
-  expect(await navLinks()).toEqual(["Installs", "Audit log", "Agent tokens"]);
+  expect(await navLinks()).toEqual([
+    "Installs",
+    "Beta",
+    "Audit log",
+    "Agent tokens",
+  ]);
   expect(
     await screen.findByRole("searchbox", {
       name: "Search slug, id, host or email",

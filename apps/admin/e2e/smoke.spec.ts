@@ -230,3 +230,94 @@ test.describe("lifecycle", () => {
     await expect(page.getByTestId("state")).toHaveText("Active");
   });
 });
+
+test("Beta: approve one, bulk approve with a confirm, an Add error, decline and remove", async ({
+  page,
+}) => {
+  await page.goto("/beta");
+  await expect(page.getByRole("heading", { name: "Beta" })).toBeVisible();
+  await expect(
+    page.getByText("Choose who can sign up while sign-ups are by invite."),
+  ).toBeVisible();
+  const waitlist = page.getByRole("table", { name: "Waitlist" });
+  await expect(waitlist.getByRole("row")).toHaveCount(5);
+  // One Approve is one click: no confirm.
+  await waitlist
+    .getByRole("row", { name: /sam.rivera@northwind.io/ })
+    .getByRole("button", { name: "Approve" })
+    .click();
+  await expect(page.getByTestId("beta-toast")).toContainText(
+    "Approved sam.rivera@northwind.io. We emailed them.",
+  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  // Approve selected confirms.
+  await page.getByLabel("Select maya@acme.com").click();
+  await page.getByLabel("Select ines@studiolumen.co").click();
+  await page.getByRole("button", { name: "Approve selected" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Approve 2 people?" }),
+  ).toBeVisible();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Approve" })
+    .click();
+  await expect(page.getByTestId("beta-toast")).toContainText(
+    "Approved 2 people. We emailed them.",
+  );
+  // Add names the first bad entry and keeps the text.
+  const box = page.getByLabel("Emails or domains to allow");
+  await box.fill("lee@initech.com, acme, @gmail.com");
+  await page.getByRole("button", { name: "Add" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    `"acme" isn't an email address or a domain like @acme.com.`,
+  );
+  await expect(box).toHaveValue("lee@initech.com, acme, @gmail.com");
+  // Decline confirms.
+  await page
+    .getByRole("row", { name: /j.okafor@gmail.com/ })
+    .getByRole("button", { name: "Decline" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Decline j.okafor@gmail.com?" }),
+  ).toBeVisible();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Decline" })
+    .click();
+  await expect(page.getByTestId("beta-toast")).toContainText("Declined");
+  await expect(page.getByText("Nobody is waiting.")).toBeVisible();
+  await page.getByRole("button", { name: /Show declined/ }).click();
+  await expect(page.getByTestId("beta-declined")).toContainText(
+    "tomas@example.net",
+  );
+  // Remove confirms.
+  await page
+    .getByRole("row", { name: /^@northwind\.io/ })
+    .getByRole("button", { name: "Remove" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Remove @northwind.io?" }),
+  ).toBeVisible();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Remove" })
+    .click();
+  await expect(page.getByTestId("beta-toast")).toContainText(
+    "Removed @northwind.io.",
+  );
+});
+
+test("Beta: a banner when sign-ups aren't by invite", async ({ page }) => {
+  await page.goto("/beta?mock=beta-open");
+  await expect(page.getByTestId("beta-banner")).toContainText(
+    "Sign-ups are open to everyone right now, so this list isn't being used.",
+  );
+});
+
+test("Beta: both empty states", async ({ page }) => {
+  await page.goto("/beta?mock=beta-empty");
+  await expect(page.getByText("Nobody is waiting.")).toBeVisible();
+  await expect(
+    page.getByText("Nobody is allowed yet. Add an email or a domain."),
+  ).toBeVisible();
+});
