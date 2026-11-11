@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import {
   type Allowed,
   addAllowed,
+  addErrorLines,
+  addToast,
   allowedQuery,
   approvePeople,
   BETA_KEY,
@@ -61,7 +63,8 @@ export const fmtJoined = (ms: number, now: number) => {
   return days === 1 ? "Yesterday" : `${days} days ago`;
 };
 
-type Toast = { text: string; bad?: boolean };
+/** `domain`: the toast asks for an action, so it stays until dismissed and a click searches it. */
+type Toast = { text: string; bad?: boolean; domain?: string };
 
 function Note({ note }: { note: string | null }) {
   const [more, setMore] = useState(false);
@@ -101,19 +104,24 @@ export function Beta() {
     ...waitlistQuery({ status: "declined", q }),
     enabled: showDeclined,
   });
+  // Approved, but the email never went out: each has "Send email again".
+  const unsent = useQuery({
+    ...waitlistQuery({ status: "unsent", q: "" }),
+    enabled: (stats.data?.unsent ?? 0) > 0,
+  });
   const allowed = useQuery(allowedQuery());
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [addText, setAddText] = useState("");
-  const [addError, setAddError] = useState("");
+  const [addErrors, setAddErrors] = useState<string[]>([]);
 
   useEffect(() => {
     const t = setTimeout(() => setQ(typed.trim()), SEARCH_DELAY_MS);
     return () => clearTimeout(t);
   }, [typed]);
   useEffect(() => {
-    if (!toast) return;
+    if (!toast || toast.domain) return;
     const t = setTimeout(() => setToast(null), TOAST_MS);
     return () => clearTimeout(t);
   }, [toast]);
@@ -139,6 +147,13 @@ export function Beta() {
               : `Approved ${who}, but ${failed.length} ${failed.length === 1 ? "email" : "emails"} didn't send. They're on the list; tell them yourself.`,
         });
       else if (done.length === 0) setToast({ text: "Nobody new to approve." });
+      else if (done.every((x) => x.resent))
+        setToast({
+          text:
+            done.length === 1
+              ? `Emailed ${who}.`
+              : `Emailed ${done.length} people.`,
+        });
       else
         setToast({
           text:
@@ -168,22 +183,22 @@ export function Beta() {
     invalidate: inv,
     onSuccess: (r) => {
       setAddText("");
-      setAddError("");
-      setToast({ text: `Added ${r.added.join(", ")}.` });
+      setAddErrors([]);
+      setToast(addToast(r));
     },
   });
   const submitAdd = () => {
     const entries = splitEntries(addText);
     if (entries.length === 0) {
-      setAddError("");
+      setAddErrors([]);
       return;
     }
     add.mutate(entries, {
       onError: (e) =>
-        setAddError(
+        setAddErrors(
           e instanceof ApiError && e.code === "invalid_input"
-            ? e.message
-            : "That didn't save. Try again.",
+            ? addErrorLines(e)
+            : ["That didn't save. Try again."],
         ),
     });
   };
@@ -225,8 +240,8 @@ export function Beta() {
           role="status"
           data-testid="beta-banner"
         >
-          <strong>{MODE_BANNER[s.mode][0]}</strong> {MODE_BANNER[s.mode][1]}{" "}
-          It takes effect when sign-ups are set to invite only.
+          <strong>{MODE_BANNER[s.mode][0]}</strong> {MODE_BANNER[s.mode][1]} It
+          takes effect when sign-ups are set to invite only.
         </p>
       )}
       <section className="oa-tiles" aria-label="Overview">
@@ -399,6 +414,40 @@ export function Beta() {
         </div>
       )}
 
+      {(stats.data?.unsent ?? 0) > 0 &&
+        (unsent.data?.items.length ?? 0) > 0 && (
+          <div className="oa-beta-card oa-tablewrap" data-testid="beta-unsent">
+            <p className="oa-beta-hint oa-beta-unsent-head">
+              Approved, but the email didn't send.
+            </p>
+            <table className="oa-beta-table" aria-label="Approved, not emailed">
+              <tbody>
+                {unsent.data?.items.map((r) => (
+                  <tr key={r.sub}>
+                    <td className="em">
+                      {r.email}
+                      <span className="oa-beta-tag">not emailed</span>
+                    </td>
+                    <td className="dt" title={fullDate(r.joinedAt)}>
+                      {fmtJoined(r.joinedAt, now)}
+                    </td>
+                    <td className="act">
+                      <button
+                        type="button"
+                        className="oa-btn oa-btn-sm"
+                        disabled={approve.isPending}
+                        onClick={() => approve.mutate([r.sub])}
+                      >
+                        Send email again
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
       <div className="oa-beta-sec">
         <h2>Allowed</h2>
       </div>
@@ -409,8 +458,10 @@ export function Beta() {
             rows={1}
             placeholder="maya@acme.com, @acme.com"
             aria-label="Emails or domains to allow"
-            aria-invalid={addError ? true : undefined}
-            aria-describedby={addError ? "beta-add-err" : "beta-add-hint"}
+            aria-invalid={addErrors.length ? true : undefined}
+            aria-describedby={
+              addErrors.length ? "beta-add-err" : "beta-add-hint"
+            }
             value={addText}
             onChange={(e) => setAddText(e.target.value)}
           />
@@ -423,10 +474,12 @@ export function Beta() {
             Add
           </button>
         </div>
-        {addError ? (
-          <p className="oa-beta-err" id="beta-add-err" role="alert">
-            {addError}
-          </p>
+        {addErrors.length ? (
+          <div className="oa-beta-err" id="beta-add-err" role="alert">
+            {addErrors.map((l) => (
+              <p key={l}>{l}</p>
+            ))}
+          </div>
         ) : (
           <p className="oa-beta-hint" id="beta-add-hint">
             Emails or @domains, separated by commas, spaces or new lines.
@@ -531,7 +584,31 @@ export function Beta() {
           role={toast.bad ? "alert" : "status"}
           data-testid="beta-toast"
         >
-          {toast.text}
+          {toast.domain ? (
+            <button
+              type="button"
+              className="oa-beta-toast-go"
+              title={`Search the waitlist for ${toast.domain}`}
+              onClick={() => {
+                setTyped(toast.domain ?? "");
+                setQ(toast.domain ?? "");
+              }}
+            >
+              {toast.text}
+            </button>
+          ) : (
+            toast.text
+          )}
+          {toast.domain && (
+            <button
+              type="button"
+              className="oa-beta-toast-x"
+              aria-label="Dismiss"
+              onClick={() => setToast(null)}
+            >
+              ×
+            </button>
+          )}
         </div>
       )}
     </div>

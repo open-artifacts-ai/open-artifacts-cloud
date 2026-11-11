@@ -2325,3 +2325,42 @@ code.oa-code,
     width: 100%;
   }
 }
+
+/* The four stat tiles fill the row to the table's right edge. */
+.oa-beta .oa-tiles {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (max-width: 700px) {
+  .oa-beta .oa-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.oa-beta-err p {
+  margin: 0 0 2px;
+}
+.oa-beta-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.oa-beta-toast-go,
+.oa-beta-toast-x {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.oa-beta-toast-go {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.oa-beta-toast-x {
+  font-size: 16px;
+  line-height: 1;
+}
+.oa-beta-unsent-head {
+  padding-top: 10px;
+}

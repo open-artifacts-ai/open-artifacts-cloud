@@ -3,7 +3,7 @@ import { type AuditEntry, audit, auditStatement } from "../audit.js";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
 import type { Principal } from "../principal.js";
-import { approvalEmail } from "../signup/approval-email.js";
+import { ADDRESS_RE, approvalEmail } from "../signup/approval-email.js";
 import { normEmail } from "../signup/gate.js";
 
 // The private beta's admin API (#2096): who may sign up while
@@ -45,10 +45,22 @@ export const PUBLIC_MAIL_DOMAINS: Readonly<Record<string, string>> = {
   "icloud.com": "iCloud",
   "proton.me": "Proton",
   "protonmail.com": "Proton",
+  "aol.com": "AOL",
+  "live.com": "Live",
+  "msn.com": "MSN",
+  "me.com": "iCloud",
+  "mac.com": "iCloud",
+  "gmx.com": "GMX",
+  "gmx.de": "GMX",
+  "yandex.com": "Yandex",
+  "yandex.ru": "Yandex",
+  "mail.com": "Mail.com",
+  "zoho.com": "Zoho",
 };
 
 const DOMAIN_RE = /^@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
-const EMAIL_RE = /^[^@\s]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
+// Printable ASCII only (ADDRESS_RE): no controls, spaces or bidi characters.
+const EMAIL_RE = ADDRESS_RE;
 const MAX_ENTRIES = 100;
 const MAX_SUBS = 100;
 const LIST_LIMIT = 500;
@@ -67,7 +79,14 @@ const tryAudit = (env: Env, e: AuditEntry) => audit(env, e).catch(() => {});
 type Json = { status: number; body: unknown };
 const ok = (body: unknown): Json => ({ status: 200, body });
 
-const WaitlistStatus = z.enum(["waiting", "approved", "declined", "all"]);
+// "unsent": approved, but the approval email never went out (Send email again).
+const WaitlistStatus = z.enum([
+  "waiting",
+  "approved",
+  "declined",
+  "unsent",
+  "all",
+]);
 const ApproveSchema = z
   .object({ subs: z.array(z.string().min(1).max(255)).min(1).max(MAX_SUBS) })
   .strict();
@@ -106,7 +125,7 @@ export async function stats(env: Env): Promise<Json> {
   const dayStart = Math.floor(Date.now() / DAY_MS) * DAY_MS;
   const [w, a, s] = await env.PLATFORM_DB.batch([
     env.PLATFORM_DB.prepare(
-      "SELECT sum(status = 'waiting') AS waiting, sum(status = 'declined') AS declined FROM signup_waitlist",
+      "SELECT sum(status = 'waiting') AS waiting, sum(status = 'declined') AS declined, sum(status = 'approved' AND emailed_at IS NULL) AS unsent FROM signup_waitlist",
     ),
     env.PLATFORM_DB.prepare(
       "SELECT sum(substr(entry, 1, 1) <> '@') AS emails, sum(substr(entry, 1, 1) = '@') AS domains FROM signup_allowlist",
@@ -120,12 +139,14 @@ export async function stats(env: Env): Promise<Json> {
   const wr = w?.results[0] as {
     waiting: number | null;
     declined: number | null;
+    unsent: number | null;
   };
   const ar = a?.results[0] as { emails: number | null; domains: number | null };
   const cap = Number.parseInt(env.SIGNUP_DAILY_CAP ?? "", 10);
   return ok({
     waiting: wr?.waiting ?? 0,
     declined: wr?.declined ?? 0,
+    unsent: wr?.unsent ?? 0,
     allowedEmails: ar?.emails ?? 0,
     allowedDomains: ar?.domains ?? 0,
     signupsToday: (s?.results[0] as { n: number } | undefined)?.n ?? 0,
@@ -143,6 +164,7 @@ type WaitRow = {
   status: string;
   decided_by: string | null;
   decided_at: number | null;
+  emailed_at: number | null;
 };
 const waitItem = (r: WaitRow) => ({
   sub: r.sub,
@@ -152,21 +174,23 @@ const waitItem = (r: WaitRow) => ({
   status: r.status,
   decidedBy: r.decided_by,
   decidedAt: r.decided_at,
+  emailedAt: r.emailed_at,
 });
 
 export async function listWaitlist(env: Env, url: URL): Promise<Json> {
   const st = WaitlistStatus.safeParse(
     url.searchParams.get("status") ?? "waiting",
   );
-  if (!st.success) throw invalid("status: waiting, approved, declined or all");
+  if (!st.success)
+    throw invalid("status: waiting, approved, declined, unsent or all");
   const q = (url.searchParams.get("q") ?? "")
     .trim()
     .toLowerCase()
     .slice(0, 200);
   const like = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
   const rows = await env.PLATFORM_DB.prepare(
-    `SELECT sub, email, note, joined_at, status, decided_by, decided_at FROM signup_waitlist
-WHERE (?1 = 'all' OR status = ?1)
+    `SELECT sub, email, note, joined_at, status, decided_by, decided_at, emailed_at FROM signup_waitlist
+WHERE (?1 = 'all' OR status = ?1 OR (?1 = 'unsent' AND status = 'approved' AND emailed_at IS NULL))
   AND (?2 = '' OR lower(email) LIKE ?3 ESCAPE '\\' OR lower(coalesce(note, '')) LIKE ?3 ESCAPE '\\')
 ORDER BY joined_at ASC, sub ASC LIMIT ?4`,
   )
@@ -187,6 +211,9 @@ async function sendApproval(env: Env, to: string): Promise<SendResult> {
       to,
       appDomain: env.APP_DOMAIN,
     });
+    // Never send to an address with controls, bidi characters or spaces.
+    if (msg.to !== to || !ADDRESS_RE.test(msg.to))
+      return { sent: false, error: "invalid_address" };
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -220,7 +247,106 @@ type ApproveResult = {
   result: "approved" | "already_approved" | "not_found";
   emailSent?: boolean;
   emailError?: string;
+  /** Approved before but never emailed: the email was sent again. */
+  resent?: boolean;
 };
+
+/**
+ * Sends the approval email for `sub` and records `emailed_at` when it went.
+ * A failure is logged and audited; the approval stands.
+ */
+async function emailApproved(
+  env: Env,
+  p: Principal,
+  sub: string,
+  email: string,
+  ip: string | undefined,
+  via: Via = {},
+): Promise<Pick<ApproveResult, "emailSent" | "emailError">> {
+  const sent = await sendApproval(env, email);
+  if (sent.sent) {
+    await env.PLATFORM_DB.prepare(
+      "UPDATE signup_waitlist SET emailed_at = ?2 WHERE sub = ?1",
+    )
+      .bind(sub, Date.now())
+      .run();
+    return { emailSent: true };
+  }
+  console.error("beta approval email failed", { sub, error: sent.error });
+  await tryAudit(env, {
+    action: BETA_ACTIONS.emailFailed,
+    actor: p,
+    outcome: "error",
+    code: "email_failed",
+    ip,
+    email,
+    detail: { ...via, sub, error: sent.error },
+  });
+  return { emailSent: false, emailError: sent.error };
+}
+
+/** Approves one waitlist row exactly as Approve does; never throws on a send failure. */
+async function approveRow(
+  env: Env,
+  p: Principal,
+  sub: string,
+  ip: string | undefined,
+  via: Via = {},
+): Promise<ApproveResult> {
+  const by = who(p);
+  const row = await env.PLATFORM_DB.prepare(
+    "SELECT email, status, emailed_at FROM signup_waitlist WHERE sub = ?1",
+  )
+    .bind(sub)
+    .first<{ email: string; status: string; emailed_at: number | null }>();
+  if (!row) return { sub, result: "not_found" };
+  if (row.status === "approved") {
+    if (row.emailed_at !== null)
+      return { sub, email: row.email, result: "already_approved" };
+    // Approved, but the email never went: approving again sends it again.
+    const email = normEmail(row.email);
+    return {
+      sub,
+      email,
+      result: "approved",
+      resent: true,
+      ...(await emailApproved(env, p, sub, email, ip, via)),
+    };
+  }
+  const email = normEmail(row.email);
+  const now = Date.now();
+  // One batch: the allow-list entry, the row's decision and the audit row
+  // (only if the decision changed a row, so a racing approve audits once).
+  const res = await env.PLATFORM_DB.batch([
+    env.PLATFORM_DB.prepare(
+      "INSERT OR IGNORE INTO signup_allowlist (entry, added_by, added_at) VALUES (?1, ?2, ?3)",
+    ).bind(email, by, now),
+    env.PLATFORM_DB.prepare(
+      "UPDATE signup_waitlist SET status = 'approved', decided_by = ?2, decided_at = ?3 WHERE sub = ?1 AND status <> 'approved'",
+    ).bind(sub, by, now),
+    await auditStatement(
+      env,
+      {
+        action: BETA_ACTIONS.approve,
+        actor: p,
+        outcome: "ok",
+        ip,
+        email,
+        detail: { ...via, sub, previous: row.status },
+      },
+      true,
+    ),
+  ]);
+  if ((res[1]?.meta.changes ?? 0) !== 1)
+    return { sub, email, result: "already_approved" };
+  // The approval stands whatever the send does.
+  return {
+    sub,
+    email,
+    result: "approved",
+    ...(await emailApproved(env, p, sub, email, ip, via)),
+  };
+}
 
 export async function approve(
   env: Env,
@@ -231,73 +357,9 @@ export async function approve(
 ): Promise<Json> {
   const parsed = ApproveSchema.safeParse(body);
   if (!parsed.success) throw invalid("subs: 1 to 100 sub ids");
-  const subs = [...new Set(parsed.data.subs)];
-  const by = who(p);
   const results: ApproveResult[] = [];
-  for (const sub of subs) {
-    const row = await env.PLATFORM_DB.prepare(
-      "SELECT email, status FROM signup_waitlist WHERE sub = ?1",
-    )
-      .bind(sub)
-      .first<{ email: string; status: string }>();
-    if (!row) {
-      results.push({ sub, result: "not_found" });
-      continue;
-    }
-    if (row.status === "approved") {
-      results.push({ sub, email: row.email, result: "already_approved" });
-      continue;
-    }
-    const email = normEmail(row.email);
-    const now = Date.now();
-    // One batch: the allow-list entry, the row's decision and the audit row
-    // (only if the decision changed a row, so a racing approve audits once).
-    const res = await env.PLATFORM_DB.batch([
-      env.PLATFORM_DB.prepare(
-        "INSERT OR IGNORE INTO signup_allowlist (entry, added_by, added_at) VALUES (?1, ?2, ?3)",
-      ).bind(email, by, now),
-      env.PLATFORM_DB.prepare(
-        "UPDATE signup_waitlist SET status = 'approved', decided_by = ?2, decided_at = ?3 WHERE sub = ?1 AND status <> 'approved'",
-      ).bind(sub, by, now),
-      await auditStatement(
-        env,
-        {
-          action: BETA_ACTIONS.approve,
-          actor: p,
-          outcome: "ok",
-          ip,
-          email,
-          detail: { ...via, sub, previous: row.status },
-        },
-        true,
-      ),
-    ]);
-    if ((res[1]?.meta.changes ?? 0) !== 1) {
-      results.push({ sub, email, result: "already_approved" });
-      continue;
-    }
-    // The approval stands whatever the send does.
-    const sent = await sendApproval(env, email);
-    if (!sent.sent) {
-      console.error("beta approval email failed", { sub, error: sent.error });
-      await tryAudit(env, {
-        action: BETA_ACTIONS.emailFailed,
-        actor: p,
-        outcome: "error",
-        code: "email_failed",
-        ip,
-        email,
-        detail: { ...via, sub, error: sent.error },
-      });
-    }
-    results.push({
-      sub,
-      email,
-      result: "approved",
-      emailSent: sent.sent,
-      ...(sent.sent ? {} : { emailError: sent.error }),
-    });
-  }
+  for (const sub of new Set(parsed.data.subs))
+    results.push(await approveRow(env, p, sub, ip, via));
   return ok({
     results,
     approved: results.filter((r) => r.result === "approved").length,
@@ -376,6 +438,16 @@ FROM signup_allowlist a ORDER BY a.added_at DESC, a.entry ASC LIMIT ?1`,
   });
 }
 
+type AddResult = {
+  entry: string;
+  /** An email entry with a waiting or declined waitlist row: approved and emailed. */
+  approved?: boolean;
+  emailSent?: boolean;
+  emailError?: string;
+  /** A domain entry: waiting people on it, left waiting. */
+  waitingOnDomain?: number;
+};
+
 export async function add(
   env: Env,
   p: Principal,
@@ -385,8 +457,9 @@ export async function add(
 ): Promise<Json> {
   const parsed = AddSchema.safeParse(body);
   if (!parsed.success) throw invalid("entries: 1 to 100 emails or @domains");
-  // Normalize first (the table has no CHECK), then validate, in order. The
-  // first bad entry refuses the whole call: nothing is added.
+  // Normalize first (the table has no CHECK), then validate every entry, in
+  // order. Any bad entry refuses the whole call, naming all of them: nothing
+  // is added.
   const entries = parsed.data.entries.map(normEntry);
   const have = new Set(
     (
@@ -396,24 +469,32 @@ export async function add(
     ).results.map((r) => r.entry),
   );
   const seen = new Set<string>();
+  const errors: { entry: string; message: string; reason: string }[] = [];
   for (const e of entries) {
     const bad =
       entryRefusal(e) ??
       (have.has(e) || seen.has(e)
         ? { message: duplicateMessage(e), reason: "duplicate" }
         : null);
-    if (bad) {
-      await tryAudit(env, {
-        action: BETA_ACTIONS.allowAdd,
-        actor: p,
-        outcome: "refused",
-        code: "invalid_input",
-        ip,
-        detail: { ...via, entry: e.slice(0, 100), reason: bad.reason },
-      });
-      throw invalid(bad.message, { entry: e, reason: bad.reason });
-    }
+    if (bad) errors.push({ entry: e, ...bad });
     seen.add(e);
+  }
+  if (errors.length) {
+    await tryAudit(env, {
+      action: BETA_ACTIONS.allowAdd,
+      actor: p,
+      outcome: "refused",
+      code: "invalid_input",
+      ip,
+      detail: {
+        ...via,
+        entries: errors.slice(0, 20).map((x) => ({
+          entry: x.entry.slice(0, 100),
+          reason: x.reason,
+        })),
+      },
+    });
+    throw invalid(errors.map((x) => x.message).join("\n"), { errors });
   }
   const now = Date.now();
   const by = who(p);
@@ -436,21 +517,54 @@ export async function add(
       ),
     );
   }
-  // An email added by hand clears that person's waiting row (no email goes:
-  // the admin chose to add them without approving).
-  const emails = entries.filter((e) => !e.startsWith("@"));
-  for (const e of emails)
-    stmts.push(
-      env.PLATFORM_DB.prepare(
-        "UPDATE signup_waitlist SET status = 'approved', decided_by = ?2, decided_at = ?3 WHERE email = ?1 AND status <> 'approved'",
-      ).bind(e, by, now),
-    );
   try {
     await env.PLATFORM_DB.batch(stmts);
   } catch {
     throw new ApiError("invalid_state", "the list changed; reload and retry");
   }
-  return ok({ added: entries });
+  const results: AddResult[] = [];
+  for (const e of entries) {
+    if (e.startsWith("@")) {
+      // A domain entry admits only Google Workspace accounts, and waitlist
+      // rows don't record hd: nobody is approved or emailed, the rows stay.
+      const n = await env.PLATFORM_DB.prepare(
+        "SELECT count(*) AS n FROM signup_waitlist WHERE status = 'waiting' AND substr(email, -length(?1)) = ?1",
+      )
+        .bind(e)
+        .first<{ n: number }>();
+      results.push({ entry: e, waitingOnDomain: n?.n ?? 0 });
+      continue;
+    }
+    // An exact email with a waiting or declined row: approved as Approve
+    // does it, the approval email included, its failure handled the same.
+    const subs = (
+      await env.PLATFORM_DB.prepare(
+        "SELECT sub FROM signup_waitlist WHERE email = ?1 AND status <> 'approved' ORDER BY joined_at, sub",
+      )
+        .bind(e)
+        .all<{ sub: string }>()
+    ).results.map((r) => r.sub);
+    const [first, ...rest] = subs;
+    if (first === undefined) {
+      results.push({ entry: e });
+      continue;
+    }
+    const r = await approveRow(env, p, first, ip, via);
+    // A second row for the same address is marked approved without a second email.
+    for (const sub of rest)
+      await env.PLATFORM_DB.prepare(
+        "UPDATE signup_waitlist SET status = 'approved', decided_by = ?2, decided_at = ?3 WHERE sub = ?1 AND status <> 'approved'",
+      )
+        .bind(sub, by, Date.now())
+        .run();
+    results.push({
+      entry: e,
+      approved: r.result === "approved",
+      ...(r.emailSent === undefined ? {} : { emailSent: r.emailSent }),
+      ...(r.emailError ? { emailError: r.emailError } : {}),
+    });
+  }
+  return ok({ added: entries, results });
 }
 
 export async function remove(
@@ -481,6 +595,12 @@ export async function remove(
       },
       true,
     ),
+    // An approved row whose email this entry is goes back to waiting (and
+    // forgets who decided and that it was emailed), so the person can be
+    // approved again. Only when the entry was there to remove.
+    env.PLATFORM_DB.prepare(
+      "UPDATE signup_waitlist SET status = 'waiting', decided_by = NULL, decided_at = NULL, emailed_at = NULL WHERE status = 'approved' AND email = ?1 AND changes() > 0",
+    ).bind(entry),
   ]);
   if ((res[0]?.meta.changes ?? 0) !== 1)
     throw new ApiError("not_found", "that entry is not on the list");
