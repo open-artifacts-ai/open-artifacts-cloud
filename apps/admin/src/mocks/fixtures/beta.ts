@@ -22,6 +22,7 @@ const person = (
   status,
   decidedBy: null,
   decidedAt: null,
+  emailedAt: null,
 });
 
 export const BETA_WAITLIST = (now: number): WaitPerson[] => [

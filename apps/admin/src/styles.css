@@ -2361,3 +2361,6 @@ code.oa-code,
   font-size: 16px;
   line-height: 1;
 }
+.oa-beta-unsent-head {
+  padding-top: 10px;
+}

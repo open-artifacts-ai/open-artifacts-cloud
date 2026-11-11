@@ -8,6 +8,8 @@ export type BetaMode = "false" | "true" | "test-users" | "invite";
 export type BetaStats = {
   waiting: number;
   declined: number;
+  /** Approved, but the approval email never went out. */
+  unsent: number;
   allowedEmails: number;
   allowedDomains: number;
   signupsToday: number;
@@ -15,7 +17,7 @@ export type BetaStats = {
   cap: number | null;
   mode: BetaMode;
 };
-export type WaitStatus = "waiting" | "approved" | "declined";
+export type WaitStatus = "waiting" | "approved" | "declined" | "unsent";
 export type WaitPerson = {
   sub: string;
   email: string;
@@ -24,6 +26,7 @@ export type WaitPerson = {
   status: WaitStatus;
   decidedBy: string | null;
   decidedAt: number | null;
+  emailedAt: number | null;
 };
 export type Allowed = {
   entry: string;
@@ -39,6 +42,7 @@ export type ApproveResult = {
     result: "approved" | "already_approved" | "not_found";
     emailSent?: boolean;
     emailError?: string;
+    resent?: boolean;
   }[];
   approved: number;
   emailFailed: number;

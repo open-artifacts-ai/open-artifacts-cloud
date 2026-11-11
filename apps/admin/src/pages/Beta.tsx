@@ -104,6 +104,11 @@ export function Beta() {
     ...waitlistQuery({ status: "declined", q }),
     enabled: showDeclined,
   });
+  // Approved, but the email never went out: each has "Send email again".
+  const unsent = useQuery({
+    ...waitlistQuery({ status: "unsent", q: "" }),
+    enabled: (stats.data?.unsent ?? 0) > 0,
+  });
   const allowed = useQuery(allowedQuery());
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<Confirm | null>(null);
@@ -142,6 +147,13 @@ export function Beta() {
               : `Approved ${who}, but ${failed.length} ${failed.length === 1 ? "email" : "emails"} didn't send. They're on the list; tell them yourself.`,
         });
       else if (done.length === 0) setToast({ text: "Nobody new to approve." });
+      else if (done.every((x) => x.resent))
+        setToast({
+          text:
+            done.length === 1
+              ? `Emailed ${who}.`
+              : `Emailed ${done.length} people.`,
+        });
       else
         setToast({
           text:
@@ -401,6 +413,40 @@ export function Beta() {
           </table>
         </div>
       )}
+
+      {(stats.data?.unsent ?? 0) > 0 &&
+        (unsent.data?.items.length ?? 0) > 0 && (
+          <div className="oa-beta-card oa-tablewrap" data-testid="beta-unsent">
+            <p className="oa-beta-hint oa-beta-unsent-head">
+              Approved, but the email didn't send.
+            </p>
+            <table className="oa-beta-table" aria-label="Approved, not emailed">
+              <tbody>
+                {unsent.data?.items.map((r) => (
+                  <tr key={r.sub}>
+                    <td className="em">
+                      {r.email}
+                      <span className="oa-beta-tag">not emailed</span>
+                    </td>
+                    <td className="dt" title={fullDate(r.joinedAt)}>
+                      {fmtJoined(r.joinedAt, now)}
+                    </td>
+                    <td className="act">
+                      <button
+                        type="button"
+                        className="oa-btn oa-btn-sm"
+                        disabled={approve.isPending}
+                        onClick={() => approve.mutate([r.sub])}
+                      >
+                        Send email again
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
       <div className="oa-beta-sec">
         <h2>Allowed</h2>

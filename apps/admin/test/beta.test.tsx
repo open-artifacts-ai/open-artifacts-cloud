@@ -276,6 +276,35 @@ it("adding an exact email whose approval email fails keeps them approved and say
   expect(t).toHaveAttribute("role", "alert");
 });
 
+it("an approved row whose email didn't send shows 'Send email again', which sends it", async () => {
+  const failEmailFor = ["sub-sam"];
+  swap(createBetaMock({ failEmailFor }));
+  renderApp("/beta");
+  const row = (await screen.findByText("sam.rivera@northwind.io")).closest(
+    "tr",
+  ) as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: "Approve" }));
+  expect(await screen.findByTestId("beta-toast")).toHaveTextContent(
+    "but the email didn't send",
+  );
+  const unsent = await screen.findByTestId("beta-unsent");
+  expect(
+    within(unsent).getByText("sam.rivera@northwind.io"),
+  ).toBeInTheDocument();
+  failEmailFor.length = 0;
+  fireEvent.click(
+    within(unsent).getByRole("button", { name: "Send email again" }),
+  );
+  expect(
+    await screen.findByText("Emailed sam.rivera@northwind.io."),
+  ).toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByTestId("beta-unsent")).toBeNull());
+  expect(writes().map((w) => w.body)).toEqual([
+    { subs: ["sub-sam"] },
+    { subs: ["sub-sam"] },
+  ]);
+});
+
 it("search filters the waitlist by email or note; no match and empty states say so", async () => {
   renderApp("/beta");
   await screen.findByText("maya@acme.com");
@@ -323,6 +352,7 @@ it("a note is shown as text only, with control, bidi and zero-width characters s
           status: "waiting",
           decidedBy: null,
           decidedAt: null,
+          emailedAt: null,
         },
       ],
     }),

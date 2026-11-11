@@ -22,10 +22,19 @@ const esc = (s: string): string =>
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
-/** Strips control characters (CR/LF included) so a value can't inject headers. */
-const oneLine = (s: string): string =>
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
-  s.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, " ").trim();
+/**
+ * An address we will send to: printable ASCII only (no controls, spaces or
+ * bidi and zero-width characters), one '@', a dotted domain of letters,
+ * digits and hyphens. The local part is `[!-?A-~]`: 0x21 to 0x7E without '@'.
+ */
+export const ADDRESS_RE = /^[!-?A-~]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+
+/**
+ * Drops control (CR/LF included), format (bidi overrides, zero-width, BOM),
+ * line and paragraph separator characters, so a value can't inject headers.
+ */
+export const sanitizeAddress = (s: string): string =>
+  s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, "").trim();
 
 /** https://signup.<app domain>/ */
 export const signupLink = (appDomain: string): string =>
@@ -36,7 +45,7 @@ export function approvalEmail(o: {
   to: string;
   appDomain: string;
 }): ApprovalEmail {
-  const to = oneLine(o.to);
+  const to = sanitizeAddress(o.to);
   const link = signupLink(o.appDomain);
   const url = new URL(link);
   if (url.origin !== link.replace(/\/$/, "")) throw new Error("invalid domain");
@@ -98,5 +107,5 @@ export function approvalEmail(o: {
 </body>
 </html>
 `;
-  return { from: o.from, to: o.to, subject: APPROVAL_SUBJECT, text, html };
+  return { from: o.from, to, subject: APPROVAL_SUBJECT, text, html };
 }

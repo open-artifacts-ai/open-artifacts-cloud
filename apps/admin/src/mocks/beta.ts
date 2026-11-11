@@ -22,9 +22,20 @@ const PUBLIC: Record<string, string> = {
   "icloud.com": "iCloud",
   "proton.me": "Proton",
   "protonmail.com": "Proton",
+  "aol.com": "AOL",
+  "live.com": "Live",
+  "msn.com": "MSN",
+  "me.com": "iCloud",
+  "mac.com": "iCloud",
+  "gmx.com": "GMX",
+  "gmx.de": "GMX",
+  "yandex.com": "Yandex",
+  "yandex.ru": "Yandex",
+  "mail.com": "Mail.com",
+  "zoho.com": "Zoho",
 };
 const DOMAIN_RE = /^@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
-const EMAIL_RE = /^[^@\s]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
+const EMAIL_RE = /^[!-?A-~]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
 export function createBetaMock(
   o: {
@@ -51,6 +62,8 @@ export function createBetaMock(
   const stats = (): BetaStats => ({
     waiting: wait.filter((w) => w.status === "waiting").length,
     declined: wait.filter((w) => w.status === "declined").length,
+    unsent: wait.filter((w) => w.status === "approved" && w.emailedAt === null)
+      .length,
     allowedEmails: allowed.filter((a) => a.kind === "email").length,
     allowedDomains: allowed.filter((a) => a.kind === "domain").length,
     signupsToday: o.signupsToday ?? 7,
@@ -64,7 +77,13 @@ export function createBetaMock(
       const st = u.searchParams.get("status") ?? "waiting";
       const q = (u.searchParams.get("q") ?? "").toLowerCase();
       const items = wait
-        .filter((w) => st === "all" || w.status === st)
+        .filter((w) =>
+          st === "all"
+            ? true
+            : st === "unsent"
+              ? w.status === "approved" && w.emailedAt === null
+              : w.status === st,
+        )
         .filter(
           (w) =>
             !q ||
@@ -88,10 +107,11 @@ export function createBetaMock(
           results.push({ sub, result: "not_found" });
           continue;
         }
-        if (w.status === "approved") {
+        if (w.status === "approved" && w.emailedAt !== null) {
           results.push({ sub, email: w.email, result: "already_approved" });
           continue;
         }
+        const resent = w.status === "approved";
         w.status = "approved";
         w.decidedBy = "admin@example.com";
         w.decidedAt = now();
@@ -104,10 +124,12 @@ export function createBetaMock(
             fromWaitlist: true,
           });
         const fail = o.failEmailFor?.includes(sub);
+        w.emailedAt = fail ? null : now();
         results.push({
           sub,
           email: w.email,
           result: "approved",
+          ...(resent ? { resent: true } : {}),
           emailSent: !fail,
           ...(fail ? { emailError: "E_SENDER_NOT_VERIFIED" } : {}),
         });
@@ -180,6 +202,7 @@ export function createBetaMock(
         }
         w.status = "approved";
         const fail = o.failEmailFor?.includes(w.sub);
+        w.emailedAt = fail ? null : now();
         results.push({
           entry: e,
           approved: true,
@@ -194,6 +217,13 @@ export function createBetaMock(
       if (!allowed.some((a) => a.entry === entry))
         return err("not_found", 404, "that entry is not on the list");
       allowed = allowed.filter((a) => a.entry !== entry);
+      for (const w of wait)
+        if (w.email === entry && w.status === "approved") {
+          w.status = "waiting";
+          w.decidedBy = null;
+          w.decidedAt = null;
+          w.emailedAt = null;
+        }
       return HttpResponse.json({ removed: entry });
     }),
   ];
