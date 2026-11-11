@@ -189,11 +189,11 @@ describe("staging-smoke-gate.sh", () => {
     });
     expect(r.code).toBe(1);
     expect(r.err).toContain(
-      `the newest run 7 (head ${"c".repeat(40)}) is not at or after ${TAG}'s commit ${TSHA} (behind)`,
+      `the newest completed run 7 (head ${"c".repeat(40)}) is not at or after ${TAG}'s commit ${TSHA} (behind)`,
     );
   });
 
-  it("refuses while the newest run is queued or running: retry when it finishes", () => {
+  it("ignores a newer run that is queued or running, with a note, and uses the completed green run", () => {
     for (const status of ["in_progress", "queued", "waiting", "pending"]) {
       const newer = runOf({
         id: 10,
@@ -202,21 +202,45 @@ describe("staging-smoke-gate.sh", () => {
         run_started_at: "2026-11-03T12:00:00Z",
       });
       const r = gate([newer, runOf()]);
-      expect(r.code, status).toBe(1);
-      expect(r.err, status).toContain(
-        `staging smoke is running (run 10 is ${status}); retry when it finishes`,
+      expect(r.code, status).toBe(0);
+      expect(r.out, status).toContain(
+        "ignoring deploy-staging.yml run(s) 10, not completed yet",
       );
-      expect(r.log.some((l) => l.includes("/compare/"))).toBe(false);
+      expect(r.out, status).toContain("green in run 9");
+      expect(r.log.some((l) => l.includes("/runs/10/"))).toBe(false);
     }
-    const r = gate([runOf({ status: null })]);
-    expect(r.code).toBe(1);
-    expect(r.err).toContain("run 9 is none");
   });
 
-  it("a red run being re-run is never passed over for an older green one", () => {
-    // Run 10 went red, then someone re-ran it: its new attempt is running and
-    // is the newest start. The listing must not filter on status=completed
-    // (the stub honours that filter, as the API does), or run 9 would pass.
+  it("a newer completed red run still blocks, even beside an in-progress one", () => {
+    const red = runOf({ id: 10, run_started_at: "2026-11-03T10:00:00Z" });
+    const running = runOf({
+      id: 11,
+      status: "in_progress",
+      conclusion: null,
+      run_started_at: "2026-11-03T12:00:00Z",
+    });
+    const r = gate([running, red, runOf()], {
+      jobs: { "9": jobsOf("success"), "10": jobsOf("failure") },
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("run 10's smoke job: failure");
+  });
+
+  it("refuses when no completed run is at or after the tag", () => {
+    // Only an in-progress run exists.
+    const running = runOf({ status: "in_progress", conclusion: null });
+    const a = gate([running]);
+    expect(a.code).toBe(1);
+    expect(a.err).toContain("no completed deploy-staging.yml run on main");
+    expect(a.out).toContain("ignoring deploy-staging.yml run(s) 9");
+    // The only completed run is before the tag.
+    const b = gate([runOf(), { ...running, id: 10 }], { compare: "behind" });
+    expect(b.code).toBe(1);
+    expect(b.err).toContain("is not at or after");
+    expect(b.log.some((l) => l.includes("/jobs"))).toBe(false);
+  });
+
+  it("a red run being re-run (its attempt in progress) is ignored until it completes", () => {
     const rerunning = runOf({
       id: 10,
       status: "in_progress",
@@ -224,11 +248,9 @@ describe("staging-smoke-gate.sh", () => {
       created_at: "2026-11-03T10:00:00Z",
       run_started_at: "2026-11-03T12:00:00Z",
     });
-    const r = gate([rerunning, runOf()], {
-      jobs: { "9": jobsOf("success"), "10": jobsOf("failure") },
-    });
-    expect(r.code).toBe(1);
-    expect(r.err).toContain("staging smoke is running (run 10 is in_progress)");
+    const r = gate([rerunning, runOf()]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("ignoring deploy-staging.yml run(s) 10");
     expect(r.log[1]).not.toContain("status=");
   });
 
@@ -253,7 +275,7 @@ describe("staging-smoke-gate.sh", () => {
     for (const runs of [[], [runOf({ head_branch: "feature" })]]) {
       const r = gate(runs);
       expect(r.code).toBe(1);
-      expect(r.err).toContain("no deploy-staging.yml run on main");
+      expect(r.err).toContain("no completed deploy-staging.yml run on main");
     }
   });
 
