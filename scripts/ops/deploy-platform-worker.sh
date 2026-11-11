@@ -184,7 +184,10 @@ case "$app" in
     fill "SIGNUP_DAILY_CAP_${up}" "${SIGNUP_DAILY_CAP:-}" "$cap"
     # Closed: each signup is acked and its row stays pending.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
-    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    # Only when this tag's config declares it (an older tag has no approval email).
+    if grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' wrangler.jsonc; then
+      fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    fi
     # The account wrangler deploys to is the one the Workflows provision in.
     fill "ACCOUNT_ID_${up}" "${CLOUDFLARE_ACCOUNT_ID:-}" "$hex32"
     fill "SECRETS_STORE_ID_${up}" "${SECRETS_STORE_ID:-}" "$hex32"
@@ -199,7 +202,10 @@ case "$app" in
     # a literal false, so this fill only checks the value there.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
     # The approval email's sender (#2096), the provisioner's value.
-    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    # Only when this tag's config declares it (an older tag has no approval email).
+    if grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' wrangler.jsonc; then
+      fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    fi
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"

@@ -62,6 +62,10 @@ ALLOW=(
   .github/workflows/staging-stripe-prices.yml
   scripts/ops/stripe-prices.ts
   scripts/ops/stripe-prices.test.ts
+  # Real v0.154.0 wrangler configs (#172): fixtures for the tag-aware deploy
+  # read-backs, this repo's own. diff -rq reports a wholly extra directory by
+  # its own path, so the entry is exact.
+  scripts/ops/test-fixtures
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
