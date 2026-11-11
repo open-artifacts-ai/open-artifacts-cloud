@@ -98,6 +98,9 @@ export interface Env {
   /** Solo's two prices (#1568): $1/month and $10/year, one per interval. */
   STRIPE_PRICE_SOLO_MONTHLY: string;
   STRIPE_PRICE_SOLO_YEARLY: string;
+  /** Per-creator yearly prices ($100 Team, $250 Business); empty string means unset (the Worker always receives the var). */
+  STRIPE_PRICE_TEAM_YEARLY: string;
+  STRIPE_PRICE_BUSINESS_YEARLY: string;
   /**
    * Staging only: comma list of exact install ids whose customer is made on a
    * Stripe test clock (test-clock.ts). Absent in prod; ignored unless staging

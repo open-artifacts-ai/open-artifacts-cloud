@@ -5,6 +5,7 @@
 // environment variable NAME (the value deploy-platform-worker.sh filled); an
 // unset or empty one exits 1, so a read-back never compares to a placeholder.
 // Usage: node scripts/ops/wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups
+// observability: true when the env block enables it (false when it says nothing).
 // signups: the env block's SIGNUPS_ENABLED as deployed (null when it has none).
 // alert-pins (the scheduler, design v7 4.8): "pinned" when the env block's
 // alert vars and ALERT_EMAIL's destination are all this env's placeholders,
@@ -45,6 +46,7 @@ export interface RateLimit {
 interface Block {
   vars?: Record<string, unknown>;
   send_email?: { name?: string; destination_address?: string }[];
+  observability?: { enabled?: boolean };
   services?: { binding?: string; service?: string; entrypoint?: string }[];
   ratelimits?: {
     name: string;
@@ -53,11 +55,22 @@ interface Block {
   }[];
 }
 
+/** Whether the env block turns observability on (false when it says nothing). */
+export function committedObservability(src: string, env: Env): boolean {
+  return block(src, env).observability?.enabled === true;
+}
+
 function block(src: string, env: Env): Block {
   const b = JSON.parse(stripJsonc(src)).env?.[env] as Block | undefined;
   if (!b) throw new Error(`no env.${env} block`);
   return b;
 }
+
+/** Placeholders that may stay unset: the yearly prices, until they are made. */
+const OPTIONAL = new Set([
+  "STRIPE_PRICE_TEAM_YEARLY",
+  "STRIPE_PRICE_BUSINESS_YEARLY",
+]);
 
 /** One var's committed value, each {{NAME_<ENV>}} filled from `values[NAME]`. */
 function fillVar(
@@ -70,6 +83,7 @@ function fillVar(
   return String(v).replace(/\{\{([A-Z0-9_]+)\}\}/g, (_, p: string) => {
     const name = p.endsWith(`_${up}`) ? p.slice(0, -up.length - 1) : null;
     const value = name ? values[name] : undefined;
+    if (!value && name && OPTIONAL.has(name)) return "";
     if (!value) throw new Error(`${k}: {{${p}}} has no value`);
     return value;
   });
@@ -186,7 +200,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|observability",
     );
     process.exit(2);
   }
@@ -196,6 +210,7 @@ if (
     if (what === "vars") out = committedVars(src, env, process.env);
     else if (what === "ratelimits") out = committedRateLimits(src, env);
     else if (what === "signups") out = committedSignups(src, env, process.env);
+    else if (what === "observability") out = committedObservability(src, env);
     else if (what === "billing") out = committedBilling(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";

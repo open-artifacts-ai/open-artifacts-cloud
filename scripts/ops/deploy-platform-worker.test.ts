@@ -621,6 +621,41 @@ describe("deploy-platform-worker.sh", () => {
       }
     });
 
+    // main's wrapper deploys the tag's own config: a tag cut before the
+    // approval email (#2096) has no WELCOME_FROM placeholder and needs no value.
+    it("a tag before the approval email deploys without WELCOME_FROM; one that declares it still needs it", () => {
+      const old = CONFIG.split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+      const { WELCOME_FROM: _, ...rest } = OK;
+      for (const env of ["staging", "prod"]) {
+        for (const w of [undefined, ""]) {
+          const r = run(
+            ["provisioner", env],
+            w === undefined ? rest : { ...rest, WELCOME_FROM: w },
+            tree(old),
+          );
+          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.log[0]).toBe(
+            `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
+          );
+          expect(readFileSync(r.snap, "utf8")).not.toContain("WELCOME_");
+        }
+        // A config with only the binding, or only the var, still requires a valid sender.
+        for (const keep of ["WELCOME_FROM", "WELCOME_EMAIL"]) {
+          const half = CONFIG.split("\n")
+            .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
+            .join("\n");
+          const r = run(["provisioner", env], rest, tree(half));
+          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.log).toEqual([]);
+        }
+        const cur = run(["provisioner", env], rest, tree(CONFIG));
+        expect(cur.code, env).toBe(1);
+        expect(cur.log).toEqual([]);
+      }
+    });
+
     it("refuses a placeholder the fills don't cover", () => {
       const script = tree(
         CONFIG.replace(
@@ -786,6 +821,41 @@ describe("deploy-platform-worker.sh", () => {
             expect(r.code, `${env} ${key}=${v}`).toBe(1);
             expect(r.log).toEqual([]);
           }
+    });
+
+    // main's wrapper deploys the tag's own config: a tag cut before the
+    // approval email (#2096) has no WELCOME_FROM placeholder and needs no value.
+    it("a tag before the approval email deploys without WELCOME_FROM; one that declares it still needs it", () => {
+      const old = CONFIG.split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+      const { WELCOME_FROM: _, ...rest } = OK;
+      for (const env of ["staging", "prod"]) {
+        for (const w of [undefined, ""]) {
+          const r = run(
+            ["provisioning", env],
+            w === undefined ? rest : { ...rest, WELCOME_FROM: w },
+            tree(old),
+          );
+          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.log[0]).toBe(
+            `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
+          );
+          expect(readFileSync(r.snap, "utf8")).not.toContain("WELCOME_");
+        }
+        // A config with only the binding, or only the var, still requires a valid sender.
+        for (const keep of ["WELCOME_FROM", "WELCOME_EMAIL"]) {
+          const half = CONFIG.split("\n")
+            .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
+            .join("\n");
+          const r = run(["provisioning", env], rest, tree(half));
+          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.log).toEqual([]);
+        }
+        const cur = run(["provisioning", env], rest, tree(CONFIG));
+        expect(cur.code, env).toBe(1);
+        expect(cur.log).toEqual([]);
+      }
     });
 
     it("refuses to deploy without the admin build's dist-assets/index.html", () => {
@@ -972,6 +1042,9 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(
           `"STRIPE_PRICE_SOLO_YEARLY": "${PRICES.STRIPE_PRICE_SOLO_YEARLY}"`,
         );
+        // The optional yearly prices are deployed empty when unset.
+        expect(snap).toContain('"STRIPE_PRICE_TEAM_YEARLY": ""');
+        expect(snap).toContain('"STRIPE_PRICE_BUSINESS_YEARLY": ""');
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         // Only this env's placeholders are filled.
         const other = env === "staging" ? "PROD" : "STAGING";
@@ -981,10 +1054,33 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`{{STRIPE_PRICE_BUSINESS_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_SOLO_MONTHLY_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_SOLO_YEARLY_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_TEAM_YEARLY_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_BUSINESS_YEARLY_${other}}}`);
         expect(r.out + r.err).not.toContain(DB);
         expect(r.out + r.err).not.toContain(REG);
         expect(existsSync(join(DIR, "wrangler.deploy.jsonc"))).toBe(false);
       });
+
+    it("fills the yearly prices when set and refuses a malformed one", () => {
+      const r = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PRICE_TEAM_YEARLY: "price_1TeamYr",
+        STRIPE_PRICE_BUSINESS_YEARLY: "price_1BizYr",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(r.code).toBe(0);
+      const snap = readFileSync(r.snap, "utf8");
+      expect(snap).toContain('"STRIPE_PRICE_TEAM_YEARLY": "price_1TeamYr"');
+      expect(snap).toContain('"STRIPE_PRICE_BUSINESS_YEARLY": "price_1BizYr"');
+      const bad = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PRICE_TEAM_YEARLY: "prod_1",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(bad.code).toBe(1);
+    });
 
     it("refuses a missing or malformed D1 or registry id", () => {
       for (const env of [

@@ -1065,6 +1065,233 @@ describe("deploy-hosted-platform.sh", () => {
     expect(noProv.err).toContain("oa-p-provisioner does not exist");
     expect(noProv.log.some((l) => l.startsWith("wrapper"))).toBe(false);
   });
+  describe("the approval email follows the tag's own wrangler (#2096): required only when the tag declares it", () => {
+    // main's scripts run against the tag's Workers: a tag cut before the
+    // approval email (no WELCOME_FROM, no send_email WELCOME_EMAIL) must deploy
+    // and verify, and a tag that declares it keeps every strict check.
+    const WDEPS = {
+      provisioner: [] as string[],
+      provisioning: ["oa-p-provisioner", "oa-p-auth-broker"],
+    } as const;
+    const withoutWelcome = (src: string) =>
+      src
+        .split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+    const liveEdit = (
+      key: string,
+      f: (b: { name: string; type: string }[]) => unknown[],
+    ) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = f(next.result.bindings);
+      return JSON.stringify(next);
+    };
+    const liveWithoutWelcome = (key: string) =>
+      liveEdit(key, (b) => b.filter((x) => !x.name.startsWith("WELCOME_")));
+    for (const app of ["provisioner", "provisioning"] as const) {
+      const real = readFileSync(
+        join(root, "apps", app, "wrangler.jsonc"),
+        "utf8",
+      );
+      const old = withoutWelcome(real);
+
+      it(`${app}, a tag before the approval email: deploys and verifies without WELCOME_FROM or the binding`, () => {
+        expect(old).not.toMatch(/WELCOME_/);
+        const r = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+          next: { [`oa-p-${app}`]: liveWithoutWelcome(`oa-p-${app}`) },
+        }).run(app, { WELCOME_FROM: "" });
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`prod ${app}: deployed and verified`);
+        clean(r);
+      });
+
+      it(`${app}, a tag before the approval email: a WELCOME_EMAIL binding it never declared still fails`, () => {
+        const bad = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+        }).run(app, { WELCOME_FROM: "" });
+        expect(bad.code).toBe(1);
+        expect(bad.err).toContain("WELCOME_EMAIL: got 'send_email', want ''");
+      });
+
+      it(`${app}, a current tag: WELCOME_FROM is required, and the binding must be live as send_email`, () => {
+        const need = setup({ exists: WDEPS[app] }).run(app, {
+          WELCOME_FROM: "",
+        });
+        expect(need.code).toBe(2);
+        expect(need.log.filter((l) => l.startsWith("wrapper"))).toEqual([]);
+        for (const [why, live] of [
+          ["missing", liveWithoutWelcome(`oa-p-${app}`)],
+          [
+            "wrong type",
+            liveEdit(`oa-p-${app}`, (b) =>
+              b.map((x) =>
+                x.name === "WELCOME_EMAIL" ? { ...x, type: "plain_text" } : x,
+              ),
+            ),
+          ],
+        ] as const) {
+          const bad = setup({
+            exists: WDEPS[app],
+            next: { [`oa-p-${app}`]: live },
+          }).run(app);
+          expect(bad.code, why).toBe(1);
+          expect(bad.err, why).toContain("WELCOME_EMAIL: got");
+        }
+      });
+    }
+  });
+
+  describe("the observability read-back follows the tag's own wrangler (#164): strict only when the tag turns it on", () => {
+    const WDEPS = {
+      provisioner: [] as string[],
+      provisioning: ["oa-p-provisioner", "oa-p-auth-broker"],
+    } as const;
+    // The same config as a tag cut before #164 had it: observability off.
+    const offConfig = (src: string) =>
+      src.replace(
+        /"observability": \{[\s\S]*?"head_sampling_rate": 1\s*\}\s*\}/g,
+        '"observability": { "enabled": false }',
+      );
+    const bindingsOf = (key: string) =>
+      JSON.parse(NEXT[key] as string).result.bindings;
+    for (const app of ["provisioner", "provisioning"] as const) {
+      const real = readFileSync(
+        join(root, "apps", app, "wrangler.jsonc"),
+        "utf8",
+      );
+      const old = offConfig(real);
+      const key = `oa-p-${app}`;
+
+      it(`${app}, a tag with observability off: deploys and verifies with it off; a live-on Worker fails`, () => {
+        expect(old).not.toContain("invocation_logs");
+        const ok = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+          next: { [key]: settingsOff(bindingsOf(key)) },
+        }).run(app);
+        expect(ok.err).toBe("");
+        expect(ok.code).toBe(0);
+        const bad = setup({ configs: { [app]: old }, exists: WDEPS[app] }).run(
+          app,
+        );
+        expect(bad.code).toBe(1);
+        expect(bad.err).toContain("observability: got 'true', want 'false'");
+      });
+
+      it(`${app}, a tag with observability on: off, or invocation logs on or unset, still fails`, () => {
+        for (const [why, live, msg] of [
+          [
+            "off",
+            settingsOff(bindingsOf(key)),
+            "observability: got 'false', want 'true'",
+          ],
+          [
+            "invocation on",
+            settings(bindingsOf(key), true, true),
+            "observability invocation_logs",
+          ],
+          [
+            "invocation unset",
+            settings(bindingsOf(key), true, null),
+            "observability invocation_logs",
+          ],
+        ] as const) {
+          const bad = setup({
+            exists: WDEPS[app],
+            next: { [key]: live },
+          }).run(app);
+          expect(bad.code, why).toBe(1);
+          expect(bad.err, why).toContain(msg);
+        }
+      });
+    }
+  });
+
+  describe("the real v0.154.0 tag (fixtures): main's scripts deploy and verify every prod target", () => {
+    // The tag's own configs (scripts/ops/test-fixtures/v0.154.0/README.md),
+    // with the live state that tag produced: observability off, and no
+    // WELCOME_EMAIL on the provisioning Worker (its config predates #154).
+    const FIX = (app: string) =>
+      readFileSync(
+        join(
+          root,
+          "scripts/ops/test-fixtures/v0.154.0",
+          `${app}.wrangler.jsonc`,
+        ),
+        "utf8",
+      );
+    const APPS = [
+      "auth-broker",
+      "directory-broker",
+      "dispatch",
+      "inventory",
+      "provisioner",
+      "provisioning",
+      "scheduler",
+    ];
+    // billing is staging only: the script refuses it on prod.
+    const configs = Object.fromEntries(APPS.map((a) => [a, FIX(a)]));
+    const PROD_WORKERS = [
+      "oa-p-auth-broker",
+      "oa-p-directory-broker",
+      "oa-p-provisioner",
+      "oa-p-provisioning",
+    ];
+    const live = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.observability = { enabled: false };
+      return JSON.stringify(next);
+    };
+    const tagLive = (app: "provisioner" | "provisioning") => {
+      const key = `oa-p-${app}`;
+      const next = JSON.parse(live(key));
+      if (app === "provisioning")
+        next.result.bindings = next.result.bindings.filter(
+          (b: { name: string }) => !b.name.startsWith("WELCOME_"),
+        );
+      return JSON.stringify(next);
+    };
+    const invVars = committedVars(FIX("inventory"), "prod", {
+      GITHUB_REPOSITORY_ID: REPO_ID,
+    });
+    const invLive = settingsOff([
+      { type: "d1", name: "PLATFORM_DB", id: DB },
+      { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+      ...Object.entries(invVars).map(([name, text]) => ({
+        type: "plain_text",
+        name,
+        text,
+      })),
+    ]);
+    for (const target of APPS) {
+      it(`${target}`, () => {
+        const next: Record<string, string> = {};
+        if (target === "provisioner" || target === "provisioning")
+          next[`oa-p-${target}`] = tagLive(target);
+        if (target === "inventory") next["oa-p-inventory"] = invLive;
+        if (target === "dispatch")
+          next["oa-p-dispatch"] = live("oa-p-dispatch");
+        const r = setup({
+          configs,
+          exists: [...PROD_WORKERS, ...SCHED_DEPS("p")],
+          next,
+        }).run(
+          target,
+          target === "inventory"
+            ? { GITHUB_REPOSITORY: invVars.OIDC_REPOSITORY ?? "o/r" }
+            : {},
+        );
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`prod ${target}: deployed and verified`);
+      });
+    }
+  });
+
   describe("the scheduler's alert wiring (#915's placeholders, or none before it)", () => {
     // #915's config, and the repo's own once it carries the placeholders.
     const PINNED = [
@@ -1825,6 +2052,7 @@ describe("deploy-hosted-platform.sh", () => {
         ],
         ["STRIPE_PRICE_TEAM", "prod_1Abc", "price id"],
         ["STRIPE_PRICE_SOLO_YEARLY", "price_1 Abc", "price id"],
+        ["STRIPE_PRICE_TEAM_YEARLY", "prod_1Abc", "price id"],
       ] as const) {
         const r = stg().run("billing", { [k]: v }, "staging");
         expect(r.code, `${k}=${v}`).toBe(2);

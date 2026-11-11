@@ -26,7 +26,8 @@
 #                    BROKER_REGISTRY_ID MAIN_BILLING_MIGRATION_LOCK (main's
 #                    apps/billing/migration-lock.json; migrations,
 #                    scripts/ops/billing-db.ts) the four Stripe price ids
-#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY)
+#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY; optional
+#                    _TEAM_YEARLY, _BUSINESS_YEARLY until made)
 #                    and, unless VERIFY_ONLY, STRIPE_SECRET_KEY and
 #                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
 #                    only, both put on the Worker, a run without them fails
@@ -314,6 +315,47 @@ billing_bound() {
     "$want" "$2 BILLING binding"
 }
 
+# The approval email (#2096: WELCOME_FROM, the send_email WELCOME_EMAIL binding)
+# is required only when the tag being deployed declares it: main's scripts run
+# against the tag's Workers, so an older tag (whose wrangler has neither) must
+# not fail for lack of it. Either one in the tag's config counts as declared,
+# so a half-declared config is never loosened.
+# welcome_declared <app>: in the main shell (no subshell to swallow the exit),
+# sets WELCOME_DECLARED=1 when the tag's apps/<app>/wrangler.jsonc names
+# WELCOME_FROM or WELCOME_EMAIL, else "". Unreadable: exit 1.
+WELCOME_DECLARED=""
+welcome_declared() {
+  local rc=0
+  WELCOME_DECLARED=""
+  grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' "$root/apps/$1/wrangler.jsonc" || rc=$?
+  [ "$rc" -le 1 ] || { echo "can't read $1's committed wrangler.jsonc" >&2; exit 1; }
+  [ "$rc" -ne 0 ] || WELCOME_DECLARED=1
+}
+# welcome_bound <settings json>, after welcome_declared: when declared, the live binding is send_email; otherwise none.
+welcome_bound() {
+  local want=""
+  [ -z "$WELCOME_DECLARED" ] || want=send_email
+  expect "$1" '[.result.bindings[] | select(.name == "WELCOME_EMAIL") | .type] | join(",")' "$want" "WELCOME_EMAIL"
+}
+
+# Workers Logs (#164) is checked strictly only when the tag being deployed
+# turns observability on; an older tag (observability off or unstated) must
+# read back off, and nothing is loosened for a tag that declares it.
+# observability_is <settings json> <app>
+observability_is() {
+  local c
+  c="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/wrangler-env.ts" "$root/apps/$2/wrangler.jsonc" "$env" observability)" ||
+    { echo "can't read $2's committed observability" >&2; exit 1; }
+  if [ "$c" = true ]; then
+    expect "$1" '.result.observability.enabled // false' true "observability"
+    # An explicit false is required (a missing field is "null" and fails;
+    # Cloudflare defaults it to on).
+    expect "$1" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
+  else
+    expect "$1" '.result.observability.enabled // false' false "observability"
+  fi
+}
+
 # broker_pin: provision's BROKER_GOOGLE_CLIENT_ID[$env] from $BROKER_PIN_FILE
 # (main's wfp.ts), or "null". Exit 1 when the pin can't be read.
 # shellcheck disable=SC2016 # the JS template literal is single-quoted on purpose
@@ -352,7 +394,9 @@ case "$target" in
     echo "$name: present in Secrets Store, modified $modified"
     ;;
   provisioner)
-    need PLATFORM_DB_ID; need SECRETS_STORE_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED; need WELCOME_FROM
+    need PLATFORM_DB_ID; need SECRETS_STORE_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
+    welcome_declared provisioner
+    [ -z "$WELCOME_DECLARED" ] || need WELCOME_FROM
     signups_committed provisioner
     # BILLING (#1568, staging only, when the tag declares it): the provisioner
     # starts an install's Solo trial through billing's BillingProvisionerRpc.
@@ -377,12 +421,12 @@ case "$target" in
       echo "R2 bucket $bucket created"
     fi
     PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
-      SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="$WELCOME_FROM" deploy provisioner
+      SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
     S="$(settings oa-$P-provisioner)"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
     expect "$S" '.result.bindings[] | select(.name == "RELEASES") | .bucket_name' "$bucket" "RELEASES"
-    expect "$S" '.result.bindings[] | select(.name == "WELCOME_EMAIL") | .type' send_email "WELCOME_EMAIL"
+    welcome_bound "$S"
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_TOKEN") | "\(.type) \(.store_id) \(.secret_name)"' \
       "secrets_store_secret $SECRETS_STORE_ID oa-$P-provision-token" "PROVISION_TOKEN"
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | "\(.workflow_name) \(.class_name)"' \
@@ -390,20 +434,19 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
     billing_bound "$S" provisioner BillingProvisionerRpc
-    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
-    expect "$S" '.result.observability.enabled // false' true "observability"
-    # Invocation logs off (#164): an explicit false is required (a missing field
-    # is "null" and fails; Cloudflare defaults it to on). The settings
-    # API's key for query-string redaction is not recorded, so it is not read.
-    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
+    # The settings API's key for query-string redaction is not recorded, so it is not read.
+    observability_is "$S" provisioner
     no_secret_bindings "$S" oa-$P-provisioner
     names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
     [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
     ;;
   provisioning)
-    need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED; need WELCOME_FROM
+    need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
+    welcome_declared provisioning
+    [ -z "$WELCOME_DECLARED" ] || need WELCOME_FROM
     # ADMIN_IDENTITIES (#1007): the `email:sub` list is the Environment's
     # secret, never committed. Fail closed: no list, no deploy; each entry is
     # checked here and the value is never printed.
@@ -481,7 +524,7 @@ case "$target" in
     [[ "$found" =~ ^[0-9a-f]{32}$ ]] || { echo "KV namespace $ns: want exactly one, with a 32 hex id" >&2; exit 1; }
     OAUTH_KV_ID="$found"
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
-      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="$WELCOME_FROM" deploy provisioning
+      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioning
     W="oa-$P-provisioning"
     have="$(secret_names "$W")"
     if ! grep -qx ADMIN_SESSION_KEY <<< "$have"; then
@@ -561,7 +604,7 @@ case "$target" in
     fi
     # Again after the secrets: the serving version carries the tag.
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
-      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="$WELCOME_FROM" deploy provisioning
+      SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioning
     S="$(settings "$W")"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "OAUTH_KV") | .namespace_id' "$OAUTH_KV_ID" "OAUTH_KV"
@@ -569,7 +612,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' "oa-$P-auth-broker" "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .queue_name' "oa-$P-signups" "SIGNUPS"
     expect "$S" '.result.bindings[] | select(.name == "ASSETS") | .type' assets "ASSETS"
-    expect "$S" '.result.bindings[] | select(.name == "WELCOME_EMAIL") | .type' send_email "WELCOME_EMAIL"
+    welcome_bound "$S"
     for wf in "PROVISION_INSTALL oa-$P-provision-install ProvisionInstall" "MANAGE_INSTALL oa-$P-manage-install ManageInstall"; do
       read -r b n c <<< "$wf"
       expect "$S" ".result.bindings[] | select(.name == \"$b\") | \"\\(.workflow_name) \\(.class_name) \\(.script_name)\"" "$n $c oa-$P-provisioner" "$b"
@@ -579,7 +622,7 @@ case "$target" in
     got="$(jq -c '[.result.bindings[] | select(.type == "ratelimit") | {name, namespace_id: (.namespace_id | tostring), limit: .simple.limit, period: .simple.period}] | sort_by(.name)' <<< "$S")"
     [ "$got" = "$want" ] || { echo "rate limits: got $got, want $want" >&2; exit 1; }
     billing_bound "$S" provisioning BillingOperatorRpc
-    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS", "WELCOME_EMAIL"] + (if $b == "" then [] else [$b] end)) | sort | join(",")' <<< "$want")"
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }
@@ -588,11 +631,8 @@ case "$target" in
     signups_deployed "$S" "$W"
     # MCP_REDIRECT_URIS among them; ADMIN_IDENTITIES is a secret, by name only.
     vars_are "$S" provisioning
-    expect "$S" '.result.observability.enabled // false' true "observability"
-    # Invocation logs off (#164): an explicit false is required (a missing field
-    # is "null" and fails; Cloudflare defaults it to on). The settings
-    # API's key for query-string redaction is not recorded, so it is not read.
-    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
+    # The settings API's key for query-string redaction is not recorded, so it is not read.
+    observability_is "$S" provisioning
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"
@@ -701,6 +741,10 @@ case "$target" in
       need "$k"
       [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
     done
+    # The yearly Team and Business prices are optional until made.
+    for k in STRIPE_PRICE_TEAM_YEARLY STRIPE_PRICE_BUSINESS_YEARLY; do
+      [ -z "${!k:-}" ] || [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
+    done
     if [ -z "$VERIFY_ONLY" ]; then
       need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
       # Test mode only (billing-core refuses a live key too); never printed.
@@ -718,6 +762,7 @@ case "$target" in
       BILLING_DB_ID="$BILLING_DB_ID" BROKER_REGISTRY_ID="$BROKER_REGISTRY_ID" \
         STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
         STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
+        STRIPE_PRICE_TEAM_YEARLY="${STRIPE_PRICE_TEAM_YEARLY:-}" STRIPE_PRICE_BUSINESS_YEARLY="${STRIPE_PRICE_BUSINESS_YEARLY:-}" \
         deploy billing
     }
     billing_deploy
@@ -753,8 +798,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
     billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
-    expect "$S" '.result.observability.enabled // false' true "observability"
-    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
+    observability_is "$S" dispatch
     ;;
   scheduler)
     need PLATFORM_DB_ID; need EMAIL_ZONE_TAGS; need EMAIL_DAILY_LIMIT

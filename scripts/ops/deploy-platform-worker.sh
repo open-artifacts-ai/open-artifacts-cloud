@@ -13,6 +13,7 @@
 #   billing: BILLING_DB_ID=<D1 uuid> BROKER_REGISTRY_ID=<32 hex>
 #            STRIPE_PRICE_TEAM=<price_...> STRIPE_PRICE_BUSINESS=<price_...>
 #            STRIPE_PRICE_SOLO_MONTHLY=<price_...> STRIPE_PRICE_SOLO_YEARLY=<price_...>
+#            [STRIPE_PRICE_TEAM_YEARLY=<price_...> STRIPE_PRICE_BUSINESS_YEARLY=<price_...>]
 #   dispatch: HOSTS_KV_ID=<32 hex>
 #   scheduler: PLATFORM_DB_ID=<uuid> EMAIL_ZONE_TAGS=<32 hex>[,...] (at most 10) EMAIL_DAILY_LIMIT=<1-9 digits>
 #              ALERT_TO=<address> ALERT_FROM=<address> SIGNUP_DAILY_CAP=<1-9999>
@@ -107,6 +108,16 @@ fill() {
   command rm -f "$copy.bak"
 }
 
+# fill_opt <placeholder> <value>: like fill for a price id, but unset means empty.
+fill_opt() {
+  if [ -z "$2" ]; then
+    sed -i.bak "s/{{$1}}//g" "$copy"
+    command rm -f "$copy.bak"
+  else
+    fill "$1" "$2" "$price"
+  fi
+}
+
 cp wrangler.jsonc "$copy"
 case "$app" in
   auth-broker)
@@ -136,6 +147,10 @@ case "$app" in
     # Solo's two prices (#1568), one per billing interval.
     fill "STRIPE_PRICE_SOLO_MONTHLY_${up}" "${STRIPE_PRICE_SOLO_MONTHLY:-}" "$price"
     fill "STRIPE_PRICE_SOLO_YEARLY_${up}" "${STRIPE_PRICE_SOLO_YEARLY:-}" "$price"
+    # The per-creator yearly Team and Business prices: optional until made
+    # (scripts/ops/stripe-prices.ts); unset deploys them empty.
+    fill_opt "STRIPE_PRICE_TEAM_YEARLY_${up}" "${STRIPE_PRICE_TEAM_YEARLY:-}"
+    fill_opt "STRIPE_PRICE_BUSINESS_YEARLY_${up}" "${STRIPE_PRICE_BUSINESS_YEARLY:-}"
     # Its D1 migrations are pinned once deployed: the lock must be frozen and
     # match every file (MIGRATION_LOCK overrides the lock path, tests only).
     node ../../scripts/ops/check-migration-lock.mjs migrations "${MIGRATION_LOCK:-migration-lock.json}"
@@ -169,7 +184,10 @@ case "$app" in
     fill "SIGNUP_DAILY_CAP_${up}" "${SIGNUP_DAILY_CAP:-}" "$cap"
     # Closed: each signup is acked and its row stays pending.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
-    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    # Only when this tag's config declares it (an older tag has no approval email).
+    if grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' wrangler.jsonc; then
+      fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    fi
     # The account wrangler deploys to is the one the Workflows provision in.
     fill "ACCOUNT_ID_${up}" "${CLOUDFLARE_ACCOUNT_ID:-}" "$hex32"
     fill "SECRETS_STORE_ID_${up}" "${SECRETS_STORE_ID:-}" "$hex32"
@@ -184,7 +202,10 @@ case "$app" in
     # a literal false, so this fill only checks the value there.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
     # The approval email's sender (#2096), the provisioner's value.
-    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    # Only when this tag's config declares it (an older tag has no approval email).
+    if grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' wrangler.jsonc; then
+      fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
+    fi
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"
