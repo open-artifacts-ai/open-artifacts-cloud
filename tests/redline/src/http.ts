@@ -14,7 +14,7 @@ import {
 import { note } from "./notes.ts";
 import { countHook } from "./rl-anon.ts";
 import { secretsOf, setPat, type Target } from "./targets.ts";
-import { idempotent } from "./transport.ts";
+import { idempotent, pacedRetry } from "./transport.ts";
 
 // Fetch helpers. Every request uses redirect: "manual" (a 3xx is judged, never
 // followed). Failure text is status plus a body hash, never the body: bodies
@@ -333,7 +333,10 @@ export async function hook(
     // on a reused socket (#155). No other hook is marked.
     res = await fetch(
       `${t.app}${path}`,
-      path === "/__test/session" ? idempotent(init) : init,
+      path === "/__test/session"
+        ? // Each wire attempt spends an RL_ANON slot: the retry claims its own.
+          pacedRetry(idempotent(init), () => paceHook(t))
+        : init,
     );
   } catch (e) {
     // A setup hook (a POST: never retried) that got no answer is infra.

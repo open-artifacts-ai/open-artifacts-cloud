@@ -38,7 +38,9 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 // copy of the init ({ ...init, signal }), and a spread keeps them.
 const IDEMPOTENT = Symbol.for("redline.transport.idempotent");
 const CALLER_RETRIES = Symbol.for("redline.transport.callerRetries");
+const PACE_RETRY = Symbol.for("redline.transport.paceRetry");
 type Marks = {
+  [PACE_RETRY]?: () => Promise<unknown>;
   [IDEMPOTENT]?: true;
   [CALLER_RETRIES]?: true;
   [NEW_ARTIFACT]?: true;
@@ -52,6 +54,19 @@ const marks = (x: unknown): Marks => (x ?? {}) as Marks;
  */
 export function idempotent<T extends Request | RequestInit>(x: T): T {
   (x as Marks)[IDEMPOTENT] = true;
+  return x;
+}
+
+/**
+ * Marks an init whose caller paces its calls (a hook's ledger slot): `claim`
+ * runs before the transport's retry too, so each wire attempt spends its own
+ * slot. The first attempt's slot is the caller's, taken before the fetch.
+ */
+export function pacedRetry<T extends RequestInit>(
+  x: T,
+  claim: () => Promise<unknown>,
+): T {
+  (x as Marks)[PACE_RETRY] = claim;
   return x;
 }
 
@@ -199,6 +214,12 @@ export function transportFetch(
       if (skip) throw tag(e, `${where}; not retried: ${skip}`);
       const agent = fresh();
       if (!agent) throw tag(e, `${where}; not retried: no new connection`);
+      try {
+        await marks(init)[PACE_RETRY]?.();
+      } catch (pe) {
+        agent.close().catch(() => {});
+        throw pe;
+      }
       const second: Attempt = {};
       try {
         const res = await watch.track(second, () =>

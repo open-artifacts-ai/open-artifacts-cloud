@@ -1,5 +1,6 @@
 import type { Socket } from "node:net";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { hookWindowCount } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { hook } from "../src/http.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
 import { watchResets } from "../src/resets.ts";
@@ -105,6 +106,8 @@ describe("the session hook is idempotent (#155)", () => {
     expect(tries[2]).toMatchObject({ nth: 1 });
     expect(tries[2]?.socket).not.toBe(1);
     expect(retried()).toHaveLength(1);
+    // One ledger slot per wire attempt: the retry claimed its own (3 sent).
+    expect(hookWindowCount(T.a.app)).toBe(3);
   });
 
   it("a reset on a new socket is not retried", async () => {
