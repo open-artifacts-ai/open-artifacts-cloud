@@ -3,19 +3,19 @@
 // check lists only the files git tracks, and cloud files are untracked in the
 // overlay, so this lists them with `-co`. It reuses public's finder and
 // reporter; the baseline is public's scripts/ci/workspace-reads-known.txt plus
-// this repo's scripts/ci/workspace-reads-overlay-known.txt.
-//   node --experimental-strip-types --no-warnings scripts/ci/workspace-reads-overlay.ts
+// this repo's scripts/audit/workspace-reads-overlay-known.txt.
+//   node --experimental-strip-types --no-warnings scripts/audit/workspace-reads-overlay.ts
 // Run at the overlay root. Exit 1 on a new or stale entry.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { workspace } from "./workspace-imports.ts";
-import { parseKnown, reads, report } from "./workspace-reads.ts";
+import { workspace } from "../ci/workspace-imports.ts";
+import { parseKnown, reads, report } from "../ci/workspace-reads.ts";
 
 const TOPS = ["apps", "packages", "scripts", "tests"];
 const SOURCE = /\.(ts|tsx|mts|cts|mjs|cjs|js|jsx)$/;
 const PUBLIC_KNOWN = "scripts/ci/workspace-reads-known.txt";
-const CLOUD_KNOWN = "scripts/ci/workspace-reads-overlay-known.txt";
+const CLOUD_KNOWN = "scripts/audit/workspace-reads-overlay-known.txt";
 
 const root = process.cwd();
 const files = execFileSync(

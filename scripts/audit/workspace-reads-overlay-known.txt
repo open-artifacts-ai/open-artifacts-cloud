@@ -1,5 +1,5 @@
 # Cross-package reads in the hosted (cloud) packages that the overlay
-# workspace-reads check tolerates (scripts/ci/workspace-reads-overlay.ts); public's
+# workspace-reads check tolerates (scripts/audit/workspace-reads-overlay.ts); public's
 # own baseline is scripts/ci/workspace-reads-known.txt, which is also applied.
 #
 # One "<file> <package-name>" per line, sorted, optional trailing "# ..." reason.

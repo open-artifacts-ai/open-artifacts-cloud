@@ -279,7 +279,7 @@ jobs:
       # Public's undeclared-workspace-read check, over the overlay so the
       # hosted packages are covered (#17). Prints the cloud packages it read.
       - name: undeclared workspace reads (overlay, hosted packages included)
-        run: node --experimental-strip-types --no-warnings scripts/ci/workspace-reads-overlay.ts
+        run: node --experimental-strip-types --no-warnings scripts/audit/workspace-reads-overlay.ts
       - name: actionlint (runs shellcheck on run blocks)
         run: |
           set -euo pipefail
