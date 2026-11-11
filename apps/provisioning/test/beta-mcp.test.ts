@@ -264,6 +264,10 @@ describe("tools", () => {
     });
     expect(ok.structuredContent).toEqual({
       added: [`new-${tag}@acme.test`, `@${tag}.example.com`],
+      results: [
+        { entry: `new-${tag}@acme.test` },
+        { entry: `@${tag}.example.com`, waitingOnDomain: 0 },
+      ],
     });
     const rows = await audits("beta.allow_add");
     expect(rows).toHaveLength(2);
@@ -285,6 +289,25 @@ describe("tools", () => {
       entries: [`@${tag}.example.com`],
     });
     expect(dup.content[0].text).toContain("is already on the list.");
+  });
+
+  it("allow_signup approves and emails a waitlisted email, counts a domain's waiting rows, lists every bad entry", async () => {
+    await wl(`a-${tag}`, `ann-${tag}@dom${tag}.test`);
+    const c = await connectAs("oauth", WRITE);
+    const r = await callIt(c, "allow_signup", {
+      entries: [`ann-${tag}@dom${tag}.test`, `@dom${tag}.test`],
+    });
+    expect(r.structuredContent.results).toEqual([
+      { entry: `ann-${tag}@dom${tag}.test`, approved: true, emailSent: true },
+      { entry: `@dom${tag}.test`, waitingOnDomain: 0 },
+    ]);
+    expect(sent).toEqual([`ann-${tag}@dom${tag}.test`]);
+    const bad = await callIt(c, "allow_signup", {
+      entries: ["nope", "@gmail.com"],
+    });
+    expect(bad.isError).toBe(true);
+    expect(bad.content[0].text).toContain("nope");
+    expect(bad.content[0].text).toContain("Gmail");
   });
 
   it("remove_allowed removes, audits, and refuses an unknown entry", async () => {
