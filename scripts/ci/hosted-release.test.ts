@@ -579,9 +579,13 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       ].join("\n");
       writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
       // No real sleeping: the stub records the delay.
-      writeFileSync(join(dir, "sleep"), '#!/usr/bin/env bash\necho "sleep $*" >> "$LOG"\n', {
-        mode: 0o755,
-      });
+      writeFileSync(
+        join(dir, "sleep"),
+        '#!/usr/bin/env bash\necho "sleep $*" >> "$LOG"\n',
+        {
+          mode: 0o755,
+        },
+      );
       const st = allSteps("mirror").find(
         (x) => x.name === "Create the tag and the release",
       ) as Step;
