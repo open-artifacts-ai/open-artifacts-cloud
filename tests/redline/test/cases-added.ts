@@ -21,6 +21,11 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/provisioning.test.ts",
       name: "provisioning > P52: a failed upgrade stays forward (#1106): rl-f's health check is failed after the upload, and it stays on the new version",
     },
+    // #1501: a killed upgrade is retried by its own job (staging proof).
+    {
+      file: "live/provisioning.test.ts",
+      name: "provisioning > P53: a killed upgrade is retried by its own job (#1501): rl-f-k's first attempt dies with the row upgrading, the job's retry takes the lease and finishes active on the new version",
+    },
     // #1346 role reach, ported with the v0.140.0 pin bump.
     ...[
       "org GET /api/v1/bus/reach [session]",

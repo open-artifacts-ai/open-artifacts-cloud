@@ -1067,7 +1067,7 @@ export type UpgradeOptions = {
    * the forward-fix path runs for real. Refused unless the env is staging and
    * the install is an rl-f- test-hooks install.
    */
-  testFailCheck?: "health";
+  testFailCheck?: "health" | "kill";
 };
 
 export class WfpProvisioner {
@@ -3842,6 +3842,10 @@ export class WfpProvisioner {
         });
       await this.hold();
       await this.migrate(rel.rec, d1Id, n.d1);
+      // #1501 test seam (gated above): the first attempt dies with the row
+      // upgrading under its lease; the job's retry sees it upgrading and runs.
+      if (o.testFailCheck === "kill" && row.state !== "upgrading")
+        throw new LostLease("injected kill (testFailCheck)");
       const out: UploadOut = { reached: null, maybe: false };
       await this.hold();
       const sent = await this.uploadRelease({

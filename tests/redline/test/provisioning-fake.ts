@@ -1,4 +1,7 @@
-import { TEST_FAIL_HEALTH_PREFIX } from "@oa/provision/names";
+import {
+  TEST_FAIL_HEALTH_PREFIX,
+  TEST_KILL_UPGRADE_PREFIX,
+} from "@oa/provision/names";
 import {
   ADMIN_TOOL_NAMES,
   JOB_STEPS,
@@ -82,6 +85,10 @@ interface FJob {
   owner: string;
   args: Record<string, unknown>;
   failAt?: { step: string; code: string; message?: string };
+  /** P53: the first attempt of `step` dies, leaving the install upgrading; the retry runs it. */
+  kill?: { step: string; done: boolean };
+  /** P53: between the killed attempt and its retry. */
+  retrying?: boolean;
   sealed: string | null;
   sealedRead: boolean;
   onStep?: (step: string) => void;
@@ -158,7 +165,13 @@ export type Fault =
   /** P52: the failed upgrade leaves the install on the old version. */
   | "p52_not_forward"
   /** P52: the failed upgrade fails with another code. */
-  | "p52_wrong_code";
+  | "p52_wrong_code"
+  /** P53: the first attempt is never killed. */
+  | "p53_no_kill"
+  /** P53: the retry is refused (another operation got there first). */
+  | "p53_retry_refused"
+  /** P53: the retry finishes but the install stays upgrading. */
+  | "p53_stuck_upgrading";
 
 export interface FakeApi {
   fetch: typeof fetch;
@@ -308,7 +321,8 @@ export function fakeApi(): FakeApi {
     slug: i.slug,
     appHost: i.appHost,
     contentHost: i.contentHost,
-    state: i.state,
+    // The API shows an upgrading row as active (installs.state active or upgrading).
+    state: i.state === "upgrading" ? "active" : i.state,
     servingMode: i.mode ?? "unmapped",
     version: i.version,
     tier: i.tier,
@@ -329,7 +343,10 @@ export function fakeApi(): FakeApi {
     purgeAt: null,
     restorable: i.state === "deleting",
     testHooks: i.testHooks,
-    lease: { held: false, until: null },
+    lease: {
+      held: i.state === "upgrading",
+      until: i.state === "upgrading" ? clock.t + 30 * 60_000 : null,
+    },
     mismatch: null,
   });
   const jobView = (j: FJob, withSealed: boolean) => ({
@@ -340,8 +357,12 @@ export function fakeApi(): FakeApi {
     step: j.steps[j.stepIndex] ?? null,
     steps: j.steps,
     stepIndex: j.stepIndex,
-    attempt: 1,
-    lastErrorCode: j.status === "failed" ? (j.failAt?.code ?? null) : null,
+    attempt: j.retrying ? 2 : 1,
+    lastErrorCode: j.retrying
+      ? "lease_held"
+      : j.status === "failed"
+        ? (j.failAt?.code ?? null)
+        : null,
     retryAt: null,
     actor:
       j.owner === "oidc"
@@ -416,6 +437,22 @@ export function fakeApi(): FakeApi {
         code: j.failAt.code,
       });
       return;
+    }
+    if (j.kill && !j.kill.done && j.kill.step === step) {
+      // The attempt dies after its claim: the row stays upgrading under the job's lease.
+      j.kill.done = true;
+      j.retrying = true;
+      const i = installs.get(j.installId);
+      if (i) i.state = "upgrading";
+      return;
+    }
+    if (j.retrying) {
+      j.retrying = false;
+      if (faults.has("p53_retry_refused")) {
+        j.failAt = { step, code: "invalid_state" };
+        advance(j);
+        return;
+      }
     }
     j.onStep?.(step);
     j.stepIndex++;
@@ -654,7 +691,13 @@ export function fakeApi(): FakeApi {
           i.previousVersion = i.version;
           i.version = to;
         }
+        const killed =
+          String(body.requestId ?? "").startsWith(TEST_KILL_UPGRADE_PREFIX) &&
+          i.testHooks &&
+          i.slug.startsWith("rl-f-") &&
+          !faults.has("p53_no_kill");
         const j = startJob(i, "upgrade", p, {
+          kill: killed ? { step: "upload", done: false } : undefined,
           failAt: seam
             ? {
                 step: "health",
@@ -666,6 +709,8 @@ export function fakeApi(): FakeApi {
           onDone: () => {
             i.previousVersion = i.version;
             i.version = to;
+            if (killed && !faults.has("p53_stuck_upgrading"))
+              i.state = "active";
           },
         });
         return ok({ job: jobView(j, false), install: summary(i) }, 202);

@@ -456,6 +456,23 @@ describe("upgrade and rollback (5.4)", () => {
       expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
     });
 
+    it("the #1501 kill seam is refused on a non-rl-f- install, nothing uploaded", async () => {
+      const s = await active({
+        slug: "rl-a-seam",
+        testHooks: true,
+        version: V1,
+      });
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: "rl-killupgrade-0123456789ab",
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
+      expect(w.install(s.installId)).toMatchObject({ version: V1 });
+      expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
+    });
+
     it("is refused in prod, even on a test-hooks rl-f- row", async () => {
       const s = await active({
         slug: "rl-f-seam",

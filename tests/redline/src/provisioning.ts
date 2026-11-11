@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   STAGING_TEST_DOMAIN,
   TEST_FAIL_HEALTH_PREFIX,
+  TEST_KILL_UPGRADE_PREFIX,
 } from "@oa/provision/names";
 import {
   ADMIN_TOOL_NAMES,
@@ -488,6 +489,8 @@ export interface RunState {
   rll?: Promise<RlP>;
   /** rl-f-<run>, the install P52 fails an upgrade on (forwardFixInstall); null: no older release. */
   rlf?: Promise<RlP | null>;
+  /** rl-f-k-<run>, the install P53 kills an upgrade on (killedUpgradeInstall); null: no older release. */
+  rlk?: Promise<RlP | null>;
 }
 
 const bare = (h: string) => h.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
@@ -938,6 +941,12 @@ export const CHAINS: readonly Chain[] = [
     tail: removeForwardFix,
   },
   {
+    // #1501: its own install, so the killed upgrade touches no other chain's.
+    name: "rl-k",
+    probes: ["P53"],
+    tail: removeKilledUpgrade,
+  },
+  {
     name: "api",
     probes: [
       "P1",
@@ -1236,37 +1245,58 @@ const failHealthRid = (run: Run): string =>
     .padEnd(16, "0");
 
 /**
+ * #1501: the request id that makes the provisioner kill an upgrade's first
+ * attempt after its migrations (TEST_KILL_UPGRADE_PREFIX; staging rl-f-
+ * test-hooks installs only).
+ */
+const killUpgradeRid = (run: Run): string =>
+  `${TEST_KILL_UPGRADE_PREFIX}${run.c.runId}`
+    .replace(/[^A-Za-z0-9_-]/g, "-")
+    .slice(0, 64)
+    .padEnd(16, "0");
+
+/**
  * rl-f-<run>: the install P52 fails an upgrade on, created at the newest
  * installable release below the one under test (null when there is none).
  * Setup as for rl-l: a failure is infra. Listed for cleanup before its
  * create; the chain's tail removes it. Memoized.
  */
 export function forwardFixInstall(run: Run): Promise<RlP | null> {
-  run.s.rlf ??= makeForwardFix(run);
+  run.s.rlf ??= makeForwardFix(run, "f");
   return run.s.rlf;
 }
 
-async function makeForwardFix(run: Run): Promise<RlP | null> {
-  const slug = run.slug("f");
+/**
+ * rl-f-k-<run>: the install P53 kills an upgrade on (#1501). Made as rl-f is;
+ * the slug keeps the rl-f- prefix the test seam is gated on.
+ */
+export function killedUpgradeInstall(run: Run): Promise<RlP | null> {
+  run.s.rlk ??= makeForwardFix(run, "f-k");
+  return run.s.rlk;
+}
+
+async function makeForwardFix(run: Run, letter: string): Promise<RlP | null> {
+  const name = `rl-${letter}`;
+  const slug = run.slug(letter);
   try {
     const version = await previous(run);
     if (!version) return null;
     run.s.cleanup.push({ slug });
     const a = run.accepted(
       await run.v1("/installs", {
-        body: oidcCreate(run, slug, run.rid("rlf"), version),
+        body: oidcCreate(run, slug, run.rid(`rl${letter}`), version),
       }),
-      "rl-f create",
+      `${name} create`,
     );
-    await run.done(a.job.id, "rl-f create");
+    await run.done(a.job.id, `${name} create`);
     const dj = (await ownDetail(run, a.install.id)).json as InstallDetail;
     if (dj.testHooks !== true)
-      throw new ProbeFail("rl-f: testHooks is not true");
+      throw new ProbeFail(`${name}: testHooks is not true`);
     if (!dj.appHost || !dj.contentHost)
       throw new ProbeFail(
-        "rl-f: the finished install has no app or content host",
+        `${name}: the finished install has no app or content host`,
       );
-    await run.within(PAGE_WITHIN_MS, "rl-f redline /healthz", async () => {
+    await run.within(PAGE_WITHIN_MS, `${name} redline /healthz`, async () => {
       const h = await run.page(dj.appHost);
       const hz = h.json as
         | { testHooks?: unknown; version?: unknown }
@@ -1284,9 +1314,25 @@ async function makeForwardFix(run: Run): Promise<RlP | null> {
   } catch (e) {
     if (e instanceof InfraError) throw e;
     throw new InfraError(
-      `rl-f setup: ${e instanceof ProbeFail ? e.message : `error ${(e as Error)?.name ?? "unknown"}`}`,
+      `${name} setup: ${e instanceof ProbeFail ? e.message : `error ${(e as Error)?.name ?? "unknown"}`}`,
       { cause: e },
     );
+  }
+}
+
+/** The rl-k chain's tail: deletes and purges rl-f-k as the rl-f tail does rl-f. */
+export async function removeKilledUpgrade(run: Run): Promise<void> {
+  const slug = run.slug("f-k");
+  const at = run.s.cleanup.findIndex((e) => e.slug === slug);
+  if (at < 0) return;
+  try {
+    await removeInstall(run, slug, "rl-f-k cleanup");
+    run.s.cleanup.splice(
+      run.s.cleanup.findIndex((e) => e.slug === slug),
+      1,
+    );
+  } catch {
+    // Left on run.s.cleanup for cleanupInstalls.
   }
 }
 
@@ -2137,6 +2183,95 @@ export const PROBES: readonly Probe[] = [
       // proved by apps/provisioner/test/node/manage.test.ts ("the #1106
       // failhealth test seam") and packages/provision/test/wfp-lifecycle.test.ts.
       return pass(`stayed on ${run.c.version}, job upgrade_incomplete`);
+    },
+  },
+  {
+    id: "P53",
+    title:
+      "a killed upgrade is retried by its own job (#1501): rl-f-k's first attempt dies with the row upgrading, the job's retry takes the lease and finishes active on the new version",
+    timeoutMs: 3 * JOB_WITHIN_MS + 10 * 60_000,
+    run: async (run) => {
+      const p = await killedUpgradeInstall(run);
+      if (!p) return na("no older installable release, so no upgrade to kill");
+      const a = run.accepted(
+        await run.v1(`/installs/${p.id}/upgrade`, {
+          // nonAdditive as the bring-up: a release with a migration is crossed,
+          // so the first attempt's restore point (#1931) is in play.
+          body: {
+            requestId: killUpgradeRid(run),
+            version: run.c.version,
+            nonAdditive: true,
+          },
+        }),
+        "P53 upgrade",
+      );
+      run.s.jobIds.push(a.job.id);
+      // (1) The first attempt is killed: the job is still running and shows a
+      // failed attempt, with the row left upgrading on the old version.
+      const killed = await run.waitJob(a.job.id, {
+        until: (j) =>
+          j.status === "done" ||
+          j.status === "failed" ||
+          j.attempt > 1 ||
+          j.lastErrorCode != null,
+      });
+      if (killed.status === "failed")
+        throw new ProbeFail(
+          `P53: the job failed (${killed.lastErrorCode ?? killed.error?.code ?? "no code"}) before its retry took the lease${failText(killed)}`,
+        );
+      if (killed.status === "done")
+        throw new ProbeFail(
+          "P53: the job finished with no failed attempt: the first attempt was never killed",
+        );
+      const mid = (await ownDetail(run, p.id)).json as InstallDetail;
+      // The API shows an upgrading row as active, with the lease held.
+      if (
+        mid.state !== "active" ||
+        mid.lease?.held !== true ||
+        mid.version !== p.createdAt ||
+        mid.activeJobId !== a.job.id
+      )
+        throw new ProbeFail(
+          `P53: after the killed first attempt the install is ${mid.state} ${mid.version} (lease held ${String(mid.lease?.held)}), want the row left upgrading: active, lease held, on ${p.createdAt}, under job ${a.job.id}`,
+        );
+      // (2) The same job's retry takes the lease and finishes. Not refused as
+      // "another operation got there first" (invalid_state).
+      const j = await run.waitJob(a.job.id);
+      const code = j.lastErrorCode ?? j.error?.code;
+      if (j.status !== "done")
+        throw new ProbeFail(
+          `P53: the job's retry did not finish: job ${j.status} (${code ?? "no code"})${failText(j)}`,
+        );
+      const now = (await ownDetail(run, p.id)).json as InstallDetail;
+      if (
+        now.state !== "active" ||
+        now.lease?.held !== false ||
+        now.version !== run.c.version ||
+        now.previousVersion !== p.createdAt
+      )
+        throw new ProbeFail(
+          `P53: after the retry the install is ${now.state} ${now.version} (previous ${now.previousVersion}, lease held ${String(now.lease?.held)}), want active ${run.c.version} (previous ${p.createdAt}) with the lease released`,
+        );
+      const hz = await run.page(p.appHost, "/healthz", true);
+      const body = hz.json as { ok?: unknown; version?: unknown } | undefined;
+      if (
+        hz.status !== 200 ||
+        body?.ok !== true ||
+        body.version !== run.c.version
+      )
+        throw new ProbeFail(
+          `P53: after the retry /healthz is not ok on ${run.c.version} (${desc(hz)})`,
+        );
+      p.version = run.c.version;
+      // (3) The retry reused the first attempt's restore point (#1931) or
+      // audited upgrade.restore_point_first_missing: both are `provision`
+      // rows (actor job:<id>) that R17 never returns to this actor, as for
+      // P52's rows, so they are not read live. They are proved by
+      // packages/provision/test/wfp-lifecycle.test.ts. (4) The chain's tail
+      // deletes and purges the install; cleanupInstalls checks nothing is left.
+      return pass(
+        `killed once, retried by its own job, active on ${run.c.version}`,
+      );
     },
   },
   {
