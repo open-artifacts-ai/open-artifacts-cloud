@@ -72,9 +72,17 @@ export function stripeClient(key: string, f: typeof fetch) {
       // Falls through to the status check.
     }
     if (!res.ok) {
-      const e = out.error as { type?: unknown; code?: unknown } | undefined;
+      const e = out.error as
+        | { type?: unknown; code?: unknown; message?: unknown }
+        | undefined;
+      // On a 403 name only the missing permissions (rak_*). The message also
+      // holds a partly masked key, so it is never printed.
+      const needs =
+        res.status === 403 && typeof e?.message === "string"
+          ? [...new Set(e.message.match(/\brak_[a-z_]+\b/g) ?? [])]
+          : [];
       throw new Refused(
-        `stripe ${method} ${path.replace(/\/(cus|sub|clock|pm|in)_[A-Za-z0-9]+/g, "/<id>")}: ${res.status} ${String(e?.code ?? e?.type ?? "error")}`,
+        `stripe ${method} ${path.replace(/\/(cus|sub|clock|pm|in)_[A-Za-z0-9]+/g, "/<id>")}: ${res.status} ${String(e?.code ?? e?.type ?? "error")}${needs.length > 0 ? ` (needs ${needs.join(", ")})` : ""}`,
       );
     }
     return out;

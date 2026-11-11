@@ -130,6 +130,29 @@ describe("stripeClient", () => {
     );
     expect(() => stripeClient("", fetch)).toThrow(Refused);
   });
+
+  it("a 403 names the missing permission and nothing else from the message", async () => {
+    const f = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "more_permissions_required",
+            message:
+              "The provided key 'rk_test_abc...xyz' does not have the required permissions. Having the 'rak_price_read' permission would allow this request.",
+          },
+        }),
+        { status: 403 },
+      )) as unknown as typeof fetch;
+    const call = stripeClient("sk_test_FAKEfakeFAKE0123", f);
+    const err = await call("GET", "/v1/prices").catch((e: unknown) => e);
+    const msg = (err as Error).message;
+    expect(msg).toContain(
+      "403 more_permissions_required (needs rak_price_read)",
+    );
+    expect(msg).not.toContain("rk_test");
+    expect(msg).not.toContain("xyz");
+    expect(msg).not.toContain("provided key");
+  });
 });
 
 describe("advance", () => {
