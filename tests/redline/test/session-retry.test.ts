@@ -3,6 +3,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { hookWindowCount } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { hook } from "../src/http.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
+import { liveBusIo } from "../src/provisioning-live.ts";
 import { watchResets } from "../src/resets.ts";
 import { loadTargets } from "../src/targets.ts";
 import {
@@ -49,7 +50,7 @@ async function install(reset: (nth: number, path: string) => boolean) {
     const path = req.url ?? "";
     hits.push({ path, socket: rec.id, nth: rec.n });
     if (reset(rec.n, path)) return void req.socket.resetAndDestroy();
-    json(res, 200, { cookie: "c" });
+    json(res, 200, { cookie: "c", ok: true });
   });
   const other = await fakeServer((req, res) =>
     req.url === "/healthz"
@@ -180,5 +181,21 @@ describe("the shared dispatcher drops sockets idle over ~1 s (#155)", () => {
     } finally {
       g[KEY_SYM] = before;
     }
+  });
+});
+
+describe("P51's session call is single-shot (#155)", () => {
+  it("liveBusIo's session POST is not marked for a retry, so a reset on a reused socket is not repeated", async () => {
+    const { T, hits } = await install(
+      (nth, path) => path === "/__test/session" && nth > 1,
+    );
+    const f = transportFetch(real, watchResets());
+    // The bus ping goes first on a new socket; the session POST reuses it.
+    const io = liveBusIo({}, f);
+    await expect(
+      io.open({ app: T.a.app, pat: "oa_pat_x", hookKey: KEY }),
+    ).rejects.toThrow();
+    expect(hits.filter((h) => h.path === "/__test/session")).toHaveLength(1);
+    expect(retried()).toEqual([]);
   });
 });

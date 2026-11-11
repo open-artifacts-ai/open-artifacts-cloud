@@ -34,7 +34,6 @@ import {
 import { gitSchemaOf } from "./schema.ts";
 import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 import { readSecretFile, secretFileName } from "./targets.ts";
-import { idempotent } from "./transport.ts";
 import { holdSocket } from "./ws.ts";
 
 // The live wiring of src/provisioning.ts: real fetch (bounded), the wall
@@ -109,22 +108,21 @@ export function liveBusIo(
     async open({ app, pat, hookKey }) {
       const site = { app, fetch: fetchImpl };
       if ((await busState(site, pat)) === "off") return "off";
-      // Safe to repeat: the session hook only mints another cookie (#155).
-      const res = await fetchImpl(
-        `${app}/__test/session`,
-        idempotent({
-          method: "POST",
-          redirect: "manual",
-          headers: {
-            authorization: `Bearer ${hookKey}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            email: `redline-admin@${STAGING_TEST_DOMAIN}`,
-            role: "admin",
-          }),
+      // Single-shot, on purpose: this call is outside the hook ledger and
+      // transportFetch's paced retry, so a retry would spend an RL_ANON slot
+      // nothing counts (#155).
+      const res = await fetchImpl(`${app}/__test/session`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          authorization: `Bearer ${hookKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: `redline-admin@${STAGING_TEST_DOMAIN}`,
+          role: "admin",
         }),
-      );
+      });
       const j = (await res.json().catch(() => null)) as {
         cookie?: unknown;
       } | null;
