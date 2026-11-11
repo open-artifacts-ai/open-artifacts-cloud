@@ -248,29 +248,39 @@ const NEXT: Record<string, string> = {
       text: "https://directory.open-artifacts.app",
     },
   ]),
-  "oa-p-dispatch": settings([
-    { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
-    { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-prod" },
-    { type: "service", name: "AUTH_BROKER", service: "oa-p-auth-broker" },
-    {
-      type: "service",
-      name: "DIRECTORY_BROKER",
-      service: "oa-p-directory-broker",
-    },
-    { type: "plain_text", name: "OA_ENV", text: "prod" },
-  ]),
-  "oa-s-dispatch": settings([
-    { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
-    { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-staging" },
-    { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
-    {
-      type: "service",
-      name: "DIRECTORY_BROKER",
-      service: "oa-s-directory-broker",
-    },
-    { type: "service", name: "BILLING", service: "oa-s-billing" },
-    { type: "plain_text", name: "OA_ENV", text: "staging" },
-  ]),
+  "oa-p-dispatch": settings(
+    [
+      { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+      { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-prod" },
+      { type: "service", name: "AUTH_BROKER", service: "oa-p-auth-broker" },
+      {
+        type: "service",
+        name: "DIRECTORY_BROKER",
+        service: "oa-p-directory-broker",
+      },
+      { type: "plain_text", name: "OA_ENV", text: "prod" },
+    ],
+    true,
+  ),
+  "oa-s-dispatch": settings(
+    [
+      { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+      {
+        type: "dispatch_namespace",
+        name: "DISPATCHER",
+        namespace: "oa-staging",
+      },
+      { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
+      {
+        type: "service",
+        name: "DIRECTORY_BROKER",
+        service: "oa-s-directory-broker",
+      },
+      { type: "service", name: "BILLING", service: "oa-s-billing" },
+      { type: "plain_text", name: "OA_ENV", text: "staging" },
+    ],
+    true,
+  ),
   "oa-p-inventory": settings([
     { type: "d1", name: "PLATFORM_DB", id: DB },
     { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
