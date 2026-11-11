@@ -172,6 +172,10 @@ export type Fault =
   | "hook_key_stale"
   /** Bring-up: the new hook key never reaches the edge. */
   | "hook_key_never"
+  /** P52: /healthz shows the old version for 3 reads after the failed upgrade. */
+  | "p52_stale_healthz"
+  /** P52: /healthz never shows the new version after the failed upgrade. */
+  | "p52_old_healthz"
   /** P52: the failed upgrade fails with another code. */
   | "p52_wrong_code"
   /** P53: the first attempt is never killed. */
@@ -272,6 +276,8 @@ export function fakeApi(): FakeApi {
   const hostsCachedUntil = new Map<string, number>();
   /** Calls to /__test/key_check by host. */
   const keyChecks = new Map<string, number>();
+  /** P52: installs whose /healthz still serves the old script, and for how many reads. */
+  const staleHealthz = new Map<string, number>();
   const signin: FakeApi["signin"] = { limit: 10 };
   const broker: FakeApi["broker"] = {
     ipLimit: Number.POSITIVE_INFINITY,
@@ -718,6 +724,9 @@ export function fakeApi(): FakeApi {
           // The upload took: the install is on `to` before the health check fails.
           i.previousVersion = i.version;
           i.version = to;
+          if (faults.has("p52_stale_healthz")) staleHealthz.set(i.id, 3);
+          if (faults.has("p52_old_healthz"))
+            staleHealthz.set(i.id, Number.POSITIVE_INFINITY);
         }
         const rid = String(body.requestId ?? "");
         const afterWrite = rid.startsWith(TEST_KILL_AFTER_WRITE_PREFIX);
@@ -969,11 +978,13 @@ export function fakeApi(): FakeApi {
       (j) =>
         j.installId === i.id && j.kind === "rollback" && j.status === "failed",
     );
+    const stale = path === "/healthz" ? (staleHealthz.get(i.id) ?? 0) : 0;
+    if (stale > 0) staleHealthz.set(i.id, stale - 1);
     return path === "/healthz"
       ? ok({
           ok: !(refused && faults.has("refusal_unhealthy")),
           version:
-            refused && faults.has("refusal_old_healthz")
+            (refused && faults.has("refusal_old_healthz")) || stale > 0
               ? (i.previousVersion ?? i.version)
               : i.version,
           testHooks: i.testHooks,
