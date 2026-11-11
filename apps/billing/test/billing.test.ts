@@ -613,7 +613,7 @@ describe("POST /trial/start", () => {
     expect(await r.json()).toMatchObject({ tier: "trial", hasCustomer: false });
   });
 
-  it("from solo/active: trial for 14 days, version + 1; a second call changes nothing", async () => {
+  it("from solo/active: trial for 30 days, version + 1; a second call changes nothing", async () => {
     at();
     await seed([{ install: A, version: 4 }, { install: B }]);
     const r = await call(gated("POST", "/trial/start", { install: A }));
@@ -628,7 +628,7 @@ describe("POST /trial/start", () => {
       version: 5,
       asOf: NOW,
     });
-    expect(TRIAL_MS).toBe(14 * 86_400_000);
+    expect(TRIAL_MS).toBe(30 * 86_400_000);
     vi.setSystemTime(NOW + 1000);
     const again = await call(gated("POST", "/trial/start", { install: A }));
     expect(again.status).toBe(200);

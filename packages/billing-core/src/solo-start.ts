@@ -7,7 +7,7 @@
 export interface SoloStartView {
   tier: "free" | "solo" | "trial" | "team" | "business";
   status: "active" | "past_due" | "lapsed" | "suspended";
-  /** The 14-day Business trial's end (ms), or null. */
+  /** The 30-day Business trial's end (ms), or null. */
   trialEndsAt: number | null;
   graceUntil: number | null;
   /** The Solo subscription's 30-day trial end (ms) while it is ahead, else null. */

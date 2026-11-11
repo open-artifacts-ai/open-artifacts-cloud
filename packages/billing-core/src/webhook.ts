@@ -238,7 +238,7 @@ const PAID = "tier IN ('solo', 'team', 'business')";
 /**
  * The row's current subscription is live: a paid tier's, active, past_due or
  * suspended (a suspension is ours and keeps the subscription billing),
- * or (during the 14-day Business trial) the Solo subscription under it, whose
+ * or (during the 30-day Business trial) the Solo subscription under it, whose
  * state lives in solo_status.
  */
 export const SUBSCRIPTION_LIVE_SQL =
@@ -531,7 +531,7 @@ export function changeFor(
         );
       // Stripe's own trial (trialing), when one runs: its end. Not Solo's:
       // its 30-day no-card trial must leave trial_ends_at null, or the first
-      // invite could never start the 14-day Business trial (billing's
+      // invite could never start the 30-day Business trial (billing's
       // TRIAL_SQL needs it unset); the Solo trial ends by cancel (lapsed).
       if (o.status === "trialing" && typeof o.trial_end === "number")
         sets.push({

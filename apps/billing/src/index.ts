@@ -152,7 +152,7 @@ function view(r: TierRow | null, now: number) {
     status: r.status,
     trialEndsAt: r.trial_ends_at,
     graceUntil: r.grace_until,
-    // The Solo subscription's own trial end. trialEndsAt stays the 14-day
+    // The Solo subscription's own trial end. trialEndsAt stays the 30-day
     // Business trial's: the server's trial eligibility is trialEndsAt === null.
     // Only while it is still ahead: once past it is null (the column keeps it).
     soloTrialEndsAt:
@@ -174,7 +174,7 @@ const COLS =
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;
 const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // Only solo/active (or free, the pre-Solo value) with no trial before: the
-// 14-day Business trial never starts twice. No row is the solo/active default,
+// 30-day Business trial never starts twice. No row is the solo/active default,
 // so a trial can start from it too (an install made before create writes
 // rows); an existing row moves only from solo/free and active, and only once
 // (trial_ends_at stays set after). The Solo subscription under it is kept as
@@ -184,7 +184,7 @@ const SELECT_SQL = `SELECT ${COLS} FROM tiers WHERE install_id = ?1`;
 // 30-day no-card trial is a Stripe
 // subscription and never sets trial_ends_at, so it doesn't use this up.
 const TRIAL_SQL = `INSERT INTO tiers (install_id, tier, status, trial_ends_at, version, updated_at) VALUES (?1, 'trial', 'active', ?2, 1, ?3) ON CONFLICT (install_id) DO UPDATE SET tier = 'trial', trial_ends_at = ?2, solo_status = CASE WHEN tiers.stripe_subscription_id IS NOT NULL AND tiers.solo_trial_ends_at IS NOT NULL THEN 'active' END, solo_grace_until = NULL, version = tiers.version + 1, updated_at = ?3 WHERE tiers.tier IN ('solo', 'free') AND tiers.status = 'active' AND tiers.trial_ends_at IS NULL RETURNING ${COLS}`;
-// The 14-day Business trial ended (trial_ends_at, set once, stays set so it
+// The 30-day Business trial ended (trial_ends_at, set once, stays set so it
 // never restarts): the row is Solo again, active while the Solo subscription
 // it kept (solo_status, recorded by the webhook while the trial ran) is
 // alive, lapsed if not or if there never was one. A change made only by time
@@ -502,7 +502,7 @@ async function checkout(
     }>();
   // A live Team or Business subscription is changed in the Portal, and so is
   // a suspended one. A live Solo subscription (its own row's, or, during the
-  // 14-day Business trial, the one kept in solo_status) refuses a second Solo
+  // 30-day Business trial, the one kept in solo_status) refuses a second Solo
   // (a card is added through Checkout only while it is still the no-card
   // trial, #1568) but is upgraded through Checkout: the webhook cancels it
   // once the Team or Business subscription is paid, so there is never a
@@ -680,7 +680,7 @@ async function tier(db: D1Database, install: string, now: number) {
 
 // Solo trials ending in (from, to], oldest install id first, after a cursor.
 // Only a live no-card Solo trial: a Solo row (or a Solo kept live under the
-// 14-day Business trial, tier trial with solo_status active), active, that
+// 30-day Business trial, tier trial with solo_status active), active, that
 // never checked out. Another tier, a lapsed or suspended status, a Solo that
 // paid (solo_trial_ends_at is then past) and one that checked out during the
 // trial (it keeps solo_trial_ends_at but has a card, solo_checked_out) never
@@ -903,7 +903,7 @@ export class BillingProvisionerRpc extends WorkerEntrypoint<Env> {
 // An operator comp (#66): the row's tier and status are set, whatever they
 // were, unless a live Stripe subscription owns them (one statement, so a
 // webhook cannot slip between check and write). Trial dates stay (the
-// 14-day Business trial is still used up); the Solo-under-trial and grace
+// 30-day Business trial is still used up); the Solo-under-trial and grace
 // state go, as the tier no longer depends on them. A missing row is made.
 const SET_TIER_PREV_SQL =
   "SELECT tier, status, version FROM tiers WHERE install_id = ?1";
