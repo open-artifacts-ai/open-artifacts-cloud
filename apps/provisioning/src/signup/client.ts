@@ -96,15 +96,15 @@ export const CLIENT_JS = String.raw`(function () {
     shell(h("div", { class: "panel" }, [
       h("h1", {}, ["Sign-ups are closed for now"]),
       h("p", {}, ["We're not opening new instances yet. You can run Open Artifacts yourself today, free and open source."]),
-      h("a", { class: "btn pri", href: S.cfg.githubUrl, rel: "noopener" }, ["Run it yourself"]),
+      h("a", { class: "btn pri", href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself"]),
+      h("p", { class: "muted small mt" }, ["It runs on your own Cloudflare account."]),
       h("div", { class: "or" }, ["or"]),
       h("div", { class: "field tight" }, [
         h("label", { for: "go" }, ["Already have an instance?"]),
         h("div", { class: "inp" }, [inp, h("span", { class: "suf" }, ["." + S.cfg.appDomain])]),
         help
       ]),
-      h("button", { class: "btn", type: "button", onclick: go }, ["Go to it"]),
-      h("p", { class: "muted small mt" }, ["It runs on your own Cloudflare account."])
+      h("button", { class: "btn", type: "button", onclick: go }, ["Go to it"])
     ]));
   }
 
@@ -526,13 +526,16 @@ export const CLIENT_JS = String.raw`(function () {
         refs.live,
         h("div", { class: "seq" }, [slot]),
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
-        refs.lab,
-        h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."])
+        refs.lab
       ]);
+      refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."]);
       shell(refs.ld);
       startAnim(slot, word);
     }
     refs.lab.textContent = pendingLabel(g);
+    // No wait-time line while in line for the daily cap: it starts on its own.
+    if (g.stage === "waiting_cap") refs.hint.remove();
+    else if (!refs.hint.parentNode) refs.ld.appendChild(refs.hint);
     paintLive();
   }
 

@@ -10,24 +10,31 @@ import type { Principal } from "../principal.js";
 export const normEmail = (email: string): string => email.trim().toLowerCase();
 
 /**
- * Whether `email` is on the allow list: an exact email entry, or a `@domain`
- * entry whose domain equals the part after the LAST '@' exactly (no suffix,
- * subdomain or look-alike matching). `emailVerified` must be true: an
- * unverified address is never allowed. Case-insensitive.
+ * Whether `email` is on the allow list: an exact email entry, or a
+ * Google Workspace `@domain` entry. A domain entry matches only when the
+ * session's Workspace `hd` claim equals that domain AND the email's domain
+ * (the part after the LAST '@') equals it too, exactly (no suffix, subdomain
+ * or look-alike matching). A personal Google account has no hd, so it never
+ * gets in by domain, whatever address it registered with. `emailVerified`
+ * must be true: an unverified address is never allowed. Case-insensitive.
  */
 export async function isAllowed(
   db: D1Database,
   email: string | null | undefined,
   emailVerified: boolean,
+  hd?: string | null,
 ): Promise<boolean> {
   if (!emailVerified || !email) return false;
   const e = normEmail(email);
   const at = e.lastIndexOf("@");
   // A local part and a domain are both required ("@acme.com" is no email).
   if (at < 1 || at === e.length - 1) return false;
+  const domain = e.slice(at);
+  // The domain entry is tried only for a Workspace session whose hd is it.
+  const hdMatches = !!hd && `@${normEmail(hd)}` === domain;
   const row = await db
     .prepare("SELECT 1 AS x FROM signup_allowlist WHERE entry IN (?1, ?2)")
-    .bind(e, e.slice(at))
+    .bind(e, hdMatches ? domain : e)
     .first();
   return row !== null;
 }
@@ -48,7 +55,7 @@ export async function admission(env: Env, p: Principal): Promise<Admission> {
       return isTestUser(p, env) ? "admitted" : "closed";
     case "invite":
       if (isTestUser(p, env)) return "admitted";
-      return (await isAllowed(env.PLATFORM_DB, p.email, true))
+      return (await isAllowed(env.PLATFORM_DB, p.email, true, p.hd))
         ? "admitted"
         : "not_invited";
     default:
