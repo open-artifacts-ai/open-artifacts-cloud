@@ -485,6 +485,9 @@ test("beta: waitlisted goes straight to on the list", async ({ page }) => {
   await mount(page, { me: true, gate: "waitlisted" });
   await expect(page.locator("h1")).toHaveText("You're on the list");
   await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(
+    page.getByRole("link", { name: "Run it yourself, free." }),
+  ).toHaveAttribute("href", "https://open-artifacts.com/docs/setup/");
 });
 
 test("beta: allowed goes to the address step as today", async ({ page }) => {

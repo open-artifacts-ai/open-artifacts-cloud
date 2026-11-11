@@ -209,7 +209,7 @@ export const CLIENT_JS = String.raw`(function () {
       whoRow(),
       h("h1", {}, ["You're on the list"]),
       h("p", { class: "lead" }, ["We'll email " + S.me.email + " when you're in. Nothing else to do for now."]),
-      h("p", { class: "muted small mt" }, ["Don't want to wait? ", h("a", { href: S.cfg.githubUrl, rel: "noopener" }, ["Run it yourself, free."])])
+      h("p", { class: "muted small mt" }, ["Don't want to wait? ", h("a", { href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself, free."])])
     ]));
   }
 
