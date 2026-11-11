@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { derive, inShard } from "../src/surfaces.ts";
 import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
@@ -410,39 +411,83 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
 });
 
 // #26: surfaces in two lanes. Lane walls are measured in run 43007228059
-// (v0.151.1, 606 s for the job: bring-up and the rest 176 s, the suite 430 s
-// as surfaces ran whole); the two surfaces shards are modeled from that run's
-// case times: about 41 s of setup and cleanup each, the cases 194 s and 195 s.
+// (v0.151.1: job 606 s, suite 430 s with surfaces in one lane; prov 246,
+// creds 271, front 219, guard 85). The surfaces cases' times in that run are
+// summed by group below (ms, and the number of cases); the shards are
+// computed from inShard, so moving a group between shards moves its seconds.
 describe("surfaces in two lanes (#26, run 43007228059)", () => {
   const jobSec = 606;
   const suiteSec = 430;
+  // The run's setup (first case at +42 s) and the afterAll sweep, per lane.
   const SETUP_SEC = 41;
-  const lanes = {
+  const GROUPS: Record<string, [ms: number, cases: number]> = {
+    "artifact artifact ": [2202, 2],
+    "artifact comments ": [6687, 14],
+    "artifact content ": [5579, 5],
+    "artifact data ": [7422, 15],
+    "artifact mcp ": [82768, 26],
+    "artifact rest ": [75417, 36],
+    "artifact storage ": [3715, 8],
+    "artifact ws ": [1729, 4],
+    "every ROUTE_POLICY ": [12, 1],
+    "org DELETE ": [37559, 14],
+    "org GET ": [33638, 46],
+    "org PATCH ": [7414, 6],
+    "org POST ": [3808, 12],
+    "org PUT ": [8872, 9],
+    "space delete ": [1587, 2],
+    "space mapping ": [23051, 4],
+    "space member ": [61921, 10],
+    "space patch ": [25435, 6],
+  };
+  const shardCaseSec = (s: "a" | "b") =>
+    Object.entries(GROUPS)
+      .filter(([g]) => inShard(g, s))
+      .reduce((n, [, [ms]]) => n + ms, 0) / 1000;
+  const lanes = (): Record<string, number> => ({
     prov: 246,
-    surfaces: SETUP_SEC + 195,
-    "surfaces-b": SETUP_SEC + 194,
+    surfaces: SETUP_SEC + shardCaseSec("a"),
+    "surfaces-b": SETUP_SEC + shardCaseSec("b"),
     creds: 271,
     guard: 85,
     front: 219,
-  };
+  });
 
-  it("the simulated lanes are the plan's lanes", () => {
-    expect(Object.keys(lanes).sort()).toEqual(
+  it("the fixture is the run's 220 cases, and every group names real cases", () => {
+    expect(Object.values(GROUPS).reduce((n, [, c]) => n + c, 0)).toBe(220);
+    const names = derive().cases.map((c) => c.name);
+    for (const g of Object.keys(GROUPS))
+      if (!g.startsWith("every "))
+        expect(
+          names.some((n) => n.startsWith(g)),
+          g,
+        ).toBe(true);
+    // The case total of the run: 388.8 s.
+    expect(shardCaseSec("a") + shardCaseSec("b")).toBeCloseTo(388.8, 0);
+  });
+
+  it("the shards are 190 s and 199 s of cases, about 231 s and 240 s per lane", () => {
+    expect(shardCaseSec("a")).toBeCloseTo(190.3, 1);
+    expect(shardCaseSec("b")).toBeCloseTo(198.6, 1);
+    expect(lanes().surfaces).toBeCloseTo(231.3, 1);
+    expect(lanes()["surfaces-b"]).toBeCloseTo(239.6, 1);
+  });
+
+  it("the simulated lanes are the plan's lanes (provisioner aside), none of surfaces over 280 s", () => {
+    expect(Object.keys(lanes()).sort()).toEqual(
       (PLAN[0] ?? [])
         .map((l) => l.name)
         .filter((n) => n !== "provisioner")
         .sort(),
     );
+    expect(lanes().surfaces).toBeLessThan(280);
+    expect(lanes()["surfaces-b"]).toBeLessThan(280);
   });
 
-  it("no surfaces lane is over 280 s, and creds is the longest lane", () => {
-    expect(lanes.surfaces).toBeLessThan(280);
-    expect(lanes["surfaces-b"]).toBeLessThan(280);
-    expect(Math.max(...Object.values(lanes))).toBe(lanes.creds);
-  });
-
-  it("the job ends at about 447 s (7.5 min): 606 - (430 - 271)", () => {
-    const end = jobSec - (suiteSec - Math.max(...Object.values(lanes)));
+  it("creds is the longest lane, and the job ends at about 447 s (7.5 min)", () => {
+    const longest = Math.max(...Object.values(lanes()));
+    expect(longest).toBe(271);
+    const end = jobSec - (suiteSec - longest);
     expect(end).toBe(447);
     expect(end).toBeLessThan(600);
   });

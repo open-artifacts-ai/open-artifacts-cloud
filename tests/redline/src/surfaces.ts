@@ -48,6 +48,7 @@ import {
   sessionCred,
   withCred,
 } from "./http.ts";
+import { withLock } from "./locks.ts";
 import {
   crossDenied,
   crossProbe,
@@ -1519,6 +1520,9 @@ export const groupSeed = (testDomain: string) => ({
  * (and an unsharded run) keeps the original titles; shard "b" has titles that
  * do not start with them (fixedArtifact matches by prefix).
  */
+/** The lock one shard lane holds while it seeds the shared fixed state (seedWorld). */
+export const SEED_LOCK = "surfaces-seed";
+
 export type SurfaceShard = "a" | "b";
 
 /** REDLINE_SURFACES_SHARD: "a" or "b" (one lane of the plan); unset runs every case. */
@@ -1668,32 +1672,40 @@ export async function seedWorld(side: Side): Promise<World> {
     surfaceShard(),
   );
   const { world: WORLD_SPACE, guard: GUARD_SPACE } = worldSpaces(t.testDomain);
-  // The hook creates the prefixed spaces if missing and grants the admin.
-  await hook(
-    t,
-    "/__test/session",
-    {
-      email: adminEmail(t),
-      role: "admin",
-      spaces: [
-        { spaceId: WORLD_SPACE, role: "manager" },
-        { spaceId: GUARD_SPACE, role: "manager" },
-      ],
-    },
-    { setup: true },
-  );
-  // The mapping probes' groups (idempotent; harmless when sync is off).
-  await hook(t, "/__test/directory-groups", groupSeed(t.testDomain), {
-    setup: true,
+  // The shared fixed state (spaces, groups, member users, the guard
+  // artifact) is seeded by one shard lane at a time (#26): it is idempotent,
+  // and a second shard finds what the first made instead of racing it to
+  // create it on a fresh TEST_DOMAIN. The world and trash artifacts below are
+  // the shard's own.
+  const { groups, users } = await withLock(SEED_LOCK, "exclusive", async () => {
+    // The hook creates the prefixed spaces if missing and grants the admin.
+    await hook(
+      t,
+      "/__test/session",
+      {
+        email: adminEmail(t),
+        role: "admin",
+        spaces: [
+          { spaceId: WORLD_SPACE, role: "manager" },
+          { spaceId: GUARD_SPACE, role: "manager" },
+        ],
+      },
+      { setup: true },
+    );
+    // The mapping probes' groups (idempotent; harmless when sync is off).
+    await hook(t, "/__test/directory-groups", groupSeed(t.testDomain), {
+      setup: true,
+    });
+    const groups = worldGroups(t.testDomain);
+    const users = {
+      member: await memberId(t, pat, "member"),
+      editor: await memberId(t, pat, "editor"),
+      manager: await memberId(t, pat, "manager"),
+    };
+    await fixedArtifact(side, GUARD_SPACE, GUARD_TITLE);
+    return { groups, users };
   });
-  const groups = worldGroups(t.testDomain);
-  const users = {
-    member: await memberId(t, pat, "member"),
-    editor: await memberId(t, pat, "editor"),
-    manager: await memberId(t, pat, "manager"),
-  };
   const id = await fixedArtifact(side, WORLD_SPACE, WORLD_TITLE);
-  await fixedArtifact(side, GUARD_SPACE, GUARD_TITLE);
   const A = `/api/v1/artifacts/${id}`;
   // Search probes look the artifact up by id; leaks are judged by the marker.
   await api(t, pat, "PATCH", A, {

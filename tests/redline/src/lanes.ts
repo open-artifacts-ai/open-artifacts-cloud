@@ -61,7 +61,7 @@ export interface Claims {
 }
 
 /** The names of the locks, ledgers and barriers a claim may name. */
-export const LOCKS = ["rl-b-members"] as const;
+export const LOCKS = ["rl-b-members", "surfaces-seed"] as const;
 
 const MEMBERS = "rl-b/members+member-user";
 
@@ -134,13 +134,15 @@ export const CLAIMS: Record<string, Claims> = {
     state: {
       ...installs(),
       [MEMBERS]: guarded("rl-b-members", "shared"),
-      // The world it seeds on both installs (spaces, groups, artifacts).
-      "rl-x/world": "write",
+      // The world it seeds on both installs: the world and trash artifacts
+      // (each shard has its own, src/surfaces.ts worldTitles), and the shared
+      // fixed spaces, groups, member users and guard artifact, which the shard
+      // lanes seed one at a time under the surfaces-seed lock (SEED_LOCK).
+      "rl-x/world-artifacts": "write",
+      "rl-x/world-shared": guarded("surfaces-seed", "exclusive"),
     },
-    // #26: the file runs as two lanes (shards a and b); each seeds fixed
-    // artifacts of its own (src/surfaces.ts worldTitles), so the world is
-    // per shard. The members lock and the buckets are shared as before.
-    perShard: ["rl-x/world"],
+    // #26: the file runs as two lanes (shards a and b).
+    perShard: ["rl-x/world-artifacts"],
     buckets: installBuckets(),
   },
   "live/edge.test.ts": {
@@ -430,6 +432,22 @@ export interface LaneResult {
 }
 type FileNote = { file: string; note: string };
 
+/** A module error or a setup hook's infra result: a file's own failure, not a case. */
+const fileLevel = (c: CaseResult): boolean =>
+  c.level !== "pass" && (c.moduleError === true || c.blocked !== undefined);
+
+/** Two shards' copies of one file-level failure: blocked cases joined, the worse level kept. */
+function mergeFileLevel(a: CaseResult, b: CaseResult): CaseResult {
+  const worse = a.level === "fail" || b.level !== "fail" ? a : b;
+  const out: CaseResult = { ...worse };
+  if (a.blocked && b.blocked)
+    out.blocked = {
+      file: a.blocked.file,
+      cases: [...new Set([...a.blocked.cases, ...b.blocked.cases])],
+    };
+  return out;
+}
+
 /**
  * The run's cases from every lane. A lane with no part, a case from a file
  * outside the lane (it ran where the plan did not put it), or one case name
@@ -445,6 +463,7 @@ export function mergeLanes(results: readonly LaneResult[]): {
   const cases: CaseResult[] = [];
   const fileNotes: FileNote[] = [];
   const seen = new Set<string>();
+  const firstAt = new Map<string, number>();
   let runExit = 0;
   for (const r of results) {
     if (r.exit !== 0 && runExit === 0) runExit = r.exit;
@@ -465,10 +484,21 @@ export function mergeLanes(results: readonly LaneResult[]): {
           reason: "a file outside the lane ran in it",
         });
       const key = `${c.file ?? ""}\u0000${c.name}`;
-      // A file-level failure (its module or setup) fails in each shard lane
-      // alike; the first already fails the gate, so the copy is not a second case.
-      if (seen.has(key) && r.lane.shard !== undefined && c.level !== "pass")
+      // Shard lanes of one file each report its file-level failures: a module
+      // error, or a setup hook's infra result (src/report.ts setupHookCase).
+      // Those alone merge into one case: the cases each refusal blocked are
+      // joined (the manifest counts them as run) and the worse level stays.
+      // Any other repeat is a duplicate.
+      const at = firstAt.get(key);
+      if (
+        at !== undefined &&
+        r.lane.shard !== undefined &&
+        fileLevel(c) &&
+        fileLevel(cases[at] as CaseResult)
+      ) {
+        cases[at] = mergeFileLevel(cases[at] as CaseResult, c);
         continue;
+      }
       if (seen.has(key))
         cases.push({
           name: `lane ${name}: duplicate ${c.file ?? ""} ${c.name}`,
@@ -476,6 +506,7 @@ export function mergeLanes(results: readonly LaneResult[]): {
           reason: "a case was reported twice",
         });
       seen.add(key);
+      if (!firstAt.has(key)) firstAt.set(key, cases.length);
       cases.push(c);
     }
     fileNotes.push(...r.part.fileNotes);

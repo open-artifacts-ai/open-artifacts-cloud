@@ -86,12 +86,23 @@ describe("the two surfaces shards (#26)", () => {
     expect(b.length).toBeGreaterThan(0);
   });
 
-  it("every shard b prefix names a case, and no case outside them is in b", () => {
+  it("every shard b prefix names a case, and shard b holds exactly the cases under them", () => {
     for (const p of SHARD_B_PREFIXES)
       expect(
         names.some((n) => n.startsWith(p)),
         p,
       ).toBe(true);
+    const b = names.filter((n) => inShard(n, "b"));
+    const under = names.filter((n) =>
+      SHARD_B_PREFIXES.some((p) => n.startsWith(p)),
+    );
+    expect(b).toEqual(under);
+    // Nothing outside the prefixes is in b, and the coverage case is not.
+    expect(
+      b.filter((n) => !SHARD_B_PREFIXES.some((p) => n.startsWith(p))),
+    ).toEqual([]);
+    expect(inShard("every ROUTE_POLICY route", "b")).toBe(false);
+    expect(inShard("a brand new group [pat]", "b")).toBe(false);
   });
 
   it("REDLINE_SURFACES_SHARD is a, b or unset", () => {
