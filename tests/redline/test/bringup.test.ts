@@ -2,11 +2,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { HookBudgetError } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { Run } from "../src/provisioning.ts";
 import {
   bringUp,
   credFile,
   type RawTargets,
+  waitHookKey,
 } from "../src/provisioning-live.ts";
 import {
   CONFIG,
@@ -185,5 +187,45 @@ describe("bringUp waits for the new hook key to take effect", () => {
     );
     // About 30 polls an install at one per 3 s: under the 25 a minute budget.
     expect(calls(f).length).toBeLessThanOrEqual(2 * 32);
+  });
+
+  it("slow ledger claims never push the total past the 90 s bound", async () => {
+    const { f } = setup();
+    f.faults.add("hook_key_never");
+    const run = new Run(CONFIG, f.io);
+    const t0 = f.io.now();
+    // Each claim waits 40 s on the fake clock, and gives up at the deadline.
+    const slow = async (_app: string, deadline: number) => {
+      await f.io.wait(40_000);
+      if (f.io.now() > deadline) throw new HookBudgetError("slow");
+    };
+    const err = await waitHookKey(run, CONFIG.rlA.app, "k", slow).then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(err?.name).toBe("InfraError");
+    expect(f.io.now() - t0).toBeLessThanOrEqual(90_000 + 40_000);
+    expect(calls(f).length).toBeLessThanOrEqual(2);
+  });
+
+  it("a request that never answers is cut off at the deadline, not at its own bound", async () => {
+    const { f } = setup();
+    const hang: typeof fetch = (_u, init) =>
+      new Promise((_r, rej) =>
+        init?.signal?.addEventListener("abort", () => rej(init.signal?.reason)),
+      );
+    const run = new Run(CONFIG, {
+      ...f.io,
+      now: Date.now,
+      wait: (ms) => new Promise((r) => setTimeout(r, ms)),
+      fetch: hang,
+    });
+    const t0 = Date.now();
+    const err = await waitHookKey(run, CONFIG.rlA.app, "k", noPace, 300).then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(err?.name).toBe("InfraError");
+    expect(Date.now() - t0).toBeLessThan(1500);
   });
 });

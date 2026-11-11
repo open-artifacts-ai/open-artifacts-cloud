@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
-import { claimHookSlot } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+import {
+  claimHookSlot,
+  HookBudgetError,
+} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import {
   BusError,
   busState,
@@ -26,6 +29,7 @@ import {
   bringUpgrade,
   type CredsOut,
   mintCreds,
+  POLL_MS,
   ProbeFail,
   type ProvIo,
   provConfig,
@@ -228,35 +232,48 @@ export const HOOK_KEY_WITHIN_MS = 90_000;
  */
 export async function waitHookKey(
   run: Run,
-  slug: string,
   app: string,
   key: string,
-  pace: (app: string) => Promise<unknown> = (a) => claimHookSlot(a),
+  pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
+    claimHookSlot(a, { deadline }),
+  within: number = HOOK_KEY_WITHIN_MS,
 ): Promise<void> {
-  try {
-    await run.within(HOOK_KEY_WITHIN_MS, `${slug} hook key`, async () => {
-      await pace(app);
-      try {
-        const res = await run.io.fetch(`${app}/__test/key_check`, {
-          method: "POST",
-          redirect: "manual",
-          headers: {
-            authorization: `Bearer ${key}`,
-            "content-type": "application/json",
-          },
-          body: "{}",
-        });
-        const text = await res.text();
-        return res.status === 404 && hookReason(text) === "bad_route";
-      } catch {
-        return false;
-      }
-    });
-  } catch (e) {
-    if (!(e instanceof ProbeFail)) throw e;
-    throw new InfraError(
-      `the new hook key was not accepted within ${HOOK_KEY_WITHIN_MS / 1000} s of R26 (hooks answer 404 on a key mismatch)`,
+  // One deadline for the whole wait: a ledger claim gives up at it, and each
+  // request is cut off at it, so the total never runs past `within`.
+  const deadline = run.io.now() + within;
+  const fail = () =>
+    new InfraError(
+      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 (hooks answer 404 on a key mismatch)`,
     );
+  for (;;) {
+    if (deadline - run.io.now() <= 0) throw fail();
+    try {
+      await pace(app, deadline);
+    } catch (e) {
+      if (e instanceof HookBudgetError) throw fail();
+      throw e;
+    }
+    const left = deadline - run.io.now();
+    if (left <= 0) throw fail();
+    try {
+      const res = await run.io.fetch(`${app}/__test/key_check`, {
+        method: "POST",
+        redirect: "manual",
+        signal: AbortSignal.timeout(left),
+        headers: {
+          authorization: `Bearer ${key}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      const text = await res.text();
+      if (res.status === 404 && hookReason(text) === "bad_route") return;
+    } catch {
+      // No answer (or cut off at the deadline): try again until it.
+    }
+    const rest = deadline - run.io.now();
+    if (rest <= 0) throw fail();
+    await run.io.wait(Math.min(POLL_MS, rest));
   }
 }
 
@@ -273,7 +290,7 @@ export async function bringUp(
   env: Record<string, string | undefined>,
   t: RawTargets,
   run: Run = liveRun(env, t),
-  pace?: (app: string) => Promise<unknown>,
+  pace?: (app: string, deadline: number) => Promise<unknown>,
 ): Promise<void> {
   const m = mask(env);
   const r = await newRecipient();
@@ -296,7 +313,7 @@ export async function bringUp(
       writeSecretFile(credFile(t, name, "HOOK_KEY"), c.hookKey);
       out(`${slug}: R26 creds written\n`);
       // Before the suite or the t19 hand-off reads the key.
-      await waitHookKey(run, slug, side.app, c.hookKey, pace);
+      await waitHookKey(run, side.app, c.hookKey, pace);
       out(`${slug}: the new hook key is accepted\n`);
     } catch (e) {
       const msg = errText(e);
