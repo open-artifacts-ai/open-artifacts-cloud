@@ -33,6 +33,12 @@ jobs:
           TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           HOSTED_DIR: .github/hosted
         run: bash scripts/ci/token-ping.sh prod
+      - name: Probe R2 read access (prints status lines only)
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: .github/hosted
+        run: bash scripts/ci/token-ping.sh prod r2
 
   repo-prod-cloudflare:
     if: github.ref == 'refs/heads/main' && inputs.target == 'repo/PROD_CLOUDFLARE_API_TOKEN'
@@ -51,3 +57,9 @@ jobs:
           TOKEN: ${{ secrets.PROD_CLOUDFLARE_API_TOKEN }}
           HOSTED_DIR: .github/hosted
         run: bash scripts/ci/token-ping.sh prod
+      - name: Probe R2 read access (prints status lines only)
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.PROD_CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: .github/hosted
+        run: bash scripts/ci/token-ping.sh prod r2

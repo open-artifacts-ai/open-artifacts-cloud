@@ -6,13 +6,20 @@
 # never the token. Any failure prints only the HTTP code and exits 1.
 # GETs only. The token reaches curl in a config on a process substitution,
 # never argv.
+# With a second argument "r2" it runs the R2 read probe instead (its own
+# workflow step, so the verify signal stays distinct): two GETs on the env's
+# releases bucket (oa-s-releases for staging, oa-p-releases for prod), the
+# bucket itself and a one-item object list. Prints one line per probe,
+#   r2 bucket=<name> op=<get|list> http=<code> cf_code=<first error code|ok|none>
+# never object keys, counts, bodies or the token, and exits 1 with an
+# ::error:: line if either probe fails (10042 on the prod publish token).
 # Env: TOKEN (the secret), HOSTED_DIR (holds <env>.json for the account id).
-# Usage: scripts/ci/token-ping.sh <staging|prod>
+# Usage: scripts/ci/token-ping.sh <staging|prod> [r2]
 set -euo pipefail
 
 CF=https://api.cloudflare.com/client/v4
 
-[ "$#" -eq 1 ] || { echo "usage: $0 <staging|prod>" >&2; exit 2; }
+{ [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = r2 ]; }; } || { echo "usage: $0 <staging|prod> [r2]" >&2; exit 2; }
 case "$1" in staging | prod) ENV="$1" ;; *) echo "unknown env: $1" >&2; exit 2 ;; esac
 : "${TOKEN:?TOKEN is required}"
 : "${HOSTED_DIR:?HOSTED_DIR is required}"
@@ -46,6 +53,33 @@ answer() {
   [[ "$status" =~ ^[a-z_]{1,20}$ ]] || return 1
   echo "id=$id status=$status kind=$1"
 }
+
+# r2probe <bucket> <op> <path>: prints the one line; returns 1 when not ok.
+r2probe() {
+  local code
+  get "$3"
+  code="$(jq -r '[.errors[]?.code | select(type == "number")] | (.[0] // "none") | tostring' <<< "$BODY" 2> /dev/null)" || code=none
+  [[ "$code" =~ ^[0-9]{1,10}$ ]] || code=none
+  if [ "$HTTP" = 200 ] && [ "$(jq -r '.success' <<< "$BODY" 2> /dev/null)" = true ]; then
+    echo "r2 bucket=$1 op=$2 http=$HTTP cf_code=ok"
+    return 0
+  fi
+  echo "r2 bucket=$1 op=$2 http=$HTTP cf_code=$code"
+  echo "::error::R2 $2 on $1 failed: http=$HTTP cf_code=$code"
+  return 1
+}
+
+if [ "${2:-}" = r2 ]; then
+  f="$HOSTED_DIR/$ENV.json"
+  [ -f "$f" ] || { echo "http=000" >&2; exit 1; }
+  account="$(jq -r '.account_id // ""' "$f")"
+  [[ "$account" =~ ^[0-9a-f]{32}$ ]] || { echo "bad account id" >&2; exit 1; }
+  if [ "$ENV" = prod ]; then bucket=oa-p-releases; else bucket=oa-s-releases; fi
+  rc=0
+  r2probe "$bucket" get "/accounts/$account/r2/buckets/$bucket" || rc=1
+  r2probe "$bucket" list "/accounts/$account/r2/buckets/$bucket/objects?per_page=1" || rc=1
+  exit "$rc"
+fi
 
 get /user/tokens/verify
 answer user && exit 0
