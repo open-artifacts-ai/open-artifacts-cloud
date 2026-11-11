@@ -104,7 +104,7 @@ export const HOSTED_DOMAINS: Readonly<
 });
 
 /** A trial's length from its start: the billing Worker and the backfill. */
-export const TRIAL_MS = 14 * 86_400_000;
+export const TRIAL_MS = 30 * 86_400_000;
 
 /**
  * Platform-wide var defaults per env, rendered at create for a name the

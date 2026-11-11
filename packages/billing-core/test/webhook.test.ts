@@ -1329,7 +1329,7 @@ describe("Solo (#1568)", () => {
       status: "active",
       grace_until: null,
       stripe_subscription_id: "sub_Test1",
-      // Solo's 30-day trial end is not the 14-day Business trial's: a set
+      // Solo's trial end is not the Business trial's: a set
       // trial_ends_at would end the first invite's trial for good.
       trial_ends_at: null,
     });
@@ -1941,7 +1941,7 @@ describe("the Business trial on top of a Solo subscription (#1568)", () => {
   };
   const soloOf = (o: Record<string, unknown> = {}) =>
     sub({ id: OLD, ...soloPrice, ...o });
-  /** A row in its 14-day Business trial that still holds a live Solo subscription. */
+  /** A row in its 30-day Business trial that still holds a live Solo subscription. */
   const trialOverSolo = (solo: string | null = "active") =>
     db
       .prepare(
