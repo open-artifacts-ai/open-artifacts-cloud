@@ -85,9 +85,10 @@ describe("the lane plan", () => {
     }
   });
 
-  it("is one phase of seven lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of eight lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
+      "billing",
       "creds",
       "front",
       "guard",
