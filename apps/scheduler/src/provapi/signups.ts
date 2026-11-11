@@ -41,7 +41,9 @@ ORDER BY updated_at, signup_id LIMIT ?2`;
  * (C6 parseSignupsEnabled).
  */
 export function signupsOn(v: string | undefined): boolean {
-  return parseSignupsEnabled(v) !== "false";
+  // `invite` (#2096) is on like "true": the API is the gate, so every pending
+  // row was already allowed. The public parser does not know it yet.
+  return v === "invite" || parseSignupsEnabled(v) !== "false";
 }
 
 async function send(

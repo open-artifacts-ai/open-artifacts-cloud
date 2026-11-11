@@ -13,6 +13,7 @@
     "0009_job_fail_point.sql": "2508bfcf3aa80acbd788e9cc4e42f3394db652952ab3eb5ea3e636a7e05815c3",
     "0010_trial_reminders.sql": "a1a7446e5e6006847b57bab2aca898f7f82c55b9fe51edc8fab12bc4aa604cf5",
     "0011_session_hd.sql": "1a30986e0800a212497eacd3509441c4586103ddf5cd6b00e25e2d2c416ab8d7",
-    "0012_solo_start.sql": "f9bd5e28417ac10741b953ebffe429af1ebeaae714701fc19dd0c111d354fd0e"
+    "0012_solo_start.sql": "f9bd5e28417ac10741b953ebffe429af1ebeaae714701fc19dd0c111d354fd0e",
+    "0013_signup_beta_gate.sql": "2e40303632074125392b5a0293ede6feafe239fae1ffc3b5d575ff229589ab0b"
   }
 }

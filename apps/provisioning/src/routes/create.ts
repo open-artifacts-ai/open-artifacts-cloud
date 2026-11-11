@@ -15,6 +15,7 @@ import { newInstallId } from "../ids.js";
 import type { Principal } from "../principal.js";
 import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
+import { admission } from "../signup/gate.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
 import { releaseDeletedSignupSlug, slugState } from "./reads.js";
@@ -71,10 +72,17 @@ async function selfServePolicy(
 ): Promise<{ hd: string | null; email: string }> {
   const { env, surface } = a;
   const testUser = isTestUser(p, env);
-  const admitted =
-    env.SIGNUPS_ENABLED === "true" ||
-    (env.SIGNUPS_ENABLED === "test-users" && testUser);
-  if (!admitted) throw new ApiError("signups_closed");
+  const admitted = await admission(env, p);
+  if (admitted === "closed") throw new ApiError("signups_closed");
+  // `invite` mode (#2096): not on the allow list. The contract's codes are
+  // public, so this is a 403 forbidden whose details.reason says why; the
+  // sign-up page sends the person to the waitlist.
+  if (admitted === "not_invited")
+    throw new ApiError(
+      "forbidden",
+      "Open Artifacts is in private beta. Join the waitlist.",
+      { reason: "not_invited" },
+    );
   // Self-serve is HTTP only: /mcp answers a user 401 before this (4.2).
   if (surface.kind !== "http") throw new ApiError("forbidden");
   if (body.turnstile === undefined) throw new ApiError("turnstile_failed");
