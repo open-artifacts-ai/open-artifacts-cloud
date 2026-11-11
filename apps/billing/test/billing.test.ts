@@ -508,6 +508,24 @@ describe("tiersOf matches GET /tier for an ended trial, and writes nothing (#205
     });
 });
 
+it("tiersOf leaves a team row with a past trial_ends_at as team, as GET /tier does (#2058)", async () => {
+  at();
+  await seed([{ install: A, tier: "team", trialEndsAt: NOW - 1 }]);
+  const before = await rowOf(A);
+  const rpc = new BillingOperatorRpc(createExecutionContext(), env);
+  const r = await rpc.tiersOf([A]);
+  expect(await rowOf(A)).toEqual(before);
+  const got = (await (await call(gated("GET", "/tier"))).json()) as {
+    tier: string;
+    status: string;
+  };
+  expect(got.tier).toBe("team");
+  expect(r).toEqual({
+    ok: true,
+    tiers: { [A]: { tier: "team", status: "active" } },
+  });
+});
+
 describe("GET /tier", () => {
   it("returns the install's own row without Stripe ids, and records last_read_at", async () => {
     at();
