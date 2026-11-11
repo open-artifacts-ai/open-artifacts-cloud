@@ -170,13 +170,40 @@ jobs:
             [ "$main_sha" = "$SHA" ] || { echo "::error::$SHA is not the head of main ($main_sha); dispatch again from main's head"; exit 1; }
             gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" > /dev/null
             echo "created tag $TAG at $SHA"
+            # The new ref can lag behind its own write (read-after-write), and
+            # release create --verify-tag reads it. Wait until it reads back.
+            waited=0
+            delay=1
+            until [ "$(gh api "repos/$REPO/git/ref/tags/$TAG" -q .object.sha 2> /dev/null || true)" = "$SHA" ]; do
+              [ "$waited" -lt 60 ] || { echo "::error::tag $TAG did not read back at $SHA within 60 s"; exit 1; }
+              sleep "$delay"
+              waited=$((waited + delay))
+              delay=$((delay < 8 ? delay * 2 : 8))
+            done
+            echo "tag $TAG reads back at $SHA"
           fi
-          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            echo "release $TAG already exists"
-          else
-            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" \
-              --notes "Hosted build of $PUBLIC_REPO $TAG. The signed hosted release files are attached by hosted-release.yml."
-          fi
+          # Retry only the verify-tag "doesn't exist" error, and look for a
+          # release first each time so a partial success never duplicates one.
+          attempt=1
+          while :; do
+            if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+              echo "release $TAG already exists"
+              break
+            fi
+            if out=$(gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" \
+              --notes "Hosted build of $PUBLIC_REPO $TAG. The signed hosted release files are attached by hosted-release.yml." 2>&1); then
+              echo "$out"
+              break
+            fi
+            echo "$out"
+            if [[ "$out" == *"doesn't exist"* ]] && [ "$attempt" -lt 5 ]; then
+              attempt=$((attempt + 1))
+              sleep $((attempt * 2))
+              continue
+            fi
+            echo "::error::could not create release $TAG"
+            exit 1
+          done
   # Stable releases only. Resolves what to build: the tag's commit in this repo
   # (a dry run has no tag: this commit), on main, whose PUBLIC_PIN is the
   # release the mirror checked.
