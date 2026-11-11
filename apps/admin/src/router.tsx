@@ -12,6 +12,7 @@ import {
 import { canCall, useMe } from "./hooks/useEnv";
 import { Shell } from "./layout/Shell";
 import { Audit } from "./pages/Audit";
+import { Beta } from "./pages/Beta";
 import { CreateInstall } from "./pages/CreateInstall";
 import { InstallDetail } from "./pages/InstallDetail";
 import { Installs, parseStateFilter, type StateFilter } from "./pages/Installs";
@@ -113,6 +114,7 @@ const routeTree = root.addChildren([
         return <Audit installId={installId} actor={actor} action={action} />;
       },
     }),
+    inShell("/beta", Beta),
     inShell("/tokens", TokensRoute),
   ]),
 ]);

@@ -62,6 +62,13 @@ export interface Env {
    * billing Worker bound anywhere); unbound, set-tier answers `unavailable`.
    */
   BILLING?: BillingOperatorRpc;
+  /**
+   * The approval email's sender (#2096): the provisioner's WELCOME_EMAIL
+   * send_email binding (no fixed destination) and WELCOME_FROM. Unbound or
+   * unset, an approval still records and reports the email as failed.
+   */
+  WELCOME_EMAIL?: SendEmail;
+  WELCOME_FROM?: string;
   /** Broker redeem only (4.3). */
   AUTH_BROKER: Fetcher;
   /** Self-serve producer (post-M1). */

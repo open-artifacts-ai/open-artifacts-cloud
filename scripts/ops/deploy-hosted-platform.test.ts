@@ -364,6 +364,8 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
     : []),
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
+  // The approval email (#2096): the provisioner's sender.
+  { type: "send_email", name: "WELCOME_EMAIL" },
   ...[
     "PROVISION_INSTALL:ProvisionInstall:provision",
     "MANAGE_INSTALL:ManageInstall:manage",
@@ -1406,6 +1408,7 @@ describe("deploy-hosted-platform.sh", () => {
       ["provisioner", { WELCOME_FROM: "" }],
       ["provisioning", { GITHUB_REPOSITORY_ID: "" }],
       ["provisioning", { SIGNUP_DAILY_CAP: "" }],
+      ["provisioning", { WELCOME_FROM: "" }],
       ["inventory", { GITHUB_REPOSITORY_ID: "" }],
       ["inventory", { GITHUB_REPOSITORY: "" }],
       ["inventory", { GITHUB_REPOSITORY: "o/r/x" }],

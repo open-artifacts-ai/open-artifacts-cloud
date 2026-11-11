@@ -198,6 +198,8 @@ case "$app" in
     # Staging's gate is the constant (open for the M2 walk); prod's block pins
     # a literal false, so this fill only checks the value there.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
+    # The approval email's sender (#2096), the provisioner's value.
+    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"

@@ -29,8 +29,9 @@ it("has the side nav, who is signed in and when the session ends", async () => {
   expect(
     within(nav)
       .getAllByRole("link")
-      .map((a) => a.textContent?.trim()),
-  ).toEqual(["Installs", "Audit log", "Agent tokens"]);
+      // The Beta link carries a count of people waiting once it loads (#2096).
+      .map((a) => a.textContent?.trim().replace(/(?<=Beta)\d+$/, "")),
+  ).toEqual(["Installs", "Beta", "Audit log", "Agent tokens"]);
   expect(screen.getByText(/Signed in as/)).toBeInTheDocument();
   expect(screen.getByTestId("session-hint")).toHaveTextContent(
     "Session ends in 6 h",

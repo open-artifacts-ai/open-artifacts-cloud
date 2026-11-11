@@ -690,9 +690,26 @@ describe("0012_solo_start (self-serve Solo start)", () => {
   });
 });
 
+describe("0014_waitlist_emailed (when the approval email went, #2096)", () => {
+  it("follows 0013 and only adds the nullable emailed_at column", () => {
+    expect(migrationFiles.slice(13)).toEqual(["0014_waitlist_emailed.sql"]);
+    const sql = migrationSql("0014_waitlist_emailed.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
+    expect(sql).toMatch(
+      /ALTER TABLE signup_waitlist ADD COLUMN emailed_at INTEGER;/,
+    );
+    expect(cols(platformDb(), "signup_waitlist")).toContain(
+      "emailed_at INTEGER",
+    );
+  });
+});
+
 describe("0013_signup_beta_gate (allow list and waitlist, #2096)", () => {
   it("follows 0012 and only adds the two tables and an index", () => {
-    expect(migrationFiles.slice(12)).toEqual(["0013_signup_beta_gate.sql"]);
+    expect(migrationFiles.slice(12, 13)).toEqual(["0013_signup_beta_gate.sql"]);
     const sql = migrationSql("0013_signup_beta_gate.sql").replace(
       /--[^\n]*/g,
       "",
