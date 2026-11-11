@@ -37,6 +37,13 @@ describe("ALLOW_SIGNUPS", () => {
     for (const st of steps)
       expect(st.env?.ALLOW_SIGNUPS, st.name).toBeUndefined();
   });
+  it("ALLOW_INVITE is set once at job level, for prod only (invite, never true), and by no step", () => {
+    expect(job.env.ALLOW_INVITE).toBe(
+      "${{ inputs.env == 'prod' && '1' || '' }}",
+    );
+    for (const st of steps)
+      expect(st.env?.ALLOW_INVITE, st.name).toBeUndefined();
+  });
 });
 
 const FULL =

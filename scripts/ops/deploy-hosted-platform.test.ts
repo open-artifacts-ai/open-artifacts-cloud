@@ -1820,20 +1820,22 @@ describe("deploy-hosted-platform.sh", () => {
     const cfg = (app: string) =>
       readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8");
     /** The prod block's SIGNUPS_ENABLED committed as a literal "true". */
-    const literalTrue = (app: string, src: string) => {
+    const literalAs = (app: string, src: string, v: string) => {
       const out =
         app === "provisioning"
           ? src.replace(
               /("prod"[\s\S]*)"SIGNUPS_ENABLED": "false"/,
-              '$1"SIGNUPS_ENABLED": "true"',
+              `$1"SIGNUPS_ENABLED": "${v}"`,
             )
           : src.replace(
               '"SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}"',
-              '"SIGNUPS_ENABLED": "true"',
+              `"SIGNUPS_ENABLED": "${v}"`,
             );
       expect(out, app).not.toBe(src);
       return out;
     };
+    const literalTrue = (app: string, src: string) =>
+      literalAs(app, src, "true");
     /** These settings with SIGNUPS_ENABLED deployed as `v`. */
     const deployedAs = (json: string, v: string) =>
       settings(
@@ -1911,12 +1913,25 @@ describe("deploy-hosted-platform.sh", () => {
         const closed = go(src, "false");
         expect(closed.code, closed.err).toBe(0);
       });
-      it(`${app}: a deployed "invite" (#2096) needs ALLOW_SIGNUPS=1 like "true"`, () => {
+      it(`${app}: a deployed "invite" (#2096) needs ALLOW_SIGNUPS=1 or ALLOW_INVITE=1; ALLOW_INVITE never admits "true"`, () => {
         const r = go(src, "invite");
         expect(r.code, app).toBe(1);
         expect(r.err).toContain(
-          `deployed ${W}: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1; refusing`,
+          `deployed ${W}: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1 or ALLOW_INVITE=1; refusing`,
         );
+        // The scheduler's committed value comes from SIGNUPS_ENABLED as filled.
+        const as = (v: string): Record<string, string> =>
+          app === "scheduler"
+            ? { SIGNUPS_ENABLED: v, ALLOW_INVITE: "1" }
+            : { ALLOW_INVITE: "1" };
+        const lit = (v: string) =>
+          app === "scheduler" ? src : literalAs(app, src, v);
+        const ok = go(lit("invite"), "invite", as("invite"));
+        expect(ok.code, ok.err).toBe(0);
+        for (const v of ["true", "test-users"]) {
+          const no = go(lit(v), v, as(v));
+          expect(no.code, `${app} ${v}`).toBe(1);
+        }
       });
       it(`${app}: a deployed "true" is refused on read-back unless ALLOW_SIGNUPS=1, verify only too`, () => {
         for (const VERIFY_ONLY of ["", "1"]) {

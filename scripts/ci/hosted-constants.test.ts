@@ -169,7 +169,7 @@ describe(".github/hosted/<env>.json", () => {
   // A): staging sign-ups are open to anyone, capped at 20 a day, for the M2
   // exit-test walk (it was test-users only, #1012, P29).
   it("prod signups stay closed, staging is open with a cap of 20 for the M2 walk; the caps and alert addresses are the Manager's", () => {
-    expect(read("prod").signup_daily_cap).toBe(50);
+    expect(read("prod").signup_daily_cap).toBe(20);
     expect(read("staging").signup_daily_cap).toBe(20);
     expect(read("prod").signups_enabled).toBe("false");
     expect(read("staging").signups_enabled).toBe("true");
@@ -233,7 +233,7 @@ describe("hosted-constants.sh", () => {
         "EMAIL_DAILY_LIMIT=5000",
         "GOOGLE_CLIENT_ID=206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com",
         "GOOGLE_DIRECTORY_CLIENT_ID=206295999771-6cr3mbfc7g2ejnvdoqhlf2v8v6sdm023.apps.googleusercontent.com",
-        "SIGNUP_DAILY_CAP=50",
+        "SIGNUP_DAILY_CAP=20",
         "SIGNUPS_ENABLED=false",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
         "PROD_SIGNUP_DEPLOY=off",
