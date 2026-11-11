@@ -972,6 +972,9 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(
           `"STRIPE_PRICE_SOLO_YEARLY": "${PRICES.STRIPE_PRICE_SOLO_YEARLY}"`,
         );
+        // The optional yearly prices are deployed empty when unset.
+        expect(snap).toContain('"STRIPE_PRICE_TEAM_YEARLY": ""');
+        expect(snap).toContain('"STRIPE_PRICE_BUSINESS_YEARLY": ""');
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         // Only this env's placeholders are filled.
         const other = env === "staging" ? "PROD" : "STAGING";
@@ -981,10 +984,33 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`{{STRIPE_PRICE_BUSINESS_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_SOLO_MONTHLY_${other}}}`);
         expect(snap).toContain(`{{STRIPE_PRICE_SOLO_YEARLY_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_TEAM_YEARLY_${other}}}`);
+        expect(snap).toContain(`{{STRIPE_PRICE_BUSINESS_YEARLY_${other}}}`);
         expect(r.out + r.err).not.toContain(DB);
         expect(r.out + r.err).not.toContain(REG);
         expect(existsSync(join(DIR, "wrangler.deploy.jsonc"))).toBe(false);
       });
+
+    it("fills the yearly prices when set and refuses a malformed one", () => {
+      const r = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PRICE_TEAM_YEARLY: "price_1TeamYr",
+        STRIPE_PRICE_BUSINESS_YEARLY: "price_1BizYr",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(r.code).toBe(0);
+      const snap = readFileSync(r.snap, "utf8");
+      expect(snap).toContain('"STRIPE_PRICE_TEAM_YEARLY": "price_1TeamYr"');
+      expect(snap).toContain('"STRIPE_PRICE_BUSINESS_YEARLY": "price_1BizYr"');
+      const bad = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PRICE_TEAM_YEARLY: "prod_1",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(bad.code).toBe(1);
+    });
 
     it("refuses a missing or malformed D1 or registry id", () => {
       for (const env of [

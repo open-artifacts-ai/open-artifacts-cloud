@@ -59,6 +59,9 @@ ALLOW=(
   .github/workflows/staging-solo-clock.yml
   scripts/ops/staging-solo-clock.ts
   scripts/ops/staging-solo-clock.test.ts
+  .github/workflows/staging-stripe-prices.yml
+  scripts/ops/stripe-prices.ts
+  scripts/ops/stripe-prices.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

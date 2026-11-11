@@ -26,7 +26,8 @@
 #                    BROKER_REGISTRY_ID MAIN_BILLING_MIGRATION_LOCK (main's
 #                    apps/billing/migration-lock.json; migrations,
 #                    scripts/ops/billing-db.ts) the four Stripe price ids
-#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY)
+#                    (STRIPE_PRICE_TEAM, _BUSINESS, _SOLO_MONTHLY, _SOLO_YEARLY; optional
+#                    _TEAM_YEARLY, _BUSINESS_YEARLY until made)
 #                    and, unless VERIFY_ONLY, STRIPE_SECRET_KEY and
 #                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
 #                    only, both put on the Worker, a run without them fails
@@ -701,6 +702,10 @@ case "$target" in
       need "$k"
       [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
     done
+    # The yearly Team and Business prices are optional until made.
+    for k in STRIPE_PRICE_TEAM_YEARLY STRIPE_PRICE_BUSINESS_YEARLY; do
+      [ -z "${!k:-}" ] || [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
+    done
     if [ -z "$VERIFY_ONLY" ]; then
       need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
       # Test mode only (billing-core refuses a live key too); never printed.
@@ -718,6 +723,7 @@ case "$target" in
       BILLING_DB_ID="$BILLING_DB_ID" BROKER_REGISTRY_ID="$BROKER_REGISTRY_ID" \
         STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
         STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
+        STRIPE_PRICE_TEAM_YEARLY="${STRIPE_PRICE_TEAM_YEARLY:-}" STRIPE_PRICE_BUSINESS_YEARLY="${STRIPE_PRICE_BUSINESS_YEARLY:-}" \
         deploy billing
     }
     billing_deploy
