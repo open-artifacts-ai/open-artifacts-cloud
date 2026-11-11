@@ -57,7 +57,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin:16px 0}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--divider)}
 .stack{display:grid;gap:10px}
-.panel .mt{margin:10px 0 0}
+.panel .mt{margin:10px 0 0;text-align:center}
 .panel .lead{margin:4px 0 0}
 .note .btn{display:flex;width:fit-content}
 .ns{max-width:420px;margin:24px auto;padding:0 16px}
@@ -115,6 +115,14 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 @keyframes bub2{0%,50%{opacity:0;transform:translateY(6px)}60%,90%{opacity:1;transform:none}100%{opacity:0}}
 @media (prefers-reduced-motion:reduce){.a1 .fr{animation:none;stroke-dashoffset:0}.a1 .cn{animation:none;opacity:1}.a1 .sq{animation:none;transform:none}.a2 i{animation:none;opacity:1}.pg3 .pin{animation:none;transform:rotate(-45deg)}.pg3 .bub{animation:none;opacity:1}.verb .w{animation:none}}
 .seq{width:132px;height:132px}.slot{width:132px;height:132px;opacity:0;transition:opacity .5s ease}.slot.in{opacity:1}
+.field.roomy{margin:16px 0 0}
+.ta{width:100%;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:8px 10px;resize:vertical;min-height:62px}
+.ta:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.ta:disabled{background:var(--sunken)}
+.help.count{display:flex;justify-content:flex-end}
+.help.near{color:var(--warn)}
+.spin{width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-top-color:transparent;animation:spin 1s linear infinite}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.dot.now{animation:none}}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}

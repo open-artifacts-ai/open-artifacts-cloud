@@ -9,7 +9,7 @@ export const CLIENT_JS = String.raw`(function () {
   var S = {
     cfg: null, me: null, signup: null, view: "loading",
     slug: "", avail: null, availSlug: "", seq: 0,
-    token: null, busy: false, step: "address", chips: [], chipsFor: "", err: "", notice: "", widget: null, poll: null
+    gate: null, token: null, busy: false, joining: false, joinErr: "", note: "", step: "address", chips: [], chipsFor: "", err: "", notice: "", widget: null, poll: null
   };
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -41,11 +41,12 @@ export const CLIENT_JS = String.raw`(function () {
       return r.text().then(function (t) {
         var j = null;
         try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
-        return { status: r.status, body: j, code: j && j.error && j.error.code, message: j && j.error && j.error.message };
+        return { status: r.status, body: j, code: j && j.error && j.error.code, message: j && j.error && j.error.message, details: j && j.error && j.error.details };
       });
     });
   }
 
+  var HOSTED_URL = "https://open-artifacts.com/docs/hosted/";
   function nw(t) { return h("span", { class: "nw" }, [t]); }
   function host(slug) { return slug + "." + S.cfg.appDomain; }
   function rid() {
@@ -59,6 +60,7 @@ export const CLIENT_JS = String.raw`(function () {
   function shell(panel) {
     var links = h("span", { class: "links" }, [
       h("a", { href: S.cfg.docsUrl, rel: "noopener" }, ["Docs"]), " · ",
+      h("a", { href: HOSTED_URL, rel: "noopener" }, ["Hosted"]), " · ",
       h("a", { href: S.cfg.githubUrl, rel: "noopener" }, ["GitHub"])
     ]);
     root.replaceChildren(
@@ -154,6 +156,63 @@ export const CLIENT_JS = String.raw`(function () {
     return s;
   }
 
+  function whoRow() {
+    return h("div", { class: "who" }, [
+      h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
+      h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
+      h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
+    ]);
+  }
+
+  // ---------- private beta (design: waitlist screens, #2096) ----------
+  var NOTE_MAX = 280, NOTE_NEAR = 40;
+  function viewJoin() {
+    var ta = h("textarea", {
+      class: "ta", id: "use", rows: "2", maxlength: String(NOTE_MAX), "aria-describedby": "use-count",
+      disabled: S.joining
+    });
+    ta.value = S.note;
+    var cnt = h("p", { class: "help count", id: "use-count", "aria-live": "polite" });
+    function paintCount() {
+      var left = NOTE_MAX - ta.value.length;
+      cnt.textContent = left <= NOTE_NEAR ? left + " left" : "";
+      cnt.className = "help count" + (left <= 0 ? " near" : "");
+    }
+    ta.addEventListener("input", function () { S.note = ta.value; paintCount(); });
+    paintCount();
+    shell(h("div", { class: "panel" }, [
+      whoRow(),
+      h("h1", {}, ["Open Artifacts is in private beta"]),
+      h("p", { class: "lead" }, ["We're letting people in a few at a time. Join the waitlist and we'll email you when it's your turn."]),
+      h("div", { class: "field roomy" }, [h("label", { for: "use" }, ["What would you use it for? (optional)"]), ta, cnt]),
+      S.joinErr ? h("div", { class: "note bad", role: "alert" }, [S.joinErr]) : null,
+      h("button", { class: "btn pri cta", type: "button", disabled: S.joining, "aria-busy": S.joining ? "true" : null, onclick: joinWaitlist },
+        S.joining ? [h("span", { class: "spin", "aria-hidden": "true" }), "Joining\u2026"] : ["Join the waitlist"])
+    ]));
+  }
+  function joinWaitlist() {
+    if (S.joining) return;
+    S.joining = true; S.joinErr = ""; render();
+    var note = S.note.trim();
+    api("POST", "/api/v1/signup/waitlist", note ? { note: note } : {}).then(function (r) {
+      S.joining = false;
+      if (r.status === 200 && r.body && r.body.gate === "waitlisted") { S.gate = "waitlisted"; route(); return; }
+      if (r.status === 401) { S.me = null; S.notice = NOTICES.expired; route(); return; }
+      if (r.code === "invalid_state" && r.details && r.details.reason === "already_allowed") { S.gate = "allowed"; S.step = "address"; route(); return; }
+      S.joinErr = "That didn't save. Try again."; render();
+    }, function () {
+      S.joining = false; S.joinErr = "That didn't save. Try again."; render();
+    });
+  }
+  function viewListed() {
+    shell(h("div", { class: "panel" }, [
+      whoRow(),
+      h("h1", {}, ["You're on the list"]),
+      h("p", { class: "lead" }, ["We'll email " + S.me.email + " when you're in. Nothing else to do for now."]),
+      h("p", { class: "muted small mt" }, ["Don't want to wait? ", h("a", { href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself, free."])])
+    ]));
+  }
+
   function viewAddress() {
     var inp = h("input", {
       type: "text", id: "slug", autocomplete: "off", autocapitalize: "none",
@@ -177,11 +236,7 @@ export const CLIENT_JS = String.raw`(function () {
     refs.ts = h("div", { class: "ts" });
 
     shell(h("div", { class: "panel" }, [
-      h("div", { class: "who" }, [
-        h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
-        h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
-        h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
-      ]),
+      whoRow(),
       h("h1", {}, ["Choose your address"]),
       h("p", { class: "lead" }, ["It's where you and your team open your artifacts. You can't change it later."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
@@ -397,6 +452,7 @@ export const CLIENT_JS = String.raw`(function () {
         return;
       }
       resetTurnstile();
+      if (r.status === 403 && r.details && r.details.reason === "not_invited") { S.gate = "waitlist"; route(); return; }
       if (r.code === "signups_closed") { S.view = "closed"; render(); return; }
       if (r.code === "signup_limit") {
         loadSignup().then(function () {
@@ -423,7 +479,7 @@ export const CLIENT_JS = String.raw`(function () {
 
   function signOut() {
     return api("POST", "/auth/logout").then(function () {
-      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; S.chips = []; S.chipsFor = ""; S.edited = false; S.step = "address"; route();
+      S.me = null; S.slug = ""; S.avail = null; S.token = null; S.err = ""; S.chips = []; S.chipsFor = ""; S.edited = false; S.step = "address"; S.gate = null; S.note = ""; S.joinErr = ""; route();
     });
   }
   function startOver() {
@@ -559,7 +615,7 @@ export const CLIENT_JS = String.raw`(function () {
           "We've been alerted and will look into it. Your address isn't reserved anymore. If you have questions, email support."
         ]),
         h("div", { class: "stack" }, [
-          h("a", { class: "btn", href: "mailto:" + S.cfg.supportEmail }, ["Email support"]),
+          h("a", { class: "btn", href: "mailto:" + HELP_EMAIL }, ["Email support"]),
           h("button", { class: "btn", type: "button", onclick: startOver }, ["Try again"])
         ])
       ];
@@ -583,6 +639,7 @@ export const CLIENT_JS = String.raw`(function () {
   function loadSignup() {
     return api("GET", "/api/v1/signup").then(function (r) {
       if (r.status === 401) return "unauth";
+      if (r.status === 200 && r.body) S.gate = r.body.gate || null;
       if (r.status === 404 || (r.status === 200 && r.body && r.body.stage === "none")) {
         S.signup = null; return "gone";
       }
@@ -636,6 +693,8 @@ export const CLIENT_JS = String.raw`(function () {
     if (!pend || !refs.ld || !document.body.contains(refs.ld)) stopAnim();
     if (S.view === "closed") viewClosed();
     else if (S.view === "setup") viewSetup();
+    else if (S.view === "join") viewJoin();
+    else if (S.view === "listed") viewListed();
     else if (S.view === "address") viewAddress();
     else viewSignin();
   }
@@ -646,6 +705,8 @@ export const CLIENT_JS = String.raw`(function () {
       S.view = "setup";
       if (S.signup.stage !== "ready" && S.signup.stage !== "failed") startPoll();
     } else if (!S.cfg.open) S.view = "closed";
+    else if (S.me && S.gate === "waitlist") S.view = "join";
+    else if (S.me && S.gate === "waitlisted") S.view = "listed";
     else S.view = S.me && S.step !== "signin" ? "address" : "signin";
     render();
   }
