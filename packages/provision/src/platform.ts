@@ -3,6 +3,7 @@
 // customer data and no secret; every write checks the env prefix first.
 import { createHash } from "node:crypto";
 import type { Cf, D1Result } from "./cf.js";
+import type { CfAuditDetail } from "./jobs.js";
 import { assertOwnResource, type Env, isPlatformPrincipalId } from "./names.js";
 import type { InstallId } from "./types.js";
 
@@ -481,7 +482,7 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
     actor: string,
     id: InstallId | "-",
     action: string,
-    detail: Record<string, string | number> = {},
+    detail: Record<string, string | number | CfAuditDetail> = {},
     lease?: string,
   ): Promise<boolean> {
     if (typeof actor !== "string" || actor === "" || actor.length > 300)
@@ -606,7 +607,7 @@ FROM installs WHERE rl_ns >= ?8 AND rl_ns < ?10`,
   async audit(
     id: InstallId,
     action: string,
-    detail: Record<string, string | number> = {},
+    detail: Record<string, string | number | CfAuditDetail> = {},
     lease?: string,
   ): Promise<boolean> {
     if (this.actor !== null)

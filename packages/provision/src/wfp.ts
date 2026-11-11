@@ -58,7 +58,9 @@ import {
   RELEASE_PUBKEY_PLACEHOLDER,
 } from "./internal/gates.js";
 import {
+  type CfAuditDetail,
   CfError,
+  cfAuditDetail,
   DoStepRequired,
   NEAR_EXPIRY_MODE,
   PROVISION_JOB_KINDS,
@@ -2974,7 +2976,7 @@ export class WfpProvisioner {
   /** An audit row for the held install, after the lock is renewed. */
   private async logged(
     action: string,
-    detail: Record<string, string | number> = {},
+    detail: Record<string, string | number | CfAuditDetail> = {},
   ): Promise<void> {
     await this.hold();
     const h = this.held as { id: InstallId; lease: string };
@@ -3006,10 +3008,19 @@ export class WfpProvisioner {
     if (h) await this.revokeCiToken();
     this.held = null;
     if (!h) return;
-    if (e !== undefined)
+    if (e !== undefined) {
+      // The operation's redaction set first (it scrubs a CfError's cfMessage and route in place).
+      const cf = cfAuditDetail(this.scrub(e));
+      // One line for `wrangler tail`: the provisioner has no other trace of which call failed.
+      if (cf) console.warn(JSON.stringify({ evt: "cf_error", ...cf }));
       await this.platform
-        .audit(h.id, `${h.op}.aborted`, { state, error: errCode(e) })
+        .audit(h.id, `${h.op}.aborted`, {
+          state,
+          error: errCode(e),
+          ...(cf ? { cf } : {}),
+        })
         .catch(() => {});
+    }
     await this.platform.finish(h.id, h.lease, state).catch(() => false);
   }
 
