@@ -40,6 +40,7 @@
       ],
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,
@@ -72,6 +73,7 @@
       ],
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,

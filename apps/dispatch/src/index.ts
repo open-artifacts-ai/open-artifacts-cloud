@@ -69,7 +69,7 @@ const notFound = () => new Response("Not found", { status: 404 });
 const unavailableNow = () =>
   new Response("Service unavailable", {
     status: 503,
-    headers: { "retry-after": "5" },
+    headers: { "retry-after": "5", "cache-control": "no-store" },
   });
 
 /** A fixed log category; never the error text (it can carry names or URLs). */

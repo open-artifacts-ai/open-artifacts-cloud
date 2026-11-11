@@ -157,7 +157,12 @@ exit 0
 const settings = (bindings: Record<string, unknown>[], obs = false) =>
   JSON.stringify({
     success: true,
-    result: { bindings, observability: { enabled: obs } },
+    result: {
+      bindings,
+      observability: obs
+        ? { enabled: true, logs: { invocation_logs: false } }
+        : { enabled: false },
+    },
   });
 // The scheduler's bindings as Cloudflare reads them back (apps/scheduler
 // wrangler.jsonc, per env).
@@ -764,6 +769,26 @@ describe("deploy-hosted-platform.sh", () => {
         }).run("dispatch", {}, "staging");
         expect(bad.code, why).toBe(1);
         expect(bad.err, why).toContain("dispatch BILLING binding: got");
+      }
+    });
+    it("dispatch refuses observability off, invocation logs on, or the field missing", () => {
+      for (const [why, obs, msg] of [
+        ["off", { enabled: false }, "observability"],
+        [
+          "invocation logs on",
+          { enabled: true, logs: { invocation_logs: true } },
+          "observability invocation_logs",
+        ],
+        ["field missing", { enabled: true }, "observability invocation_logs"],
+      ] as const) {
+        const next = JSON.parse(NEXT["oa-p-dispatch"] as string);
+        next.result.observability = obs;
+        const bad = setup({
+          exists: SCHED_DEPS("p"),
+          next: { "oa-p-dispatch": JSON.stringify(next) },
+        }).run("dispatch");
+        expect(bad.code, why).toBe(1);
+        expect(bad.err, why).toContain(msg);
       }
     });
     it("staging scheduler verifies its BILLING binding too", () => {

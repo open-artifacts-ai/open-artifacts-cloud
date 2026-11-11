@@ -58,8 +58,13 @@ describe("wrangler.jsonc", () => {
       expect(e.kv_namespaces).toEqual([
         { binding: "HOSTS", id: `{{HOSTS_KV_ID_${env.toUpperCase()}}}` },
       ]);
-      // Workers Logs would record full URLs; the Worker logs the host only.
-      expect(e.observability).toEqual({ enabled: false });
+      // Workers Logs gets the console lines only: invocation logs would record
+      // full URLs, so they stay off and query strings are redacted anyway.
+      expect(e.observability).toEqual({
+        enabled: true,
+        redact_query_string: true,
+        logs: { enabled: true, invocation_logs: false, head_sampling_rate: 1 },
+      });
     }
     expect(platformNames("staging").hosts).toBe("oa-s-hosts");
     expect(platformNames("prod").hosts).toBe("oa-p-hosts");

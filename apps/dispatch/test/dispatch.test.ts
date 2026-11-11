@@ -107,6 +107,7 @@ const NOT_FOUND = {
 const UNAVAILABLE = {
   status: 503,
   headers: [
+    ["cache-control", "no-store"],
     ["content-type", "text/plain;charset=UTF-8"],
     ["retry-after", "5"],
   ],
