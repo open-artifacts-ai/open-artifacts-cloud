@@ -295,7 +295,7 @@ const mismatched = (body: Record<string, unknown>, install: string) =>
 
 /** Each signed POST's allowed body keys; any other field is 400 bad_body. */
 const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
-  "/checkout": ["install", "ts", "plan", "interval", "creators"],
+  "/checkout": ["install", "ts", "plan", "interval", "creators", "seats"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
@@ -468,7 +468,7 @@ async function checkout(
   appHost: string,
   body: Record<string, unknown>,
 ) {
-  const { plan, interval, creators } = body;
+  const { plan, interval, creators, seats } = body;
   if (plan !== "solo" && plan !== "team" && plan !== "business")
     return bad("bad_plan");
   // Team and Business bill per creator (#2123): the instance's own count for
@@ -481,16 +481,31 @@ async function checkout(
       (creators as number) > MAX_CREATORS)
   )
     return bad("bad_creators");
-  const quantity =
-    typeof creators === "number" ? Math.max(1, creators) : undefined;
-  // Solo names its billing interval; no other plan takes one (the shared
-  // BillingCheckoutInput contract).
+  // Solo names its billing interval; Team and Business take month (the
+  // default) or year (#2136, prepaid seats).
   if (
     plan === "solo"
       ? interval !== "month" && interval !== "year"
-      : interval !== undefined
+      : interval !== undefined && interval !== "month" && interval !== "year"
   )
     return bad("bad_plan");
+  // Yearly Team and Business sell prepaid seats (1..MAX_CREATORS), required
+  // with year and refused otherwise; a creator count is the monthly plan's.
+  const yearly = plan !== "solo" && interval === "year";
+  if (yearly && creators !== undefined) return bad("bad_creators");
+  if (
+    yearly
+      ? !Number.isInteger(seats) ||
+        (seats as number) < 1 ||
+        (seats as number) > MAX_CREATORS
+      : seats !== undefined
+  )
+    return bad("bad_seats");
+  const quantity = yearly
+    ? (seats as number)
+    : typeof creators === "number"
+      ? Math.max(1, creators)
+      : undefined;
   const tier: CheckoutTier = plan;
   const priceId =
     plan === "solo"
@@ -498,8 +513,18 @@ async function checkout(
         ? env.STRIPE_PRICE_SOLO_MONTHLY
         : env.STRIPE_PRICE_SOLO_YEARLY
       : plan === "team"
-        ? env.STRIPE_PRICE_TEAM
-        : env.STRIPE_PRICE_BUSINESS;
+        ? yearly
+          ? env.STRIPE_PRICE_TEAM_YEARLY
+          : env.STRIPE_PRICE_TEAM
+        : yearly
+          ? env.STRIPE_PRICE_BUSINESS_YEARLY
+          : env.STRIPE_PRICE_BUSINESS;
+  // A yearly price that is not configured (empty means unset) is a clear
+  // 503, never an empty price.
+  if (yearly && !priceId) {
+    console.error("billing stripe yearly price unset", install);
+    return bad("config", 503);
+  }
   // An unfilled or malformed price never gets as far as a customer.
   if (typeof priceId !== "string" || !PRICE_ID.test(priceId)) {
     console.error("billing stripe config", install);
@@ -590,7 +615,7 @@ async function checkout(
   const idempotencyKey =
     plan === "solo"
       ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
-      : `checkout-${install}-${tier}${quantity === undefined ? "" : `-q${quantity}`}-${body.ts}`;
+      : `checkout-${install}-${tier}${yearly ? `-year-s${quantity}` : quantity === undefined ? "" : `-q${quantity}`}-${body.ts}`;
   // Only the newest Checkout can be paid: the install's open session (kept
   // below) is expired first. A retry with the same key is the same session
   // (Stripe replays it), so it is not expired. Order matters for a crash: the
@@ -1222,6 +1247,8 @@ export default {
           STRIPE_WEBHOOK_SECRET: secret,
           STRIPE_PRICE_TEAM: env.STRIPE_PRICE_TEAM,
           STRIPE_PRICE_BUSINESS: env.STRIPE_PRICE_BUSINESS,
+          STRIPE_PRICE_TEAM_YEARLY: env.STRIPE_PRICE_TEAM_YEARLY,
+          STRIPE_PRICE_BUSINESS_YEARLY: env.STRIPE_PRICE_BUSINESS_YEARLY,
           STRIPE_PRICE_SOLO_MONTHLY: env.STRIPE_PRICE_SOLO_MONTHLY,
           STRIPE_PRICE_SOLO_YEARLY: env.STRIPE_PRICE_SOLO_YEARLY,
           STRIPE_SECRET_KEY: env.STRIPE_SECRET_KEY,

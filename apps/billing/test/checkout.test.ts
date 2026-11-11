@@ -646,7 +646,7 @@ describe("POST /checkout", () => {
         400,
         "bad_body",
       ],
-      [{ install: A, plan: "team", interval: "month" }, 400, "bad_plan"],
+      [{ install: A, plan: "team", interval: "week" }, 400, "bad_plan"],
       [{ install: A, plan: "team", ts: Date.now() + 0.5 }, 400, "bad_body"],
       [{ plan: "team" }, 403, "install_mismatch"],
       [{ install: B, plan: "team" }, 403, "install_mismatch"],
@@ -2041,5 +2041,89 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
       new RegExp(`^qty-${A}-${closed}-5-\\d+$`),
     );
     expect(await usageRow(closed)).toMatchObject({ applied_quantity: 5 });
+  });
+});
+
+describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => {
+  const yearlyEnv = (): Env => ({
+    ...baseEnv(),
+    STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
+    STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+  });
+
+  it("year + seats uses the yearly price, quantity = seats, and interval and seats are in the key", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    const ts = Date.now();
+    for (const [plan, seats, price] of [
+      ["team", 5, "price_teamY1"],
+      ["business", 1, "price_businessY1"],
+      ["team", MAX_CREATORS, "price_teamY1"],
+    ] as const) {
+      const r = await call(
+        req("/checkout", { install: A, ts, plan, interval: "year", seats }),
+        yearlyEnv(),
+      );
+      expect(r.status).toBe(200);
+      const c = s.calls.at(-1);
+      expect(c?.path).toBe(CHECKOUT);
+      expect(c?.form["line_items[0][price]"]).toBe(price);
+      expect(c?.form["line_items[0][quantity]"]).toBe(String(seats));
+      expect(c?.key).toBe(`checkout-${A}-${plan}-year-s${seats}-${ts}`);
+    }
+  });
+
+  it("interval month is the monthly price, as when absent", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    const r = await call(
+      req("/checkout", { install: A, plan: "team", interval: "month" }),
+      yearlyEnv(),
+    );
+    expect(r.status).toBe(200);
+    expect(s.calls.at(-1)?.form["line_items[0][price]"]).toBe("price_team1");
+  });
+
+  it("refuses bad seats, seats with month, year without seats or with creators, before any Stripe call", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    for (const [body, error] of [
+      [{ plan: "team", seats: 3 }, "bad_seats"],
+      [{ plan: "team", interval: "month", seats: 3 }, "bad_seats"],
+      [{ plan: "team", interval: "year" }, "bad_seats"],
+      [{ plan: "team", interval: "year", seats: 0 }, "bad_seats"],
+      [
+        { plan: "team", interval: "year", seats: MAX_CREATORS + 1 },
+        "bad_seats",
+      ],
+      [{ plan: "business", interval: "year", seats: 1.5 }, "bad_seats"],
+      [{ plan: "business", interval: "year", seats: "3" }, "bad_seats"],
+      [{ plan: "business", interval: "year", seats: null }, "bad_seats"],
+      [{ plan: "solo", interval: "year", seats: 3 }, "bad_seats"],
+      [
+        { plan: "team", interval: "year", seats: 3, creators: 3 },
+        "bad_creators",
+      ],
+    ] as [Record<string, unknown>, string][]) {
+      const r = await call(
+        req("/checkout", { install: A, ...body }),
+        yearlyEnv(),
+      );
+      expect([r.status, await r.json()]).toEqual([400, { error }]);
+    }
+    expect(s.calls).toEqual([]);
+  });
+
+  it("yearly with the price id unset is a 503 config error, never an empty price", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    for (const plan of ["team", "business"]) {
+      const r = await call(
+        req("/checkout", { install: A, plan, interval: "year", seats: 2 }),
+        baseEnv(),
+      );
+      expect([r.status, await r.json()]).toEqual([503, { error: "config" }]);
+    }
+    expect(s.calls).toEqual([]);
   });
 });

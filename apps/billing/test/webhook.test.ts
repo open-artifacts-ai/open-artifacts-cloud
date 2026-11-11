@@ -290,6 +290,38 @@ describe("Solo prices (#1568)", () => {
       )
     ).json();
 
+  it("the env's yearly Team and Business prices reach the webhook: a paid yearly checkout sets the tier (#2136)", async () => {
+    const yearly = {
+      ...priced,
+      STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
+      STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+    } as Env;
+    for (const [i, [price, tier]] of [
+      ["price_teamY1", "team"],
+      ["price_businessY1", "business"],
+    ].entries()) {
+      await db
+        .prepare(
+          "UPDATE tiers SET tier = 'free', stripe_subscription_id = NULL, last_event_created = NULL WHERE install_id = ?1",
+        )
+        .bind(A)
+        .run();
+      const r = await call(
+        await hook(
+          solo(
+            `evt_Year${i}x1`,
+            "customer.subscription.updated",
+            "active",
+            price,
+          ),
+        ),
+        yearly,
+      );
+      expect(r.status).toBe(200);
+      expect(await tierOf(), price).toMatchObject({ tier, status: "active" });
+    }
+  });
+
   it("the env's two Solo prices reach the webhook: either one makes the row solo", async () => {
     for (const [i, price] of ["price_soloM1", "price_soloY1"].entries()) {
       await db
