@@ -5,6 +5,7 @@ import {
   TOKEN_SCOPES,
 } from "@oa/provisioning-contract";
 import type { BusIo, ProvConfig, ProvIo } from "../src/provisioning.ts";
+import { HOSTED_TOOL_NAMES } from "../src/provisioning.ts";
 import { type Schema, schemaAhead } from "../src/schema.ts";
 import { sealTo } from "./provisioner-seal.ts";
 
@@ -827,6 +828,7 @@ export function fakeApi(): FakeApi {
       return rpcOk(rpc.id, {
         tools: [
           ...ADMIN_TOOL_NAMES,
+          ...HOSTED_TOOL_NAMES,
           ...(faults.has("p45_extra_tool") ? ["mint_token"] : []),
         ].map((name) => ({ name })),
       });
