@@ -110,7 +110,7 @@ describe("signups duty", () => {
       expect(f.sent()).toEqual([]);
     });
 
-  for (const v of ["true", "test-users"])
+  for (const v of ["true", "test-users", "invite"])
     it(`SIGNUPS_ENABLED ${v}: on`, async () => {
       await selfServe({ status: "pending", updated_at: 1 });
       const f = fakes({ SIGNUPS_ENABLED: v });

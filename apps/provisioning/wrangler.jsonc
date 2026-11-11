@@ -5,8 +5,9 @@
 // no main, so a deploy without --env is refused. No routes, custom domains or
 // workers.dev here: admin.<app>/* and api.<app>/* are wired by
 // scripts/ops/hosted-zones.sh. Placeholders ({{...}}) are filled at deploy.
-// Observability stays off: Workers Logs would hold request URLs (sign-in
-// codes and state, OAuth codes).
+// Workers Logs on for console output only (#164): invocation logs stay off,
+// because they hold request URLs, and query strings are redacted from the
+// URLs that other log entries carry (sign-in codes and state, OAuth codes).
 // This Worker holds no Cloudflare token (2.5); the provisioner does.
 // Secrets (set by CI only if absent, 4.6): ADMIN_SESSION_KEY (32 random
 // bytes), ADMIN_BROKER_KEY (Ed25519 pkcs8). MCP adds none (2.4).
@@ -34,7 +35,13 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": {
-        "enabled": false
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
       },
       // Hourly MCP client sweep (sweepOAuthClients): unclaimed after 24 h,
       // any client after 30 days, with its grants.
@@ -48,6 +55,8 @@
         "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_STAGING}}",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
+        // The sender of the approval email (#2096), the provisioner's value.
+        "WELCOME_FROM": "{{WELCOME_FROM_STAGING}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
         "OIDC_AUDIENCE": "https://api.open-artifacts-staging.app",
         "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
@@ -78,6 +87,8 @@
       ],
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      // The approval email (#2096): the provisioner's sender, no fixed destination.
+      "send_email": [{ "name": "WELCOME_EMAIL" }],
       // BILLING is STAGING ONLY (#66): billing's BillingOperatorRpc entrypoint,
       // how an operator sets an install's tier (set_install_tier). oa-s-billing
       // must be deployed first, and the deploy reads the binding back when the
@@ -191,7 +202,13 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": {
-        "enabled": false
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
       },
       // Hourly MCP client sweep (sweepOAuthClients): unclaimed after 24 h,
       // any client after 30 days, with its grants.
@@ -204,6 +221,8 @@
         "SIGNUPS_ENABLED": "false",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
+        // The sender of the approval email (#2096), the provisioner's value.
+        "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback"
       },
       "d1_databases": [
@@ -229,6 +248,8 @@
       ],
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      // The approval email (#2096): the provisioner's sender, no fixed destination.
+      "send_email": [{ "name": "WELCOME_EMAIL" }],
       "services": [
         {
           "binding": "PROVISIONER",

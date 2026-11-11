@@ -8,6 +8,7 @@ import { render } from "@testing-library/react";
 import { type HttpHandler, HttpResponse, http, type JsonBodyType } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, vi } from "vitest";
+import { createBetaMock } from "../src/mocks/beta";
 import { createMock } from "../src/mocks/handlers";
 import { router as appRouter, rawSearch } from "../src/router";
 
@@ -48,6 +49,8 @@ server.events.on("request:start", async ({ request }) => {
 });
 /** The contract mock of the current test: advanceJob, finishAllJobs. */
 export let mock: ReturnType<typeof createMock>;
+/** The Beta tab's stateful mock (#2096) of the current test. */
+export let betaMock: ReturnType<typeof createBetaMock>;
 export const writes = () => seen.filter((s) => s.method !== "GET");
 
 // Captured after listen(): msw patches the global fetch there. The panel's
@@ -60,7 +63,8 @@ beforeAll(() => {
 beforeEach(() => {
   seen = [];
   mock = createMock();
-  server.use(...mock.handlers);
+  betaMock = createBetaMock();
+  server.use(...betaMock.handlers, ...mock.handlers);
   vi.stubGlobal("fetch", (u: RequestInfo | URL, init?: RequestInit) =>
     realFetch(new URL(u as string, ORIGIN).href, init),
   );

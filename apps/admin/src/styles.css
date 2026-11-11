@@ -2086,3 +2086,281 @@ code.oa-code,
   color: var(--oa-text);
   overflow-wrap: anywhere;
 }
+
+/* ---------- Beta tab (#2096; design jL29NAp7gLQFqT9U) ---------- */
+.oa-navcnt {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 99px;
+  background: var(--oa-text);
+  color: var(--oa-bg);
+  font: 600 11px / 18px var(--oa-font-sans);
+  text-align: center;
+}
+.oa-btn-sm {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+.oa-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.oa-lnk {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--oa-accent-fg);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.oa-beta-mode {
+  font-size: 15px;
+  line-height: 27px;
+}
+.oa-beta-sec {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: 22px 0 8px;
+}
+.oa-beta-sec h2 {
+  margin: 0;
+}
+.oa-beta-search {
+  width: 240px;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--oa-border);
+  border-radius: 7px;
+  background: var(--oa-surface);
+  color: var(--oa-text);
+  font: 400 13px / 1.4 var(--oa-font-sans);
+}
+.oa-beta-card {
+  margin-bottom: 0;
+}
+.oa-beta-card + .oa-beta-card {
+  margin-top: 8px;
+}
+.oa-beta-table th.sel,
+.oa-beta-table td.sel {
+  width: 30px;
+}
+.oa-beta-table td {
+  vertical-align: top;
+  white-space: normal;
+}
+.oa-beta-table td.act {
+  white-space: nowrap;
+  text-align: right;
+}
+.oa-beta-table td.act .oa-btn + .oa-btn {
+  margin-left: 6px;
+}
+.oa-beta-table td.em {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.oa-beta-table td.dt,
+.oa-beta-table .dt {
+  color: var(--oa-text-muted);
+}
+.oa-beta-table td.dt {
+  white-space: nowrap;
+}
+.oa-beta-nt {
+  display: block;
+  max-width: 46ch;
+  color: var(--oa-text-2);
+  overflow-wrap: anywhere;
+}
+.oa-beta-nt.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.oa-beta-none {
+  color: var(--oa-text-muted);
+}
+.oa-beta-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 7px;
+  border: 1px solid var(--oa-border);
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--oa-text-2);
+  white-space: nowrap;
+}
+.oa-beta-empty {
+  margin: 0;
+  padding: 26px 16px;
+  text-align: center;
+  color: var(--oa-text-muted);
+}
+.oa-beta-bulk {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--oa-accent-soft);
+  border-bottom: 1px solid var(--oa-divider);
+  font-size: 12.5px;
+}
+.oa-beta-add {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 12px;
+  border-bottom: 1px solid var(--oa-divider);
+}
+.oa-app .oa-beta-ta {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+  height: 32px;
+  resize: vertical;
+  padding: 6px 10px;
+  border: 1px solid var(--oa-border);
+  border-radius: 7px;
+  background: var(--oa-surface);
+  color: var(--oa-text);
+  font: 400 13px / 1.4 var(--oa-font-sans);
+}
+.oa-beta-ta[aria-invalid="true"] {
+  border-color: var(--oa-danger);
+}
+.oa-beta-err,
+.oa-beta-hint {
+  margin: 0;
+  padding: 0 12px 10px;
+  font-size: 12.5px;
+}
+.oa-page .oa-beta-err,
+.oa-page .oa-beta-hint {
+  margin: 0;
+}
+.oa-beta-err {
+  color: var(--oa-danger);
+}
+.oa-beta-hint {
+  color: var(--oa-text-muted);
+  font-size: 12px;
+}
+.oa-beta-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 60;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 9px 13px;
+  border-radius: 9px;
+  background: var(--oa-text);
+  color: var(--oa-bg);
+  font-size: 13px;
+  box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.4);
+}
+.oa-beta-toast.bad {
+  background: var(--oa-danger);
+  color: var(--oa-accent-text);
+}
+/* Under 700px the tables become stacked rows: email and date, then the
+   note, then the buttons. No sideways scrolling. */
+@media (max-width: 700px) {
+  .oa-beta-table thead {
+    display: none;
+  }
+  .oa-beta-table,
+  .oa-beta-table tbody,
+  .oa-beta-table tr,
+  .oa-beta-table td {
+    display: block;
+    width: 100%;
+  }
+  .oa-beta-table tr {
+    position: relative;
+    padding: 10px 12px;
+    border-top: 1px solid var(--oa-divider);
+  }
+  .oa-beta-table tbody tr:first-child {
+    border-top: 0;
+  }
+  .oa-beta-table td {
+    padding: 0;
+    border: 0;
+  }
+  .oa-beta-table td.sel {
+    position: absolute;
+    left: 12px;
+    top: 10px;
+    width: auto;
+  }
+  .oa-beta-table tr.hassel td:not(.sel) {
+    padding-left: 24px;
+  }
+  .oa-beta-table td.act {
+    text-align: left;
+    margin-top: 8px;
+  }
+  .oa-beta-table td.dt {
+    font-size: 12px;
+  }
+  .oa-beta-table td.nt-td {
+    margin-top: 4px;
+  }
+  .oa-beta-add {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .oa-beta-search {
+    width: 100%;
+  }
+}
+
+/* The four stat tiles fill the row to the table's right edge. */
+.oa-beta .oa-tiles {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (max-width: 700px) {
+  .oa-beta .oa-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.oa-beta-err p {
+  margin: 0 0 2px;
+}
+.oa-beta-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.oa-beta-toast-go,
+.oa-beta-toast-x {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.oa-beta-toast-go {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.oa-beta-toast-x {
+  font-size: 16px;
+  line-height: 1;
+}
+.oa-beta-unsent-head {
+  padding-top: 10px;
+}

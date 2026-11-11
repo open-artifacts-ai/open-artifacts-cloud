@@ -157,7 +157,10 @@ export async function world(a: HandlerArgs): Promise<RouteResult> {
       stale: tickAt === null || now - tickAt > SCHEDULER_STALE_MS,
     },
     prodClean: pc ? { at: pc.at, ok: pc.ok === 1, code: pc.code } : null,
-    signups: env.SIGNUPS_ENABLED,
+    // The public World schema's enum has no `invite` yet (#2096): it reads as
+    // `test-users` (only chosen people get in), not `true` (anyone).
+    signups:
+      env.SIGNUPS_ENABLED === "invite" ? "test-users" : env.SIGNUPS_ENABLED,
   };
   return { status: 200, body, headers: {} };
 }

@@ -1,6 +1,7 @@
 import type { Env } from "../env.js";
 import type { Principal } from "../principal.js";
 import { CLIENT_JS } from "./client.js";
+import { gateOf } from "./gate.js";
 import { CSS } from "./style.js";
 
 // The sign-up page's own responses on signup.<app>: the static document, its
@@ -63,14 +64,13 @@ export function signupStatic(req: Request, path: string): Response | null {
   return null;
 }
 
-/** `open` is false while SIGNUPS_ENABLED is "false"; "test-users" shows the form. */
+/** `open` is false while SIGNUPS_ENABLED is "false"; "test-users" and "invite" show the form. */
 export function signupConfig(env: Env): Response {
   return json(
     {
       open: env.SIGNUPS_ENABLED !== "false",
       appDomain: env.APP_DOMAIN,
       turnstileSiteKey: env.TURNSTILE_SITEKEY ?? null,
-      supportEmail: `support@${env.APP_DOMAIN}`,
       docsUrl: "https://open-artifacts.com",
       githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
     },
@@ -112,9 +112,14 @@ export async function signupStatus(env: Env, p: Principal): Promise<Response> {
     .bind(p.sub ?? "")
     .first<Row>();
   const h = { "cache-control": "no-store" };
-  if (!row || !STAGES.has(row.status)) return json({ stage: "none" }, 200, h);
+  // `gate` (#2096): allowed | waitlist | waitlisted, absent while closed.
+  const gate = await gateOf(env, p);
+  const g = gate === undefined ? {} : { gate };
+  if (!row || !STAGES.has(row.status))
+    return json({ stage: "none", ...g }, 200, h);
   return json(
     {
+      ...g,
       stage: row.status === "pending" ? "queued" : row.status,
       slug: row.slug,
       host: `${row.slug}.${env.APP_DOMAIN}`,

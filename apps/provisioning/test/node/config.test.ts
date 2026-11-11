@@ -58,7 +58,17 @@ describe("wrangler.jsonc", () => {
         expect(e.main).toBe("src/index.ts");
         expect(e.workers_dev).toBe(false);
         expect(e.preview_urls).toBe(false);
-        expect(e.observability).toEqual({ enabled: false });
+        // Console logs on (#164); invocation logs off: request URLs carry
+        // sign-in and OAuth codes.
+        expect(e.observability).toEqual({
+          enabled: true,
+          redact_query_string: true,
+          logs: {
+            enabled: true,
+            invocation_logs: false,
+            head_sampling_rate: 1,
+          },
+        });
         for (const k of ["route", "routes", "custom_domain", "custom_domains"])
           expect(e[k]).toBeUndefined();
       });
@@ -205,7 +215,17 @@ describe("wrangler.jsonc", () => {
           expect(k).toMatch(new RegExp(`_${env.toUpperCase()}$`));
       });
 
-      it("binds nothing else (no dispatcher, releases, email or token)", () => {
+      it("sends the approval email through the provisioner's sender (#2096)", () => {
+        // No fixed destination: each approval goes to its own address.
+        expect(e.send_email).toEqual([{ name: "WELCOME_EMAIL" }]);
+        expect(e.vars.WELCOME_FROM).toBe(
+          `{{WELCOME_FROM_${env.toUpperCase()}}}`,
+        );
+      });
+
+      // The one email binding is the approval email's sender (#2096), the
+      // provisioner's WELCOME_EMAIL; no dispatcher, releases or token.
+      it("binds nothing else (no dispatcher, releases or token)", () => {
         expect(Object.keys(e).sort()).toEqual(
           [
             "assets",
@@ -217,6 +237,7 @@ describe("wrangler.jsonc", () => {
             "preview_urls",
             "queues",
             "ratelimits",
+            "send_email",
             "services",
             "triggers",
             "vars",

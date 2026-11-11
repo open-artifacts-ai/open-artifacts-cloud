@@ -571,6 +571,26 @@ describe("deploy-platform-worker.sh", () => {
       ).toBe(0);
     });
 
+    it("SIGNUPS_ENABLED invite (#2096) needs ALLOW_SIGNUPS=1, in both envs", () => {
+      for (const env of ["staging", "prod"]) {
+        const off = run(["provisioner", env], {
+          ...OK,
+          SIGNUPS_ENABLED: "invite",
+        });
+        expect(off.code, env).toBe(1);
+        expect(off.log).toEqual([]);
+        const on = run(["provisioner", env], {
+          ...OK,
+          SIGNUPS_ENABLED: "invite",
+          ALLOW_SIGNUPS: "1",
+        });
+        expect(on.code, env).toBe(0);
+        expect(readFileSync(on.snap, "utf8")).toContain(
+          '"SIGNUPS_ENABLED": "invite"',
+        );
+      }
+    });
+
     it("refuses an unfilled or invalid value", () => {
       const bad: Record<string, string[]> = {
         SIGNUP_DAILY_CAP: ["", "0", "10000", "020", "1e3", "-1", "20 "],
@@ -699,6 +719,8 @@ describe("deploy-platform-worker.sh", () => {
       GITHUB_REPOSITORY_ID: "1012345678",
       SIGNUP_DAILY_CAP: "20",
       SIGNUPS_ENABLED: "false",
+      // The approval email's sender (#2096), the provisioner's value.
+      WELCOME_FROM: "welcome@mail.open-artifacts.app",
     };
     /** A tree with this config and, unless `assets` is false, the admin build's index.html. */
     const tree = (config: string, assets = true) => {
@@ -735,6 +757,9 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`"database_id": "${DB}"`);
         expect(snap).toContain(`"id": "${KV}"`);
         expect(snap).toContain('"SIGNUP_DAILY_CAP": "20"');
+        expect(snap).toContain(
+          '"WELCOME_FROM": "welcome@mail.open-artifacts.app"',
+        );
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         if (env === "staging")
           expect(snap).toContain('"OIDC_REPOSITORY_ID": "1012345678"');
@@ -748,6 +773,7 @@ describe("deploy-platform-worker.sh", () => {
         PROVISIONING_OAUTH_KV_ID: ["", DB, KV.toUpperCase()],
         GITHUB_REPOSITORY_ID: ["", "0123", "12a", "1/2"],
         SIGNUP_DAILY_CAP: ["", "0", "10000", "1e3"],
+        WELCOME_FROM: ["", "a@b", "x y@mail.open-artifacts.app"],
       };
       for (const env of ["staging", "prod"])
         for (const [key, values] of Object.entries(bad))

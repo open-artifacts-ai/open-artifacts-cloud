@@ -653,7 +653,7 @@ describe("0010_trial_reminders (cloud #39)", () => {
 
 describe("0012_solo_start (self-serve Solo start)", () => {
   it("follows 0009 and only adds two nullable signups columns, backfilling legacy rows as skipped", () => {
-    expect(migrationFiles.slice(11)).toEqual(["0012_solo_start.sql"]);
+    expect(migrationFiles.slice(11, 12)).toEqual(["0012_solo_start.sql"]);
     const sql = migrationSql("0012_solo_start.sql").replace(/--[^\n]*/g, "");
     expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
     const db = platformDb();
@@ -687,5 +687,87 @@ describe("0012_solo_start (self-serve Solo start)", () => {
     }
     for (const st of ["pending", "queued", "waiting_cap", "creating"])
       expect(row(ids[st] as string)).toEqual({ s: null, k: null });
+  });
+});
+
+describe("0014_waitlist_emailed (when the approval email went, #2096)", () => {
+  it("follows 0013 and only adds the nullable emailed_at column", () => {
+    expect(migrationFiles.slice(13)).toEqual(["0014_waitlist_emailed.sql"]);
+    const sql = migrationSql("0014_waitlist_emailed.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE)\b/i);
+    expect(sql).toMatch(
+      /ALTER TABLE signup_waitlist ADD COLUMN emailed_at INTEGER;/,
+    );
+    expect(cols(platformDb(), "signup_waitlist")).toContain(
+      "emailed_at INTEGER",
+    );
+  });
+});
+
+describe("0013_signup_beta_gate (allow list and waitlist, #2096)", () => {
+  it("follows 0012 and only adds the two tables and an index", () => {
+    expect(migrationFiles.slice(12, 13)).toEqual(["0013_signup_beta_gate.sql"]);
+    const sql = migrationSql("0013_signup_beta_gate.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
+    const db = platformDb();
+    expect(cols(db, "signup_allowlist")).toEqual(
+      expect.arrayContaining([
+        "entry TEXT PK",
+        "added_by TEXT NN",
+        "added_at INTEGER NN",
+      ]),
+    );
+    expect(cols(db, "signup_waitlist")).toEqual(
+      expect.arrayContaining([
+        "sub TEXT PK",
+        "email TEXT NN",
+        "note TEXT",
+        "joined_at INTEGER NN",
+        "status TEXT NN",
+      ]),
+    );
+  });
+
+  it("has no foreign key either way, so removing an entry cascades to nothing", () => {
+    const db = platformDb();
+    for (const t of ["signup_allowlist", "signup_waitlist"])
+      expect(db.prepare(`PRAGMA foreign_key_list(${t})`).all()).toEqual([]);
+    const refs = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all() as { name: string }[];
+    for (const { name } of refs)
+      expect(
+        (
+          db.prepare(`PRAGMA foreign_key_list(${name})`).all() as {
+            table: string;
+          }[]
+        ).filter(
+          (f) =>
+            f.table.startsWith("signup_allow") || f.table === "signup_waitlist",
+        ),
+      ).toEqual([]);
+  });
+
+  it("the waitlist status is waiting by default and only waiting, approved or declined", () => {
+    const db = platformDb();
+    db.prepare(
+      "INSERT INTO signup_waitlist (sub, email, joined_at) VALUES ('s1', 'a@b.co', 1)",
+    ).run();
+    expect(
+      db.prepare("SELECT status FROM signup_waitlist WHERE sub = 's1'").get(),
+    ).toEqual({ status: "waiting" });
+    expect(() =>
+      db
+        .prepare(
+          "INSERT INTO signup_waitlist (sub, email, joined_at, status) VALUES ('s2', 'a@b.co', 1, 'nope')",
+        )
+        .run(),
+    ).toThrow();
   });
 });
