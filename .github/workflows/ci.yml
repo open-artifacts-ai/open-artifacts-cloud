@@ -252,7 +252,8 @@ jobs:
   # workflows (#17). Runs on the overlay tree (the action above), where the
   # root biome.json, tsconfig and node_modules are. tsc uses
   # scripts/audit/tsconfig.json: the root tsconfig also pulls in
-  # scripts/hosted and the scheduler, which have their own typecheck.
+  # scripts/hosted and the scheduler, which have their own typecheck; it
+  # excludes scripts/ops/platform-db.test.ts, which imports scheduler source.
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -305,6 +306,10 @@ jobs:
         app: [provisioning, admin]
     env:
       PLAYWRIGHT_IMAGE_VERSION: 1.64.1
+    # The container's default shell is sh; the steps use bash (pipefail).
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

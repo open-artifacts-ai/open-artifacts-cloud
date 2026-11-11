@@ -7,8 +7,5 @@
     "../ops/**/*.mjs",
     "./**/*.ts"
   ],
-  "exclude": [
-    "**/node_modules/**",
-    "../ops/platform-db.test.ts"
-  ]
+  "exclude": ["**/node_modules/**", "../ops/platform-db.test.ts"]
 }
