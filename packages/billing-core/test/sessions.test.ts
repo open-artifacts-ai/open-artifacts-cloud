@@ -1,15 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  cancelSubscription,
   createCheckoutSession,
   createCustomer,
   createPortalSession,
-  cancelSubscription,
-  retrieveSubscription,
   createSoloTrialSubscription,
   expireCheckoutSession,
+  retrieveSubscription,
   SOLO_TRIAL_DAYS,
   StripeApiError,
   StripeConfigError,
+  setSubscriptionQuantity,
 } from "../src/index.js";
 
 // Checkout and Portal against a fake fetch: no Stripe call leaves the test,
@@ -731,5 +732,158 @@ describe("retrieveSubscription (#1568)", () => {
       { secretKey: KEY, fetch: stripe({ id: "sub_Test1" }) },
     ).catch((x) => x);
     expect([e.status, e.type]).toEqual([200, "bad_answer"]);
+  });
+});
+
+describe("setSubscriptionQuantity (#2123)", () => {
+  type Call = { method: string; url: string; init: RequestInit };
+  const sub = (
+    o: Record<string, unknown> = {},
+    item: Record<string, unknown> = {},
+  ) => ({
+    id: "sub_Test1",
+    status: "active",
+    items: {
+      data: [
+        {
+          id: "si_Item1",
+          quantity: 1,
+          price: { id: "price_Team1", recurring: { interval: "month" } },
+          ...item,
+        },
+      ],
+    },
+    ...o,
+  });
+  const stripe = (get: unknown, getStatus = 200, postStatus = 200) => {
+    const calls: Call[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push({ method: String(init.method), url, init });
+      return init.method === "GET"
+        ? Response.json(get, { status: getStatus })
+        : Response.json(
+            postStatus === 200 ? { id: "si_Item1" } : { error: { type: "x" } },
+            { status: postStatus },
+          );
+    }) as unknown as typeof fetch;
+    return { calls, f };
+  };
+  const input = {
+    subscriptionId: "sub_Test1",
+    quantity: 4,
+    monthlyPriceIds: ["price_Team1"],
+    idempotencyKey: "qty-iabc123def45-2026-10-4",
+  };
+
+  it("reads, then POSTs the item's quantity with proration_behavior none and the key", async () => {
+    const { calls, f } = stripe(sub());
+    expect(
+      await setSubscriptionQuantity(input, { secretKey: KEY, fetch: f }),
+    ).toEqual({
+      outcome: "updated",
+      previous: 1,
+    });
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ["GET", "https://api.stripe.com/v1/subscriptions/sub_Test1"],
+      ["POST", "https://api.stripe.com/v1/subscription_items/si_Item1"],
+    ]);
+    const post = calls[1] as Call;
+    expect(
+      Object.fromEntries(new URLSearchParams(String(post.init.body))),
+    ).toEqual({
+      quantity: "4",
+      proration_behavior: "none",
+    });
+    expect(new Headers(post.init.headers).get("idempotency-key")).toBe(
+      input.idempotencyKey,
+    );
+  });
+
+  it("an item already at the quantity is not written", async () => {
+    const { calls, f } = stripe(sub({}, { quantity: 4 }));
+    expect(
+      await setSubscriptionQuantity(input, { secretKey: KEY, fetch: f }),
+    ).toEqual({
+      outcome: "unchanged",
+      previous: 4,
+    });
+    expect(calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("a yearly, unlisted or multi-item subscription is not_monthly; canceled, trialing or gone is not_live; no write", async () => {
+    const yearly = { id: "price_Team1", recurring: { interval: "year" } };
+    for (const [answer, status, outcome] of [
+      [sub({}, { price: yearly }), 200, "not_monthly"],
+      [
+        sub(
+          {},
+          { price: { id: "price_TeamY1", recurring: { interval: "year" } } },
+        ),
+        200,
+        "not_monthly",
+      ],
+      [
+        sub(
+          {},
+          { price: { id: "price_Other1", recurring: { interval: "month" } } },
+        ),
+        200,
+        "not_monthly",
+      ],
+      [
+        sub({ items: { data: [sub().items.data[0], sub().items.data[0]] } }),
+        200,
+        "not_monthly",
+      ],
+      [sub({ status: "canceled" }), 200, "not_live"],
+      [sub({ status: "trialing" }), 200, "not_live"],
+      [sub({ status: "incomplete" }), 200, "not_live"],
+      [{ error: { type: "invalid_request_error" } }, 404, "not_live"],
+    ] as const) {
+      const { calls, f } = stripe(answer, status);
+      expect(
+        (await setSubscriptionQuantity(input, { secretKey: KEY, fetch: f }))
+          .outcome,
+      ).toBe(outcome);
+      expect(calls.map((c) => c.method)).toEqual(["GET"]);
+    }
+  });
+
+  it("refuses a bad quantity, id, price or key before any call; a Stripe error keeps status and type", async () => {
+    const { calls, f } = stripe(sub());
+    for (const [bad, field] of [
+      [{ quantity: 0 }, "quantity"],
+      [{ quantity: 10_001 }, "quantity"],
+      [{ quantity: 1.5 }, "quantity"],
+      [{ subscriptionId: "si_x" }, "subscriptionId"],
+      [{ monthlyPriceIds: ["nope"] }, "monthlyPriceIds"],
+      [{ idempotencyKey: "short" }, "idempotencyKey"],
+    ] as const) {
+      const e = await setSubscriptionQuantity(
+        { ...input, ...bad },
+        { secretKey: KEY, fetch: f },
+      ).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe(field);
+    }
+    expect(calls).toEqual([]);
+    for (const [g, p, status] of [
+      [500, 200, 500],
+      [200, 400, 400],
+    ] as const) {
+      const s = stripe(sub(), g, p);
+      const e = await setSubscriptionQuantity(input, {
+        secretKey: KEY,
+        fetch: s.f,
+      }).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(StripeApiError);
+      expect((e as StripeApiError).status).toBe(status);
+    }
+    const odd = stripe({ status: "active" });
+    const e = await setSubscriptionQuantity(input, {
+      secretKey: KEY,
+      fetch: odd.f,
+    }).catch((x: unknown) => x);
+    expect((e as StripeApiError).type).toBe("bad_answer");
   });
 });

@@ -442,3 +442,103 @@ export async function retrieveSubscription(
     throw e;
   }
 }
+
+/** What setSubscriptionQuantity did. */
+export type QuantityOutcome =
+  /** The item's quantity was set (proration_behavior none). */
+  | "updated"
+  /** The item already had this quantity: no write. */
+  | "unchanged"
+  /**
+   * The subscription's one item is not a monthly price billing names (a
+   * yearly prepaid-seat price, #2123 PR 4b, or anything unknown): left alone.
+   */
+  | "not_monthly"
+  /** Canceled, incomplete, gone (404) or trialing in Stripe: left alone. */
+  | "not_live";
+
+export interface QuantityInput {
+  subscriptionId: string;
+  /** The creator count to bill (1..10000). */
+  quantity: number;
+  /**
+   * The monthly per-creator prices this may change (Team's and Business's).
+   * The item's price must be one of them and recur monthly; a yearly price
+   * is recognised by its recurring interval and never changed here.
+   */
+  monthlyPriceIds: readonly string[];
+  /** Billing's key, e.g. qty-<install>-<month>-<quantity>: a retry is one write. */
+  idempotencyKey: string;
+}
+
+/** Stripe statuses whose quantity follows the creator count. */
+const QUANTITY_LIVE = new Set(["active", "past_due"]);
+const SUBSCRIPTION_ITEM = /^si_[A-Za-z0-9]{1,255}$/;
+
+/**
+ * Sets a monthly Team or Business subscription's quantity to the creator
+ * count (#2123), with proration_behavior none: nothing is charged or
+ * credited now, and the next invoice bills that many creators. Reads the
+ * subscription first and changes nothing unless it is live (active or
+ * past_due) with exactly one item at one of `monthlyPriceIds` recurring
+ * monthly; an item already at `quantity` is not written. Safe to repeat.
+ * Any Stripe error but a 404 on the read is thrown (status and type only).
+ */
+export async function setSubscriptionQuantity(
+  input: QuantityInput,
+  cfg: StripeConfig,
+): Promise<{ outcome: QuantityOutcome; previous?: number }> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const quantity = input.quantity;
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
+    throw new StripeConfigError("quantity");
+  for (const p of input.monthlyPriceIds) check(PRICE, "monthlyPriceIds", p);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  let status: number;
+  let out: Record<string, unknown> | null;
+  try {
+    ({ status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/subscriptions/${id}`,
+      null,
+      null,
+    ));
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404)
+      return { outcome: "not_live" };
+    throw e;
+  }
+  if (typeof out?.status !== "string")
+    throw new StripeApiError(status, "bad_answer");
+  if (!QUANTITY_LIVE.has(out.status)) return { outcome: "not_live" };
+  const items = (out.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  if (items.length !== 1) return { outcome: "not_monthly" };
+  const item = items[0] as {
+    id?: unknown;
+    quantity?: unknown;
+    price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+  };
+  if (typeof item?.id !== "string" || !SUBSCRIPTION_ITEM.test(item.id))
+    throw new StripeApiError(status, "bad_answer");
+  if (
+    typeof item.price?.id !== "string" ||
+    !input.monthlyPriceIds.includes(item.price.id) ||
+    item.price.recurring?.interval !== "month"
+  )
+    return { outcome: "not_monthly" };
+  const previous =
+    typeof item.quantity === "number" ? item.quantity : undefined;
+  if (previous === quantity) return { outcome: "unchanged", previous };
+  await post(
+    cfg,
+    `/v1/subscription_items/${item.id}`,
+    { quantity: String(quantity), proration_behavior: "none" },
+    input.idempotencyKey,
+  );
+  return {
+    outcome: "updated",
+    ...(previous === undefined ? {} : { previous }),
+  };
+}
