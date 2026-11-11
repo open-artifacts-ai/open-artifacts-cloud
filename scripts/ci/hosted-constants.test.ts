@@ -428,6 +428,17 @@ describe("hosted-constants.sh", () => {
     expect(bad.code).toBe(1);
   });
 
+  it("SIGNUPS_ENABLED invite (the private beta, #2096) loads for staging and prod", () => {
+    for (const env of ["staging", "prod"] as const) {
+      const r = load({ ...read(env), signups_enabled: "invite" }, env);
+      expect(r.code, r.err).toBe(0);
+      expect(r.ghEnv).toContain("SIGNUPS_ENABLED=invite\n");
+      expect(load({ ...read(env), signups_enabled: "INVITE" }, env).code).toBe(
+        1,
+      );
+    }
+  });
+
   it("staging loads the four prices as STRIPE_PRICE_*; a missing or malformed one fails and writes nothing", () => {
     const st = load(read("staging"), "staging");
     expect(st.code, st.err).toBe(0);

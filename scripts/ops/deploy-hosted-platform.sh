@@ -236,8 +236,9 @@ signups_ok() {
   case "$1" in
     false) return 0 ;;
     test-users) [ "$env" = staging ] || { echo "$2: SIGNUPS_ENABLED=test-users is staging only; refusing" >&2; exit 1; } ;;
+    invite) [ "${ALLOW_SIGNUPS:-}" = 1 ] || { echo "$2: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1; refusing" >&2; exit 1; } ;;
     true) [ "${ALLOW_SIGNUPS:-}" = 1 ] || { echo "$2: SIGNUPS_ENABLED=true opens self-serve signups and needs ALLOW_SIGNUPS=1; refusing" >&2; exit 1; } ;;
-    *) echo "$2: SIGNUPS_ENABLED is '$1', want false (staging also test-users); refusing" >&2; exit 1 ;;
+    *) echo "$2: SIGNUPS_ENABLED is '$1', want false or invite (staging also test-users, true); refusing" >&2; exit 1 ;;
   esac
 }
 # signups_committed <app>: before deploying, the tag's committed value for

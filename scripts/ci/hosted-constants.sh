@@ -42,7 +42,8 @@ google_id='^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$'
 # the deploy workflow sets ALLOW_SIGNUPS=1 for staging only, prod stays false)
 # and email.
 cap='^[1-9][0-9]{0,3}$'
-if [ "$1" = staging ]; then onoff='^(false|test-users|true)$'; else onoff='^false$'; fi
+# invite (#2096, the private beta) is allowed in both envs; the deploy still needs ALLOW_SIGNUPS=1.
+if [ "$1" = staging ]; then onoff='^(false|test-users|true|invite)$'; else onoff='^(false|invite)$'; fi
 email='^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$'
 lines=""
 # key ENV_NAME rule, one per line.

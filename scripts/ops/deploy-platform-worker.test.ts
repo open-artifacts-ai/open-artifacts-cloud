@@ -571,6 +571,26 @@ describe("deploy-platform-worker.sh", () => {
       ).toBe(0);
     });
 
+    it("SIGNUPS_ENABLED invite (#2096) needs ALLOW_SIGNUPS=1, in both envs", () => {
+      for (const env of ["staging", "prod"]) {
+        const off = run(["provisioner", env], {
+          ...OK,
+          SIGNUPS_ENABLED: "invite",
+        });
+        expect(off.code, env).toBe(1);
+        expect(off.log).toEqual([]);
+        const on = run(["provisioner", env], {
+          ...OK,
+          SIGNUPS_ENABLED: "invite",
+          ALLOW_SIGNUPS: "1",
+        });
+        expect(on.code, env).toBe(0);
+        expect(readFileSync(on.snap, "utf8")).toContain(
+          '"SIGNUPS_ENABLED": "invite"',
+        );
+      }
+    });
+
     it("refuses an unfilled or invalid value", () => {
       const bad: Record<string, string[]> = {
         SIGNUP_DAILY_CAP: ["", "0", "10000", "020", "1e3", "-1", "20 "],

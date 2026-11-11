@@ -383,6 +383,20 @@ describe("each probe fails on the behaviour it guards", () => {
       expect(out.get(id)).toMatch(re);
     });
 
+  it("P52 waits for /healthz to show the new version after a stale read", async () => {
+    const f = fakeApi();
+    f.faults.add("p52_stale_healthz");
+    expect(level((await runAll(f)).get("P52"))).toBe("pass");
+  });
+
+  it("P52 fails with the same message when /healthz never shows the new version", async () => {
+    const f = fakeApi();
+    f.faults.add("p52_old_healthz");
+    expect((await runAll(f)).get("P52")).toMatch(
+      /^P52: after the failed upgrade \/healthz is not ok on \S+ \(status 200, /,
+    );
+  });
+
   it("P13 waits out the 60 s HOSTS cache for the redline /healthz", async () => {
     const f = fakeApi();
     f.faults.add("p13_hosts_cache");
