@@ -319,17 +319,21 @@ billing_bound() {
 # against the tag's Workers, so an older tag (whose wrangler has neither) must
 # not fail for lack of it. Either one in the tag's config counts as declared,
 # so a half-declared config is never loosened.
-# welcome_declared <app>: 0 when the tag's apps/<app>/wrangler.jsonc names WELCOME_FROM or WELCOME_EMAIL.
+# welcome_declared <app>: in the main shell (no subshell to swallow the exit),
+# sets WELCOME_DECLARED=1 when the tag's apps/<app>/wrangler.jsonc names
+# WELCOME_FROM or WELCOME_EMAIL, else "". Unreadable: exit 1.
+WELCOME_DECLARED=""
 welcome_declared() {
   local rc=0
+  WELCOME_DECLARED=""
   grep -q -E 'WELCOME_FROM|WELCOME_EMAIL' "$root/apps/$1/wrangler.jsonc" || rc=$?
   [ "$rc" -le 1 ] || { echo "can't read $1's committed wrangler.jsonc" >&2; exit 1; }
-  return "$rc"
+  [ "$rc" -ne 0 ] || WELCOME_DECLARED=1
 }
-# welcome_bound <settings json> <app>: when declared, the live binding is send_email; otherwise none.
+# welcome_bound <settings json>, after welcome_declared: when declared, the live binding is send_email; otherwise none.
 welcome_bound() {
   local want=""
-  ! welcome_declared "$2" || want=send_email
+  [ -z "$WELCOME_DECLARED" ] || want=send_email
   expect "$1" '[.result.bindings[] | select(.name == "WELCOME_EMAIL") | .type] | join(",")' "$want" "WELCOME_EMAIL"
 }
 
@@ -390,7 +394,8 @@ case "$target" in
     ;;
   provisioner)
     need PLATFORM_DB_ID; need SECRETS_STORE_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
-    ! welcome_declared provisioner || need WELCOME_FROM
+    welcome_declared provisioner
+    [ -z "$WELCOME_DECLARED" ] || need WELCOME_FROM
     signups_committed provisioner
     # BILLING (#1568, staging only, when the tag declares it): the provisioner
     # starts an install's Solo trial through billing's BillingProvisionerRpc.
@@ -420,7 +425,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
     expect "$S" '.result.bindings[] | select(.name == "RELEASES") | .bucket_name' "$bucket" "RELEASES"
-    welcome_bound "$S" provisioner
+    welcome_bound "$S"
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_TOKEN") | "\(.type) \(.store_id) \(.secret_name)"' \
       "secrets_store_secret $SECRETS_STORE_ID oa-$P-provision-token" "PROVISION_TOKEN"
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | "\(.workflow_name) \(.class_name)"' \
@@ -428,7 +433,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
     billing_bound "$S" provisioner BillingProvisionerRpc
-    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES$(welcome_declared provisioner && echo ,WELCOME_EMAIL)"
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
@@ -439,7 +444,8 @@ case "$target" in
     ;;
   provisioning)
     need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
-    ! welcome_declared provisioning || need WELCOME_FROM
+    welcome_declared provisioning
+    [ -z "$WELCOME_DECLARED" ] || need WELCOME_FROM
     # ADMIN_IDENTITIES (#1007): the `email:sub` list is the Environment's
     # secret, never committed. Fail closed: no list, no deploy; each entry is
     # checked here and the value is never printed.
@@ -605,7 +611,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' "oa-$P-auth-broker" "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .queue_name' "oa-$P-signups" "SIGNUPS"
     expect "$S" '.result.bindings[] | select(.name == "ASSETS") | .type' assets "ASSETS"
-    welcome_bound "$S" provisioning
+    welcome_bound "$S"
     for wf in "PROVISION_INSTALL oa-$P-provision-install ProvisionInstall" "MANAGE_INSTALL oa-$P-manage-install ManageInstall"; do
       read -r b n c <<< "$wf"
       expect "$S" ".result.bindings[] | select(.name == \"$b\") | \"\\(.workflow_name) \\(.class_name) \\(.script_name)\"" "$n $c oa-$P-provisioner" "$b"
@@ -615,7 +621,7 @@ case "$target" in
     got="$(jq -c '[.result.bindings[] | select(.type == "ratelimit") | {name, namespace_id: (.namespace_id | tostring), limit: .simple.limit, period: .simple.period}] | sort_by(.name)' <<< "$S")"
     [ "$got" = "$want" ] || { echo "rate limits: got $got, want $want" >&2; exit 1; }
     billing_bound "$S" provisioning BillingOperatorRpc
-    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "$(welcome_declared provisioning && echo WELCOME_EMAIL)" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end)) | sort | join(",")' <<< "$want")"
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }
@@ -786,8 +792,7 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
     billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
-    expect "$S" '.result.observability.enabled // false' true "observability"
-    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
+    observability_is "$S" dispatch
     ;;
   scheduler)
     need PLATFORM_DB_ID; need EMAIL_ZONE_TAGS; need EMAIL_DAILY_LIMIT

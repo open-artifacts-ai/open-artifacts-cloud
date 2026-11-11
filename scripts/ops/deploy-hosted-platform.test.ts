@@ -1273,6 +1273,8 @@ describe("deploy-hosted-platform.sh", () => {
         if (target === "provisioner" || target === "provisioning")
           next[`oa-p-${target}`] = tagLive(target);
         if (target === "inventory") next["oa-p-inventory"] = invLive;
+        if (target === "dispatch")
+          next["oa-p-dispatch"] = live("oa-p-dispatch");
         const r = setup({
           configs,
           exists: [...PROD_WORKERS, ...SCHED_DEPS("p")],
