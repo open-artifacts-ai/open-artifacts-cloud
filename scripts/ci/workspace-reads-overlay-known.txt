@@ -1,0 +1,43 @@
+# Cross-package reads in the hosted (cloud) packages that the overlay
+# workspace-reads check tolerates (scripts/ci/workspace-reads-overlay.ts); public's
+# own baseline is scripts/ci/workspace-reads-known.txt, which is also applied.
+#
+# One "<file> <package-name>" per line, sorted, optional trailing "# ..." reason.
+# Each is a source file that reaches another package's files by path literal
+# without importing it, so pnpm's affected-only run (--filter ...[base]) cannot
+# see the edge (#1353, #1308). Mostly tests that read server migrations, the
+# wrangler template or a sibling's source as a fixture or a source-shape guard.
+#
+# Baseline at the first run (#17): it only shrinks. Declare the package in the
+# reader's package.json and delete the line, or drop the read. A line that
+# matches no current read fails the check as stale.
+apps/admin/vite.config.ts @oa/provisioning
+apps/provisioner/src/workflow.ts @oa/billing-core
+apps/provisioner/test/node/gmail-signup-owner.test.ts @oa/provisioning
+apps/provisioner/test/node/gmail-signup-owner.test.ts @oa/server
+apps/provisioner/test/node/manage.test.ts @oa/provisioning
+apps/provisioner/test/node/oauth-store-real.test.ts @oa/server
+apps/provisioner/test/node/world.ts @oa/server
+apps/provisioning/test/node/seal-copy.test.ts @oa/provisioner
+apps/scheduler/test/node/config.test.ts @oa/redline
+packages/bus-adapter-openclaw/test/bus.test.ts @open-artifacts/bus
+packages/provision/src/internal/template.ts @oa/server
+packages/provision/test/billing-backfill.test.ts @oa/billing
+packages/provision/test/gate.test.ts @oa/server
+packages/provision/test/metadata.test.ts @oa/server
+packages/provision/test/non-additive.test.ts @oa/server
+packages/provision/test/owner-email-source.test.ts @oa/auth-broker
+packages/provision/test/owner-email-source.test.ts @oa/directory-broker
+packages/provision/test/owner-email-source.test.ts @oa/dispatch
+packages/provision/test/owner-email-source.test.ts @oa/hosted
+packages/provision/test/owner-email-source.test.ts @oa/inventory
+packages/provision/test/owner-email-source.test.ts @oa/provisioner
+packages/provision/test/owner-email-source.test.ts @oa/provisioning
+packages/provision/test/owner-email-source.test.ts @oa/scheduler
+packages/provision/test/owner-email-source.test.ts @oa/server
+packages/provision/test/release-t3b.test.ts @oa/server
+packages/provision/test/sign-release.test.ts @oa/server
+packages/provision/test/staging-bus.test.ts @oa/server
+packages/provision/test/wfp-create.test.ts @oa/server
+packages/provision/test/wfp-lifecycle.test.ts @oa/auth-broker
+packages/provision/test/wfp-lifecycle.test.ts @oa/server
