@@ -225,7 +225,8 @@ export function Beta() {
           role="status"
           data-testid="beta-banner"
         >
-          <strong>{MODE_BANNER[s.mode][0]}</strong> {MODE_BANNER[s.mode][1]}
+          <strong>{MODE_BANNER[s.mode][0]}</strong> {MODE_BANNER[s.mode][1]}{" "}
+          It takes effect when sign-ups are set to invite only.
         </p>
       )}
       <section className="oa-tiles" aria-label="Overview">

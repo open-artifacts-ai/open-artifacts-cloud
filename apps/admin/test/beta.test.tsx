@@ -47,7 +47,7 @@ it("a banner shows when the mode isn't invite", async () => {
   renderApp("/beta");
   const b = await screen.findByTestId("beta-banner");
   expect(b).toHaveTextContent(
-    "Sign-ups are open to everyone right now, so this list isn't being used.",
+    "Sign-ups are open to everyone right now, so this list isn't being used. It takes effect when sign-ups are set to invite only.",
   );
 });
 

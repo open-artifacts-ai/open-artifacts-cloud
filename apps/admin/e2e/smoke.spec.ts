@@ -310,7 +310,7 @@ test("Beta: approve one, bulk approve with a confirm, an Add error, decline and 
 test("Beta: a banner when sign-ups aren't by invite", async ({ page }) => {
   await page.goto("/beta?mock=beta-open");
   await expect(page.getByTestId("beta-banner")).toContainText(
-    "Sign-ups are open to everyone right now, so this list isn't being used.",
+    "Sign-ups are open to everyone right now, so this list isn't being used. It takes effect when sign-ups are set to invite only.",
   );
 });
 
