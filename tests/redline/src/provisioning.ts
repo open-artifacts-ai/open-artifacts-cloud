@@ -2559,12 +2559,18 @@ export const PROBES: readonly Probe[] = [
       await run.settledMode("P23", p.appHost, null);
       if ((await run.hostMode(p.appHost)).installId !== null)
         throw new ProbeFail("P23: HOSTS still maps the app host");
-      // A purged install keeps its row, and installs.slug is UNIQUE: a new
-      // customer can never take this slug, and with it old links and agent
-      // configs. P32 is the other side: a discarded create frees its slug.
+      // A purged install keeps its row (cloud #110): its slug reads "taken"
+      // for the 2 minute unmap settle (SLUG_UNMAP_SETTLE_MS), then "cooling"
+      // for 30 days (SLUG_REUSE_COOLDOWN_MS). The waits above can outlast the
+      // settle, so either is right. O is an OIDC principal, not the owner
+      // (slugState gets no ownerSub), so it never reads "free"/"ok" in the
+      // window. P32 is the other side: a discarded create frees its slug.
       const s = await run.v1(`/slugs/${p.slug}`, { read: true });
-      if ((s.json as { status?: string })?.status !== "taken")
-        throw new ProbeFail(`P23: R18 after purge: ${desc(s)}, want taken`);
+      const st = (s.json as { status?: string })?.status;
+      if (st !== "taken" && st !== "cooling")
+        throw new ProbeFail(
+          `P23: R18 after purge: ${desc(s)}, want taken or cooling`,
+        );
       return pass();
     },
   },

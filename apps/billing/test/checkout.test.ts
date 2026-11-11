@@ -33,6 +33,8 @@ const baseEnv = (): Env => ({
   STRIPE_PRICE_BUSINESS: "price_business1",
   STRIPE_PRICE_SOLO_MONTHLY: "price_soloM1",
   STRIPE_PRICE_SOLO_YEARLY: "price_soloY1",
+  STRIPE_PRICE_TEAM_YEARLY: "",
+  STRIPE_PRICE_BUSINESS_YEARLY: "",
 });
 let env = baseEnv();
 

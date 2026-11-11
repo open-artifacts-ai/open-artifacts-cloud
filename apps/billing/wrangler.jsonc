@@ -35,6 +35,9 @@
         "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_STAGING}}",
         "STRIPE_PRICE_SOLO_MONTHLY": "{{STRIPE_PRICE_SOLO_MONTHLY_STAGING}}",
         "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_STAGING}}",
+        // Per-creator yearly prices; empty until the ops script has made them.
+        "STRIPE_PRICE_TEAM_YEARLY": "{{STRIPE_PRICE_TEAM_YEARLY_STAGING}}",
+        "STRIPE_PRICE_BUSINESS_YEARLY": "{{STRIPE_PRICE_BUSINESS_YEARLY_STAGING}}",
         // Exact install ids whose customer is made on a Stripe test clock
         // (M2 step 8; test-clock.ts), by install id or slug. Staging only.
         "STAGING_TEST_CLOCK_INSTALLS": "m2-walk"
@@ -71,7 +74,10 @@
         "STRIPE_PRICE_TEAM": "{{STRIPE_PRICE_TEAM_PROD}}",
         "STRIPE_PRICE_BUSINESS": "{{STRIPE_PRICE_BUSINESS_PROD}}",
         "STRIPE_PRICE_SOLO_MONTHLY": "{{STRIPE_PRICE_SOLO_MONTHLY_PROD}}",
-        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_PROD}}"
+        "STRIPE_PRICE_SOLO_YEARLY": "{{STRIPE_PRICE_SOLO_YEARLY_PROD}}",
+        // Per-creator yearly prices; empty until the ops script has made them.
+        "STRIPE_PRICE_TEAM_YEARLY": "{{STRIPE_PRICE_TEAM_YEARLY_PROD}}",
+        "STRIPE_PRICE_BUSINESS_YEARLY": "{{STRIPE_PRICE_BUSINESS_YEARLY_PROD}}"
       },
       "workers_dev": false,
       "preview_urls": false,

@@ -66,6 +66,12 @@ function block(src: string, env: Env): Block {
   return b;
 }
 
+/** Placeholders that may stay unset: the yearly prices, until they are made. */
+const OPTIONAL = new Set([
+  "STRIPE_PRICE_TEAM_YEARLY",
+  "STRIPE_PRICE_BUSINESS_YEARLY",
+]);
+
 /** One var's committed value, each {{NAME_<ENV>}} filled from `values[NAME]`. */
 function fillVar(
   k: string,
@@ -77,6 +83,7 @@ function fillVar(
   return String(v).replace(/\{\{([A-Z0-9_]+)\}\}/g, (_, p: string) => {
     const name = p.endsWith(`_${up}`) ? p.slice(0, -up.length - 1) : null;
     const value = name ? values[name] : undefined;
+    if (!value && name && OPTIONAL.has(name)) return "";
     if (!value) throw new Error(`${k}: {{${p}}} has no value`);
     return value;
   });
