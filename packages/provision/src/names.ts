@@ -394,3 +394,17 @@ export function ownerEmailOf(row: { owner_email?: unknown }): string | null {
  * the env is staging and the install is an rl-f- test-hooks install.
  */
 export const TEST_FAIL_HEALTH_PREFIX = "rl-failhealth-";
+
+/**
+ * #1501 test seam, by request id: an upgrade job whose requestId starts with
+ * this runs with testFailCheck "kill": its first attempt dies (LostLease)
+ * after the migrations and before the upload, leaving the row upgrading under
+ * its own lease, as a killed isolate would. Same gate as the health seam.
+ */
+export const TEST_KILL_UPGRADE_PREFIX = "rl-killupgrade-";
+
+/**
+ * #1501 test seam, second point: testFailCheck "kill_after_write" dies right
+ * after the version write, leaving the row upgrading on `to`. Same gate.
+ */
+export const TEST_KILL_AFTER_WRITE_PREFIX = "rl-killwrite-";

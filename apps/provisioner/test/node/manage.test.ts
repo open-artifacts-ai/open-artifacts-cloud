@@ -456,6 +456,23 @@ describe("upgrade and rollback (5.4)", () => {
       expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
     });
 
+    it("the #1501 kill seam is refused on a non-rl-f- install, nothing uploaded", async () => {
+      const s = await active({
+        slug: "rl-a-seam",
+        testHooks: true,
+        version: V1,
+      });
+      const r = await manage("upgrade", s.installId, {
+        args: { from: V1, to: V2 },
+        requestId: "rl-killupgrade-0123456789ab",
+      });
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.job?.error_code).toBe("invalid_state");
+      expect(r.job?.step).toBe("recheck");
+      expect(w.install(s.installId)).toMatchObject({ version: V1 });
+      expect(audited(s.installId, "upgrade.start")).toHaveLength(0);
+    });
+
     it("is refused in prod, even on a test-hooks rl-f- row", async () => {
       const s = await active({
         slug: "rl-f-seam",
@@ -596,6 +613,63 @@ describe("upgrade and rollback (5.4)", () => {
     expect(w.install(s.installId)).toMatchObject({
       state: "upgrading",
       lease: "theirs",
+    });
+  });
+
+  describe("#1501: a row left upgrading on `to` by a killed attempt (it died after the version write)", () => {
+    /** The row as a dead attempt left it, under `holder`'s lease. */
+    const left = async (holder: string) => {
+      const s = await active({ slug: "killco", version: V1 });
+      const id = seedJob(w, {
+        kind: "upgrade",
+        installId: s.installId,
+        args: { from: V1, to: V2 },
+      });
+      w.db
+        .prepare(
+          "UPDATE installs SET state = 'upgrading', version = ?, previous_version = ?, lease = ?, lease_until = ? WHERE id = ?",
+        )
+        .run(
+          V2,
+          V1,
+          `${leaseJobPart(jobHolder(holder === "own" ? id : holder))}${"ab".repeat(16)}`,
+          w.clock.t + 20 * 60_000,
+          s.installId,
+        );
+      const error = await runManage(
+        w.ctx,
+        event(id),
+        stepRunner(w.clock).step,
+      ).then(
+        () => null,
+        (x: unknown) => x as Error,
+      );
+      return { s, id, error, job: w.job(id) };
+    };
+
+    it("the same job's retry renders again and finishes active on `to`", async () => {
+      const { s, job } = await left("own");
+      expect(job?.status).toBe("done");
+      expect(w.install(s.installId)).toMatchObject({
+        state: "active",
+        version: V2,
+        previous_version: V1,
+        lease: null,
+      });
+    });
+
+    it("another job's lease on the same row stays refused, the row untouched", async () => {
+      const { s, job } = await left("someone-else");
+      expect(job?.status).toBe("failed");
+      expect(job?.error_code).toBe("invalid_state");
+      expect(w.install(s.installId)).toMatchObject({
+        state: "upgrading",
+        version: V2,
+        previous_version: V1,
+      });
+      expect(w.install(s.installId)?.lease).toBe(
+        `${leaseJobPart(jobHolder("someone-else"))}${"ab".repeat(16)}`,
+      );
     });
   });
 

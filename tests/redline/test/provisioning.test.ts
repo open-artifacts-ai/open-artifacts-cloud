@@ -160,12 +160,12 @@ const level = (o: Outcome | string | undefined) =>
 vi.mock("../src/bus-gate.ts", () => ({ HOSTED_BUS_LIFTED: true }));
 
 describe("the probes on a conforming staging fake", () => {
-  it("covers P1-P52 exactly once: a probe, or removed with the issue that says why", () => {
+  it("covers P1-P53 exactly once: a probe, or removed with the issue that says why", () => {
     const removed = Object.keys(REMOVED_PROBES);
     const ids = [...PROBES.map((p) => p.id), ...removed]
       .map((id) => Number(id.slice(1)))
       .sort((a, b) => a - b);
-    expect(ids).toEqual(Array.from({ length: 52 }, (_, i) => i + 1));
+    expect(ids).toEqual(Array.from({ length: 53 }, (_, i) => i + 1));
     expect(removed.sort()).toEqual(["P35", "P50"]);
     expect(REMOVED_PROBES.P35).toMatch(/^#1260: /);
     expect(REMOVED_PROBES.P50).toMatch(/^#1078: /);
@@ -345,6 +345,12 @@ describe("each probe fails on the behaviour it guards", () => {
       "P44",
       /P44: registration want 201 with a client_id or 429, got status 400/,
     ],
+    [
+      "p53_retry_refused",
+      "P53",
+      /the job's retry did not finish: job failed \(invalid_state\)/,
+    ],
+    ["p53_stuck_upgrading", "P53", /want active/],
     ["p52_not_forward", "P52", /it must stay forward, never revert/],
     [
       "p52_wrong_code",
@@ -365,8 +371,8 @@ describe("each probe fails on the behaviour it guards", () => {
     [
       "r2_q_owner_email",
       "P49",
-      // rl-p, and rl-l when its chain has it live.
-      /P49 R2 q=owner email: [1-3] items match by owner email only, want 0/,
+      // rl-p, and rl-l, rl-f and rl-f-k when their chains have them live.
+      /P49 R2 q=owner email: [1-4] items match by owner email only, want 0/,
     ],
   ];
   for (const [fault, id, re] of cases)
@@ -1286,6 +1292,27 @@ describe("each probe fails on the behaviour it guards", () => {
     expect((await runAll(f)).get("P29")).toMatch(
       /P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be true or test-users/,
     );
+  });
+
+  it("P53 is unproven, never pass, when the seam never fires", async () => {
+    const f = fakeApi();
+    f.faults.add("p53_no_kill");
+    expect((await runAll(f)).get("P53")).toMatchObject({
+      level: "unproven-live",
+      reason: expect.stringMatching(/no failed attempt/),
+    });
+  });
+
+  it("P53 judges the kill from the job's record when the retry beats the first poll", async () => {
+    const f = fakeApi();
+    f.faults.add("p53_fast_retry");
+    expect(level((await runAll(f)).get("P53"))).toBe("pass");
+    const g = fakeApi();
+    g.faults.add("p53_fast_retry_silent");
+    expect((await runAll(g)).get("P53")).toMatchObject({
+      level: "unproven-live",
+      reason: expect.stringMatching(/no failed attempt/),
+    });
   });
 
   it("P16 late: the accepted upgrade runs to done, so P18, P45 and P31 test what they guard", async () => {

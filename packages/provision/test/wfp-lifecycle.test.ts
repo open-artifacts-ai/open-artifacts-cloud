@@ -1087,6 +1087,89 @@ describe("#1106: the test seam that fails an upgrade's health check", () => {
     expect(s.row(inst.id)).toMatchObject({ version: "0.23.0", lease: null });
   });
 
+  it("kill (#1501): the first attempt dies upgrading, the same job's retry finishes on `to`", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(rl()));
+    const J = "job:01JOBKILLAAAAAAAAAAAAAAAAA";
+    const e = await fails(
+      s.mk({ leaseHolder: J }).upgrade(inst.id, "0.24.0", {
+        testFailCheck: "kill",
+      }),
+    );
+    expect(e).toBeInstanceOf(LostLease);
+    expect(s.row(inst.id)).toMatchObject({
+      state: "upgrading",
+      version: "0.23.0",
+    });
+    expect(s.row(inst.id).lease).not.toBeNull();
+    expect(s.audit(inst.id)).not.toContain("upgrade.done");
+    // The retry carries the option again and is not killed: the row is upgrading.
+    expect(
+      keep(
+        await s.mk({ leaseHolder: J }).upgrade(inst.id, "0.24.0", {
+          testFailCheck: "kill",
+        }),
+      ),
+    ).toMatchObject({ ok: true, to: "0.24.0" });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.0",
+      previous_version: "0.23.0",
+      lease: null,
+    });
+  });
+
+  it("kill_after_write (#1501): dies upgrading on `to`; the same job's retry finishes from previous_version", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(rl()));
+    const J = "job:01JOBKILLWAAAAAAAAAAAAAAAA";
+    const e = await fails(
+      s.mk({ leaseHolder: J }).upgrade(inst.id, "0.24.0", {
+        testFailCheck: "kill_after_write",
+      }),
+    );
+    expect(e).toBeInstanceOf(LostLease);
+    expect(s.row(inst.id)).toMatchObject({
+      state: "upgrading",
+      version: "0.24.0",
+      previous_version: "0.23.0",
+    });
+    // Another job is refused the row; its lease stays.
+    const lease = s.row(inst.id).lease;
+    const other = await fails(
+      s
+        .mk({ leaseHolder: "job:01JOBOTHERAAAAAAAAAAAAAAAA" })
+        .upgrade(inst.id, "0.24.0"),
+    );
+    expect(other.code).toBe("invalid_state");
+    expect(s.row(inst.id).lease).toBe(lease);
+    expect(
+      keep(
+        await s.mk({ leaseHolder: J }).upgrade(inst.id, "0.24.0", {
+          testFailCheck: "kill_after_write",
+        }),
+      ),
+    ).toMatchObject({ ok: true, from: "0.23.0", to: "0.24.0" });
+    expect(s.row(inst.id)).toMatchObject({
+      state: "active",
+      version: "0.24.0",
+      previous_version: "0.23.0",
+      lease: null,
+    });
+  });
+
+  it("kill is refused on a shared rl- install that is not rl-f-, nothing uploaded", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(rl("rl-p-seam")));
+    const w = s.fake.writes().length;
+    const e = await fails(
+      s.p.upgrade(inst.id, "0.24.0", { testFailCheck: "kill" }),
+    );
+    expect(e.code).toBe("invalid_state");
+    expect(s.fake.writes().length).toBe(w);
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+
   it("without the option an upgrade is unchanged", async () => {
     const s = setup();
     const inst = keep(await s.p.create(rl()));
