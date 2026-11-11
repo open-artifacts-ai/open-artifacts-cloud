@@ -38,7 +38,9 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 // copy of the init ({ ...init, signal }), and a spread keeps them.
 const IDEMPOTENT = Symbol.for("redline.transport.idempotent");
 const CALLER_RETRIES = Symbol.for("redline.transport.callerRetries");
+const PACE_RETRY = Symbol.for("redline.transport.paceRetry");
 type Marks = {
+  [PACE_RETRY]?: () => Promise<unknown>;
   [IDEMPOTENT]?: true;
   [CALLER_RETRIES]?: true;
   [NEW_ARTIFACT]?: true;
@@ -52,6 +54,19 @@ const marks = (x: unknown): Marks => (x ?? {}) as Marks;
  */
 export function idempotent<T extends Request | RequestInit>(x: T): T {
   (x as Marks)[IDEMPOTENT] = true;
+  return x;
+}
+
+/**
+ * Marks an init whose caller paces its calls (a hook's ledger slot): `claim`
+ * runs before the transport's retry too, so each wire attempt spends its own
+ * slot. The first attempt's slot is the caller's, taken before the fetch.
+ */
+export function pacedRetry<T extends RequestInit>(
+  x: T,
+  claim: () => Promise<unknown>,
+): T {
+  (x as Marks)[PACE_RETRY] = claim;
   return x;
 }
 
@@ -70,19 +85,64 @@ export interface FreshDispatcher {
   close(): Promise<unknown>;
 }
 
+/** Longest a pooled socket may sit idle before the pool drops it (#155). */
+export const SOCKET_IDLE_MS = 1000;
+
+/**
+ * The Agent options that keep an idle socket under SOCKET_IDLE_MS. undici
+ * drops a socket after the server's keep-alive hint, capped by
+ * keepAliveMaxTimeout (default 10 min); both are set so neither a long hint
+ * nor the cap keeps a socket the edge has already closed.
+ */
+export const IDLE_AGENT_OPTIONS = {
+  keepAliveTimeout: SOCKET_IDLE_MS,
+  keepAliveMaxTimeout: SOCKET_IDLE_MS,
+} as const;
+
+const GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+
+function newAgent(g: unknown, opts?: object): FreshDispatcher | undefined {
+  const Agent = (g as { constructor?: unknown } | undefined)?.constructor;
+  if (typeof Agent !== "function" || Agent === Object) return undefined;
+  try {
+    return new (Agent as new (o?: object) => FreshDispatcher)(opts);
+  } catch {
+    // A global dispatcher that wraps another (newer Node) takes no options.
+    return undefined;
+  }
+}
+
 /**
  * A new connection pool of the kind fetch already uses: a new Agent from the
  * global dispatcher's own class, so the retry can't reuse the pool's sockets.
  * Undefined before the first fetch set the global dispatcher up.
  */
 export function freshAgent(): FreshDispatcher | undefined {
-  const g = (globalThis as Record<symbol, unknown>)[
-    Symbol.for("undici.globalDispatcher.1")
-  ] as { constructor?: unknown } | undefined;
-  const Agent = g?.constructor;
-  return typeof Agent === "function" && Agent !== Object
-    ? new (Agent as new () => FreshDispatcher)()
-    : undefined;
+  return newAgent(
+    (globalThis as Record<symbol, unknown>)[GLOBAL_DISPATCHER],
+    IDLE_AGENT_OPTIONS,
+  );
+}
+
+/**
+ * Replaces the shared (global) dispatcher with a new Agent of the same class
+ * whose sockets drop after SOCKET_IDLE_MS idle, so a request is never sent on
+ * a socket the edge already closed (#155). The global dispatcher exists only
+ * after the first fetch, so `prime` (default: a fetch to a closed loopback
+ * port) runs first when it is missing. Returns false, leaving the default,
+ * when the global dispatcher takes no options. The previous one is not
+ * closed: nothing is in flight yet when setup calls this.
+ */
+export async function useShortIdleSockets(
+  prime: () => Promise<unknown> = () =>
+    fetch("http://127.0.0.1:1/", { signal: AbortSignal.timeout(2000) }),
+): Promise<boolean> {
+  const g = globalThis as Record<symbol, unknown>;
+  if (!g[GLOBAL_DISPATCHER]) await prime().catch(() => {});
+  const agent = newAgent(g[GLOBAL_DISPATCHER], IDLE_AGENT_OPTIONS);
+  if (!agent) return false;
+  g[GLOBAL_DISPATCHER] = agent;
+  return true;
 }
 
 /** Tags `e` (unchanged otherwise) as infra and returns it to throw. */
@@ -154,6 +214,12 @@ export function transportFetch(
       if (skip) throw tag(e, `${where}; not retried: ${skip}`);
       const agent = fresh();
       if (!agent) throw tag(e, `${where}; not retried: no new connection`);
+      try {
+        await marks(init)[PACE_RETRY]?.();
+      } catch (pe) {
+        agent.close().catch(() => {});
+        throw pe;
+      }
       const second: Attempt = {};
       try {
         const res = await watch.track(second, () =>
