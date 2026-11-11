@@ -40,6 +40,7 @@ const list = async (rpc?: BillingOperatorRpc) =>
     id: string;
     tier: string | null;
     billingTier?: string | null;
+    billingStatus?: string | null;
   }[];
 
 describe("billingTier", () => {
@@ -61,6 +62,27 @@ describe("billingTier", () => {
     expect(byId[a].billingTier).toBe("team");
     expect(byId[b].billingTier).toBe("solo");
     for (const i of items) InstallSummarySchema.parse(i);
+  });
+
+  it("carries the status: a lapsed Team is not shown as plain Team", async () => {
+    const { a, b } = await seedTwo();
+    const m = billing(() => ({
+      ok: true,
+      tiers: {
+        [a]: { tier: "team", status: "lapsed" },
+        [b]: { tier: "team", status: "weird" },
+      },
+    }));
+    const byId = Object.fromEntries((await list(m.rpc)).map((i) => [i.id, i]));
+    expect(byId[a]).toMatchObject({
+      billingTier: "team",
+      billingStatus: "lapsed",
+    });
+    expect(byId[b]).toMatchObject({ billingTier: "team", billingStatus: null });
+    const d = await call(fakeEnv({ BILLING: m.rpc }), ADMIN_P, "R3", {
+      params: { id: a },
+    });
+    expect(d.body.billingStatus).toBe("lapsed");
   });
 
   it("detail carries it too", async () => {

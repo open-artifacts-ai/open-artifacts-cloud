@@ -63,6 +63,7 @@ import {
   StripeConfigError,
   SUBSCRIPTION_LIVE_SQL,
   TIERS_OF_MAX,
+  type TierOfView,
   type TiersOfResult,
 } from "@oa/billing-core";
 import {
@@ -956,8 +957,18 @@ async function operatorSetTier(
 }
 
 // The read side of the operator RPC (#2058): the tier GET /tier shows, for
-// many installs, in one SELECT. Read only: it does not materialize an ended
-// trial or record last_read_at, and it calls no Stripe. No row: solo, active.
+// many installs. It changes no tier: no comp, no Stripe call, no
+// last_read_at. The one write is the time-driven materialize every read of
+// the row does (an ended Business trial becomes Solo), the same function, so
+// this answer and GET /tier cannot drift. No row: solo, active.
+const TIERS_OF_SQL = (n: number) =>
+  `SELECT install_id, tier, status, trial_ends_at FROM tiers WHERE install_id IN (${Array.from({ length: n }, () => "?").join(",")})`;
+type TiersOfRow = {
+  install_id: string;
+  tier: string | null;
+  status: string | null;
+  trial_ends_at: number | null;
+};
 async function operatorTiersOf(
   env: Env,
   installs: unknown,
@@ -970,22 +981,35 @@ async function operatorTiersOf(
   )
     return { ok: false, error: "bad_installs" };
   const ids = [...new Set(installs as string[])];
+  const now = Date.now();
   try {
-    const rows = await env.BILLING_DB.prepare(
-      `SELECT install_id, tier, status FROM tiers WHERE install_id IN (${ids.map(() => "?").join(",")})`,
-    )
-      .bind(...ids)
-      .all<{
-        install_id: string;
-        tier: string | null;
-        status: string | null;
-      }>();
-    const tiers: Record<
-      string,
-      { tier: string | null; status: string | null }
-    > = {};
+    const read = async (of: string[]) =>
+      (
+        await env.BILLING_DB.prepare(TIERS_OF_SQL(of.length))
+          .bind(...of)
+          .all<TiersOfRow>()
+      ).results;
+    let rows = await read(ids);
+    const ended = rows.filter(
+      (r) =>
+        r.tier === "trial" &&
+        r.trial_ends_at !== null &&
+        r.trial_ends_at <= now,
+    );
+    if (ended.length > 0) {
+      for (const r of ended)
+        await materialize(env.BILLING_DB, r.install_id, now);
+      const again = new Map(
+        (await read(ended.map((r) => r.install_id))).map((r) => [
+          r.install_id,
+          r,
+        ]),
+      );
+      rows = rows.map((r) => again.get(r.install_id) ?? r);
+    }
+    const tiers: Record<string, TierOfView> = {};
     for (const id of ids) tiers[id] = { tier: "solo", status: "active" };
-    for (const r of rows.results)
+    for (const r of rows)
       tiers[r.install_id] = { tier: r.tier, status: r.status };
     return { ok: true, tiers };
   } catch {

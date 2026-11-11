@@ -239,12 +239,13 @@ export async function detailOf(
   showEmail: boolean,
 ): Promise<InstallDetail> {
   const now = Date.now();
-  const billingTier = (await billingTiersOf(env, [row.install_id])).get(
+  const billing = (await billingTiersOf(env, [row.install_id])).get(
     row.install_id,
   );
   return {
     ...summaryOf(env, row),
-    billingTier: billingTier ?? null,
+    billingTier: billing?.billingTier ?? null,
+    billingStatus: billing?.billingStatus ?? null,
     ownerEmail: showEmail ? await ownerEmailFor(env, row) : null,
     auth: authOf(row),
     previousVersion:

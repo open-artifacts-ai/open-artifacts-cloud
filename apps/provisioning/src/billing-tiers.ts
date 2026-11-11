@@ -1,13 +1,16 @@
-import { BillingTierSchema } from "@oa/shared";
+import { BillingStatusSchema, BillingTierSchema } from "@oa/shared";
 import type { Env } from "./env.js";
 
 /** How long admin waits on billing before showing "Created as" instead. */
 export const BILLING_TIERS_TIMEOUT_MS = 1500;
 
-type BillingTier = ReturnType<typeof BillingTierSchema.parse>;
+export type BillingView = {
+  billingTier: ReturnType<typeof BillingTierSchema.parse>;
+  billingStatus: ReturnType<typeof BillingStatusSchema.parse> | null;
+};
 
 /**
- * The billing tier of each install (#2058), from one batched read through
+ * The billing tier and status of each install (#2058), from one batched read through
  * BILLING.tiersOf. Best effort: unbound, a missing method (billing deploys
  * after provisioning), a throw, a refusal, a slow answer or an unknown tier
  * all leave the install out of the map, and the caller shows null. It never
@@ -16,8 +19,8 @@ type BillingTier = ReturnType<typeof BillingTierSchema.parse>;
 export async function billingTiersOf(
   env: Env,
   installs: string[],
-): Promise<Map<string, BillingTier>> {
-  const out = new Map<string, BillingTier>();
+): Promise<Map<string, BillingView>> {
+  const out = new Map<string, BillingView>();
   const rpc = env.BILLING;
   if (!rpc || typeof rpc.tiersOf !== "function" || installs.length === 0)
     return out;
@@ -32,7 +35,12 @@ export async function billingTiersOf(
     if (!r || !r.ok) return out;
     for (const [id, v] of Object.entries(r.tiers)) {
       const t = BillingTierSchema.safeParse(v?.tier);
-      if (t.success) out.set(id, t.data);
+      if (!t.success) continue;
+      const st = BillingStatusSchema.safeParse(v?.status);
+      out.set(id, {
+        billingTier: t.data,
+        billingStatus: st.success ? st.data : null,
+      });
     }
   } catch {
     // billing is down or lacks the method: no billing tier

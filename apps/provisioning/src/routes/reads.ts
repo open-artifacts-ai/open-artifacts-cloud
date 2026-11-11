@@ -156,7 +156,8 @@ export async function listInstalls(a: HandlerArgs): Promise<RouteResult> {
   );
   const items: InstallSummary[] = page.map((x) => ({
     ...summaryOf(a.env, x),
-    billingTier: billing.get(x.install_id) ?? null,
+    billingTier: billing.get(x.install_id)?.billingTier ?? null,
+    billingStatus: billing.get(x.install_id)?.billingStatus ?? null,
   }));
   const last = rows.length > n ? rows[n - 1] : undefined;
   return ok({

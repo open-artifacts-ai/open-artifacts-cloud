@@ -290,6 +290,24 @@ describe("tiersOf (#2058)", () => {
     expect(await rowOf(B)).toBeNull();
   });
 
+  it("an ended Business trial reads as GET /tier reads it: solo, lapsed without a Solo subscription (#2058)", async () => {
+    await seed({ tier: "trial", trialEndsAt: NOW - 1 });
+    const r = await tiersOf([A]);
+    expect(r).toEqual({
+      ok: true,
+      tiers: { [A]: { tier: "solo", status: "lapsed" } },
+    });
+    expect(await rowOf()).toMatchObject({ tier: "solo", status: "lapsed" });
+  });
+
+  it("a running trial stays trial", async () => {
+    await seed({ tier: "trial", trialEndsAt: NOW + 1000 });
+    expect(await tiersOf([A])).toEqual({
+      ok: true,
+      tiers: { [A]: { tier: "trial", status: "active" } },
+    });
+  });
+
   it("refuses a bad list: not an array, empty, over the cap, a bad id", async () => {
     const ok = Array.from(
       { length: 100 },

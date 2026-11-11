@@ -694,6 +694,24 @@ it("shows the billing tier when the API has it, else Created as (#2058)", async 
   ).toHaveTextContent(/^Tier · Sign-inSolo · /);
 });
 
+it("a billing trial reads Business trial; a lapsed or past-due plan says so (#2058)", async () => {
+  await open({ ...installsByState.active, billingTier: "trial" });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inBusiness trial · Google/);
+});
+
+it("a non-active billing status follows the tier", async () => {
+  await open({
+    ...installsByState.active,
+    billingTier: "team",
+    billingStatus: "lapsed",
+  });
+  expect(
+    (await screen.findByText("Tier · Sign-in")).parentElement,
+  ).toHaveTextContent(/^Tier · Sign-inTeam · lapsed · Google/);
+});
+
 it("billingTier null reads Created as <tier>, never the bare tier (#2058)", async () => {
   await open({ ...installsByState.active, billingTier: null, tier: "trial" });
   expect(

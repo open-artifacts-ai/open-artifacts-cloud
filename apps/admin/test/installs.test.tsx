@@ -69,6 +69,28 @@ it("shows the billing tier when the API has it (#2058)", async () => {
   expect(r.queryByText(/Created as/)).toBeNull();
 });
 
+it("the list says a lapsed plan is lapsed (#2058)", async () => {
+  use(
+    http.get("*/api/v1/installs", () =>
+      json({
+        items: [
+          {
+            ...fixtureSummary({ slug: "late" }),
+            billingTier: "team",
+            billingStatus: "past_due",
+          },
+        ],
+        nextCursor: null,
+      }),
+    ),
+  );
+  renderApp("/installs");
+  const row = (await screen.findByRole("link", { name: "late" })).closest("tr");
+  expect(
+    within(row as HTMLElement).getByText("Team · past due"),
+  ).toBeInTheDocument();
+});
+
 it("shows a failed create and its attention badges in the table", async () => {
   renderApp("/installs");
   const row = (
