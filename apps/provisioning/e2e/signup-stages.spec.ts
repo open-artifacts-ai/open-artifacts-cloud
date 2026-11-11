@@ -460,11 +460,16 @@ test("loading: status line follows the stage, no step list", async ({
   await expect(page.locator(".panel .addr")).toHaveText(
     "Lots of people are signing up right now. You're in line, and it starts on its own.",
   );
+  await expect(page.locator(".panel .hint")).toHaveCount(0);
   // the animation survives a status update (not rebuilt)
   await expect(page.locator(".anim")).toHaveCount(1);
   await expect(page.locator(".verb")).toContainText("Margin-noting");
   await page.clock.runFor(2300);
   await expect(page.locator(".verb")).toContainText("Inking");
+  // the wait-time line returns once the signup leaves the line
+  stage = "queued";
+  await tick(page);
+  await expect(page.locator(".panel .hint")).toHaveCount(1);
 });
 
 test("loading: reduced motion shows the static mark, no rotation", async ({
