@@ -396,10 +396,9 @@ test("footer links: Docs, Hosted and GitHub; no support@ anywhere", async ({
     "href",
     "https://open-artifacts.com/docs/hosted/",
   );
-  await expect(page.getByRole("link", { name: "Email support" })).toHaveAttribute(
-    "href",
-    "mailto:hello@open-artifacts.com",
-  );
+  await expect(
+    page.getByRole("link", { name: "Email support" }),
+  ).toHaveAttribute("href", "mailto:hello@open-artifacts.com");
 });
 
 const JOIN_LEAD =

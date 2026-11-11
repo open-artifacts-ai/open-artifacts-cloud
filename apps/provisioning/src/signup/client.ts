@@ -640,11 +640,11 @@ export const CLIENT_JS = String.raw`(function () {
   function loadSignup() {
     return api("GET", "/api/v1/signup").then(function (r) {
       if (r.status === 401) return "unauth";
+      if (r.status === 200 && r.body) S.gate = r.body.gate || null;
       if (r.status === 404 || (r.status === 200 && r.body && r.body.stage === "none")) {
         S.signup = null; return "gone";
       }
       if (r.status !== 200 || !r.body) return "error";
-      S.gate = r.body.gate || null;
       S.signup = { stage: r.body.stage, slug: r.body.slug, host: r.body.host };
       return "ok";
     }, function () { return "error"; });
