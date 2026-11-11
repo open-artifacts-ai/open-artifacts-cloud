@@ -13,7 +13,10 @@
 # puts older code on staging, counts as the newest). A run still queued or
 # running is ignored, with a note in the output (#163): a public merge that
 # just started deploy-staging must not re-block a prod chain whose tag already
-# has a green smoke.
+# has a green smoke. Only a fresh run (run_attempt 1, no earlier verdict) is
+# ignored: an in-progress run with run_attempt > 1 is a re-run of one that
+# already ran, so the gate refuses ("previous attempt failed and is being
+# re-run; wait for it") rather than pass on an older green run.
 #   1. Its head is the tag's commit or a descendant of it
 #      (compare/<tag sha>...<head> is "identical" or "ahead"), and on main
 #      (compare/main...<head> is "identical" or "behind").
@@ -62,12 +65,15 @@ run="$(jq -r --arg repo "$PUBLIC_REPO" '
   | [.workflow_runs[]
     | select(.head_branch == "main" and .event == "push")
     | select((.head_repository.full_name // "") == $repo)] as $all
-  | ($all | map(select(.status != "completed") | "\(.id)") | join(",")) as $skipped
+  | ($all | map(select(.status != "completed" and (.run_attempt // 1) > 1))
+    | sort_by(.run_started_at // .created_at // "", .id) | last | if . == null then "-" else "\(.id)" end) as $rerun
+  | ($all | map(select(.status != "completed" and (.run_attempt // 1) <= 1) | "\(.id)") | join(",")) as $skipped
   | [$all[] | select(.status == "completed")]
   | sort_by(.run_started_at // .created_at // "", .id) | last
-  | if . == null then "0 \($skipped | if . == "" then "-" else . end) -" else "\(.id) \($skipped | if . == "" then "-" else . end) \(.head_sha // "")" end' <<< "$runs" 2> /dev/null)" ||
+  | "\(. | if . == null then "0" else "\(.id)" end) \($skipped | if . == "" then "-" else . end) \(. | if . == null then "-" else (.head_sha // "") end) \($rerun)"' <<< "$runs" 2> /dev/null)" ||
   fail "unparsable deploy-staging.yml runs"
-read -r run skipped head <<< "$run" || true
+read -r run skipped head rerun <<< "$run" || true
+[ "${rerun:--}" = - ] || fail "run $rerun's previous attempt failed and is being re-run; wait for it"
 [ "$skipped" = - ] || echo "staging smoke: ignoring deploy-staging.yml run(s) $skipped, not completed yet"
 [ "$run" != 0 ] || fail "no completed deploy-staging.yml run on main"
 [[ "$run" =~ ^[1-9][0-9]{0,19}$ ]] || fail "unparsable deploy-staging.yml runs"

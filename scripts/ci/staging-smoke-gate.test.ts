@@ -240,18 +240,24 @@ describe("staging-smoke-gate.sh", () => {
     expect(b.log.some((l) => l.includes("/jobs"))).toBe(false);
   });
 
-  it("a red run being re-run (its attempt in progress) is ignored until it completes", () => {
+  it("a run being re-run (attempt > 1) blocks: the older green run never vouches for it", () => {
     const rerunning = runOf({
       id: 10,
       status: "in_progress",
       conclusion: null,
+      run_attempt: 2,
       created_at: "2026-11-03T10:00:00Z",
       run_started_at: "2026-11-03T12:00:00Z",
     });
     const r = gate([rerunning, runOf()]);
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("ignoring deploy-staging.yml run(s) 10");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(
+      "run 10's previous attempt failed and is being re-run; wait for it",
+    );
+    expect(r.log.some((l) => l.includes("/jobs"))).toBe(false);
     expect(r.log[1]).not.toContain("status=");
+    // A fresh in-progress run (attempt 1) is still ignored.
+    expect(gate([{ ...rerunning, run_attempt: 1 }, runOf()]).code).toBe(0);
   });
 
   it("skips runs that are not pushes on main of this repository", () => {
