@@ -371,11 +371,44 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
   };
 }
 
+/** Mirrors apps/provisioning/src/routes/reads.ts (a provisioning test pins both). */
+export const SLUG_UNMAP_SETTLE_MS = 2 * 60 * 1000;
+export const SLUG_REUSE_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Cloud #108: a purged install's row keeps its unique slug, app_host and
+ * content_host (installs.slug, app_host, content_host, 0001_installs.sql),
+ * which would refuse this create (findRow, holdersOf in wfp.ts). Past the
+ * 2 minute HOSTS settle, the same Google account (owner_sub) takes the
+ * address at once and anyone else after 30 days; the dead row then keeps
+ * its id, state and times and its three keys gain `~<id>`. The API already
+ * answered the slug check by the same rule; this repeats it, so a create
+ * the API let through but the rule refuses fails as slug_taken in wfp.
+ */
+const RELEASE_PURGED_SLUG = `UPDATE installs SET slug = slug || '~' || id, app_host = app_host || '~' || id, content_host = content_host || '~' || id
+WHERE slug = ?1 AND state = 'deleted' AND id <> ?2 AND updated_at <= ?3
+  AND (updated_at <= ?4
+    OR (SELECT owner_sub FROM signups WHERE signup_id = ?5) = COALESCE(
+      (SELECT l.owner_sub FROM install_lifecycle l WHERE l.install_id = installs.id),
+      (SELECT s.owner_sub FROM signups s WHERE s.install_id = installs.id)))`;
+
 /** install_id = COALESCE(install_id, ?), signups.status creating. */
 async function reserve(
   ctx: CreateCtx,
   job: CreateJob,
 ): Promise<{ installId: string }> {
+  const now = ctx.io.now();
+  await transient(
+    ctx.env.PLATFORM_DB.prepare(RELEASE_PURGED_SLUG)
+      .bind(
+        job.slug,
+        job.installId,
+        now - SLUG_UNMAP_SETTLE_MS,
+        now - SLUG_REUSE_COOLDOWN_MS,
+        job.signupId,
+      )
+      .run(),
+  );
   const r = await transient(
     ctx.env.PLATFORM_DB.prepare(
       `UPDATE signups SET install_id = COALESCE(install_id, ?2),

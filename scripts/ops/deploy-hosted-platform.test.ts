@@ -494,7 +494,7 @@ const setup = (
   opts: {
     /** App configs to deploy from instead of the repo's (app -> wrangler.jsonc). */
     configs?: Record<string, string>;
-    exists?: string[];
+    exists?: readonly string[];
     secrets?: Record<string, string[]>;
     next?: Record<string, string>;
     failSecrets?: boolean;
@@ -882,7 +882,8 @@ describe("deploy-hosted-platform.sh", () => {
         const configs = { [app]: withoutBilling(APP_CONFIG(app)) };
         // oa-s-billing does not exist, and none is asked for.
         // The provisioning target also needs its OAuth KV namespace id.
-        const extra = app === "provisioning" ? { NEW_KV: OAUTH } : {};
+        const extra: Record<string, string> =
+          app === "provisioning" ? { NEW_KV: OAUTH } : {};
         const ok = setup({
           configs,
           exists: DEPS[app],
@@ -2137,7 +2138,7 @@ describe("deploy-hosted-platform.sh", () => {
         { PROD_SIGNUP_DEPLOY: "off" },
         { PROD_SIGNUP_DEPLOY: "1" },
         { PROD_SIGNUP_DEPLOY: "ON" },
-      ]) {
+      ] as Record<string, string>[]) {
         const r = setup({ exists: brokers }).run("provisioning", extra);
         expect(r.code, r.err).toBe(0);
         expect(r.writes.some((w) => w.includes("i00000signup"))).toBe(false);
@@ -2183,7 +2184,13 @@ describe("deploy-hosted-platform.sh", () => {
         keys: [{ kid: "k".repeat(16), x: "x".repeat(43) }],
         domains: [],
       });
-      const cases: [string, Record<string, string>, string[], string, string][] = [
+      const cases: [
+        string,
+        Record<string, string>,
+        string[],
+        string,
+        string,
+      ][] = [
         [
           "the SIGNUP_BROKER_KEY secret",
           live,
@@ -2200,7 +2207,10 @@ describe("deploy-hosted-platform.sh", () => {
         ],
       ];
       for (const [name, files, secrets, hint, other] of cases) {
-        for (const extra of [{}, { VERIFY_ONLY: "1" }]) {
+        for (const extra of [{}, { VERIFY_ONLY: "1" }] as Record<
+          string,
+          string
+        >[]) {
           it(`${name}${extra.VERIFY_ONLY ? " (verify only)" : ""}`, () => {
             const r = setup({
               exists: [...brokers, "oa-p-provisioning"],

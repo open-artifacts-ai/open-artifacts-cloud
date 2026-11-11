@@ -405,8 +405,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     };
     collect(hr.jobs);
     expect(ifs.length).toBeGreaterThan(0);
-    for (const c of ifs)
-      expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
+    for (const c of ifs) expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
     // The guard's shell test treats anything but the string true as a real run.
     expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
     // The mirror runs on a push because the ref is main.
@@ -514,6 +513,10 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       main: string;
       compare: string;
       sha: string;
+      readAfter?: number; // a new tag reads back on this many-th read (default 1)
+      neverReads?: boolean;
+      createFailsTimes?: number; // release create says "doesn't exist" this often
+      releaseExists?: boolean;
     }) {
       const dir = mkdtempSync(join(tmpdir(), "relcreate-"));
       const log = join(dir, "calls.log");
@@ -522,13 +525,32 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         'echo "$*" >> "$LOG"',
         'case "$*" in',
         '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
-        `  "api repos/o/r/git/ref/tags/"*) [ -n "\${TAG_AT:-}" ] || exit 1; echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
+        `  "api repos/o/r/git/ref/tags/"*)`,
+        '    if [ -z "${TAG_AT:-}" ]; then',
+        '      grep -q -- "-X POST" "$LOG" || exit 1',
+        '      [ -z "${NEVER:-}" ] || exit 1',
+        '      n=$(grep -c "git/ref/tags/" "$LOG")',
+        '      [ "$n" -ge "$READ_AFTER" ] || exit 1',
+        '      case "$*" in *" -q "*) echo "$SHA_" ;; *) echo \'{"object":{"type":"commit","sha":"\'"$SHA_"\'"}}\' ;; esac',
+        "    else",
+        `      echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}'`,
+        "    fi ;;",
         '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
-        '  "release view"*) exit 0 ;;',
+        '  "release view"*) [ -z "${REL_EXISTS:-}" ] || exit 0; grep -q "^release create" "$LOG" && [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] ;;',
+        '  "release create"*)',
+        '    [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] || { echo "tag v1.2.3 doesn\'t exist" >&2; exit 1; } ;;',
         "  *) exit 0 ;;",
         "esac",
       ].join("\n");
       writeFileSync(join(dir, "gh"), fake, { mode: 0o755 });
+      // No real sleeping: the stub records the delay.
+      writeFileSync(
+        join(dir, "sleep"),
+        '#!/usr/bin/env bash\necho "sleep $*" >> "$LOG"\n',
+        {
+          mode: 0o755,
+        },
+      );
       const st = allSteps("mirror").find(
         (x) => x.name === "Create the tag and the release",
       ) as Step;
@@ -540,6 +562,11 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
           MAIN: o.main,
           COMPARE: o.compare,
           TAG_AT: o.tagAt ?? "",
+          SHA_: o.sha,
+          READ_AFTER: String(o.readAfter ?? 1),
+          NEVER: o.neverReads ? "1" : "",
+          CREATE_FAILS: String(o.createFailsTimes ?? 0),
+          REL_EXISTS: o.releaseExists ? "1" : "",
           REPO: "o/r",
           TAG: "v1.2.3",
           SHA: o.sha,
@@ -585,6 +612,68 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       const r = runCreate({ main: X, compare: "identical", sha: X });
       expect(r.status, r.out).toBe(0);
       expect(r.calls).toContain("-X POST");
+      expect(r.calls).toContain("release create");
+    });
+    it("a new tag that reads back only after several tries: waits, then releases", () => {
+      const r = runCreate({
+        main: X,
+        compare: "identical",
+        sha: X,
+        readAfter: 5,
+      });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls.match(/^sleep /gm)?.length).toBe(3);
+      expect(r.calls.indexOf("release create")).toBeGreaterThan(
+        r.calls.lastIndexOf("git/ref/tags/"),
+      );
+    });
+    it("a new tag that never reads back: fails after a bounded wait, no release", () => {
+      const r = runCreate({
+        main: X,
+        compare: "identical",
+        sha: X,
+        neverReads: true,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("did not read back");
+      expect(r.calls).not.toContain("release create");
+      const total = [...r.calls.matchAll(/^sleep (\d+)$/gm)].reduce(
+        (a, m) => a + Number(m[1]),
+        0,
+      );
+      expect(total).toBeGreaterThanOrEqual(60);
+      expect(total).toBeLessThan(75);
+    });
+    it("release create retries on 'doesn't exist', then succeeds once", () => {
+      const r = runCreate({
+        main: X,
+        compare: "identical",
+        sha: X,
+        createFailsTimes: 2,
+      });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls.match(/^release create/gm)?.length).toBe(3);
+    });
+    it("release create gives up after a bounded number of tries", () => {
+      const r = runCreate({
+        main: X,
+        compare: "identical",
+        sha: X,
+        createFailsTimes: 99,
+      });
+      expect(r.status).toBe(1);
+      expect(r.calls.match(/^release create/gm)?.length).toBe(5);
+    });
+    it("a release that already exists is never created again", () => {
+      const r = runCreate({
+        tagAt: X,
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+        releaseExists: true,
+      });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).not.toContain("release create");
     });
   });
 
