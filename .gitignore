@@ -1,0 +1,6 @@
+apps/*/wrangler.deploy.jsonc
+node_modules/
+dist/
+dist-assets/
+.wrangler/
+*.log
