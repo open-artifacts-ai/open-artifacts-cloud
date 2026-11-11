@@ -18,6 +18,14 @@ type Sc = {
   // delay (ms) on the slug-check answers
   slugDelay?: number;
   createCode?: string;
+  // the beta gate in GET /api/v1/signup (absent: as while sign-ups are open)
+  gate?: string;
+  // POST /api/v1/signup/waitlist: delay (ms), status and what was sent
+  joinDelay?: number;
+  joinStatus?: number;
+  joined?: unknown[];
+  // create answers 403 forbidden with details.reason (the not_invited race)
+  createReason?: string;
   path?: string;
   // per-request override of GET /api/v1/signup (n counts calls, from 1)
   signup?: (n: number) => { status: number; body?: unknown };
@@ -58,7 +66,6 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
         open: sc.open !== false,
         appDomain: "open-artifacts.app",
         turnstileSiteKey: "1x00000000000000000000AA",
-        supportEmail: "support@open-artifacts.app",
         docsUrl: "https://open-artifacts.com",
         githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
       });
@@ -70,6 +77,13 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
       const o = sc.signup(++signupCalls);
       return json(o.body ?? {}, o.status);
     }
+    if (url.pathname === "/api/v1/signup/waitlist" && req.method() === "POST") {
+      sc.joined?.push(req.postDataJSON());
+      if (sc.joinDelay) await new Promise((r) => setTimeout(r, sc.joinDelay));
+      return sc.joinStatus && sc.joinStatus !== 200
+        ? json({ error: { code: "internal" } }, sc.joinStatus)
+        : json({ gate: "waitlisted" });
+    }
     if (url.pathname === "/api/v1/signup")
       return json(
         sc.stage
@@ -78,7 +92,7 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
               slug: sc.slug ?? "acme",
               host: `${sc.slug ?? "acme"}.open-artifacts.app`,
             }
-          : { stage: "none" },
+          : { stage: "none", ...(sc.gate ? { gate: sc.gate } : {}) },
       );
     if (url.pathname.startsWith("/api/v1/slugs/")) {
       if (sc.slugDelay) await new Promise((r) => setTimeout(r, sc.slugDelay));
@@ -91,7 +105,17 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
       });
     }
     if (url.pathname === "/api/v1/installs" && req.method() === "POST")
-      return json({ error: { code: sc.createCode ?? "forbidden" } }, 403);
+      return json(
+        {
+          error: {
+            code: sc.createCode ?? "forbidden",
+            ...(sc.createReason
+              ? { details: { reason: sc.createReason } }
+              : {}),
+          },
+        },
+        403,
+      );
     return route.fulfill({ status: 404, body: "" });
   });
   await page.goto(`${ORIGIN}${sc.path ?? "/"}`);
@@ -348,6 +372,138 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   );
 });
 
+test("closed view: the Cloudflare line is centred under the button", async ({
+  page,
+}) => {
+  await mount(page, { open: false });
+  const line = page.locator(".panel .muted.small");
+  expect(await line.evaluate((e) => getComputedStyle(e).textAlign)).toBe(
+    "center",
+  );
+});
+
+test("footer links: Docs, Hosted and GitHub; no support@ anywhere", async ({
+  page,
+}) => {
+  await mount(page, { me: true, stage: "failed" });
+  const links = page.locator(".top .links a");
+  await expect(links).toHaveText(["Docs", "Hosted", "GitHub"]);
+  await expect(links.nth(1)).toHaveAttribute(
+    "href",
+    "https://open-artifacts.com/docs/hosted/",
+  );
+  await expect(page.getByRole("link", { name: "Email support" })).toHaveAttribute(
+    "href",
+    "mailto:hello@open-artifacts.com",
+  );
+});
+
+const JOIN_LEAD =
+  "We're letting people in a few at a time. Join the waitlist and we'll email you when it's your turn.";
+
+test("beta: waitlist shows the join screen, a note is sent, then on the list", async ({
+  page,
+}) => {
+  const joined: unknown[] = [];
+  const v = await mount(page, { me: true, gate: "waitlist", joined });
+  await expect(page.locator("h1")).toHaveText(
+    "Open Artifacts is in private beta",
+  );
+  await expect(page.locator(".panel .lead")).toHaveText(JOIN_LEAD);
+  await expect(page.locator(".who")).toContainText("ada@acme.com");
+  await expect(page.getByRole("button", { name: "Not you?" })).toBeVisible();
+  await expect(
+    page.getByLabel("What would you use it for? (optional)"),
+  ).toHaveAttribute("maxlength", "280");
+  await expect(page.locator("#use")).toHaveAttribute("rows", "2");
+  await page.locator("#use").fill("Client status pages");
+  await page.getByRole("button", { name: "Join the waitlist" }).click();
+  await expect(page.locator("h1")).toHaveText("You're on the list");
+  await expect(page.locator(".panel .lead")).toHaveText(
+    "We'll email ada@acme.com when you're in. Nothing else to do for now.",
+  );
+  expect(joined).toEqual([{ note: "Client status pages" }]);
+  expect(await page.locator("[style]").count()).toBe(0);
+  expect(v).toEqual([]);
+});
+
+test("beta: joining with no note sends none", async ({ page }) => {
+  const joined: unknown[] = [];
+  await mount(page, { me: true, gate: "waitlist", joined });
+  await page.getByRole("button", { name: "Join the waitlist" }).click();
+  await expect(page.locator("h1")).toHaveText("You're on the list");
+  expect(joined).toEqual([{}]);
+});
+
+test("beta: sending state disables the field and button", async ({ page }) => {
+  await mount(page, { me: true, gate: "waitlist", joinDelay: 1500 });
+  await page.locator("#use").fill("x");
+  await page.getByRole("button", { name: "Join the waitlist" }).click();
+  const btn = page.locator(".btn.cta");
+  await expect(btn).toHaveText("Joining\u2026");
+  await expect(btn).toBeDisabled();
+  await expect(page.locator("#use")).toBeDisabled();
+  await expect(page.locator("#use")).toHaveValue("x");
+  await expect(page.locator("h1")).toHaveText("You're on the list");
+});
+
+test("beta: a failed join shows the error and keeps the note", async ({
+  page,
+}) => {
+  await mount(page, { me: true, gate: "waitlist", joinStatus: 500 });
+  await page.locator("#use").fill("keep me");
+  await page.getByRole("button", { name: "Join the waitlist" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "That didn't save. Try again.",
+  );
+  await expect(page.locator("#use")).toHaveValue("keep me");
+  await expect(
+    page.getByRole("button", { name: "Join the waitlist" }),
+  ).toBeEnabled();
+});
+
+test("beta: the counter shows 40 left, warns at 0, and typing stops at 280", async ({
+  page,
+}) => {
+  await mount(page, { me: true, gate: "waitlist" });
+  const cnt = page.locator("#use-count");
+  await page.locator("#use").fill("a".repeat(239));
+  await expect(cnt).toHaveText("");
+  await page.locator("#use").fill("a".repeat(240));
+  await expect(cnt).toHaveText("40 left");
+  await page.locator("#use").fill("a".repeat(280));
+  await expect(cnt).toHaveText("0 left");
+  await expect(cnt).toHaveClass(/near/);
+  await page.locator("#use").pressSequentially("b");
+  await expect(page.locator("#use")).toHaveValue("a".repeat(280));
+});
+
+test("beta: waitlisted goes straight to on the list", async ({ page }) => {
+  await mount(page, { me: true, gate: "waitlisted" });
+  await expect(page.locator("h1")).toHaveText("You're on the list");
+  await expect(page.locator("textarea")).toHaveCount(0);
+});
+
+test("beta: allowed goes to the address step as today", async ({ page }) => {
+  await mount(page, { me: true, gate: "allowed", free: ["acme"] });
+  await expect(page.locator("h1")).toHaveText("Choose your address");
+});
+
+test("beta: create answering 403 not_invited (a race) shows the join screen", async ({
+  page,
+}) => {
+  await mount(page, {
+    me: true,
+    gate: "allowed",
+    free: ["acme"],
+    createReason: "not_invited",
+  });
+  await page.getByRole("button", { name: "Create my instance" }).click();
+  await expect(page.locator("h1")).toHaveText(
+    "Open Artifacts is in private beta",
+  );
+});
+
 test("closed view: field and Go to it read as one group (10px)", async ({
   page,
 }) => {
@@ -502,6 +658,13 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
     avail: "taken",
     act: (p) => p.locator("#slug").fill("acme"),
   },
+  "beta-join": { me: true, gate: "waitlist" },
+  "beta-join-near": {
+    me: true,
+    gate: "waitlist",
+    act: (p) => p.locator("#use").fill("a".repeat(262)),
+  },
+  "beta-listed": { me: true, gate: "waitlisted" },
   "setup-queued": { me: true, stage: "queued" },
   "setup-waiting-cap": { me: true, stage: "waiting_cap" },
   "setup-creating": { me: true, stage: "creating" },
