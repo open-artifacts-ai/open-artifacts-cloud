@@ -71,6 +71,10 @@ export async function run(
     const monthly = env[p.monthlyEnv] ?? "";
     if (!PRICE.test(monthly))
       throw new Refused(`${p.monthlyEnv} is not a Stripe price id`);
+    const mp = await stripe("GET", `/v1/prices/${monthly}`);
+    const product = idOf(mp.product);
+    if (!product) throw new Refused(`no product on ${p.monthlyEnv}`);
+    const tax = String(mp.tax_behavior ?? "unspecified");
     const found = await stripe(
       "GET",
       `/v1/prices?lookup_keys[]=${p.lookupKey}&active=true&limit=1`,
@@ -78,23 +82,24 @@ export async function run(
     const hit = (found.data as Obj[] | undefined)?.[0];
     if (hit) {
       const rec = hit.recurring as Obj | undefined;
-      if (
-        hit.unit_amount !== p.cents ||
-        hit.currency !== "usd" ||
-        rec?.interval !== "year" ||
-        hit.billing_scheme !== "per_unit"
-      )
+      const bad = [
+        hit.unit_amount === p.cents || "amount",
+        hit.currency === "usd" || "currency",
+        rec?.interval === "year" || "interval",
+        rec?.interval_count === 1 || "interval_count",
+        rec?.usage_type === "licensed" || "usage_type",
+        hit.billing_scheme === "per_unit" || "billing_scheme",
+        idOf(hit.product) === product || "product",
+        String(hit.tax_behavior ?? "unspecified") === tax || "tax_behavior",
+      ].filter((x) => x !== true);
+      if (bad.length)
         throw new Refused(
-          `${p.lookupKey} exists but is not $${p.cents / 100}/year per unit; fix it in Stripe`,
+          `${p.lookupKey} exists but differs (${bad.join(", ")}): expected $${p.cents / 100}/year, licensed, per unit, on the ${p.monthlyEnv} product with its tax behavior; fix it in Stripe`,
         );
       ids[p.out] = idOf(hit.id);
       io.log(`${p.out}=${ids[p.out]} (found)`);
       continue;
     }
-    const product = idOf(
-      (await stripe("GET", `/v1/prices/${monthly}`)).product,
-    );
-    if (!product) throw new Refused(`no product on ${p.monthlyEnv}`);
     if (dry) {
       io.log(
         `${p.out} would be created: ${p.cents} usd/year on ${product} (dry run)`,
@@ -108,6 +113,9 @@ export async function run(
       product,
       lookup_key: p.lookupKey,
       nickname: p.name,
+      ...(tax === "inclusive" || tax === "exclusive"
+        ? { tax_behavior: tax }
+        : {}),
     });
     ids[p.out] = idOf(made.id);
     if (!ids[p.out]) throw new Refused("no id in the created price");

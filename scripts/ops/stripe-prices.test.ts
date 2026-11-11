@@ -13,7 +13,10 @@ const ENV = {
 
 type Call = { method: string; path: string; form: Record<string, string> };
 
-function world(existing: Record<string, Record<string, unknown>> = {}) {
+function world(
+  existing: Record<string, Record<string, unknown>> = {},
+  monthly: Record<string, unknown> = {},
+) {
   const calls: Call[] = [];
   const logs: string[] = [];
   const f = (async (url: string, init: RequestInit) => {
@@ -30,7 +33,7 @@ function world(existing: Record<string, Record<string, unknown>> = {}) {
       const k = u.searchParams.get("lookup_keys[]") ?? "";
       return json({ data: existing[k] ? [existing[k]] : [] });
     }
-    if (method === "GET") return json({ product: "prod_1" });
+    if (method === "GET") return json({ product: "prod_1", ...monthly });
     return json({ id: `price_new_${form.lookup_key}` });
   }) as unknown as typeof fetch;
   return { calls, logs, io: { fetch: f, log: (s: string) => logs.push(s) } };
@@ -41,7 +44,8 @@ const good = (key: string, cents: number) => ({
   unit_amount: cents,
   currency: "usd",
   billing_scheme: "per_unit",
-  recurring: { interval: "year" },
+  product: "prod_1",
+  recurring: { interval: "year", interval_count: 1, usage_type: "licensed" },
 });
 
 describe("stripe-prices", () => {
@@ -103,6 +107,52 @@ describe("stripe-prices", () => {
   it("refuses an existing price with the wrong amount", async () => {
     const w = world({ oa_team_yearly: good("team", 9999) });
     await expect(run(ENV, w.io)).rejects.toThrow(Refused);
+  });
+
+  it("refuses an existing price that differs in any way, never reusing it", async () => {
+    const base = good("team", 10000);
+    for (const [field, over] of [
+      [
+        "interval_count",
+        { recurring: { ...base.recurring, interval_count: 2 } },
+      ],
+      [
+        "usage_type",
+        { recurring: { ...base.recurring, usage_type: "metered" } },
+      ],
+      ["interval", { recurring: { ...base.recurring, interval: "month" } }],
+      ["product", { product: "prod_other" }],
+      ["currency", { currency: "eur" }],
+      ["billing_scheme", { billing_scheme: "tiered" }],
+      ["tax_behavior", { tax_behavior: "inclusive" }],
+    ] as const) {
+      const w = world({ oa_team_yearly: { ...base, ...over } });
+      await expect(run(ENV, w.io)).rejects.toThrow(new RegExp(field));
+      expect(w.calls.some((c) => c.method === "POST")).toBe(false);
+    }
+  });
+
+  it("copies the monthly price's tax behavior on create, and matches it when found", async () => {
+    const w = world({}, { tax_behavior: "exclusive" });
+    await run(ENV, w.io);
+    for (const c of w.calls.filter((c) => c.method === "POST"))
+      expect(c.form.tax_behavior).toBe("exclusive");
+    const f = world(
+      {
+        oa_team_yearly: { ...good("team", 10000), tax_behavior: "exclusive" },
+        oa_business_yearly: {
+          ...good("biz", 25000),
+          tax_behavior: "exclusive",
+        },
+      },
+      { tax_behavior: "exclusive" },
+    );
+    await expect(run(ENV, f.io)).resolves.toBeTruthy();
+    const u = world(
+      { oa_team_yearly: good("team", 10000) },
+      { tax_behavior: "exclusive" },
+    );
+    await expect(run(ENV, u.io)).rejects.toThrow(/tax_behavior/);
   });
 
   it("refuses a live or non-test key before any request", async () => {
