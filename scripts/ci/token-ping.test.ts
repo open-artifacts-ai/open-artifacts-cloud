@@ -71,7 +71,17 @@ describe.each(Object.entries(FILES))("%s", (file, choices) => {
         /^(hosted-.*-deploy-cloudflare|repo-(prod-)?cloudflare)$/.test(
           Object.keys(w.jobs)[jobs.indexOf(j)] as string,
         );
-      expect(j.steps).toHaveLength(probe ? 3 : 2);
+      const jobName = Object.keys(w.jobs)[jobs.indexOf(j)] as string;
+      // The hosted deploy-token jobs add a read-only Turnstile domains check.
+      const ts = /^hosted-.*-deploy-cloudflare$/.test(jobName);
+      expect(j.steps).toHaveLength(ts ? 4 : probe ? 3 : 2);
+      if (ts) {
+        expect(j.steps[3].if).toBe("${{ !cancelled() }}");
+        expect(j.steps[3].run).toMatch(
+          /^bash scripts\/ci\/turnstile-domains\.sh (staging|prod)$/,
+        );
+        expect(j.steps[3].env).toEqual(j.steps[1].env);
+      }
       if (probe) {
         expect(j.steps[2].if).toBe("${{ !cancelled() }}");
         expect(j.steps[2].run).toMatch(

@@ -39,6 +39,12 @@ jobs:
           TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           HOSTED_DIR: .github/hosted
         run: bash scripts/ci/token-ping.sh prod r2
+      - name: Check the Turnstile widget covers the sign-up host (prints name, mode and domains only)
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: .github/hosted
+        run: bash scripts/ci/turnstile-domains.sh prod
 
   repo-prod-cloudflare:
     if: github.ref == 'refs/heads/main' && inputs.target == 'repo/PROD_CLOUDFLARE_API_TOKEN'
