@@ -72,8 +72,9 @@ const BILLING_STATUS_LABEL: Record<string, string> = {
 
 /**
  * The plan an install is on (#2058): billing's tier when the API has it,
- * else "Created as <tier>" (a billing status that is not active follows the tier) (the tier it was created with), so the created-as
- * tier is never read as the current plan. Null: neither is known.
+ * else "Created as <tier>" (the tier it was created with), so the created-as
+ * tier is never read as the current plan. A billing status that is not active
+ * follows the billing tier. Null: neither is known.
  */
 export function tierText(i: {
   tier: Tier | null;

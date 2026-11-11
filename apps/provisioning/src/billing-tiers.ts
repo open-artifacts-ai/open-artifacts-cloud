@@ -22,12 +22,11 @@ export async function billingTiersOf(
 ): Promise<Map<string, BillingView>> {
   const out = new Map<string, BillingView>();
   const rpc = env.BILLING;
-  if (!rpc || typeof rpc.tiersOf !== "function" || installs.length === 0)
-    return out;
+  if (!rpc || installs.length === 0) return out;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const r = await Promise.race([
-      rpc.tiersOf(installs),
+      rpc.tiersOf?.(installs),
       new Promise<null>((resolve) => {
         timer = setTimeout(() => resolve(null), BILLING_TIERS_TIMEOUT_MS);
       }),
