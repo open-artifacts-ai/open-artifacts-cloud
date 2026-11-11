@@ -50,9 +50,12 @@ const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
 // (its lane is dropped); the real plan, with the file's wall, is simulated
 // below from run 42642922707.
 const NEW_FILE = "live/provisioner.test.ts";
+// #26 splits surfaces into two lanes (shards a and b); the recording ran it
+// whole, so its second shard is left out and the first stands for the file.
 const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
     ph
+      .filter((l) => l.shard !== "b")
       .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
       .filter((l) => l.files.length > 0),
   );
@@ -373,8 +376,12 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
     m.revokeSec;
 
   it("the simulated lanes are the plan's lanes", () => {
+    // The recording ran surfaces whole: #26's second shard is not in it.
     expect(Object.keys(ends()).sort()).toEqual(
-      (PLAN[0] ?? []).map((l) => l.name).sort(),
+      (PLAN[0] ?? [])
+        .filter((l) => l.shard !== "b")
+        .map((l) => l.name)
+        .sort(),
     );
   });
 
@@ -399,5 +406,44 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
     expect(job(e)).toBe(600);
     e.provisioner = (e.prov ?? 0) + 90;
     expect(job(e)).toBeGreaterThan(600);
+  });
+});
+
+// #26: surfaces in two lanes. Lane walls are measured in run 43007228059
+// (v0.151.1, 606 s for the job: bring-up and the rest 176 s, the suite 430 s
+// as surfaces ran whole); the two surfaces shards are modeled from that run's
+// case times: about 41 s of setup and cleanup each, the cases 194 s and 195 s.
+describe("surfaces in two lanes (#26, run 43007228059)", () => {
+  const jobSec = 606;
+  const suiteSec = 430;
+  const SETUP_SEC = 41;
+  const lanes = {
+    prov: 246,
+    surfaces: SETUP_SEC + 195,
+    "surfaces-b": SETUP_SEC + 194,
+    creds: 271,
+    guard: 85,
+    front: 219,
+  };
+
+  it("the simulated lanes are the plan's lanes", () => {
+    expect(Object.keys(lanes).sort()).toEqual(
+      (PLAN[0] ?? [])
+        .map((l) => l.name)
+        .filter((n) => n !== "provisioner")
+        .sort(),
+    );
+  });
+
+  it("no surfaces lane is over 280 s, and creds is the longest lane", () => {
+    expect(lanes.surfaces).toBeLessThan(280);
+    expect(lanes["surfaces-b"]).toBeLessThan(280);
+    expect(Math.max(...Object.values(lanes))).toBe(lanes.creds);
+  });
+
+  it("the job ends at about 447 s (7.5 min): 606 - (430 - 271)", () => {
+    const end = jobSec - (suiteSec - Math.max(...Object.values(lanes)));
+    expect(end).toBe(447);
+    expect(end).toBeLessThan(600);
   });
 });

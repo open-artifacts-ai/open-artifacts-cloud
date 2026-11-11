@@ -39,7 +39,8 @@ const liveFiles = readdirSync(join(pkg, "live"))
   .filter((f) => f.endsWith(".test.ts"))
   .map((f) => `live/${f}`)
   .sort();
-const planned = PLAN.flat().flatMap((l) => l.files);
+// #26: surfaces runs as two lanes (shards a and b), the one file in two lanes.
+const planned = [...new Set(PLAN.flat().flatMap((l) => l.files))];
 const L = (name: string, ...files: string[]): Lane => ({
   name,
   files: files.map((f) => `live/${f}.test.ts`),
@@ -57,6 +58,16 @@ describe("the lane plan", () => {
   it("runs every live file exactly once, and only live files", () => {
     expect([...planned].sort()).toEqual(liveFiles);
     expect(new Set(planned).size).toBe(planned.length);
+    // Only the shards of one file share it, one lane each.
+    const shared = PLAN.flat()
+      .flatMap((l) => l.files.map((f) => [f, l.shard] as const))
+      .filter(
+        ([f]) => PLAN.flat().filter((l) => l.files.includes(f)).length > 1,
+      );
+    expect(shared).toEqual([
+      ["live/surfaces.test.ts", "a"],
+      ["live/surfaces.test.ts", "b"],
+    ]);
     expect(Object.keys(CLAIMS).sort()).toEqual(liveFiles);
     expect(planProblems(PLAN)).toEqual([]);
     expect(planProblems(PLAN_SERIAL)).toEqual([]);
@@ -66,11 +77,14 @@ describe("the lane plan", () => {
     const m = parseManifest(read("live/manifest.json"));
     for (const c of m.cases) {
       const lanes = PLAN.flat().filter((l) => l.files.includes(c.file));
-      expect(lanes, c.file).toHaveLength(1);
+      // Surfaces' cases are split between its two shards, each case in one.
+      expect(lanes, c.file).toHaveLength(
+        c.file === "live/surfaces.test.ts" ? 2 : 1,
+      );
     }
   });
 
-  it("is one phase of six lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of seven lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
       "creds",
@@ -79,6 +93,7 @@ describe("the lane plan", () => {
       "prov",
       "provisioner",
       "surfaces",
+      "surfaces-b",
     ]);
     const front = PLAN[0]?.find((l) => l.name === "front") as Lane;
     expect(front.files).toEqual([
@@ -139,6 +154,15 @@ describe("the lane plan", () => {
       /in two lanes/,
     );
     expect(planProblems([[L("x")]]).join()).toMatch(/no file/);
+    // Two lanes of one file are fine only as different shards.
+    const S = (name: string, shard: string): Lane => ({
+      ...L(name, "surfaces"),
+      shard,
+    });
+    expect(planProblems([[S("x", "a"), S("y", "b")]])).toEqual([]);
+    expect(planProblems([[S("x", "a"), S("y", "a")]]).join()).toMatch(
+      /in two lanes/,
+    );
   });
 
   it("every observe says why, and every ordered bucket names a barrier barrier.ts exports", () => {
@@ -518,6 +542,30 @@ describe("mergeLanes", () => {
       }),
     ]);
     expect(buildReport(m.cases, "staging").gate.passed).toBe(false);
+  });
+
+  it("a file-level failure in both shard lanes of one file is one fail case, not a duplicate", () => {
+    const f = "live/a.test.ts";
+    const bad = { name: "a: module error", file: f, level: "fail" as const };
+    const shard = (name: string, shard: string): LaneResult => ({
+      lane: { name, files: [f], shard },
+      exit: 1,
+      part: { cases: [bad], fileNotes: [] },
+    });
+    const m = mergeLanes([shard("a", "a"), shard("b", "b")]);
+    expect(m.cases).toEqual([bad]);
+    expect(buildReport(m.cases, "staging").gate.passed).toBe(false);
+    // A shard's passing case reported by both is still a duplicate.
+    const dup = mergeLanes(
+      ["a", "b"].map(
+        (n): LaneResult => ({
+          lane: { name: n, files: [f], shard: n },
+          exit: 0,
+          part: { cases: [pass(f, "same")], fileNotes: [] },
+        }),
+      ),
+    );
+    expect(dup.cases.filter((c) => /duplicate/.test(c.name))).toHaveLength(1);
   });
 
   it("a case from a file outside its lane is a fail case", () => {

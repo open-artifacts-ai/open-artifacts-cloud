@@ -54,6 +54,8 @@ export const paced = (ledger: string): BucketMode => ({ paced: ledger });
 export const ordered = (barrier: string): BucketMode => ({ ordered: barrier });
 
 export interface Claims {
+  /** State keys that a sharded lane (Lane.shard) holds for its own shard only. */
+  perShard?: string[];
   state: Record<string, StateMode>;
   buckets: Record<string, BucketMode>;
 }
@@ -135,6 +137,10 @@ export const CLAIMS: Record<string, Claims> = {
       // The world it seeds on both installs (spaces, groups, artifacts).
       "rl-x/world": "write",
     },
+    // #26: the file runs as two lanes (shards a and b); each seeds fixed
+    // artifacts of its own (src/surfaces.ts worldTitles), so the world is
+    // per shard. The members lock and the buckets are shared as before.
+    perShard: ["rl-x/world"],
     buckets: installBuckets(),
   },
   "live/edge.test.ts": {
@@ -209,6 +215,12 @@ export interface Lane {
   readonly name: string;
   /** Run one at a time, in this order. */
   readonly files: readonly string[];
+  /**
+   * Set when the lane runs one shard of a file that another lane runs the
+   * other shard of (#26: surfaces, by REDLINE_SURFACES_SHARD in env). Such a
+   * file may be in several lanes, one per shard.
+   */
+  readonly shard?: string;
   /** Extra environment for the lane's vitest run. */
   readonly env?: Readonly<Record<string, string>>;
 }
@@ -219,15 +231,31 @@ const lane = (name: string, ...files: string[]): Lane => ({
   files: files.map((f) => `live/${f}.test.ts`),
 });
 
+/** A lane that runs shard `shard` of the one file `file` (env names the shard). */
+const shardLane = (
+  name: string,
+  file: string,
+  shard: string,
+  envKey: string,
+): Lane => ({
+  name,
+  files: [`live/${file}.test.ts`],
+  shard,
+  env: { [envKey]: shard },
+});
+
 /**
- * The run (#1730): one phase, six lanes, the longest file per lane.
+ * The run (#1730, #26): one phase, seven lanes.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
  *   barrier;
  * - provisioner: #859's provisioner file, in a lane of its own so its 60 s
  *   replay watch runs beside prov instead of after it (the job would end
  *   about 180 s later). Its createTaken spends the provisioning-api bucket,
  *   so that case waits for prov's exit (the prov-done barrier);
- * - surfaces: surfaces (335.0 s);
+ * - surfaces, surfaces-b: surfaces split in two by case (#26; REDLINE_SURFACES_SHARD
+ *   a and b, src/surfaces.ts SHARD_B_PREFIXES): 430 s in run 43007228059 as one
+ *   lane, about 235 s each (about 41 s of setup and cleanup in each, the
+ *   cases about 194 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it), then bus (#1299:
  *   one case, a few requests; unproven-live while the bus is off);
@@ -238,7 +266,8 @@ export const PLAN: readonly Phase[] = [
   [
     lane("prov", "provisioning"),
     lane("provisioner", "provisioner"),
-    lane("surfaces", "surfaces"),
+    shardLane("surfaces", "surfaces", "a", "REDLINE_SURFACES_SHARD"),
+    shardLane("surfaces-b", "surfaces", "b", "REDLINE_SURFACES_SHARD"),
     lane("creds", "credentials"),
     lane("guard", "guard", "bus"),
     lane("front", "signin", "edge", "live"),
@@ -294,8 +323,9 @@ export function planProblems(plan: readonly Phase[] = PLAN): string[] {
       names.add(l.name);
       if (l.files.length === 0) out.push(`lane ${l.name} has no file`);
       for (const f of l.files) {
-        if (files.has(f)) out.push(`${f} is in two lanes`);
-        files.add(f);
+        const k = l.shard === undefined ? f : `${f}\u0000${l.shard}`;
+        if (files.has(k)) out.push(`${f} is in two lanes`);
+        files.add(k);
       }
     }
   return out;
@@ -337,13 +367,28 @@ export function conflicts(
     if (!c) throw new Error(`${f}: no claims`);
     return c;
   };
+  // A sharded lane holds its own copy of the file's perShard state keys.
+  const claimsOf = (f: string, l: Lane | undefined): Claims => {
+    const c = of(f);
+    if (l?.shard === undefined || !c.perShard) return c;
+    const own = new Set(c.perShard);
+    return {
+      ...c,
+      state: Object.fromEntries(
+        Object.entries(c.state).map(([k, m]) => [
+          own.has(k) ? `${k}#${l.shard}` : k,
+          m,
+        ]),
+      ),
+    };
+  };
   plan.forEach((phase, p) => {
     for (let i = 0; i < phase.length; i++)
       for (let j = i + 1; j < phase.length; j++)
         for (const x of phase[i]?.files ?? [])
           for (const y of phase[j]?.files ?? []) {
-            const cx = of(x);
-            const cy = of(y);
+            const cx = claimsOf(x, phase[i]);
+            const cy = claimsOf(y, phase[j]);
             for (const [k, m] of Object.entries(cx.state)) {
               const n = cy.state[k];
               if (!n) continue;
@@ -420,6 +465,10 @@ export function mergeLanes(results: readonly LaneResult[]): {
           reason: "a file outside the lane ran in it",
         });
       const key = `${c.file ?? ""}\u0000${c.name}`;
+      // A file-level failure (its module or setup) fails in each shard lane
+      // alike; the first already fails the gate, so the copy is not a second case.
+      if (seen.has(key) && r.lane.shard !== undefined && c.level !== "pass")
+        continue;
       if (seen.has(key))
         cases.push({
           name: `lane ${name}: duplicate ${c.file ?? ""} ${c.name}`,

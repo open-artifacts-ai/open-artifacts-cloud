@@ -49,13 +49,16 @@ import {
   HOOK_SPACE_ID,
   HOSTED_FEATURES,
   INTERACTIVE_ONLY,
+  inShard,
   MATRIX_AT_B,
   ORG_FRESH,
   type ProbeCase,
   pickOwnGrant,
   readRepoFile,
   runRead,
+  SHARD_B_PREFIXES,
   SMOKES,
+  surfaceShard,
   viaTarget,
   type World,
   worldGroups,
@@ -68,6 +71,37 @@ import { interactiveRoutes, serverSources } from "./interactive-routes.ts";
 const toDispose: (() => unknown)[] = [];
 afterEach(async () => {
   for (const d of toDispose.splice(0)) await d();
+});
+
+describe("the two surfaces shards (#26)", () => {
+  const names = derive().cases.map((c) => c.name);
+
+  it("every case is in exactly one shard, and an unsharded run has them all", () => {
+    const a = names.filter((n) => inShard(n, "a"));
+    const b = names.filter((n) => inShard(n, "b"));
+    expect(a.length + b.length).toBe(names.length);
+    expect(a.filter((n) => b.includes(n))).toEqual([]);
+    expect(names.every((n) => inShard(n, undefined))).toBe(true);
+    expect(a.length).toBeGreaterThan(0);
+    expect(b.length).toBeGreaterThan(0);
+  });
+
+  it("every shard b prefix names a case, and no case outside them is in b", () => {
+    for (const p of SHARD_B_PREFIXES)
+      expect(
+        names.some((n) => n.startsWith(p)),
+        p,
+      ).toBe(true);
+  });
+
+  it("REDLINE_SURFACES_SHARD is a, b or unset", () => {
+    expect(surfaceShard({})).toBeUndefined();
+    expect(surfaceShard({ REDLINE_SURFACES_SHARD: "a" })).toBe("a");
+    expect(surfaceShard({ REDLINE_SURFACES_SHARD: " b " })).toBe("b");
+    expect(() => surfaceShard({ REDLINE_SURFACES_SHARD: "c" })).toThrow(
+      /REDLINE_SURFACES_SHARD/,
+    );
+  });
 });
 
 describe("probe cases (derived from Backend's surfaces)", () => {
