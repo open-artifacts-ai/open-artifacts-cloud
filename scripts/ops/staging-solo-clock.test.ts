@@ -213,7 +213,10 @@ describe("cleanup", () => {
 });
 
 describe("inspect", () => {
-  function iw(row: Record<string, unknown>) {
+  function iw(
+    row: Record<string, unknown>,
+    events?: { status: number; body: unknown },
+  ) {
     const calls: string[] = [];
     const f = (async (url: string, init: RequestInit) => {
       const u = new URL(url);
@@ -259,6 +262,8 @@ describe("inspect", () => {
             },
           ],
         });
+      if (u.pathname === "/v1/events" && events)
+        return Response.json(events.body, { status: events.status });
       if (u.pathname === "/v1/events")
         return j({
           data: [
@@ -319,6 +324,36 @@ describe("inspect", () => {
     expect(out).toContain("pending_webhooks 0");
     expect(out).not.toContain("pending_webhooks 1");
     expect(out).not.toContain(KEY);
+  });
+
+  const CUS = {
+    stripe_customer_id: "cus_1",
+    stripe_test_clock_id: null,
+    stripe_subscription_id: "sub_1",
+  };
+
+  it("a 403 on the event list is skipped with a message and does not fail", async () => {
+    const w = iw(CUS, {
+      status: 403,
+      body: { error: { code: "more_permissions_required" } },
+    });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.lines.at(-1)).toBe(
+      "events: not readable with this key (needs Events read); skipped",
+    );
+  });
+
+  it("a 500 on the event list still fails", async () => {
+    const w = iw(CUS, { status: 500, body: { error: { type: "api_error" } } });
+    await expect(
+      inspect(w.io, stripeClient(KEY, getOnly(w.f)), A),
+    ).rejects.toThrow(/: 500 /);
+  });
+
+  it("no matching event says so for the account's last 100", async () => {
+    const w = iw(CUS, { status: 200, body: { data: [] } });
+    await inspect(w.io, stripeClient(KEY, getOnly(w.f)), A);
+    expect(w.lines.at(-1)).toBe("no matching event in the account's last 100");
   });
 
   it("a row without a customer prints the row and no customer, with no Stripe call", async () => {
