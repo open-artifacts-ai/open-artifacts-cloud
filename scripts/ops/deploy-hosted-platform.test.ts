@@ -262,7 +262,7 @@ const NEXT: Record<string, string> = {
       text: "https://directory.open-artifacts.app",
     },
   ]),
-  "oa-p-dispatch": settingsOff([
+  "oa-p-dispatch": settings([
     { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
     { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-prod" },
     { type: "service", name: "AUTH_BROKER", service: "oa-p-auth-broker" },
@@ -273,7 +273,7 @@ const NEXT: Record<string, string> = {
     },
     { type: "plain_text", name: "OA_ENV", text: "prod" },
   ]),
-  "oa-s-dispatch": settingsOff([
+  "oa-s-dispatch": settings([
     { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
     { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-staging" },
     { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
@@ -770,6 +770,26 @@ describe("deploy-hosted-platform.sh", () => {
         }).run("dispatch", {}, "staging");
         expect(bad.code, why).toBe(1);
         expect(bad.err, why).toContain("dispatch BILLING binding: got");
+      }
+    });
+    it("dispatch refuses observability off, invocation logs on, or the field missing", () => {
+      for (const [why, obs, msg] of [
+        ["off", { enabled: false }, "observability"],
+        [
+          "invocation logs on",
+          { enabled: true, logs: { invocation_logs: true } },
+          "observability invocation_logs",
+        ],
+        ["field missing", { enabled: true }, "observability invocation_logs"],
+      ] as const) {
+        const next = JSON.parse(NEXT["oa-p-dispatch"] as string);
+        next.result.observability = obs;
+        const bad = setup({
+          exists: SCHED_DEPS("p"),
+          next: { "oa-p-dispatch": JSON.stringify(next) },
+        }).run("dispatch");
+        expect(bad.code, why).toBe(1);
+        expect(bad.err, why).toContain(msg);
       }
     });
     it("staging scheduler verifies its BILLING binding too", () => {

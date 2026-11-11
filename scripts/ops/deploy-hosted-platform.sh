@@ -753,7 +753,8 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
     billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     ;;
   scheduler)
     need PLATFORM_DB_ID; need EMAIL_ZONE_TAGS; need EMAIL_DAILY_LIMIT
