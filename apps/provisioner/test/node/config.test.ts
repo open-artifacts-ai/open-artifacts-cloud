@@ -111,8 +111,12 @@ describe("wrangler.jsonc", () => {
       expect(JSON.stringify(e)).not.toMatch(/RELEASE_VERSION/);
       expect(e.vars.SELF_SERVE_TIER).toBe(api.env[env].vars.SELF_SERVE_TIER);
       expect(e.vars.OA_ENV).toBe(api.env[env].vars.OA_ENV);
-      // Workers Logs would record message bodies' context.
-      expect(e.observability).toEqual({ enabled: false });
+      // Console logs on (#164); invocation logs off, so no request URL is stored.
+      expect(e.observability).toEqual({
+        enabled: true,
+        redact_query_string: true,
+        logs: { enabled: true, invocation_logs: false, head_sampling_rate: 1 },
+      });
       for (const k of ["durable_objects", "triggers", "assets"])
         expect(e).not.toHaveProperty(k);
       // The one service binding (#1568): billing's BillingProvisionerRpc, on

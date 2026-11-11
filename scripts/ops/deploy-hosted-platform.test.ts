@@ -154,11 +154,25 @@ exit 0
   return p;
 };
 
-const settings = (bindings: Record<string, unknown>[], obs = false) =>
+// The provisioner and provisioning have Workers Logs on (#164); the brokers,
+// dispatch and billing stay off (Workers Logs would record their URLs).
+const settings = (
+  bindings: Record<string, unknown>[],
+  obs = true,
+  invocation: boolean | null = false,
+) =>
   JSON.stringify({
     success: true,
-    result: { bindings, observability: { enabled: obs } },
+    result: {
+      bindings,
+      observability: {
+        enabled: obs,
+        logs: { invocation_logs: invocation ?? undefined },
+      },
+    },
   });
+const settingsOff = (bindings: Record<string, unknown>[]) =>
+  settings(bindings, false);
 // The scheduler's bindings as Cloudflare reads them back (apps/scheduler
 // wrangler.jsonc, per env).
 // The alert wiring the deploy fills by default (ENV below holds the same).
@@ -230,7 +244,7 @@ const queueList = (names: string[], total = names.length, pages = 1) =>
     },
   });
 const NEXT: Record<string, string> = {
-  "oa-p-auth-broker": settings([
+  "oa-p-auth-broker": settingsOff([
     { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
     { type: "plain_text", name: "GOOGLE_CLIENT_ID", text: CLIENT },
     {
@@ -239,7 +253,7 @@ const NEXT: Record<string, string> = {
       text: "https://auth.open-artifacts.app",
     },
   ]),
-  "oa-p-directory-broker": settings([
+  "oa-p-directory-broker": settingsOff([
     { type: "kv_namespace", name: "DIRECTORY_REGISTRY", namespace_id: DIRREG },
     { type: "plain_text", name: "GOOGLE_DIRECTORY_CLIENT_ID", text: DCLIENT },
     {
@@ -248,7 +262,7 @@ const NEXT: Record<string, string> = {
       text: "https://directory.open-artifacts.app",
     },
   ]),
-  "oa-p-dispatch": settings([
+  "oa-p-dispatch": settingsOff([
     { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
     { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-prod" },
     { type: "service", name: "AUTH_BROKER", service: "oa-p-auth-broker" },
@@ -259,7 +273,7 @@ const NEXT: Record<string, string> = {
     },
     { type: "plain_text", name: "OA_ENV", text: "prod" },
   ]),
-  "oa-s-dispatch": settings([
+  "oa-s-dispatch": settingsOff([
     { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
     { type: "dispatch_namespace", name: "DISPATCHER", namespace: "oa-staging" },
     { type: "service", name: "AUTH_BROKER", service: "oa-s-auth-broker" },
@@ -385,7 +399,7 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
 ];
-NEXT["oa-s-billing"] = settings([
+NEXT["oa-s-billing"] = settingsOff([
   { type: "d1", name: "BILLING_DB", id: BDB },
   { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
   ...Object.entries(
@@ -1832,7 +1846,7 @@ describe("deploy-hosted-platform.sh", () => {
       const live = (mut: (b: Record<string, unknown>[]) => void) => {
         const b = JSON.parse(NEXT["oa-s-billing"] as string).result.bindings;
         mut(b);
-        return settings(b);
+        return settingsOff(b);
       };
       for (const [why, next, want] of [
         [
@@ -2030,8 +2044,18 @@ describe("deploy-hosted-platform.sh", () => {
         ],
         [
           "observability",
-          settings(JSON.parse(base).result.bindings, true),
+          settings(JSON.parse(base).result.bindings, false),
           "observability",
+        ],
+        [
+          "invocation logs missing",
+          settings(JSON.parse(base).result.bindings, true, null),
+          "observability invocation_logs",
+        ],
+        [
+          "invocation logs",
+          settings(JSON.parse(base).result.bindings, true, true),
+          "observability invocation_logs",
         ],
       ] as const) {
         const r = setup({
