@@ -237,6 +237,22 @@ const CUSTOMERS = "/v1/customers";
 // ------------------------------------------------------------ tests
 
 describe("POST /checkout", () => {
+  it("success, cancel and portal return URLs all use the dashboard plan path", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    await call(req("/checkout", { install: A, ts: Date.now(), plan: "team" }));
+    await call(req("/portal", { install: A, ts: Date.now() }));
+    const urls = s.calls.flatMap((c) =>
+      [c.form.success_url, c.form.cancel_url, c.form.return_url].filter(
+        Boolean,
+      ),
+    );
+    expect(urls.length).toBe(3);
+    for (const u of urls) {
+      expect(new URL(u as string).pathname).toBe("/settings/plan");
+    }
+  });
+
   it("no row: makes the solo row, creates and maps the customer, then the session; answers {url} only", async () => {
     const s = fakeStripe();
     const ts = Date.now();
@@ -254,8 +270,8 @@ describe("POST /checkout", () => {
       customer: "cus_fake1",
       "line_items[0][price]": "price_team1",
       "line_items[0][quantity]": "1",
-      success_url: `https://${HOST_A}/settings/billing?checkout=done`,
-      cancel_url: `https://${HOST_A}/settings/billing?checkout=cancel`,
+      success_url: `https://${HOST_A}/settings/plan?checkout=done`,
+      cancel_url: `https://${HOST_A}/settings/plan?checkout=cancel`,
       "metadata[tier]": "team",
       "subscription_data[metadata][tier]": "team",
     });
@@ -826,7 +842,7 @@ describe("POST /portal", () => {
         auth: `Bearer ${SECRET}`,
         form: {
           customer: "cus_existingA",
-          return_url: `https://${HOST_A}/settings/billing`,
+          return_url: `https://${HOST_A}/settings/plan`,
         },
       },
     ]);
@@ -899,9 +915,9 @@ describe("the redirect origin comes only from the gate's app host", () => {
         .filter((v) => v !== undefined),
     );
     expect(urls).toEqual([
-      `https://${HOST_A}/settings/billing?checkout=done`,
-      `https://${HOST_A}/settings/billing?checkout=cancel`,
-      `https://${HOST_A}/settings/billing`,
+      `https://${HOST_A}/settings/plan?checkout=done`,
+      `https://${HOST_A}/settings/plan?checkout=cancel`,
+      `https://${HOST_A}/settings/plan`,
     ]);
   });
 
@@ -948,7 +964,7 @@ describe("the redirect origin comes only from the gate's app host", () => {
     );
     expect(r.status).toBe(200);
     expect(s.calls[0]?.form.return_url).toBe(
-      "https://acme.open-artifacts.app/settings/billing",
+      "https://acme.open-artifacts.app/settings/plan",
     );
   });
 });
