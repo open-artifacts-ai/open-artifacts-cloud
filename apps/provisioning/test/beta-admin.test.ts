@@ -845,6 +845,56 @@ describe("resend", () => {
   });
 });
 
+describe("one send per approval", () => {
+  it("two approves at once send exactly once", async () => {
+    const m = mailer();
+    const env = envWith(m);
+    await wl("s1", "a@acme.com");
+    const [x, y] = await Promise.all([
+      call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] }),
+      call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] }),
+    ]);
+    expect(m.sent).toHaveLength(1);
+    const r = [x, y].flatMap((z) =>
+      (z.body as { results: { result: string }[] }).results.map(
+        (q) => q.result,
+      ),
+    );
+    expect(r.sort()).toEqual(["already_approved", "approved"]);
+    expect(await audits("beta.approve")).toHaveLength(1);
+  });
+  it("two resends at once send exactly once", async () => {
+    const bad = mailer(Object.assign(new Error("boom"), { code: "E_DOWN" }));
+    await wl("s1", "a@acme.com");
+    await call(envWith(bad), ADMIN_P, "POST", "/waitlist/approve", {
+      subs: ["s1"],
+    });
+    const m = mailer();
+    const env = envWith(m);
+    await Promise.all([
+      call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] }),
+      call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] }),
+    ]);
+    expect(m.sent).toHaveLength(1);
+    expect(await rows("SELECT emailed_at FROM signup_waitlist")).toMatchObject([
+      { emailed_at: expect.any(Number) },
+    ]);
+  });
+  it("a failed send gives the claim back, so a resend works", async () => {
+    await wl("s1", "a@acme.com");
+    await call(
+      envWith(mailer(Object.assign(new Error("x"), { code: "E_DOWN" }))),
+      ADMIN_P,
+      "POST",
+      "/waitlist/approve",
+      { subs: ["s1"] },
+    );
+    expect(await rows("SELECT emailed_at FROM signup_waitlist")).toEqual([
+      { emailed_at: null },
+    ]);
+  });
+});
+
 describe("addresses", () => {
   const BIDI = String.fromCharCode(0x202e);
   const ZW = String.fromCharCode(0x200b);
@@ -872,6 +922,23 @@ describe("addresses", () => {
         })
       ).status,
     ).toBe(200);
+  });
+  it('the Add box refuses , ; < > and " in the local part', async () => {
+    const env = envWith();
+    for (const bad of [
+      "a,b@acme.com",
+      "a;b@acme.com",
+      "a<b@acme.com",
+      "a>b@acme.com",
+      'a"b@acme.com',
+      "<a@acme.com>",
+    ])
+      expect(
+        await code(
+          call(env, ADMIN_P, "POST", "/allowlist", { entries: [bad] }),
+        ),
+        bad,
+      ).toBe("invalid_input");
   });
   it("approvalEmail returns the sanitized to", () => {
     const m = approvalEmail({

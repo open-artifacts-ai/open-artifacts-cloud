@@ -117,6 +117,12 @@ export const addErrorLines = (e: unknown): string[] => {
 };
 
 /** What the Add toast says: who was allowed, who was emailed, who still waits. */
+/** The one sentence for a send that failed, in Product's words. */
+export const emailFailedText = (emails: string[], code: string | undefined) =>
+  emails.length === 1
+    ? `${emails[0]} is allowed, but the email telling them didn't send (${code}). Send it again below, or tell them yourself.`
+    : `${emails.join(", ")} are allowed, but the emails telling them didn't send (${code}). Send them again below, or tell them yourself.`;
+
 export function addToast(r: { added: string[]; results: AddResult[] }): {
   text: string;
   bad: boolean;
@@ -125,19 +131,19 @@ export function addToast(r: { added: string[]; results: AddResult[] }): {
   const sent = r.results.filter((x) => x.emailSent === true);
   const failed = r.results.filter((x) => x.emailSent === false);
   const only = r.added.length === 1;
-  let text = `Allowed ${r.added.join(", ")}`;
-  if (failed.length)
-    text += only
-      ? `, but the email didn't send (${failed[0]?.emailError}). They're on the list; tell them yourself.`
-      : `. ${failed.map((x) => x.entry).join(", ")}: the email didn't send (${failed[0]?.emailError}). They're on the list; tell them yourself.`;
-  else text += ".";
+  let text = `Allowed ${r.added.join(", ")}.`;
   if (sent.length)
     text += only
       ? " We emailed them."
       : ` We emailed ${sent.map((x) => x.entry).join(", ")}.`;
+  if (failed.length)
+    text = `${sent.length ? `${text} ` : ""}${emailFailedText(
+      failed.map((x) => x.entry),
+      failed[0]?.emailError,
+    )}`;
   const doms = r.results.filter((x) => (x.waitingOnDomain ?? 0) > 0);
   const n = doms.reduce((a, x) => a + (x.waitingOnDomain ?? 0), 0);
   if (n > 0)
-    text += ` ${n === 1 ? "1 person on the waitlist uses" : `${n} people on the waitlist use`} ${doms.length === 1 ? "this domain" : "these domains"}. Approve them to email them.`;
+    text += ` ${n === 1 ? "1 person on the waitlist has an address" : `${n} people on the waitlist have addresses`} at ${doms.length === 1 ? "this domain" : "these domains"}. Approve them to tell them they're in.`;
   return { text, bad: failed.length > 0, domain: doms[0]?.entry };
 }

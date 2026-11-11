@@ -25,9 +25,10 @@ const esc = (s: string): string =>
 /**
  * An address we will send to: printable ASCII only (no controls, spaces or
  * bidi and zero-width characters), one '@', a dotted domain of letters,
- * digits and hyphens. The local part is `[!-?A-~]`: 0x21 to 0x7E without '@'.
+ * digits and hyphens. The local part is 0x21 to 0x7E without '@', ',', ';',
+ * '<', '>' and '"' (the characters that split or quote an address list).
  */
-export const ADDRESS_RE = /^[!-?A-~]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+export const ADDRESS_RE = /^[!#-+\-.-:=?A-~]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 
 /**
  * Drops control (CR/LF included), format (bidi overrides, zero-width, BOM),
