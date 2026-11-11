@@ -312,43 +312,8 @@ describe("docs/ops/hosted.md first-create checklist", () => {
   });
 });
 
-// deploy-prod is a public job (release-please.yml is public's file and keeps
-// it after the split). Not a hosted job: this only reads it.
-describe("deploy-prod checks the release bundle before Upgrade", () => {
-  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
-  const rp: any = parse(read(".github/workflows/release-please.yml"));
-  const st: Step[] = rp.jobs["deploy-prod"].steps;
-  // Stable release, and not held by the non-additive migration guard.
-  const GATE =
-    "steps.guard.outputs.deploy == 'true' && steps.migration.outputs.hold == 'false'";
-  const at = (m: string) => st.findIndex((s) => (s.run ?? "").includes(m));
-  it("builds the release bundle and runs check-no-test-hooks on it before the upgrade", () => {
-    const build = at("build-release-bundle.ts");
-    const check = at("pnpm check-no-test-hooks");
-    const up = at("prod-setup.sh upgrade");
-    expect(build).toBeGreaterThan(-1);
-    expect(check).toBeGreaterThan(build);
-    expect(up).toBeGreaterThan(check);
-    for (const i of [build, check]) {
-      expect(st[i]?.if).toBe(GATE);
-      expect(st[i]?.["continue-on-error"]).toBeUndefined();
-      expect(JSON.stringify(st[i]?.env ?? {})).not.toContain("secrets.");
-    }
-    expect(st[build]?.run).toContain("--variant release");
-  });
-  it("runs check-no-fake-idp on the same bundle after the hooks check, before the upgrade", () => {
-    const check = at("pnpm check-no-test-hooks");
-    const fake = at('pnpm check-no-fake-idp "$RUNNER_TEMP/release-bundle"');
-    expect(fake).toBeGreaterThan(check);
-    expect(at("prod-setup.sh upgrade")).toBeGreaterThan(fake);
-    expect(st[fake]?.if).toBe(GATE);
-    expect(st[fake]?.["continue-on-error"]).toBeUndefined();
-  });
-  it("L10: the upgrade itself runs check-no-test-hooks on the bundle it deploys", () => {
-    const up = st[at("prod-setup.sh upgrade")];
-    expect(up?.env?.OA_CHECK_NO_TEST_HOOKS).toBe("1");
-  });
-});
+// deploy-prod (release-please.yml) is public's job and public's file; its
+// bundle-check ordering is asserted in public's scripts/check-ci.test.ts.
 
 // The old "ci.yml no-test-hooks job" test read the public repo's ci.yml, which
 // drops that job at the split. Its N5 guard (the real-build pin test in
@@ -884,6 +849,11 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       expect(r.status).toBe(1);
       expect(r.out).toContain("not the release commit");
     });
+    it("a pin whose package.json version is not the tag's fails", () => {
+      const r = runRead({ target: PUB, prev: "1.2.2", version: "1.2.4" });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("1.2.3");
+    });
     it("a release that targets another commit fails", () => {
       const r = runRead({ target: OTHER, prev: "1.2.2" });
       expect(r.status).toBe(1);
@@ -920,6 +890,10 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(runOf(st)).toMatch(
       /build-hosted-release\.ts "\$RUNNER_TEMP\/hosted" --commit "\$PUB_SHA"/,
     );
+    const build = st.find((x) =>
+      (x.run ?? "").includes("build-hosted-release"),
+    );
+    expect(build?.env?.PUB_SHA).toBe(PUB_COMMIT);
     const up = st.filter((x) =>
       String(x.uses ?? "").startsWith("actions/upload-artifact"),
     );

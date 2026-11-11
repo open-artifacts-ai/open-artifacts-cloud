@@ -180,8 +180,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$KIND" in
-            release) pnpm -s --silent --filter @oa/hosted start publish-release --env staging --tag "$TAG" ;;
-            floor) pnpm -s --silent --filter @oa/hosted start publish-floor --env staging --floor "$FLOOR" ;;
+            release) pnpm -s --filter @oa/hosted start publish-release --env staging --tag "$TAG" ;;
+            floor) pnpm -s --filter @oa/hosted start publish-floor --env staging --floor "$FLOOR" ;;
             *) echo "nothing to publish ($KIND)"; exit 1 ;;
           esac
       - name: Remove the token files
@@ -279,8 +279,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$KIND" in
-            release) pnpm -s --silent --filter @oa/hosted start publish-release --env prod --tag "$TAG" ;;
-            floor) pnpm -s --silent --filter @oa/hosted start publish-floor --env prod --floor "$FLOOR" ;;
+            release) pnpm -s --filter @oa/hosted start publish-release --env prod --tag "$TAG" ;;
+            floor) pnpm -s --filter @oa/hosted start publish-floor --env prod --floor "$FLOOR" ;;
             *) echo "nothing to publish ($KIND)"; exit 1 ;;
           esac
       - name: Remove the token files
