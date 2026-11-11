@@ -35,7 +35,7 @@ const PUBLIC: Record<string, string> = {
   "zoho.com": "Zoho",
 };
 const DOMAIN_RE = /^@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
-const EMAIL_RE = /^[!-?A-~]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
+const EMAIL_RE = /^[!#-+\-.-:=?A-~]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
 export function createBetaMock(
   o: {

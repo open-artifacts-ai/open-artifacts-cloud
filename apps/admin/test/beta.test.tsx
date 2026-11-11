@@ -118,7 +118,7 @@ it("an email that didn't send is shown, and the person stays approved", async ()
   fireEvent.click(within(row).getByRole("button", { name: "Approve" }));
   const t = await screen.findByTestId("beta-toast");
   expect(t).toHaveTextContent(
-    "but the email didn't send (E_SENDER_NOT_VERIFIED)",
+    "sam.rivera@northwind.io is allowed, but the email telling them didn't send (E_SENDER_NOT_VERIFIED). Send it again below, or tell them yourself.",
   );
   expect(t).toHaveAttribute("role", "alert");
 });
@@ -228,7 +228,7 @@ it("the Add box takes several entries and names the first bad one, keeping the t
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   const toast = await screen.findByTestId("beta-toast");
   expect(toast).toHaveTextContent(
-    "Allowed lee@initech.com, @acme.com, zed@x.io. 1 person on the waitlist uses this domain. Approve them to email them.",
+    "Allowed lee@initech.com, @acme.com, zed@x.io. 1 person on the waitlist has an address at this domain. Approve them to tell them they're in.",
   );
   expect(box).toHaveValue("");
   // it asks for an action: it stays, and a click searches the domain
@@ -271,7 +271,7 @@ it("adding an exact email whose approval email fails keeps them approved and say
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   const t = await screen.findByTestId("beta-toast");
   expect(t).toHaveTextContent(
-    "Allowed sam.rivera@northwind.io, but the email didn't send (E_SENDER_NOT_VERIFIED). They're on the list; tell them yourself.",
+    "sam.rivera@northwind.io is allowed, but the email telling them didn't send (E_SENDER_NOT_VERIFIED). Send it again below, or tell them yourself.",
   );
   expect(t).toHaveAttribute("role", "alert");
 });
@@ -285,7 +285,7 @@ it("an approved row whose email didn't send shows 'Send email again', which send
   ) as HTMLElement;
   fireEvent.click(within(row).getByRole("button", { name: "Approve" }));
   expect(await screen.findByTestId("beta-toast")).toHaveTextContent(
-    "but the email didn't send",
+    "is allowed, but the email telling them didn't send",
   );
   const unsent = await screen.findByTestId("beta-unsent");
   expect(

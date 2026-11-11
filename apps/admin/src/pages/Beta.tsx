@@ -13,6 +13,7 @@ import {
   betaStatsQuery,
   cleanNote,
   declinePerson,
+  emailFailedText,
   removeAllowed,
   splitEntries,
   type WaitPerson,
@@ -141,10 +142,10 @@ export function Beta() {
       if (failed.length)
         setToast({
           bad: true,
-          text:
-            done.length === 1
-              ? `Approved ${who}, but the email didn't send (${failed[0]?.emailError}). They're on the list; tell them yourself.`
-              : `Approved ${who}, but ${failed.length} ${failed.length === 1 ? "email" : "emails"} didn't send. They're on the list; tell them yourself.`,
+          text: emailFailedText(
+            failed.map((x) => x.email ?? "them"),
+            failed[0]?.emailError,
+          ),
         });
       else if (done.length === 0) setToast({ text: "Nobody new to approve." });
       else if (done.every((x) => x.resent))

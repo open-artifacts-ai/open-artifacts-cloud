@@ -249,8 +249,11 @@ type ApproveResult = {
 };
 
 /**
- * Sends the approval email for `sub` and records `emailed_at` when it went.
- * A failure is logged and audited; the approval stands.
+ * Sends the approval email for `sub`, once. The send is claimed first with an
+ * atomic `emailed_at` update (only if it is still NULL), so two approves at
+ * once send exactly once; null means another call holds the claim. A failed
+ * send gives the claim back (only if it is still ours), so a resend stays
+ * possible. A failure is logged and audited; the approval stands.
  */
 async function emailApproved(
   env: Env,
@@ -258,16 +261,21 @@ async function emailApproved(
   sub: string,
   email: string,
   ip: string,
-): Promise<Pick<ApproveResult, "emailSent" | "emailError">> {
+): Promise<Pick<ApproveResult, "emailSent" | "emailError"> | null> {
+  const claim = Date.now();
+  const got = await env.PLATFORM_DB.prepare(
+    "UPDATE signup_waitlist SET emailed_at = ?2 WHERE sub = ?1 AND emailed_at IS NULL",
+  )
+    .bind(sub, claim)
+    .run();
+  if ((got.meta.changes ?? 0) !== 1) return null;
   const sent = await sendApproval(env, email);
-  if (sent.sent) {
-    await env.PLATFORM_DB.prepare(
-      "UPDATE signup_waitlist SET emailed_at = ?2 WHERE sub = ?1",
-    )
-      .bind(sub, Date.now())
-      .run();
-    return { emailSent: true };
-  }
+  if (sent.sent) return { emailSent: true };
+  await env.PLATFORM_DB.prepare(
+    "UPDATE signup_waitlist SET emailed_at = NULL WHERE sub = ?1 AND emailed_at = ?2",
+  )
+    .bind(sub, claim)
+    .run();
   console.error("beta approval email failed", { sub, error: sent.error });
   await tryAudit(env, {
     action: BETA_ACTIONS.emailFailed,
@@ -300,13 +308,9 @@ async function approveRow(
       return { sub, email: row.email, result: "already_approved" };
     // Approved, but the email never went: approving again sends it again.
     const email = normEmail(row.email);
-    return {
-      sub,
-      email,
-      result: "approved",
-      resent: true,
-      ...(await emailApproved(env, p, sub, email, ip)),
-    };
+    const r = await emailApproved(env, p, sub, email, ip);
+    if (!r) return { sub, email, result: "already_approved" };
+    return { sub, email, result: "approved", resent: true, ...r };
   }
   const email = normEmail(row.email);
   const now = Date.now();
@@ -335,12 +339,10 @@ async function approveRow(
   if ((res[1]?.meta.changes ?? 0) !== 1)
     return { sub, email, result: "already_approved" };
   // The approval stands whatever the send does.
-  return {
-    sub,
-    email,
-    result: "approved",
-    ...(await emailApproved(env, p, sub, email, ip)),
-  };
+  const r = await emailApproved(env, p, sub, email, ip);
+  return r
+    ? { sub, email, result: "approved", ...r }
+    : { sub, email, result: "already_approved" };
 }
 
 async function approve(
