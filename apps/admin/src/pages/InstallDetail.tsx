@@ -40,9 +40,9 @@ import { ActionDialog } from "../components/ActionDialog";
 import { ErrorLine, StateBadge, StatusBadge } from "../components/Bits";
 import { fmtTime } from "../components/format";
 import {
+  actorName,
   fmtClock,
   fmtDay,
-  actorName,
   HEALTH_LABEL,
   HEALTH_TONE,
   JOB_VERB,
@@ -50,7 +50,7 @@ import {
   providerLabel,
   SERVING_LABEL,
   stepCount,
-  TIER_LABEL,
+  tierText,
   visibleSteps,
 } from "../components/labels";
 import {
@@ -744,12 +744,8 @@ export function InstallDetail({ id }: { id: string }) {
             <div>
               <dt>Tier · Sign-in</dt>
               <dd>
-                {i.tier ? (
-                  TIER_LABEL[i.tier]
-                ) : (
-                  <span className="oa-note">–</span>
-                )}{" "}
-                · {i.auth.providers.map(providerLabel).join(", ")}
+                {tierText(i) ?? <span className="oa-note">–</span>} ·{" "}
+                {i.auth.providers.map(providerLabel).join(", ")}
                 {i.auth.domains.length > 0 &&
                   ` · ${i.auth.domains.length} ${i.auth.domains.length === 1 ? "domain" : "domains"}`}
               </dd>
@@ -814,7 +810,9 @@ export function InstallDetail({ id }: { id: string }) {
                       {fmtDay(j.startedAt ?? j.createdAt)}{" "}
                       {fmtClock(j.startedAt ?? j.createdAt)}
                     </TableCell>
-                    <TableCell className="oa-note">{actorName(j.actor)}</TableCell>
+                    <TableCell className="oa-note">
+                      {actorName(j.actor)}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

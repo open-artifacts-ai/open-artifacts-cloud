@@ -32,7 +32,15 @@ export type BillingSetTierResult =
         | "subscription_active"
         | "unavailable";
     };
+export type BillingTiersOfResult =
+  | {
+      ok: true;
+      tiers: Record<string, { tier: string | null; status: string | null }>;
+    }
+  | { ok: false; error: "bad_installs" | "unavailable" };
 export interface BillingOperatorRpc {
+  /** Optional: billing may deploy after provisioning (release-before-use). */
+  tiersOf?(installs: string[]): Promise<BillingTiersOfResult>;
   setTier(
     install: string,
     tier: "team" | "business",

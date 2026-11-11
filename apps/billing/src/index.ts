@@ -62,6 +62,8 @@ import {
   type StripeConfig,
   StripeConfigError,
   SUBSCRIPTION_LIVE_SQL,
+  TIERS_OF_MAX,
+  type TiersOfResult,
 } from "@oa/billing-core";
 import {
   ASSERTION_SKEW_MS,
@@ -953,15 +955,58 @@ async function operatorSetTier(
   }
 }
 
+// The read side of the operator RPC (#2058): the tier GET /tier shows, for
+// many installs, in one SELECT. Read only: it does not materialize an ended
+// trial or record last_read_at, and it calls no Stripe. No row: solo, active.
+async function operatorTiersOf(
+  env: Env,
+  installs: unknown,
+): Promise<TiersOfResult> {
+  if (
+    !Array.isArray(installs) ||
+    installs.length < 1 ||
+    installs.length > TIERS_OF_MAX ||
+    !installs.every((i) => typeof i === "string" && INSTALL_ID.test(i))
+  )
+    return { ok: false, error: "bad_installs" };
+  const ids = [...new Set(installs as string[])];
+  try {
+    const rows = await env.BILLING_DB.prepare(
+      `SELECT install_id, tier, status FROM tiers WHERE install_id IN (${ids.map(() => "?").join(",")})`,
+    )
+      .bind(...ids)
+      .all<{
+        install_id: string;
+        tier: string | null;
+        status: string | null;
+      }>();
+    const tiers: Record<
+      string,
+      { tier: string | null; status: string | null }
+    > = {};
+    for (const id of ids) tiers[id] = { tier: "solo", status: "active" };
+    for (const r of rows.results)
+      tiers[r.install_id] = { tier: r.tier, status: r.status };
+    return { ok: true, tiers };
+  } catch {
+    console.error("billing tiers_of db_error");
+    return { ok: false, error: "unavailable" };
+  }
+}
+
 /**
  * The Provisioning API's operator RPC (a service binding with
  * `entrypoint: "BillingOperatorRpc"`): its own entrypoint, so the one Worker
  * that may comp a tier cannot start a Solo trial and the provisioner cannot
- * comp. Exactly one method (a test pins the prototype).
+ * comp. Exactly two methods (a test pins the prototype).
  */
 export class BillingOperatorRpc extends WorkerEntrypoint<Env> {
   setTier(install: string, tier: SetTierTier): Promise<SetTierResult> {
     return operatorSetTier(this.env, install, tier);
+  }
+
+  tiersOf(installs: string[]): Promise<TiersOfResult> {
+    return operatorTiersOf(this.env, installs);
   }
 }
 

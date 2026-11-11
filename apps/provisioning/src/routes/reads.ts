@@ -12,6 +12,7 @@ import {
   slugRule,
 } from "@oa/provisioning-contract";
 import { z } from "zod";
+import { billingTiersOf } from "../billing-tiers.js";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
 import { factsOf } from "../facts.js";
@@ -148,9 +149,15 @@ export async function listInstalls(a: HandlerArgs): Promise<RouteResult> {
       .bind(...binds, n + 1)
       .all<StatusRow>()
   ).results;
-  const items: InstallSummary[] = rows
-    .slice(0, n)
-    .map((x) => summaryOf(a.env, x));
+  const page = rows.slice(0, n);
+  const billing = await billingTiersOf(
+    a.env,
+    page.map((x) => x.install_id),
+  );
+  const items: InstallSummary[] = page.map((x) => ({
+    ...summaryOf(a.env, x),
+    billingTier: billing.get(x.install_id) ?? null,
+  }));
   const last = rows.length > n ? rows[n - 1] : undefined;
   return ok({
     items,

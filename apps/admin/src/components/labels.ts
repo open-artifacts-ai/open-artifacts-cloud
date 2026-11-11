@@ -56,6 +56,27 @@ export const TIER_LABEL: Record<Tier, string> = {
   business: "Business",
 };
 
+const BILLING_TIER_LABEL: Record<string, string> = {
+  free: "Free",
+  solo: "Solo",
+  trial: "Trial",
+  team: "Team",
+  business: "Business",
+};
+
+/**
+ * The plan an install is on (#2058): billing's tier when the API has it,
+ * else "Created as <tier>" (the tier it was created with), so the created-as
+ * tier is never read as the current plan. Null: neither is known.
+ */
+export function tierText(i: {
+  tier: Tier | null;
+  billingTier?: string | null;
+}): string | null {
+  if (i.billingTier) return BILLING_TIER_LABEL[i.billingTier] ?? i.billingTier;
+  return i.tier ? `Created as ${TIER_LABEL[i.tier]}` : null;
+}
+
 const ALERT_LABEL: Record<string, string> = {
   job_failed: "Job failed",
   install_failed: "Create failed",
