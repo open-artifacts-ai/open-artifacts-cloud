@@ -546,7 +546,7 @@ export const CLIENT_JS = String.raw`(function () {
       label = "Ready";
       head = [h("h1", {}, [nw(hostName), " is ready"])];
       steps = [reserve, step("done", create), step("done", email)];
-      body = [h("a", { class: "btn pri", href: "https://" + hostName + "/" }, ["Open your instance"])];
+      body = [h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, ["Open your instance"])];
     } else {
       label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
@@ -564,6 +564,17 @@ export const CLIENT_JS = String.raw`(function () {
     shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
     ], body)));
+  }
+
+  // POST /auth/open mints a short-lived ticket so the instance can sign the
+  // owner in without a second prompt; any failure is the plain link.
+  function openInstance(ev) {
+    var a = ev.currentTarget, plain = a.href;
+    ev.preventDefault();
+    api("POST", "/auth/open").then(function (r) {
+      var u = r.status === 200 && r.body && typeof r.body.url === "string" ? r.body.url : plain;
+      window.location.assign(u);
+    }, function () { window.location.assign(plain); });
   }
 
   function loadSignup() {
