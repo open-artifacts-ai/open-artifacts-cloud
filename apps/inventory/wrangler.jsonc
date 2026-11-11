@@ -7,6 +7,8 @@
 // PLATFORM_DB, HOSTS and repository ids have their own placeholder, filled at
 // deploy (the ids of oa-<p>-platform and oa-<p>-hosts). HOSTS is read-only in
 // code; PLATFORM_DB's one write is the prodclean_reports insert. No secrets.
+// Workers Logs on for console errors only (#164): invocation logs stay off, so
+// no request URL is recorded.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "compatibility_date": "2026-10-01",
@@ -18,6 +20,15 @@
       "main": "src/index.ts",
       "workers_dev": true,
       "preview_urls": false,
+      "observability": {
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       "vars": {
         "OIDC_AUDIENCE": "https://oa-s-inventory",
         "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
@@ -39,6 +50,15 @@
       "main": "src/index.ts",
       "workers_dev": true,
       "preview_urls": false,
+      "observability": {
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       // The monitor and red-line's prodClean both run in redline-staging,
       // where the REDLINE_PROD_* tokens live.
       "vars": {

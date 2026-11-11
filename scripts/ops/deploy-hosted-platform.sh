@@ -394,7 +394,11 @@ case "$target" in
     names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
+    # Invocation logs off (#164): an explicit false is required (a missing field
+    # is "null" and fails; Cloudflare defaults it to on). The settings
+    # API's key for query-string redaction is not recorded, so it is not read.
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     no_secret_bindings "$S" oa-$P-provisioner
     names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
     [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
@@ -585,7 +589,11 @@ case "$target" in
     signups_deployed "$S" "$W"
     # MCP_REDIRECT_URIS among them; ADMIN_IDENTITIES is a secret, by name only.
     vars_are "$S" provisioning
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
+    # Invocation logs off (#164): an explicit false is required (a missing field
+    # is "null" and fails; Cloudflare defaults it to on). The settings
+    # API's key for query-string redaction is not recorded, so it is not read.
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"
@@ -751,7 +759,8 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
     billing_bound "$S" dispatch ""
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
+    expect "$S" '.result.observability.logs.invocation_logs | tostring' false "observability invocation_logs"
     ;;
   scheduler)
     need PLATFORM_DB_ID; need EMAIL_ZONE_TAGS; need EMAIL_DAILY_LIMIT

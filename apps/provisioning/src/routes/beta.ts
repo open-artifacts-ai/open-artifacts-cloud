@@ -22,6 +22,9 @@ import { normEmail } from "../signup/gate.js";
 //
 // No write here touches an install, a signup or a signup_accounts row.
 
+/** Extra audit detail naming the surface (an MCP call); empty for HTTP. */
+export type Via = Record<string, unknown>;
+
 export const BETA_PATH_RE = /^\/api\/v1\/beta(\/[^?]*)?$/;
 
 export const BETA_ACTIONS = {
@@ -118,7 +121,7 @@ export function entryRefusal(
 
 const who = (p: Principal) => p.email ?? p.label;
 
-async function stats(env: Env): Promise<Json> {
+export async function stats(env: Env): Promise<Json> {
   const dayStart = Math.floor(Date.now() / DAY_MS) * DAY_MS;
   const [w, a, s] = await env.PLATFORM_DB.batch([
     env.PLATFORM_DB.prepare(
@@ -174,7 +177,7 @@ const waitItem = (r: WaitRow) => ({
   emailedAt: r.emailed_at,
 });
 
-async function listWaitlist(env: Env, url: URL): Promise<Json> {
+export async function listWaitlist(env: Env, url: URL): Promise<Json> {
   const st = WaitlistStatus.safeParse(
     url.searchParams.get("status") ?? "waiting",
   );
@@ -260,7 +263,8 @@ async function emailApproved(
   p: Principal,
   sub: string,
   email: string,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Pick<ApproveResult, "emailSent" | "emailError"> | null> {
   const claim = Date.now();
   const got = await env.PLATFORM_DB.prepare(
@@ -284,7 +288,7 @@ async function emailApproved(
     code: "email_failed",
     ip,
     email,
-    detail: { sub, error: sent.error },
+    detail: { ...via, sub, error: sent.error },
   });
   return { emailSent: false, emailError: sent.error };
 }
@@ -294,7 +298,8 @@ async function approveRow(
   env: Env,
   p: Principal,
   sub: string,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<ApproveResult> {
   const by = who(p);
   const row = await env.PLATFORM_DB.prepare(
@@ -308,7 +313,7 @@ async function approveRow(
       return { sub, email: row.email, result: "already_approved" };
     // Approved, but the email never went: approving again sends it again.
     const email = normEmail(row.email);
-    const r = await emailApproved(env, p, sub, email, ip);
+    const r = await emailApproved(env, p, sub, email, ip, via);
     if (!r) return { sub, email, result: "already_approved" };
     return { sub, email, result: "approved", resent: true, ...r };
   }
@@ -331,7 +336,7 @@ async function approveRow(
         outcome: "ok",
         ip,
         email,
-        detail: { sub, previous: row.status },
+        detail: { ...via, sub, previous: row.status },
       },
       true,
     ),
@@ -339,23 +344,24 @@ async function approveRow(
   if ((res[1]?.meta.changes ?? 0) !== 1)
     return { sub, email, result: "already_approved" };
   // The approval stands whatever the send does.
-  const r = await emailApproved(env, p, sub, email, ip);
+  const r = await emailApproved(env, p, sub, email, ip, via);
   return r
     ? { sub, email, result: "approved", ...r }
     : { sub, email, result: "already_approved" };
 }
 
-async function approve(
+export async function approve(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = ApproveSchema.safeParse(body);
   if (!parsed.success) throw invalid("subs: 1 to 100 sub ids");
   const results: ApproveResult[] = [];
   for (const sub of new Set(parsed.data.subs))
-    results.push(await approveRow(env, p, sub, ip));
+    results.push(await approveRow(env, p, sub, ip, via));
   return ok({
     results,
     approved: results.filter((r) => r.result === "approved").length,
@@ -363,11 +369,12 @@ async function approve(
   });
 }
 
-async function decline(
+export async function decline(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = DeclineSchema.safeParse(body);
   if (!parsed.success) throw invalid("sub is required");
@@ -399,7 +406,7 @@ async function decline(
         outcome: "ok",
         ip,
         email: row.email,
-        detail: { sub },
+        detail: { ...via, sub },
       },
       true,
     ),
@@ -409,7 +416,7 @@ async function decline(
   return ok({ sub, email: row.email, status: "declined" });
 }
 
-async function listAllowed(env: Env): Promise<Json> {
+export async function listAllowed(env: Env): Promise<Json> {
   const rows = await env.PLATFORM_DB.prepare(
     `SELECT a.entry, a.added_by, a.added_at,
   EXISTS (SELECT 1 FROM signup_waitlist w WHERE w.email = a.entry AND w.status = 'approved') AS from_waitlist
@@ -443,11 +450,12 @@ type AddResult = {
   waitingOnDomain?: number;
 };
 
-async function add(
+export async function add(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = AddSchema.safeParse(body);
   if (!parsed.success) throw invalid("entries: 1 to 100 emails or @domains");
@@ -481,6 +489,7 @@ async function add(
       code: "invalid_input",
       ip,
       detail: {
+        ...via,
         entries: errors.slice(0, 20).map((x) => ({
           entry: x.entry.slice(0, 100),
           reason: x.reason,
@@ -504,7 +513,7 @@ async function add(
           actor: p,
           outcome: "ok",
           ip,
-          detail: { entry: e },
+          detail: { ...via, entry: e },
         },
         true,
       ),
@@ -542,7 +551,7 @@ async function add(
       results.push({ entry: e });
       continue;
     }
-    const r = await approveRow(env, p, first, ip);
+    const r = await approveRow(env, p, first, ip, via);
     // A second row for the same address is marked approved without a second email.
     for (const sub of rest)
       await env.PLATFORM_DB.prepare(
@@ -560,11 +569,12 @@ async function add(
   return ok({ added: entries, results });
 }
 
-async function remove(
+export async function remove(
   env: Env,
   p: Principal,
   raw: string,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   let entry: string;
   try {
@@ -583,7 +593,7 @@ async function remove(
         actor: p,
         outcome: "ok",
         ip,
-        detail: { entry },
+        detail: { ...via, entry },
       },
       true,
     ),
@@ -634,4 +644,69 @@ export async function betaApi(
   const rm = method === "DELETE" ? /^\/allowlist\/([^/]+)$/.exec(sub) : null;
   if (rm?.[1]) return remove(env, p, rm[1], ip);
   throw new ApiError("not_found");
+}
+
+// The admin MCP tools (hosted-tools.ts) call the same functions as betaApi
+// above, each surface keeping its own authz. Over MCP the principal is an
+// admin's OAuth grant (as set_install_tier): installs:read lists, installs:write
+// writes. An oat_ token, OIDC or a session is forbidden. The prod "yes" for a
+// write is the operator's own, at the client, as for every admin write tool.
+
+export const BETA_TOOLS = {
+  list: "list_waitlist",
+  approve: "approve_waitlist",
+  allow: "allow_signup",
+  remove: "remove_allowed",
+  stats: "beta_stats",
+} as const;
+
+export const ListWaitlistInput = z
+  .object({
+    status: WaitlistStatus.optional(),
+    q: z.string().max(200).optional(),
+  })
+  .strict();
+export const ApproveInput = ApproveSchema;
+export const AllowInput = AddSchema;
+export const RemoveInput = z
+  .object({ entry: z.string().min(1).max(320) })
+  .strict();
+export const StatsInput = z.object({}).strict();
+
+/** An admin's OAuth grant holding the scope; nothing else over MCP. */
+const mayBetaMcp = (p: Principal, write: boolean) =>
+  p.kind === "token" &&
+  p.tokenKind === "oauth" &&
+  p.scopes.includes(write ? "installs:write" : "installs:read");
+
+/**
+ * Runs one beta tool: authz (refusal audited), then the shared function with
+ * the surface in every audit row's detail.
+ */
+export async function betaMcp(
+  env: Env,
+  p: Principal,
+  tool: string,
+  write: boolean,
+  clientVersion: string | null,
+  run: (via: Via) => Promise<Json>,
+): Promise<Json> {
+  if (!mayBetaMcp(p, write)) {
+    await tryAudit(env, {
+      action: "authz.refused",
+      actor: p,
+      outcome: "refused",
+      code: "forbidden",
+      detail: { action: "beta", surface: "mcp", tool },
+    });
+    throw new ApiError("forbidden");
+  }
+  return run({
+    surface: "mcp",
+    tool,
+    clientVersion,
+    ...(p.kind === "token"
+      ? { via: p.tokenKind, client: p.client ?? null }
+      : {}),
+  });
 }
