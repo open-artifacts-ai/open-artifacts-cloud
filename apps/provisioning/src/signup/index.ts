@@ -71,7 +71,6 @@ export function signupConfig(env: Env): Response {
       open: env.SIGNUPS_ENABLED !== "false",
       appDomain: env.APP_DOMAIN,
       turnstileSiteKey: env.TURNSTILE_SITEKEY ?? null,
-      supportEmail: `support@${env.APP_DOMAIN}`,
       docsUrl: "https://open-artifacts.com",
       githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
     },
