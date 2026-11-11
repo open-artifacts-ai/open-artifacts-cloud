@@ -75,6 +75,9 @@ import {
 import { isAppHost, type Env as OaEnv, TRIAL_MS } from "@oa/provision/names";
 import { isClockInstall } from "./test-clock.js";
 
+/** Dashboard page Checkout and the portal return to. */
+const PLAN_PATH = "/settings/plan";
+
 export interface Env {
   BILLING_DB: D1Database;
   /** The install registry (read-only): the namespace the auth broker reads. */
@@ -542,7 +545,7 @@ async function checkout(
       (await lookupInstall(env.BROKER_REGISTRY, install, Date.now()))?.origin,
     ),
   );
-  const base = `https://${appHost}/settings/billing`;
+  const base = `https://${appHost}${PLAN_PATH}`;
   // Paying during the no-card Solo trial keeps the free days: the new
   // subscription's trial ends where the old one's does, so no money moves
   // until then and the card is collected. Stripe needs trial_end at least 48
@@ -639,7 +642,7 @@ async function portal(
     createPortalSession(
       {
         customerId,
-        returnUrl: `https://${appHost}/settings/billing`,
+        returnUrl: `https://${appHost}${PLAN_PATH}`,
         idempotencyKey: `portal-${install}-${body.ts}`,
       },
       cfg,
