@@ -65,7 +65,8 @@ cap='^[1-9][0-9]{0,3}$'
 # The signups gate: false; staging also test-users (design v7 7). true opens
 # self-serve, which waits until after M1: it needs ALLOW_SIGNUPS=1 (a change the
 # Manager approves), so a deploy can't admit real signups into stub Workflow steps.
-if [ "${ALLOW_SIGNUPS:-}" = 1 ]; then on='true|'; else on=''; fi
+# invite (#2096) opens self-serve to the allow list, so it needs it too.
+if [ "${ALLOW_SIGNUPS:-}" = 1 ]; then on='true|invite|'; else on=''; fi
 if [ "$env" = staging ]; then onoff="^(${on}false|test-users)\$"; else onoff="^(${on}false)\$"; fi
 price='^price_[A-Za-z0-9]{1,255}$'
 # One plain address: no slash, ampersand, backslash, quote, comma or space, so
@@ -182,6 +183,8 @@ case "$app" in
     # Staging's gate is the constant (open for the M2 walk); prod's block pins
     # a literal false, so this fill only checks the value there.
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
+    # The approval email's sender (#2096), the provisioner's value.
+    fill "WELCOME_FROM_${up}" "${WELCOME_FROM:-}" "$email"
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"

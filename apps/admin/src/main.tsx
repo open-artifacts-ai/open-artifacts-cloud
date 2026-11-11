@@ -13,11 +13,13 @@ async function startMocks() {
     { setupWorker },
     { http, HttpResponse },
     { createMock },
+    { createBetaMock },
     { autoAdvance },
   ] = await Promise.all([
     import("msw/browser"),
     import("msw"),
     import("./mocks/handlers"),
+    import("./mocks/beta"),
     import("./mocks/autoAdvance"),
   ]);
   // ?mock=unauth: GET /api/v1/me answers 401.
@@ -151,7 +153,13 @@ async function startMocks() {
       },
     ],
   });
-  const worker = setupWorker(...extra, ...mock.handlers);
+  // The Beta tab's API (#2096): ?mock=beta-open shows the "not by invite" banner.
+  const beta = createBetaMock({
+    now: Date.now,
+    mode: flag === "beta-open" ? "true" : "invite",
+    ...(flag === "beta-empty" ? { waitlist: [], allowed: [] } : {}),
+  });
+  const worker = setupWorker(...extra, ...beta.handlers, ...mock.handlers);
   autoAdvance(worker.events, mock, 1500);
   await worker.start({
     onUnhandledRequest: "bypass",

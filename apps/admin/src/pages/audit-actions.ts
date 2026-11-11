@@ -31,6 +31,11 @@ const VERB: Record<string, string> = {
   "test_admin.session": "started a test admin session",
   "signup_claim.free": "freed a sign-up claim",
   "install.tier_set": "set the install's billing tier",
+  "beta.approve": "approved someone from the waitlist",
+  "beta.decline": "declined someone on the waitlist",
+  "beta.allow_add": "allowed an email or domain to sign up",
+  "beta.allow_remove": "removed an email or domain from the allow list",
+  "beta.email_failed": "couldn't send an approval email",
   // The provisioner's step rows (#1136); job.done and job.failed sum them up.
   "create.start": "started creating the install",
   "create.resume": "resumed creating the install",
@@ -40,7 +45,8 @@ const VERB: Record<string, string> = {
   "upgrade.start": "started an upgrade",
   "upgrade.held": "held an upgrade",
   "upgrade.restore_point": "saved a restore point",
-  "upgrade.restore_point_first_missing": "found no first restore point on a retry",
+  "upgrade.restore_point_first_missing":
+    "found no first restore point on a retry",
   "upgrade.done": "finished an upgrade",
   "upgrade.failed": "had an upgrade fail",
   "upgrade.incomplete": "left an upgrade unfinished",

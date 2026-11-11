@@ -1406,6 +1406,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
           RUNNER_TEMP: dir,
           CALLS: calls,
           FAIL: fail || "no-such-arg",
+          PW_DEPS_S: "5",
         });
         return {
           status: r.status,
@@ -1415,13 +1416,20 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         };
       };
       const all = [
-        "--filter @oa/dashboard exec playwright install --with-deps chromium",
+        "--filter @oa/dashboard exec playwright install chromium",
+        "--filter @oa/dashboard exec playwright install-deps chromium",
         "--filter @oa/provision build",
         "--filter @oa/shared build",
       ];
       expect(run("")).toEqual({ status: 0, calls: all });
-      // The install fails in the background: the step still fails.
-      expect(run("playwright").status).toBe(1);
+      // Chromium's download fails in the background: the step fails, and
+      // no deps install is tried.
+      const pw = run("install chromium");
+      expect(pw.status).toBe(1);
+      expect(pw.calls).toEqual([all[0], all[2], all[3]]);
+      // Only the apt deps fail: best effort, the step passes (T19's own
+      // launch is the browser check).
+      expect(run("install-deps")).toEqual({ status: 0, calls: all });
       // A build fails: the step fails, and the install was still waited on.
       const b = run("provision");
       expect(b.status).toBe(1);

@@ -154,11 +154,25 @@ exit 0
   return p;
 };
 
-const settings = (bindings: Record<string, unknown>[], obs = false) =>
+// The provisioner and provisioning have Workers Logs on (#164); the brokers,
+// dispatch and billing stay off (Workers Logs would record their URLs).
+const settings = (
+  bindings: Record<string, unknown>[],
+  obs = true,
+  invocation: boolean | null = false,
+) =>
   JSON.stringify({
     success: true,
-    result: { bindings, observability: { enabled: obs } },
+    result: {
+      bindings,
+      observability: {
+        enabled: obs,
+        logs: { invocation_logs: invocation ?? undefined },
+      },
+    },
   });
+const settingsOff = (bindings: Record<string, unknown>[]) =>
+  settings(bindings, false);
 // The scheduler's bindings as Cloudflare reads them back (apps/scheduler
 // wrangler.jsonc, per env).
 // The alert wiring the deploy fills by default (ENV below holds the same).
@@ -230,7 +244,7 @@ const queueList = (names: string[], total = names.length, pages = 1) =>
     },
   });
 const NEXT: Record<string, string> = {
-  "oa-p-auth-broker": settings([
+  "oa-p-auth-broker": settingsOff([
     { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
     { type: "plain_text", name: "GOOGLE_CLIENT_ID", text: CLIENT },
     {
@@ -239,7 +253,7 @@ const NEXT: Record<string, string> = {
       text: "https://auth.open-artifacts.app",
     },
   ]),
-  "oa-p-directory-broker": settings([
+  "oa-p-directory-broker": settingsOff([
     { type: "kv_namespace", name: "DIRECTORY_REGISTRY", namespace_id: DIRREG },
     { type: "plain_text", name: "GOOGLE_DIRECTORY_CLIENT_ID", text: DCLIENT },
     {
@@ -364,6 +378,8 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
     : []),
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
+  // The approval email (#2096): the provisioner's sender.
+  { type: "send_email", name: "WELCOME_EMAIL" },
   ...[
     "PROVISION_INSTALL:ProvisionInstall:provision",
     "MANAGE_INSTALL:ManageInstall:manage",
@@ -383,7 +399,7 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
 ];
-NEXT["oa-s-billing"] = settings([
+NEXT["oa-s-billing"] = settingsOff([
   { type: "d1", name: "BILLING_DB", id: BDB },
   { type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG },
   ...Object.entries(
@@ -754,6 +770,26 @@ describe("deploy-hosted-platform.sh", () => {
         }).run("dispatch", {}, "staging");
         expect(bad.code, why).toBe(1);
         expect(bad.err, why).toContain("dispatch BILLING binding: got");
+      }
+    });
+    it("dispatch refuses observability off, invocation logs on, or the field missing", () => {
+      for (const [why, obs, msg] of [
+        ["off", { enabled: false }, "observability"],
+        [
+          "invocation logs on",
+          { enabled: true, logs: { invocation_logs: true } },
+          "observability invocation_logs",
+        ],
+        ["field missing", { enabled: true }, "observability invocation_logs"],
+      ] as const) {
+        const next = JSON.parse(NEXT["oa-p-dispatch"] as string);
+        next.result.observability = obs;
+        const bad = setup({
+          exists: SCHED_DEPS("p"),
+          next: { "oa-p-dispatch": JSON.stringify(next) },
+        }).run("dispatch");
+        expect(bad.code, why).toBe(1);
+        expect(bad.err, why).toContain(msg);
       }
     });
     it("staging scheduler verifies its BILLING binding too", () => {
@@ -1406,6 +1442,7 @@ describe("deploy-hosted-platform.sh", () => {
       ["provisioner", { WELCOME_FROM: "" }],
       ["provisioning", { GITHUB_REPOSITORY_ID: "" }],
       ["provisioning", { SIGNUP_DAILY_CAP: "" }],
+      ["provisioning", { WELCOME_FROM: "" }],
       ["inventory", { GITHUB_REPOSITORY_ID: "" }],
       ["inventory", { GITHUB_REPOSITORY: "" }],
       ["inventory", { GITHUB_REPOSITORY: "o/r/x" }],
@@ -1647,6 +1684,13 @@ describe("deploy-hosted-platform.sh", () => {
         const closed = go(src, "false");
         expect(closed.code, closed.err).toBe(0);
       });
+      it(`${app}: a deployed "invite" (#2096) needs ALLOW_SIGNUPS=1 like "true"`, () => {
+        const r = go(src, "invite");
+        expect(r.code, app).toBe(1);
+        expect(r.err).toContain(
+          `deployed ${W}: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1; refusing`,
+        );
+      });
       it(`${app}: a deployed "true" is refused on read-back unless ALLOW_SIGNUPS=1, verify only too`, () => {
         for (const VERIFY_ONLY of ["", "1"]) {
           const s = setup({
@@ -1822,7 +1866,7 @@ describe("deploy-hosted-platform.sh", () => {
       const live = (mut: (b: Record<string, unknown>[]) => void) => {
         const b = JSON.parse(NEXT["oa-s-billing"] as string).result.bindings;
         mut(b);
-        return settings(b);
+        return settingsOff(b);
       };
       for (const [why, next, want] of [
         [
@@ -2020,8 +2064,18 @@ describe("deploy-hosted-platform.sh", () => {
         ],
         [
           "observability",
-          settings(JSON.parse(base).result.bindings, true),
+          settings(JSON.parse(base).result.bindings, false),
           "observability",
+        ],
+        [
+          "invocation logs missing",
+          settings(JSON.parse(base).result.bindings, true, null),
+          "observability invocation_logs",
+        ],
+        [
+          "invocation logs",
+          settings(JSON.parse(base).result.bindings, true, true),
+          "observability invocation_logs",
         ],
       ] as const) {
         const r = setup({

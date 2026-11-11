@@ -396,9 +396,18 @@ describe("server identity, tools, resources, prompts (9A.5)", () => {
     // ADMIN_TOOLS, then the hosted-only set_install_tier (#66; set-tier.test.ts).
     expect(tools.map((t) => t.name)).toEqual([
       ...ADMIN_TOOL_NAMES,
+      "list_waitlist",
+      "beta_stats",
+      "approve_waitlist",
+      "allow_signup",
+      "remove_allowed",
       "set_install_tier",
     ]);
-    for (const t of tools.filter((x) => x.name !== "set_install_tier")) {
+    for (const t of tools.filter(
+      (x) =>
+        x.name !== "set_install_tier" &&
+        !x.name.match(/waitlist|allow|beta_stats/),
+    )) {
       const def = toolOf(t.name as AdminToolName);
       expect(t.description).toBe(def.description);
       expect(t.annotations).toMatchObject(def.annotations);

@@ -228,6 +228,18 @@ describe("handleSignup", () => {
     expect(wf.creates).toEqual([]);
   });
 
+  it("invite admits on staging and prod: the API (create) is the gate (#2096)", async () => {
+    for (const [n, oaEnv] of [
+      [1, "staging"],
+      [2, "prod"],
+    ] as const) {
+      await seed(n);
+      await handleSignup(msg(n), mkEnv("20", db, "invite", oaEnv), NOW);
+    }
+    expect(outcomes()).toEqual(["queued", "queued"]);
+    expect(wf.creates).toHaveLength(2);
+  });
+
   it("test-users admits on staging only (design v7 7)", async () => {
     await seed(1);
     const m = msg(1);

@@ -2171,16 +2171,27 @@ export const PROBES: readonly Probe[] = [
         throw new ProbeFail(
           `P52: after the failed upgrade the install is ${now.state} ${now.version} (previous ${now.previousVersion}), want active ${run.c.version} (previous ${p.createdAt}): it must stay forward, never revert`,
         );
-      const hz = await run.page(p.appHost, "/healthz", true);
-      const body = hz.json as { ok?: unknown; version?: unknown } | undefined;
-      if (
-        hz.status !== 200 ||
-        body?.ok !== true ||
-        body.version !== run.c.version
-      )
+      // The edge can serve the old script for a few seconds after the upload:
+      // poll, and report the last answer if it never shows the new version.
+      let hz = await run.page(p.appHost, "/healthz", true);
+      const healthy = (r: typeof hz) => {
+        const b = r.json as { ok?: unknown; version?: unknown } | undefined;
+        return (
+          r.status === 200 && b?.ok === true && b.version === run.c.version
+        );
+      };
+      try {
+        await run.within(PAGE_WITHIN_MS, "P52 /healthz", async () => {
+          if (healthy(hz)) return true;
+          hz = await run.page(p.appHost, "/healthz", true);
+          return healthy(hz);
+        });
+      } catch (e) {
+        if (!(e instanceof ProbeFail)) throw e;
         throw new ProbeFail(
           `P52: after the failed upgrade /healthz is not ok on ${run.c.version} (${desc(hz)})`,
         );
+      }
       // Not read live, as in P31: the upgrade.failed and upgrade.forward_fix
       // rows are `provision` rows (actor job:<id>) that R17 never returns to
       // this actor, and no fleet_halt key exists to read: the job is not a

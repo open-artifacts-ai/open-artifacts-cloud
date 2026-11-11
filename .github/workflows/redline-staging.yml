@@ -163,7 +163,18 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/playwright-install.log"
-          pnpm --filter @oa/dashboard exec playwright install --with-deps chromium > "$log" 2>&1 &
+          # Chromium first, required. Then its apt deps, best effort only: a
+          # runner's DNS can fail apt (v0.154.0, security.ubuntu.com), and a dead
+          # resolver hangs each try for minutes, past the redline job's 10 min
+          # wait for this job's key. One try of PW_DEPS_S, never fatal. T19's
+          # playwright test is the browser check: it fails if Chromium can't
+          # launch.
+          pw_install() {
+            pnpm --filter @oa/dashboard exec playwright install chromium || return
+            timeout "${PW_DEPS_S:-60}" pnpm --filter @oa/dashboard exec playwright install-deps chromium ||
+              echo "::warning title=T19 browser deps::apt deps did not install within ${PW_DEPS_S:-60} s; going on without them. T19 still fails if Chromium can't launch."
+          }
+          pw_install > "$log" 2>&1 &
           pw=$!
           b=0
           { pnpm --filter @oa/provision build && pnpm --filter @oa/shared build; } || b=$?

@@ -30,6 +30,7 @@ import { limit, limitRoute } from "./limits.js";
 import { handleMcp } from "./mcp/index.js";
 import { isRefusal } from "./principal.js";
 import { refuse } from "./refuse.js";
+import { BETA_PATH_RE, betaApi } from "./routes/beta.js";
 import { CLAIM_FREE_PATH, freeClaim } from "./routes/claim-free.js";
 import { bodyKeys, invokeRoute } from "./routes/invoke.js";
 import { SET_TIER_PATH_RE, setTier } from "./routes/set-tier.js";
@@ -41,6 +42,7 @@ import {
   signupStatic,
   signupStatus,
 } from "./signup/index.js";
+import { joinWaitlist } from "./signup/waitlist.js";
 
 // The HTTP adapter (design v7 4.2 check order): host policy -> pre-authn IP
 // limit -> Origin (browser writes) -> authn -> CSRF -> invokeRoute.
@@ -143,12 +145,20 @@ async function route(
       if (r) return refuse(env, "auth", r.code, req);
       return guard(() => signupStatus(env, p));
     }
+    if (path === "/api/v1/signup/waitlist") {
+      if (req.method !== "POST") return methodNotAllowed("POST");
+      return guard(() => joinWaitlist(req, env, Date.now()));
+    }
   }
 
   if (host === "admin" && path === CLAIM_FREE_PATH) {
     if (req.method !== "POST") return methodNotAllowed("POST");
     return claimFreeRoute(req, env, clientIp(req));
   }
+
+  const betaPath = host === "admin" ? BETA_PATH_RE.exec(path) : null;
+  if (betaPath)
+    return betaRoute(req, env, clientIp(req), betaPath[1] ?? "", url);
 
   const tierPath = host === "admin" ? SET_TIER_PATH_RE.exec(path) : null;
   if (tierPath) {
@@ -231,6 +241,42 @@ async function claimFreeRoute(
     const rl = await limit(env, "write", p.rateKey);
     if (rl) throw new ApiError(rl.code);
     const r = await freeClaim(env, p, await readJsonBody(req), ip);
+    return new Response(JSON.stringify(r.body), {
+      status: r.status,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+    });
+  });
+}
+
+/**
+ * The private beta's admin API (#2096). Admin host, so Origin was checked;
+ * authn, CSRF and the read or write limit run here like claimFreeRoute, and
+ * betaApi admits an admin session only.
+ */
+async function betaRoute(
+  req: Request,
+  env: Env,
+  ip: string,
+  sub: string,
+  url: URL,
+): Promise<Response> {
+  const p = await authenticate(req, env, "admin");
+  if (isRefusal(p)) return refuse(env, "auth", p.code, req);
+  const c = checkCsrf(req, env, p);
+  if (c) return refuse(env, "csrf", c.code, req);
+  return guard(async () => {
+    const read = req.method === "GET";
+    const rl = await limit(env, read ? "read" : "write", p.rateKey);
+    if (rl) throw new ApiError(rl.code);
+    const r = await betaApi(
+      env,
+      p,
+      { method: req.method, sub, url, body: () => readJsonBody(req) },
+      ip,
+    );
     return new Response(JSON.stringify(r.body), {
       status: r.status,
       headers: {

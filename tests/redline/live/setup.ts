@@ -9,7 +9,7 @@ import {
   pacingNote,
   phaseScopes,
 } from "../src/rl-anon.ts";
-import { transportFetch } from "../src/transport.ts";
+import { transportFetch, useShortIdleSockets } from "../src/transport.ts";
 
 // Notes (a retried setup GET, say): on the running test's meta, else on the
 // file's, where src/reporter.ts finds them.
@@ -22,6 +22,9 @@ const resets = watchResets();
 // covers both tries of a retried request. Inside it, a request that got no
 // HTTP response is infra, never a verdict, and a safe one that failed on a
 // reused socket is sent once more on a new connection (src/transport.ts).
+// No socket idles longer than ~1 s in the shared pool: the edge closes idle
+// ones, and a request sent on one resets (#155).
+await useShortIdleSockets();
 const bound = boundFetch(transportFetch(globalThis.fetch, resets));
 // RL_ANON pacing, the members lock and the unclassified-429 tripwire go in
 // FRONT of the bound (src/rl-anon.ts), so a wait never counts against a

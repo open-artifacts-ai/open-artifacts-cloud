@@ -8,7 +8,9 @@
 // domains or workers.dev here: the wildcard routes are wired once per env by
 // the gated ops step, never from this file. Each env's HOSTS id has its own
 // placeholder, filled at deploy (the id of oa-s-hosts / oa-p-hosts).
-// Observability stays off: Workers Logs would record full URLs.
+// Workers Logs is on for the console.error lines only (#158). Invocation
+// logs stay off (`invocation_logs: false`): they record the full request URL,
+// and dispatch sees every tenant request, query strings (OAuth codes) included.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "compatibility_date": "2026-10-01",
@@ -36,7 +38,15 @@
         { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
         { "binding": "BILLING", "service": "oa-s-billing" }
       ],
-      "observability": { "enabled": false },
+      "observability": {
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-staging" }
       ],
@@ -61,7 +71,15 @@
         { "binding": "AUTH_BROKER", "service": "oa-p-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-p-directory-broker" }
       ],
-      "observability": { "enabled": false },
+      "observability": {
+        "enabled": true,
+        "redact_query_string": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-prod" }
       ],

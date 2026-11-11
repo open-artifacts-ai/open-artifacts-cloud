@@ -58,10 +58,15 @@ describe("wrangler.jsonc", () => {
         "queues",
         "ai",
         "analytics_engine_datasets",
-        "observability",
         "workflows",
       ])
         expect(e, k).not.toHaveProperty(k);
+      // Console logs on (#164); invocation logs off, so no request URL is stored.
+      expect(e.observability).toEqual({
+        enabled: true,
+        redact_query_string: true,
+        logs: { enabled: true, invocation_logs: false, head_sampling_rate: 1 },
+      });
       expect(raw).not.toMatch(/KEY"|TOKEN|SECRET/);
       expect(e.workers_dev).toBe(true);
       expect(e.preview_urls).toBe(false);
