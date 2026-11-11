@@ -177,7 +177,6 @@ export const CLIENT_JS = String.raw`(function () {
     refs.ts = h("div", { class: "ts" });
 
     shell(h("div", { class: "panel" }, [
-      h("div", { class: "stepbar", "aria-hidden": "true" }, [h("i", { class: "on" }), h("i", { class: "on" }), h("i")]),
       h("div", { class: "who" }, [
         h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
         h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
@@ -527,7 +526,8 @@ export const CLIENT_JS = String.raw`(function () {
         refs.live,
         h("div", { class: "seq" }, [slot]),
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
-        refs.lab
+        refs.lab,
+        h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."])
       ]);
       shell(refs.ld);
       startAnim(slot, word);
