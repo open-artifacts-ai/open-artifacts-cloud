@@ -170,7 +170,7 @@ describe("hosted-zones.sh", () => {
       { PROD_SIGNUP_DEPLOY: "" },
       { PROD_SIGNUP_DEPLOY: "off" },
       { PROD_SIGNUP_DEPLOY: "1" },
-    ]) {
+    ] as Record<string, string>[]) {
       const r = setup().run("apply", "prod", extra);
       expect(r.code, r.err).toBe(0);
       expect(r.out).not.toContain("signup.");

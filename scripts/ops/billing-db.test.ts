@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { join } from "node:path";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { run } from "./billing-db.ts";
 import { loadMigrations } from "./platform-db.ts";

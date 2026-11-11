@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "../ci/**/*.ts",
+    "../ci/**/*.mjs",
+    "../ops/**/*.ts",
+    "../ops/**/*.mjs",
+    "./**/*.ts"
+  ],
+  "exclude": ["**/node_modules/**", "../ops/platform-db.test.ts"]
+}

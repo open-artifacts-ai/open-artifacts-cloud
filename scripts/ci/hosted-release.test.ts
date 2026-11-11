@@ -440,8 +440,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     };
     collect(hr.jobs);
     expect(ifs.length).toBeGreaterThan(0);
-    for (const c of ifs)
-      expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
+    for (const c of ifs) expect(c).not.toMatch(/[!=]=\s*inputs\.dry_run/);
     // The guard's shell test treats anything but the string true as a real run.
     expect(text).toContain('if [ "$DRY_RUN" != true ]; then');
     // The mirror runs on a push because the ref is main.
