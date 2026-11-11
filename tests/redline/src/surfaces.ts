@@ -48,6 +48,7 @@ import {
   sessionCred,
   withCred,
 } from "./http.ts";
+import { withLock } from "./locks.ts";
 import {
   crossDenied,
   crossProbe,
@@ -1513,8 +1514,51 @@ export const groupSeed = (testDomain: string) => ({
   })),
 });
 
-const WORLD_TITLE = "test-redline-world";
-const TRASH_TITLE = "test-redline-trash";
+/**
+ * #26: the surfaces file runs as two lanes (src/lanes.ts), each with its own
+ * fixed world artifacts so neither resets or retitles the other's. Shard "a"
+ * (and an unsharded run) keeps the original titles; shard "b" has titles that
+ * do not start with them (fixedArtifact matches by prefix).
+ */
+/** The lock one shard lane holds while it seeds the shared fixed state (seedWorld). */
+export const SEED_LOCK = "surfaces-seed";
+
+export type SurfaceShard = "a" | "b";
+
+/** REDLINE_SURFACES_SHARD: "a" or "b" (one lane of the plan); unset runs every case. */
+export function surfaceShard(
+  env: Record<string, string | undefined> = process.env,
+): SurfaceShard | undefined {
+  const v = (env.REDLINE_SURFACES_SHARD ?? "").trim();
+  if (v === "") return undefined;
+  if (v === "a" || v === "b") return v;
+  throw new Error(`REDLINE_SURFACES_SHARD must be "a" or "b", not "${v}"`);
+}
+
+/**
+ * Shard b's cases, by name prefix, balanced by the times measured in run
+ * 43007228059 (about 194 s each). Every other case, and any new group, is
+ * shard a's; the shard a lane also runs the coverage case.
+ */
+export const SHARD_B_PREFIXES: readonly string[] = [
+  "artifact mcp ",
+  "artifact data ",
+  "artifact content ",
+  "artifact ws ",
+  "org DELETE ",
+  "space member ",
+  "space delete ",
+];
+
+/** Whether the shard runs the case; an unsharded run (undefined) runs all. */
+export const inShard = (name: string, shard: SurfaceShard | undefined) =>
+  shard === undefined ||
+  SHARD_B_PREFIXES.some((p) => name.startsWith(p)) === (shard === "b");
+
+const worldTitles = (shard: SurfaceShard | undefined) =>
+  shard === "b"
+    ? { world: "test-redline-b-world", trash: "test-redline-b-trash" }
+    : { world: "test-redline-world", trash: "test-redline-trash" };
 /** Reuse a trashed probe artifact only while it is this fresh: well inside the 30-day purge. */
 const TRASH_REUSE_MS = 20 * 86_400_000;
 const GUARD_TITLE = "test-redline-guard";
@@ -1587,10 +1631,14 @@ async function fixedArtifact(
 
 /**
  * A deleted artifact in `spaceId` for the trash probe: the newest one
- * titled TRASH_TITLE still well inside the purge window, else a new one
+ * titled `TRASH_TITLE` still well inside the purge window, else a new one
  * deleted now (older ones purge on their own, so at most two a month).
  */
-async function trashedArtifact(side: Side, spaceId: string): Promise<string> {
+async function trashedArtifact(
+  side: Side,
+  spaceId: string,
+  TRASH_TITLE: string,
+): Promise<string> {
   const q = `/api/v1/trash?spaceId=${encodeURIComponent(spaceId)}&limit=100`;
   const page = (await api(side.t, side.pat, "GET", q)) as {
     items?: { id: string; title?: string; deletedAt?: string }[];
@@ -1620,33 +1668,44 @@ async function trashedArtifact(side: Side, spaceId: string): Promise<string> {
  */
 export async function seedWorld(side: Side): Promise<World> {
   const { t, pat, marker } = side;
-  const { world: WORLD_SPACE, guard: GUARD_SPACE } = worldSpaces(t.testDomain);
-  // The hook creates the prefixed spaces if missing and grants the admin.
-  await hook(
-    t,
-    "/__test/session",
-    {
-      email: adminEmail(t),
-      role: "admin",
-      spaces: [
-        { spaceId: WORLD_SPACE, role: "manager" },
-        { spaceId: GUARD_SPACE, role: "manager" },
-      ],
-    },
-    { setup: true },
+  const { world: WORLD_TITLE, trash: TRASH_TITLE } = worldTitles(
+    surfaceShard(),
   );
-  // The mapping probes' groups (idempotent; harmless when sync is off).
-  await hook(t, "/__test/directory-groups", groupSeed(t.testDomain), {
-    setup: true,
+  const { world: WORLD_SPACE, guard: GUARD_SPACE } = worldSpaces(t.testDomain);
+  // The shared fixed state (spaces, groups, member users, the guard
+  // artifact) is seeded by one shard lane at a time (#26): it is idempotent,
+  // and a second shard finds what the first made instead of racing it to
+  // create it on a fresh TEST_DOMAIN. The world and trash artifacts below are
+  // the shard's own.
+  const { groups, users } = await withLock(SEED_LOCK, "exclusive", async () => {
+    // The hook creates the prefixed spaces if missing and grants the admin.
+    await hook(
+      t,
+      "/__test/session",
+      {
+        email: adminEmail(t),
+        role: "admin",
+        spaces: [
+          { spaceId: WORLD_SPACE, role: "manager" },
+          { spaceId: GUARD_SPACE, role: "manager" },
+        ],
+      },
+      { setup: true },
+    );
+    // The mapping probes' groups (idempotent; harmless when sync is off).
+    await hook(t, "/__test/directory-groups", groupSeed(t.testDomain), {
+      setup: true,
+    });
+    const groups = worldGroups(t.testDomain);
+    const users = {
+      member: await memberId(t, pat, "member"),
+      editor: await memberId(t, pat, "editor"),
+      manager: await memberId(t, pat, "manager"),
+    };
+    await fixedArtifact(side, GUARD_SPACE, GUARD_TITLE);
+    return { groups, users };
   });
-  const groups = worldGroups(t.testDomain);
-  const users = {
-    member: await memberId(t, pat, "member"),
-    editor: await memberId(t, pat, "editor"),
-    manager: await memberId(t, pat, "manager"),
-  };
   const id = await fixedArtifact(side, WORLD_SPACE, WORLD_TITLE);
-  await fixedArtifact(side, GUARD_SPACE, GUARD_TITLE);
   const A = `/api/v1/artifacts/${id}`;
   // Search probes look the artifact up by id; leaks are judged by the marker.
   await api(t, pat, "PATCH", A, {
@@ -1657,7 +1716,7 @@ export async function seedWorld(side: Side): Promise<World> {
     type: "image/webp",
   });
   await resetData(side, id);
-  const trashedId = await trashedArtifact(side, WORLD_SPACE);
+  const trashedId = await trashedArtifact(side, WORLD_SPACE, TRASH_TITLE);
   const got = (await api(t, pat, "GET", A)) as { space?: { id?: unknown } };
   if (got.space?.id !== WORLD_SPACE)
     throw new Error(`${t.name}: the probe artifact is not in the world space`);

@@ -54,12 +54,14 @@ export const paced = (ledger: string): BucketMode => ({ paced: ledger });
 export const ordered = (barrier: string): BucketMode => ({ ordered: barrier });
 
 export interface Claims {
+  /** State keys that a sharded lane (Lane.shard) holds for its own shard only. */
+  perShard?: string[];
   state: Record<string, StateMode>;
   buckets: Record<string, BucketMode>;
 }
 
 /** The names of the locks, ledgers and barriers a claim may name. */
-export const LOCKS = ["rl-b-members"] as const;
+export const LOCKS = ["rl-b-members", "surfaces-seed"] as const;
 
 const MEMBERS = "rl-b/members+member-user";
 
@@ -132,9 +134,15 @@ export const CLAIMS: Record<string, Claims> = {
     state: {
       ...installs(),
       [MEMBERS]: guarded("rl-b-members", "shared"),
-      // The world it seeds on both installs (spaces, groups, artifacts).
-      "rl-x/world": "write",
+      // The world it seeds on both installs: the world and trash artifacts
+      // (each shard has its own, src/surfaces.ts worldTitles), and the shared
+      // fixed spaces, groups, member users and guard artifact, which the shard
+      // lanes seed one at a time under the surfaces-seed lock (SEED_LOCK).
+      "rl-x/world-artifacts": "write",
+      "rl-x/world-shared": guarded("surfaces-seed", "exclusive"),
     },
+    // #26: the file runs as two lanes (shards a and b).
+    perShard: ["rl-x/world-artifacts"],
     buckets: installBuckets(),
   },
   "live/edge.test.ts": {
@@ -209,6 +217,12 @@ export interface Lane {
   readonly name: string;
   /** Run one at a time, in this order. */
   readonly files: readonly string[];
+  /**
+   * Set when the lane runs one shard of a file that another lane runs the
+   * other shard of (#26: surfaces, by REDLINE_SURFACES_SHARD in env). Such a
+   * file may be in several lanes, one per shard.
+   */
+  readonly shard?: string;
   /** Extra environment for the lane's vitest run. */
   readonly env?: Readonly<Record<string, string>>;
 }
@@ -219,15 +233,31 @@ const lane = (name: string, ...files: string[]): Lane => ({
   files: files.map((f) => `live/${f}.test.ts`),
 });
 
+/** A lane that runs shard `shard` of the one file `file` (env names the shard). */
+const shardLane = (
+  name: string,
+  file: string,
+  shard: string,
+  envKey: string,
+): Lane => ({
+  name,
+  files: [`live/${file}.test.ts`],
+  shard,
+  env: { [envKey]: shard },
+});
+
 /**
- * The run (#1730): one phase, six lanes, the longest file per lane.
+ * The run (#1730, #26): one phase, seven lanes.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
  *   barrier;
  * - provisioner: #859's provisioner file, in a lane of its own so its 60 s
  *   replay watch runs beside prov instead of after it (the job would end
  *   about 180 s later). Its createTaken spends the provisioning-api bucket,
  *   so that case waits for prov's exit (the prov-done barrier);
- * - surfaces: surfaces (335.0 s);
+ * - surfaces, surfaces-b: surfaces split in two by case (#26; REDLINE_SURFACES_SHARD
+ *   a and b, src/surfaces.ts SHARD_B_PREFIXES): 430 s in run 43007228059 as one
+ *   lane, about 235 s each (about 41 s of setup and cleanup in each, the
+ *   cases about 194 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it), then bus (#1299:
  *   one case, a few requests; unproven-live while the bus is off);
@@ -238,7 +268,8 @@ export const PLAN: readonly Phase[] = [
   [
     lane("prov", "provisioning"),
     lane("provisioner", "provisioner"),
-    lane("surfaces", "surfaces"),
+    shardLane("surfaces", "surfaces", "a", "REDLINE_SURFACES_SHARD"),
+    shardLane("surfaces-b", "surfaces", "b", "REDLINE_SURFACES_SHARD"),
     lane("creds", "credentials"),
     lane("guard", "guard", "bus"),
     lane("front", "signin", "edge", "live"),
@@ -294,8 +325,9 @@ export function planProblems(plan: readonly Phase[] = PLAN): string[] {
       names.add(l.name);
       if (l.files.length === 0) out.push(`lane ${l.name} has no file`);
       for (const f of l.files) {
-        if (files.has(f)) out.push(`${f} is in two lanes`);
-        files.add(f);
+        const k = l.shard === undefined ? f : `${f}\u0000${l.shard}`;
+        if (files.has(k)) out.push(`${f} is in two lanes`);
+        files.add(k);
       }
     }
   return out;
@@ -337,13 +369,28 @@ export function conflicts(
     if (!c) throw new Error(`${f}: no claims`);
     return c;
   };
+  // A sharded lane holds its own copy of the file's perShard state keys.
+  const claimsOf = (f: string, l: Lane | undefined): Claims => {
+    const c = of(f);
+    if (l?.shard === undefined || !c.perShard) return c;
+    const own = new Set(c.perShard);
+    return {
+      ...c,
+      state: Object.fromEntries(
+        Object.entries(c.state).map(([k, m]) => [
+          own.has(k) ? `${k}#${l.shard}` : k,
+          m,
+        ]),
+      ),
+    };
+  };
   plan.forEach((phase, p) => {
     for (let i = 0; i < phase.length; i++)
       for (let j = i + 1; j < phase.length; j++)
         for (const x of phase[i]?.files ?? [])
           for (const y of phase[j]?.files ?? []) {
-            const cx = of(x);
-            const cy = of(y);
+            const cx = claimsOf(x, phase[i]);
+            const cy = claimsOf(y, phase[j]);
             for (const [k, m] of Object.entries(cx.state)) {
               const n = cy.state[k];
               if (!n) continue;
@@ -385,6 +432,22 @@ export interface LaneResult {
 }
 type FileNote = { file: string; note: string };
 
+/** A module error or a setup hook's infra result: a file's own failure, not a case. */
+const fileLevel = (c: CaseResult): boolean =>
+  c.level !== "pass" && (c.moduleError === true || c.blocked !== undefined);
+
+/** Two shards' copies of one file-level failure: blocked cases joined, the worse level kept. */
+function mergeFileLevel(a: CaseResult, b: CaseResult): CaseResult {
+  const worse = a.level === "fail" || b.level !== "fail" ? a : b;
+  const out: CaseResult = { ...worse };
+  if (a.blocked && b.blocked)
+    out.blocked = {
+      file: a.blocked.file,
+      cases: [...new Set([...a.blocked.cases, ...b.blocked.cases])],
+    };
+  return out;
+}
+
 /**
  * The run's cases from every lane. A lane with no part, a case from a file
  * outside the lane (it ran where the plan did not put it), or one case name
@@ -400,6 +463,7 @@ export function mergeLanes(results: readonly LaneResult[]): {
   const cases: CaseResult[] = [];
   const fileNotes: FileNote[] = [];
   const seen = new Set<string>();
+  const firstAt = new Map<string, number>();
   let runExit = 0;
   for (const r of results) {
     if (r.exit !== 0 && runExit === 0) runExit = r.exit;
@@ -420,6 +484,21 @@ export function mergeLanes(results: readonly LaneResult[]): {
           reason: "a file outside the lane ran in it",
         });
       const key = `${c.file ?? ""}\u0000${c.name}`;
+      // Shard lanes of one file each report its file-level failures: a module
+      // error, or a setup hook's infra result (src/report.ts setupHookCase).
+      // Those alone merge into one case: the cases each refusal blocked are
+      // joined (the manifest counts them as run) and the worse level stays.
+      // Any other repeat is a duplicate.
+      const at = firstAt.get(key);
+      if (
+        at !== undefined &&
+        r.lane.shard !== undefined &&
+        fileLevel(c) &&
+        fileLevel(cases[at] as CaseResult)
+      ) {
+        cases[at] = mergeFileLevel(cases[at] as CaseResult, c);
+        continue;
+      }
       if (seen.has(key))
         cases.push({
           name: `lane ${name}: duplicate ${c.file ?? ""} ${c.name}`,
@@ -427,6 +506,7 @@ export function mergeLanes(results: readonly LaneResult[]): {
           reason: "a case was reported twice",
         });
       seen.add(key);
+      if (!firstAt.has(key)) firstAt.set(key, cases.length);
       cases.push(c);
     }
     fileNotes.push(...r.part.fileNotes);
