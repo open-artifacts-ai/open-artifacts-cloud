@@ -177,10 +177,24 @@ describe("isAllowed", () => {
     expect(await isAllowed(db, "bo@acme.test", true)).toBe(false);
   });
 
-  it("a @domain entry admits that exact domain, case-insensitively", async () => {
+  it("a Google Workspace @domain entry admits that exact domain with a matching hd, case-insensitively", async () => {
     await allow("@acme.com");
+    expect(await isAllowed(db, "bo@acme.com", true, "acme.com")).toBe(true);
+    expect(await isAllowed(db, "BO@Acme.COM", true, "ACME.com")).toBe(true);
+  });
+
+  it("a domain entry needs the hd: none or a different one is refused", async () => {
+    await allow("@acme.com");
+    expect(await isAllowed(db, "bo@acme.com", true)).toBe(false);
+    expect(await isAllowed(db, "bo@acme.com", true, null)).toBe(false);
+    expect(await isAllowed(db, "bo@acme.com", true, "other.com")).toBe(false);
+    expect(await isAllowed(db, "bo@other.com", true, "acme.com")).toBe(false);
+  });
+
+  it("an exact email entry still needs no hd", async () => {
+    await allow("bo@acme.com");
     expect(await isAllowed(db, "bo@acme.com", true)).toBe(true);
-    expect(await isAllowed(db, "BO@Acme.COM", true)).toBe(true);
+    expect(await isAllowed(db, "bo@acme.com", true, null)).toBe(true);
   });
 
   it("a stored email entry is not a domain and a domain entry is not an email", async () => {
@@ -201,23 +215,23 @@ describe("isAllowed", () => {
       "acme.com@evil.com",
       "x@xacme.com",
     ])
-      expect(await isAllowed(db, e, true), e).toBe(false);
+      expect(await isAllowed(db, e, true, "acme.com"), e).toBe(false);
   });
 
   it("an unverified email, a missing one and a malformed one are refused", async () => {
     await allow("ana@acme.test", "@acme.com");
     expect(await isAllowed(db, "ana@acme.test", false)).toBe(false);
-    expect(await isAllowed(db, "bo@acme.com", false)).toBe(false);
+    expect(await isAllowed(db, "bo@acme.com", false, "acme.com")).toBe(false);
     expect(await isAllowed(db, null, true)).toBe(false);
     expect(await isAllowed(db, undefined, true)).toBe(false);
     expect(await isAllowed(db, "", true)).toBe(false);
-    expect(await isAllowed(db, "@acme.com", true)).toBe(false);
+    expect(await isAllowed(db, "@acme.com", true, "acme.com")).toBe(false);
     expect(await isAllowed(db, "bo@", true)).toBe(false);
   });
 });
 
 describe("admission by mode", () => {
-  const user = (sub: string, email: string) =>
+  const user = (sub: string, email: string, hd?: string) =>
     ({
       kind: "user",
       actorKey: `user:${sub}`,
@@ -226,6 +240,7 @@ describe("admission by mode", () => {
       scopes: [],
       sub,
       email,
+      ...(hd ? { hd } : {}),
     }) as const;
   const at = (
     mode: Env["SIGNUPS_ENABLED"],
@@ -259,7 +274,11 @@ describe("admission by mode", () => {
     await allow("ana@acme.test", "@corp.test");
     const e = at("invite");
     expect(await admission(e, user("g1", "ana@acme.test"))).toBe("admitted");
-    expect(await admission(e, user("g2", "bo@corp.test"))).toBe("admitted");
+    expect(await admission(e, user("g2", "bo@corp.test", "corp.test"))).toBe(
+      "admitted",
+    );
+    // The same address without a Workspace hd (a personal account) is not.
+    expect(await admission(e, user("g4", "bo@corp.test"))).toBe("not_invited");
     expect(await admission(e, user("rl-test-b", "t@x.test"))).toBe("admitted");
     expect(await admission(e, user("g3", "cy@evil-corp.test"))).toBe(
       "not_invited",
