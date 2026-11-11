@@ -3009,7 +3009,8 @@ export class WfpProvisioner {
     this.held = null;
     if (!h) return;
     if (e !== undefined) {
-      const cf = cfAuditDetail(e);
+      // The operation's redaction set first (it scrubs a CfError's cfMessage and route in place).
+      const cf = cfAuditDetail(this.scrub(e));
       // One line for `wrangler tail`: the provisioner has no other trace of which call failed.
       if (cf) console.warn(JSON.stringify({ evt: "cf_error", ...cf }));
       await this.platform
