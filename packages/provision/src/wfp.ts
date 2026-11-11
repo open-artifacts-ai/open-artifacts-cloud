@@ -4637,7 +4637,12 @@ export class WfpProvisioner {
         // stalled create) still maps a host to this deleted id; clear it.
         // deleted is terminal, so no operation can claim the row meanwhile.
         let stale = 0;
-        for (const h of [row.app_host, row.content_host]) {
+        // A reused address renames the row's hosts to "<host>~<id>" (cloud
+        // #108); the real host is the part before the "~", which no host
+        // name contains.
+        for (const h of [row.app_host, row.content_host].map((x) =>
+          x.replace(/~.*$/, ""),
+        )) {
           const cur = await this.cf.kvGet(this.hostsKv.id, h);
           if (parseHostsValue(cur)?.installId !== id) continue;
           assertOwnResource(this.hostsKv.title, this.env);

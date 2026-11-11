@@ -768,3 +768,123 @@ describe("ProvisionInstall: release gate and failures", () => {
 });
 
 void NOW;
+
+describe("reserve frees a purged address (cloud #108)", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  /** A deleted install holding `slug`, purged `ago` ms before the world's clock. */
+  const purged = (slug: string, sub: string | null, ago: number) => {
+    const id = `i${Math.random().toString(36).slice(2, 13).padEnd(11, "0")}`;
+    w.db
+      .prepare(
+        `INSERT INTO installs (id, slug, app_host, content_host, owner_email, rl_ns, inputs_hash, state, created_at, updated_at)
+VALUES (?, ?, ?, ?, 'o@x.test', 8000008, 'h', 'deleted', 1, ?)`,
+      )
+      .run(id, slug, app(slug), `${slug}.content.test`, w.clock.t - ago);
+    w.db
+      .prepare(
+        "INSERT INTO install_lifecycle (install_id, source, owner_sub, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+      )
+      .run(id, sub ? "self-serve" : "admin", sub);
+    return id;
+  };
+
+  it("the same account takes its old address back at once; the dead row keeps its id and state", async () => {
+    const old = purged("finqore", "sub-a", 10 * 60 * 1000);
+    const s = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-a",
+    });
+    expect((await run(w, s.jobId)).error).toBeNull();
+    expect(w.install(s.installId)).toMatchObject({
+      state: "active",
+      slug: "finqore",
+    });
+    expect(w.install(old)).toMatchObject({
+      state: "deleted",
+      slug: `finqore~${old}`,
+      app_host: `${app("finqore")}~${old}`,
+      content_host: `finqore.content.test~${old}`,
+    });
+  });
+
+  it("another account is refused inside 30 days, and allowed after", async () => {
+    const old = purged("finqore", "sub-a", 29 * DAY);
+    const s = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-b",
+    });
+    expect((await run(w, s.jobId)).error).not.toBeNull();
+    expect(w.install(old)).toMatchObject({ slug: "finqore", state: "deleted" });
+    expect(w.install(s.installId)?.state).not.toBe("active");
+    w.db
+      .prepare("UPDATE installs SET updated_at = ? WHERE id = ?")
+      .run(w.clock.t - 31 * DAY, old);
+    const t = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-c",
+    });
+    expect((await run(w, t.jobId)).error).toBeNull();
+    expect(w.install(t.installId)).toMatchObject({
+      state: "active",
+      slug: "finqore",
+    });
+  });
+
+  it("a create that fails after reserve leaves the dead row renamed with its purge time", async () => {
+    const old = purged("finqore", "sub-a", 10 * 60 * 1000);
+    const at = w.clock.t - 10 * 60 * 1000;
+    const s = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-a",
+    });
+    const r = stepRunner(w.clock, {
+      onStep: (n) => {
+        if (n === "release_gate")
+          w.db
+            .prepare(
+              "UPDATE jobs SET status = 'failed', error_code = 'canceled', error_message = 'x', finished_at = 1 WHERE id = ?",
+            )
+            .run(s.jobId);
+      },
+    });
+    await runCreate(w.ctx, event(s.jobId), r.step).catch((x) => x);
+    // The tombstone still says when it was purged, so the API's slugState
+    // keeps another account in "cooling" for 30 days from `at`.
+    expect(w.install(old)).toMatchObject({
+      slug: `finqore~${old}`,
+      state: "deleted",
+      updated_at: at,
+    });
+    expect(w.install(s.installId)).toBeUndefined();
+  });
+
+  it("inside the 2 minute HOSTS settle nobody takes it, and an admin create has no owner to match", async () => {
+    const old = purged("finqore", "sub-a", 30 * 1000);
+    const s = seedCreate(w, {
+      slug: "finqore",
+      source: "self-serve",
+      tier: "trial",
+      sub: "sub-a",
+    });
+    expect((await run(w, s.jobId)).error).not.toBeNull();
+    w.db
+      .prepare("UPDATE installs SET updated_at = ? WHERE id = ?")
+      .run(w.clock.t - 10 * 60 * 1000, old);
+    w.db
+      .prepare(
+        "UPDATE install_lifecycle SET owner_sub = NULL WHERE install_id = ?",
+      )
+      .run(old);
+    const t = seedCreate(w, { slug: "finqore" });
+    expect((await run(w, t.jobId)).error).not.toBeNull();
+    expect(w.install(old)).toMatchObject({ slug: "finqore" });
+  });
+});

@@ -221,3 +221,21 @@ describe("the API never writes provision's tables (W4 static SQL test)", () => {
       expect(re.test(sql), sql).toBe(false);
   });
 });
+
+describe("slug reuse constants (cloud #108)", () => {
+  // reads.ts answers the slug check; the provisioner's reserve step releases
+  // the dead row by the same two numbers. They live apart, so pin them.
+  const num = (text: string, name: string) =>
+    new RegExp(`export const ${name} =\\s*([^;]+);`).exec(text)?.[1]?.trim();
+  it("the API and the provisioner agree on the cooldown and the settle", () => {
+    const api = readFileSync(join(app, "src/routes/reads.ts"), "utf8");
+    const prov = readFileSync(
+      join(app, "../provisioner/src/workflow.ts"),
+      "utf8",
+    );
+    for (const n of ["SLUG_REUSE_COOLDOWN_MS", "SLUG_UNMAP_SETTLE_MS"]) {
+      expect(num(api, n), n).toBeDefined();
+      expect(num(prov, n), n).toBe(num(api, n));
+    }
+  });
+});

@@ -2933,6 +2933,22 @@ describe("fix round 4", () => {
     expect(s.audit(inst.id)).toContain("delete.unmap_stale");
   });
 
+  it("cloud #108: a reused address renames the row's hosts to <host>~<id>; the stale-HOSTS cleanup still finds the real host", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    await s.p.delete(inst.id, inst.id);
+    s.db()
+      .prepare(
+        "UPDATE installs SET slug = slug || '~' || id, app_host = app_host || '~' || id, content_host = content_host || '~' || id WHERE id = ?",
+      )
+      .run(inst.id);
+    s.fake.kvValues(s.hostsId).set(inst.appHost, inst.id);
+    const r = keep(await s.p.delete(inst.id, inst.id));
+    expect(r).toEqual({ id: inst.id, ok: true, state: "deleted" });
+    expect(s.fake.kvValues(s.hostsId).has(inst.appHost)).toBe(false);
+    expect(s.audit(inst.id)).toContain("delete.unmap_stale");
+  });
+
   it("R2-N1: status reports a pending cut as the alarm, with owed relative to the recorded vars", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input("finqore", { vars: CODES })));
