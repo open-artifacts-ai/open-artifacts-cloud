@@ -1,4 +1,8 @@
-import { emptyWorld, fixtureWorld } from "@oa/provisioning-contract/fixtures";
+import {
+  emptyWorld,
+  fixtureSummary,
+  fixtureWorld,
+} from "@oa/provisioning-contract/fixtures";
 import {
   act,
   fireEvent,
@@ -20,7 +24,7 @@ it("lists installs with state, release, sign-in and health, and six tiles from t
   const r = within(row as HTMLElement);
   expect(r.getByTestId("state")).toHaveTextContent("Active");
   expect(r.getByText("1.42.0")).toBeInTheDocument();
-  expect(r.getByText("Team")).toBeInTheDocument();
+  expect(r.getByText("Created as Team")).toBeInTheDocument();
   expect(r.getByText("Google · 1 domain")).toBeInTheDocument();
   expect(r.getByText("OK")).toBeInTheDocument();
   expect(r.getByText("leo.open-artifacts.app")).toBeInTheDocument();
@@ -42,6 +46,49 @@ it("lists installs with state, release, sign-in and health, and six tiles from t
     `${fmtClock(at)} passed`,
   );
   expect(screen.getByText("3 installs on staging.")).toBeInTheDocument();
+});
+
+it("shows the billing tier when the API has it (#2058)", async () => {
+  use(
+    http.get("*/api/v1/installs", () =>
+      json({
+        items: [
+          {
+            ...fixtureSummary({ slug: "paid", tier: "trial" }),
+            billingTier: "team",
+          },
+        ],
+        nextCursor: null,
+      }),
+    ),
+  );
+  renderApp("/installs");
+  const row = (await screen.findByRole("link", { name: "paid" })).closest("tr");
+  const r = within(row as HTMLElement);
+  expect(r.getByText("Team")).toBeInTheDocument();
+  expect(r.queryByText(/Created as/)).toBeNull();
+});
+
+it("the list says a lapsed plan is lapsed (#2058)", async () => {
+  use(
+    http.get("*/api/v1/installs", () =>
+      json({
+        items: [
+          {
+            ...fixtureSummary({ slug: "late" }),
+            billingTier: "team",
+            billingStatus: "past_due",
+          },
+        ],
+        nextCursor: null,
+      }),
+    ),
+  );
+  renderApp("/installs");
+  const row = (await screen.findByRole("link", { name: "late" })).closest("tr");
+  expect(
+    within(row as HTMLElement).getByText("Team · past due"),
+  ).toBeInTheDocument();
 });
 
 it("shows a failed create and its attention badges in the table", async () => {
