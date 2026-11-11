@@ -36,6 +36,7 @@
       "limits": { "cpu_ms": 300000 },
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,
@@ -120,6 +121,7 @@
       "limits": { "cpu_ms": 300000 },
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,

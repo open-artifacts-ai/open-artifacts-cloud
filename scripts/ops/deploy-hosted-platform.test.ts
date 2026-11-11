@@ -156,10 +156,17 @@ exit 0
 
 // The provisioner and provisioning have Workers Logs on (#164); the brokers,
 // dispatch and billing stay off (Workers Logs would record their URLs).
-const settings = (bindings: Record<string, unknown>[], obs = true) =>
+const settings = (
+  bindings: Record<string, unknown>[],
+  obs = true,
+  invocation = false,
+) =>
   JSON.stringify({
     success: true,
-    result: { bindings, observability: { enabled: obs } },
+    result: {
+      bindings,
+      observability: { enabled: obs, logs: { invocation_logs: invocation } },
+    },
   });
 const settingsOff = (bindings: Record<string, unknown>[]) =>
   settings(bindings, false);
@@ -2026,6 +2033,11 @@ describe("deploy-hosted-platform.sh", () => {
           "observability",
           settings(JSON.parse(base).result.bindings, false),
           "observability",
+        ],
+        [
+          "invocation logs",
+          settings(JSON.parse(base).result.bindings, true, true),
+          "observability invocation_logs",
         ],
       ] as const) {
         const r = setup({

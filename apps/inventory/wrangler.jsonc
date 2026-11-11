@@ -22,6 +22,7 @@
       "preview_urls": false,
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,
@@ -51,6 +52,7 @@
       "preview_urls": false,
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,

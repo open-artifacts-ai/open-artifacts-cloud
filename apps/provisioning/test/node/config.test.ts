@@ -62,6 +62,7 @@ describe("wrangler.jsonc", () => {
         // sign-in and OAuth codes.
         expect(e.observability).toEqual({
           enabled: true,
+          redact_query_string: true,
           logs: {
             enabled: true,
             invocation_logs: false,

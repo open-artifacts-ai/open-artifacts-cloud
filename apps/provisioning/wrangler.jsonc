@@ -6,7 +6,8 @@
 // workers.dev here: admin.<app>/* and api.<app>/* are wired by
 // scripts/ops/hosted-zones.sh. Placeholders ({{...}}) are filled at deploy.
 // Workers Logs on for console output only (#164): invocation logs stay off,
-// because they hold request URLs (sign-in codes and state, OAuth codes).
+// because they hold request URLs, and query strings are redacted from the
+// URLs that other log entries carry (sign-in codes and state, OAuth codes).
 // This Worker holds no Cloudflare token (2.5); the provisioner does.
 // Secrets (set by CI only if absent, 4.6): ADMIN_SESSION_KEY (32 random
 // bytes), ADMIN_BROKER_KEY (Ed25519 pkcs8). MCP adds none (2.4).
@@ -35,6 +36,7 @@
       "preview_urls": false,
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,
@@ -197,6 +199,7 @@
       "preview_urls": false,
       "observability": {
         "enabled": true,
+        "redact_query_string": true,
         "logs": {
           "enabled": true,
           "invocation_logs": false,
