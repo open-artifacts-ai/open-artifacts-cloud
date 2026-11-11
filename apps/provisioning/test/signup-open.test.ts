@@ -13,7 +13,7 @@ import {
   type JWK,
   SignJWT,
 } from "jose";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { handle as appHandle } from "../src/app.js";
 import { csrfToken } from "../src/auth/csrf.js";
 import { BROKER_GOOGLE_CLIENT_ID } from "../src/auth/google.js";
@@ -297,7 +297,7 @@ describe("POST /auth/open (silent ticket)", () => {
   it("an instance older than the release that supports it gets the plain link, no ticket", async () => {
     const e = env();
     const { sid } = await signIn(e);
-    const inst = await seedReady("g-100", "0.148.9");
+    const inst = await seedReady("g-100", "0.153.9");
     expect(await (await open(e, sid)).json()).toEqual({
       url: `https://${inst.slug}.${APP}/`,
       silent: false,
@@ -309,6 +309,23 @@ describe("POST /auth/open (silent ticket)", () => {
     expect(
       ((await (await open(e, sid)).json()) as { silent: boolean }).silent,
     ).toBe(false);
+  });
+
+  it("a mint failure logs only the error name and falls back to the plain link", async () => {
+    const e = env({ SIGNUP_BROKER_KEY: "not-a-key" });
+    const { sid } = await signIn(env());
+    await seedReady("g-100", SILENT_MIN_VERSION);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const b = (await (await open(e, sid)).json()) as {
+      silent: boolean;
+      url: string;
+    };
+    expect(b.silent).toBe(false);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const args = spy.mock.calls[0] as string[];
+    expect(args[0]).toBe("signup_open_mint_failed");
+    expect(JSON.stringify(args)).not.toContain("not-a-key");
+    spy.mockRestore();
   });
 
   it("without the signing key it is the plain link", async () => {
@@ -324,12 +341,12 @@ describe("POST /auth/open (silent ticket)", () => {
   });
 
   it("versionAtLeast orders releases; a prerelease is below its release", () => {
-    expect(versionAtLeast("0.149.0", "0.149.0")).toBe(true);
-    expect(versionAtLeast("0.149.1", "0.149.0")).toBe(true);
-    expect(versionAtLeast("1.0.0", "0.149.0")).toBe(true);
-    expect(versionAtLeast("0.148.9", "0.149.0")).toBe(false);
-    expect(versionAtLeast("0.149.0-dev+abc", "0.149.0")).toBe(false);
-    expect(versionAtLeast("junk", "0.149.0")).toBe(false);
-    expect(versionAtLeast(null, "0.149.0")).toBe(false);
+    expect(versionAtLeast("0.154.0", "0.154.0")).toBe(true);
+    expect(versionAtLeast("0.154.1", "0.154.0")).toBe(true);
+    expect(versionAtLeast("1.0.0", "0.154.0")).toBe(true);
+    expect(versionAtLeast("0.153.9", "0.154.0")).toBe(false);
+    expect(versionAtLeast("0.154.0-dev+abc", "0.154.0")).toBe(false);
+    expect(versionAtLeast("junk", "0.154.0")).toBe(false);
+    expect(versionAtLeast(null, "0.154.0")).toBe(false);
   });
 });

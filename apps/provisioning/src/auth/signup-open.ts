@@ -14,7 +14,7 @@ import { signupPrincipal } from "./signup-session.js";
 // from the caller's own ready signups row; the request body is never read.
 
 /** Oldest instance release that passes `silent` through to the broker. */
-export const SILENT_MIN_VERSION = "0.149.0";
+export const SILENT_MIN_VERSION = "0.154.0";
 /** Under the broker's 60 s ceiling, with room for clock skew. */
 export const SILENT_TICKET_LIFETIME_MS = 45_000;
 const GATE_NOTE = "no-store";
@@ -92,7 +92,12 @@ export async function openInstance(
       exp: now + SILENT_TICKET_LIFETIME_MS,
       nonce: randomToken(16),
     });
-  } catch {
+  } catch (e) {
+    // Name only: never the ticket, key or sub.
+    console.error(
+      "signup_open_mint_failed",
+      e instanceof Error ? e.name : typeof e,
+    );
     return json(plain);
   }
   const u = new URL(`${origin}/auth/login/google`);
