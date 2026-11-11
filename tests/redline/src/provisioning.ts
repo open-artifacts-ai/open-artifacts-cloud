@@ -27,6 +27,11 @@ import { NIGHTLY_NA_REASON, PRE_PROD_REASON } from "./report.ts";
 import { type Schema, schemaAhead } from "./schema.ts";
 import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 
+// Hosted-only MCP tools, registered next to ADMIN_TOOLS by the hosted service.
+// Mirrors the names in apps/provisioning/src/hosted-tools.ts (HOSTED_TOOLS);
+// tests/redline/test/hosted-tool-names.test.ts fails if the two drift.
+export const HOSTED_TOOL_NAMES: readonly string[] = ["set_install_tier"];
+
 // The red-line provisioning probes (design v7 12.2, P1-P50 but
 // REMOVED_PROBES) against the staging Provisioning API, as the GitHub OIDC principal "O" (4.4): `rl-`
 // slugs and testHooks only, plus the `x-oa-test-user` self-serve test users
@@ -2031,10 +2036,11 @@ export const PROBES: readonly Probe[] = [
       )
         .map((t) => t.name)
         .sort();
-      if (
-        JSON.stringify(names) !== JSON.stringify([...ADMIN_TOOL_NAMES].sort())
-      )
-        throw new ProbeFail("P45: tools/list names differ from ADMIN_TOOLS");
+      const want = [...ADMIN_TOOL_NAMES, ...HOSTED_TOOL_NAMES].sort();
+      if (JSON.stringify(names) !== JSON.stringify(want))
+        throw new ProbeFail(
+          `P45: tools/list names differ from ADMIN_TOOLS + hosted tools: missing [${want.filter((n) => !names.includes(n)).join(", ")}], unexpected [${names.filter((n) => !want.includes(n)).join(", ")}]`,
+        );
       // get_world equals REST R27 for this principal (O is 403 on R27: 4.2).
       const world = await tool(run, "get_world", {});
       const rest = await run.v1("/world", { read: true });
