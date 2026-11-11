@@ -13,7 +13,8 @@
 // custom domains or workers.dev: the Worker has no fetch handler. Each env's
 // ids, cap, sender and account are placeholders filled at deploy; the release
 // is a job argument, never a var.
-// Observability stays off: the Worker logs fixed categories and ids only.
+// Workers Logs on for console output only (#164): invocation logs stay off,
+// and the Worker logs fixed categories and ids only.
 // The provision token is the Secrets Store secret oa-<p>-provision-token,
 // bound here and in no other Worker (scripts/ops/deploy-platform-worker.sh
 // refuses any other app that names it). Messages are { signupId } only, so
@@ -33,7 +34,14 @@
       "compatibility_flags": ["nodejs_compat"],
       // A create is ~300 ms of CPU; the headroom covers a slow release.
       "limits": { "cpu_ms": 300000 },
-      "observability": { "enabled": false },
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       "vars": {
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         // "true" or "test-users" admits signups; anything else acks them, rows left pending.
@@ -110,7 +118,14 @@
       "compatibility_flags": ["nodejs_compat"],
       // A create is ~300 ms of CPU; the headroom covers a slow release.
       "limits": { "cpu_ms": 300000 },
-      "observability": { "enabled": false },
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
+      },
       "vars": {
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // "true" admits signups; anything else acks them, rows left pending.

@@ -392,7 +392,7 @@ case "$target" in
     names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES,WELCOME_EMAIL"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
     no_secret_bindings "$S" oa-$P-provisioner
     names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
     [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
@@ -582,7 +582,7 @@ case "$target" in
     signups_deployed "$S" "$W"
     # MCP_REDIRECT_URIS among them; ADMIN_IDENTITIES is a secret, by name only.
     vars_are "$S" provisioning
-    expect "$S" '.result.observability.enabled // false' false "observability"
+    expect "$S" '.result.observability.enabled // false' true "observability"
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"

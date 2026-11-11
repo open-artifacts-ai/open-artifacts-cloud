@@ -5,8 +5,8 @@
 // no main, so a deploy without --env is refused. No routes, custom domains or
 // workers.dev here: admin.<app>/* and api.<app>/* are wired by
 // scripts/ops/hosted-zones.sh. Placeholders ({{...}}) are filled at deploy.
-// Observability stays off: Workers Logs would hold request URLs (sign-in
-// codes and state, OAuth codes).
+// Workers Logs on for console output only (#164): invocation logs stay off,
+// because they hold request URLs (sign-in codes and state, OAuth codes).
 // This Worker holds no Cloudflare token (2.5); the provisioner does.
 // Secrets (set by CI only if absent, 4.6): ADMIN_SESSION_KEY (32 random
 // bytes), ADMIN_BROKER_KEY (Ed25519 pkcs8). MCP adds none (2.4).
@@ -34,7 +34,12 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": {
-        "enabled": false
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
       },
       // Hourly MCP client sweep (sweepOAuthClients): unclaimed after 24 h,
       // any client after 30 days, with its grants.
@@ -191,7 +196,12 @@
       "workers_dev": false,
       "preview_urls": false,
       "observability": {
-        "enabled": false
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "head_sampling_rate": 1
+        }
       },
       // Hourly MCP client sweep (sweepOAuthClients): unclaimed after 24 h,
       // any client after 30 days, with its grants.

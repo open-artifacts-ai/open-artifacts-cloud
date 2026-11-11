@@ -58,7 +58,16 @@ describe("wrangler.jsonc", () => {
         expect(e.main).toBe("src/index.ts");
         expect(e.workers_dev).toBe(false);
         expect(e.preview_urls).toBe(false);
-        expect(e.observability).toEqual({ enabled: false });
+        // Console logs on (#164); invocation logs off: request URLs carry
+        // sign-in and OAuth codes.
+        expect(e.observability).toEqual({
+          enabled: true,
+          logs: {
+            enabled: true,
+            invocation_logs: false,
+            head_sampling_rate: 1,
+          },
+        });
         for (const k of ["route", "routes", "custom_domain", "custom_domains"])
           expect(e[k]).toBeUndefined();
       });
