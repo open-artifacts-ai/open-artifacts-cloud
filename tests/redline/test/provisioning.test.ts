@@ -361,7 +361,11 @@ describe("each probe fails on the behaviour it guards", () => {
     ["p21_stays_paused", "P21", /P21 \/healthz 200: not within 120 s/],
     ["p22_closed_404", "P22", /P22 closed page/],
     ["p23_no_row", "P23", /P23: inventory has no row for it/],
-    ["p23_slug_freed", "P23", /P23: R18 after purge: .*, want taken/],
+    [
+      "p23_slug_freed",
+      "P23",
+      /P23: R18 after purge: .*, want taken or cooling/,
+    ],
     ["p45_extra_tool", "P45", /unexpected \[mint_token\]/],
     [
       "p47_wrong_code",
@@ -382,6 +386,13 @@ describe("each probe fails on the behaviour it guards", () => {
       const out = await runAll(f);
       expect(out.get(id)).toMatch(re);
     });
+
+  it("P23 accepts a cooling slug after a purge (cloud #110)", async () => {
+    const f = fakeApi();
+    f.faults.add("p23_cooling");
+    const out = await runAll(f);
+    expect(level(out.get("P23"))).toBe("pass");
+  });
 
   it("P13 waits out the 60 s HOSTS cache for the redline /healthz", async () => {
     const f = fakeApi();

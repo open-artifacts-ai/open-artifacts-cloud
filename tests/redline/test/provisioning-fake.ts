@@ -130,6 +130,7 @@ export type Fault =
   | "p22_closed_404"
   | "p23_no_row"
   | "p23_slug_freed"
+  | "p23_cooling"
   | "p44_unlisted_redirect"
   | "p24_old"
   | "p27_no_token_ok"
@@ -572,7 +573,12 @@ export function fakeApi(): FakeApi {
         status: [...installs.values()].some(
           (i) => holdsSlug(i) && i.slug === m?.[1],
         )
-          ? "taken"
+          ? faults.has("p23_cooling") &&
+            [...installs.values()].some(
+              (i) => i.slug === m?.[1] && i.state === "deleted",
+            )
+            ? "cooling"
+            : "taken"
           : "ok",
       });
     m = path.match(/^\/jobs\/([^/]+)(\/cancel)?$/);
