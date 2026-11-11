@@ -43,6 +43,9 @@ export interface WebhookEnv {
   /** The Stripe price ids billing sells (optional): a price id matching one names the tier. */
   STRIPE_PRICE_TEAM?: string;
   STRIPE_PRICE_BUSINESS?: string;
+  /** Per-creator yearly prices (#2136); empty means unset. */
+  STRIPE_PRICE_TEAM_YEARLY?: string;
+  STRIPE_PRICE_BUSINESS_YEARLY?: string;
   /** Solo's two prices (#1568); either one names the tier solo. */
   STRIPE_PRICE_SOLO_MONTHLY?: string;
   STRIPE_PRICE_SOLO_YEARLY?: string;
@@ -60,6 +63,8 @@ export interface WebhookEnv {
 export type PriceIds = {
   team?: string;
   business?: string;
+  teamYearly?: string;
+  businessYearly?: string;
   soloMonthly?: string;
   soloYearly?: string;
 };
@@ -68,12 +73,21 @@ export type PriceIds = {
 export const pricesOf = (env: WebhookEnv): PriceIds => ({
   team: env.STRIPE_PRICE_TEAM,
   business: env.STRIPE_PRICE_BUSINESS,
+  teamYearly: env.STRIPE_PRICE_TEAM_YEARLY || undefined,
+  businessYearly: env.STRIPE_PRICE_BUSINESS_YEARLY || undefined,
   soloMonthly: env.STRIPE_PRICE_SOLO_MONTHLY,
   soloYearly: env.STRIPE_PRICE_SOLO_YEARLY,
 });
 
 const anyConfigured = (p: PriceIds): boolean =>
-  Boolean(p.team || p.business || p.soloMonthly || p.soloYearly);
+  Boolean(
+    p.team ||
+      p.business ||
+      p.teamYearly ||
+      p.businessYearly ||
+      p.soloMonthly ||
+      p.soloYearly,
+  );
 
 import {
   cancelSubscription,
@@ -167,9 +181,9 @@ export function tierFromSubscription(
     const p = item.price;
     const byId =
       typeof p.id === "string" && p.id !== ""
-        ? p.id === prices.team
+        ? p.id === prices.team || p.id === prices.teamYearly
           ? "team"
-          : p.id === prices.business
+          : p.id === prices.business || p.id === prices.businessYearly
             ? "business"
             : p.id === prices.soloMonthly || p.id === prices.soloYearly
               ? "solo"
@@ -209,6 +223,8 @@ export function unknownPrice(
       (id) =>
         id === prices.team ||
         id === prices.business ||
+        (prices.teamYearly !== undefined && id === prices.teamYearly) ||
+        (prices.businessYearly !== undefined && id === prices.businessYearly) ||
         id === prices.soloMonthly ||
         id === prices.soloYearly,
     )
