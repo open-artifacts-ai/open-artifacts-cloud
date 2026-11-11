@@ -13,7 +13,11 @@ import {
   it,
   vi,
 } from "vitest";
-import billing, { BillingOperatorRpc, type Env } from "../src/index.js";
+import billing, {
+  BillingOperatorRpc,
+  type Env,
+  MAX_CREATORS,
+} from "../src/index.js";
 
 // POST /checkout and POST /portal: signed like the other POSTs, redirect URLs
 // built only from the gate's app host, the Stripe customer created and mapped
@@ -230,6 +234,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const CHECKOUT = "/v1/checkout/sessions";
@@ -1629,5 +1634,412 @@ describe("an open Checkout session is expired before another is made (#1568)", (
       expect(r.status).toBe(500);
     }
     expect(s.calls).toEqual([]);
+  });
+});
+
+// ------------------------------------------------------------ per creator
+
+describe("Team and Business Checkout bill the instance's creators (#2123)", () => {
+  it("creators is the line item's quantity and part of the key; 0 bills 1", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    const ts = Date.now();
+    for (const [plan, creators, q] of [
+      ["team", 7, "7"],
+      ["business", 0, "1"],
+      ["team", MAX_CREATORS, String(MAX_CREATORS)],
+    ] as const) {
+      const r = await call(
+        req("/checkout", { install: A, ts, plan, creators }),
+      );
+      expect(r.status).toBe(200);
+      const c = s.calls.at(-1);
+      expect(c?.path).toBe(CHECKOUT);
+      expect(c?.form["line_items[0][quantity]"]).toBe(q);
+      expect(c?.key).toBe(`checkout-${A}-${plan}-q${q}-${ts}`);
+    }
+  });
+
+  it("refuses creators on Solo, or one that isn't an integer in 0..10000, before any Stripe call", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    for (const body of [
+      { plan: "solo", interval: "month", creators: 2 },
+      { plan: "team", creators: -1 },
+      { plan: "team", creators: MAX_CREATORS + 1 },
+      { plan: "team", creators: 1.5 },
+      { plan: "business", creators: "3" },
+      { plan: "business", creators: null },
+    ]) {
+      const r = await call(req("/checkout", { install: A, ...body }));
+      expect([r.status, await r.json()]).toEqual([
+        400,
+        { error: "bad_creators" },
+      ]);
+    }
+    expect(s.calls).toEqual([]);
+  });
+});
+
+describe("POST /usage sets the monthly Team or Business quantity (#2123)", () => {
+  const SUB = "sub_liveA";
+  const SUBS = `/v1/subscriptions/${SUB}`;
+  const ITEM = "/v1/subscription_items/si_itemA";
+  /** The month before now's, YYYY-MM: a closed month. */
+  const shift = (n: number) => {
+    const d = new Date();
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1))
+      .toISOString()
+      .slice(0, 7);
+  };
+  const closed = shift(-1);
+  const report = (month: string, count: number) =>
+    req("/usage", {
+      install: A,
+      month,
+      creators: Array.from({ length: count }, (_, i) => `u${i}`),
+      count,
+    });
+  async function live(tier = "team", status = "active") {
+    await seed(A, "cus_existingA", tier);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = ?1, status = ?2 WHERE install_id = ?3",
+      )
+      .bind(SUB, status, A)
+      .run();
+  }
+  /** Stripe's subscription: one item at `price`, recurring `interval`. */
+  const subscription = (
+    o: {
+      price?: string;
+      interval?: string;
+      quantity?: number;
+      status?: string;
+    } = {},
+  ) =>
+    Response.json({
+      id: SUB,
+      status: o.status ?? "active",
+      items: {
+        data: [
+          {
+            id: "si_itemA",
+            quantity: o.quantity ?? 1,
+            price: {
+              id: o.price ?? "price_team1",
+              recurring: { interval: o.interval ?? "month" },
+            },
+          },
+        ],
+      },
+    });
+  const fake = (o: Parameters<typeof subscription>[0] = {}, post?: Override) =>
+    fakeStripe(async (c) => {
+      if (c.method === "GET" && c.path === SUBS) return subscription(o);
+      if (c.method === "POST" && c.path === ITEM) {
+        const p = await post?.(c);
+        return (
+          p ??
+          Response.json({ id: "si_itemA", quantity: Number(c.form.quantity) })
+        );
+      }
+      return undefined;
+    });
+  const usageRow = (month: string) =>
+    db
+      .prepare(
+        "SELECT count, applied_quantity, applied_at, apply_outcome FROM usage WHERE install_id = ?1 AND month = ?2",
+      )
+      .bind(A, month)
+      .first();
+
+  it("a closed month sets the quantity once, with no proration; a repeat is a no-op", async () => {
+    await live();
+    const s = fake();
+    const r = await call(report(closed, 3));
+    expect([r.status, await r.json()]).toEqual([
+      200,
+      { ok: true, month: closed, count: 3 },
+    ]);
+    expect(s.calls.map((c) => [c.method, c.path, c.key])).toEqual([
+      ["GET", SUBS, null],
+      [
+        "POST",
+        ITEM,
+        expect.stringMatching(new RegExp(`^qty-${A}-${closed}-3-\\d+$`)),
+      ],
+    ]);
+    expect(s.calls[1]?.form).toEqual({
+      quantity: "3",
+      proration_behavior: "none",
+    });
+    expect(await usageRow(closed)).toMatchObject({
+      count: 3,
+      applied_quantity: 3,
+      apply_outcome: "updated",
+    });
+    s.calls.length = 0;
+    expect((await call(report(closed, 3))).status).toBe(200);
+    expect(s.calls).toEqual([]);
+  });
+
+  it("Business is set at its own price; an item already at the count is not written", async () => {
+    await live("business");
+    const s = fake({ price: "price_business1", quantity: 4 });
+    expect((await call(report(closed, 4))).status).toBe(200);
+    expect(s.calls.map((c) => [c.method, c.path])).toEqual([["GET", SUBS]]);
+    expect(await usageRow(closed)).toMatchObject({
+      applied_quantity: 4,
+      apply_outcome: "unchanged",
+    });
+  });
+
+  it("a month with no creators bills 1", async () => {
+    await live();
+    const s = fake({ quantity: 5 });
+    expect((await call(report(closed, 0))).status).toBe(200);
+    expect(s.calls[1]?.form.quantity).toBe("1");
+    expect(await usageRow(closed)).toMatchObject({ applied_quantity: 1 });
+  });
+
+  it("a past_due subscription is still set", async () => {
+    await live("team", "past_due");
+    const s = fake({ status: "past_due" });
+    expect((await call(report(closed, 2))).status).toBe(200);
+    expect(s.calls.at(-1)?.form.quantity).toBe("2");
+  });
+
+  it("Solo, trial, lapsed, suspended and no-subscription rows are stored and skipped, with no Stripe call", async () => {
+    for (const [setup, why] of [
+      [() => live("solo"), "solo"],
+      [() => live("free"), "solo"],
+      [() => live("trial"), "trial"],
+      [() => live("team", "lapsed"), "lapsed"],
+      [() => live("business", "suspended"), "suspended"],
+      [() => seed(A, "cus_existingA", "team"), "no_subscription"],
+      [async () => undefined, "no_subscription"],
+    ] as const) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+      ]);
+      await setup();
+      const s = fake();
+      const r = await call(report(closed, 2));
+      expect(r.status, why).toBe(200);
+      expect(s.calls, why).toEqual([]);
+      expect(await usageRow(closed), why).toMatchObject({
+        count: 2,
+        applied_quantity: null,
+        apply_outcome: why,
+      });
+      s.spy.mockRestore();
+    }
+  });
+
+  it("the current month is stored only: its quantity waits until it closes", async () => {
+    await live();
+    const s = fake();
+    expect((await call(report(shift(0), 3))).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect(await usageRow(shift(0))).toMatchObject({
+      count: 3,
+      applied_quantity: null,
+      apply_outcome: null,
+    });
+  });
+
+  it("a yearly or unknown price is left alone (not_monthly)", async () => {
+    for (const o of [
+      { interval: "year" },
+      { price: "price_teamY1", interval: "year" },
+      { price: "price_business1" },
+    ]) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+      ]);
+      await live();
+      const s = fake(o);
+      expect((await call(report(closed, 3))).status).toBe(200);
+      expect(s.calls.map((c) => c.method)).toEqual(["GET"]);
+      expect(await usageRow(closed)).toMatchObject({
+        applied_quantity: null,
+        apply_outcome: "not_monthly",
+      });
+      s.spy.mockRestore();
+    }
+  });
+
+  it("an older month never overrides a later one already applied", async () => {
+    await live();
+    const s = fake();
+    expect((await call(report(closed, 3))).status).toBe(200);
+    s.calls.length = 0;
+    expect((await call(report(shift(-2), 9))).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect(await usageRow(shift(-2))).toMatchObject({
+      count: 9,
+      applied_quantity: null,
+      apply_outcome: "stale",
+    });
+  });
+
+  it("a Stripe outage keeps the report, answers 502 so the instance re-sends, and the re-send applies it", async () => {
+    await live();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let down = true;
+    const s = fakeStripe(async (c) => {
+      if (down)
+        return Response.json({ error: { type: "api_error" } }, { status: 500 });
+      if (c.method === "GET" && c.path === SUBS) return subscription();
+      if (c.method === "POST" && c.path === ITEM)
+        return Response.json({ id: "si_itemA" });
+      return undefined;
+    });
+    const r = await call(report(closed, 3));
+    expect([r.status, await r.json()]).toEqual([502, { error: "upstream" }]);
+    expect(await usageRow(closed)).toMatchObject({
+      count: 3,
+      applied_quantity: null,
+      apply_outcome: "failed",
+    });
+    down = false;
+    s.calls.length = 0;
+    expect((await call(report(closed, 3))).status).toBe(200);
+    expect(s.calls.map((c) => [c.method, c.path, c.key])).toEqual([
+      ["GET", SUBS, null],
+      [
+        "POST",
+        ITEM,
+        expect.stringMatching(new RegExp(`^qty-${A}-${closed}-3-\\d+$`)),
+      ],
+    ]);
+    expect(await usageRow(closed)).toMatchObject({
+      applied_quantity: 3,
+      apply_outcome: "updated",
+    });
+  });
+
+  it("a Stripe 409 (the same write in progress) is 503 retry; a 429 is 502", async () => {
+    await live();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const [status, want] of [
+      [409, [503, { error: "retry" }]],
+      [429, [502, { error: "upstream" }]],
+    ] as const) {
+      const s = fake({}, () =>
+        Response.json({ error: { type: "x" } }, { status }),
+      );
+      const r = await call(report(closed, 3));
+      expect([r.status, await r.json()]).toEqual(want);
+      s.spy.mockRestore();
+    }
+  });
+
+  it("a Stripe 4xx a retry can't fix keeps the report and answers 200 (later months still report); the next report tries again", async () => {
+    await live();
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
+    let refuse = true;
+    const s = fake({}, () =>
+      refuse
+        ? Response.json(
+            { error: { type: "invalid_request_error" } },
+            { status: 400 },
+          )
+        : undefined,
+    );
+    expect((await call(report(closed, 3))).status).toBe(200);
+    expect(await usageRow(closed)).toMatchObject({
+      applied_quantity: null,
+      apply_outcome: "failed",
+    });
+    expect(errors).toContain(`billing usage quantity failed ${A}`);
+    refuse = false;
+    s.calls.length = 0;
+    expect((await call(report(closed, 3))).status).toBe(200);
+    expect(s.calls.map((c) => c.method)).toEqual(["GET", "POST"]);
+    expect(await usageRow(closed)).toMatchObject({
+      applied_quantity: 3,
+      apply_outcome: "updated",
+    });
+  });
+
+  it("a Stripe 401 or 403 (a revoked or rotated key) is retried: 502, never a 200 that moves the server past the month", async () => {
+    await live();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const status of [401, 403]) {
+      const s = fakeStripe(() =>
+        Response.json({ error: { type: "invalid_request_error" } }, { status }),
+      );
+      const r = await call(report(closed, 3));
+      expect([r.status, await r.json()], String(status)).toEqual([
+        502,
+        { error: "upstream" },
+      ]);
+      expect(await usageRow(closed)).toMatchObject({
+        count: 3,
+        applied_quantity: null,
+        apply_outcome: "failed",
+      });
+      s.spy.mockRestore();
+    }
+  });
+
+  it("3 -> 5 -> 3 within a day ends at 3 in Stripe: each report's write has its own key", async () => {
+    await live();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const t0 = Date.UTC(2026, 10, 11, 12, 0);
+    vi.setSystemTime(t0);
+    const month = "2026-10";
+    // Stripe as it is: the item's quantity, and a key's first answer replayed
+    // for 24 hours without applying the write again.
+    let quantity = 1;
+    const seen = new Set<string>();
+    const s = fakeStripe((c) => {
+      if (c.method === "GET" && c.path === SUBS)
+        return subscription({ quantity });
+      if (c.method === "POST" && c.path === ITEM) {
+        if (!seen.has(c.key as string)) {
+          seen.add(c.key as string);
+          quantity = Number(c.form.quantity);
+        }
+        return Response.json({ id: "si_itemA", quantity });
+      }
+      return undefined;
+    });
+    for (const [i, n] of [3, 5, 3].entries()) {
+      vi.setSystemTime(t0 + i * 3_600_000);
+      expect((await call(report(month, n))).status).toBe(200);
+      expect(quantity).toBe(n);
+      expect(await usageRow(month)).toMatchObject({
+        applied_quantity: n,
+        applied_at: t0 + i * 3_600_000,
+        apply_outcome: "updated",
+      });
+    }
+    const keys = s.calls.filter((c) => c.method === "POST").map((c) => c.key);
+    expect(keys).toEqual([
+      `qty-${A}-${month}-3-${t0}`,
+      `qty-${A}-${month}-5-${t0 + 3_600_000}`,
+      `qty-${A}-${month}-3-${t0 + 7_200_000}`,
+    ]);
+    vi.useRealTimers();
+  });
+
+  it("a changed count for an applied month is applied again", async () => {
+    await live();
+    const s = fake();
+    await call(report(closed, 3));
+    s.calls.length = 0;
+    expect((await call(report(closed, 5))).status).toBe(200);
+    expect(s.calls.at(-1)?.key).toMatch(
+      new RegExp(`^qty-${A}-${closed}-5-\\d+$`),
+    );
+    expect(await usageRow(closed)).toMatchObject({ applied_quantity: 5 });
   });
 });

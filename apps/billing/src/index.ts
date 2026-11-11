@@ -62,6 +62,7 @@ import {
   type StripeConfig,
   StripeConfigError,
   SUBSCRIPTION_LIVE_SQL,
+  setSubscriptionQuantity,
   TIERS_OF_MAX,
   type TierOfView,
   type TiersOfResult,
@@ -294,7 +295,7 @@ const mismatched = (body: Record<string, unknown>, install: string) =>
 
 /** Each signed POST's allowed body keys; any other field is 400 bad_body. */
 const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
-  "/checkout": ["install", "ts", "plan", "interval"],
+  "/checkout": ["install", "ts", "plan", "interval", "creators"],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
@@ -467,9 +468,21 @@ async function checkout(
   appHost: string,
   body: Record<string, unknown>,
 ) {
-  const { plan, interval } = body;
+  const { plan, interval, creators } = body;
   if (plan !== "solo" && plan !== "team" && plan !== "business")
     return bad("bad_plan");
+  // Team and Business bill per creator (#2123): the instance's own count for
+  // this month (0..MAX_CREATORS), billed as at least 1. Solo takes none.
+  if (
+    creators !== undefined &&
+    (plan === "solo" ||
+      !Number.isInteger(creators) ||
+      (creators as number) < 0 ||
+      (creators as number) > MAX_CREATORS)
+  )
+    return bad("bad_creators");
+  const quantity =
+    typeof creators === "number" ? Math.max(1, creators) : undefined;
   // Solo names its billing interval; no other plan takes one (the shared
   // BillingCheckoutInput contract).
   if (
@@ -577,7 +590,7 @@ async function checkout(
   const idempotencyKey =
     plan === "solo"
       ? `checkout-${install}-solo-${interval}${trialEnd === undefined ? "" : "-trial"}-${body.ts}`
-      : `checkout-${install}-${tier}-${body.ts}`;
+      : `checkout-${install}-${tier}${quantity === undefined ? "" : `-q${quantity}`}-${body.ts}`;
   // Only the newest Checkout can be paid: the install's open session (kept
   // below) is expired first. A retry with the same key is the same session
   // (Stripe replays it), so it is not expired. Order matters for a crash: the
@@ -599,6 +612,7 @@ async function checkout(
         customerId,
         priceId,
         tier,
+        ...(quantity === undefined ? {} : { quantity }),
         ...(trialEnd === undefined ? {} : { trialEnd }),
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
@@ -1026,12 +1040,131 @@ export class BillingOperatorRpc extends WorkerEntrypoint<Env> {
   }
 }
 
+const USAGE_STATE_SQL =
+  "SELECT u.applied_quantity, u.apply_outcome, (SELECT max(l.month) FROM usage l WHERE l.install_id = ?1 AND l.month > ?2 AND l.applied_quantity IS NOT NULL) AS later FROM usage u WHERE u.install_id = ?1 AND u.month = ?2";
+const USAGE_TIER_SQL =
+  "SELECT tier, status, stripe_subscription_id FROM tiers WHERE install_id = ?1";
+const USAGE_APPLIED_SQL =
+  "UPDATE usage SET applied_quantity = ?3, applied_at = ?4, apply_outcome = ?5 WHERE install_id = ?1 AND month = ?2";
+const USAGE_OUTCOME_SQL =
+  "UPDATE usage SET apply_outcome = ?3 WHERE install_id = ?1 AND month = ?2";
+/** A UTC calendar month, YYYY-MM. */
+const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
+
+/**
+ * Per-creator monthly billing (#2123): a closed month's report sets the
+ * install's monthly Team or Business subscription quantity to its creator
+ * count (at least 1), with no proration, so the next invoice bills that
+ * many. Runs after the report is stored, so a failure here never loses it.
+ * Idempotent per (install, month): a month already applied at this quantity
+ * changes nothing. The Stripe write is keyed per report
+ * (qty-<install>-<month>-<n>-<received_at>) and sets an absolute quantity.
+ * Skipped, with the reason in usage.apply_outcome: the current (or a future)
+ * month, a month older than one already applied, no row or subscription, and
+ * Solo, trial, lapsed or suspended rows. billing-core leaves a subscription
+ * whose price is not the tier's monthly price alone (not_monthly): a yearly
+ * prepaid-seat price recurs yearly and is recognised there (PR 4b bills its
+ * overage). Answers null when the route's 200 stands, or the refusal: a
+ * Stripe failure the install should retry (network, 5xx, 401, 403, 409,
+ * 429, config)
+ * is that failure's 5xx, and the instance's usage tick re-sends the month
+ * (every 2 minutes) until it is accepted. A Stripe 4xx that a retry can't
+ * fix is recorded (failed) and logged, and the 200 stands so later months
+ * still report; the next report, or a repeat of this one, tries again.
+ */
+async function applyQuantity(
+  env: Env,
+  install: string,
+  month: string,
+  count: number,
+  now: number,
+): Promise<Response | null> {
+  if (month >= monthOf(now)) return null;
+  const db = env.BILLING_DB;
+  const quantity = Math.max(1, count);
+  const outcome = async (o: string) => {
+    await db.prepare(USAGE_OUTCOME_SQL).bind(install, month, o).run();
+    console.log("billing usage quantity", o, install);
+    return null;
+  };
+  const state = await db.prepare(USAGE_STATE_SQL).bind(install, month).first<{
+    applied_quantity: number | null;
+    apply_outcome: string | null;
+    later: string | null;
+  }>();
+  if (
+    state?.applied_quantity === quantity &&
+    (state.apply_outcome === "updated" || state.apply_outcome === "unchanged")
+  ) {
+    console.log("billing usage quantity repeat", install);
+    return null;
+  }
+  if (state?.later) return outcome("stale");
+  const row = await db.prepare(USAGE_TIER_SQL).bind(install).first<{
+    tier: string | null;
+    status: string | null;
+    stripe_subscription_id: string | null;
+  }>();
+  if (!row?.stripe_subscription_id) return outcome("no_subscription");
+  if (row.tier !== "team" && row.tier !== "business")
+    return outcome(row.tier === "trial" ? "trial" : "solo");
+  if (row.status !== "active" && row.status !== "past_due")
+    return outcome(row.status === "suspended" ? "suspended" : "lapsed");
+  const priceId =
+    row.tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
+  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const subscriptionId = row.stripe_subscription_id;
+  let r: Awaited<ReturnType<typeof setSubscriptionQuantity>>;
+  try {
+    r = await stripe(install, () =>
+      setSubscriptionQuantity(
+        {
+          subscriptionId,
+          quantity,
+          monthlyPriceIds: typeof priceId === "string" ? [priceId] : [],
+          // One key per report (its received_at): Stripe replays a key's
+          // first answer for 24 hours without applying it again, so a
+          // month-and-quantity key would leave 3 -> 5 -> 3 at 5. The write
+          // sets an absolute quantity, so a new key per attempt is safe.
+          idempotencyKey: `qty-${install}-${month}-${quantity}-${now}`,
+        },
+        cfg,
+      ),
+    );
+  } catch (e) {
+    if (!(e instanceof StripeFailure)) throw e;
+    await db.prepare(USAGE_OUTCOME_SQL).bind(install, month, "failed").run();
+    console.error("billing usage quantity failed", install);
+    // 401 and 403 (a revoked or rotated key) are billing's own config, like
+    // config: retried, never a 200 that lets the server move past the month.
+    const permanent =
+      e.code === "bad_upstream" ||
+      (e.code === "upstream" &&
+        e.status !== undefined &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 401 &&
+        e.status !== 403 &&
+        e.status !== 429);
+    return permanent ? null : e.res;
+  }
+  if (r.outcome !== "updated" && r.outcome !== "unchanged")
+    return outcome(r.outcome);
+  await db
+    .prepare(USAGE_APPLIED_SQL)
+    .bind(install, month, quantity, now, r.outcome)
+    .run();
+  console.log("billing usage quantity", r.outcome, install, quantity);
+  return null;
+}
+
 async function usage(
-  db: D1Database,
+  env: Env,
   install: string,
   body: Record<string, unknown>,
   now: number,
 ) {
+  const db = env.BILLING_DB;
   if (mismatched(body, install)) return bad("install_mismatch", 403);
   const { month, creators, count } = body;
   if (typeof month !== "string" || !MONTH.test(month)) return bad("bad_month");
@@ -1048,6 +1181,8 @@ async function usage(
     .bind(install, month, JSON.stringify(creators), count, now)
     .run();
   console.log("billing usage", install);
+  const refused = await applyQuantity(env, install, month, count, now);
+  if (refused) return refused;
   return Response.json({ ok: true, month, count });
 }
 
@@ -1146,7 +1281,7 @@ export default {
       if (!strictBody(body, url.pathname)) return bad("bad_body");
       if (route === "POST /trial/start")
         return await trialStart(env.BILLING_DB, install, body, now);
-      return await usage(env.BILLING_DB, install, body, now);
+      return await usage(env, install, body, now);
     } catch {
       // Never the error text: it can carry a D1 message.
       console.error("billing db_error", install);
