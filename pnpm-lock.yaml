@@ -395,6 +395,9 @@ importers:
 
   apps/provisioner:
     dependencies:
+      '@oa/billing-core':
+        specifier: workspace:*
+        version: link:../../packages/billing-core
       '@oa/provision':
         specifier: workspace:*
         version: link:../../packages/provision
@@ -417,9 +420,15 @@ importers:
       '@oa/auth-core':
         specifier: workspace:*
         version: link:../../packages/auth-core
+      '@oa/provisioning':
+        specifier: workspace:*
+        version: link:../provisioning
       '@oa/scheduler':
         specifier: workspace:*
         version: link:../scheduler
+      '@oa/server':
+        specifier: workspace:*
+        version: link:../server
       '@types/node':
         specifier: ^22.20.5
         version: 22.20.5
@@ -957,6 +966,15 @@ importers:
         specifier: 1.0.20
         version: 1.0.20
     devDependencies:
+      '@oa/auth-broker':
+        specifier: workspace:*
+        version: link:../../apps/auth-broker
+      '@oa/directory-broker':
+        specifier: workspace:*
+        version: link:../../apps/directory-broker
+      '@oa/server':
+        specifier: workspace:*
+        version: link:../../apps/server
       '@types/node':
         specifier: ^22.20.5
         version: 22.20.5
