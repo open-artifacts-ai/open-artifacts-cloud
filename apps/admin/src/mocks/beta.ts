@@ -1,5 +1,6 @@
 import { HttpResponse, http } from "msw";
 import type {
+  AddResult,
   Allowed,
   ApproveResult,
   BetaMode,
@@ -130,6 +131,7 @@ export function createBetaMock(
       const { entries } = (await request.json()) as { entries: string[] };
       const norm = entries.map((e) => e.trim().toLowerCase());
       const seen = new Set<string>();
+      const errors: { entry: string; message: string }[] = [];
       for (const e of norm) {
         const bad = DOMAIN_RE.test(e)
           ? PUBLIC[e.slice(1)]
@@ -142,10 +144,18 @@ export function createBetaMock(
           allowed.some((a) => a.entry === e) || seen.has(e)
             ? `${e} is already on the list.`
             : null;
-        if (bad ?? dup)
-          return err("invalid_input", 400, (bad ?? dup) as string);
+        const message = bad ?? dup;
+        if (message) errors.push({ entry: e, message });
         seen.add(e);
       }
+      if (errors.length)
+        return err(
+          "invalid_input",
+          400,
+          errors.map((x) => x.message).join("\n"),
+          { errors },
+        );
+      const results: AddResult[] = [];
       for (const e of norm) {
         allowed.unshift({
           entry: e,
@@ -154,10 +164,30 @@ export function createBetaMock(
           addedAt: now(),
           fromWaitlist: false,
         });
-        for (const w of wait)
-          if (w.email === e && w.status !== "approved") w.status = "approved";
+        if (e.startsWith("@")) {
+          results.push({
+            entry: e,
+            waitingOnDomain: wait.filter(
+              (w) => w.status === "waiting" && w.email.endsWith(e),
+            ).length,
+          });
+          continue;
+        }
+        const w = wait.find((x) => x.email === e && x.status !== "approved");
+        if (!w) {
+          results.push({ entry: e });
+          continue;
+        }
+        w.status = "approved";
+        const fail = o.failEmailFor?.includes(w.sub);
+        results.push({
+          entry: e,
+          approved: true,
+          emailSent: !fail,
+          ...(fail ? { emailError: "E_SENDER_NOT_VERIFIED" } : {}),
+        });
       }
-      return HttpResponse.json({ added: norm });
+      return HttpResponse.json({ added: norm, results });
     }),
     http.delete("*/api/v1/beta/allowlist/:entry", ({ params }) => {
       const entry = decodeURIComponent(String(params.entry)).toLowerCase();

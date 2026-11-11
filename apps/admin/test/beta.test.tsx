@@ -199,9 +199,15 @@ it("the Add box takes several entries and names the first bad one, keeping the t
     target: { value: "lee@initech.com, acme, @gmail.com" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
-  expect(await screen.findByRole("alert")).toHaveTextContent(
+  // every bad entry, one line each
+  const alert = await screen.findByRole("alert");
+  expect(
+    Array.from(alert.querySelectorAll("p")).map((x) => x.textContent),
+  ).toEqual([
     `"acme" isn't an email address or a domain like @acme.com.`,
-  );
+    "@gmail.com would let in anyone with a Gmail address. Add emails one at a time instead.",
+  ]);
+  expect(writes()).toHaveLength(1);
   expect(box).toHaveAttribute("aria-invalid", "true");
   expect(box).toHaveValue("lee@initech.com, acme, @gmail.com");
   fireEvent.change(box, { target: { value: "@gmail.com" } });
@@ -220,13 +226,54 @@ it("the Add box takes several entries and names the first bad one, keeping the t
     target: { value: "lee@initech.com, @acme.com\nzed@x.io" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
-  expect(await screen.findByTestId("beta-toast")).toHaveTextContent(
-    "Added lee@initech.com, @acme.com, zed@x.io.",
+  const toast = await screen.findByTestId("beta-toast");
+  expect(toast).toHaveTextContent(
+    "Allowed lee@initech.com, @acme.com, zed@x.io. 1 person on the waitlist uses this domain. Approve them to email them.",
   );
   expect(box).toHaveValue("");
+  // it asks for an action: it stays, and a click searches the domain
+  await new Promise((r) => setTimeout(r, 300));
+  fireEvent.click(
+    within(toast).getByRole("button", { name: /1 person on the waitlist/ }),
+  );
+  expect(screen.getByLabelText("Search the waitlist")).toHaveValue("@acme.com");
+  await waitFor(() =>
+    expect(screen.queryByText("sam.rivera@northwind.io")).toBeNull(),
+  );
+  expect(screen.getAllByText("maya@acme.com").length).toBeGreaterThan(0);
+  fireEvent.click(
+    within(screen.getByTestId("beta-toast")).getByRole("button", {
+      name: "Dismiss",
+    }),
+  );
+  expect(screen.queryByTestId("beta-toast")).toBeNull();
   expect(writes().at(-1)?.body).toEqual({
     entries: ["lee@initech.com", "@acme.com", "zed@x.io"],
   });
+});
+
+it("adding an exact email on the waitlist approves and emails them; a failed email says so", async () => {
+  renderApp("/beta");
+  const box = await screen.findByLabelText("Emails or domains to allow");
+  await screen.findByText("sam.rivera@northwind.io");
+  fireEvent.change(box, { target: { value: "sam.rivera@northwind.io" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  expect(await screen.findByTestId("beta-toast")).toHaveTextContent(
+    "Allowed sam.rivera@northwind.io. We emailed them.",
+  );
+});
+
+it("adding an exact email whose approval email fails keeps them approved and says so", async () => {
+  swap(createBetaMock({ failEmailFor: ["sub-sam"] }));
+  renderApp("/beta");
+  const box = await screen.findByLabelText("Emails or domains to allow");
+  fireEvent.change(box, { target: { value: "sam.rivera@northwind.io" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  const t = await screen.findByTestId("beta-toast");
+  expect(t).toHaveTextContent(
+    "Allowed sam.rivera@northwind.io, but the email didn't send (E_SENDER_NOT_VERIFIED). They're on the list; tell them yourself.",
+  );
+  expect(t).toHaveAttribute("role", "alert");
 });
 
 it("search filters the waitlist by email or note; no match and empty states say so", async () => {

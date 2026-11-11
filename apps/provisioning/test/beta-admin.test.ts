@@ -484,7 +484,7 @@ describe("the allow list", () => {
     const r = await call(env, ADMIN_P, "POST", "/allowlist", {
       entries: ["  Maya@ACME.com ", "@ACME.COM"],
     });
-    expect(r.body).toEqual({ added: ["maya@acme.com", "@acme.com"] });
+    expect(r.body).toMatchObject({ added: ["maya@acme.com", "@acme.com"] });
     expect(
       (
         await rows<{ entry: string }>(
@@ -502,7 +502,7 @@ describe("the allow list", () => {
     ).toBe("maya@acme.com is already on the list.");
   });
 
-  it("names each kind of bad entry with Product's strings; the first bad one refuses the whole call", async () => {
+  it("names each kind of bad entry with Product's strings; any bad entry refuses the whole call, naming every one", async () => {
     const env = envWith();
     await db
       .prepare("INSERT INTO signup_allowlist VALUES ('maya@acme.com','x',1)")
@@ -523,8 +523,12 @@ describe("the allow list", () => {
         "@gmail.com would let in anyone with a Gmail address. Add emails one at a time instead.",
       ],
       [
-        ["ok@a.co", "lee@initech.com", "acme", "@gmail.com"],
-        `"acme" isn't an email address or a domain like @acme.com.`,
+        ["ok@a.co", "lee@initech.com", "acme", "@gmail.com", "maya@acme.com"],
+        [
+          `"acme" isn't an email address or a domain like @acme.com.`,
+          "@gmail.com would let in anyone with a Gmail address. Add emails one at a time instead.",
+          "maya@acme.com is already on the list.",
+        ].join("\n"),
       ],
     ];
     for (const [entries, want] of cases) {
@@ -544,6 +548,13 @@ describe("the allow list", () => {
     expect(
       (await audits("beta.allow_add")).every((a) => a.outcome === "refused"),
     ).toBe(true);
+    // the details list every bad entry, one per line of the message
+    const err = await call(env, ADMIN_P, "POST", "/allowlist", {
+      entries: ["acme", "ok@a.co", "x@y"],
+    }).catch((e) => e as ApiError);
+    expect((err as ApiError).details).toMatchObject({
+      errors: [{ entry: "acme" }, { entry: "x@y" }],
+    });
   });
 
   it("refuses every public mail domain, by name; an exact public address is fine", async () => {
@@ -577,19 +588,95 @@ describe("the allow list", () => {
     ).toBe(200);
   });
 
-  it("adds several at once, audits each, and clears a waiting row for an added email", async () => {
+  it("adds several at once and audits each", async () => {
     const m = mailer();
     const env = envWith(m);
-    await wl("s1", "ada@lovelace.dev");
     const r = await call(env, ADMIN_P, "POST", "/allowlist", {
       entries: ["ada@lovelace.dev", "@northwind.io", "grace@hopper.org"],
     });
     expect((r.body as { added: string[] }).added).toHaveLength(3);
     expect(await audits("beta.allow_add")).toHaveLength(3);
+    // no waitlist rows: nobody is approved or emailed
+    expect(m.sent).toEqual([]);
+  });
+
+  it("an exact email with a waiting or declined row is approved and emailed, as Approve does", async () => {
+    const m = mailer();
+    const env = envWith(m);
+    await wl("s1", "maya@acme.com");
+    await wl("s2", "dan@acme.com", { status: "declined" });
+    const r = await call(env, ADMIN_P, "POST", "/allowlist", {
+      entries: ["Maya@acme.com", "dan@acme.com", "new@acme.com"],
+    });
+    expect((r.body as { results: unknown[] }).results).toEqual([
+      { entry: "maya@acme.com", approved: true, emailSent: true },
+      { entry: "dan@acme.com", approved: true, emailSent: true },
+      { entry: "new@acme.com" },
+    ]);
+    expect(
+      (
+        await rows<{ status: string }>("SELECT status FROM signup_waitlist")
+      ).map((x) => x.status),
+    ).toEqual(["approved", "approved"]);
+    expect(m.sent.map((x) => x.to).sort()).toEqual([
+      "dan@acme.com",
+      "maya@acme.com",
+    ]);
+    expect(m.sent[0]?.subject).toBe("You're in: Open Artifacts beta");
+    expect(await audits("beta.approve")).toHaveLength(2);
+    expect(await rows("SELECT entry FROM signup_allowlist")).toHaveLength(3);
+  });
+
+  it("an email failure on add still records the approval and is reported per entry", async () => {
+    const m = mailer(
+      Object.assign(new Error("boom"), { code: "E_SENDER_NOT_VERIFIED" }),
+    );
+    const env = envWith(m);
+    await wl("s1", "maya@acme.com");
+    const r = await call(env, ADMIN_P, "POST", "/allowlist", {
+      entries: ["maya@acme.com"],
+    });
+    expect((r.body as { results: unknown[] }).results).toEqual([
+      {
+        entry: "maya@acme.com",
+        approved: true,
+        emailSent: false,
+        emailError: "E_SENDER_NOT_VERIFIED",
+      },
+    ]);
     expect(await rows("SELECT status FROM signup_waitlist")).toEqual([
       { status: "approved" },
     ]);
+    expect(await rows("SELECT entry FROM signup_allowlist")).toEqual([
+      { entry: "maya@acme.com" },
+    ]);
+    expect(await audits("beta.email_failed")).toHaveLength(1);
+  });
+
+  it("a whole-domain add approves and emails nobody, leaves rows waiting, and counts them", async () => {
+    const m = mailer();
+    const env = envWith(m);
+    await wl("s1", "maya@acme.com");
+    await wl("s2", "sam@acme.com");
+    await wl("s3", "dan@acme.com", { status: "declined" });
+    await wl("s4", "eve@notacme.com");
+    await wl("s5", "li@sub.acme.com");
+    const r = await call(env, ADMIN_P, "POST", "/allowlist", {
+      entries: ["@ACME.com", "@empty.io"],
+    });
+    expect((r.body as { results: unknown[] }).results).toEqual([
+      { entry: "@acme.com", waitingOnDomain: 2 },
+      { entry: "@empty.io", waitingOnDomain: 0 },
+    ]);
     expect(m.sent).toEqual([]);
+    expect(await audits("beta.approve")).toEqual([]);
+    expect(
+      (
+        await rows<{ status: string }>(
+          "SELECT status FROM signup_waitlist ORDER BY sub",
+        )
+      ).map((x) => x.status),
+    ).toEqual(["waiting", "waiting", "declined", "waiting", "waiting"]);
   });
 
   it("remove deletes only the entry: installs, sign-ups and the waitlist stay", async () => {

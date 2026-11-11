@@ -44,6 +44,14 @@ export type ApproveResult = {
   emailFailed: number;
 };
 
+export type AddResult = {
+  entry: string;
+  approved?: boolean;
+  emailSent?: boolean;
+  emailError?: string;
+  waitingOnDomain?: number;
+};
+
 export const BETA_KEY = ["beta"] as const;
 
 export const betaStatsQuery = () =>
@@ -72,7 +80,9 @@ export const approvePeople = (subs: string[]) =>
 export const declinePerson = (sub: string) =>
   api.post<unknown>("/beta/waitlist/decline", { sub });
 export const addAllowed = (entries: string[]) =>
-  api.post<{ added: string[] }>("/beta/allowlist", { entries });
+  api.post<{ added: string[]; results: AddResult[] }>("/beta/allowlist", {
+    entries,
+  });
 export const removeAllowed = (entry: string) =>
   api.delete<{ removed: string }>(
     `/beta/allowlist/${encodeURIComponent(entry)}`,
@@ -94,3 +104,36 @@ export const cleanNote = (note: string | null | undefined): string =>
     .replace(/[\p{Cf}]/gu, "")
     .replace(/ {2,}/g, " ")
     .trim();
+
+/** Every bad entry of a refused Add, one line each (the API's own strings). */
+export const addErrorLines = (e: unknown): string[] => {
+  const d = (e as { details?: { errors?: { message?: string }[] } }).details;
+  const lines = d?.errors?.flatMap((x) => (x.message ? [x.message] : []));
+  return lines?.length ? lines : [e instanceof Error ? e.message : ""];
+};
+
+/** What the Add toast says: who was allowed, who was emailed, who still waits. */
+export function addToast(r: { added: string[]; results: AddResult[] }): {
+  text: string;
+  bad: boolean;
+  domain?: string;
+} {
+  const sent = r.results.filter((x) => x.emailSent === true);
+  const failed = r.results.filter((x) => x.emailSent === false);
+  const only = r.added.length === 1;
+  let text = `Allowed ${r.added.join(", ")}`;
+  if (failed.length)
+    text += only
+      ? `, but the email didn't send (${failed[0]?.emailError}). They're on the list; tell them yourself.`
+      : `. ${failed.map((x) => x.entry).join(", ")}: the email didn't send (${failed[0]?.emailError}). They're on the list; tell them yourself.`;
+  else text += ".";
+  if (sent.length)
+    text += only
+      ? " We emailed them."
+      : ` We emailed ${sent.map((x) => x.entry).join(", ")}.`;
+  const doms = r.results.filter((x) => (x.waitingOnDomain ?? 0) > 0);
+  const n = doms.reduce((a, x) => a + (x.waitingOnDomain ?? 0), 0);
+  if (n > 0)
+    text += ` ${n === 1 ? "1 person on the waitlist uses" : `${n} people on the waitlist use`} ${doms.length === 1 ? "this domain" : "these domains"}. Approve them to email them.`;
+  return { text, bad: failed.length > 0, domain: doms[0]?.entry };
+}
