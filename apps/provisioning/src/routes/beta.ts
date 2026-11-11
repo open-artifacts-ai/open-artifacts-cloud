@@ -22,6 +22,9 @@ import { normEmail } from "../signup/gate.js";
 //
 // No write here touches an install, a signup or a signup_accounts row.
 
+/** Extra audit detail naming the surface (an MCP call); empty for HTTP. */
+export type Via = Record<string, unknown>;
+
 export const BETA_PATH_RE = /^\/api\/v1\/beta(\/[^?]*)?$/;
 
 export const BETA_ACTIONS = {
@@ -99,7 +102,7 @@ export function entryRefusal(
 
 const who = (p: Principal) => p.email ?? p.label;
 
-async function stats(env: Env): Promise<Json> {
+export async function stats(env: Env): Promise<Json> {
   const dayStart = Math.floor(Date.now() / DAY_MS) * DAY_MS;
   const [w, a, s] = await env.PLATFORM_DB.batch([
     env.PLATFORM_DB.prepare(
@@ -151,7 +154,7 @@ const waitItem = (r: WaitRow) => ({
   decidedAt: r.decided_at,
 });
 
-async function listWaitlist(env: Env, url: URL): Promise<Json> {
+export async function listWaitlist(env: Env, url: URL): Promise<Json> {
   const st = WaitlistStatus.safeParse(
     url.searchParams.get("status") ?? "waiting",
   );
@@ -219,11 +222,12 @@ type ApproveResult = {
   emailError?: string;
 };
 
-async function approve(
+export async function approve(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = ApproveSchema.safeParse(body);
   if (!parsed.success) throw invalid("subs: 1 to 100 sub ids");
@@ -263,7 +267,7 @@ async function approve(
           outcome: "ok",
           ip,
           email,
-          detail: { sub, previous: row.status },
+          detail: { ...via, sub, previous: row.status },
         },
         true,
       ),
@@ -283,7 +287,7 @@ async function approve(
         code: "email_failed",
         ip,
         email,
-        detail: { sub, error: sent.error },
+        detail: { ...via, sub, error: sent.error },
       });
     }
     results.push({
@@ -301,11 +305,12 @@ async function approve(
   });
 }
 
-async function decline(
+export async function decline(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = DeclineSchema.safeParse(body);
   if (!parsed.success) throw invalid("sub is required");
@@ -337,7 +342,7 @@ async function decline(
         outcome: "ok",
         ip,
         email: row.email,
-        detail: { sub },
+        detail: { ...via, sub },
       },
       true,
     ),
@@ -347,7 +352,7 @@ async function decline(
   return ok({ sub, email: row.email, status: "declined" });
 }
 
-async function listAllowed(env: Env): Promise<Json> {
+export async function listAllowed(env: Env): Promise<Json> {
   const rows = await env.PLATFORM_DB.prepare(
     `SELECT a.entry, a.added_by, a.added_at,
   EXISTS (SELECT 1 FROM signup_waitlist w WHERE w.email = a.entry AND w.status = 'approved') AS from_waitlist
@@ -371,11 +376,12 @@ FROM signup_allowlist a ORDER BY a.added_at DESC, a.entry ASC LIMIT ?1`,
   });
 }
 
-async function add(
+export async function add(
   env: Env,
   p: Principal,
   body: unknown,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   const parsed = AddSchema.safeParse(body);
   if (!parsed.success) throw invalid("entries: 1 to 100 emails or @domains");
@@ -403,7 +409,7 @@ async function add(
         outcome: "refused",
         code: "invalid_input",
         ip,
-        detail: { entry: e.slice(0, 100), reason: bad.reason },
+        detail: { ...via, entry: e.slice(0, 100), reason: bad.reason },
       });
       throw invalid(bad.message, { entry: e, reason: bad.reason });
     }
@@ -424,7 +430,7 @@ async function add(
           actor: p,
           outcome: "ok",
           ip,
-          detail: { entry: e },
+          detail: { ...via, entry: e },
         },
         true,
       ),
@@ -447,11 +453,12 @@ async function add(
   return ok({ added: entries });
 }
 
-async function remove(
+export async function remove(
   env: Env,
   p: Principal,
   raw: string,
-  ip: string,
+  ip: string | undefined,
+  via: Via = {},
 ): Promise<Json> {
   let entry: string;
   try {
@@ -470,7 +477,7 @@ async function remove(
         actor: p,
         outcome: "ok",
         ip,
-        detail: { entry },
+        detail: { ...via, entry },
       },
       true,
     ),
@@ -515,4 +522,69 @@ export async function betaApi(
   const rm = method === "DELETE" ? /^\/allowlist\/([^/]+)$/.exec(sub) : null;
   if (rm?.[1]) return remove(env, p, rm[1], ip);
   throw new ApiError("not_found");
+}
+
+// The admin MCP tools (hosted-tools.ts) call the same functions as betaApi
+// above, each surface keeping its own authz. Over MCP the principal is an
+// admin's OAuth grant (as set_install_tier): installs:read lists, installs:write
+// writes. An oat_ token, OIDC or a session is forbidden. The prod "yes" for a
+// write is the operator's own, at the client, as for every admin write tool.
+
+export const BETA_TOOLS = {
+  list: "list_waitlist",
+  approve: "approve_waitlist",
+  allow: "allow_signup",
+  remove: "remove_allowed",
+  stats: "beta_stats",
+} as const;
+
+export const ListWaitlistInput = z
+  .object({
+    status: WaitlistStatus.optional(),
+    q: z.string().max(200).optional(),
+  })
+  .strict();
+export const ApproveInput = ApproveSchema;
+export const AllowInput = AddSchema;
+export const RemoveInput = z
+  .object({ entry: z.string().min(1).max(320) })
+  .strict();
+export const StatsInput = z.object({}).strict();
+
+/** An admin's OAuth grant holding the scope; nothing else over MCP. */
+const mayBetaMcp = (p: Principal, write: boolean) =>
+  p.kind === "token" &&
+  p.tokenKind === "oauth" &&
+  p.scopes.includes(write ? "installs:write" : "installs:read");
+
+/**
+ * Runs one beta tool: authz (refusal audited), then the shared function with
+ * the surface in every audit row's detail.
+ */
+export async function betaMcp(
+  env: Env,
+  p: Principal,
+  tool: string,
+  write: boolean,
+  clientVersion: string | null,
+  run: (via: Via) => Promise<Json>,
+): Promise<Json> {
+  if (!mayBetaMcp(p, write)) {
+    await tryAudit(env, {
+      action: "authz.refused",
+      actor: p,
+      outcome: "refused",
+      code: "forbidden",
+      detail: { action: "beta", surface: "mcp", tool },
+    });
+    throw new ApiError("forbidden");
+  }
+  return run({
+    surface: "mcp",
+    tool,
+    clientVersion,
+    ...(p.kind === "token"
+      ? { via: p.tokenKind, client: p.client ?? null }
+      : {}),
+  });
 }
