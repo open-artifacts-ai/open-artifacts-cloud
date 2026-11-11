@@ -108,6 +108,9 @@ export function liveBusIo(
     async open({ app, pat, hookKey }) {
       const site = { app, fetch: fetchImpl };
       if ((await busState(site, pat)) === "off") return "off";
+      // Single-shot, on purpose: this call is outside the hook ledger and
+      // transportFetch's paced retry, so a retry would spend an RL_ANON slot
+      // nothing counts (#155).
       const res = await fetchImpl(`${app}/__test/session`, {
         method: "POST",
         redirect: "manual",
