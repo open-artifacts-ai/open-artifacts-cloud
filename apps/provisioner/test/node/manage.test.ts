@@ -616,6 +616,63 @@ describe("upgrade and rollback (5.4)", () => {
     });
   });
 
+  describe("#1501: a row left upgrading on `to` by a killed attempt (it died after the version write)", () => {
+    /** The row as a dead attempt left it, under `holder`'s lease. */
+    const left = async (holder: string) => {
+      const s = await active({ slug: "killco", version: V1 });
+      const id = seedJob(w, {
+        kind: "upgrade",
+        installId: s.installId,
+        args: { from: V1, to: V2 },
+      });
+      w.db
+        .prepare(
+          "UPDATE installs SET state = 'upgrading', version = ?, previous_version = ?, lease = ?, lease_until = ? WHERE id = ?",
+        )
+        .run(
+          V2,
+          V1,
+          `${leaseJobPart(jobHolder(holder === "own" ? id : holder))}${"ab".repeat(16)}`,
+          w.clock.t + 20 * 60_000,
+          s.installId,
+        );
+      const error = await runManage(
+        w.ctx,
+        event(id),
+        stepRunner(w.clock).step,
+      ).then(
+        () => null,
+        (x: unknown) => x as Error,
+      );
+      return { s, id, error, job: w.job(id) };
+    };
+
+    it("the same job's retry renders again and finishes active on `to`", async () => {
+      const { s, job } = await left("own");
+      expect(job?.status).toBe("done");
+      expect(w.install(s.installId)).toMatchObject({
+        state: "active",
+        version: V2,
+        previous_version: V1,
+        lease: null,
+      });
+    });
+
+    it("another job's lease on the same row stays refused, the row untouched", async () => {
+      const { s, job } = await left("someone-else");
+      expect(job?.status).toBe("failed");
+      expect(job?.error_code).toBe("invalid_state");
+      expect(w.install(s.installId)).toMatchObject({
+        state: "upgrading",
+        version: V2,
+        previous_version: V1,
+      });
+      expect(w.install(s.installId)?.lease).toBe(
+        `${leaseJobPart(jobHolder("someone-else"))}${"ab".repeat(16)}`,
+      );
+    });
+  });
+
   it("rollback: back on previous_version; a replay changes nothing", async () => {
     const s = await active({ slug: "backco", version: V1 });
     await manage("upgrade", s.installId, { args: { from: V1, to: V2 } });

@@ -402,3 +402,9 @@ export const TEST_FAIL_HEALTH_PREFIX = "rl-failhealth-";
  * its own lease, as a killed isolate would. Same gate as the health seam.
  */
 export const TEST_KILL_UPGRADE_PREFIX = "rl-killupgrade-";
+
+/**
+ * #1501 test seam, second point: testFailCheck "kill_after_write" dies right
+ * after the version write, leaving the row upgrading on `to`. Same gate.
+ */
+export const TEST_KILL_AFTER_WRITE_PREFIX = "rl-killwrite-";

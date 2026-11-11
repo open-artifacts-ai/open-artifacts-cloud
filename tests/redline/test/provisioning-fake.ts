@@ -1,5 +1,6 @@
 import {
   TEST_FAIL_HEALTH_PREFIX,
+  TEST_KILL_AFTER_WRITE_PREFIX,
   TEST_KILL_UPGRADE_PREFIX,
 } from "@oa/provision/names";
 import {
@@ -86,7 +87,7 @@ interface FJob {
   args: Record<string, unknown>;
   failAt?: { step: string; code: string; message?: string };
   /** P53: the first attempt of `step` dies, leaving the install upgrading; the retry runs it. */
-  kill?: { step: string; done: boolean };
+  kill?: { step: string; done: boolean; afterWrite: boolean; to: string };
   /** P53: between the killed attempt and its retry. */
   retrying?: boolean;
   /** P53: the error code a finished job still records from the killed attempt. */
@@ -363,7 +364,8 @@ export function fakeApi(): FakeApi {
     step: j.steps[j.stepIndex] ?? null,
     steps: j.steps,
     stepIndex: j.stepIndex,
-    attempt: j.retrying ? 2 : 1,
+    // 0-based, as jobs.attempt counts failures of the running step.
+    attempt: j.retrying ? 1 : 0,
     lastErrorCode: j.retrying
       ? "lease_held"
       : j.status === "failed"
@@ -448,7 +450,14 @@ export function fakeApi(): FakeApi {
       // The attempt dies after its claim: the row stays upgrading under the job's lease.
       j.kill.done = true;
       const i = installs.get(j.installId);
-      if (i) i.state = "upgrading";
+      if (i) {
+        i.state = "upgrading";
+        if (j.kill.afterWrite) {
+          // Died after the version write: the row is upgrading on `to`.
+          i.previousVersion = i.version;
+          i.version = j.kill.to;
+        }
+      }
       if (faults.has("p53_fast_retry") || faults.has("p53_fast_retry_silent")) {
         // The retry's backoff is shorter than the poll: the job is done at the next read.
         if (faults.has("p53_fast_retry")) j.trace = "lease_held";
@@ -703,13 +712,17 @@ export function fakeApi(): FakeApi {
           i.previousVersion = i.version;
           i.version = to;
         }
+        const rid = String(body.requestId ?? "");
+        const afterWrite = rid.startsWith(TEST_KILL_AFTER_WRITE_PREFIX);
         const killed =
-          String(body.requestId ?? "").startsWith(TEST_KILL_UPGRADE_PREFIX) &&
+          (afterWrite || rid.startsWith(TEST_KILL_UPGRADE_PREFIX)) &&
           i.testHooks &&
           i.slug.startsWith("rl-f-") &&
           !faults.has("p53_no_kill");
         const j = startJob(i, "upgrade", p, {
-          kill: killed ? { step: "upload", done: false } : undefined,
+          kill: killed
+            ? { step: "upload", done: false, afterWrite, to }
+            : undefined,
           failAt: seam
             ? {
                 step: "health",
@@ -719,7 +732,7 @@ export function fakeApi(): FakeApi {
               }
             : undefined,
           onDone: () => {
-            i.previousVersion = i.version;
+            if (i.version !== to) i.previousVersion = i.version;
             i.version = to;
             if (killed && !faults.has("p53_stuck_upgrading"))
               i.state = "active";

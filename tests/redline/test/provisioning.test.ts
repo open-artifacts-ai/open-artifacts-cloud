@@ -1294,6 +1294,15 @@ describe("each probe fails on the behaviour it guards", () => {
     );
   });
 
+  it("P53 is unproven, never pass, when the seam never fires", async () => {
+    const f = fakeApi();
+    f.faults.add("p53_no_kill");
+    expect((await runAll(f)).get("P53")).toMatchObject({
+      level: "unproven-live",
+      reason: expect.stringMatching(/no failed attempt/),
+    });
+  });
+
   it("P53 judges the kill from the job's record when the retry beats the first poll", async () => {
     const f = fakeApi();
     f.faults.add("p53_fast_retry");
