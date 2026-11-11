@@ -451,7 +451,12 @@ export function Beta() {
                   <td className="em">
                     {a.entry}
                     {a.kind === "domain" && (
-                      <span className="oa-beta-tag">whole domain</span>
+                      <span
+                        className="oa-beta-tag"
+                        title="Google Workspace accounts on this domain"
+                      >
+                        whole domain
+                      </span>
                     )}
                   </td>
                   <td>
