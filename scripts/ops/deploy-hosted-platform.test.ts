@@ -1647,6 +1647,13 @@ describe("deploy-hosted-platform.sh", () => {
         const closed = go(src, "false");
         expect(closed.code, closed.err).toBe(0);
       });
+      it(`${app}: a deployed "invite" (#2096) needs ALLOW_SIGNUPS=1 like "true"`, () => {
+        const r = go(src, "invite");
+        expect(r.code, app).toBe(1);
+        expect(r.err).toContain(
+          `deployed ${W}: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1; refusing`,
+        );
+      });
       it(`${app}: a deployed "true" is refused on read-back unless ALLOW_SIGNUPS=1, verify only too`, () => {
         for (const VERIFY_ONLY of ["", "1"]) {
           const s = setup({

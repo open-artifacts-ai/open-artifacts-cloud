@@ -65,6 +65,8 @@ const TABLES = [
   "platform_state",
   "audit_refusals",
   "rate_counters",
+  "signup_allowlist",
+  "signup_waitlist",
 ];
 export async function resetDb() {
   await migrate();

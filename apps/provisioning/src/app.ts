@@ -41,6 +41,7 @@ import {
   signupStatic,
   signupStatus,
 } from "./signup/index.js";
+import { joinWaitlist } from "./signup/waitlist.js";
 
 // The HTTP adapter (design v7 4.2 check order): host policy -> pre-authn IP
 // limit -> Origin (browser writes) -> authn -> CSRF -> invokeRoute.
@@ -142,6 +143,10 @@ async function route(
       const r = await limitRoute(env, "read", p, "signup");
       if (r) return refuse(env, "auth", r.code, req);
       return guard(() => signupStatus(env, p));
+    }
+    if (path === "/api/v1/signup/waitlist") {
+      if (req.method !== "POST") return methodNotAllowed("POST");
+      return guard(() => joinWaitlist(req, env, Date.now()));
     }
   }
 

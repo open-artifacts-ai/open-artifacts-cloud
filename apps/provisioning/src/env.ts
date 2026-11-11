@@ -99,7 +99,11 @@ export interface Env {
   /** Committed `email:sub` comma list (4.1), read on every request. */
   ADMIN_IDENTITIES: string;
   APP_DOMAIN: string;
-  SIGNUPS_ENABLED: "false" | "true" | "test-users";
+  /**
+   * `invite` (#2096): the allow list (signup_allowlist) and the staging test
+   * users get in; everyone else gets the waitlist.
+   */
+  SIGNUPS_ENABLED: "false" | "true" | "test-users" | "invite";
   SELF_SERVE_TIER: Tier;
   /**
    * The scheduler's and consumer's daily self-serve cap, so R27 runs the

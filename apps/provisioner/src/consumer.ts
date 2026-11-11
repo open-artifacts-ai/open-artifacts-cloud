@@ -17,7 +17,8 @@ export interface ConsumerEnv {
   SIGNUP_DAILY_CAP: string;
   /**
    * "true" admits signups, and so does "test-users" on staging (the API let
-   * only test users through); anything else acks each one, row left pending.
+   * only test users through) and "invite" (the API let only the allow list and
+   * test users through); anything else acks each one, row left pending.
    */
   SIGNUPS_ENABLED: string;
   OA_ENV: string;
@@ -94,6 +95,9 @@ export function dailyCap(v: string | undefined): number | null {
 export function signupsOpen(env: ConsumerEnv): boolean {
   return (
     env.SIGNUPS_ENABLED === "true" ||
+    // `invite` (#2096) like `test-users`: the API (create) is the gate, so a
+    // row that reached the queue was already allowed or is a test user.
+    env.SIGNUPS_ENABLED === "invite" ||
     (env.SIGNUPS_ENABLED === "test-users" && env.OA_ENV === "staging")
   );
 }
