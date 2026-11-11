@@ -1045,6 +1045,152 @@ describe("deploy-hosted-platform.sh", () => {
     expect(noProv.err).toContain("oa-p-provisioner does not exist");
     expect(noProv.log.some((l) => l.startsWith("wrapper"))).toBe(false);
   });
+  describe("the approval email follows the tag's own wrangler (#2096): required only when the tag declares it", () => {
+    // main's scripts run against the tag's Workers: a tag cut before the
+    // approval email (no WELCOME_FROM, no send_email WELCOME_EMAIL) must deploy
+    // and verify, and a tag that declares it keeps every strict check.
+    const WDEPS = {
+      provisioner: [] as string[],
+      provisioning: ["oa-p-provisioner", "oa-p-auth-broker"],
+    } as const;
+    const withoutWelcome = (src: string) =>
+      src
+        .split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+    const liveEdit = (
+      key: string,
+      f: (b: { name: string; type: string }[]) => unknown[],
+    ) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = f(next.result.bindings);
+      return JSON.stringify(next);
+    };
+    const liveWithoutWelcome = (key: string) =>
+      liveEdit(key, (b) => b.filter((x) => !x.name.startsWith("WELCOME_")));
+    for (const app of ["provisioner", "provisioning"] as const) {
+      const real = readFileSync(
+        join(root, "apps", app, "wrangler.jsonc"),
+        "utf8",
+      );
+      const old = withoutWelcome(real);
+
+      it(`${app}, a tag before the approval email: deploys and verifies without WELCOME_FROM or the binding`, () => {
+        expect(old).not.toMatch(/WELCOME_/);
+        const r = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+          next: { [`oa-p-${app}`]: liveWithoutWelcome(`oa-p-${app}`) },
+        }).run(app, { WELCOME_FROM: "" });
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`prod ${app}: deployed and verified`);
+        clean(r);
+      });
+
+      it(`${app}, a tag before the approval email: a WELCOME_EMAIL binding it never declared still fails`, () => {
+        const bad = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+        }).run(app, { WELCOME_FROM: "" });
+        expect(bad.code).toBe(1);
+        expect(bad.err).toContain("WELCOME_EMAIL: got 'send_email', want ''");
+      });
+
+      it(`${app}, a current tag: WELCOME_FROM is required, and the binding must be live as send_email`, () => {
+        const need = setup({ exists: WDEPS[app] }).run(app, {
+          WELCOME_FROM: "",
+        });
+        expect(need.code).toBe(2);
+        expect(need.log.filter((l) => l.startsWith("wrapper"))).toEqual([]);
+        for (const [why, live] of [
+          ["missing", liveWithoutWelcome(`oa-p-${app}`)],
+          [
+            "wrong type",
+            liveEdit(`oa-p-${app}`, (b) =>
+              b.map((x) =>
+                x.name === "WELCOME_EMAIL" ? { ...x, type: "plain_text" } : x,
+              ),
+            ),
+          ],
+        ] as const) {
+          const bad = setup({
+            exists: WDEPS[app],
+            next: { [`oa-p-${app}`]: live },
+          }).run(app);
+          expect(bad.code, why).toBe(1);
+          expect(bad.err, why).toContain("WELCOME_EMAIL: got");
+        }
+      });
+    }
+  });
+
+  describe("the observability read-back follows the tag's own wrangler (#164): strict only when the tag turns it on", () => {
+    const WDEPS = {
+      provisioner: [] as string[],
+      provisioning: ["oa-p-provisioner", "oa-p-auth-broker"],
+    } as const;
+    // The same config as a tag cut before #164 had it: observability off.
+    const offConfig = (src: string) =>
+      src.replace(
+        /"observability": \{[\s\S]*?"head_sampling_rate": 1\s*\}\s*\}/g,
+        '"observability": { "enabled": false }',
+      );
+    const bindingsOf = (key: string) =>
+      JSON.parse(NEXT[key] as string).result.bindings;
+    for (const app of ["provisioner", "provisioning"] as const) {
+      const real = readFileSync(
+        join(root, "apps", app, "wrangler.jsonc"),
+        "utf8",
+      );
+      const old = offConfig(real);
+      const key = `oa-p-${app}`;
+
+      it(`${app}, a tag with observability off: deploys and verifies with it off; a live-on Worker fails`, () => {
+        expect(old).not.toContain("invocation_logs");
+        const ok = setup({
+          configs: { [app]: old },
+          exists: WDEPS[app],
+          next: { [key]: settingsOff(bindingsOf(key)) },
+        }).run(app);
+        expect(ok.err).toBe("");
+        expect(ok.code).toBe(0);
+        const bad = setup({ configs: { [app]: old }, exists: WDEPS[app] }).run(
+          app,
+        );
+        expect(bad.code).toBe(1);
+        expect(bad.err).toContain("observability: got 'true', want 'false'");
+      });
+
+      it(`${app}, a tag with observability on: off, or invocation logs on or unset, still fails`, () => {
+        for (const [why, live, msg] of [
+          [
+            "off",
+            settingsOff(bindingsOf(key)),
+            "observability: got 'false', want 'true'",
+          ],
+          [
+            "invocation on",
+            settings(bindingsOf(key), true, true),
+            "observability invocation_logs",
+          ],
+          [
+            "invocation unset",
+            settings(bindingsOf(key), true, null),
+            "observability invocation_logs",
+          ],
+        ] as const) {
+          const bad = setup({
+            exists: WDEPS[app],
+            next: { [key]: live },
+          }).run(app);
+          expect(bad.code, why).toBe(1);
+          expect(bad.err, why).toContain(msg);
+        }
+      });
+    }
+  });
+
   describe("the scheduler's alert wiring (#915's placeholders, or none before it)", () => {
     // #915's config, and the repo's own once it carries the placeholders.
     const PINNED = [

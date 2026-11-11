@@ -621,6 +621,41 @@ describe("deploy-platform-worker.sh", () => {
       }
     });
 
+    // main's wrapper deploys the tag's own config: a tag cut before the
+    // approval email (#2096) has no WELCOME_FROM placeholder and needs no value.
+    it("a tag before the approval email deploys without WELCOME_FROM; one that declares it still needs it", () => {
+      const old = CONFIG.split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+      const { WELCOME_FROM: _, ...rest } = OK;
+      for (const env of ["staging", "prod"]) {
+        for (const w of [undefined, ""]) {
+          const r = run(
+            ["provisioner", env],
+            w === undefined ? rest : { ...rest, WELCOME_FROM: w },
+            tree(old),
+          );
+          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.log[0]).toBe(
+            `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
+          );
+          expect(readFileSync(r.snap, "utf8")).not.toContain("WELCOME_");
+        }
+        // A config with only the binding, or only the var, still requires a valid sender.
+        for (const keep of ["WELCOME_FROM", "WELCOME_EMAIL"]) {
+          const half = CONFIG.split("\n")
+            .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
+            .join("\n");
+          const r = run(["provisioner", env], rest, tree(half));
+          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.log).toEqual([]);
+        }
+        const cur = run(["provisioner", env], rest, tree(CONFIG));
+        expect(cur.code, env).toBe(1);
+        expect(cur.log).toEqual([]);
+      }
+    });
+
     it("refuses a placeholder the fills don't cover", () => {
       const script = tree(
         CONFIG.replace(
@@ -786,6 +821,41 @@ describe("deploy-platform-worker.sh", () => {
             expect(r.code, `${env} ${key}=${v}`).toBe(1);
             expect(r.log).toEqual([]);
           }
+    });
+
+    // main's wrapper deploys the tag's own config: a tag cut before the
+    // approval email (#2096) has no WELCOME_FROM placeholder and needs no value.
+    it("a tag before the approval email deploys without WELCOME_FROM; one that declares it still needs it", () => {
+      const old = CONFIG.split("\n")
+        .filter((l) => !l.includes("WELCOME_"))
+        .join("\n");
+      const { WELCOME_FROM: _, ...rest } = OK;
+      for (const env of ["staging", "prod"]) {
+        for (const w of [undefined, ""]) {
+          const r = run(
+            ["provisioning", env],
+            w === undefined ? rest : { ...rest, WELCOME_FROM: w },
+            tree(old),
+          );
+          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.log[0]).toBe(
+            `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
+          );
+          expect(readFileSync(r.snap, "utf8")).not.toContain("WELCOME_");
+        }
+        // A config with only the binding, or only the var, still requires a valid sender.
+        for (const keep of ["WELCOME_FROM", "WELCOME_EMAIL"]) {
+          const half = CONFIG.split("\n")
+            .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
+            .join("\n");
+          const r = run(["provisioning", env], rest, tree(half));
+          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.log).toEqual([]);
+        }
+        const cur = run(["provisioning", env], rest, tree(CONFIG));
+        expect(cur.code, env).toBe(1);
+        expect(cur.log).toEqual([]);
+      }
     });
 
     it("refuses to deploy without the admin build's dist-assets/index.html", () => {
