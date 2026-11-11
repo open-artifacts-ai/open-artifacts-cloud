@@ -249,9 +249,9 @@ const CONSENT =
     <h1>Connect this agent to the {{env_name}} admin?</h1>
     <p>It acts as you, with only what you tick:</p>
     <ul>
-      <li><label><input type="checkbox" name="scope" value="installs:read" checked><div><b>Read installs<span class="mono code">installs:read</span></b><small>Installs, jobs, releases and the status of the world.</small></div></label></li>
+      <li><label><input type="checkbox" name="scope" value="installs:read" checked><div><b>Read installs and the beta waitlist<span class="mono code">installs:read</span></b><small>See installs, jobs, releases and the status of the world, and the beta waitlist (people's emails and notes) and allow list.</small></div></label></li>
       <li><label><input type="checkbox" name="scope" value="audit:read" checked><div><b>Read the audit log<span class="mono code">audit:read</span></b><small>Owner emails stay hidden.</small></div></label></li>
-      <li><label><input type="checkbox" name="scope" value="installs:write"><div><b>Create and change installs<span class="mono code">installs:write</span></b><small>Create, upgrade, roll back, pause, resume and retry.</small></div></label></li>
+      <li><label><input type="checkbox" name="scope" value="installs:write"><div><b>Change installs and the beta<span class="mono code">installs:write</span></b><small>Create, upgrade, roll back, pause, resume and retry installs, and decide who can sign up for the beta, including sending approval emails.</small></div></label></li>
       <li><label><input type="checkbox" name="scope" value="installs:delete"><div><b>Delete and restore installs<span class="mono code">installs:delete</span></b><small>Soft delete with the typed slug, restore, and remove failed creates.</small></div></label></li>
       <li><label><input type="checkbox" name="scope" value="installs:pii"><div><b>See owner emails<span class="mono code">installs:pii</span></b><small>On installs and in the audit log.</small></div></label></li>
     </ul>
