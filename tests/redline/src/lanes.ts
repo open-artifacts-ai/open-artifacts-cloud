@@ -130,6 +130,9 @@ export const CLAIMS: Record<string, Claims> = {
   // device-flow requests, which the rl-anon ledgers pace (bus-dev, bus-tok,
   // bus-code, bus-approve in src/rl-anon.ts).
   "live/bus.test.ts": { state: installs(), buckets: installBuckets() },
+  // #873: billing isolation. Reads the billing route with an admin session
+  // on each side; writes nothing (no valid /checkout body is ever sent).
+  "live/billing.test.ts": { state: installs(), buckets: installBuckets() },
   "live/surfaces.test.ts": {
     state: {
       ...installs(),
@@ -272,6 +275,7 @@ export const PLAN: readonly Phase[] = [
     shardLane("surfaces-b", "surfaces", "b", "REDLINE_SURFACES_SHARD"),
     lane("creds", "credentials"),
     lane("guard", "guard", "bus"),
+    lane("billing", "billing"),
     lane("front", "signin", "edge", "live"),
   ],
 ];
