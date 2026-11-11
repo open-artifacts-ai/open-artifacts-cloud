@@ -135,8 +135,9 @@ describe("stripe-prices", () => {
   it("copies the monthly price's tax behavior on create, and matches it when found", async () => {
     const w = world({}, { tax_behavior: "exclusive" });
     await run(ENV, w.io);
-    for (const c of w.calls.filter((c) => c.method === "POST"))
-      expect(c.form.tax_behavior).toBe("exclusive");
+    const posts = w.calls.filter((c) => c.method === "POST");
+    expect(posts).toHaveLength(2);
+    for (const c of posts) expect(c.form.tax_behavior).toBe("exclusive");
     const f = world(
       {
         oa_team_yearly: { ...good("team", 10000), tax_behavior: "exclusive" },
