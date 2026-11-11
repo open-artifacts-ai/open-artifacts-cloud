@@ -89,6 +89,8 @@ interface FJob {
   kill?: { step: string; done: boolean };
   /** P53: between the killed attempt and its retry. */
   retrying?: boolean;
+  /** P53: the error code a finished job still records from the killed attempt. */
+  trace?: string;
   sealed: string | null;
   sealedRead: boolean;
   onStep?: (step: string) => void;
@@ -171,7 +173,11 @@ export type Fault =
   /** P53: the retry is refused (another operation got there first). */
   | "p53_retry_refused"
   /** P53: the retry finishes but the install stays upgrading. */
-  | "p53_stuck_upgrading";
+  | "p53_stuck_upgrading"
+  /** P53: the retry finishes before the first poll; the job keeps the kill's error code. */
+  | "p53_fast_retry"
+  /** P53: as p53_fast_retry, but the job keeps no trace of the kill. */
+  | "p53_fast_retry_silent";
 
 export interface FakeApi {
   fetch: typeof fetch;
@@ -362,7 +368,7 @@ export function fakeApi(): FakeApi {
       ? "lease_held"
       : j.status === "failed"
         ? (j.failAt?.code ?? null)
-        : null,
+        : (j.trace ?? null),
     retryAt: null,
     actor:
       j.owner === "oidc"
@@ -441,9 +447,15 @@ export function fakeApi(): FakeApi {
     if (j.kill && !j.kill.done && j.kill.step === step) {
       // The attempt dies after its claim: the row stays upgrading under the job's lease.
       j.kill.done = true;
-      j.retrying = true;
       const i = installs.get(j.installId);
       if (i) i.state = "upgrading";
+      if (faults.has("p53_fast_retry") || faults.has("p53_fast_retry_silent")) {
+        // The retry's backoff is shorter than the poll: the job is done at the next read.
+        if (faults.has("p53_fast_retry")) j.trace = "lease_held";
+        while (j.status === "running") advance(j);
+        return;
+      }
+      j.retrying = true;
       return;
     }
     if (j.retrying) {

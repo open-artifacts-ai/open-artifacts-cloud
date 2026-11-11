@@ -2206,8 +2206,13 @@ export const PROBES: readonly Probe[] = [
         "P53 upgrade",
       );
       run.s.jobIds.push(a.job.id);
-      // (1) The first attempt is killed: the job is still running and shows a
-      // failed attempt, with the row left upgrading on the old version.
+      // (1) The first attempt is killed. Judged from the job's own record (a
+      // failed attempt: attempt > 1, or the kill's error code in
+      // lastErrorCode), never from timing. The window to see it running is
+      // the step's retry backoff, 2 minutes (apps/provisioner/src/manage.ts
+      // MANAGE_UPLOAD_STEP), against POLL_MS = 3 s; a shorter backoff, or a
+      // slow poll, can show the job already done. Then the record decides,
+      // and the in-between install state is not checked.
       const killed = await run.waitJob(a.job.id, {
         until: (j) =>
           j.status === "done" ||
@@ -2219,17 +2224,18 @@ export const PROBES: readonly Probe[] = [
         throw new ProbeFail(
           `P53: the job failed (${killed.lastErrorCode ?? killed.error?.code ?? "no code"}) before its retry took the lease${failText(killed)}`,
         );
-      if (killed.status === "done")
-        throw new ProbeFail(
-          "P53: the job finished with no failed attempt: the first attempt was never killed",
-        );
+      const sawKill = killed.attempt > 1 || killed.lastErrorCode != null;
+      // Only while the job is still running when the install is read, and
+      // the version has not moved (the retry past its upload): else skipped.
       const mid = (await ownDetail(run, p.id)).json as InstallDetail;
+      const still = (await run.v1(`/jobs/${a.job.id}`)).json as Job | undefined;
       // The API shows an upgrading row as active, with the lease held.
       if (
-        mid.state !== "active" ||
-        mid.lease?.held !== true ||
-        mid.version !== p.createdAt ||
-        mid.activeJobId !== a.job.id
+        still?.status === "running" &&
+        mid.version === p.createdAt &&
+        (mid.state !== "active" ||
+          mid.lease?.held !== true ||
+          mid.activeJobId !== a.job.id)
       )
         throw new ProbeFail(
           `P53: after the killed first attempt the install is ${mid.state} ${mid.version} (lease held ${String(mid.lease?.held)}), want the row left upgrading: active, lease held, on ${p.createdAt}, under job ${a.job.id}`,
@@ -2269,6 +2275,10 @@ export const PROBES: readonly Probe[] = [
       // P52's rows, so they are not read live. They are proved by
       // packages/provision/test/wfp-lifecycle.test.ts. (4) The chain's tail
       // deletes and purges the install; cleanupInstalls checks nothing is left.
+      if (killed.status === "done" && !sawKill)
+        return unproven(
+          `the job finished and its record shows no failed attempt: a kill cannot be told from a clean first attempt (active on ${run.c.version})`,
+        );
       return pass(
         `killed once, retried by its own job, active on ${run.c.version}`,
       );

@@ -345,7 +345,6 @@ describe("each probe fails on the behaviour it guards", () => {
       "P44",
       /P44: registration want 201 with a client_id or 429, got status 400/,
     ],
-    ["p53_no_kill", "P53", /the first attempt was never killed/],
     [
       "p53_retry_refused",
       "P53",
@@ -1293,6 +1292,18 @@ describe("each probe fails on the behaviour it guards", () => {
     expect((await runAll(f)).get("P29")).toMatch(
       /P29: 503 signups_closed: staging's SIGNUPS_ENABLED must be true or test-users/,
     );
+  });
+
+  it("P53 judges the kill from the job's record when the retry beats the first poll", async () => {
+    const f = fakeApi();
+    f.faults.add("p53_fast_retry");
+    expect(level((await runAll(f)).get("P53"))).toBe("pass");
+    const g = fakeApi();
+    g.faults.add("p53_fast_retry_silent");
+    expect((await runAll(g)).get("P53")).toMatchObject({
+      level: "unproven-live",
+      reason: expect.stringMatching(/no failed attempt/),
+    });
   });
 
   it("P16 late: the accepted upgrade runs to done, so P18, P45 and P31 test what they guard", async () => {
