@@ -231,7 +231,7 @@ describe("isAllowed", () => {
 });
 
 describe("admission by mode", () => {
-  const user = (sub: string, email: string) =>
+  const user = (sub: string, email: string, hd?: string) =>
     ({
       kind: "user",
       actorKey: `user:${sub}`,
@@ -240,6 +240,7 @@ describe("admission by mode", () => {
       scopes: [],
       sub,
       email,
+      ...(hd ? { hd } : {}),
     }) as const;
   const at = (
     mode: Env["SIGNUPS_ENABLED"],
@@ -273,7 +274,11 @@ describe("admission by mode", () => {
     await allow("ana@acme.test", "@corp.test");
     const e = at("invite");
     expect(await admission(e, user("g1", "ana@acme.test"))).toBe("admitted");
-    expect(await admission(e, user("g2", "bo@corp.test"))).toBe("admitted");
+    expect(await admission(e, user("g2", "bo@corp.test", "corp.test"))).toBe(
+      "admitted",
+    );
+    // The same address without a Workspace hd (a personal account) is not.
+    expect(await admission(e, user("g4", "bo@corp.test"))).toBe("not_invited");
     expect(await admission(e, user("rl-test-b", "t@x.test"))).toBe("admitted");
     expect(await admission(e, user("g3", "cy@evil-corp.test"))).toBe(
       "not_invited",
