@@ -582,8 +582,7 @@ export const CLIENT_JS = String.raw`(function () {
         refs.live,
         h("div", { class: "seq" }, [slot]),
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
-        refs.lab,
-        h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."])
+        refs.lab
       ]);
       refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."]);
       shell(refs.ld);
