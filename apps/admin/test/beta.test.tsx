@@ -106,11 +106,7 @@ it("Approve selected confirms: 'Approve 1 person?' for one, 'Approve 3 people?' 
   );
   expect(writes()).toHaveLength(1);
   const body = writes()[0]?.body as { subs: string[] };
-  expect([...body.subs].sort()).toEqual([
-    "sub-ines",
-    "sub-maya",
-    "sub-sam",
-  ]);
+  expect([...body.subs].sort()).toEqual(["sub-ines", "sub-maya", "sub-sam"]);
 });
 
 it("an email that didn't send is shown, and the person stays approved", async () => {

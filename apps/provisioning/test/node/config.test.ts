@@ -205,7 +205,17 @@ describe("wrangler.jsonc", () => {
           expect(k).toMatch(new RegExp(`_${env.toUpperCase()}$`));
       });
 
-      it("binds nothing else (no dispatcher, releases, email or token)", () => {
+      it("sends the approval email through the provisioner's sender (#2096)", () => {
+        // No fixed destination: each approval goes to its own address.
+        expect(e.send_email).toEqual([{ name: "WELCOME_EMAIL" }]);
+        expect(e.vars.WELCOME_FROM).toBe(
+          `{{WELCOME_FROM_${env.toUpperCase()}}}`,
+        );
+      });
+
+      // The one email binding is the approval email's sender (#2096), the
+      // provisioner's WELCOME_EMAIL; no dispatcher, releases or token.
+      it("binds nothing else (no dispatcher, releases or token)", () => {
         expect(Object.keys(e).sort()).toEqual(
           [
             "assets",
@@ -217,6 +227,7 @@ describe("wrangler.jsonc", () => {
             "preview_urls",
             "queues",
             "ratelimits",
+            "send_email",
             "services",
             "triggers",
             "vars",

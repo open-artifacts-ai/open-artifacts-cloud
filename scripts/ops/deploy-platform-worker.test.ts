@@ -757,7 +757,9 @@ describe("deploy-platform-worker.sh", () => {
         expect(snap).toContain(`"database_id": "${DB}"`);
         expect(snap).toContain(`"id": "${KV}"`);
         expect(snap).toContain('"SIGNUP_DAILY_CAP": "20"');
-        expect(snap).toContain('"WELCOME_FROM": "welcome@mail.open-artifacts.app"');
+        expect(snap).toContain(
+          '"WELCOME_FROM": "welcome@mail.open-artifacts.app"',
+        );
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
         if (env === "staging")
           expect(snap).toContain('"OIDC_REPOSITORY_ID": "1012345678"');
