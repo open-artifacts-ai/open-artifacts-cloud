@@ -3064,7 +3064,7 @@ describe("fix round 5 (security review)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     s.fake.inject((m, p) => m === "PUT" && /\/scripts\/oa-s-/.test(p), {
       status: 400,
-      message: `boom ${"x".repeat(900)}`,
+      message: `boom leo@example.com Bearer xyz ?token=abc ${"x".repeat(900)}`,
     });
     await fails(s.p.upgrade(a.id, "0.24.0"));
     const r = s
@@ -3079,13 +3079,13 @@ describe("fix round 5 (security review)", () => {
     expect(d.cf.route).toMatch(
       /^\/accounts\/[0-9a-f]{32}\/workers\/dispatch\/namespaces\/[^?]+\/scripts\/oa-s-/,
     );
-    expect(d.cf.route).not.toContain("?");
-    expect(d.cf.message.length).toBeLessThanOrEqual(500);
-    expect(d.cf.message).toContain("boom");
-    expect(JSON.stringify(d)).not.toMatch(/Bearer|token/i);
+    expect(d.cf.message.length).toBeLessThanOrEqual(300);
+    expect(d.cf.message).toContain("boom <email> ");
+    expect(JSON.stringify(d)).not.toContain("@");
     const line = warn.mock.calls
       .map((c) => String(c[0]))
       .find((l) => l.includes('"cf_error"'));
+    expect(line).not.toContain("@");
     expect(JSON.parse(line as string)).toMatchObject({
       evt: "cf_error",
       method: "PUT",
