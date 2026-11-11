@@ -1191,6 +1191,85 @@ describe("deploy-hosted-platform.sh", () => {
     }
   });
 
+  describe("the real v0.154.0 tag (fixtures): main's scripts deploy and verify every prod target", () => {
+    // The tag's own configs (scripts/ops/test-fixtures/v0.154.0/README.md),
+    // with the live state that tag produced: observability off, and no
+    // WELCOME_EMAIL on the provisioning Worker (its config predates #154).
+    const FIX = (app: string) =>
+      readFileSync(
+        join(
+          root,
+          "scripts/ops/test-fixtures/v0.154.0",
+          `${app}.wrangler.jsonc`,
+        ),
+        "utf8",
+      );
+    const APPS = [
+      "auth-broker",
+      "directory-broker",
+      "dispatch",
+      "inventory",
+      "provisioner",
+      "provisioning",
+      "scheduler",
+    ];
+    // billing is staging only: the script refuses it on prod.
+    const configs = Object.fromEntries(APPS.map((a) => [a, FIX(a)]));
+    const PROD_WORKERS = [
+      "oa-p-auth-broker",
+      "oa-p-directory-broker",
+      "oa-p-provisioner",
+      "oa-p-provisioning",
+    ];
+    const live = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.observability = { enabled: false };
+      return JSON.stringify(next);
+    };
+    const tagLive = (app: "provisioner" | "provisioning") => {
+      const key = `oa-p-${app}`;
+      const next = JSON.parse(live(key));
+      if (app === "provisioning")
+        next.result.bindings = next.result.bindings.filter(
+          (b: { name: string }) => !b.name.startsWith("WELCOME_"),
+        );
+      return JSON.stringify(next);
+    };
+    const invVars = committedVars(FIX("inventory"), "prod", {
+      GITHUB_REPOSITORY_ID: REPO_ID,
+    });
+    const invLive = settingsOff([
+      { type: "d1", name: "PLATFORM_DB", id: DB },
+      { type: "kv_namespace", name: "HOSTS", namespace_id: HOSTS },
+      ...Object.entries(invVars).map(([name, text]) => ({
+        type: "plain_text",
+        name,
+        text,
+      })),
+    ]);
+    for (const target of APPS) {
+      it(`${target}`, () => {
+        const next: Record<string, string> = {};
+        if (target === "provisioner" || target === "provisioning")
+          next[`oa-p-${target}`] = tagLive(target);
+        if (target === "inventory") next["oa-p-inventory"] = invLive;
+        const r = setup({
+          configs,
+          exists: [...PROD_WORKERS, ...SCHED_DEPS("p")],
+          next,
+        }).run(
+          target,
+          target === "inventory"
+            ? { GITHUB_REPOSITORY: invVars.OIDC_REPOSITORY ?? "o/r" }
+            : {},
+        );
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`prod ${target}: deployed and verified`);
+      });
+    }
+  });
+
   describe("the scheduler's alert wiring (#915's placeholders, or none before it)", () => {
     // #915's config, and the repo's own once it carries the placeholders.
     const PINNED = [
