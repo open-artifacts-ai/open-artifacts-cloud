@@ -3058,6 +3058,43 @@ describe("fix round 5 (security review)", () => {
     expect(s.audit(g)).toContain("create.aborted");
   });
 
+  it("2b: an upgrade aborted by a Cloudflare error records the call that failed", async () => {
+    const s = setup();
+    const a = keep(await s.p.create(input("alpha")));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    s.fake.inject((m, p) => m === "PUT" && /\/scripts\/oa-s-/.test(p), {
+      status: 400,
+      message: `boom ${"x".repeat(900)}`,
+    });
+    await fails(s.p.upgrade(a.id, "0.24.0"));
+    const r = s
+      .db()
+      .prepare(
+        "SELECT detail FROM hosted_audit WHERE install_id = ? AND action = 'upgrade.aborted'",
+      )
+      .get(a.id) as { detail: string };
+    const d = JSON.parse(r.detail);
+    expect(d.error).toBe("CfError");
+    expect(d.cf).toMatchObject({ method: "PUT", status: 400 });
+    expect(d.cf.route).toMatch(
+      /^\/accounts\/[0-9a-f]{32}\/workers\/dispatch\/namespaces\/[^?]+\/scripts\/oa-s-/,
+    );
+    expect(d.cf.route).not.toContain("?");
+    expect(d.cf.message.length).toBeLessThanOrEqual(500);
+    expect(d.cf.message).toContain("boom");
+    expect(JSON.stringify(d)).not.toMatch(/Bearer|token/i);
+    const line = warn.mock.calls
+      .map((c) => String(c[0]))
+      .find((l) => l.includes('"cf_error"'));
+    expect(JSON.parse(line as string)).toMatchObject({
+      evt: "cf_error",
+      method: "PUT",
+      status: 400,
+      route: d.cf.route,
+    });
+    warn.mockRestore();
+  });
+
   it("3: the DO tag actually reached is stored in installs and install_versions", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input()));
