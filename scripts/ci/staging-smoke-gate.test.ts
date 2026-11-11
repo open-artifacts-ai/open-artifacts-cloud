@@ -201,14 +201,46 @@ describe("staging-smoke-gate.sh", () => {
         conclusion: null,
         run_started_at: "2026-11-03T12:00:00Z",
       });
-      const r = gate([newer, runOf()]);
+      const r = gate([newer, runOf()], {
+        jobs: { "9": jobsOf("success"), "10": jobsOf(null) },
+      });
       expect(r.code, status).toBe(0);
       expect(r.out, status).toContain(
         "ignoring deploy-staging.yml run(s) 10, not completed yet",
       );
       expect(r.out, status).toContain("green in run 9");
-      expect(r.log.some((l) => l.includes("/runs/10/"))).toBe(false);
     }
+  });
+
+  it("a fresh in-progress run whose smoke already failed blocks; one whose smoke has not concluded is ignored", () => {
+    const fresh = runOf({
+      id: 10,
+      status: "in_progress",
+      conclusion: null,
+      run_started_at: "2026-11-03T12:00:00Z",
+    });
+    for (const smoke of ["failure", "cancelled", "skipped"]) {
+      const r = gate([fresh, runOf()], {
+        jobs: { "9": jobsOf("success"), "10": jobsOf(smoke) },
+      });
+      expect(r.code, smoke).toBe(1);
+      expect(r.err, smoke).toContain(
+        `run 10's smoke ${smoke}; its run is still finishing`,
+      );
+    }
+    for (const smoke of [null, "success"]) {
+      const r = gate([fresh, runOf()], {
+        jobs: { "9": jobsOf("success"), "10": jobsOf(smoke) },
+      });
+      expect(r.code, String(smoke)).toBe(0);
+    }
+    const noSmoke = gate([fresh, runOf()], {
+      jobs: {
+        "9": jobsOf("success"),
+        "10": jobsOf("success").filter((j) => j.name !== "smoke"),
+      },
+    });
+    expect(noSmoke.code).toBe(0);
   });
 
   it("a newer completed red run still blocks, even beside an in-progress one", () => {
@@ -220,7 +252,11 @@ describe("staging-smoke-gate.sh", () => {
       run_started_at: "2026-11-03T12:00:00Z",
     });
     const r = gate([running, red, runOf()], {
-      jobs: { "9": jobsOf("success"), "10": jobsOf("failure") },
+      jobs: {
+        "9": jobsOf("success"),
+        "10": jobsOf("failure"),
+        "11": jobsOf(null),
+      },
     });
     expect(r.code).toBe(1);
     expect(r.err).toContain("run 10's smoke job: failure");
@@ -229,15 +265,18 @@ describe("staging-smoke-gate.sh", () => {
   it("refuses when no completed run is at or after the tag", () => {
     // Only an in-progress run exists.
     const running = runOf({ status: "in_progress", conclusion: null });
-    const a = gate([running]);
+    const a = gate([running], { jobs: { "9": jobsOf(null) } });
     expect(a.code).toBe(1);
     expect(a.err).toContain("no completed deploy-staging.yml run on main");
     expect(a.out).toContain("ignoring deploy-staging.yml run(s) 9");
     // The only completed run is before the tag.
-    const b = gate([runOf(), { ...running, id: 10 }], { compare: "behind" });
+    const b = gate([runOf(), { ...running, id: 10 }], {
+      compare: "behind",
+      jobs: { "9": jobsOf("success"), "10": jobsOf(null) },
+    });
     expect(b.code).toBe(1);
     expect(b.err).toContain("is not at or after");
-    expect(b.log.some((l) => l.includes("/jobs"))).toBe(false);
+    expect(b.log.some((l) => l.includes("/runs/9/jobs"))).toBe(false);
   });
 
   it("a run being re-run (attempt > 1) blocks: the older green run never vouches for it", () => {
@@ -257,7 +296,11 @@ describe("staging-smoke-gate.sh", () => {
     expect(r.log.some((l) => l.includes("/jobs"))).toBe(false);
     expect(r.log[1]).not.toContain("status=");
     // A fresh in-progress run (attempt 1) is still ignored.
-    expect(gate([{ ...rerunning, run_attempt: 1 }, runOf()]).code).toBe(0);
+    expect(
+      gate([{ ...rerunning, run_attempt: 1 }, runOf()], {
+        jobs: { "9": jobsOf("success"), "10": jobsOf(null) },
+      }).code,
+    ).toBe(0);
   });
 
   it("skips runs that are not pushes on main of this repository", () => {

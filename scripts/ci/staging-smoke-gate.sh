@@ -16,7 +16,10 @@
 # has a green smoke. Only a fresh run (run_attempt 1, no earlier verdict) is
 # ignored: an in-progress run with run_attempt > 1 is a re-run of one that
 # already ran, so the gate refuses ("previous attempt failed and is being
-# re-run; wait for it") rather than pass on an older green run.
+# re-run; wait for it") rather than pass on an older green run. A fresh
+# in-progress run whose smoke job already concluded red or cancelled also
+# blocks ("smoke failed; its run is still finishing"): its report job keeps
+# the run in progress after the smoke is known.
 #   1. Its head is the tag's commit or a descendant of it
 #      (compare/<tag sha>...<head> is "identical" or "ahead"), and on main
 #      (compare/main...<head> is "identical" or "behind").
@@ -74,6 +77,22 @@ run="$(jq -r --arg repo "$PUBLIC_REPO" '
   fail "unparsable deploy-staging.yml runs"
 read -r run skipped head rerun <<< "$run" || true
 [ "${rerun:--}" = - ] || fail "run $rerun's previous attempt failed and is being re-run; wait for it"
+if [ "$skipped" != - ]; then
+  # A fresh run stays in progress while its `report` job runs after a failed
+  # smoke, so read each ignored run's smoke job: one that concluded without
+  # success blocks. Ignore it only while smoke is running or not started.
+  IFS=, read -ra ids <<< "$skipped"
+  for id in "${ids[@]}"; do
+    [[ "$id" =~ ^[1-9][0-9]{0,19}$ ]] || fail "unparsable deploy-staging.yml runs"
+    c="$(api "run $id's jobs" "$R/actions/runs/$id/jobs?filter=latest&per_page=100" |
+      jq -r '[.jobs[] | select(.name == "smoke") | (.conclusion // "")] | if length == 1 then .[0] else "" end' 2> /dev/null)" ||
+      fail "unparsable jobs of run $id"
+    case "$c" in
+      "" | success) ;;
+      *) fail "run $id's smoke $c; its run is still finishing" ;;
+    esac
+  done
+fi
 [ "$skipped" = - ] || echo "staging smoke: ignoring deploy-staging.yml run(s) $skipped, not completed yet"
 [ "$run" != 0 ] || fail "no completed deploy-staging.yml run on main"
 [[ "$run" =~ ^[1-9][0-9]{0,19}$ ]] || fail "unparsable deploy-staging.yml runs"
