@@ -407,6 +407,27 @@ describe("hosted-constants.sh", () => {
     ).toBe(1);
   });
 
+  it("the yearly Team and Business prices are optional, validated when present", () => {
+    const st = load(read("staging"), "staging");
+    expect(st.ghEnv).not.toContain("_YEARLY=price_team");
+    const ok = load(
+      {
+        ...read("staging"),
+        stripe_price_team_yearly: "price_1TeamY",
+        stripe_price_business_yearly: "price_1BizY",
+      },
+      "staging",
+    );
+    expect(ok.code, ok.err).toBe(0);
+    expect(ok.ghEnv).toContain("STRIPE_PRICE_TEAM_YEARLY=price_1TeamY\n");
+    expect(ok.ghEnv).toContain("STRIPE_PRICE_BUSINESS_YEARLY=price_1BizY\n");
+    const bad = load(
+      { ...read("staging"), stripe_price_team_yearly: "prod_1" },
+      "staging",
+    );
+    expect(bad.code).toBe(1);
+  });
+
   it("staging loads the four prices as STRIPE_PRICE_*; a missing or malformed one fails and writes nothing", () => {
     const st = load(read("staging"), "staging");
     expect(st.code, st.err).toBe(0);

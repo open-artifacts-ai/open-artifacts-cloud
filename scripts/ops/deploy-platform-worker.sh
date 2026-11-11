@@ -13,6 +13,7 @@
 #   billing: BILLING_DB_ID=<D1 uuid> BROKER_REGISTRY_ID=<32 hex>
 #            STRIPE_PRICE_TEAM=<price_...> STRIPE_PRICE_BUSINESS=<price_...>
 #            STRIPE_PRICE_SOLO_MONTHLY=<price_...> STRIPE_PRICE_SOLO_YEARLY=<price_...>
+#            [STRIPE_PRICE_TEAM_YEARLY=<price_...> STRIPE_PRICE_BUSINESS_YEARLY=<price_...>]
 #   dispatch: HOSTS_KV_ID=<32 hex>
 #   scheduler: PLATFORM_DB_ID=<uuid> EMAIL_ZONE_TAGS=<32 hex>[,...] (at most 10) EMAIL_DAILY_LIMIT=<1-9 digits>
 #              ALERT_TO=<address> ALERT_FROM=<address> SIGNUP_DAILY_CAP=<1-9999>
@@ -106,6 +107,16 @@ fill() {
   command rm -f "$copy.bak"
 }
 
+# fill_opt <placeholder> <value>: like fill for a price id, but unset means empty.
+fill_opt() {
+  if [ -z "$2" ]; then
+    sed -i.bak "s/{{$1}}//g" "$copy"
+    command rm -f "$copy.bak"
+  else
+    fill "$1" "$2" "$price"
+  fi
+}
+
 cp wrangler.jsonc "$copy"
 case "$app" in
   auth-broker)
@@ -135,6 +146,10 @@ case "$app" in
     # Solo's two prices (#1568), one per billing interval.
     fill "STRIPE_PRICE_SOLO_MONTHLY_${up}" "${STRIPE_PRICE_SOLO_MONTHLY:-}" "$price"
     fill "STRIPE_PRICE_SOLO_YEARLY_${up}" "${STRIPE_PRICE_SOLO_YEARLY:-}" "$price"
+    # The per-creator yearly Team and Business prices: optional until made
+    # (scripts/ops/stripe-prices.ts); unset deploys them empty.
+    fill_opt "STRIPE_PRICE_TEAM_YEARLY_${up}" "${STRIPE_PRICE_TEAM_YEARLY:-}"
+    fill_opt "STRIPE_PRICE_BUSINESS_YEARLY_${up}" "${STRIPE_PRICE_BUSINESS_YEARLY:-}"
     # Its D1 migrations are pinned once deployed: the lock must be frozen and
     # match every file (MIGRATION_LOCK overrides the lock path, tests only).
     node ../../scripts/ops/check-migration-lock.mjs migrations "${MIGRATION_LOCK:-migration-lock.json}"

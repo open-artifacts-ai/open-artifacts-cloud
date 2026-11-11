@@ -15,7 +15,8 @@
 # STAGING ONLY (#1568): the billing service's four Stripe test-mode price ids
 # (stripe_price_team, _business, _solo_monthly, _solo_yearly: not secrets) load
 # as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS, STRIPE_PRICE_SOLO_MONTHLY and
-# STRIPE_PRICE_SOLO_YEARLY, each a price id. Prod's file must hold no stripe_*
+# STRIPE_PRICE_SOLO_YEARLY, each a price id; stripe_price_team_yearly and
+# stripe_price_business_yearly are optional (STRIPE_PRICE_TEAM_YEARLY, _BUSINESS_YEARLY). Prod's file must hold no stripe_*
 # key (prod has no billing Worker, and no Stripe value reaches its run).
 # PROD ONLY (#40): signup_deploy, exactly "on" or "off" (case-sensitive, a
 # string), loads as PROD_SIGNUP_DEPLOY: prod's sign-up steps (the signup.<app>
@@ -76,6 +77,15 @@ stripe_price_business STRIPE_PRICE_BUSINESS $price
 stripe_price_solo_monthly STRIPE_PRICE_SOLO_MONTHLY $price
 stripe_price_solo_yearly STRIPE_PRICE_SOLO_YEARLY $price
 LIST
+  # The yearly Team and Business prices: optional until the ops script has
+  # made them; when present they must be price ids.
+  for pair in stripe_price_team_yearly:STRIPE_PRICE_TEAM_YEARLY stripe_price_business_yearly:STRIPE_PRICE_BUSINESS_YEARLY; do
+    k="${pair%%:*}"; name="${pair##*:}"
+    v="$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else "" end' "$file")" || exit 1
+    [ -n "$v" ] || continue
+    [[ "$v" =~ $price ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
+    lines+="$name=$v"$'\n'
+  done
 else
   [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
     { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }
