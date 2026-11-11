@@ -36,6 +36,12 @@ jobs:
           TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           HOSTED_DIR: .github/hosted
         run: bash scripts/ci/token-ping.sh staging
+      - name: Probe R2 read access (prints status lines only)
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: .github/hosted
+        run: bash scripts/ci/token-ping.sh staging r2
 
   repo-cloudflare:
     if: github.ref == 'refs/heads/main' && inputs.target == 'repo/CLOUDFLARE_API_TOKEN'
@@ -54,6 +60,12 @@ jobs:
           TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           HOSTED_DIR: .github/hosted
         run: bash scripts/ci/token-ping.sh staging
+      - name: Probe R2 read access (prints status lines only)
+        if: ${{ !cancelled() }}
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: .github/hosted
+        run: bash scripts/ci/token-ping.sh staging r2
 
   repo-analytics:
     if: github.ref == 'refs/heads/main' && inputs.target == 'repo/ANALYTICS_TOKEN'
