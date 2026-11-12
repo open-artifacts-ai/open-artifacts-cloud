@@ -649,7 +649,7 @@ export const CLIENT_JS = String.raw`(function () {
         head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
         steps = [reserve, step("done", create), step("done", email)];
       } else {
-        head = [h("h1", {}, ["Welcome back"]),
+        head = [h("h1", {}, ["Log in"]),
           h("div", { class: "who" }, [
             h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
             h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])

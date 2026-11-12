@@ -133,7 +133,7 @@ const STAGE_HEADING: Record<string, RegExp> = {
   queued: /^Setting up acme\.open-artifacts\.app$/,
   waiting_cap: /^Setting up acme\.open-artifacts\.app$/,
   creating: /^Setting up acme\.open-artifacts\.app$/,
-  ready: /^Welcome back$/,
+  ready: /^Log in$/,
   failed: /^We couldn't set up acme\.open-artifacts\.app$/,
 };
 
@@ -777,7 +777,7 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
       nav: (window as unknown as { __nav: string[] }).__nav,
     }));
   await expect.poll(dom).toEqual({
-    h1: "Welcome back",
+    h1: "Log in",
     who: "Logged in as ada@acme.comNot you?",
     line: "You have acme.open-artifacts.app.",
     steps: 0,
@@ -790,7 +790,7 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
   expect((await dom()).btn).toEqual(["Open acme.open-artifacts.app"]);
   // a reload in the same tab session does not redirect again
   await page.reload();
-  await expect(page.locator("h1")).toHaveText("Welcome back");
+  await expect(page.locator("h1")).toHaveText("Log in");
   await expect(
     page.getByRole("link", { name: "Open acme.open-artifacts.app" }),
   ).toBeVisible();
@@ -861,7 +861,7 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   "setup-returning": {
     me: true,
     stage: "ready",
-    act: (p) => p.locator("h1").filter({ hasText: "Welcome back" }).waitFor(),
+    act: (p) => p.locator("h1").filter({ hasText: "Log in" }).waitFor(),
   },
   "setup-returning-fallback": {
     me: true,
