@@ -25,6 +25,7 @@ export {
   type PortalInput,
   type QuantityInput,
   type QuantityOutcome,
+  retrieveCustomerPaymentMethod,
   retrieveInvoiceStatus,
   retrieveSubscription,
   SOLO_TRIAL_DAYS,

@@ -55,6 +55,7 @@ import {
   findOverageItem,
   handleStripeWebhook,
   pruneStripeEvents,
+  retrieveCustomerPaymentMethod,
   retrieveInvoiceStatus,
   SET_TIER_TIERS,
   type SetTierError,
@@ -1102,8 +1103,13 @@ function usageRefusal(e: StripeFailure): Response | null {
   return permanent ? null : e.res;
 }
 
-/** The monthly per-creator price in cents; yearly overage bills at this. */
-const MONTHLY_CENTS = { team: 1000, business: 2500 } as const;
+/**
+ * The monthly per-creator price in cents (usd): $10 Team, $25 Business. A
+ * yearly subscription's extra creators bill at the same price as the monthly
+ * plans (the Stripe prices behind STRIPE_PRICE_TEAM and _BUSINESS), so change
+ * this with them; a test pins it.
+ */
+export const MONTHLY_CENTS = { team: 1000, business: 2500 } as const;
 const OVERAGE_SQL =
   "SELECT seats, quantity, unit_amount, item_id, invoice_id, outcome, generation FROM overage WHERE install_id = ?1 AND month = ?2";
 const OVERAGE_INSERT_SQL =
@@ -1156,6 +1162,11 @@ async function billOverage(
   seats: number,
   tier: "team" | "business",
   customerId: string,
+  sub: {
+    defaultPaymentMethod: string | null;
+    billingCycleAnchor: number | null;
+    startDate: number | null;
+  },
   now: number,
 ): Promise<Response | null> {
   const db = env.BILLING_DB;
@@ -1168,6 +1179,18 @@ async function billOverage(
     db.prepare(OVERAGE_SQL).bind(install, month).first<OverageRow>();
   let row = await read();
   if (!row) {
+    // Only months that start on or after the yearly term are billed: the
+    // seats cover the term, and earlier months were on the monthly plan.
+    // The term starts at the billing cycle anchor, which Stripe resets when
+    // a monthly subscription switches to yearly (else the start date). With
+    // neither, nothing is billed (no_term_start) rather than guessed.
+    const termStart = sub.billingCycleAnchor ?? sub.startDate;
+    if (termStart === null) {
+      console.error("billing usage overage no term start", install);
+      return done("no_term_start");
+    }
+    if (Date.parse(`${month}-01T00:00:00Z`) / 1000 < termStart)
+      return done("before_term");
     const extra = count - seats;
     if (extra <= 0) return done("overage_none");
     await db
@@ -1233,12 +1256,31 @@ async function billOverage(
       const found = await stripe(install, () =>
         findOverageInvoice({ customerId, install, month }, cfg),
       );
+      // A one-off invoice does not inherit the subscription's card: Checkout
+      // saves it on the subscription, so use that, else the customer's own
+      // default. With neither, create and finalize nothing; a repeat report
+      // of the month tries again.
+      let paymentMethodId: string | null = null;
+      if (!found) {
+        const pm = sub.defaultPaymentMethod;
+        paymentMethodId =
+          pm ??
+          (await stripe(install, () =>
+            retrieveCustomerPaymentMethod({ customerId }, cfg),
+          ));
+        if (!paymentMethodId) {
+          console.error("billing usage overage no payment method", install);
+          return done("no_payment_method");
+        }
+      }
+      const pmId = paymentMethodId;
       invoiceId =
         found ??
         (await stripe(install, () =>
           createOverageInvoice(
             {
               customerId,
+              paymentMethodId: pmId ?? "",
               install,
               month,
               idempotencyKey: `ovg-inv-${install}-${month}-g${gen}`,
@@ -1413,6 +1455,11 @@ async function applyQuantity(
         r.item.quantity,
         row.tier,
         row.stripe_customer_id,
+        r.subscription ?? {
+          defaultPaymentMethod: null,
+          billingCycleAnchor: null,
+          startDate: null,
+        },
         now,
       );
   }

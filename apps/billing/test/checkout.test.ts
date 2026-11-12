@@ -17,6 +17,7 @@ import billing, {
   BillingOperatorRpc,
   type Env,
   MAX_CREATORS,
+  MONTHLY_CENTS,
   pricesCollide,
 } from "../src/index.js";
 
@@ -2172,11 +2173,26 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       .run();
   }
   const subscription = (
-    o: { price?: string; interval?: string; seats?: number } = {},
+    o: {
+      price?: string;
+      interval?: string;
+      seats?: number;
+      /** The subscription's card (default pm_card1; null = none). */
+      pm?: string | null;
+      /** billing_cycle_anchor, epoch s (default 2001; null = absent). */
+      anchor?: number | null;
+      /** start_date, epoch s (default 2001; null = absent). */
+      start?: number | null;
+    } = {},
   ) =>
     Response.json({
       id: SUB,
       status: "active",
+      ...(o.pm === null ? {} : { default_payment_method: o.pm ?? "pm_card1" }),
+      ...(o.anchor === null
+        ? {}
+        : { billing_cycle_anchor: o.anchor ?? 1_000_000_000 }),
+      ...(o.start === null ? {} : { start_date: o.start ?? 1_000_000_000 }),
       items: {
         data: [
           {
@@ -2222,6 +2238,8 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     ledger?: Ledger;
     fail?: Record<string, number>;
     lose?: Record<string, boolean>;
+    /** The customer's invoice_settings.default_payment_method. */
+    customerPm?: string;
   };
   const metaOf = (form: Record<string, string>) => ({
     kind: form["metadata[kind]"] ?? "",
@@ -2237,6 +2255,11 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
         return Response.json({ error: { type: "x" } }, { status: bad });
       let out: Response | undefined;
       if (key === `GET ${SUBS}`) return subscription(o.sub);
+      if (key === "GET /v1/customers/cus_existingA")
+        return Response.json({
+          id: "cus_existingA",
+          invoice_settings: { default_payment_method: o.customerPm ?? null },
+        });
       // A repeated Idempotency-Key replays the first answer, no effect.
       const replayed = c.key ? L.replay.get(c.key) : undefined;
       if (replayed !== undefined) return Response.json(replayed);
@@ -2354,6 +2377,8 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       pending_invoice_items_behavior: "exclude",
       // The draft never advances on its own; only the finalize does.
       auto_advance: "false",
+      // A one-off invoice has no card of its own: the subscription's is used.
+      default_payment_method: "pm_card1",
       ...meta,
     });
     // Finalize turns auto_advance on: without it the invoice is never charged.
@@ -2663,6 +2688,117 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     expect(s.calls.every((c) => c.key === null || /-g0$/.test(c.key))).toBe(
       true,
     );
+  });
+
+  it("the draft invoice takes the customer's default card when the subscription has none", async () => {
+    await live();
+    const s = fake({ sub: { pm: null }, customerPm: "pm_cust1" });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("GET /v1/customers/cus_existingA");
+    expect(
+      s.calls.find((c) => c.path === "/v1/invoices" && c.method === "POST")
+        ?.form.default_payment_method,
+    ).toBe("pm_cust1");
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("the subscription's card is used without asking the customer", async () => {
+    await live();
+    const s = fake({ customerPm: "pm_cust1" });
+    await send(closed, 5);
+    expect(paths(s)).not.toContain("GET /v1/customers/cus_existingA");
+  });
+
+  it("no card anywhere: nothing is created or finalized, the outcome is recorded and logged, and a repeat report tries again", async () => {
+    await live();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const L = newLedger();
+    const s = fake({ ledger: L, sub: { pm: null } });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect(paths(s)).not.toContain("POST /v1/invoiceitems");
+    expect([L.invoices.length, L.items.length, L.finalizes.length]).toEqual([
+      0, 0, 0,
+    ]);
+    expect(await outcomeOf()).toBe("no_payment_method");
+    expect(await overageRow()).toMatchObject({
+      invoice_id: null,
+      outcome: "pending",
+    });
+    expect(
+      err.mock.calls.some((c) => String(c[0]).includes("no payment method")),
+    ).toBe(true);
+    // The customer adds a card; the month is reported again.
+    fake({ ledger: L, sub: { pm: null }, customerPm: "pm_later1" });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+    expect(L.invoices).toHaveLength(1);
+  });
+
+  describe("only months in the yearly term are billed", () => {
+    const monthStart = (m: string) => Date.parse(`${m}-01T00:00:00Z`) / 1000;
+    const none = async (month: string, outcome: string, sub: object) => {
+      const s = fake({ sub });
+      expect((await send(month, 9)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      const r = await db
+        .prepare(
+          "SELECT apply_outcome AS o FROM usage WHERE install_id = ?1 AND month = ?2",
+        )
+        .bind(A, month)
+        .first<{ o: string }>();
+      expect(r?.o).toBe(outcome);
+      expect(
+        await db
+          .prepare("SELECT count(*) AS n FROM overage")
+          .first<{ n: number }>(),
+      ).toEqual({ n: 0 });
+    };
+
+    it("a monthly subscription switched to yearly this month: the earlier months are before_term, with no Stripe write", async () => {
+      await live();
+      // The switch reset the anchor to the start of the open month.
+      const anchor = monthStart(shift(0));
+      await none(closed, "before_term", { anchor });
+      await none(shift(-2), "before_term", { anchor });
+    });
+
+    it("a switch in the middle of the closed month: that month is before_term; the next is billed", async () => {
+      await live();
+      const anchor = monthStart(closed) + 10 * 86_400;
+      await none(closed, "before_term", { anchor });
+    });
+
+    it("a month that starts exactly at the term start is billed", async () => {
+      await live();
+      const s = fake({ sub: { anchor: monthStart(closed) } });
+      expect((await send(closed, 5)).status).toBe(200);
+      expect(paths(s)).toContain("POST /v1/invoices");
+      expect((await overageRow())?.outcome).toBe("invoiced");
+    });
+
+    it("falls back to start_date when there is no anchor; with neither, nothing is billed", async () => {
+      await live();
+      await none(closed, "before_term", {
+        anchor: null,
+        start: monthStart(shift(0)),
+      });
+      await db.prepare("DELETE FROM usage").run();
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      await none(closed, "no_term_start", { anchor: null, start: null });
+      expect(err).toHaveBeenCalled();
+    });
+  });
+
+  it("the monthly price is $10 Team and $25 Business, in usd", async () => {
+    expect(MONTHLY_CENTS).toEqual({ team: 1000, business: 2500 });
+    await live();
+    const s = fake();
+    await send(closed, 5);
+    expect(
+      s.calls.find((c) => c.method === "POST" && c.path === "/v1/invoiceitems")
+        ?.form,
+    ).toMatchObject({ currency: "usd", unit_amount: "1000" });
   });
 
   it("401, 403, 409, 429, 5xx and network errors are retried; other 4xx are logged and the 200 stands", async () => {

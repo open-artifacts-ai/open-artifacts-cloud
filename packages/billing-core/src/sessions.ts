@@ -471,6 +471,14 @@ export interface QuantityInput {
   idempotencyKey: string;
 }
 
+const PAYMENT_METHOD = /^pm_[A-Za-z0-9_]{1,255}$/;
+/** A Stripe id that may come as a string or an expanded object. */
+const idString = (v: unknown, re: RegExp): string | null => {
+  const id =
+    typeof v === "object" && v !== null ? (v as { id?: unknown }).id : v;
+  return typeof id === "string" && re.test(id) ? id : null;
+};
+
 /** Stripe statuses whose quantity follows the creator count. */
 const QUANTITY_LIVE = new Set(["active", "past_due"]);
 const SUBSCRIPTION_ITEM = /^si_[A-Za-z0-9]{1,255}$/;
@@ -492,6 +500,16 @@ export async function setSubscriptionQuantity(
   previous?: number;
   /** With not_monthly on a one-item subscription: what that item is. */
   item?: { priceId: string; interval: string | null; quantity: number | null };
+  /**
+   * With not_monthly: the subscription's payment method and when its current
+   * billing cycle began (epoch seconds; Stripe resets it when the interval
+   * changes, so a monthly-to-yearly switch moves it to the switch).
+   */
+  subscription?: {
+    defaultPaymentMethod: string | null;
+    billingCycleAnchor: number | null;
+    startDate: number | null;
+  };
 }> {
   const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
   const quantity = input.quantity;
@@ -541,6 +559,17 @@ export async function setSubscriptionQuantity(
             ? item.price.recurring.interval
             : null,
         quantity: typeof item.quantity === "number" ? item.quantity : null,
+      },
+      subscription: {
+        defaultPaymentMethod: idString(
+          out.default_payment_method,
+          PAYMENT_METHOD,
+        ),
+        billingCycleAnchor:
+          typeof out.billing_cycle_anchor === "number"
+            ? out.billing_cycle_anchor
+            : null,
+        startDate: typeof out.start_date === "number" ? out.start_date : null,
       },
     };
   const previous =
@@ -645,17 +674,21 @@ export async function createOverageInvoice(
     customerId: string;
     install: string;
     month: string;
+    /** The card to charge: a one-off invoice does not inherit the subscription's. */
+    paymentMethodId: string;
     idempotencyKey: string;
   },
   cfg: StripeConfig,
 ): Promise<string> {
   check(CUSTOMER, "customerId", input.customerId);
+  check(PAYMENT_METHOD, "paymentMethodId", input.paymentMethodId);
   check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
   const { status, out } = await post(
     cfg,
     "/v1/invoices",
     {
       customer: input.customerId,
+      default_payment_method: input.paymentMethodId,
       collection_method: "charge_automatically",
       pending_invoice_items_behavior: "exclude",
       auto_advance: "false",
@@ -664,6 +697,25 @@ export async function createOverageInvoice(
     input.idempotencyKey,
   );
   return idOf(out, INVOICE, status);
+}
+
+/**
+ * The customer's invoice_settings.default_payment_method, or null. Checkout
+ * saves the card on the subscription, so this is only the fallback.
+ */
+export async function retrieveCustomerPaymentMethod(
+  input: { customerId: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const id = check(CUSTOMER, "customerId", input.customerId);
+  const { out } = await send(cfg, "GET", `/v1/customers/${id}`, null, null);
+  const s = out?.invoice_settings;
+  return idString(
+    typeof s === "object" && s !== null
+      ? (s as { default_payment_method?: unknown }).default_payment_method
+      : null,
+    PAYMENT_METHOD,
+  );
 }
 
 const metaOf = (o: unknown): Record<string, unknown> =>
