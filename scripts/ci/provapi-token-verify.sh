@@ -299,7 +299,7 @@ verify_summary() {
 }
 
 main() {
-  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: $0 <staging|prod> [verify|summary]" >&2; exit 2; }
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: $0 <staging|prod> [verify|summary|sending]" >&2; exit 2; }
   case "$1" in staging | prod) ENV="$1" ;; *) echo "unknown env: $1" >&2; exit 2 ;; esac
   if [ "${2:-verify}" != sending ]; then
     : "${RESULTS_DIR:?RESULTS_DIR is required}"
