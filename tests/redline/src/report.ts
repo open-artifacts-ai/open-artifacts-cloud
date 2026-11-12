@@ -486,6 +486,12 @@ export interface AcceptedUnproven {
   evidence: string;
 }
 /**
+ * The start of a hosted bus failure that is a breach (src/hosted-bus.ts
+ * BreachFail): a 101 where none may be. notGating never converts it.
+ */
+export const BREACH_MARK = "BREACH:";
+
+/**
  * The reason live/bus.test.ts reports when a hosted bus case fails (cloud
  * #202): the two cases run and report, but don't gate, for one release.
  */
@@ -626,6 +632,8 @@ const accepted = (c: CaseResult, run: RunKind) =>
  */
 export function notGating(c: CaseResult): CaseResult {
   if (c.level !== "fail" && c.level !== "infra") return c;
+  // OA Bus M1: a breach (a forbidden 101) gates the run whatever applies.
+  if (c.reason?.includes(BREACH_MARK)) return c;
   const hit = ACCEPTED_UNPROVEN.some(
     (e) =>
       e.reason === HOSTED_BUS_NOT_GATING &&

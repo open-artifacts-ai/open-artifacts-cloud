@@ -1,8 +1,12 @@
 import { afterAll, describe, it } from "vitest";
 import {
+  BreachFail,
   BUS_CASE_TIMEOUT_MS,
+  BUS_CLEANUP_TIMEOUT_MS,
+  CASE_JOB_WITHIN_MS,
   CROSS_CASE_TIMEOUT_MS,
   crossInstallCase,
+  ensureResumed,
   type LivePair,
   liveCrossIo,
   livePair,
@@ -77,6 +81,8 @@ async function notGating(
   try {
     label(ctx, await Promise.race([p.then(body), late]));
   } catch (e) {
+    // OA Bus M1: a breach gates the run even while the cases don't.
+    if (e instanceof BreachFail) throw e;
     label(
       ctx,
       `would fail: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500),
@@ -87,10 +93,22 @@ async function notGating(
   }
 }
 
+// OA Bus M3: a case that ran out of time doesn't stop suspendCase, so rl-busb
+// may still be suspended here: resume it (bounded, logged), then revoke this
+// run's machines. The revoke step resumes it too if this could not.
 afterAll(async () => {
   for (const h of held) h.destroy();
+  const l = await live?.catch(() => undefined);
+  if (l)
+    await ensureResumed(
+      l.run,
+      l.pair.busb.installId,
+      l.pair.busb.name,
+      CASE_JOB_WITHIN_MS,
+      (s) => process.stdout.write(`bus cleanup: ${s}`),
+    );
   await minted.cleanup();
-});
+}, BUS_CLEANUP_TIMEOUT_MS);
 
 describe("bus", () => {
   it(

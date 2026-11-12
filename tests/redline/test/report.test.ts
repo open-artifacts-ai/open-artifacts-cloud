@@ -17,6 +17,7 @@ import {
 } from "../src/capture.ts";
 import {
   ACCEPTED_UNPROVEN,
+  BREACH_MARK,
   buildReport,
   type CaseResult,
   exitCode,
@@ -355,6 +356,20 @@ describe("gate", () => {
             gatePasses([ok, { ...red, file: "live/copied.test.ts" }]),
           ).toBe(false);
         }
+      // OA Bus M1: a breach (a forbidden 101) is never converted: it gates.
+      for (const e of bus) {
+        const breach: CaseResult = {
+          name: e.name,
+          file: "live/bus.test.ts",
+          level: "fail",
+          reason: `${BREACH_MARK} rl-busb upgraded rl-busa's machine token (101)`,
+        };
+        const r = buildReport([ok, breach]);
+        expect(r.cases[1]?.level).toBe("fail");
+        expect(r.gate.passed).toBe(false);
+        expect(gatePasses([ok, breach])).toBe(false);
+        expect(exitCode(r, true)).not.toBe(0);
+      }
       for (const level of ["fail", "infra"] as const) {
         const other = c(NAMES[0] as string, level, "x");
         expect(exitCode(buildReport([ok, other]), true)).not.toBe(0);

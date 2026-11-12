@@ -10,13 +10,9 @@ import {
 import { InfraError } from "./fetch-timeout.ts";
 import { paceHook, sendProbe } from "./http.ts";
 import { mask } from "./oidc.ts";
-import {
-  JOB_WITHIN_MS,
-  PAGE_WITHIN_MS,
-  ProbeFail,
-  type Run,
-} from "./provisioning.ts";
+import { PAGE_WITHIN_MS, ProbeFail, type Run } from "./provisioning.ts";
 import { liveRun, rawTargets } from "./provisioning-live.ts";
+import { BREACH_MARK } from "./report.ts";
 import type { AnonTarget } from "./rl-anon.ts";
 import { readSecretFile, secretFileName, type Target } from "./targets.ts";
 import { type Held, holdSocket, wsHandshake } from "./ws.ts";
@@ -56,8 +52,11 @@ export interface BusPair {
 /** The pair's own process (provisioning-live.ts spawnBusPair): its pid, and its output. */
 export const BUS_PAIR_STARTED_FILE = "REDLINE_BUS_PAIR_STARTED";
 export const BUS_PAIR_LOG_FILE = "REDLINE_BUS_PAIR_LOG";
-/** How long the bus lane waits for the pair (two creates or upgrades and R26). */
-export const BUS_PAIR_WAIT_MS = 25 * 60_000;
+/**
+ * How long the bus lane waits for the pair. The pair starts with bring-up, so
+ * it has had all of bring-up's time already; this bounds the rest.
+ */
+export const BUS_PAIR_WAIT_MS = 10 * 60_000;
 /** How long the revoke waits for a pair still going before stopping it. */
 export const BUS_PAIR_REVOKE_WAIT_MS = 15 * 60_000;
 
@@ -183,8 +182,23 @@ export interface CrossIo {
     origin: string,
     token: string,
   ): Promise<{ status: number; body: string }>;
-  /** B's (rl-busb's) GET /api/v1/bus/machines and /api/v1/bus/agents, as its admin reads them. */
+  /** B's (rl-busb's) machines and roster as its admin reads them: ids and labels or names (hubView). */
   snapshotB(): Promise<string>;
+}
+
+/**
+ * A 101 where none may be (OA Bus, M1): a machine token upgrading at an
+ * install it isn't of, at a content host, or at a suspended install. Its
+ * message starts with BREACH_MARK, which the not-gating rule (src/report.ts
+ * notGating, live/bus.test.ts) never turns into an unproven: it fails the
+ * run even while HOSTED_BUS_NOT_GATING applies.
+ */
+export { BREACH_MARK };
+export class BreachFail extends ProbeFail {
+  override name = "BreachFail";
+  constructor(what: string) {
+    super(`${BREACH_MARK} ${what}`);
+  }
 }
 
 const codeOf = (body: string): string | undefined => {
@@ -207,7 +221,7 @@ export async function crossInstallCase(io: CrossIo, p: BusPair): Promise<void> {
   const before = await io.snapshotB();
   const atB = await io.connect(p.busb.app, token);
   if (atB.status === 101)
-    throw new ProbeFail(
+    throw new BreachFail(
       `${p.busb.name} upgraded ${p.busa.name}'s machine token (101)`,
     );
   if (atB.status !== 401 || codeOf(atB.body) !== "unauthorized")
@@ -221,7 +235,7 @@ export async function crossInstallCase(io: CrossIo, p: BusPair): Promise<void> {
     );
   const content = await io.connect(p.busb.content, token);
   if (content.status === 101)
-    throw new ProbeFail(
+    throw new BreachFail(
       `${p.busb.name}'s content host upgraded ${p.busa.name}'s machine token (101)`,
     );
   if ((await io.snapshotB()) !== before)
@@ -250,14 +264,85 @@ export const RECONNECT_AT_MS = [10_000, 60_000, 125_000] as const;
 /** A redelivery after the resume, and every frame wait. */
 export const FRAME_WAIT_MS = 30_000;
 const CLOSE_POLL_MS = 1_000;
-/** Case 2's vitest bound: two jobs at their bound, the probes and slack. */
+/**
+ * Case 2's suspend and resume jobs: bounded here, not at JOB_WITHIN_MS, so the
+ * lane's worst case stays inside the job's budget (a suspend is seconds).
+ */
+export const CASE_JOB_WITHIN_MS = 3 * 60_000;
+/**
+ * Case 2's own bound: two sockets and the hub reads (2 min), the suspend job,
+ * the probes to 125 s with the 30 s close inside them, the resume job and its
+ * /healthz (PAGE_WITHIN_MS), the reopen and slack (2 min). The pair is
+ * already up: case 1 waited for it.
+ */
 export const BUS_CASE_TIMEOUT_MS =
-  BUS_PAIR_WAIT_MS +
-  2 * JOB_WITHIN_MS +
+  2 * 60_000 +
+  CASE_JOB_WITHIN_MS +
   (RECONNECT_AT_MS.at(-1) ?? 0) +
-  10 * 60_000;
+  CASE_JOB_WITHIN_MS +
+  PAGE_WITHIN_MS +
+  60_000;
 /** Case 1's: the wait for the pair, its sign-in, a device flow (polls 5 s apart) and pacing waits. */
-export const CROSS_CASE_TIMEOUT_MS = BUS_PAIR_WAIT_MS + 5 * 60_000;
+export const CROSS_CASE_TIMEOUT_MS = BUS_PAIR_WAIT_MS + 3 * 60_000;
+/** The lane's afterAll: a resume if one is needed (M3) and the machines' revoke. */
+export const BUS_CLEANUP_TIMEOUT_MS = CASE_JOB_WITHIN_MS + 2 * 60_000;
+/**
+ * The lane's worst case: both cases at their bounds and the cleanup. The
+ * suite starts at the latest 75 min into the job (5 setup, 60 bring-up, 10
+ * seal wait) and the revoke's own start is capped at 110 (t19-done), so this
+ * stays under 35 min (test/hosted-bus.test.ts pins it).
+ */
+export const BUS_LANE_WORST_MS =
+  CROSS_CASE_TIMEOUT_MS + BUS_CASE_TIMEOUT_MS + BUS_CLEANUP_TIMEOUT_MS;
+
+/** A job to done within `ms`, else a ProbeFail naming the bound. */
+export async function doneWithin(
+  run: Run,
+  jobId: string,
+  what: string,
+  ms: number,
+): Promise<void> {
+  const j = await run.waitJob(jobId, { within: ms });
+  if (j.status !== "done")
+    throw new ProbeFail(
+      `${what}: job ${j.status} (${j.lastErrorCode ?? j.error?.code ?? "no code"})`,
+    );
+}
+
+/**
+ * M3: rl-busb resumed if a case, a timeout or a killed run left it
+ * suspended. R3, then R8 to done within `within`. Says what it did; returns
+ * false when it could not (never throws).
+ */
+export async function ensureResumed(
+  run: Run,
+  id: string,
+  slug: string,
+  within: number,
+  log: (s: string) => void,
+): Promise<boolean> {
+  try {
+    const d = await run.v1(`/installs/${id}`, { read: true });
+    const state = (d.json as { state?: unknown } | undefined)?.state;
+    if (d.status !== 200) throw new Error(`R3 ${d.status}`);
+    if (state !== "suspended") return true;
+    log(`${slug}: suspended at cleanup, resuming\n`);
+    const a = run.accepted(
+      await run.v1(`/installs/${id}/resume`, {
+        body: { requestId: run.rid(`${slug}-cleanup-resume`) },
+      }),
+      `${slug} cleanup resume`,
+    );
+    await doneWithin(run, a.job.id, `${slug} cleanup resume`, within);
+    log(`${slug}: resumed\n`);
+    return true;
+  } catch (e) {
+    log(
+      `${slug}: still suspended? the cleanup resume failed: ${e instanceof Error ? e.message : String(e)}\n`,
+    );
+    return false;
+  }
+}
 
 export { mask };
 
@@ -289,8 +374,8 @@ export interface SuspendIo {
   reconnect(): Promise<{ status: number; paused: boolean }>;
   /** After the resume: the same token's upgrade, hello, the receiver up again, and whether msgId came again. */
   reopen(msgId: string): Promise<{ status: number; redelivered: boolean }>;
-  /** The machine still listed and the receiving agent still on the roster: null, or what is missing. */
-  hubProblem(): Promise<string | null>;
+  /** The suspended install's machines and roster (hubView), and whether the case's machine and receiver are on them. */
+  hub(): Promise<{ view: string; ours: boolean }>;
 }
 
 export interface SuspendResult {
@@ -317,6 +402,13 @@ export async function suspendCase(
   const Y = p.busa.name;
   const bystander = await io.openBystander();
   const d = await io.openDaemon();
+  // The hub as the daemon left it: compared after the resume, before the
+  // reopen (M2), so the reopen's own agent_up can't stand in for it.
+  const hubBefore = await io.hub();
+  if (!hubBefore.ours)
+    throw new ProbeFail(
+      `${X}'s roster does not list the case's machine and receiver before the suspend`,
+    );
   const out: SuspendResult = { closeMs: 0, reconnects: 0 };
   const stillUp = (when: string) => {
     if (!bystander.isOpen())
@@ -327,6 +419,8 @@ export async function suspendCase(
   // Marked before the request: a suspend whose answer was lost is still resumed.
   let suspended = false;
   try {
+    if (!d.isOpen())
+      throw new ProbeFail(`${X}'s daemon socket closed before the suspend`);
     suspended = true;
     await io.suspend();
     const t0 = io.now();
@@ -362,7 +456,7 @@ export async function suspendCase(
       out.reconnects++;
       const s = Math.round((io.now() - t0) / 1000);
       if (r.status === 101)
-        throw new ProbeFail(
+        throw new BreachFail(
           `${X} upgraded the daemon's token ${s} s after the suspend`,
         );
       if (!r.paused)
@@ -383,6 +477,11 @@ export async function suspendCase(
   if (failure) throw failure;
   if (resumeFailure) throw resumeFailure;
   stillUp("by the resume");
+  const hubAfter = await io.hub();
+  if (!hubAfter.ours || hubAfter.view !== hubBefore.view)
+    throw new ProbeFail(
+      `after the resume ${X}'s hub is not the one before the suspend (${hubAfter.ours ? "machines or roster changed" : "the case's machine or receiver is gone"})`,
+    );
   const r = await io.reopen(d.msgId);
   if (r.status !== 101)
     throw new ProbeFail(
@@ -392,8 +491,6 @@ export async function suspendCase(
     throw new ProbeFail(
       `after the resume the pending mail did not come again on ${X} within ${FRAME_WAIT_MS / 1000} s`,
     );
-  const hub = await io.hubProblem();
-  if (hub) throw new ProbeFail(`after the resume ${X}'s hub: ${hub}`);
   stillUp("at the end");
   return out;
 }
@@ -558,9 +655,53 @@ export function liveCrossIo(a: Signed, b: Signed, minted: Minted): CrossIo {
         throw new ProbeFail(
           `${b.side.name}: /api/v1/bus/machines ${ms.status}, /api/v1/bus/agents ${ag.status}, want 200 and 200`,
         );
-      return JSON.stringify([ms.text, ag.text]);
+      return hubView(ms.text, ag.text).view;
     },
   };
+}
+
+/** Every object at any depth of `v` with a string id and a string `key`, as "id|value". */
+const idsWith = (
+  v: unknown,
+  key: string,
+  out: string[] = [],
+  depth = 0,
+): string[] => {
+  if (depth > 6 || v === null || typeof v !== "object") return out;
+  if (Array.isArray(v)) {
+    for (const x of v) idsWith(x, key, out, depth + 1);
+    return out;
+  }
+  const o = v as Record<string, unknown>;
+  if (typeof o.id === "string" && typeof o[key] === "string")
+    out.push(
+      `${o.id}|${o[key]}${key === "label" ? `|${o.revokedAt ? "revoked" : "live"}` : ""}`,
+    );
+  else for (const x of Object.values(o)) idsWith(x, key, out, depth + 1);
+  return out;
+};
+
+/**
+ * A hub's machines (id, label, revoked or not) and roster (agent id, name),
+ * sorted, from GET /api/v1/bus/machines and /api/v1/bus/agents: what the
+ * cases compare, never the raw JSON (timestamps and state move). `label` and
+ * `recv`, when given, say whether the case's machine (live) and receiver are
+ * on them.
+ */
+export function hubView(
+  machinesJson: string,
+  agentsJson: string,
+  label?: string,
+  recv?: string,
+): { view: string; ours: boolean } {
+  const machines = idsWith(JSON.parse(machinesJson), "label").sort();
+  const agents = idsWith(JSON.parse(agentsJson), "name").sort();
+  const ours =
+    label !== undefined &&
+    recv !== undefined &&
+    machines.some((m) => m.endsWith(`|${label}|live`)) &&
+    agents.some((a) => a.endsWith(`|${recv}`));
+  return { view: JSON.stringify({ machines, agents }), ours };
 }
 
 type Frame = Record<string, unknown>;
@@ -722,7 +863,12 @@ export function liveSuspendIo(
         }),
         `${x.side.name} suspend`,
       );
-      await run.done(a.job.id, `${x.side.name} suspend`);
+      await doneWithin(
+        run,
+        a.job.id,
+        `${x.side.name} suspend`,
+        CASE_JOB_WITHIN_MS,
+      );
     },
     async resume() {
       const a = run.accepted(
@@ -731,7 +877,12 @@ export function liveSuspendIo(
         }),
         `${x.side.name} resume`,
       );
-      await run.done(a.job.id, `${x.side.name} resume`);
+      await doneWithin(
+        run,
+        a.job.id,
+        `${x.side.name} resume`,
+        CASE_JOB_WITHIN_MS,
+      );
       await run.within(
         PAGE_WITHIN_MS,
         `${x.side.name} /healthz 200 after the resume`,
@@ -761,31 +912,27 @@ export function liveSuspendIo(
         "redline-recv",
         `${x.side.name} after the resume`,
       );
-      const again = await h.waitText(
-        (t) => t.includes(`"${msgId}"`) && t.includes('"deliver"'),
-        FRAME_WAIT_MS,
+      const again = await waitFrame(
+        h,
+        (f) =>
+          f.type === "deliver" && f.msg_id === msgId && f.to_ref === RECV_REF,
+        `${x.side.name} redelivery`,
+      ).then(
+        () => true,
+        () => false,
       );
       if (again)
         h.send(JSON.stringify({ v: 1, id: "a1", type: "ack", msg_id: msgId }));
       return { status: 101, redelivered: again };
     },
-    async hubProblem() {
+    async hub() {
       const ms = await getText(x, "/api/v1/bus/machines");
       const ag = await getText(x, "/api/v1/bus/agents");
-      if (ms.status !== 200)
-        return `/api/v1/bus/machines answered ${ms.status}`;
-      if (ag.status !== 200) return `/api/v1/bus/agents answered ${ag.status}`;
-      const rows =
-        (
-          JSON.parse(ms.text) as {
-            machines?: { label?: unknown; revokedAt?: unknown }[];
-          }
-        ).machines ?? [];
-      if (!rows.some((r) => r.label === minted.label && !r.revokedAt))
-        return "the machine is not listed, or is revoked";
-      if (!listsName(JSON.parse(ag.text), recvName))
-        return "the receiving agent is not on the roster";
-      return null;
+      if (ms.status !== 200 || ag.status !== 200)
+        throw new ProbeFail(
+          `${x.side.name}: /api/v1/bus/machines ${ms.status}, /api/v1/bus/agents ${ag.status}, want 200 and 200`,
+        );
+      return hubView(ms.text, ag.text, minted.label, recvName);
     },
   };
 }

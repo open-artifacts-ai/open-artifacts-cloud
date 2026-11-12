@@ -158,6 +158,21 @@ jobs:
   # at the latest at 5 + 60 + 10 + 20 = 95 min after the run's start, under that
   # cap. Only a t19 job that starts more than 15 min late AND a worst-case
   # bring-up could be cut off by the revoke; nothing fits that inside 150 min.
+  #
+  # The hosted bus pair (cloud #202, rl-busa and rl-busb) is outside that
+  # chain: bringup starts it as a detached process and never waits for it, so
+  # neither bring-up nor the seal waits on its creates or upgrades. Its lane
+  # (live/bus.test.ts, beside the others) waits for it at most 10 min, and its
+  # cases and cleanup are bounded at 31 min in all (BUS_LANE_WORST_MS), so a
+  # suite started by 75 min (5 + 60 + 10) has it done by 106, before the 110
+  # cap. The revoke does rl-a and rl-b first (up to 40 min), then the pair
+  # only in what is left before the job's start + 145 min (the VM's boot when
+  # nothing else says): its wait for the pair process, a resume of rl-busb if
+  # it was left suspended, and the two R26 revokes. With no time left it logs
+  # a warning and leaves them to the next run's mint. Worst case, in minutes
+  # from the job's start: setup 5, bring-up 60, seal 10, suite (bus lane) 31,
+  # t19-done cap at 110, revoke of rl-a and rl-b 40: 150; the pair's revoke
+  # fits only in what a faster run leaves, never past 145.
   t19:
     name: t19
     needs: platform-tags

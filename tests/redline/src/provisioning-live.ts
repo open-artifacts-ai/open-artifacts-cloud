@@ -6,6 +6,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import { uptime } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -34,6 +35,8 @@ import {
   type BusPair,
   busPairEnded,
   busPairSides,
+  CASE_JOB_WITHIN_MS,
+  ensureResumed,
   type PairSide,
   writeBusPair,
   writeBusPairError,
@@ -642,9 +645,13 @@ export async function awaitPairEnd(
 export async function revokeAll(
   env: Record<string, string | undefined>,
   t: RawTargets,
+  o: { run?: Run; now?: () => number; deadline?: number } = {},
 ): Promise<number> {
-  const run = liveRun(env, t);
+  const run = o.run ?? liveRun(env, t);
+  const now = o.now ?? Date.now;
+  const deadline = o.deadline ?? jobDeadline(env);
   let failed = 0;
+  // rl-a and rl-b first, as ever: their own bound (JOB_WITHIN_MS each).
   for (const [name, side] of [
     ["a", t.a],
     ["b", t.b],
@@ -661,23 +668,83 @@ export async function revokeAll(
       out(`rl-${name}: revoke failed: ${(e as Error).message}\n`);
     }
   }
-  // The hosted bus pair's installs that bring-up took R26 creds on (cloud
-  // #202): first its process's end, bounded, so a late mint is revoked too.
-  await awaitPairEnd(t.secretsDir);
-  for (const side of busPairSides(t.secretsDir)) {
+  // The hosted bus pair (cloud #202), only in what the job has left before
+  // its deadline: its end (a late mint is revoked too), rl-busb resumed if
+  // something left it suspended (OA Bus M3), then each R26 revoke. Not gating
+  // for one release, so a pair revoke that fails or has no time left warns,
+  // loudly, and doesn't fail the step: the next run's R26 mint revokes it.
+  if (!existsSync(join(t.secretsDir, BUS_PAIR_STARTED_FILE)))
+    return failed ? 1 : 0;
+  const left = () => deadline - now();
+  const noTime = (names: string) =>
+    out(
+      `::warning::${names} R26 not revoked: no time left; the next run's mint revokes them\n`,
+    );
+  if (left() < MIN_PAIR_REVOKE_MS) {
+    noTime(`${BUS_A}/${BUS_B}`);
+    return failed ? 1 : 0;
+  }
+  await awaitPairEnd(
+    t.secretsDir,
+    Math.min(BUS_PAIR_REVOKE_WAIT_MS, left() - MIN_PAIR_REVOKE_MS),
+    { now },
+  );
+  const sides = busPairSides(t.secretsDir);
+  const busb = sides.find((s) => s.name === BUS_B);
+  if (busb && left() >= 2 * MIN_PAIR_REVOKE_MS)
+    await ensureResumed(
+      run,
+      busb.installId,
+      busb.name,
+      Math.min(CASE_JOB_WITHIN_MS, left() - MIN_PAIR_REVOKE_MS),
+      out,
+    );
+  for (const [i, side] of sides.entries()) {
+    if (left() < MIN_PAIR_REVOKE_MS) {
+      noTime(
+        sides
+          .slice(i)
+          .map((s) => s.name)
+          .join("/"),
+      );
+      break;
+    }
     const f = join(t.secretsDir, secretFileName(side.name, "PAT"));
     const pat = existsSync(f)
       ? readSecretFile(f, secretFileName(side.name, "PAT"))
       : undefined;
     try {
-      await revokeCreds(run, side.installId, side.name, side.app, pat);
+      await revokeCreds(run, side.installId, side.name, side.app, pat, left());
       out(`${side.name}: R26 revoked\n`);
     } catch (e) {
-      failed++;
-      out(`${side.name}: revoke failed: ${(e as Error).message}\n`);
+      out(
+        `::warning::${side.name}: R26 revoke failed: ${(e as Error).message}; the next run's mint revokes it\n`,
+      );
     }
   }
   return failed ? 1 : 0;
+}
+
+/** The redline job's timeout (redline-staging.yml) and the margin the revoke keeps under it. */
+export const REDLINE_JOB_MS = 150 * 60_000;
+export const REVOKE_MARGIN_MS = 5 * 60_000;
+/** Less than this left: a pair revoke isn't started. */
+export const MIN_PAIR_REVOKE_MS = 2 * 60_000;
+
+/**
+ * When the revoke must be done: the job's start + REDLINE_JOB_MS -
+ * REVOKE_MARGIN_MS. The start is REDLINE_JOB_STARTED_AT (epoch ms) when set,
+ * else this runner VM's boot (now - uptime): a GitHub-hosted VM boots for its
+ * job, never after it starts, so the deadline is never later than the job's.
+ */
+export function jobDeadline(
+  env: Record<string, string | undefined>,
+  now: number = Date.now(),
+  uptimeSec: number = uptime(),
+): number {
+  const set = Number(env.REDLINE_JOB_STARTED_AT);
+  const start = Number.isFinite(set) && set > 0 ? set : now - uptimeSec * 1000;
+  return start + REDLINE_JOB_MS - REVOKE_MARGIN_MS;
 }
 
 /**

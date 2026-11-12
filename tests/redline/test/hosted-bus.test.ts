@@ -11,9 +11,13 @@ import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import {
+  BREACH_MARK,
+  BreachFail,
+  BUS_LANE_WORST_MS,
   BUS_PAIR_ERROR_FILE,
   BUS_PAIR_LOG_FILE,
   BUS_PAIR_STARTED_FILE,
+  BUS_PAIR_WAIT_MS,
   type BusPair,
   busPairEnded,
   busPairSides,
@@ -21,6 +25,7 @@ import {
   CLOSE_WITHIN_MS,
   type CrossIo,
   crossInstallCase,
+  hubView,
   listsName,
   RECONNECT_AT_MS,
   readBusPair,
@@ -34,7 +39,9 @@ import {
   awaitPairEnd,
   bringUp,
   bringUpBusPair,
+  jobDeadline,
   type RawTargets,
+  revokeAll,
   runBusPair,
 } from "../src/provisioning-live.ts";
 import { newRecipient, openSealed, parseCreds } from "../src/seal.ts";
@@ -113,7 +120,7 @@ function crossIo(
   };
 }
 
-describe("case 1: rl-busa' machine token at rl-busb", () => {
+describe("case 1: rl-busa's machine token at rl-busb", () => {
   it("passes in OA Bus's order: mint on A, snapshot B, B is 401 unauthorized, A is 101, B's content host refuses, B unchanged", async () => {
     const io = crossIo();
     await crossInstallCase(io, PAIR);
@@ -164,10 +171,35 @@ describe("case 1: rl-busa' machine token at rl-busb", () => {
       /machines or roster changed/,
     ],
   ])("fails when %s, and never names the token", async (_, o, re) => {
+    // OA Bus M1: a 101 at B's app or content host is a breach.
+    const breach = o?.atB?.status === 101 || o?.atContent === 101;
     const e = await crossInstallCase(crossIo(o), PAIR).catch((x) => x);
     expect(e).toBeInstanceOf(ProbeFail);
     expect((e as Error).message).toMatch(re);
     expect((e as Error).message).not.toContain(TOKEN);
+    expect(e instanceof BreachFail, "breach").toBe(breach);
+  });
+
+  it("compares B's machines and roster by ids and labels or names, not raw JSON", () => {
+    const m = (t: number) =>
+      JSON.stringify({
+        machines: [{ id: "m1", label: "x", revokedAt: null, lastUsedAt: t }],
+      });
+    const a = (state: string) =>
+      JSON.stringify({ agents: [{ id: "a1", name: "redline-recv", state }] });
+    expect(hubView(m(1), a("live")).view).toBe(hubView(m(2), a("away")).view);
+    expect(hubView(m(1), a("live"), "x", "redline-recv").ours).toBe(true);
+    expect(
+      hubView(
+        JSON.stringify({ machines: [{ id: "m1", label: "x", revokedAt: 5 }] }),
+        a("live"),
+        "x",
+        "redline-recv",
+      ).ours,
+    ).toBe(false);
+    expect(
+      hubView(m(1), JSON.stringify({ agents: [{ id: "a2", name: "y" }] })).view,
+    ).not.toBe(hubView(m(1), a("live")).view);
   });
 });
 
@@ -183,7 +215,9 @@ function suspendIo(
     resumeFails?: boolean;
     reopenStatus?: number;
     redelivered?: boolean;
-    hub?: string | null;
+    /** The hub after the resume: "same" (default), "changed" or "gone" (ours missing). */
+    hubAfter?: "same" | "changed" | "gone";
+    daemonClosedEarly?: boolean;
   } = {},
 ): SuspendIo & { log: string[]; reconnectsAt: number[] } {
   const t = { now: 0 };
@@ -230,7 +264,7 @@ function suspendIo(
       log.push("daemon");
       return {
         closed,
-        isOpen: () => closedAt === null,
+        isOpen: () => closedAt === null && !o.daemonClosedEarly,
         closeCode: () => (o.closeCode === undefined ? 4403 : o.closeCode),
         msgId: "Msg1111111111111",
       };
@@ -259,9 +293,16 @@ function suspendIo(
         redelivered: o.redelivered ?? true,
       };
     },
-    hubProblem: async () => {
-      log.push("hub");
-      return o.hub ?? null;
+    hub: async () => {
+      // Before the suspend (doneAt null) the daemon's hub; after the resume,
+      // whatever the test asks for.
+      const after = doneAt !== null;
+      log.push(after ? "hub after" : "hub before");
+      const how = after ? (o.hubAfter ?? "same") : "same";
+      return {
+        view: how === "changed" ? "other" : "same",
+        ours: how !== "gone",
+      };
     },
   };
 }
@@ -270,13 +311,15 @@ describe("case 2: suspend rl-busb", () => {
   it("passes: closes within 30 s with 4403, reconnects at 10, 60 and 125 s are dispatch's paused answer, resumes, reopens with the pending mail, hub intact", async () => {
     const io = suspendIo();
     const r = await suspendCase(io, PAIR);
+    // The hub is compared after the resume and BEFORE the reopen (OA Bus M2).
     expect(io.log).toEqual([
       "bystander",
       "daemon",
+      "hub before",
       "suspend",
       "resume",
+      "hub after",
       "reopen Msg1111111111111",
-      "hub",
     ]);
     expect(r.closeMs).toBe(5_000);
     expect(io.reconnectsAt).toEqual([...RECONNECT_AT_MS]);
@@ -331,10 +374,32 @@ describe("case 2: suspend rl-busb", () => {
     expect(io.log.some((l) => l.startsWith("reopen"))).toBe(false);
   });
 
+  it("OA Bus M1: a 101 for a suspended install is a breach, never a plain failure", async () => {
+    const e = await suspendCase(suspendIo({ upgradeAtMs: 0 }), PAIR).catch(
+      (x) => x,
+    );
+    expect(e).toBeInstanceOf(BreachFail);
+    expect((e as Error).message.startsWith(BREACH_MARK)).toBe(true);
+  });
+
+  it("the daemon socket must be open just before the suspend; nothing is suspended then", async () => {
+    const io = suspendIo({ daemonClosedEarly: true });
+    await expect(suspendCase(io, PAIR)).rejects.toThrow(
+      /daemon socket closed before the suspend/,
+    );
+    expect(io.log).not.toContain("suspend");
+  });
+
   it("a failed suspend request is still followed by a resume (its answer may be lost)", async () => {
     const io = suspendIo({ suspendFails: true });
     await expect(suspendCase(io, PAIR)).rejects.toThrow(/suspend: job failed/);
-    expect(io.log).toEqual(["bystander", "daemon", "suspend", "resume"]);
+    expect(io.log).toEqual([
+      "bystander",
+      "daemon",
+      "hub before",
+      "suspend",
+      "resume",
+    ]);
   });
 
   it("the first failure wins over a failed resume; a failed resume alone fails", async () => {
@@ -358,9 +423,14 @@ describe("case 2: suspend rl-busb", () => {
       /the pending mail did not come again/,
     ],
     [
-      "the hub lost the machine",
-      { hub: "the machine is not listed, or is revoked" },
-      /hub: the machine is not listed/,
+      "the hub's machines or roster changed",
+      { hubAfter: "changed" },
+      /hub is not the one before the suspend \(machines or roster changed\)/,
+    ],
+    [
+      "the hub lost the case's machine or receiver",
+      { hubAfter: "gone" },
+      /the case's machine or receiver is gone/,
     ],
   ])("fails after the resume when %s", async (_, o, re) => {
     await expect(suspendCase(suspendIo(o), PAIR)).rejects.toThrow(re);
@@ -620,5 +690,93 @@ describe("bringUp and the pair (its own process)", () => {
     });
     expect(t.now).toBe(0);
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+describe("the revoke inside the job's deadline (cloud #202)", () => {
+  const targets = (d: string): RawTargets => ({
+    secretsDir: d,
+    a: { name: "rl-a", installId: CONFIG.rlA.id, app: CONFIG.rlA.app },
+    b: { name: "rl-b", installId: CONFIG.rlB.id, app: CONFIG.rlB.app },
+  });
+  /** A pair brought up on the fake, so its sides file lists both installs. */
+  async function upPair() {
+    const f = fakeApi();
+    const d = scratch();
+    quiet();
+    await bringUpBusPair(new Run(CONFIG, f.io), d, await recipient(), noPace);
+    writeFileSync(join(d, BUS_PAIR_STARTED_FILE), "1\n");
+    // The fake serves /api/v1/me for rl-a and rl-b only: no PAT check here.
+    for (const n of ["rl-busa", "rl-busb"])
+      rmSync(join(d, secretFileName(n, "PAT")));
+    vi.restoreAllMocks();
+    return { f, d };
+  }
+  const revokes = (f: FakeApi) =>
+    f.log.filter((l) => /redline-creds$/.test(l)).length;
+
+  it("the bus lane's worst case fits between the suite's latest start (75 min) and the revoke's cap (110 min)", () => {
+    expect(BUS_PAIR_WAIT_MS).toBe(10 * 60_000);
+    expect(BUS_LANE_WORST_MS).toBeLessThanOrEqual(35 * 60_000);
+    expect(Math.round(BUS_LANE_WORST_MS / 60_000)).toBe(31);
+  });
+
+  it("the deadline is the job's start + 150 min - 5 min: REDLINE_JOB_STARTED_AT, else the VM's boot", () => {
+    expect(jobDeadline({ REDLINE_JOB_STARTED_AT: "1000" }, 0, 0)).toBe(
+      1000 + 145 * 60_000,
+    );
+    expect(jobDeadline({}, 10 * 60_000, 120)).toBe(8 * 60_000 + 145 * 60_000);
+  });
+
+  it("with time left: rl-a and rl-b first, then both pair installs", async () => {
+    const { f, d } = await upPair();
+    const before = revokes(f);
+    const out = quiet();
+    const code = await revokeAll({}, targets(d), {
+      run: new Run(CONFIG, f.io),
+      deadline: f.io.now() + 60 * 60_000,
+      now: f.io.now,
+    });
+    expect(code).toBe(0);
+    expect(revokes(f) - before).toBe(4);
+    const text = out.mock.calls.map((c) => String(c[0])).join("");
+    expect(text.indexOf("rl-b: R26 revoked")).toBeLessThan(
+      text.indexOf("rl-busa: R26 revoked"),
+    );
+    expect(text).toContain("rl-busb: R26 revoked");
+  });
+
+  it("with no time left: rl-a and rl-b only, and a loud warning for the pair; the step doesn't fail on it", async () => {
+    const { f, d } = await upPair();
+    const before = revokes(f);
+    const out = quiet();
+    const code = await revokeAll({}, targets(d), {
+      run: new Run(CONFIG, f.io),
+      deadline: f.io.now() + 60_000,
+      now: f.io.now,
+    });
+    expect(code).toBe(0);
+    expect(revokes(f) - before).toBe(2);
+    expect(out.mock.calls.map((c) => String(c[0])).join("")).toContain(
+      "::warning::rl-busa/rl-busb R26 not revoked: no time left; the next run's mint revokes them",
+    );
+  });
+
+  it("OA Bus M3: rl-busb left suspended is resumed before its revoke", async () => {
+    const { f, d } = await upPair();
+    const busb = [...f.installs.values()].find((i) => i.slug === "rl-busb");
+    if (!busb) throw new Error("no rl-busb");
+    busb.state = "suspended";
+    const out = quiet();
+    await revokeAll({}, targets(d), {
+      run: new Run(CONFIG, f.io),
+      deadline: f.io.now() + 60 * 60_000,
+      now: f.io.now,
+    });
+    expect(f.log.some((l) => l.endsWith(`${busb.id}/resume`))).toBe(true);
+    expect(busb.state).toBe("active");
+    expect(out.mock.calls.map((c) => String(c[0])).join("")).toContain(
+      "rl-busb: suspended at cleanup, resuming",
+    );
   });
 });
