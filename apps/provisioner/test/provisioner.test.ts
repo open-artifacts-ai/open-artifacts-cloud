@@ -114,6 +114,22 @@ describe("provisionerOptions", () => {
     expect(prod.stagingBusSlugs).toEqual([]);
   });
 
+  it('STAGING_BUS_ALL: only "1" on staging turns it on; prod and absent are off (#2325)', async () => {
+    const o = (e: Record<string, string>) =>
+      provisionerOptions(mkEnv(e), LABEL, io(), JOB);
+    expect(
+      (await o({ OA_ENV: "staging", STAGING_BUS_ALL: "1" })).stagingBusAll,
+    ).toBe(true);
+    for (const v of ["0", "true", "", " 1"])
+      expect(
+        (await o({ OA_ENV: "staging", STAGING_BUS_ALL: v })).stagingBusAll,
+      ).toBe(false);
+    expect((await o({ OA_ENV: "staging" })).stagingBusAll).toBe(false);
+    expect(
+      (await o({ OA_ENV: "prod", STAGING_BUS_ALL: "1" })).stagingBusAll,
+    ).toBe(false);
+  });
+
   it("reads PROVISION_TOKEN once and calls Cloudflare with it on ACCOUNT_ID", async () => {
     const gets: string[] = [];
     const calls: { url: string; auth: string | null }[] = [];

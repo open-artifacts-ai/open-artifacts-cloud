@@ -7545,6 +7545,17 @@ describe("stagingBusSlugs reaches the rendered metadata (#1299 part 6)", () => {
     expect(featuresOf(s, other.id).split(",")).not.toContain("bus");
   });
 
+  it("stagingBusAll: any slug gets bus on staging, never on prod (#2325)", async () => {
+    const s = setup();
+    const p = s.mk({ stagingBusAll: true });
+    const inst = keep(await p.create(input("unlisted")));
+    expect(featuresOf(s, inst.id).split(",")).toContain("bus");
+    const prod = setup({ env: "prod" });
+    const pp = prod.mk({ stagingBusAll: true });
+    const pi = keep(await pp.create(input("unlisted")));
+    expect(featuresOf(prod, pi.id).split(",")).not.toContain("bus");
+  });
+
   it("without the option, or on prod with it, no bus", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input("finqore")));
