@@ -199,6 +199,30 @@ export async function closeInstallSockets(
   return out;
 }
 
+export const CLOSE_AUDIT_FAILED = "suspend close_sockets audit failed";
+
+/**
+ * Appends the suspend's socket-close outcome to admin_audit (the admin audit
+ * read shows it): action suspend.close_sockets, code ok|throw|timeout|outcome.
+ * Never throws: a failed write logs one fixed line and the suspend goes on.
+ */
+export async function auditCloseSockets(
+  ctx: OpsCtx,
+  installId: string,
+  jobId: string,
+  out: CloseSocketsOutcome,
+): Promise<void> {
+  try {
+    await ctx.env.PLATFORM_DB.prepare(
+      "INSERT INTO admin_audit (at, actor_kind, actor_label, action, install_id, job_id, outcome, code) VALUES (?1, 'system', 'provisioner', 'suspend.close_sockets', ?2, ?3, ?4, ?5)",
+    )
+      .bind(ctx.io.now(), installId, jobId, out === "ok" ? "ok" : "error", out)
+      .run();
+  } catch {
+    console.warn(CLOSE_AUDIT_FAILED);
+  }
+}
+
 /** The stored vars of an install (installs.vars), as strings. */
 export function storedVars(raw: string | null): Record<string, string> {
   if (raw === null) return {};
