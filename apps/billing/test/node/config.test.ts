@@ -178,12 +178,17 @@ describe("migrations", () => {
     );
   });
 
-  it("0008 adds cancels_at to tiers (#2138)", () => {
+  it("0008 adds cancels_at, renews_at and billing_interval to tiers (#2138, #2135)", () => {
     const sql = readFileSync(
       join(app, "migrations/0008_cancels_at.sql"),
       "utf8",
     );
-    expect(sql).toMatch(/ALTER TABLE tiers ADD COLUMN cancels_at INTEGER;/);
+    for (const c of [
+      "cancels_at INTEGER",
+      "renews_at INTEGER",
+      "billing_interval TEXT",
+    ])
+      expect(sql).toContain(`ALTER TABLE tiers ADD COLUMN ${c};`);
   });
 
   it("0007 adds the retry and overage payment columns (#2210, #2246)", () => {

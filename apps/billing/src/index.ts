@@ -149,6 +149,9 @@ interface TierRow {
   solo_checked_out: number | null;
   /** tiers.cancels_at: when a scheduled cancel takes effect (ms), else null. */
   cancels_at: number | null;
+  /** tiers.renews_at (ms) and billing_interval ('month' | 'year'). */
+  renews_at: number | null;
+  billing_interval: string | null;
   version: number;
 }
 
@@ -203,6 +206,8 @@ function view(
       hasCustomer: false,
       soloCheckedOut: false,
       cancelsAt: null,
+      renewsAt: null,
+      interval: null,
       yearlyTeamBusiness,
       overageDue: null,
       version: 0,
@@ -228,6 +233,13 @@ function view(
     soloCheckedOut: r.solo_checked_out === 1,
     // When a scheduled cancel (Stripe cancel_at_period_end) takes effect, in ms.
     cancelsAt: r.cancels_at,
+    // When the next charge is due (ms; null while a cancel is scheduled) and
+    // the interval it bills on, from the subscription itself (#2135).
+    renewsAt: r.renews_at,
+    interval:
+      r.billing_interval === "month" || r.billing_interval === "year"
+        ? r.billing_interval
+        : null,
     yearlyTeamBusiness,
     // A yearly overage invoice whose payment failed and is unpaid (#2246).
     // A notice only: it never moves tier, status or grace.
@@ -238,7 +250,7 @@ function view(
 }
 
 const COLS =
-  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, solo_checked_out, cancels_at, version";
+  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, solo_checked_out, cancels_at, renews_at, billing_interval, version";
 // The read records last_read_at on the install's own row and writes nothing
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;
