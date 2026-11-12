@@ -258,7 +258,7 @@ jobs:
           done
           cp .deploy-logic/packages/provision/src/wfp.ts "$RUNNER_TEMP/main-wfp.ts"
           mkdir "$RUNNER_TEMP/main-ci"
-          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh; do
+          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh; do
             cp ".deploy-logic/scripts/ci/$f" "$RUNNER_TEMP/main-ci/$f"
           done
           cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"
@@ -345,6 +345,14 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/hosted-resource-ids.sh" "$DEPLOY_ENV"
+      # Read-only (GETs), before any target deploys, verify_only too (#967):
+      # each sender's domain in <env>.json must be onboarded in Email Sending.
+      - name: The senders' domain is onboarded in Email Sending
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HOSTED_DIR: ${{ runner.temp }}/main-ci/hosted
+        run: bash "$RUNNER_TEMP/main-ci/provapi-token-verify.sh" "$DEPLOY_ENV" sending
       - id: deploy
         name: Deploy and verify
         env:

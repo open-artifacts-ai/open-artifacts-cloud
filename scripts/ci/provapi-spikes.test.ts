@@ -537,6 +537,88 @@ describe("Email Sending: the senders' domain is onboarded (#967)", () => {
   });
 });
 
+describe("provapi-token-verify.sh sending: the deploy's gate (#967)", () => {
+  // The deploy token comes in CLOUDFLARE_API_TOKEN, no token file.
+  const gate = (
+    list: unknown[],
+    envName: "staging" | "prod" = "prod",
+    hosted?: Record<string, unknown>,
+  ) => {
+    const sfx = envName === "prod" ? "" : "-staging";
+    const fx: Record<string, string> = {
+      [key("GET", `/zones?name=open-artifacts${sfx}.app&account.id=${ACCT}`)]:
+        ok([
+          { id: ZAPP, name: `open-artifacts${sfx}.app`, account: { id: ACCT } },
+        ]),
+      [key("GET", `/zones/${ZAPP}/email/sending/subdomains`)]: ok(list),
+    };
+    const t = setup(fx, hosted, envName);
+    const r = t.verify("sending", {
+      TOKEN_FILE: "",
+      RESULTS_DIR: "",
+      CLOUDFLARE_API_TOKEN: TOK,
+    });
+    return { t, r };
+  };
+
+  it("passes on both envs when mail.<zone> is listed, with two GETs and nothing else", () => {
+    for (const e of ["prod", "staging"] as const) {
+      const sfx = e === "prod" ? "" : "-staging";
+      const { t, r } = gate([{ name: `mail.open-artifacts${sfx}.app` }], e);
+      expect(r.code, r.err + r.out).toBe(0);
+      expect(r.out).toContain(
+        `senders onboarded: mail.open-artifacts${sfx}.app`,
+      );
+      expect(t.reqs()).toEqual([
+        `GET /zones?name=open-artifacts${sfx}.app&account.id=${ACCT}`,
+        `GET /zones/${ZAPP}/email/sending/subdomains`,
+      ]);
+    }
+  });
+
+  it("fails naming the missing domain and listing the ones found", () => {
+    for (const list of [
+      [],
+      [
+        { name: "news.open-artifacts.app" },
+        { name: "xmail.open-artifacts.app" },
+      ],
+    ]) {
+      const { r } = gate(list);
+      expect(r.code, JSON.stringify(list)).toBe(1);
+      expect(r.err).toContain("not onboarded: mail.open-artifacts.app");
+      expect(r.err).toContain(
+        `listed: ${list.length ? "news.open-artifacts.app,xmail.open-artifacts.app" : "none"}`,
+      );
+    }
+  });
+
+  it("checks both senders, and fails when the email zone is not found", () => {
+    const { r } = gate([{ name: "mail.open-artifacts.app" }], "prod", {
+      welcome_from: "welcome@hello.open-artifacts.app",
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("not onboarded: hello.open-artifacts.app");
+    const t = setup({}, undefined, "prod");
+    const z = t.verify("sending", {
+      TOKEN_FILE: "",
+      RESULTS_DIR: "",
+      CLOUDFLARE_API_TOKEN: TOK,
+    });
+    expect(z.code).toBe(1);
+    expect(z.err).toContain("was not found");
+  });
+
+  it("never prints the token, and refuses with no token at all", () => {
+    const { r } = gate([]);
+    expect(r.out + r.err).not.toContain(TOK);
+    const t = setup({});
+    const n = t.verify("sending", { TOKEN_FILE: "", RESULTS_DIR: "" });
+    expect(n.code).toBe(3);
+    expect(t.reqs()).toEqual([]);
+  });
+});
+
 describe("provapi-spikes.sh verify", () => {
   it("passes a token 365 days out with every group readable, GETs only", () => {
     const t = setup(verifyFx(365));
