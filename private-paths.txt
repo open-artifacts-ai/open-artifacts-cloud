@@ -82,6 +82,8 @@ scripts/ci/tag-passed-checks.sh
 scripts/ci/tag-passed-checks.test.ts
 scripts/ci/token-ping.sh
 scripts/ci/token-ping.test.ts
+scripts/ci/turnstile-domains.sh
+scripts/ci/turnstile-domains.test.ts
 scripts/ci/worker-tag.sh
 scripts/ops/broker-key.ts
 scripts/ops/check-migration-lock.mjs

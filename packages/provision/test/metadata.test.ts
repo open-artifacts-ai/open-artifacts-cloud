@@ -218,7 +218,7 @@ describe("userWorkerMetadata", () => {
   // two are never passed together, on any install (Manager ruling).
   it("TIER derives FEATURES; TIER with FEATURES, or an unknown tier, is refused", () => {
     const expected = {
-      trial: "spaces,sync_google,content_revocation,usage_off",
+      trial: "spaces,sync_frozen,content_revocation,usage_off",
       team: "spaces,sync_frozen,content_revocation,usage_off",
       business: "spaces,sync_google,content_revocation,usage_off",
     };

@@ -543,6 +543,7 @@ describe("GET /tier", () => {
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: true,
+      yearlyTeamBusiness: false,
       version: 3,
       asOf: NOW,
     });
@@ -563,6 +564,39 @@ describe("GET /tier", () => {
     expect(b).toMatchObject({ hasCustomer: true });
   });
 
+  it("yearlyTeamBusiness is true only when both yearly price ids are set", async () => {
+    at();
+    await seed([{ install: A }]);
+    const ask = async (e: Env) =>
+      (
+        await billing.fetch(
+          (await gated("GET", "/tier")) as Parameters<typeof billing.fetch>[0],
+          e,
+        )
+      ).json();
+    const both = {
+      ...env,
+      STRIPE_PRICE_TEAM_YEARLY: "price_t",
+      STRIPE_PRICE_BUSINESS_YEARLY: "price_b",
+    } as Env;
+    expect(await ask(both)).toMatchObject({ yearlyTeamBusiness: true });
+    expect(
+      await ask({ ...both, STRIPE_PRICE_TEAM_YEARLY: "" } as Env),
+    ).toMatchObject({ yearlyTeamBusiness: false });
+    expect(
+      await ask({ ...both, STRIPE_PRICE_BUSINESS_YEARLY: "" } as Env),
+    ).toMatchObject({ yearlyTeamBusiness: false });
+    for (const bad of [" ", "bogus"]) {
+      expect(
+        await ask({ ...both, STRIPE_PRICE_TEAM_YEARLY: bad } as Env),
+      ).toMatchObject({ yearlyTeamBusiness: false });
+      expect(
+        await ask({ ...both, STRIPE_PRICE_BUSINESS_YEARLY: bad } as Env),
+      ).toMatchObject({ yearlyTeamBusiness: false });
+    }
+    expect(await ask(env)).toMatchObject({ yearlyTeamBusiness: false });
+  });
+
   it("a missing row is solo/active at version 0, and nothing is written", async () => {
     at();
     const r = await call(gated("GET", "/tier"));
@@ -573,6 +607,7 @@ describe("GET /tier", () => {
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: false,
+      yearlyTeamBusiness: false,
       version: 0,
       asOf: NOW,
     });
@@ -625,6 +660,7 @@ describe("POST /trial/start", () => {
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: true,
+      yearlyTeamBusiness: false,
       version: 5,
       asOf: NOW,
     });
@@ -740,6 +776,9 @@ describe("POST /usage", () => {
         creators_json: '["u3"]',
         count: 1,
         received_at: NOW + 1,
+        applied_quantity: null,
+        applied_at: null,
+        apply_outcome: null,
       },
       {
         install_id: A,
@@ -747,6 +786,9 @@ describe("POST /usage", () => {
         creators_json: '["u1","u2"]',
         count: 2,
         received_at: NOW + 1,
+        applied_quantity: null,
+        applied_at: null,
+        apply_outcome: null,
       },
     ]);
     expect(await usageOf(B)).toEqual([]);
@@ -840,6 +882,8 @@ describe("logs", () => {
       `billing tier row ${A}`,
       `billing trial started ${A}`,
       `billing usage ${A}`,
+      // A closed month on a trial row: stored, its quantity skipped (#2123).
+      `billing usage quantity trial ${A}`,
     ]);
   });
 

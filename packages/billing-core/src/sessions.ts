@@ -442,3 +442,438 @@ export async function retrieveSubscription(
     throw e;
   }
 }
+
+/** What setSubscriptionQuantity did. */
+export type QuantityOutcome =
+  /** The item's quantity was set (proration_behavior none). */
+  | "updated"
+  /** The item already had this quantity: no write. */
+  | "unchanged"
+  /**
+   * The subscription's one item is not a monthly price billing names (a
+   * yearly prepaid-seat price, #2123 PR 4b, or anything unknown): left alone.
+   */
+  | "not_monthly"
+  /** Canceled, incomplete, gone (404) or trialing in Stripe: left alone. */
+  | "not_live";
+
+export interface QuantityInput {
+  subscriptionId: string;
+  /** The creator count to bill (1..10000). */
+  quantity: number;
+  /**
+   * The monthly per-creator prices this may change (Team's and Business's).
+   * The item's price must be one of them and recur monthly; a yearly price
+   * is recognised by its recurring interval and never changed here.
+   */
+  monthlyPriceIds: readonly string[];
+  /** Billing's key, e.g. qty-<install>-<month>-<quantity>: a retry is one write. */
+  idempotencyKey: string;
+}
+
+const PAYMENT_METHOD = /^pm_[A-Za-z0-9_]{1,255}$/;
+/** A Stripe id that may come as a string or an expanded object. */
+const idString = (v: unknown, re: RegExp): string | null => {
+  const id =
+    typeof v === "object" && v !== null ? (v as { id?: unknown }).id : v;
+  return typeof id === "string" && re.test(id) ? id : null;
+};
+
+/** Stripe statuses whose quantity follows the creator count. */
+const QUANTITY_LIVE = new Set(["active", "past_due"]);
+const SUBSCRIPTION_ITEM = /^si_[A-Za-z0-9]{1,255}$/;
+
+/**
+ * Sets a monthly Team or Business subscription's quantity to the creator
+ * count (#2123), with proration_behavior none: nothing is charged or
+ * credited now, and the next invoice bills that many creators. Reads the
+ * subscription first and changes nothing unless it is live (active or
+ * past_due) with exactly one item at one of `monthlyPriceIds` recurring
+ * monthly; an item already at `quantity` is not written. Safe to repeat.
+ * Any Stripe error but a 404 on the read is thrown (status and type only).
+ */
+export async function setSubscriptionQuantity(
+  input: QuantityInput,
+  cfg: StripeConfig,
+): Promise<{
+  outcome: QuantityOutcome;
+  previous?: number;
+  /** With not_monthly on a one-item subscription: what that item is. */
+  item?: { priceId: string; interval: string | null; quantity: number | null };
+  /**
+   * With not_monthly: the subscription's payment method and when its current
+   * billing cycle began (epoch seconds; Stripe resets it when the interval
+   * changes, so a monthly-to-yearly switch moves it to the switch).
+   */
+  subscription?: {
+    defaultPaymentMethod: string | null;
+    billingCycleAnchor: number | null;
+    startDate: number | null;
+  };
+}> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const quantity = input.quantity;
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
+    throw new StripeConfigError("quantity");
+  for (const p of input.monthlyPriceIds) check(PRICE, "monthlyPriceIds", p);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  let status: number;
+  let out: Record<string, unknown> | null;
+  try {
+    ({ status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/subscriptions/${id}`,
+      null,
+      null,
+    ));
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404)
+      return { outcome: "not_live" };
+    throw e;
+  }
+  if (typeof out?.status !== "string")
+    throw new StripeApiError(status, "bad_answer");
+  if (!QUANTITY_LIVE.has(out.status)) return { outcome: "not_live" };
+  const items = (out.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  if (items.length !== 1) return { outcome: "not_monthly" };
+  const item = items[0] as {
+    id?: unknown;
+    quantity?: unknown;
+    price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+  };
+  if (typeof item?.id !== "string" || !SUBSCRIPTION_ITEM.test(item.id))
+    throw new StripeApiError(status, "bad_answer");
+  if (
+    typeof item.price?.id !== "string" ||
+    !input.monthlyPriceIds.includes(item.price.id) ||
+    item.price.recurring?.interval !== "month"
+  )
+    return {
+      outcome: "not_monthly",
+      item: {
+        priceId: typeof item.price?.id === "string" ? item.price.id : "",
+        interval:
+          typeof item.price?.recurring?.interval === "string"
+            ? item.price.recurring.interval
+            : null,
+        quantity: typeof item.quantity === "number" ? item.quantity : null,
+      },
+      subscription: {
+        defaultPaymentMethod: idString(
+          out.default_payment_method,
+          PAYMENT_METHOD,
+        ),
+        billingCycleAnchor:
+          typeof out.billing_cycle_anchor === "number"
+            ? out.billing_cycle_anchor
+            : null,
+        startDate: typeof out.start_date === "number" ? out.start_date : null,
+      },
+    };
+  const previous =
+    typeof item.quantity === "number" ? item.quantity : undefined;
+  if (previous === quantity) return { outcome: "unchanged", previous };
+  await post(
+    cfg,
+    `/v1/subscription_items/${item.id}`,
+    { quantity: String(quantity), proration_behavior: "none" },
+    input.idempotencyKey,
+  );
+  return {
+    outcome: "updated",
+    ...(previous === undefined ? {} : { previous }),
+  };
+}
+
+// ------------------------------------------------- yearly overage (#2235)
+
+const INVOICE_ITEM = /^ii_[A-Za-z0-9_]{1,255}$/;
+const INVOICE = /^in_[A-Za-z0-9_]{1,255}$/;
+const MONTH_KEY = /^\d{4}-(?:0[1-9]|1[0-2])$/;
+
+const idOf = (
+  out: Record<string, unknown> | null,
+  re: RegExp,
+  status: number,
+): string => {
+  if (typeof out?.id !== "string" || !re.test(out.id))
+    throw new StripeApiError(status, "bad_answer");
+  return out.id;
+};
+
+export interface OverageItemInput {
+  customerId: string;
+  /** The draft overage invoice the item is attached to (never a pending item). */
+  invoiceId: string;
+  install: string;
+  /** The closed month, YYYY-MM. */
+  month: string;
+  /** Extra creators (1..10000). */
+  quantity: number;
+  /** The monthly per-creator price in cents. */
+  unitAmount: number;
+  description: string;
+  idempotencyKey: string;
+}
+
+function overageMeta(install: string, month: string, p: string) {
+  check(INSTALL, "install", install);
+  check(MONTH_KEY, "month", month);
+  return {
+    [`${p}[kind]`]: "overage",
+    [`${p}[install]`]: install,
+    [`${p}[month]`]: month,
+  };
+}
+
+/**
+ * An invoice item for the extra creators, attached to the given draft
+ * invoice (so it is never a pending item another invoice could sweep up).
+ * Answers its id.
+ */
+export async function createOverageItem(
+  input: OverageItemInput,
+  cfg: StripeConfig,
+): Promise<string> {
+  check(CUSTOMER, "customerId", input.customerId);
+  check(INVOICE, "invoiceId", input.invoiceId);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  if (
+    !Number.isInteger(input.quantity) ||
+    input.quantity < 1 ||
+    input.quantity > 10_000
+  )
+    throw new StripeConfigError("quantity");
+  if (!Number.isInteger(input.unitAmount) || input.unitAmount < 1)
+    throw new StripeConfigError("unitAmount");
+  const { status, out } = await post(
+    cfg,
+    "/v1/invoiceitems",
+    {
+      customer: input.customerId,
+      invoice: input.invoiceId,
+      currency: "usd",
+      unit_amount: String(input.unitAmount),
+      quantity: String(input.quantity),
+      description: input.description,
+      ...overageMeta(input.install, input.month, "metadata"),
+    },
+    input.idempotencyKey,
+  );
+  return idOf(out, INVOICE_ITEM, status);
+}
+
+/**
+ * A draft one-off invoice, charged automatically, that takes no pending
+ * items (its one item is attached to it). Answers its id.
+ */
+export async function createOverageInvoice(
+  input: {
+    customerId: string;
+    install: string;
+    month: string;
+    /** The card to charge: a one-off invoice does not inherit the subscription's. */
+    paymentMethodId: string;
+    idempotencyKey: string;
+  },
+  cfg: StripeConfig,
+): Promise<string> {
+  check(CUSTOMER, "customerId", input.customerId);
+  check(PAYMENT_METHOD, "paymentMethodId", input.paymentMethodId);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  const { status, out } = await post(
+    cfg,
+    "/v1/invoices",
+    {
+      customer: input.customerId,
+      default_payment_method: input.paymentMethodId,
+      collection_method: "charge_automatically",
+      pending_invoice_items_behavior: "exclude",
+      auto_advance: "false",
+      ...overageMeta(input.install, input.month, "metadata"),
+    },
+    input.idempotencyKey,
+  );
+  return idOf(out, INVOICE, status);
+}
+
+/**
+ * The customer's invoice_settings.default_payment_method, or null. Checkout
+ * saves the card on the subscription, so this is only the fallback.
+ */
+export async function retrieveCustomerPaymentMethod(
+  input: { customerId: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const id = check(CUSTOMER, "customerId", input.customerId);
+  const { out } = await send(cfg, "GET", `/v1/customers/${id}`, null, null);
+  const s = out?.invoice_settings;
+  return idString(
+    typeof s === "object" && s !== null
+      ? (s as { default_payment_method?: unknown }).default_payment_method
+      : null,
+    PAYMENT_METHOD,
+  );
+}
+
+const metaOf = (o: unknown): Record<string, unknown> =>
+  typeof o === "object" && o !== null && "metadata" in o
+    ? ((o as { metadata?: Record<string, unknown> }).metadata ?? {})
+    : {};
+
+/**
+ * The draft overage invoice already made for (install, month), if any: how a
+ * retry finds an invoice whose answer was lost, without relying on an
+ * idempotency key that Stripe forgets after 24 hours. Reads the customer's
+ * drafts (the first 100).
+ */
+export async function findOverageInvoice(
+  input: { customerId: string; install: string; month: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const customer = check(CUSTOMER, "customerId", input.customerId);
+  overageMeta(input.install, input.month, "metadata");
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoices?customer=${customer}&status=draft&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  for (const inv of out.data as unknown[]) {
+    const m = metaOf(inv);
+    const id = (inv as { id?: unknown }).id;
+    if (
+      m.kind === "overage" &&
+      m.install === input.install &&
+      m.month === input.month &&
+      typeof id === "string" &&
+      INVOICE.test(id)
+    )
+      return id;
+  }
+  return null;
+}
+
+/**
+ * The overage item already attached to an invoice for `month`, if any (a
+ * retry whose item answer was lost reuses it instead of adding a second).
+ */
+export async function findOverageItem(
+  input: { invoiceId: string; month: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const invoice = check(INVOICE, "invoiceId", input.invoiceId);
+  check(MONTH_KEY, "month", input.month);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoiceitems?invoice=${invoice}&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  for (const it of out.data as unknown[]) {
+    const m = metaOf(it);
+    const id = (it as { id?: unknown }).id;
+    if (
+      m.kind === "overage" &&
+      m.month === input.month &&
+      typeof id === "string" &&
+      INVOICE_ITEM.test(id)
+    )
+      return id;
+  }
+  return null;
+}
+
+/** An invoice's status (draft, open, paid, ...), or "missing" for a 404. */
+export async function retrieveInvoiceStatus(
+  input: { invoiceId: string },
+  cfg: StripeConfig,
+): Promise<string> {
+  const id = check(INVOICE, "invoiceId", input.invoiceId);
+  try {
+    const { status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/invoices/${id}`,
+      null,
+      null,
+    );
+    if (typeof out?.status !== "string")
+      throw new StripeApiError(status, "bad_answer");
+    return out.status;
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404) return "missing";
+    throw e;
+  }
+}
+
+/**
+ * Finalizes a draft invoice with auto_advance true: an API-created invoice
+ * defaults to false, and a finalized one with it false is never charged.
+ * (The draft itself stays at auto_advance false, so an empty draft can't
+ * finalize on its own.)
+ */
+export async function finalizeInvoice(
+  input: { invoiceId: string; idempotencyKey: string },
+  cfg: StripeConfig,
+): Promise<void> {
+  const id = check(INVOICE, "invoiceId", input.invoiceId);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  await post(
+    cfg,
+    `/v1/invoices/${id}/finalize`,
+    { auto_advance: "true" },
+    input.idempotencyKey,
+  );
+}
+
+/**
+ * Deletes this (install, month)'s overage items that are still pending
+ * (attached to no invoice), so a reset never leaves one a later invoice
+ * could sweep up. Reads the customer's pending items (the first 100).
+ * Answers how many it deleted.
+ */
+export async function deletePendingOverageItems(
+  input: { customerId: string; install: string; month: string },
+  cfg: StripeConfig,
+): Promise<number> {
+  const customer = check(CUSTOMER, "customerId", input.customerId);
+  overageMeta(input.install, input.month, "metadata");
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoiceitems?customer=${customer}&pending=true&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  let n = 0;
+  for (const it of out.data as unknown[]) {
+    const m = metaOf(it);
+    const { id, invoice } = it as { id?: unknown; invoice?: unknown };
+    if (
+      m.kind === "overage" &&
+      m.install === input.install &&
+      m.month === input.month &&
+      (invoice === null || invoice === undefined) &&
+      typeof id === "string" &&
+      INVOICE_ITEM.test(id)
+    ) {
+      try {
+        await send(cfg, "DELETE", `/v1/invoiceitems/${id}`, null, null);
+      } catch (e) {
+        // Already gone.
+        if (!(e instanceof StripeApiError && e.status === 404)) throw e;
+        continue;
+      }
+      n++;
+    }
+  }
+  return n;
+}

@@ -17,6 +17,7 @@ import {
   MAX_WEBHOOK_BODY,
   parseEvent,
   parseSignatureHeader,
+  pricesOf,
   pruneStripeEvents,
   STRIPE_EVENT_RETENTION_MS,
   STRIPE_TOLERANCE_S,
@@ -26,6 +27,7 @@ import {
   verifyStripeSignature,
   type WebhookEnv,
 } from "../src/index.js";
+import { unknownPrice } from "../src/webhook.js";
 
 // The webhook against the tier store's real tables (#849 0001_init.sql).
 // Signatures are made here with a test secret; no Stripe call is made.
@@ -1278,6 +1280,26 @@ describe("Solo (#1568)", () => {
       )
       .bind(A)
       .run();
+
+  it("the yearly Team and Business prices name team and business, and are not unknown (#2136)", () => {
+    const yp = {
+      ...prices,
+      teamYearly: "price_TY",
+      businessYearly: "price_BY",
+    };
+    const one = (id: string) => sub({ items: { data: [{ price: { id } }] } });
+    expect(tierFromSubscription(one("price_TY"), yp)).toBe("team");
+    expect(tierFromSubscription(one("price_BY"), yp)).toBe("business");
+    expect(unknownPrice(one("price_TY"), yp)).toBe(false);
+    expect(unknownPrice(one("price_BY"), yp)).toBe(false);
+    expect(unknownPrice(one("price_Z"), yp)).toBe(true);
+    // Unset (empty env) yearly ids match nothing, even an empty price id.
+    expect(
+      pricesOf({ STRIPE_PRICE_TEAM_YEARLY: "" } as never).teamYearly,
+    ).toBeUndefined();
+    expect(tierFromSubscription(one("price_TY"), prices)).toBeNull();
+    expect(unknownPrice(one("price_TY"), prices)).toBe(true);
+  });
 
   it("either Solo price names the tier solo; an unknown price does not", () => {
     expect(tierFromSubscription(soloSub(), prices)).toBe("solo");
@@ -3281,5 +3303,64 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
       env: s.e,
     });
     expect(s.calls).toEqual(["GET sub_Solo1", "DELETE sub_Solo1"]);
+  });
+});
+
+describe("a yearly overage invoice never touches the plan (#2235)", () => {
+  const overage = (o: Record<string, unknown> = {}) => ({
+    customer: CUS_A,
+    metadata: { kind: "overage", install: A, month: "2026-10" },
+    ...o,
+  });
+  const setup = async () => {
+    await ownSub(A);
+    // A row mid-grace, so a stray paid event would visibly clear it.
+    await db
+      .prepare(
+        "UPDATE tiers SET status = 'past_due', grace_until = ?, last_invoice_created = ? WHERE install_id = ?",
+      )
+      .bind(NOW + 1000, T - 100, A)
+      .run();
+    return row(A);
+  };
+
+  it("invoice.paid and invoice.payment_failed without a subscription change nothing", async () => {
+    const before = await setup();
+    await deliver(event("invoice.paid", overage()));
+    await deliver(event("invoice.payment_failed", overage()));
+    expect(await row(A)).toEqual(before);
+  });
+
+  it("even one that names the row's own subscription is ignored (metadata.kind overage)", async () => {
+    const before = await setup();
+    await deliver(
+      event("invoice.paid", overage({ subscription: "sub_Test1" })),
+    );
+    await deliver(
+      event(
+        "invoice.payment_failed",
+        overage({
+          parent: { subscription_details: { subscription: "sub_Test1" } },
+        }),
+      ),
+    );
+    expect(await row(A)).toEqual(before);
+  });
+
+  it("a failed overage invoice does not move an active row", async () => {
+    await ownSub(A);
+    await deliver(event("invoice.payment_failed", overage()));
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      grace_until: null,
+      last_invoice_created: null,
+    });
+  });
+
+  it("a subscription invoice still applies (the skip is only for overage)", async () => {
+    await ownSub(A);
+    await deliver(event("invoice.payment_failed", inv()));
+    expect(await row(A)).toMatchObject({ status: "past_due" });
   });
 });

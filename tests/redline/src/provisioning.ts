@@ -30,7 +30,14 @@ import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 // Hosted-only MCP tools, registered next to ADMIN_TOOLS by the hosted service.
 // Mirrors the names in apps/provisioning/src/hosted-tools.ts (HOSTED_TOOLS);
 // tests/redline/test/hosted-tool-names.test.ts fails if the two drift.
-export const HOSTED_TOOL_NAMES: readonly string[] = ["set_install_tier"];
+export const HOSTED_TOOL_NAMES: readonly string[] = [
+  "set_install_tier",
+  "allow_signup",
+  "approve_waitlist",
+  "beta_stats",
+  "list_waitlist",
+  "remove_allowed",
+];
 
 // The red-line provisioning probes (design v7 12.2, P1-P50 but
 // REMOVED_PROBES) against the staging Provisioning API, as the GitHub OIDC principal "O" (4.4): `rl-`

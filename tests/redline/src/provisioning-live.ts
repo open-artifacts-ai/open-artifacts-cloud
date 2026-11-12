@@ -280,6 +280,37 @@ export async function waitHookKey(
   }
 }
 
+/** The red-line billing fixture: rl-a Team (T19), rl-b Business (#2169). */
+export const TIER_FIXTURE = { a: "team", b: "business" } as const;
+
+/**
+ * Reads the install's tier from its own GET /api/v1/me with its new PAT
+ * (instance.tier) and fails as infra unless it is the fixture's. No hook, no
+ * new endpoint; a GET, so the run's read retries apply.
+ */
+export async function checkTier(
+  run: Run,
+  slug: string,
+  app: string,
+  pat: string,
+  want: string,
+): Promise<void> {
+  const r = await run.raw(`${app}/api/v1/me`, {
+    auth: { bearer: pat },
+    read: true,
+  });
+  if (r.status !== 200)
+    throw new InfraError(
+      `GET /api/v1/me answered ${r.status || "nothing"}, so the tier of ${slug} is unknown`,
+    );
+  const tier = (r.json as { instance?: { tier?: unknown } } | null)?.instance
+    ?.tier;
+  if (tier !== want)
+    throw new InfraError(
+      `${slug} is on ${typeof tier === "string" ? tier : "an unknown tier"}, want ${want}: the red-line fixture is rl-a Team, rl-b Business (docs/ops/hosted.md). Fix the staging tier, then rerun.`,
+    );
+}
+
 /**
  * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
  * creds, the two installs at the same time (#1730: the two upgrades are about
@@ -318,6 +349,8 @@ export async function bringUp(
       // Before the suite or the t19 hand-off reads the key.
       await waitHookKey(run, side.app, c.hookKey, pace);
       out(`${slug}: the new hook key is accepted\n`);
+      await checkTier(run, slug, side.app, c.pat, TIER_FIXTURE[name]);
+      out(`${slug}: tier is ${TIER_FIXTURE[name]}\n`);
     } catch (e) {
       const msg = errText(e);
       if (!(e instanceof Error)) throw new Error(`${slug}: ${msg}`);

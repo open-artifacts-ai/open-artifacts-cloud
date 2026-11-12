@@ -197,6 +197,8 @@ export interface FakeApi {
   jobs: Map<string, FJob>;
   pats: Map<string, { install: string; revoked: boolean }>;
   faults: Set<Fault>;
+  /** Each install's tier on /api/v1/me; the red-line fixture by default. */
+  tiers: Map<string, string>;
   clock: { t: number };
   audit: {
     actor: string;
@@ -256,6 +258,10 @@ export function fakeApi(): FakeApi {
   const jobs = new Map<string, FJob>();
   const pats = new Map<string, { install: string; revoked: boolean }>();
   const faults = new Set<Fault>();
+  const tiers = new Map<string, string>([
+    [CONFIG.rlA.id, "team"],
+    [CONFIG.rlB.id, "business"],
+  ]);
   const audit: FakeApi["audit"] = [];
   const schemas = new Map<string, Schema>();
   const schemaOf = (v: string): Schema =>
@@ -1211,12 +1217,14 @@ export function fakeApi(): FakeApi {
     if (host === "inventory.open-artifacts.app")
       return new Response(null, { status: 404 });
     if (
-      host === "rl-a.open-artifacts-staging.app" &&
+      (host === "rl-a.open-artifacts-staging.app" ||
+        host === "rl-b.open-artifacts-staging.app") &&
       url.pathname === "/api/v1/me"
     ) {
       const t = req.headers.get("authorization")?.slice(7) ?? "";
       const v = pats.get(t);
-      return new Response(null, { status: v && !v.revoked ? 200 : 401 });
+      if (!v || v.revoked) return new Response(null, { status: 401 });
+      return ok({ instance: { tier: tiers.get(v.install) } });
     }
     return page(host, url.pathname);
   };
@@ -1284,6 +1292,7 @@ export function fakeApi(): FakeApi {
     jobs,
     pats,
     faults,
+    tiers,
     clock,
     audit,
     schemas,

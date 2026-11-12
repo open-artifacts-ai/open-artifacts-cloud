@@ -36,6 +36,16 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.158.0: the agent-authored comment thread routes (PUT/DELETE).
+    ...[
+      "artifact comments thread agent put [session]",
+      "artifact comments thread agent put [pat]",
+      "artifact comments thread agent delete [session]",
+      "artifact comments thread agent delete [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",
