@@ -12,9 +12,15 @@
 # the prod token never shares a job with write code. Never leo.
 # The Cloudflare token is read from $TOKEN_FILE (0600) into curl's config on
 # a pipe (never argv); it is never printed.
-# Env: TOKEN_FILE, RESULTS_DIR, HOSTED_DIR (holds <env>.json), RESULTS_OUT
-# and GITHUB_STEP_SUMMARY (summary only).
-# Usage: scripts/ci/provapi-token-verify.sh <staging|prod> [verify|summary]
+#   sending  only the Email Sending check (#967), run by deploy-hosted-platform.yml
+#            before any target deploys, verify_only included: each sender's
+#            domain in <env>.json must be onboarded in the email zone. Fails
+#            naming the missing domain and the ones found. Takes the deploy
+#            token from $CLOUDFLARE_API_TOKEN when TOKEN_FILE is unset.
+# Env: TOKEN_FILE (or CLOUDFLARE_API_TOKEN for sending), RESULTS_DIR (not for
+# sending), HOSTED_DIR (holds <env>.json), RESULTS_OUT and GITHUB_STEP_SUMMARY
+# (summary only).
+# Usage: scripts/ci/provapi-token-verify.sh <staging|prod> [verify|summary|sending]
 set -euo pipefail
 
 CF=https://api.cloudflare.com/client/v4
@@ -73,15 +79,21 @@ load_constants() {
 
 # ---- Cloudflare GETs ----
 
+# The token: the 0600 file, else (the deploy) $CLOUDFLARE_API_TOKEN.
+_token() { if [ -n "${TOKEN_FILE:-}" ]; then cat "$TOKEN_FILE"; else printf '%s' "${CLOUDFLARE_API_TOKEN:-}"; fi; }
+
 check_token() {
-  : "${TOKEN_FILE:?TOKEN_FILE is required}"
-  [ -s "$TOKEN_FILE" ] || refuse "the token file is missing or empty"
+  if [ -n "${TOKEN_FILE:-}" ]; then
+    [ -s "$TOKEN_FILE" ] || refuse "the token file is missing or empty"
+  else
+    [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || refuse "TOKEN_FILE or CLOUDFLARE_API_TOKEN is required"
+  fi
   # Also keeps the curl config line well-formed (no quote, no newline).
-  [[ "$(cat "$TOKEN_FILE")" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || refuse "the token has unexpected characters"
+  [[ "$(_token)" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || refuse "the token has unexpected characters"
 }
 
 # curl's config on a pipe: the token never reaches argv.
-_auth() { printf 'header = "Authorization: Bearer %s"\n' "$(cat "$TOKEN_FILE")"; }
+_auth() { printf 'header = "Authorization: Bearer %s"\n' "$(_token)"; }
 
 # cf_get <path>: GET only. Sets HTTP and BODY; never prints the body.
 cf_get() {
@@ -130,6 +142,43 @@ provision_secret() {
 }
 
 has_workers_scope() { jq -e '. != null and ((.scopes // []) | index("workers") != null)' <<< "$1" > /dev/null; }
+
+# sending_check <email zone id>: the senders' domains (alert_from and
+# welcome_from, mail.<zone>) are all onboarded in Email Sending. A 200 alone
+# proves only the token's reach. Sets SENDING_OBS; returns 1 when not.
+sending_check() {
+  cf_get "/zones/$1/email/sending/subdomains"
+  local names want missing=""
+  names="$(jq -r '[.result[]? | (.name // .subdomain // .domain // empty)] | join(",")' <<< "$BODY" 2> /dev/null)" || names=""
+  # An empty sender never matches: its domain is "", and no listed name is.
+  for want in "${ALERT_FROM#*@}" "${WELCOME_FROM#*@}"; do
+    [[ ",$names," == *",$want,"* ]] || missing="$missing $want"
+  done
+  if ok && [ -z "$missing" ]; then
+    SENDING_OBS="HTTP $HTTP; senders onboarded: ${ALERT_FROM#*@}"
+  else
+    SENDING_OBS="HTTP $HTTP; not onboarded:${missing:- (no sender in $ENV.json)}; listed: ${names:-none}"
+    return 1
+  fi
+}
+
+# ---- sending (the deploy's gate) ----
+
+sending_gate() {
+  local id
+  cf_get "/zones?name=$EMAIL_ZONE&account.id=$ACCOUNT"
+  id="$(jq -r --arg z "$EMAIL_ZONE" --arg a "$ACCOUNT" '[.result[]? | select(.name == $z and .account.id == $a) | .id] | if length == 1 then .[0] else "" end' <<< "$BODY")"
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || {
+    echo "::error title=Email Sending::the email zone $EMAIL_ZONE was not found (HTTP $HTTP)" >&2
+    return 1
+  }
+  if sending_check "$id"; then
+    echo "Email Sending ($EMAIL_ZONE) ok: $SENDING_OBS"
+  else
+    echo "::error title=Email Sending::Email Sending ($EMAIL_ZONE): $SENDING_OBS" >&2
+    return 1
+  fi
+}
 
 # ---- verify ----
 
@@ -185,19 +234,11 @@ EOF
   [ "$EMAIL_ZONE" = "$APP_ZONE" ] && ez="$ZONE_APP"
   [ "$EMAIL_ZONE" = "$CONTENT_ZONE" ] && ez="$ZONE_CONTENT"
   if [ -n "$ez" ]; then
-    cf_get "/zones/$ez/email/sending/subdomains"
-    # Read-only proof the senders can send: each sender's domain (mail.<zone>)
-    # is onboarded in Email Sending. A 200 alone proves only the token's reach.
-    local names want missing=""
-    names="$(jq -r '[.result[]? | (.name // .subdomain // .domain // empty)] | join(",")' <<< "$BODY" 2> /dev/null)" || names=""
-    # An empty sender never matches: its domain is "", and no listed name is.
-    for want in "${ALERT_FROM#*@}" "${WELCOME_FROM#*@}"; do
-      [[ ",$names," == *",$want,"* ]] || missing="$missing $want"
-    done
-    if [ "$(tf ok)" = true ] && [ -z "$missing" ]; then
-      record $s "Email Sending ($EMAIL_ZONE)" true "HTTP $HTTP; senders onboarded: ${ALERT_FROM#*@}"
+    # Read-only proof the senders can send (see sending_check).
+    if sending_check "$ez"; then
+      record $s "Email Sending ($EMAIL_ZONE)" true "$SENDING_OBS"
     else
-      record $s "Email Sending ($EMAIL_ZONE)" false "HTTP $HTTP; not onboarded:${missing:- (no sender in $ENV.json)}; listed: ${names:-none}"
+      record $s "Email Sending ($EMAIL_ZONE)" false "$SENDING_OBS"
     fi
   else
     record $s "Email Sending ($EMAIL_ZONE)" false "email zone not resolved"
@@ -258,16 +299,23 @@ verify_summary() {
 }
 
 main() {
-  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: $0 <staging|prod> [verify|summary]" >&2; exit 2; }
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "usage: $0 <staging|prod> [verify|summary|sending]" >&2; exit 2; }
   case "$1" in staging | prod) ENV="$1" ;; *) echo "unknown env: $1" >&2; exit 2 ;; esac
-  : "${RESULTS_DIR:?RESULTS_DIR is required}"
-  mkdir -p "$RESULTS_DIR"
+  if [ "${2:-verify}" != sending ]; then
+    : "${RESULTS_DIR:?RESULTS_DIR is required}"
+    mkdir -p "$RESULTS_DIR"
+  fi
   case "${2:-verify}" in
   verify)
     check_token
     load_constants
     spike_verify
     if grep -q '"pass":false' "$RESULTS_DIR/verify.jsonl" 2> /dev/null; then exit 1; fi
+    ;;
+  sending)
+    check_token
+    load_constants
+    sending_gate
     ;;
   summary) verify_summary ;;
   *) echo "unknown command: $2" >&2; exit 2 ;;

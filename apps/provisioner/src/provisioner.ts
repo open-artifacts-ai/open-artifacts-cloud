@@ -26,6 +26,8 @@ export interface ProvisionerEnv {
   OA_ENV: string;
   /** Staging only (#1299 part 6): comma list of exact install slugs that get `bus`. Absent in prod. */
   STAGING_BUS_SLUGS?: string;
+  /** Staging only (open-artifacts#2325): "1" gives every install `bus`; anything else is off. Absent in prod. */
+  STAGING_BUS_ALL?: string;
 }
 
 /** The runtime's network and clock; the tests' run on fakes. */
@@ -80,6 +82,7 @@ export async function provisionerOptions(
     env: e,
     stagingBusSlugs:
       e === "staging" ? parseBusSlugs(env.STAGING_BUS_SLUGS) : [],
+    stagingBusAll: e === "staging" && env.STAGING_BUS_ALL === "1",
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),

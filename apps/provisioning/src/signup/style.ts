@@ -74,6 +74,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .who .av{width:24px;height:24px;border-radius:50%;background:#1e7a5a;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
 .who .wt{flex:1;min-width:0}
 .panel .lead{color:var(--text2);margin:8px 0 0}
+.panel .signin-lead{margin:8px 0 16px}
 .help.ok{display:flex;align-items:center;gap:6px}
 .help svg{width:14px;height:14px;flex:none}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
