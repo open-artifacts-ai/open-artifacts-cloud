@@ -63,12 +63,21 @@ describe("welcomeEmail", () => {
       "Open acme.open-artifacts.app",
       "Then connect your agent. Paste this into Claude Code, Cursor or any AI agent:",
       "Set up Open Artifacts for me: follow https://acme.open-artifacts.app/llms.txt",
-      "Sign in through the browser. Never ask me to paste a token into this chat.",
       "You got this because you signed up and created acme.open-artifacts.app.",
     ]) {
       expect(m.text).toContain(s);
       expect(html).toContain(s);
     }
+  });
+
+  it("the setup prompt is one line", () => {
+    const m = welcomeEmail(base);
+    expect(m.text).not.toContain("paste a token");
+    expect(m.html).not.toContain("paste a token");
+    expect(m.text).toContain(
+      "\n  Set up Open Artifacts for me: follow https://acme.open-artifacts.app/llms.txt\n\n",
+    );
+    expect(m.html).not.toMatch(/llms\.txt<\/td>.*<br>/);
   });
 
   it("button label never breaks the host at a hyphen", () => {

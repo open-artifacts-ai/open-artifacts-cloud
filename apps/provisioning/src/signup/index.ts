@@ -29,13 +29,13 @@ const HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Create your Open Artifacts</title>
+<title>Sign up or log in</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <div id="app"></div>
-<noscript><main class="ns"><h1>Create your Open Artifacts</h1><p>This page needs JavaScript to log you in and create your instance.</p></main></noscript>
+<noscript><main class="ns"><h1>Sign up or log in</h1><p>This page needs JavaScript to log you in and create your instance.</p></main></noscript>
 <script src="/app.js"></script>
 </body>
 </html>
