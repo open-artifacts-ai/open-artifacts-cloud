@@ -265,8 +265,14 @@ describe("redline-nightly.yml", () => {
       "id-token": "write",
       actions: "read",
     });
-    // A called run's Environments resolve secrets only with inherit (43183209806).
-    expect(j.secrets).toBe("inherit");
+    // By name, exactly the callee's declared secrets; never inherit (43183209806).
+    expect(j.secrets).toEqual({
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+      REDLINE_PROD_R2_TOKEN: "${{ secrets.REDLINE_PROD_R2_TOKEN }}",
+      REDLINE_PROD_SCRIPTS_TOKEN: "${{ secrets.REDLINE_PROD_SCRIPTS_TOKEN }}",
+      REDLINE_STG_PROVISIONER_TOKEN:
+        "${{ secrets.REDLINE_STG_PROVISIONER_TOKEN }}",
+    });
   });
 
   it("records the release before it runs", () => {

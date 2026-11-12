@@ -85,6 +85,20 @@ on:
         type: string
         required: false
         default: ""
+    # The four secrets this file names, each declared so a called run's jobs
+    # can resolve it (without a declaration, t19-dry-run 43183209806 got an
+    # empty CLOUDFLARE_API_TOKEN). The jobs that use them declare their
+    # Environment, whose secret is the one used. Callers pass these four by
+    # name, never inherit; the t19 job references none.
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      REDLINE_PROD_R2_TOKEN:
+        required: false
+      REDLINE_PROD_SCRIPTS_TOKEN:
+        required: false
+      REDLINE_STG_PROVISIONER_TOKEN:
+        required: false
 
 permissions:
   contents: read

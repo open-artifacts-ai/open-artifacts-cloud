@@ -1691,7 +1691,31 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
     const j = dry.jobs.redline;
     expect(j.needs).toBe("idle");
     expect(j.uses).toBe("./.github/workflows/redline-staging.yml");
-    expect(j.secrets).toBe("inherit");
+    // By name, exactly the callee's declared secrets; never inherit.
+    expect(j.secrets).toEqual({
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+      REDLINE_PROD_R2_TOKEN: "${{ secrets.REDLINE_PROD_R2_TOKEN }}",
+      REDLINE_PROD_SCRIPTS_TOKEN: "${{ secrets.REDLINE_PROD_SCRIPTS_TOKEN }}",
+      REDLINE_STG_PROVISIONER_TOKEN:
+        "${{ secrets.REDLINE_STG_PROVISIONER_TOKEN }}",
+    });
+    expect(Object.keys(w.on.workflow_call.secrets).sort()).toEqual(
+      Object.keys(j.secrets).sort(),
+    );
+    // Every secret the callee names is declared, and nothing more.
+    const named = [
+      ...new Set(
+        [
+          ...readFileSync(
+            join(root, ".github/workflows/redline-staging.yml"),
+            "utf8",
+          ).matchAll(/secrets\.([A-Z0-9_]+)/g),
+        ].map((m) => m[1]),
+      ),
+    ].sort();
+    expect(Object.keys(w.on.workflow_call.secrets).sort()).toEqual(named);
+    // The job that runs a branch's specs gets no secret at all.
+    expect(JSON.stringify(w.jobs.t19)).not.toContain("secrets.");
     expect(j.permissions).toEqual({
       contents: "read",
       "id-token": "write",

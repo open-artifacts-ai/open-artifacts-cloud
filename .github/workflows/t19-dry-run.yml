@@ -67,8 +67,11 @@ jobs:
       tag: ${{ inputs.tag }}
       t19_public_branch: ${{ inputs.public_branch }}
       t19_public_sha: ${{ inputs.public_sha }}
-    # secrets: inherit. Without it a called run's jobs get empty secrets even
-    # with their Environment named (t19-dry-run 43183209806: platform-tags had
-    # no CLOUDFLARE_API_TOKEN). The callee is main's file and names only the
-    # secrets it uses; the t19 job references none, so branch specs see none.
-    secrets: inherit
+    # By name, never inherit: only the four secrets the callee declares
+    # (on.workflow_call.secrets). Undeclared, a called run's jobs got none
+    # (t19-dry-run 43183209806); the t19 job references none of them.
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      REDLINE_PROD_R2_TOKEN: ${{ secrets.REDLINE_PROD_R2_TOKEN }}
+      REDLINE_PROD_SCRIPTS_TOKEN: ${{ secrets.REDLINE_PROD_SCRIPTS_TOKEN }}
+      REDLINE_STG_PROVISIONER_TOKEN: ${{ secrets.REDLINE_STG_PROVISIONER_TOKEN }}
