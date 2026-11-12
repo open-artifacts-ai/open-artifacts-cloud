@@ -637,6 +637,10 @@ TODO (Platform): before directory sync is enabled on any env that already has br
 
 `prod-inspect.yml` is dispatch-only, has no inputs and runs only from main, in `hosted-prod-deploy`. It runs `scripts/ci/prod-inspect.sh`, which finds `oa-p-platform` by exact name (exactly one) and runs two fixed statements, nothing else: `sqlite_master` (type, name, table and DDL of every table, index, view and trigger) and `d1_migrations` (id, name, applied_at; `d1_migrations: absent` when there is no such table). It takes no SQL from anyone, and an allowlist refuses any other statement before a request. Job logs are public, so it prints DDL and migration names only, never rows or row counts of any other table.
 
+### Which prod install Workers have a TIER binding (`tier-audit.yml`, #218)
+
+`tier-audit.yml` is dispatch-only, has no inputs and runs only from main, in `hosted-prod-deploy`. It runs `scripts/ci/tier-audit.sh`, which lists every Worker in the `dispatch_namespace` of `.github/hosted/prod.json` (all pages) and reads each one's settings, with GET calls only. It prints `<script> TIER=yes|no` (whether a binding is named `TIER`) and a final `total`, `with_tier`, `without_tier` and `errors` line. Job logs are public, so it never prints a binding's value, type or any other binding's name; a failed call prints the script name, the HTTP status and the Cloudflare error codes only, and the job then fails.
+
 ### Staging test admin for agents (`staging-test-admin.yml`, #1053)
 
 Agents (Frontend, Design and Platform walkthroughs, and e2e tests) sign in to the staging admin panel as `rl-test-admin@test.invalid`, never with a Google account. Run `node scripts/ops/staging-test-admin.ts`, which needs `gh`. It makes an X25519 key pair in memory and dispatches `staging-test-admin.yml` on main. That job mints a GitHub OIDC JWT, calls R28 (`POST /v1/test-admin/session` on `api.open-artifacts-staging.app`) and prints only the session id sealed to the public key. The script opens the sealed id locally and writes a 0600 Playwright storage-state file holding the `__Host-oa-admin` cookie for `admin.open-artifacts-staging.app`; it prints only that file's path.
