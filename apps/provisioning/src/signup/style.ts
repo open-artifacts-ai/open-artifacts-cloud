@@ -22,10 +22,11 @@ a{color:var(--accent-fg)}
 .mark.lg{width:36px;height:36px;margin-bottom:20px}
 .login main.side{max-width:none;width:auto;margin:0;padding:32px;background:var(--surface);border-left:1px solid var(--divider);display:flex;align-items:center;justify-content:center}
 .col{width:100%;max-width:360px}
+.col:has(.panel.ld) .mark.lg{display:none}
 .side .panel{background:none;border:0;box-shadow:none;padding:0;border-radius:0}
 .side h1{font-size:23px}
 @media (max-width:700px){
-.login{grid-template-columns:1fr;min-height:0}
+.login{grid-template-columns:1fr;grid-template-rows:auto 1fr}
 .top{padding:20px 20px 0}
 .pitchtext{margin:20px 0}
 .pitchtext .pt{font-size:21px;margin:0 0 6px}
@@ -79,7 +80,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin:16px 0}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--divider)}
 .stack{display:grid;gap:10px}
-.panel .mt{margin:10px 0 0;text-align:center}
+.panel .mt{margin:10px 0 0;text-align:left}
 .panel .lead{margin:4px 0 0}
 .note .btn{display:flex;width:fit-content}
 .ns{max-width:420px;margin:24px auto;padding:0 16px}

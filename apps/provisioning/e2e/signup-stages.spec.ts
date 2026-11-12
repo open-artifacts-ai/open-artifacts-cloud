@@ -379,13 +379,13 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   );
 });
 
-test("closed view: the Cloudflare line is centred under the button", async ({
+test("closed view: the Cloudflare line is left-aligned under the button, like the column", async ({
   page,
 }) => {
   await mount(page, { open: false });
   const line = page.locator(".panel .muted.small");
   expect(await line.evaluate((e) => getComputedStyle(e).textAlign)).toBe(
-    "center",
+    "left",
   );
 });
 
@@ -778,7 +778,7 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
     }));
   await expect.poll(dom).toEqual({
     h1: "Log in",
-    who: "Logged in as ada@acme.comNot you? Sign out",
+    who: "Logged in as ada@acme.comNot you?",
     line: "You have acme.open-artifacts.app.",
     steps: 0,
     btn: [],

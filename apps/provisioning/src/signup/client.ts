@@ -161,12 +161,12 @@ export const CLIENT_JS = String.raw`(function () {
       action = h("div", {}, [
         h("div", { class: "who" }, [
           h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
-          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
+          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
         ]),
         h("button", { class: "btn pri", type: "button", onclick: function () { S.step = "address"; route(); } }, ["Continue"])
       ]);
     } else {
-      action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
+      action = h("a", { class: "btn pri gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
     }
     shell(h("div", { class: "panel" }, [
       h("h1", {}, [S.me ? "Continue to Open Artifacts" : "Create your Open Artifacts"]),
@@ -214,8 +214,8 @@ export const CLIENT_JS = String.raw`(function () {
     ta.addEventListener("input", function () { S.note = ta.value; paintCount(); });
     paintCount();
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["Open Artifacts is in private beta"]),
+      whoRow(),
       h("p", { class: "lead" }, ["We're letting people in a few at a time. Join the waitlist and we'll email you when it's your turn."]),
       h("div", { class: "field roomy" }, [h("label", { for: "use" }, ["What would you use it for? (optional)"]), ta, cnt]),
       S.joinErr ? h("div", { class: "note bad", role: "alert" }, [S.joinErr]) : null,
@@ -239,8 +239,8 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function viewListed() {
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["You're on the list"]),
+      whoRow(),
       h("p", { class: "lead" }, ["We'll email " + S.me.email + " when you're in. Nothing else to do for now."]),
       h("p", { class: "muted small mt" }, ["Don't want to wait? ", h("a", { href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself, free."])])
     ]));
@@ -269,8 +269,8 @@ export const CLIENT_JS = String.raw`(function () {
     refs.ts = h("div", { class: "ts" });
 
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["Choose your address"]),
+      whoRow(),
       h("p", { class: "lead" }, ["It's where you and your team open your artifacts. You can't change it later."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       h("div", { class: "field" }, [h("label", { for: "slug" }, ["Address"]), refs.box, refs.help, refs.sugg, refs.chips]),
@@ -651,7 +651,7 @@ export const CLIENT_JS = String.raw`(function () {
         head = [h("h1", {}, ["Log in"]),
           h("div", { class: "who" }, [
             h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
-            h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
+            h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
           ]),
           h("p", {}, ["You have ", nw(hostName), "."])];
         steps = null;
