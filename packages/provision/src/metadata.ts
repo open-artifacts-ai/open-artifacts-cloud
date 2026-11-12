@@ -246,6 +246,11 @@ export interface ResourceMetaInput {
    * feature on top of what their tier grants. Never read when env is prod.
    */
   busSlugs?: readonly string[];
+  /**
+   * Staging only (open-artifacts#2325): every install gets `bus`, not just the
+   * named slugs. Never read when env is prod.
+   */
+  busAll?: boolean;
 }
 
 /** One install slug as STAGING_BUS_SLUGS lists it: lowercase, no "--". */
@@ -404,7 +409,9 @@ export function userWorkerMetadata(
   // env check is here, in code, not only in the provisioner's config.
   const slug = i.appHost.split(".")[0] ?? "";
   const bus =
-    r.env === "staging" && busSlugOk(slug) && (r.busSlugs ?? []).includes(slug);
+    r.env === "staging" &&
+    (r.busAll === true ||
+      (busSlugOk(slug) && (r.busSlugs ?? []).includes(slug)));
   const features = [
     ...new Set(
       (tier ? TIER_FEATURES[tier].join(",") : (i.vars.FEATURES ?? ""))

@@ -216,6 +216,11 @@ export interface WfpOptions {
    */
   stagingBusSlugs?: readonly string[];
   /**
+   * Staging only (open-artifacts#2325): every install gets `bus` (metadata's
+   * busAll). Prod ignores it, in provision's code.
+   */
+  stagingBusAll?: boolean;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -2393,6 +2398,7 @@ export class WfpProvisioner {
         doMigrationTag: r.tag,
         env: this.env,
         busSlugs: this.o.stagingBusSlugs,
+        busAll: this.o.stagingBusAll,
         target: this.target.kind,
         mode: r.mode,
         secrets: known,
