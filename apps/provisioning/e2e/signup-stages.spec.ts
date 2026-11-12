@@ -299,9 +299,9 @@ test("poll: a 401 goes to sign-in", async ({ page }) => {
   );
   expired = true;
   await tick(page);
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Sign up or log in");
   await expect(
-    page.getByRole("link", { name: "Sign in with Google" }),
+    page.getByRole("link", { name: "Continue with Google" }),
   ).toBeVisible();
 });
 
@@ -585,11 +585,14 @@ for (const scheme of ["light", "dark"] as const)
 
 test("first screen: only Google, no address field", async ({ page }) => {
   await mount(page, { me: false });
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Sign up or log in");
   await expect(
-    page.getByRole("link", { name: "Sign in with Google" }),
+    page.getByRole("link", { name: "Continue with Google" }),
   ).toBeVisible();
   await expect(page.locator("input")).toHaveCount(0);
+  await expect(page.locator(".panel p.lead").first()).toHaveText(
+    "Use your Google account. If you already have an instance, we'll take you to it.",
+  );
 });
 
 test("address step: only free suggestions show, the first is prefilled", async ({
@@ -621,7 +624,7 @@ test("address step: back keeps you signed in", async ({ page }) => {
   await mount(page, { me: true, free: ["acme"] });
   await expect(page.locator("#slug")).toHaveValue("acme");
   await page.getByRole("button", { name: "Back" }).click();
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Sign up or log in");
   await expect(page.locator(".who")).toContainText("ada@acme.com");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.locator("h1")).toHaveText("Choose your address");
