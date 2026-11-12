@@ -59,6 +59,9 @@ ALLOW=(
   .github/workflows/staging-solo-clock.yml
   scripts/ops/staging-solo-clock.ts
   scripts/ops/staging-solo-clock.test.ts
+  .github/workflows/staging-team-proof.yml
+  scripts/ops/staging-team-proof.ts
+  scripts/ops/staging-team-proof.test.ts
   .github/workflows/staging-stripe-prices.yml
   scripts/ops/stripe-prices.ts
   scripts/ops/stripe-prices.test.ts
