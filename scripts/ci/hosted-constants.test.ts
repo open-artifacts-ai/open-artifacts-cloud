@@ -28,6 +28,11 @@ const STRIPE_KEYS = [
   "stripe_price_solo_yearly",
   "stripe_price_team",
 ];
+// The yearly Team and Business prices (#2136): optional for the loader, held by staging.
+const STRIPE_YEARLY_KEYS = [
+  "stripe_price_business_yearly",
+  "stripe_price_team_yearly",
+];
 // Read by provapi-spikes.sh and provapi-token-verify.sh only; hosted-constants.sh does not load them.
 const SPIKE_KEYS = [
   "app_zone",
@@ -65,7 +70,7 @@ describe(".github/hosted/<env>.json", () => {
       [...KEYS, "signup_deploy"].sort(),
     );
     expect(Object.keys(read("staging")).sort()).toEqual(
-      [...KEYS, ...STRIPE_KEYS].sort(),
+      [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS].sort(),
     );
   });
 
@@ -76,8 +81,10 @@ describe(".github/hosted/<env>.json", () => {
       stripe_price_solo_yearly: "price_1UaImwJuK8jgC2cZKiXgN6nX",
       stripe_price_team: "price_1UYx2vJuK8jgC2cZAcUMAQpw",
       stripe_price_business: "price_1UYx2vJuK8jgC2cZr02sKqwQ",
+      stripe_price_team_yearly: "price_1UamQGJuK8jgC2cZYOU7jxrn",
+      stripe_price_business_yearly: "price_1UamSJJuK8jgC2cZImmC9P8p",
     });
-    for (const k of STRIPE_KEYS)
+    for (const k of [...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS])
       expect(read("staging")[k], k).toMatch(/^price_[A-Za-z0-9]+$/);
   });
 
@@ -263,7 +270,9 @@ describe("hosted-constants.sh", () => {
       const lines = readFileSync(ghEnv, "utf8").split("\n");
       expect(lines).toHaveLength(
         LOADED.length +
-          (env === "staging" ? STRIPE_KEYS.length : 0) +
+          (env === "staging"
+            ? STRIPE_KEYS.length + STRIPE_YEARLY_KEYS.length
+            : 0) +
           (env === "prod" ? 1 : 0) +
           1,
       );
@@ -447,6 +456,8 @@ describe("hosted-constants.sh", () => {
       "STRIPE_PRICE_BUSINESS=price_1UYx2vJuK8jgC2cZr02sKqwQ",
       "STRIPE_PRICE_SOLO_MONTHLY=price_1UYx2tJuK8jgC2cZS0mg3Uiz",
       "STRIPE_PRICE_SOLO_YEARLY=price_1UaImwJuK8jgC2cZKiXgN6nX",
+      "STRIPE_PRICE_TEAM_YEARLY=price_1UamQGJuK8jgC2cZYOU7jxrn",
+      "STRIPE_PRICE_BUSINESS_YEARLY=price_1UamSJJuK8jgC2cZImmC9P8p",
     ])
       expect(st.ghEnv).toContain(`${l}\n`);
     for (const k of STRIPE_KEYS) {
@@ -469,7 +480,7 @@ describe("hosted-constants.sh", () => {
       delete missing[k];
       expect(load(missing, "staging").code, k).toBe(1);
     }
-  });
+  }, 30_000);
 
   it("prod loads no Stripe value and refuses a file that holds one", () => {
     const ok = load(PROD(), "prod");
