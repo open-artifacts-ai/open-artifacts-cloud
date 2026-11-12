@@ -135,10 +135,11 @@ export const CLIENT_JS = String.raw`(function () {
         h("button", { class: "btn pri", type: "button", onclick: function () { S.step = "address"; route(); } }, ["Continue"])
       ]);
     } else {
-      action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
+      action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Continue with Google"]);
     }
     shell(h("div", { class: "panel" }, [
-      h("h1", {}, ["Create your Open Artifacts"]),
+      h("h1", {}, ["Sign up or log in"]),
+      S.me ? null : h("p", { class: "lead signin-lead" }, ["Use your Google account. If you already have an instance, we'll take you to it."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       action,
       h("p", { class: "muted small mt" }, [price()])
