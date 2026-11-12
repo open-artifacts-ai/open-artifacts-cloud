@@ -45,12 +45,17 @@ export function approvalEmail(o: {
   from: string;
   to: string;
   appDomain: string;
+  /** True where billing is configured (the BILLING binding exists): the trial line. Else the beta line. */
+  billing: boolean;
 }): ApprovalEmail {
   const to = sanitizeAddress(o.to);
   const link = signupLink(o.appDomain);
   const url = new URL(link);
   if (url.origin !== link.replace(/\/$/, "")) throw new Error("invalid domain");
-  const body = `You can create your Open Artifacts now. Sign in with ${to} at ${link}. Your first 30 days are free.`;
+  const freeLine = o.billing
+    ? "Your first 30 days are free."
+    : "It's free during the private beta.";
+  const body = `You can create your Open Artifacts now. Sign in with ${to} at ${link}. ${freeLine}`;
   const footer = `You're getting this because you joined the Open Artifacts waitlist with ${to}.`;
   const text = [
     body,
@@ -61,7 +66,7 @@ export function approvalEmail(o: {
   ].join("\n");
   const FONT =
     "Geist,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
-  const htmlBody = `You can create your Open Artifacts now. Sign in with ${esc(to)} at <a href="${esc(link)}" style="color:#1D45B8;">${esc(url.host)}</a>. Your first 30 days are free.`;
+  const htmlBody = `You can create your Open Artifacts now. Sign in with ${esc(to)} at <a href="${esc(link)}" style="color:#1D45B8;">${esc(url.host)}</a>. ${esc(freeLine)}`;
   const html = `<!doctype html>
 <html lang="en">
 <head>

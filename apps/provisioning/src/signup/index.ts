@@ -71,6 +71,8 @@ export function signupConfig(env: Env): Response {
       open: env.SIGNUPS_ENABLED !== "false",
       appDomain: env.APP_DOMAIN,
       turnstileSiteKey: env.TURNSTILE_SITEKEY ?? null,
+      // Billing is configured only where the BILLING binding exists (staging).
+      billing: !!env.BILLING,
       docsUrl: "https://open-artifacts.com",
       githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
     },

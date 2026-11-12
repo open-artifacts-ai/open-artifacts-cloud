@@ -6,6 +6,7 @@ const base = {
   to: "ana@example.com",
   appHost: "acme.open-artifacts.app",
   selfServe: true,
+  billing: true,
 };
 
 describe("welcomeEmail", () => {
@@ -27,6 +28,18 @@ describe("welcomeEmail", () => {
       for (const part of [m.text, m.html]) {
         expect(part).toContain("free for 30 days");
         expect(part).not.toMatch(/free until/);
+      }
+    }
+  });
+
+  it("billing unbound: beta copy, no trial or price, in text and html", () => {
+    for (const trialEndsAt of [undefined, Date.UTC(2026, 11, 9, 23)]) {
+      const m = welcomeEmail({ ...base, billing: false, trialEndsAt });
+      for (const part of [m.text, m.html.replace(/&#39;/g, "'")]) {
+        expect(part).toContain(
+          "You're in the private beta: free, no card needed. We'll email you before paid plans start.",
+        );
+        expect(part).not.toMatch(/Solo|30 days|\$10|free until/);
       }
     }
   });
