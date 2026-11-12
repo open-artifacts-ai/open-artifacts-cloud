@@ -625,6 +625,13 @@ describe("platform-db.ts", () => {
       expect(() => pinDrift(LOCK, t.lock)).toThrow(
         "the tag's migration lock has no pins",
       );
+      writeFileSync(t.lock, '{"pins":{}}');
+      expect(() => pinDrift(LOCK, t.lock)).toThrow(
+        "the tag's migration lock has no pins",
+      );
+      expect(() => pinDrift(t.lock, LOCK)).toThrow(
+        "main's migration lock has no pins",
+      );
     });
   });
 

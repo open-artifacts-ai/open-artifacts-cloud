@@ -110,7 +110,11 @@ export function pinDrift(
   };
   const main = pins(mainLockFile, "main's");
   const tag = pins(tagLockFile, "the tag's");
-  const newest = Object.keys(tag).sort().at(-1) ?? "";
+  if (!Object.keys(main).length)
+    throw new Refused("main's migration lock has no pins");
+  if (!Object.keys(tag).length)
+    throw new Refused("the tag's migration lock has no pins");
+  const newest = Object.keys(tag).sort().at(-1) as string;
   const problems: string[] = [];
   const aheadOnMain: string[] = [];
   for (const [name, sha] of Object.entries(main)) {
