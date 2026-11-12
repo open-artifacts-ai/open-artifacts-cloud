@@ -265,8 +265,8 @@ describe("redline-nightly.yml", () => {
       "id-token": "write",
       actions: "read",
     });
-    // The callee's Environments carry its secrets; nothing repo-level goes.
-    expect(j.secrets).toBeUndefined();
+    // A called run's Environments resolve secrets only with inherit (43183209806).
+    expect(j.secrets).toBe("inherit");
   });
 
   it("records the release before it runs", () => {

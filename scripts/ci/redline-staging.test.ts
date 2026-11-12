@@ -1691,7 +1691,7 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
     const j = dry.jobs.redline;
     expect(j.needs).toBe("idle");
     expect(j.uses).toBe("./.github/workflows/redline-staging.yml");
-    expect(j.secrets).toBeUndefined();
+    expect(j.secrets).toBe("inherit");
     expect(j.permissions).toEqual({
       contents: "read",
       "id-token": "write",

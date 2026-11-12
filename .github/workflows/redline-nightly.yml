@@ -73,8 +73,11 @@ jobs:
     uses: ./.github/workflows/redline-staging.yml
     with:
       tag: ${{ needs.pick.outputs.tag }}
-    # No secrets passed: the called jobs name their Environments, and an
-    # Environment's secrets reach them there. Nothing repo-level goes along.
+    # secrets: inherit. Without it a called run's jobs get empty secrets even
+    # with their Environment named (t19-dry-run 43183209806: platform-tags had
+    # no CLOUDFLARE_API_TOKEN). The callee is main's file and names only the
+    # secrets it uses; the t19 job references none, so branch specs see none.
+    secrets: inherit
   report:
     needs: [pick, redline]
     if: ${{ always() && (needs.pick.result != 'success' || needs.pick.outputs.run == 'true') }}
