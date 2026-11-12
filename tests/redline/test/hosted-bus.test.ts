@@ -12,7 +12,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import {
   BUS_PAIR_ERROR_FILE,
+  BUS_PAIR_LOG_FILE,
+  BUS_PAIR_STARTED_FILE,
   type BusPair,
+  busPairEnded,
   busPairSides,
   busPairTargets,
   CLOSE_WITHIN_MS,
@@ -23,13 +26,16 @@ import {
   readBusPair,
   type SuspendIo,
   suspendCase,
+  waitBusPair,
   writeBusPair,
 } from "../src/hosted-bus.ts";
 import { ProbeFail, Run } from "../src/provisioning.ts";
 import {
+  awaitPairEnd,
   bringUp,
   bringUpBusPair,
   type RawTargets,
+  runBusPair,
 } from "../src/provisioning-live.ts";
 import { newRecipient, openSealed, parseCreds } from "../src/seal.ts";
 import { secretFileName } from "../src/targets.ts";
@@ -513,26 +519,106 @@ describe("bringUpBusPair", () => {
   });
 });
 
-describe("bringUp and the pair", () => {
-  it("a pair that fails never fails the bring-up: its reason is written for the bus cases", async () => {
+describe("bringUp and the pair (its own process)", () => {
+  const targets = (d: string): RawTargets => ({
+    secretsDir: d,
+    a: { name: "rl-a", installId: CONFIG.rlA.id, app: CONFIG.rlA.app },
+    b: { name: "rl-b", installId: CONFIG.rlB.id, app: CONFIG.rlB.app },
+  });
+
+  it("starts the pair before rl-a's and rl-b's chains and returns without waiting for it", async () => {
     const f = fakeApi();
     setVersion(f, CONFIG.rlA.id, "0.80.0");
     const d = scratch();
-    const t: RawTargets = {
-      secretsDir: d,
-      a: { name: "rl-a", installId: CONFIG.rlA.id, app: CONFIG.rlA.app },
-      b: { name: "rl-b", installId: CONFIG.rlB.id, app: CONFIG.rlB.app },
-    };
-    const out = quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace, async () => {
-      throw new InfraError("rl-busb create: job failed");
+    quiet();
+    let startedAt = -1;
+    await bringUp({}, targets(d), new Run(CONFIG, f.io), noPace, () => {
+      startedAt = f.log.length;
     });
-    expect(existsSync(join(d, BUS_PAIR_ERROR_FILE))).toBe(true);
-    expect(() => readBusPair(d)).toThrow(
-      /bus pair bring-up: infra: rl-busb create: job failed/,
+    // Before any request of the a/b chains; nothing of the pair was awaited.
+    expect(startedAt).toBe(0);
+    expect(f.log.some((l) => /redline-creds$/.test(l))).toBe(true);
+    expect(existsSync(join(d, "REDLINE_BUS_PAIR"))).toBe(false);
+    expect(existsSync(join(d, BUS_PAIR_ERROR_FILE))).toBe(false);
+  });
+
+  it("runBusPair writes the pair, or the reason it failed, so its end is always marked", async () => {
+    const f = fakeApi();
+    const d = scratch();
+    quiet();
+    await runBusPair({}, targets(d), new Run(CONFIG, f.io), noPace);
+    expect(readBusPair(d).busb.name).toBe("rl-busb");
+    const g = fakeApi();
+    g.faults.add("signups_closed");
+    const e = scratch();
+    const broken = new Run(CONFIG, {
+      ...g.io,
+      fetch: (async () => new Response("no", { status: 500 })) as typeof fetch,
+    });
+    await runBusPair({}, targets(e), broken, noPace);
+    expect(busPairEnded(e)).toBe(true);
+    expect(() => readBusPair(e)).toThrow(
+      /bus pair bring-up: rl-busa: R2 q=rl-busa/,
     );
-    expect(out.mock.calls.map((c) => String(c[0])).join("")).toContain(
-      "bus pair: not ready",
+  });
+
+  it("the bus lane waits for the pair with its own deadline; not ended by then is infra", async () => {
+    const d = scratch();
+    const t = { now: 0 };
+    const clock = {
+      now: () => t.now,
+      wait: async (ms: number) => {
+        t.now += ms;
+        if (t.now >= 60_000) writeBusPair(d, PAIR);
+      },
+    };
+    await expect(waitBusPair(d, 120_000, clock)).resolves.toEqual(PAIR);
+    const e = scratch();
+    t.now = 0;
+    await expect(
+      waitBusPair(e, 30_000, {
+        now: () => t.now,
+        wait: async (ms) => {
+          t.now += ms;
+        },
+      }),
+    ).rejects.toThrow("infra: bus pair bring-up not done within 1 min");
+  });
+
+  it("the revoke waits for a started pair, bounded; one still going is stopped by its own pid; its log prints without workflow commands", async () => {
+    const d = scratch();
+    // Not started: nothing to wait for.
+    await awaitPairEnd(d, 1_000, { wait: async () => {}, now: () => 0 });
+    writeFileSync(join(d, BUS_PAIR_STARTED_FILE), "424242\n");
+    writeFileSync(
+      join(d, BUS_PAIR_LOG_FILE),
+      "rl-busa: created (0.82.0)\n::add-mask::secret\n",
     );
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const out = quiet();
+    const t = { now: 0 };
+    await awaitPairEnd(d, 30_000, {
+      now: () => t.now,
+      wait: async (ms) => {
+        t.now += ms;
+      },
+    });
+    expect(t.now).toBeGreaterThanOrEqual(30_000);
+    expect(kill).toHaveBeenCalledWith(424242, "SIGTERM");
+    const text = out.mock.calls.map((c) => String(c[0])).join("");
+    expect(text).toContain("bus pair log: rl-busa: created (0.82.0)");
+    expect(text).not.toContain("secret");
+    // Ended already: no wait, no kill.
+    kill.mockClear();
+    writeBusPair(d, PAIR);
+    t.now = 0;
+    await awaitPairEnd(d, 30_000, {
+      now: () => t.now,
+      wait: async (ms) => {
+        t.now += ms;
+      },
+    });
+    expect(t.now).toBe(0);
+    expect(kill).not.toHaveBeenCalled();
   });
 });

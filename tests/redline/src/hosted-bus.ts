@@ -53,6 +53,40 @@ export interface BusPair {
   busb: PairSide;
 }
 
+/** The pair's own process (provisioning-live.ts spawnBusPair): its pid, and its output. */
+export const BUS_PAIR_STARTED_FILE = "REDLINE_BUS_PAIR_STARTED";
+export const BUS_PAIR_LOG_FILE = "REDLINE_BUS_PAIR_LOG";
+/** How long the bus lane waits for the pair (two creates or upgrades and R26). */
+export const BUS_PAIR_WAIT_MS = 25 * 60_000;
+/** How long the revoke waits for a pair still going before stopping it. */
+export const BUS_PAIR_REVOKE_WAIT_MS = 15 * 60_000;
+
+/** The pair's process has ended: it wrote the pair or its error. */
+export const busPairEnded = (dir: string): boolean =>
+  existsSync(join(dir, BUS_PAIR_FILE)) ||
+  existsSync(join(dir, BUS_PAIR_ERROR_FILE));
+
+/**
+ * The bus lane's wait for the pair: polls for its end up to `within`, then
+ * reads it (readBusPair: an error file is infra); not ended by then is infra.
+ */
+export async function waitBusPair(
+  dir: string,
+  within = BUS_PAIR_WAIT_MS,
+  o: { wait?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<BusPair> {
+  const wait =
+    o.wait ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = o.now ?? Date.now;
+  const end = now() + within;
+  while (!busPairEnded(dir) && now() < end) await wait(5_000);
+  if (!busPairEnded(dir))
+    throw new InfraError(
+      `bus pair bring-up not done within ${Math.round(within / 60_000)} min`,
+    );
+  return readBusPair(dir);
+}
+
 /** The pair's installs bring-up reached R26 on, in order (the run's revoke reads it). */
 export const BUS_PAIR_SIDES_FILE = "REDLINE_BUS_PAIR_SIDES";
 
@@ -218,9 +252,12 @@ export const FRAME_WAIT_MS = 30_000;
 const CLOSE_POLL_MS = 1_000;
 /** Case 2's vitest bound: two jobs at their bound, the probes and slack. */
 export const BUS_CASE_TIMEOUT_MS =
-  2 * JOB_WITHIN_MS + (RECONNECT_AT_MS.at(-1) ?? 0) + 10 * 60_000;
-/** Case 1's: the pair's sign-in, a device flow (polls 5 s apart) and pacing waits. */
-export const CROSS_CASE_TIMEOUT_MS = 5 * 60_000;
+  BUS_PAIR_WAIT_MS +
+  2 * JOB_WITHIN_MS +
+  (RECONNECT_AT_MS.at(-1) ?? 0) +
+  10 * 60_000;
+/** Case 1's: the wait for the pair, its sign-in, a device flow (polls 5 s apart) and pacing waits. */
+export const CROSS_CASE_TIMEOUT_MS = BUS_PAIR_WAIT_MS + 5 * 60_000;
 
 export { mask };
 
@@ -774,7 +811,7 @@ export async function livePair(
   env: Record<string, string | undefined> = process.env,
 ): Promise<LivePair> {
   const t = rawTargets(env.REDLINE_TARGETS);
-  const pair = readBusPair(t.secretsDir);
+  const pair = await waitBusPair(t.secretsDir);
   const m = mask(env);
   const busa = await signIn(t.secretsDir, pair.busa, m);
   const busb = await signIn(t.secretsDir, pair.busb, m);

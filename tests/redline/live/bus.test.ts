@@ -45,8 +45,16 @@ const pair = (): Promise<LivePair> | null => {
 };
 
 type Ctx = Parameters<typeof proof>[0];
-/** Runs a case; a failure is reported, not gated (one release, cloud #202). */
-async function notGating(ctx: Ctx, body: (l: LivePair) => Promise<string>) {
+/**
+ * Runs a case; a failure is reported, not gated (one release, cloud #202).
+ * Its own deadline, a minute inside vitest's, so a slow case reports too
+ * instead of timing out red.
+ */
+async function notGating(
+  ctx: Ctx,
+  timeoutMs: number,
+  body: (l: LivePair) => Promise<string>,
+) {
   const p = pair();
   if (!p)
     return proof(
@@ -54,14 +62,28 @@ async function notGating(ctx: Ctx, body: (l: LivePair) => Promise<string>) {
       "not-applicable",
       "no REDLINE_RELEASE: the hosted bus pair is staging's (redline-staging)",
     );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `no result within ${Math.round((timeoutMs - 60_000) / 1000)} s`,
+          ),
+        ),
+      timeoutMs - 60_000,
+    );
+  });
   try {
-    label(ctx, await body(await p));
+    label(ctx, await Promise.race([p.then(body), late]));
   } catch (e) {
     label(
       ctx,
       `would fail: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500),
     );
     proof(ctx, "unproven-live", HOSTED_BUS_NOT_GATING);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -74,7 +96,7 @@ describe("bus", () => {
   it(
     "rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
     (ctx) =>
-      notGating(ctx, async (l) => {
+      notGating(ctx, CROSS_CASE_TIMEOUT_MS, async (l) => {
         await crossInstallCase(liveCrossIo(l.busa, l.busb, minted), l.pair);
         return `rl-busa ${l.pair.busa.version}, rl-busb ${l.pair.busb.version}`;
       }),
@@ -84,7 +106,7 @@ describe("bus", () => {
   it(
     "suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     (ctx) =>
-      notGating(ctx, async (l) => {
+      notGating(ctx, BUS_CASE_TIMEOUT_MS, async (l) => {
         const r = await suspendCase(
           liveSuspendIo(l.busb, l.busa, minted, l.run, held),
           l.pair,

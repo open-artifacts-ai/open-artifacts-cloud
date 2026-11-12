@@ -1,6 +1,14 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import type { InstallDetail } from "@oa/provisioning-contract";
 import {
@@ -19,8 +27,12 @@ import { boundFetch, InfraError } from "./fetch-timeout.ts";
 import {
   BUS_A,
   BUS_B,
+  BUS_PAIR_LOG_FILE,
+  BUS_PAIR_REVOKE_WAIT_MS,
   BUS_PAIR_SIDES_FILE,
+  BUS_PAIR_STARTED_FILE,
   type BusPair,
+  busPairEnded,
   busPairSides,
   type PairSide,
   writeBusPair,
@@ -451,6 +463,78 @@ export async function bringUpBusPair(
   return pair;
 }
 
+/** scripts/provisioning.ts, which runs `bus-pair` in the child. */
+const PROVISIONING_SCRIPT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../scripts/provisioning.ts",
+);
+
+/**
+ * Starts the pair's bring-up (`provisioning bus-pair`, runBusPair) as a
+ * detached child of this step: its output goes to BUS_PAIR_LOG_FILE (the
+ * revoke prints it), its pid to BUS_PAIR_STARTED_FILE (the revoke stops only
+ * that process, if it is still going at its bound). A spawn that fails is
+ * written as the pair's error. Never throws.
+ */
+export function spawnBusPair(t: RawTargets): void {
+  try {
+    const log = openSync(join(t.secretsDir, BUS_PAIR_LOG_FILE), "a", 0o600);
+    const child = spawn(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--no-warnings",
+        PROVISIONING_SCRIPT,
+        "bus-pair",
+      ],
+      { detached: true, stdio: ["ignore", log, log], env: process.env },
+    );
+    child.unref();
+    if (!child.pid) throw new Error("no pid");
+    writeFileSync(join(t.secretsDir, BUS_PAIR_STARTED_FILE), `${child.pid}\n`, {
+      mode: 0o600,
+    });
+    out(`bus pair: started (pid ${child.pid})\n`);
+  } catch (e) {
+    writeBusPairError(t.secretsDir, `not started: ${errText(e)}`);
+    out("bus pair: not started\n");
+  }
+}
+
+/**
+ * The child's whole job (`provisioning bus-pair`): bringUpBusPair with its
+ * own Run and recipient; a failure is written as the pair's error, so the
+ * pair file or the error file always marks its end.
+ */
+export async function runBusPair(
+  env: Record<string, string | undefined>,
+  t: RawTargets,
+  run: Run = liveRun(env, t),
+  pace?: (app: string, deadline: number) => Promise<unknown>,
+): Promise<void> {
+  const m = mask(env);
+  const r = await newRecipient();
+  const open = async (sealed: string): Promise<CredsOut> => {
+    const c = parseCreds(await openSealed(r, sealed));
+    m(c.pat);
+    m(c.hookKey);
+    return c;
+  };
+  try {
+    await bringUpBusPair(
+      run,
+      t.secretsDir,
+      { publicKey: r.publicKey, open },
+      pace,
+    );
+    out("bus pair: ready\n");
+  } catch (e) {
+    const why = errText(e);
+    writeBusPairError(t.secretsDir, why);
+    out(`bus pair: not ready: ${why}\n`);
+  }
+}
+
 /**
  * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
  * creds, the two installs at the same time (#1730: the two upgrades are about
@@ -465,7 +549,7 @@ export async function bringUp(
   t: RawTargets,
   run: Run = liveRun(env, t),
   pace?: (app: string, deadline: number) => Promise<unknown>,
-  busPair?: typeof bringUpBusPair,
+  startPair: (t: RawTargets) => void = spawnBusPair,
 ): Promise<void> {
   const m = mask(env);
   const r = await newRecipient();
@@ -500,24 +584,13 @@ export async function bringUp(
       throw e;
     }
   };
-  // The hosted bus pair (cloud #202) beside them. Its failure never fails the
-  // bring-up: it is written for the two bus cases, which report it as infra,
-  // so the rest of the suite still runs.
-  const pair = (busPair ?? bringUpBusPair)(
-    run,
-    t.secretsDir,
-    { publicKey: r.publicKey, open },
-    pace,
-  ).then(
-    () => out("bus pair: ready\n"),
-    (e) => {
-      const why = errText(e);
-      writeBusPairError(t.secretsDir, why);
-      out(`bus pair: not ready: ${why}\n`);
-    },
-  );
+  // The hosted bus pair (cloud #202) in a process of its own, started first
+  // and never awaited here: this step's end (and after it the seal of rl-a's
+  // hook key for T19) never waits for rl-busa's and rl-busb's creates and
+  // upgrades. The bus lane waits for the pair itself (waitBusPair, its own
+  // deadline); the revoke waits for it, bounded, before revoking it.
+  startPair(t);
   const done = await Promise.allSettled([one("a", t.a), one("b", t.b)]);
-  await pair;
   const failed = done.filter(
     (d): d is PromiseRejectedResult => d.status === "rejected",
   );
@@ -528,6 +601,42 @@ export async function bringUp(
 
 const errText = (e: unknown): string =>
   e instanceof Error ? e.message : String(e);
+
+/**
+ * Before the revoke: waits for the pair's process to end (its pair or error
+ * file), up to `within`; one still going then is stopped by its own pid (the
+ * one spawnBusPair started, nothing else), so nothing mints after the revoke
+ * reads which installs to revoke. Then prints its log, without workflow
+ * command lines. No-op when no pair was started.
+ */
+export async function awaitPairEnd(
+  dir: string,
+  within = BUS_PAIR_REVOKE_WAIT_MS,
+  o: { wait?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<void> {
+  const started = join(dir, BUS_PAIR_STARTED_FILE);
+  if (!existsSync(started)) return;
+  const wait = o.wait ?? ((ms: number) => delay(ms));
+  const now = o.now ?? Date.now;
+  const end = now() + within;
+  while (!busPairEnded(dir) && now() < end) await wait(POLL_MS);
+  if (!busPairEnded(dir)) {
+    const pid = Number(readFileSync(started, "utf8").trim());
+    if (Number.isSafeInteger(pid) && pid > 0)
+      try {
+        process.kill(pid, "SIGTERM");
+        out(
+          `bus pair: still going after ${Math.round(within / 60_000)} min, stopped (pid ${pid})\n`,
+        );
+      } catch {
+        // Already gone.
+      }
+  }
+  const log = join(dir, BUS_PAIR_LOG_FILE);
+  if (existsSync(log))
+    for (const l of readFileSync(log, "utf8").split("\n"))
+      if (l && !l.startsWith("::")) out(`bus pair log: ${l.slice(0, 300)}\n`);
+}
 
 /** The workflow's last step: R26 revoke on rl-a and rl-b; both run, any failure fails. */
 export async function revokeAll(
@@ -552,7 +661,9 @@ export async function revokeAll(
       out(`rl-${name}: revoke failed: ${(e as Error).message}\n`);
     }
   }
-  // The hosted bus pair's installs that bring-up took R26 creds on (cloud #202).
+  // The hosted bus pair's installs that bring-up took R26 creds on (cloud
+  // #202): first its process's end, bounded, so a late mint is revoked too.
+  await awaitPairEnd(t.secretsDir);
   for (const side of busPairSides(t.secretsDir)) {
     const f = join(t.secretsDir, secretFileName(side.name, "PAT"));
     const pat = existsSync(f)

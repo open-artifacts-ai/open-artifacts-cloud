@@ -618,21 +618,45 @@ const accepted = (c: CaseResult, run: RunKind) =>
   acceptedUnproven(c) !== undefined ||
   nightlyOnly(c, run);
 
+/**
+ * Cloud #202: a fail or infra on a case accepted as HOSTED_BUS_NOT_GATING
+ * (the hosted bus pair, not gating for one release) reports as that accepted
+ * unproven-live, so neither a red case nor a pair that never came up turns
+ * the run red. What it was goes in the label. Every other case is unchanged.
+ */
+export function notGating(c: CaseResult): CaseResult {
+  if (c.level !== "fail" && c.level !== "infra") return c;
+  const hit = ACCEPTED_UNPROVEN.some(
+    (e) =>
+      e.reason === HOSTED_BUS_NOT_GATING &&
+      e.name === c.name &&
+      (c.file === undefined || c.file.endsWith(e.file)),
+  );
+  if (!hit) return c;
+  return {
+    ...c,
+    level: "unproven-live",
+    reason: HOSTED_BUS_NOT_GATING,
+    label: `would be ${c.level}: ${c.reason ?? "no reason"}`.slice(0, 500),
+  };
+}
+
 export function gatePasses(
   cases: readonly CaseResult[],
   run: RunKind = {},
 ): boolean {
   return (
     cases.length > 0 &&
-    cases.every((c) => c.level === "pass" || accepted(c, run))
+    cases.map(notGating).every((c) => c.level === "pass" || accepted(c, run))
   );
 }
 
 export function buildReport(
-  cases: readonly CaseResult[],
+  raw: readonly CaseResult[],
   mode = "unknown",
   run: RunKind = {},
 ): Report {
+  const cases = raw.map(notGating);
   const counts = Object.fromEntries(LEVELS.map((l) => [l, 0])) as Record<
     Level,
     number

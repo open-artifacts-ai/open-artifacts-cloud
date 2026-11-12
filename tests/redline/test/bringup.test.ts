@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HookBudgetError } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
-import type { BusPair } from "../src/hosted-bus.ts";
 import { Run } from "../src/provisioning.ts";
 import {
   bringUp,
@@ -45,8 +44,8 @@ function setup(): { f: FakeApi; t: RawTargets } {
 }
 /** No hook ledger on disk: the polls' pacing is its own concern. */
 const noPace = async () => {};
-/** The hosted bus pair is test/hosted-bus.test.ts's: none here. */
-const noPair = async () => ({}) as BusPair;
+/** The hosted bus pair is test/hosted-bus.test.ts's: none started here. */
+const noPair = () => {};
 const quiet = () => vi.spyOn(process.stdout, "write").mockReturnValue(true);
 const at = (log: string[], re: RegExp) => log.findIndex((l) => re.test(l));
 

@@ -326,6 +326,41 @@ describe("gate", () => {
       }
     });
 
+    it("cloud #202: a fail or an infra on a hosted bus case reports as its accepted unproven-live, what it was in the label, and the run stays green", () => {
+      const bus = ACCEPTED_UNPROVEN.filter(
+        (e) => e.reason === HOSTED_BUS_NOT_GATING,
+      );
+      expect(bus.map((e) => e.file)).toEqual(["bus.test.ts", "bus.test.ts"]);
+      for (const e of bus)
+        for (const level of ["fail", "infra"] as const) {
+          const red: CaseResult = {
+            name: e.name,
+            file: "live/bus.test.ts",
+            level,
+            reason: "infra: bus pair bring-up: rl-busb create: job failed",
+          };
+          const r = buildReport([ok, red]);
+          expect(r.counts[level], level).toBe(0);
+          expect(r.counts["unproven-live"]).toBe(1);
+          expect(r.cases[1]).toMatchObject({
+            level: "unproven-live",
+            reason: HOSTED_BUS_NOT_GATING,
+            label: `would be ${level}: infra: bus pair bring-up: rl-busb create: job failed`,
+          });
+          expect(r.gate.passed).toBe(true);
+          expect(gatePasses([ok, red])).toBe(true);
+          expect(exitCode(r, true)).toBe(0);
+          // The same result in another file, or another case, still fails.
+          expect(
+            gatePasses([ok, { ...red, file: "live/copied.test.ts" }]),
+          ).toBe(false);
+        }
+      for (const level of ["fail", "infra"] as const) {
+        const other = c(NAMES[0] as string, level, "x");
+        expect(exitCode(buildReport([ok, other]), true)).not.toBe(0);
+      }
+    });
+
     it("a listed case at another level fails the gate", () => {
       for (const level of ["fail", "not-applicable", "staging-only"] as const)
         expect(
