@@ -133,7 +133,7 @@ const STAGE_HEADING: Record<string, RegExp> = {
   queued: /^Setting up acme\.open-artifacts\.app$/,
   waiting_cap: /^Setting up acme\.open-artifacts\.app$/,
   creating: /^Setting up acme\.open-artifacts\.app$/,
-  ready: /^Log in$/,
+  ready: /^Welcome back$/,
   failed: /^We couldn't set up acme\.open-artifacts\.app$/,
 };
 
@@ -366,9 +366,9 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
   const order = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("a,input,button")).map(
-      (e) => e.textContent || e.id,
-    ),
+    Array.from(
+      document.querySelectorAll(".panel a,.panel input,.panel button"),
+    ).map((e) => e.textContent || e.id),
   );
   expect(order.slice(-3)).toEqual(["Run it yourself", "go", "Go to it"]);
   // Today's behaviour: a bad slug shows the hint and stays put.
@@ -777,7 +777,7 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
       nav: (window as unknown as { __nav: string[] }).__nav,
     }));
   await expect.poll(dom).toEqual({
-    h1: "Log in",
+    h1: "Welcome back",
     who: "Logged in as ada@acme.comNot you?",
     line: "You have acme.open-artifacts.app.",
     steps: 0,
@@ -790,7 +790,7 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
   expect((await dom()).btn).toEqual(["Open acme.open-artifacts.app"]);
   // a reload in the same tab session does not redirect again
   await page.reload();
-  await expect(page.locator("h1")).toHaveText("Log in");
+  await expect(page.locator("h1")).toHaveText("Welcome back");
   await expect(
     page.getByRole("link", { name: "Open acme.open-artifacts.app" }),
   ).toBeVisible();
@@ -861,7 +861,7 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   "setup-returning": {
     me: true,
     stage: "ready",
-    act: (p) => p.locator("h1").filter({ hasText: "Log in" }).waitFor(),
+    act: (p) => p.locator("h1").filter({ hasText: "Welcome back" }).waitFor(),
   },
   "setup-returning-fallback": {
     me: true,

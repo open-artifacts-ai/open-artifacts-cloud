@@ -22,6 +22,7 @@ a{color:var(--accent-fg)}
 .mark.lg{width:36px;height:36px;margin-bottom:20px}
 .login main.side{max-width:none;width:auto;margin:0;padding:32px;background:var(--surface);border-left:1px solid var(--divider);display:flex;align-items:center;justify-content:center}
 .col{width:100%;max-width:360px}
+.foot{display:none}
 .col:has(.panel.ld) .mark.lg{display:none}
 .side .panel{background:none;border:0;box-shadow:none;padding:0;border-radius:0}
 .side h1{font-size:23px}
@@ -32,7 +33,10 @@ a{color:var(--accent-fg)}
 .pitchtext .pt{font-size:21px;margin:0 0 6px}
 .pitchtext .ps{font-size:14px}
 .top .links,.mark.ghost,.mark.lg{display:none}
-.login main.side{border-left:0;border-top:1px solid var(--divider);align-items:flex-start;padding:24px 20px 40px}
+.login main.side{flex-direction:column;align-items:stretch;justify-content:space-between;gap:32px;padding-bottom:24px}
+.foot{display:block;font-size:13px;color:var(--muted)}
+.foot a{color:var(--muted)}
+.login main.side{border-left:0;border-top:1px solid var(--divider);padding:24px 20px 24px}
 }
 .top .links a{color:var(--text2)}
 .mark{width:20px;height:20px;flex:none;color:var(--text)}

@@ -85,6 +85,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("a", { href: HOSTED_URL, rel: "noopener" }, ["Hosted"]), " · ",
       h("a", { href: S.cfg.githubUrl, rel: "noopener" }, ["GitHub"])
     ]);
+    var foot = links.cloneNode(true); foot.setAttribute("class", "foot");
     var ghost = brandMark(); ghost.setAttribute("class", "mark ghost");
     var big = brandMark(); big.setAttribute("class", "mark lg");
     root.replaceChildren(h("div", { class: "login" }, [
@@ -99,7 +100,7 @@ export const CLIENT_JS = String.raw`(function () {
         ]),
         ghost
       ]),
-      h("main", { class: "side" }, [h("div", { class: "col" }, [big, panel])])
+      h("main", { class: "side" }, [h("div", { class: "col" }, [big, panel]), foot])
     ]));
   }
 
@@ -648,7 +649,7 @@ export const CLIENT_JS = String.raw`(function () {
         head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
         steps = [reserve, step("done", create), step("done", email)];
       } else {
-        head = [h("h1", {}, ["Log in"]),
+        head = [h("h1", {}, ["Welcome back"]),
           h("div", { class: "who" }, [
             h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
             h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
