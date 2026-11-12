@@ -545,6 +545,10 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
+      cancelsAt: null,
+      renewsAt: null,
+      interval: null,
       overageDue: null,
       version: 3,
       asOf: NOW,
@@ -564,6 +568,62 @@ describe("GET /tier", () => {
       await call(gated("GET", "/tier", undefined, { "x-oa-gate-install": B }))
     ).json();
     expect(b).toMatchObject({ hasCustomer: true });
+  });
+
+  it("soloCheckedOut is true only for a row with a card on file from Checkout (solo_checked_out = 1); false without a row or a column value", async () => {
+    at();
+    await seed([{ install: A }, { install: B }]);
+    await db
+      .prepare("UPDATE tiers SET solo_checked_out = 1 WHERE install_id = ?1")
+      .bind(A)
+      .run();
+    const ask = async (install: string) =>
+      (
+        await call(
+          gated("GET", "/tier", undefined, { "x-oa-gate-install": install }),
+        )
+      ).json();
+    expect(await ask(A)).toMatchObject({ soloCheckedOut: true });
+    expect(await ask(B)).toMatchObject({ soloCheckedOut: false });
+  });
+
+  it("cancelsAt is the recorded cancel date (ms), null without one or a row", async () => {
+    at();
+    await seed([{ install: A }, { install: B }]);
+    await db
+      .prepare("UPDATE tiers SET cancels_at = ?2 WHERE install_id = ?1")
+      .bind(A, NOW + 86_400_000)
+      .run();
+    const ask = async (install: string) =>
+      (
+        await call(
+          gated("GET", "/tier", undefined, { "x-oa-gate-install": install }),
+        )
+      ).json();
+    expect(await ask(A)).toMatchObject({ cancelsAt: NOW + 86_400_000 });
+    expect(await ask(B)).toMatchObject({ cancelsAt: null });
+  });
+
+  it("interval and renewsAt are the recorded billing interval and renewal date, null without them", async () => {
+    at();
+    await seed([{ install: A }, { install: B }]);
+    await db
+      .prepare(
+        "UPDATE tiers SET billing_interval = 'year', renews_at = ?2 WHERE install_id = ?1",
+      )
+      .bind(A, NOW + 86_400_000)
+      .run();
+    const ask = async (install: string) =>
+      (
+        await call(
+          gated("GET", "/tier", undefined, { "x-oa-gate-install": install }),
+        )
+      ).json();
+    expect(await ask(A)).toMatchObject({
+      interval: "year",
+      renewsAt: NOW + 86_400_000,
+    });
+    expect(await ask(B)).toMatchObject({ interval: null, renewsAt: null });
   });
 
   it("yearlyTeamBusiness is true only when both yearly price ids are set", async () => {
@@ -610,6 +670,10 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
+      cancelsAt: null,
+      renewsAt: null,
+      interval: null,
       overageDue: null,
       version: 0,
       asOf: NOW,
@@ -664,6 +728,10 @@ describe("POST /trial/start", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
+      cancelsAt: null,
+      renewsAt: null,
+      interval: null,
       overageDue: null,
       version: 5,
       asOf: NOW,

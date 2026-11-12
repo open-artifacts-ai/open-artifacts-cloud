@@ -99,6 +99,9 @@ type Row = {
   last_event_created: number | null;
   last_invoice_created: number | null;
   last_checkout_created: number | null;
+  cancels_at: number | null;
+  renews_at: number | null;
+  billing_interval: string | null;
   open_checkout_id: string | null;
   open_checkout_key: string | null;
 };
@@ -1483,6 +1486,257 @@ describe("Solo (#1568)", () => {
 });
 
 // ---------------------------------------------------------------- prune
+
+describe("a scheduled cancel is recorded (#2138)", () => {
+  const PERIOD_END = T + 20 * 86_400;
+  const cancelling = (o: Record<string, unknown> = {}) =>
+    sub({
+      cancel_at_period_end: true,
+      current_period_end: PERIOD_END,
+      ...o,
+    });
+  const upd = (o: Record<string, unknown>, created: number) =>
+    event("customer.subscription.updated", o, { created });
+  beforeEach(() => ownSub(A).then(() => undefined));
+
+  it("cancel while paid: cancels_at is the period end (ms)", async () => {
+    await deliver(upd(cancelling(), T + 10));
+    expect((await row(A)).cancels_at).toBe(PERIOD_END * 1000);
+  });
+
+  it("cancel_at wins over the period end", async () => {
+    await deliver(upd(cancelling({ cancel_at: PERIOD_END + 5 }), T + 10));
+    expect((await row(A)).cancels_at).toBe((PERIOD_END + 5) * 1000);
+  });
+
+  it("the period end on a newer API version lives on the item", async () => {
+    await deliver(
+      upd(
+        sub({
+          cancel_at_period_end: true,
+          items: {
+            data: [
+              {
+                price: { id: "price_Team", lookup_key: "team" },
+                current_period_end: PERIOD_END,
+              },
+            ],
+          },
+        }),
+        T + 10,
+      ),
+    );
+    expect((await row(A)).cancels_at).toBe(PERIOD_END * 1000);
+  });
+
+  it("cancel during the trial: the trial's end", async () => {
+    await deliver(
+      upd(
+        cancelling({
+          status: "trialing",
+          trial_end: T + 9 * 86_400,
+          current_period_end: T + 30 * 86_400,
+        }),
+        T + 10,
+      ),
+    );
+    expect((await row(A)).cancels_at).toBe((T + 9 * 86_400) * 1000);
+  });
+
+  it("created carries it too", async () => {
+    await deliver(
+      event("customer.subscription.created", cancelling(), { created: T + 10 }),
+    );
+    expect((await row(A)).cancels_at).toBe(PERIOD_END * 1000);
+  });
+
+  it("resume (cancel_at_period_end false, no cancel_at) clears it", async () => {
+    await deliver(upd(cancelling(), T + 10));
+    await deliver(
+      upd(
+        sub({ cancel_at_period_end: false, current_period_end: PERIOD_END }),
+        T + 20,
+      ),
+    );
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("a subscription with no cancel leaves it null", async () => {
+    await deliver(upd(sub({ cancel_at_period_end: false }), T + 10));
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("an older event cannot overwrite a newer one, either way", async () => {
+    await deliver(upd(cancelling(), T + 100));
+    // A delayed older "resume" must not clear it.
+    await deliver(upd(sub({ cancel_at_period_end: false }), T + 50));
+    expect((await row(A)).cancels_at).toBe(PERIOD_END * 1000);
+    // Resumed later, then a delayed older cancel must not set it again.
+    await deliver(upd(sub({ cancel_at_period_end: false }), T + 200));
+    expect((await row(A)).cancels_at).toBeNull();
+    await deliver(upd(cancelling({ cancel_at: PERIOD_END + 9 }), T + 150));
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("an event for another subscription changes nothing", async () => {
+    await deliver(upd(cancelling({ id: "sub_Other9" }), T + 10));
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("deleted clears it", async () => {
+    await deliver(upd(cancelling(), T + 10));
+    await deliver(
+      event("customer.subscription.deleted", sub(), { created: T + 30 }),
+    );
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("an incomplete subscription records nothing", async () => {
+    await deliver(upd(cancelling({ status: "incomplete" }), T + 10));
+    expect((await row(A)).cancels_at).toBeNull();
+  });
+
+  it("applies to Solo and Business subscriptions too", async () => {
+    for (const price of [
+      { id: "price_Solo", lookup_key: "solo" },
+      { id: "price_Biz", lookup_key: "business" },
+    ]) {
+      await db
+        .prepare(
+          "UPDATE tiers SET cancels_at = NULL, last_event_created = NULL WHERE install_id = ?",
+        )
+        .bind(A)
+        .run();
+      await deliver(upd(cancelling({ items: { data: [{ price }] } }), T + 10));
+      expect((await row(A)).cancels_at, price.id).toBe(PERIOD_END * 1000);
+    }
+  });
+});
+
+describe("the renewal date and interval are recorded (#2135)", () => {
+  const PERIOD_END = T + 20 * 86_400;
+  const priced = (interval: unknown, o: Record<string, unknown> = {}) =>
+    sub({
+      current_period_end: PERIOD_END,
+      items: {
+        data: [
+          {
+            price: {
+              id: "price_Team",
+              lookup_key: "team",
+              recurring: { interval },
+            },
+          },
+        ],
+      },
+      ...o,
+    });
+  const upd = (o: Record<string, unknown>, created: number) =>
+    event("customer.subscription.updated", o, { created });
+  beforeEach(() => ownSub(A).then(() => undefined));
+
+  it("monthly and yearly: the item's price interval and the period end (ms)", async () => {
+    await deliver(upd(priced("month"), T + 10));
+    expect(await row(A)).toMatchObject({
+      billing_interval: "month",
+      renews_at: PERIOD_END * 1000,
+    });
+    await deliver(
+      upd(priced("year", { current_period_end: PERIOD_END + 99 }), T + 20),
+    );
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: (PERIOD_END + 99) * 1000,
+    });
+  });
+
+  it("the period end on a newer API version lives on the item", async () => {
+    await deliver(
+      upd(
+        sub({
+          items: {
+            data: [
+              {
+                price: {
+                  id: "price_Team",
+                  lookup_key: "team",
+                  recurring: { interval: "year" },
+                },
+                current_period_end: PERIOD_END,
+              },
+            ],
+          },
+        }),
+        T + 10,
+      ),
+    );
+    expect((await row(A)).renews_at).toBe(PERIOD_END * 1000);
+  });
+
+  it("an interval that is not month or year is not recorded; the period end still is", async () => {
+    await deliver(upd(priced("week"), T + 10));
+    expect(await row(A)).toMatchObject({
+      billing_interval: null,
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("a cancel clears renews_at and keeps the interval; a resume sets it again", async () => {
+    await deliver(upd(priced("year"), T + 10));
+    await deliver(upd(priced("year", { cancel_at_period_end: true }), T + 20));
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: null,
+      cancels_at: PERIOD_END * 1000,
+    });
+    await deliver(upd(priced("year"), T + 30));
+    expect(await row(A)).toMatchObject({
+      renews_at: PERIOD_END * 1000,
+      cancels_at: null,
+    });
+  });
+
+  it("an older event cannot overwrite a newer one", async () => {
+    await deliver(upd(priced("year"), T + 100));
+    await deliver(
+      upd(priced("month", { current_period_end: PERIOD_END - 5 }), T + 50),
+    );
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("an event for another subscription changes nothing", async () => {
+    await deliver(upd(priced("year", { id: "sub_Other9" }), T + 10));
+    expect(await row(A)).toMatchObject({
+      billing_interval: null,
+      renews_at: null,
+    });
+  });
+
+  it("deleted clears both; an incomplete subscription records nothing", async () => {
+    await deliver(upd(priced("year"), T + 10));
+    await deliver(
+      event("customer.subscription.deleted", sub(), { created: T + 30 }),
+    );
+    expect(await row(A)).toMatchObject({
+      billing_interval: null,
+      renews_at: null,
+    });
+    await db
+      .prepare(
+        "UPDATE tiers SET last_event_created = NULL, status = 'active', tier = 'team' WHERE install_id = ?",
+      )
+      .bind(A)
+      .run();
+    await deliver(upd(priced("year", { status: "incomplete" }), T + 40));
+    expect(await row(A)).toMatchObject({
+      billing_interval: null,
+      renews_at: null,
+    });
+  });
+});
 
 describe("pruning stripe_events (#1479)", () => {
   const ids = async () =>

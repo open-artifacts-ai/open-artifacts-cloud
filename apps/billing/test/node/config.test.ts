@@ -109,7 +109,7 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage and 0007_retry are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage, 0007_retry and 0008_cancels_at are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
@@ -119,6 +119,7 @@ describe("migrations", () => {
       "0005_usage_applied.sql",
       "0006_overage.sql",
       "0007_retry.sql",
+      "0008_cancels_at.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -176,6 +177,19 @@ describe("migrations", () => {
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
     );
+  });
+
+  it("0008 adds cancels_at, renews_at and billing_interval to tiers (#2138, #2135)", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0008_cancels_at.sql"),
+      "utf8",
+    );
+    for (const c of [
+      "cancels_at INTEGER",
+      "renews_at INTEGER",
+      "billing_interval TEXT",
+    ])
+      expect(sql).toContain(`ALTER TABLE tiers ADD COLUMN ${c};`);
   });
 
   it("0007 adds the retry and overage payment columns (#2210, #2246)", () => {
