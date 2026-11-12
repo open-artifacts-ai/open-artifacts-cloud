@@ -7,6 +7,8 @@ import { SIGNUP_CSP, signupStatic } from "../src/signup/index.js";
 // and dark, desktop and phone.
 
 const ORIGIN = "https://signup.test";
+// What POST /auth/open answers: the #2026 silent sign-in hand-off URL.
+const HANDOFF = "https://acme.open-artifacts.app/welcome?ticket=t1";
 type Sc = {
   open?: boolean;
   me?: boolean;
@@ -76,6 +78,8 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
       return sc.me
         ? json({ principal: "user", email: "ada@acme.com", csrf: "c" })
         : json({ error: { code: "unauthorized" } }, 401);
+    if (url.pathname === "/auth/open" && req.method() === "POST")
+      return json({ url: HANDOFF });
     if (url.pathname === "/api/v1/signup" && sc.signup) {
       const o = sc.signup(++signupCalls);
       return json(o.body ?? {}, o.status);
@@ -129,7 +133,7 @@ const STAGE_HEADING: Record<string, RegExp> = {
   queued: /^Setting up acme\.open-artifacts\.app$/,
   waiting_cap: /^Setting up acme\.open-artifacts\.app$/,
   creating: /^Setting up acme\.open-artifacts\.app$/,
-  ready: /^acme\.open-artifacts\.app is ready$/,
+  ready: /^Log in$/,
   failed: /^We couldn't set up acme\.open-artifacts\.app$/,
 };
 
@@ -137,6 +141,7 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
   test(`stage ${stage}: heading first, steps under it, no CSP violations`, async ({
     page,
   }) => {
+    await blockNavigation(page);
     const v = await mount(page, { me: true, stage });
     const panel = page.locator(".panel");
     await expect(panel.locator("h1")).toHaveText(heading);
@@ -144,14 +149,9 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
     expect(await panel.evaluate((p) => p.firstElementChild?.tagName)).toBe(
       "H1",
     );
-    if (stage === "ready" || stage === "failed")
+    if (stage === "failed")
       await expect(panel.locator(".steps li")).toHaveCount(3);
     else await expect(panel.locator(".steps")).toHaveCount(0);
-    if (stage === "ready") {
-      await expect(panel.locator("> :last-child")).toHaveText(
-        "Open your instance",
-      );
-    }
     if (stage === "failed") {
       await expect(
         page.getByRole("button", { name: "Try again" }),
@@ -299,9 +299,9 @@ test("poll: a 401 goes to sign-in", async ({ page }) => {
   );
   expired = true;
   await tick(page);
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Sign up or log in");
   await expect(
-    page.getByRole("link", { name: "Sign in with Google" }),
+    page.getByRole("link", { name: "Continue with Google" }),
   ).toBeVisible();
 });
 
@@ -366,9 +366,9 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
   const order = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("a,input,button")).map(
-      (e) => e.textContent || e.id,
-    ),
+    Array.from(
+      document.querySelectorAll(".panel a,.panel input,.panel button"),
+    ).map((e) => e.textContent || e.id),
   );
   expect(order.slice(-3)).toEqual(["Run it yourself", "go", "Go to it"]);
   // Today's behaviour: a bad slug shows the hint and stays put.
@@ -379,13 +379,13 @@ test("closed view reads exactly, newcomer first", async ({ page }) => {
   );
 });
 
-test("closed view: the Cloudflare line is centred under the button", async ({
+test("closed view: the Cloudflare line is left-aligned under the button, like the column", async ({
   page,
 }) => {
   await mount(page, { open: false });
   const line = page.locator(".panel .muted.small");
   expect(await line.evaluate((e) => getComputedStyle(e).textAlign)).toBe(
-    "center",
+    "left",
   );
 });
 
@@ -547,13 +547,52 @@ test("form price line reads the beta wording when billing is off", async ({
   );
 });
 
+for (const scheme of ["light", "dark"] as const)
+  test(`header: the real Open Artifacts mark, ${scheme}, no placeholder`, async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: scheme });
+    await mount(page, { me: false });
+    const mark = page.locator("header.top svg.mark");
+    await expect(mark).toHaveCount(1);
+    await expect(mark).toHaveAttribute("viewBox", "0 0 32 32");
+    await expect(mark).toHaveAttribute("aria-hidden", "true");
+    await expect(page.locator("header.top .logo")).toHaveCount(0);
+    await expect(page.locator("header.top")).toContainText("Open Artifacts");
+    const box = await mark.boundingBox();
+    expect(box?.width).toBe(20);
+    // frame follows the text colour, corners and artifact the accent
+    const fills = await mark.evaluate((m) => ({
+      f: getComputedStyle(m.querySelector(".f") as Element).fill,
+      a: getComputedStyle(m.querySelector(".a") as Element).fill,
+    }));
+    expect(fills).toEqual(
+      scheme === "light"
+        ? { f: "rgb(21, 24, 28)", a: "rgb(35, 80, 208)" }
+        : { f: "rgb(233, 235, 238)", a: "rgb(127, 156, 255)" },
+    );
+    const icon = signupStatic(
+      new Request(`${ORIGIN}/favicon.svg`),
+      "/favicon.svg",
+    );
+    expect(icon?.headers.get("content-type")).toMatch(/^image\/svg\+xml/);
+    expect(await icon?.text()).toContain("Open Artifacts");
+    await expect(page.locator('link[rel="icon"]')).toHaveAttribute(
+      "href",
+      "/favicon.svg",
+    );
+  });
+
 test("first screen: only Google, no address field", async ({ page }) => {
   await mount(page, { me: false });
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
+  await expect(page.locator("h1")).toHaveText("Sign up or log in");
   await expect(
-    page.getByRole("link", { name: "Sign in with Google" }),
+    page.getByRole("link", { name: "Continue with Google" }),
   ).toBeVisible();
   await expect(page.locator("input")).toHaveCount(0);
+  await expect(page.locator(".panel p.lead").first()).toHaveText(
+    "Use your Google account. If you already have an instance, we'll take you to it.",
+  );
 });
 
 test("address step: only free suggestions show, the first is prefilled", async ({
@@ -585,8 +624,8 @@ test("address step: back keeps you signed in", async ({ page }) => {
   await mount(page, { me: true, free: ["acme"] });
   await expect(page.locator("#slug")).toHaveValue("acme");
   await page.getByRole("button", { name: "Back" }).click();
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
-  await expect(page.locator(".who")).toContainText("ada@acme.com");
+  await expect(page.locator("h1")).toHaveText("Continue to Open Artifacts");
+  await expect(page.locator(".who")).toContainText("Logged in as ada@acme.com");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.locator("h1")).toHaveText("Choose your address");
 });
@@ -625,7 +664,7 @@ test("loading: status line follows the stage, no step list", async ({
     "Creating acme.open-artifacts.app\u2026",
   );
   await expect(page.locator(".panel .hint")).toHaveText(
-    "This usually takes a minute or two. Keep this tab open, and it tells you when it's ready.",
+    "This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too.",
   );
   await expect(page.locator(".steps")).toHaveCount(0);
   await expect(page.locator(".anim")).toHaveCount(1);
@@ -644,6 +683,132 @@ test("loading: status line follows the stage, no step list", async ({
   stage = "queued";
   await tick(page);
   await expect(page.locator(".panel .hint")).toHaveCount(1);
+});
+
+// open-artifacts#2350: go straight in when creation finishes.
+// Records top-level navigations and cancels them, so the page stays put (as
+// when a browser blocks the redirect) and the timers keep running.
+const blockNavigation = (page: Page) =>
+  page.addInitScript(() => {
+    const w = window as unknown as { __nav: string[] };
+    w.__nav = [];
+    (
+      window as unknown as { navigation: EventTarget }
+    ).navigation.addEventListener("navigate", (e) => {
+      w.__nav.push(
+        (e as unknown as { destination: { url: string } }).destination.url,
+      );
+      e.preventDefault();
+    });
+  });
+const instance = async (page: Page) => {
+  const hits: string[] = [];
+  await page.route("https://acme.open-artifacts.app/**", (r) => {
+    hits.push(r.request().url());
+    return r.fulfill({ contentType: "text/html", body: "<h1>instance</h1>" });
+  });
+  return hits;
+};
+
+test("ready: the transition from in progress opens the instance by hand-off", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "creating";
+  const hits = await instance(page);
+  await mount(page, {
+    me: true,
+    stage: "creating",
+    signup: () => creating(stage),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  stage = "ready";
+  await tick(page);
+  await page.waitForURL(HANDOFF);
+  expect(hits).toEqual([HANDOFF]);
+});
+
+test("ready: the Open your instance fallback shows only after 3 s on the page", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "creating";
+  await blockNavigation(page);
+  await mount(page, {
+    me: true,
+    stage: "creating",
+    signup: () => creating(stage),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  stage = "ready";
+  await tick(page);
+  const dom = () =>
+    page.evaluate(() => ({
+      h1: document.querySelector("h1")?.textContent,
+      btn: [...document.querySelectorAll("a.btn")].map((a) => a.textContent),
+      nav: (window as unknown as { __nav: string[] }).__nav,
+    }));
+  await expect.poll(dom).toEqual({
+    h1: "Ready. Opening acme.open-artifacts.app\u2026",
+    btn: [],
+    nav: [HANDOFF],
+  });
+  await page.clock.runFor(2000);
+  expect((await dom()).btn).toEqual([]);
+  await page.clock.runFor(1000);
+  expect((await dom()).btn).toEqual(["Open your instance"]);
+  expect(page.url()).toBe(`${ORIGIN}/`);
+});
+
+test("returning owner: goes straight in, no checklist, button after 3 s, once per session", async ({
+  page,
+}) => {
+  await page.clock.install();
+  await blockNavigation(page);
+  await mount(page, { me: true, stage: "ready" });
+  const dom = () =>
+    page.evaluate(() => ({
+      h1: document.querySelector("h1")?.textContent,
+      line: document.querySelector(".panel p")?.textContent,
+      who: document.querySelector(".panel .who")?.textContent,
+      steps: document.querySelectorAll(".steps").length,
+      btn: [...document.querySelectorAll("a.btn")].map((a) => a.textContent),
+      nav: (window as unknown as { __nav: string[] }).__nav,
+    }));
+  await expect.poll(dom).toEqual({
+    h1: "Log in",
+    who: "Logged in as ada@acme.comNot you?",
+    line: "You have acme.open-artifacts.app.",
+    steps: 0,
+    btn: [],
+    nav: [HANDOFF],
+  });
+  await page.clock.runFor(2000);
+  expect((await dom()).btn).toEqual([]);
+  await page.clock.runFor(1000);
+  expect((await dom()).btn).toEqual(["Open acme.open-artifacts.app"]);
+  // a reload in the same tab session does not redirect again
+  await page.reload();
+  await expect(page.locator("h1")).toHaveText("Log in");
+  await expect(
+    page.getByRole("link", { name: "Open acme.open-artifacts.app" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => (window as unknown as { __nav: string[] }).__nav),
+  ).toEqual([]);
+});
+
+test("returning owner: the hand-off navigates to the instance", async ({
+  page,
+}) => {
+  const hits = await instance(page);
+  await mount(page, { me: true, stage: "ready" });
+  await page.waitForURL(HANDOFF);
+  expect(hits).toEqual([HANDOFF]);
 });
 
 test("loading: reduced motion shows the static mark, no rotation", async ({
@@ -668,6 +833,11 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   closed: { open: false },
   "form-signed-out": { me: false },
   "form-notice-expired": { me: false, path: "/?error=expired" },
+  "form-continue": {
+    me: true,
+    free: ["acme"],
+    act: (p) => p.getByRole("button", { name: "Back" }).click(),
+  },
   "form-signed-in-empty": { me: true, free: [] },
   "address-suggestions": { me: true, free: ["acme", "ada", "acme-team"] },
   "form-invalid": { me: true, act: (p) => p.locator("#slug").fill("-bad-") },
@@ -691,7 +861,38 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   "setup-queued": { me: true, stage: "queued" },
   "setup-waiting-cap": { me: true, stage: "waiting_cap" },
   "setup-creating": { me: true, stage: "creating" },
-  "setup-ready": { me: true, stage: "ready" },
+  "setup-returning": {
+    me: true,
+    stage: "ready",
+    act: (p) => p.locator("h1").filter({ hasText: "Log in" }).waitFor(),
+  },
+  "setup-returning-fallback": {
+    me: true,
+    stage: "ready",
+    act: (p) =>
+      p
+        .getByRole("link", { name: "Open acme.open-artifacts.app" })
+        .waitFor({ timeout: 8000 }),
+  },
+  // seen going from in progress to ready (open-artifacts#2350)
+  "setup-opening": {
+    me: true,
+    signup: (n) => creating(n === 1 ? "creating" : "ready"),
+    act: (p) =>
+      p
+        .locator("h1")
+        .filter({ hasText: "Ready. Opening" })
+        .waitFor({ timeout: 9000 }),
+  },
+  "setup-opening-fallback": {
+    me: true,
+    signup: (n) => creating(n === 1 ? "creating" : "ready"),
+    act: async (p) => {
+      await p
+        .getByRole("link", { name: "Open your instance" })
+        .waitFor({ timeout: 15000 });
+    },
+  },
   "setup-failed": { me: true, stage: "failed" },
 };
 test.describe("screenshots", () => {
@@ -708,6 +909,7 @@ test.describe("screenshots", () => {
             colorScheme: scheme,
             reducedMotion: "reduce",
           });
+          await blockNavigation(page);
           await mount(page, sc);
           await page.locator("h1").first().waitFor();
           await sc.act?.(page);

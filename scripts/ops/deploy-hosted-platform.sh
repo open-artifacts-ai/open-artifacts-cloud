@@ -746,6 +746,9 @@ case "$target" in
     for k in STRIPE_PRICE_TEAM_YEARLY STRIPE_PRICE_BUSINESS_YEARLY; do
       [ -z "${!k:-}" ] || [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
     done
+    # The portal configuration is optional (unset: Stripe's default portal).
+    [ -z "${STRIPE_PORTAL_CONFIG:-}" ] || [[ "$STRIPE_PORTAL_CONFIG" =~ ^bpc_[A-Za-z0-9]{1,255}$ ]] ||
+      { echo "STRIPE_PORTAL_CONFIG is not a Stripe portal configuration id" >&2; exit 2; }
     if [ -z "$VERIFY_ONLY" ]; then
       need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
       # Test mode only (billing-core refuses a live key too); never printed.
@@ -764,6 +767,7 @@ case "$target" in
         STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
         STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
         STRIPE_PRICE_TEAM_YEARLY="${STRIPE_PRICE_TEAM_YEARLY:-}" STRIPE_PRICE_BUSINESS_YEARLY="${STRIPE_PRICE_BUSINESS_YEARLY:-}" \
+        STRIPE_PORTAL_CONFIG="${STRIPE_PORTAL_CONFIG:-}" \
         deploy billing
     }
     billing_deploy

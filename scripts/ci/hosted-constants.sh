@@ -87,6 +87,13 @@ LIST
     [[ "$v" =~ $price ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
     lines+="$name=$v"$'\n'
   done
+  # The portal configuration (bpc_...; Stripe Customer Portal with seats and
+  # plan changes off): optional until made (scripts/ops/staging-portal-config.ts).
+  v="$(jq -r '.stripe_portal_config | if type == "string" then . else "" end' "$file")" || exit 1
+  if [ -n "$v" ]; then
+    [[ "$v" =~ ^bpc_[A-Za-z0-9]{1,255}$ ]] || { echo "$file: stripe_portal_config is not a valid value: $v" >&2; exit 1; }
+    lines+="STRIPE_PORTAL_CONFIG=$v"$'\n'
+  fi
 else
   [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
     { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }

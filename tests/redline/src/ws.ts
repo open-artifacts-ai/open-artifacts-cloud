@@ -150,6 +150,11 @@ export interface Held {
   waitText: (pred: (t: string) => boolean, ms: number) => Promise<boolean>;
   /** Ends it from this side; safe to call twice. */
   destroy: () => void;
+  /**
+   * The code of the server's close frame (RFC 6455 5.5.1), once one came;
+   * null before that, for a close frame with no code, and with nothing open.
+   */
+  closeCode: () => number | null;
 }
 
 /** One masked client text frame (RFC 6455 5.2), for a short payload. */
@@ -207,6 +212,7 @@ export async function holdSocket(
       destroy: () => {},
       texts,
       waitText: async () => false,
+      closeCode: () => null,
     };
   let ended = false;
   const waiters = new Set<() => void>();
@@ -221,6 +227,7 @@ export async function holdSocket(
     socket.once("error", end);
   });
   let buf: Buffer = Buffer.alloc(0);
+  let code: number | null = null;
   socket.on("data", (d: Buffer) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -237,8 +244,10 @@ export async function holdSocket(
         off = 10;
       }
       if (buf.length < off + len) break;
-      if (((buf[0] as number) & 0x0f) === 1)
-        texts.push(buf.subarray(off, off + len).toString("utf8"));
+      const op = (buf[0] as number) & 0x0f;
+      if (op === 1) texts.push(buf.subarray(off, off + len).toString("utf8"));
+      // A close frame: its first two payload bytes are the code.
+      if (op === 8 && code === null && len >= 2) code = buf.readUInt16BE(off);
       buf = buf.subarray(off + len);
     }
     for (const w of waiters) w();
@@ -259,6 +268,7 @@ export async function holdSocket(
       clearInterval(ping);
       socket.destroy();
     },
+    closeCode: () => code,
     waitText: (pred, ms) =>
       new Promise<boolean>((resolve) => {
         const done = (v: boolean) => {

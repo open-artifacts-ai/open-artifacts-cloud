@@ -9,7 +9,8 @@
 // mint-oidc writes one GitHub OIDC JWT per audience key (provisioning,
 // stagingInventory, prodInventory) into REDLINE_TARGETS.secretsDir as 0600
 // files. bringup upgrades rl-a and rl-b to REDLINE_RELEASE (R5) and writes
-// their R26 creds (REDLINE_RL_<X>_PAT, _HOOK_KEY). staged-version writes
+// their R26 creds (REDLINE_RL_<X>_PAT, _HOOK_KEY); it first starts bus-pair
+// (cloud #202: rl-busa and rl-busb) as a detached process it never waits for. staged-version writes
 // REDLINE_RELEASE (X.Y.Z) to <file> once rl-a's and rl-b's /healthz both
 // report it (the redline-staged-version artifact). revoke is the job's
 // if: always() end: R26 revoke on both, and their PATs must then be 401.
@@ -25,6 +26,7 @@ import {
   mintFiles,
   rawTargets,
   revokeAll,
+  runBusPair,
   writeStagedVersion,
 } from "../src/provisioning-live.ts";
 import {
@@ -73,6 +75,11 @@ async function main(): Promise<number> {
     await bringUp(env, t);
     return 0;
   }
+  // Cloud #202: the hosted bus pair, in the detached process bringup starts.
+  if (cmd === "bus-pair") {
+    await runBusPair(env, t);
+    return 0;
+  }
   if (cmd === "staged-version") {
     if (rest.length !== 1 || !rest[0])
       throw new Error("staged-version: one output file");
@@ -81,7 +88,7 @@ async function main(): Promise<number> {
   }
   if (cmd === "revoke") return revokeAll(env, t);
   throw new Error(
-    "usage: provisioning.ts mint-oidc <key>... | bringup | staged-version <file> | revoke | t19-recipient | t19-seal <pub> <out> | t19-open",
+    "usage: provisioning.ts mint-oidc <key>... | bringup | bus-pair | staged-version <file> | revoke | t19-recipient | t19-seal <pub> <out> | t19-open",
   );
 }
 

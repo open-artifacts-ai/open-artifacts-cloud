@@ -71,6 +71,7 @@ describe("wrangler.jsonc", () => {
         STRIPE_PRICE_SOLO_YEARLY: `{{STRIPE_PRICE_SOLO_YEARLY_${up}}}`,
         STRIPE_PRICE_TEAM_YEARLY: `{{STRIPE_PRICE_TEAM_YEARLY_${up}}}`,
         STRIPE_PRICE_BUSINESS_YEARLY: `{{STRIPE_PRICE_BUSINESS_YEARLY_${up}}}`,
+        STRIPE_PORTAL_CONFIG: `{{STRIPE_PORTAL_CONFIG_${up}}}`,
       });
       for (const k of [
         "services",
