@@ -147,6 +147,8 @@ interface TierRow {
   has_customer: number;
   /** tiers.solo_checked_out: 1 once a Checkout put a card on file, else null. */
   solo_checked_out: number | null;
+  /** tiers.cancels_at: when a scheduled cancel takes effect (ms), else null. */
+  cancels_at: number | null;
   version: number;
 }
 
@@ -200,6 +202,7 @@ function view(
       soloTrialEndsAt: null,
       hasCustomer: false,
       soloCheckedOut: false,
+      cancelsAt: null,
       yearlyTeamBusiness,
       overageDue: null,
       version: 0,
@@ -223,6 +226,8 @@ function view(
     // A Checkout put a card on file (solo_checked_out): a Solo in its free
     // days that has already paid is charged at the trial's end.
     soloCheckedOut: r.solo_checked_out === 1,
+    // When a scheduled cancel (Stripe cancel_at_period_end) takes effect, in ms.
+    cancelsAt: r.cancels_at,
     yearlyTeamBusiness,
     // A yearly overage invoice whose payment failed and is unpaid (#2246).
     // A notice only: it never moves tier, status or grace.
@@ -233,7 +238,7 @@ function view(
 }
 
 const COLS =
-  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, solo_checked_out, version";
+  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, solo_checked_out, cancels_at, version";
 // The read records last_read_at on the install's own row and writes nothing
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;

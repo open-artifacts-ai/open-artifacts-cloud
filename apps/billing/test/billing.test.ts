@@ -546,6 +546,7 @@ describe("GET /tier", () => {
       hasCustomer: true,
       yearlyTeamBusiness: false,
       soloCheckedOut: false,
+      cancelsAt: null,
       overageDue: null,
       version: 3,
       asOf: NOW,
@@ -582,6 +583,23 @@ describe("GET /tier", () => {
       ).json();
     expect(await ask(A)).toMatchObject({ soloCheckedOut: true });
     expect(await ask(B)).toMatchObject({ soloCheckedOut: false });
+  });
+
+  it("cancelsAt is the recorded cancel date (ms), null without one or a row", async () => {
+    at();
+    await seed([{ install: A }, { install: B }]);
+    await db
+      .prepare("UPDATE tiers SET cancels_at = ?2 WHERE install_id = ?1")
+      .bind(A, NOW + 86_400_000)
+      .run();
+    const ask = async (install: string) =>
+      (
+        await call(
+          gated("GET", "/tier", undefined, { "x-oa-gate-install": install }),
+        )
+      ).json();
+    expect(await ask(A)).toMatchObject({ cancelsAt: NOW + 86_400_000 });
+    expect(await ask(B)).toMatchObject({ cancelsAt: null });
   });
 
   it("yearlyTeamBusiness is true only when both yearly price ids are set", async () => {
@@ -629,6 +647,7 @@ describe("GET /tier", () => {
       hasCustomer: false,
       yearlyTeamBusiness: false,
       soloCheckedOut: false,
+      cancelsAt: null,
       overageDue: null,
       version: 0,
       asOf: NOW,
@@ -684,6 +703,7 @@ describe("POST /trial/start", () => {
       hasCustomer: true,
       yearlyTeamBusiness: false,
       soloCheckedOut: false,
+      cancelsAt: null,
       overageDue: null,
       version: 5,
       asOf: NOW,

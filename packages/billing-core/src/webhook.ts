@@ -269,6 +269,31 @@ const HOLD =
 const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/;
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
+/**
+ * When a subscription's scheduled cancel takes effect, in ms (#2138): its
+ * cancel_at, else (cancel_at_period_end) the end of the period, which is the
+ * trial's end while it is trialing. null: no cancel is scheduled (resumed).
+ * undefined: a cancel is scheduled but Stripe named no date, so nothing is
+ * recorded. The period end sits on the subscription, or on its first item
+ * from newer API versions.
+ */
+export function cancelsAtOf(
+  o: Record<string, unknown>,
+): number | null | undefined {
+  const num = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v * 1000 : null;
+  const cancelAt = num(o.cancel_at);
+  if (cancelAt !== null) return cancelAt;
+  if (o.cancel_at_period_end !== true) return null;
+  const items =
+    isObj(o.items) && Array.isArray(o.items.data) ? o.items.data : [];
+  const first = isObj(items[0]) ? items[0] : {};
+  const periodEnd = num(o.current_period_end) ?? num(first.current_period_end);
+  const end =
+    o.status === "trialing" ? (num(o.trial_end) ?? periodEnd) : periodEnd;
+  return end ?? undefined;
+}
+
 /** One column assignment in the row update: SQL and its binds. */
 type Set = { sql: string; args: unknown[] };
 
@@ -565,6 +590,16 @@ export function changeFor(
           sql: "solo_trial_ends_at = CASE WHEN solo_trial_ends_at IS NULL OR solo_trial_ends_at > ? THEN ? ELSE solo_trial_ends_at END",
           args: [ev.created * 1000, ev.created * 1000],
         });
+      // A scheduled cancel, or its resume (#2138), on a live subscription of
+      // any tier. Under the same ordering guard as everything above.
+      if (
+        tierFromSubscription(o, prices) &&
+        (status === "active" || status === "past_due")
+      ) {
+        const ends = cancelsAtOf(o);
+        if (ends !== undefined)
+          sets.push({ sql: "cancels_at = ?", args: [ends] });
+      }
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
         sets.push({ sql: "stripe_subscription_id = ?", args: [subId] });
@@ -575,6 +610,7 @@ export function changeFor(
       // subscription that ends under a running Business trial is recorded
       // for when the trial ends.
       return [
+        { sql: "cancels_at = NULL", args: [] },
         guarded("status", "'lapsed'", [], { paid: true }),
         guarded("grace_until", "NULL", [], { paid: true }),
         ...(tierFromSubscription(o, prices) === "solo"

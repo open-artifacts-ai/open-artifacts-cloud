@@ -62,6 +62,7 @@ describe("billing-db.ts", () => {
       "0005_usage_applied.sql",
       "0006_overage.sql",
       "0007_retry.sql",
+      "0008_cancels_at.sql",
     ]);
   });
 
@@ -77,13 +78,14 @@ describe("billing-db.ts", () => {
       "0005_usage_applied.sql applied",
       "0006_overage.sql applied",
       "0007_retry.sql applied",
-      "7 migrations tracked, tables present",
+      "0008_cancels_at.sql applied",
+      "8 migrations tracked, tables present",
     ]);
     expect(tracked(f)).toEqual(
       migrations.map((m) => ({ name: m.name, sha256: m.sha256 })),
     );
     // Tracker creation, then one request per file carrying its own record.
-    expect(f.execs).toHaveLength(8);
+    expect(f.execs).toHaveLength(9);
     for (const [i, m] of migrations.entries()) {
       const e = f.execs[i + 1] as string;
       expect(e).toContain(m.sql.trimEnd());
@@ -126,7 +128,7 @@ describe("billing-db.ts", () => {
     f.execs.length = 0;
     const r = await go(f);
     expect(r.ok, r.err).toBe(true);
-    expect(r.log).toEqual(["7 migrations tracked, tables present"]);
+    expect(r.log).toEqual(["8 migrations tracked, tables present"]);
     expect(f.execs).toEqual([
       expect.stringContaining("CREATE TABLE IF NOT EXISTS billing_migrations"),
     ]);
@@ -158,7 +160,7 @@ describe("billing-db.ts", () => {
     const pend = await go(f, { verifyOnly: true });
     expect(pend.ok).toBe(false);
     expect(pend.err).toContain(
-      "0002_solo_tier.sql, 0003_solo_checked_out.sql, 0004_test_clock.sql, 0005_usage_applied.sql, 0006_overage.sql, 0007_retry.sql pending (verify only)",
+      "0002_solo_tier.sql, 0003_solo_checked_out.sql, 0004_test_clock.sql, 0005_usage_applied.sql, 0006_overage.sql, 0007_retry.sql, 0008_cancels_at.sql pending (verify only)",
     );
     expect(f.execs).toEqual([]);
     await go(f);
