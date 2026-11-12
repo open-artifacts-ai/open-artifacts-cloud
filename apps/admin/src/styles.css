@@ -118,8 +118,7 @@ code {
   width: 18px;
   height: 18px;
   flex: none;
-  border-radius: 5px;
-  background: var(--oa-text);
+  color: var(--oa-text);
 }
 .oa-env {
   margin: 6px 8px 12px;
