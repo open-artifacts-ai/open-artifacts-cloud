@@ -132,7 +132,7 @@ export const CLIENT_JS = String.raw`(function () {
     if (S.me) {
       action = h("div", {}, [
         h("div", { class: "who" }, [
-          h("span", {}, ["Signed in as ", h("b", {}, [S.me.email])]),
+          h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
           h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
         ]),
         h("button", { class: "btn pri", type: "button", onclick: function () { S.step = "address"; route(); } }, ["Continue"])
@@ -141,7 +141,7 @@ export const CLIENT_JS = String.raw`(function () {
       action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
     }
     shell(h("div", { class: "panel" }, [
-      h("h1", {}, ["Create your Open Artifacts"]),
+      h("h1", {}, [S.me ? "Continue to Open Artifacts" : "Create your Open Artifacts"]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       action,
       h("p", { class: "muted small mt" }, [price()])
@@ -164,7 +164,7 @@ export const CLIENT_JS = String.raw`(function () {
   function whoRow() {
     return h("div", { class: "who" }, [
       h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
-      h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
+      h("span", { class: "wt" }, ["Logged in as ", h("b", {}, [S.me.email])]),
       h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
     ]);
   }
@@ -608,24 +608,35 @@ export const CLIENT_JS = String.raw`(function () {
     var create = "Create your instance", email = "Send your welcome email";
     if (st === "ready") {
       label = "Ready";
-      steps = [reserve, step("done", create), step("done", email)];
-      var btn = h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, ["Open your instance"]);
+      var btn = h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, S.opening ? ["Open your instance"] : ["Open " + hostName]);
+      // Seen going from in progress to ready in this page view: "fresh", with
+      // the checklist. Otherwise a returning owner whose instance is ready.
+      // Either way we go in once per tab session (sessionStorage guard, so a
+      // failed hand-off that reloads the page cannot loop).
+      var key = "oa-signup-opened:" + hostName, seen = false;
+      try { seen = !!window.sessionStorage.getItem(key); } catch (e) { seen = false; }
+      var auto = S.opening || !seen;
       if (S.opening) {
-        // Seen going from in progress to ready in this page view: go in.
         head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
-        body = [];
-        if (!S.openStarted) {
-          S.openStarted = true;
+        steps = [reserve, step("done", create), step("done", email)];
+      } else {
+        head = [h("h1", {}, ["Log in"]), h("p", {}, ["You have ", nw(hostName), "."])];
+        steps = null;
+      }
+      body = [];
+      if (!S.openStarted) {
+        S.openStarted = true;
+        if (auto) {
+          try { window.sessionStorage.setItem(key, "1"); } catch (e) { /* no storage: still once per page view */ }
           goToInstance(btn.href);
+          S.auto = true;
           S.fbT = setTimeout(function () {
             S.fbT = null;
-            if (S.view === "setup" && S.opening) document.querySelector(".panel").appendChild(btn);
+            if (S.view === "setup" && S.auto) document.querySelector(".panel").appendChild(btn);
           }, FALLBACK_MS);
         }
-      } else {
-        head = [h("h1", {}, [nw(hostName), " is ready"])];
-        body = [btn];
       }
+      if (!auto) body = [btn];
     } else {
       label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
@@ -640,9 +651,9 @@ export const CLIENT_JS = String.raw`(function () {
         ])
       ];
     }
-    shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
+    shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat(steps ? [
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
-    ], body)));
+    ] : [], body)));
   }
 
   // POST /auth/open mints a short-lived ticket so the instance can sign the
@@ -724,7 +735,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function route() {
     stopPoll(); stopAnim();
-    clearTimeout(S.fbT); S.fbT = null; S.opening = false; S.openStarted = false;
+    clearTimeout(S.fbT); S.fbT = null; S.opening = false; S.openStarted = false; S.auto = false;
     refs = {};
     if (S.me && S.signup) {
       S.view = "setup";

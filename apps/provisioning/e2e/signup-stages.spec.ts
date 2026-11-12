@@ -133,7 +133,7 @@ const STAGE_HEADING: Record<string, RegExp> = {
   queued: /^Setting up acme\.open-artifacts\.app$/,
   waiting_cap: /^Setting up acme\.open-artifacts\.app$/,
   creating: /^Setting up acme\.open-artifacts\.app$/,
-  ready: /^acme\.open-artifacts\.app is ready$/,
+  ready: /^Log in$/,
   failed: /^We couldn't set up acme\.open-artifacts\.app$/,
 };
 
@@ -141,6 +141,7 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
   test(`stage ${stage}: heading first, steps under it, no CSP violations`, async ({
     page,
   }) => {
+    await blockNavigation(page);
     const v = await mount(page, { me: true, stage });
     const panel = page.locator(".panel");
     await expect(panel.locator("h1")).toHaveText(heading);
@@ -148,14 +149,9 @@ for (const [stage, heading] of Object.entries(STAGE_HEADING)) {
     expect(await panel.evaluate((p) => p.firstElementChild?.tagName)).toBe(
       "H1",
     );
-    if (stage === "ready" || stage === "failed")
+    if (stage === "failed")
       await expect(panel.locator(".steps li")).toHaveCount(3);
     else await expect(panel.locator(".steps")).toHaveCount(0);
-    if (stage === "ready") {
-      await expect(panel.locator("> :last-child")).toHaveText(
-        "Open your instance",
-      );
-    }
     if (stage === "failed") {
       await expect(
         page.getByRole("button", { name: "Try again" }),
@@ -589,8 +585,8 @@ test("address step: back keeps you signed in", async ({ page }) => {
   await mount(page, { me: true, free: ["acme"] });
   await expect(page.locator("#slug")).toHaveValue("acme");
   await page.getByRole("button", { name: "Back" }).click();
-  await expect(page.locator("h1")).toHaveText("Create your Open Artifacts");
-  await expect(page.locator(".who")).toContainText("ada@acme.com");
+  await expect(page.locator("h1")).toHaveText("Continue to Open Artifacts");
+  await expect(page.locator(".who")).toContainText("Logged in as ada@acme.com");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.locator("h1")).toHaveText("Choose your address");
 });
@@ -729,22 +725,49 @@ test("ready: the Open your instance fallback shows only after 3 s on the page", 
   expect(page.url()).toBe(`${ORIGIN}/`);
 });
 
-test("ready: a page loaded on an already ready instance does not navigate", async ({
+test("returning owner: goes straight in, no checklist, button after 3 s, once per session", async ({
   page,
 }) => {
   await page.clock.install();
+  await blockNavigation(page);
+  await mount(page, { me: true, stage: "ready" });
+  const dom = () =>
+    page.evaluate(() => ({
+      h1: document.querySelector("h1")?.textContent,
+      line: document.querySelector(".panel p")?.textContent,
+      steps: document.querySelectorAll(".steps").length,
+      btn: [...document.querySelectorAll("a.btn")].map((a) => a.textContent),
+      nav: (window as unknown as { __nav: string[] }).__nav,
+    }));
+  await expect.poll(dom).toEqual({
+    h1: "Log in",
+    line: "You have acme.open-artifacts.app.",
+    steps: 0,
+    btn: [],
+    nav: [HANDOFF],
+  });
+  await page.clock.runFor(2000);
+  expect((await dom()).btn).toEqual([]);
+  await page.clock.runFor(1000);
+  expect((await dom()).btn).toEqual(["Open acme.open-artifacts.app"]);
+  // a reload in the same tab session does not redirect again
+  await page.reload();
+  await expect(page.locator("h1")).toHaveText("Log in");
+  await expect(
+    page.getByRole("link", { name: "Open acme.open-artifacts.app" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => (window as unknown as { __nav: string[] }).__nav),
+  ).toEqual([]);
+});
+
+test("returning owner: the hand-off navigates to the instance", async ({
+  page,
+}) => {
   const hits = await instance(page);
   await mount(page, { me: true, stage: "ready" });
-  await expect(page.locator("h1")).toHaveText(
-    "acme.open-artifacts.app is ready",
-  );
-  const btn = page.getByRole("link", { name: "Open your instance" });
-  await expect(btn).toBeVisible();
-  await page.clock.runFor(10000);
-  await new Promise((r) => setTimeout(r, 250));
-  expect(page.url()).toBe(`${ORIGIN}/`);
-  expect(hits).toEqual([]);
-  await expect(btn).toBeVisible();
+  await page.waitForURL(HANDOFF);
+  expect(hits).toEqual([HANDOFF]);
 });
 
 test("loading: reduced motion shows the static mark, no rotation", async ({
@@ -769,6 +792,11 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   closed: { open: false },
   "form-signed-out": { me: false },
   "form-notice-expired": { me: false, path: "/?error=expired" },
+  "form-continue": {
+    me: true,
+    free: ["acme"],
+    act: (p) => p.getByRole("button", { name: "Back" }).click(),
+  },
   "form-signed-in-empty": { me: true, free: [] },
   "address-suggestions": { me: true, free: ["acme", "ada", "acme-team"] },
   "form-invalid": { me: true, act: (p) => p.locator("#slug").fill("-bad-") },
@@ -792,7 +820,19 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   "setup-queued": { me: true, stage: "queued" },
   "setup-waiting-cap": { me: true, stage: "waiting_cap" },
   "setup-creating": { me: true, stage: "creating" },
-  "setup-ready": { me: true, stage: "ready" },
+  "setup-returning": {
+    me: true,
+    stage: "ready",
+    act: (p) => p.locator("h1").filter({ hasText: "Log in" }).waitFor(),
+  },
+  "setup-returning-fallback": {
+    me: true,
+    stage: "ready",
+    act: (p) =>
+      p
+        .getByRole("link", { name: "Open acme.open-artifacts.app" })
+        .waitFor({ timeout: 8000 }),
+  },
   // seen going from in progress to ready (open-artifacts#2350)
   "setup-opening": {
     me: true,

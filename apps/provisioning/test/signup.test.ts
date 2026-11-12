@@ -776,7 +776,8 @@ describe("CSP: no inline styles on the sign-up page", () => {
   it("every stage keeps a heading: no empty header branch", () => {
     for (const t of [
       '"Setting up ", nw(hostName)',
-      'nw(hostName), " is ready"',
+      '"Ready. Opening ", nw(hostName)',
+      '"You have ", nw(hostName)',
       '"We couldn\'t set up ", nw(hostName)',
     ])
       expect(CLIENT_JS).toContain(t);
