@@ -138,8 +138,12 @@ interface TierRow {
   version: number;
 }
 
+/** True exactly when both per-creator yearly prices (Team and Business) are configured. */
+const yearlyOn = (env: Env) =>
+  !!env.STRIPE_PRICE_TEAM_YEARLY && !!env.STRIPE_PRICE_BUSINESS_YEARLY;
+
 /** What an install sees: no Stripe ids, ever. */
-function view(r: TierRow | null, now: number) {
+function view(r: TierRow | null, now: number, yearlyTeamBusiness: boolean) {
   if (!r)
     return {
       tier: "solo",
@@ -148,6 +152,7 @@ function view(r: TierRow | null, now: number) {
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: false,
+      yearlyTeamBusiness,
       version: 0,
       asOf: now,
     };
@@ -166,6 +171,7 @@ function view(r: TierRow | null, now: number) {
     // Whether a Stripe customer exists (the portal needs one). The id
     // itself never leaves billing.
     hasCustomer: r.has_customer === 1,
+    yearlyTeamBusiness,
     version: r.version,
     asOf: now,
   };
@@ -713,11 +719,12 @@ function answer(install: string, route: string, url: string, host: RegExp) {
   return Response.json({ url });
 }
 
-async function tier(db: D1Database, install: string, now: number) {
+async function tier(env: Env, install: string, now: number) {
+  const db = env.BILLING_DB;
   await materialize(db, install, now);
   const r = await db.prepare(READ_SQL).bind(install, now).first<TierRow>();
   console.log("billing tier", r ? "row" : "default", install);
-  return Response.json(view(r, now));
+  return Response.json(view(r, now, yearlyOn(env)));
 }
 
 // Solo trials ending in (from, to], oldest install id first, after a cursor.
@@ -765,12 +772,13 @@ async function soloTrialEnding(db: D1Database, q: URLSearchParams) {
 }
 
 async function trialStart(
-  db: D1Database,
+  env: Env,
   install: string,
   body: Record<string, unknown>,
   now: number,
 ) {
   if (mismatched(body, install)) return bad("install_mismatch", 403);
+  const db = env.BILLING_DB;
   await materialize(db, install, now);
   const started = await db
     .prepare(TRIAL_SQL)
@@ -778,12 +786,12 @@ async function trialStart(
     .first<TierRow>();
   if (started) {
     console.log("billing trial started", install);
-    return Response.json(view(started, now));
+    return Response.json(view(started, now, yearlyOn(env)));
   }
   // Any other state: unchanged, and still a 200.
   const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
   console.log("billing trial unchanged", install);
-  return Response.json(view(r, now));
+  return Response.json(view(r, now, yearlyOn(env)));
 }
 
 /**
@@ -827,7 +835,7 @@ async function soloStartCore(
   const unchanged = async (): Promise<SoloStartResult> => {
     const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
     console.log("billing solo unchanged", install);
-    return soloOk(view(r, now));
+    return soloOk(view(r, now, yearlyOn(env)));
   };
   // One trial per install, and nothing beside a subscription already there.
   if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
@@ -860,7 +868,7 @@ async function soloStartCore(
     .first<TierRow>();
   if (started) {
     console.log("billing solo started", install);
-    return soloOk(view(started, now));
+    return soloOk(view(started, now, yearlyOn(env)));
   }
   return unchanged();
 }
@@ -1281,8 +1289,7 @@ export default {
     }
     const now = Date.now();
     try {
-      if (route === "GET /tier")
-        return await tier(env.BILLING_DB, install, now);
+      if (route === "GET /tier") return await tier(env, install, now);
       // Both POSTs: the install's signature first, before any write.
       const body = await signedBody(req, env, install, url.pathname, now);
       if (body instanceof Response) return body;
@@ -1307,7 +1314,7 @@ export default {
       }
       if (!strictBody(body, url.pathname)) return bad("bad_body");
       if (route === "POST /trial/start")
-        return await trialStart(env.BILLING_DB, install, body, now);
+        return await trialStart(env, install, body, now);
       return await usage(env, install, body, now);
     } catch {
       // Never the error text: it can carry a D1 message.
