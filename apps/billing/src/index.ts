@@ -145,6 +145,8 @@ interface TierRow {
   solo_trial_ends_at: number | null;
   /** 1 when tiers.stripe_customer_id is set, else 0 (see COLS). */
   has_customer: number;
+  /** tiers.solo_checked_out: 1 once a Checkout put a card on file, else null. */
+  solo_checked_out: number | null;
   version: number;
 }
 
@@ -197,6 +199,7 @@ function view(
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: false,
+      soloCheckedOut: false,
       yearlyTeamBusiness,
       overageDue: null,
       version: 0,
@@ -217,6 +220,9 @@ function view(
     // Whether a Stripe customer exists (the portal needs one). The id
     // itself never leaves billing.
     hasCustomer: r.has_customer === 1,
+    // A Checkout put a card on file (solo_checked_out): a Solo in its free
+    // days that has already paid is charged at the trial's end.
+    soloCheckedOut: r.solo_checked_out === 1,
     yearlyTeamBusiness,
     // A yearly overage invoice whose payment failed and is unpaid (#2246).
     // A notice only: it never moves tier, status or grace.
@@ -227,7 +233,7 @@ function view(
 }
 
 const COLS =
-  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, version";
+  "tier, status, trial_ends_at, grace_until, solo_trial_ends_at, (stripe_customer_id IS NOT NULL) AS has_customer, solo_checked_out, version";
 // The read records last_read_at on the install's own row and writes nothing
 // when there is no row (create writes rows, not this route).
 const READ_SQL = `UPDATE tiers SET last_read_at = ?2 WHERE install_id = ?1 RETURNING ${COLS}`;

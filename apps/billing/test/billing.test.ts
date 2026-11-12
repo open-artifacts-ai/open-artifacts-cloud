@@ -545,6 +545,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
       overageDue: null,
       version: 3,
       asOf: NOW,
@@ -564,6 +565,23 @@ describe("GET /tier", () => {
       await call(gated("GET", "/tier", undefined, { "x-oa-gate-install": B }))
     ).json();
     expect(b).toMatchObject({ hasCustomer: true });
+  });
+
+  it("soloCheckedOut is true only for a row with a card on file from Checkout (solo_checked_out = 1); false without a row or a column value", async () => {
+    at();
+    await seed([{ install: A }, { install: B }]);
+    await db
+      .prepare("UPDATE tiers SET solo_checked_out = 1 WHERE install_id = ?1")
+      .bind(A)
+      .run();
+    const ask = async (install: string) =>
+      (
+        await call(
+          gated("GET", "/tier", undefined, { "x-oa-gate-install": install }),
+        )
+      ).json();
+    expect(await ask(A)).toMatchObject({ soloCheckedOut: true });
+    expect(await ask(B)).toMatchObject({ soloCheckedOut: false });
   });
 
   it("yearlyTeamBusiness is true only when both yearly price ids are set", async () => {
@@ -610,6 +628,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
       overageDue: null,
       version: 0,
       asOf: NOW,
@@ -664,6 +683,7 @@ describe("POST /trial/start", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      soloCheckedOut: false,
       overageDue: null,
       version: 5,
       asOf: NOW,
