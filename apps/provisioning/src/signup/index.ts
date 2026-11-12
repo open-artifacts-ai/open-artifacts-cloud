@@ -35,7 +35,7 @@ const HTML = `<!doctype html>
 </head>
 <body>
 <div id="app"></div>
-<noscript><main class="ns"><h1>Sign up or log in</h1><p>This page needs JavaScript to sign you in and create your instance.</p></main></noscript>
+<noscript><main class="ns"><h1>Sign up or log in</h1><p>This page needs JavaScript to log you in and create your instance.</p></main></noscript>
 <script src="/app.js"></script>
 </body>
 </html>
