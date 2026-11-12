@@ -302,7 +302,7 @@ describe("approve", () => {
       subject: "You're in: Open Artifacts beta",
     });
     expect(m.sent[0]?.text).toContain(
-      "Sign in with maya@acme.com at https://signup.hosted.test/. Your first month is free.",
+      "Sign in with maya@acme.com at https://signup.hosted.test/. Your first 30 days are free.",
     );
     const [a, ...rest] = await audits("beta.approve");
     expect(rest).toEqual([]);
@@ -1013,7 +1013,7 @@ describe("the approval email", () => {
     });
     expect(m.subject).toBe("You're in: Open Artifacts beta");
     expect(m.text).toContain(
-      "You can create your Open Artifacts now. Sign in with maya@acme.com at https://signup.open-artifacts.app/. Your first month is free.",
+      "You can create your Open Artifacts now. Sign in with maya@acme.com at https://signup.open-artifacts.app/. Your first 30 days are free.",
     );
     expect(m.html).toContain('href="https://signup.open-artifacts.app/"');
     expect(m.html).toContain("Create your Open Artifacts");

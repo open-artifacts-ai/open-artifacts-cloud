@@ -60,13 +60,13 @@ export function trialReminderEmail(o: {
 
   // The approved line (OA Design audit #8), for both the 7-day and the
   // last-day email.
-  const title = `Your free month ends on ${date}. Keep Solo for $1/month.`;
+  const title = `Your free 30 days end on ${date}. Keep Solo for $10 a year or $1 a month.`;
   const intro = `Your Solo trial for ${host} ends on ${date}, and there is no card on file yet.`;
   const consequence =
     "Add a card before then to keep publishing. If you do nothing, your workspace turns read-only when the trial ends. Nothing is deleted.";
   const button = "Add a card";
-  const preheader = `Your free month ends on ${date}. Add a card to keep Solo for $1/month.`;
-  const why = `You got this because you created ${host}. We send one a week before the free month ends and one on its last day.`;
+  const preheader = `Your free 30 days end on ${date}. Add a card to keep Solo for $10 a year or $1 a month.`;
+  const why = `You got this because you created ${host}. We send one a week before the free 30 days end and one on its last day.`;
   const to = oneLine(o.to);
 
   const text = [

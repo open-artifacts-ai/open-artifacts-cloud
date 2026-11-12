@@ -17,15 +17,15 @@ describe("welcomeEmail", () => {
     const m = welcomeEmail({ ...base, trialEndsAt: Date.UTC(2026, 11, 9, 23) });
     for (const part of [m.text, m.html.replace(/&#39;/g, "'")])
       expect(part).toContain(
-        "You're on Solo: free until Dec 9, then $1/month or $10/year.",
+        "You're on Solo: free until Dec 9, then $10 a year or $1 a month.",
       );
   });
 
-  it("says 'free for your first month', no date, when absent or invalid", () => {
+  it("says 'free for 30 days', no date, when absent or invalid", () => {
     for (const trialEndsAt of [undefined, new Date("nope")]) {
       const m = welcomeEmail({ ...base, trialEndsAt });
       for (const part of [m.text, m.html]) {
-        expect(part).toContain("free for your first month");
+        expect(part).toContain("free for 30 days");
         expect(part).not.toMatch(/free until/);
       }
     }
