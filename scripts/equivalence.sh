@@ -63,6 +63,9 @@ ALLOW=(
   .github/workflows/staging-team-proof.yml
   scripts/ops/staging-team-proof.ts
   scripts/ops/staging-team-proof.test.ts
+  .github/workflows/staging-portal-config.yml
+  scripts/ops/staging-portal-config.ts
+  scripts/ops/staging-portal-config.test.ts
   .github/workflows/staging-stripe-prices.yml
   scripts/ops/stripe-prices.ts
   scripts/ops/stripe-prices.test.ts

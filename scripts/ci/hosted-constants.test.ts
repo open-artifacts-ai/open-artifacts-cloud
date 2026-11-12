@@ -437,6 +437,25 @@ describe("hosted-constants.sh", () => {
     expect(bad.code).toBe(1);
   });
 
+  it("stripe_portal_config is optional, validated when present, and never on prod", () => {
+    const st = load(read("staging"), "staging");
+    expect(st.ghEnv).not.toContain("STRIPE_PORTAL_CONFIG");
+    const ok = load(
+      { ...read("staging"), stripe_portal_config: "bpc_1Abc" },
+      "staging",
+    );
+    expect(ok.code, ok.err).toBe(0);
+    expect(ok.ghEnv).toContain("STRIPE_PORTAL_CONFIG=bpc_1Abc\n");
+    for (const v of ["pc_1", "bpc_", "bpc_1 2", "price_1Abc"])
+      expect(
+        load({ ...read("staging"), stripe_portal_config: v }, "staging").code,
+        v,
+      ).toBe(1);
+    expect(
+      load({ ...read("prod"), stripe_portal_config: "bpc_1Abc" }, "prod").code,
+    ).toBe(1);
+  });
+
   it("SIGNUPS_ENABLED invite (the private beta, #2096) loads for staging and prod", () => {
     for (const env of ["staging", "prod"] as const) {
       const r = load({ ...read(env), signups_enabled: "invite" }, env);

@@ -170,6 +170,59 @@ describe("createPortalSession", () => {
   });
 });
 
+describe("createPortalSession configuration", () => {
+  const base = {
+    customerId: "cus_Test1",
+    returnUrl: "https://app.example.com/settings/billing",
+    idempotencyKey: "portal:iabc123def45:1",
+  };
+  it("passes a bpc_ configuration id when given", async () => {
+    const { seen, f } = fake({
+      id: "bps_1",
+      url: "https://billing.stripe.com/p/session/test_1",
+    });
+    await createPortalSession(
+      { ...base, configuration: "bpc_1ABcd" },
+      { secretKey: KEY, fetch: f },
+    );
+    expect(form(seen[0] as Seen)).toEqual({
+      customer: "cus_Test1",
+      return_url: "https://app.example.com/settings/billing",
+      configuration: "bpc_1ABcd",
+    });
+  });
+  it("omits it when unset or empty", async () => {
+    for (const configuration of [undefined, ""]) {
+      const { seen, f } = fake({
+        id: "bps_1",
+        url: "https://billing.stripe.com/p/session/test_1",
+      });
+      await createPortalSession(
+        { ...base, configuration },
+        { secretKey: KEY, fetch: f },
+      );
+      expect(form(seen[0] as Seen)).not.toHaveProperty("configuration");
+    }
+  });
+  it("refuses a malformed id before any call", async () => {
+    for (const configuration of ["pc_1", "bpc_", "bpc_1 2", "bpc_1&x=y"]) {
+      const { seen, f } = fake({});
+      let e: unknown;
+      try {
+        await createPortalSession(
+          { ...base, configuration },
+          { secretKey: KEY, fetch: f },
+        );
+      } catch (x) {
+        e = x;
+      }
+      expect(e).toBeInstanceOf(StripeConfigError);
+      expect((e as StripeConfigError).field).toBe("configuration");
+      expect(seen).toHaveLength(0);
+    }
+  });
+});
+
 describe("createCustomer", () => {
   const input = {
     installId: "iabc123def45",
