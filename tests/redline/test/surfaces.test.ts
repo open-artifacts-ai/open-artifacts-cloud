@@ -248,17 +248,28 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .map(([n]) => `${n} [session]`)
         .sort(),
     );
+    // #2263 adds ten passkey routes to the interactive-only drops.
     // Seven real-only and eight interactive-only on main (#1346's two reach
     // writes among them), three hosted-only billing writes (interactive-only:
     // browser sessions).
-    expect(only).toHaveLength(18);
+    expect(only).toHaveLength(28);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
   it("#1204/#1313: every route behind interactiveSession, direct or through helpers, is interactive-only or owner-only, and no other is", () => {
     // Every file under apps/server/src (routes/, bus/, mcp/, ...); a handler
     // counts when it reaches interactiveSession(c) through any helper chain.
-    const found = interactiveRoutes(serverSources());
+    const scanned = interactiveRoutes(serverSources());
+    // #2263: a pick's answer and its passkey challenge read interactiveSession
+    // (a passkey assertion rides only a browser session) but still answer an
+    // agent's token for an ask without a passkey gate, so they are not
+    // interactive-only; the matrix covers them as artifact comment routes.
+    const ANSWER_ROUTES = [
+      "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer",
+      "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer/challenge",
+    ];
+    const found = scanned.filter((r) => !ANSWER_ROUTES.includes(r));
+    for (const r of ANSWER_ROUTES) expect(scanned).toContain(r);
     // The scan's own reach: direct (erase), a function helper
     // (share-notices' browserUser) and a const arrow on R.* paths
     // (directory's disconnect).
@@ -364,9 +375,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(18);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(28);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 19);
+    expect(by("own")).toHaveLength(cases.length - 2 - 29);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
