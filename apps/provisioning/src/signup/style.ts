@@ -13,8 +13,9 @@ a{color:var(--accent-fg)}
 .top{display:flex;align-items:center;gap:8px;padding:12px 16px;font-weight:700}
 .top .links{margin-left:auto;font-weight:500;font-size:12.5px;color:var(--text2);display:flex;gap:6px}
 .top .links a{color:var(--text2)}
-.logo{width:18px;height:18px;border-radius:4px;border:2px solid var(--accent);display:grid;place-items:center;flex:none}
-.logo i{width:8px;height:8px;background:var(--accent);border-radius:1px}
+.mark{width:20px;height:20px;flex:none;color:var(--text)}
+.mark .f{fill:currentColor}
+.mark .a{fill:var(--accent)}
 main{flex:1;width:100%;max-width:452px;margin:0 auto;padding:24px 16px 48px}
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px;box-shadow:var(--shadow)}
 h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
