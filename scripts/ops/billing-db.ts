@@ -4,8 +4,10 @@
 // it back. The platform-db runner's rules, for a database that never had a
 // legacy schema:
 //   1. The lock holds (check-migration-lock.mjs): frozen, every file pinned and
-//      unchanged; and every pin on main's lock (MAIN_BILLING_MIGRATION_LOCK) is
-//      the tag's too: a tag may add a migration, never edit one and re-pin it.
+//      unchanged; and every pin the tag shares with main's lock
+//      (MAIN_BILLING_MIGRATION_LOCK) matches it: a tag may add a migration,
+//      never edit one and re-pin it. Main may be ahead by migrations newer than
+//      the tag's newest (skipped, logged); a main pin the tag dropped refuses.
 //   2. Tracker billing_migrations (name, sha256, applied_at), created if absent.
 //      Its rows must be a prefix of the pinned files, each with its pin.
 //   3. Each pinned file the tracker lacks, in order: the file and its tracker
@@ -133,7 +135,11 @@ if (
   const lockFile = join(root, "apps/billing/migration-lock.json");
   try {
     const drift = pinDrift(mainLock as string, lockFile);
-    if (drift.length) throw new Refused(drift.join("; "));
+    if (drift.problems.length) throw new Refused(drift.problems.join("; "));
+    for (const n of drift.aheadOnMain)
+      console.error(
+        `oa-s-billing: main pins ${n}, not in this tag yet; skipped`,
+      );
     await run({
       db: d1({
         token: CLOUDFLARE_API_TOKEN as string,

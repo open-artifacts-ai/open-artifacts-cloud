@@ -3,8 +3,10 @@
 // oa-<p>-platform up to every pinned migration in apps/platform-db, and reads
 // it back. First in the deploy order.
 //   1. The lock holds (check-migration-lock.mjs): every file pinned, unchanged;
-//      and every pin on main's lock (MAIN_MIGRATION_LOCK) is the tag's too: a
-//      tag may add a migration, never edit one and re-pin it (pinDrift).
+//      and every pin the tag shares with main's lock (MAIN_MIGRATION_LOCK)
+//      matches it: a tag may add a migration, never edit one and re-pin it
+//      (pinDrift). Main may be ahead by migrations newer than the tag's newest
+//      (skipped, logged); a main pin the tag dropped still refuses.
 //   2. Tracker platform_migrations (name, sha256, applied_at). A tracker row
 //      that isn't a pinned prefix stops the run. Every 0001-0005 file not in
 //      the tracker (all of them when it is empty or absent) is detected by
@@ -79,12 +81,18 @@ const TRACKER = /CREATE TABLE IF NOT EXISTS platform_migrations \([^;]*\);/;
 
 /**
  * main's lock against the tag's (design v7 8.4): the tag's own lock vouches
- * only for itself, so every file main pins must keep exactly that pin in the
- * tag's lock. A changed or dropped pin is an edited migration re-pinned,
- * which never reaches a database that recorded the old file. The tag may pin
- * new files. Problems, empty when none.
+ * only for itself, so every file both locks pin must have the same pin. A
+ * changed pin is an edited migration re-pinned, which never reaches a database
+ * that recorded the old file. The tag may pin new files. A pin only on main is
+ * a migration added after the tag was cut when its name sorts after the tag's
+ * newest pin (`aheadOnMain`, skipped for this deploy); at or before it, the
+ * tag dropped a pin (a problem). If a newer tag already applied an ahead
+ * migration, the tracker check refuses this tag's deploy.
  */
-export function pinDrift(mainLockFile: string, tagLockFile: string): string[] {
+export function pinDrift(
+  mainLockFile: string,
+  tagLockFile: string,
+): { problems: string[]; aheadOnMain: string[] } {
   const pins = (f: string, what: string): Record<string, unknown> => {
     let lock: { pins?: unknown };
     try {
@@ -102,13 +110,22 @@ export function pinDrift(mainLockFile: string, tagLockFile: string): string[] {
   };
   const main = pins(mainLockFile, "main's");
   const tag = pins(tagLockFile, "the tag's");
-  const out: string[] = [];
+  if (!Object.keys(main).length)
+    throw new Refused("main's migration lock has no pins");
+  if (!Object.keys(tag).length)
+    throw new Refused("the tag's migration lock has no pins");
+  const newest = Object.keys(tag).sort().at(-1) as string;
+  const problems: string[] = [];
+  const aheadOnMain: string[] = [];
   for (const [name, sha] of Object.entries(main)) {
-    if (!(name in tag)) out.push(`${name} is pinned on main, not in the tag`);
-    else if (tag[name] !== sha)
-      out.push(`${name}'s pin differs from main's (an edited migration)`);
+    if (!(name in tag)) {
+      if (name > newest) aheadOnMain.push(name);
+      else problems.push(`${name} is pinned on main, not in the tag`);
+    } else if (tag[name] !== sha)
+      problems.push(`${name}'s pin differs from main's (an edited migration)`);
   }
-  return out;
+  aheadOnMain.sort();
+  return { problems, aheadOnMain };
 }
 
 /** The pinned migrations in `dir`, in order. */
@@ -654,7 +671,11 @@ if (
   const verifyOnly = Boolean(process.env.VERIFY_ONLY);
   try {
     const drift = pinDrift(mainLock as string, lockFile);
-    if (drift.length) throw new Refused(drift.join("; "));
+    if (drift.problems.length) throw new Refused(drift.problems.join("; "));
+    for (const n of drift.aheadOnMain)
+      console.error(
+        `oa-${env?.[0]}-platform: main pins ${n}, not in this tag yet; skipped`,
+      );
     await run({
       db: d1({
         token: CLOUDFLARE_API_TOKEN as string,

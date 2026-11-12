@@ -371,8 +371,9 @@ broker_pin() {
 
 case "$target" in
   platform-db)
-    # MAIN_MIGRATION_LOCK: main's migration-lock.json; every pin on it must be
-    # the tag's too (platform-db.ts refuses an edited, re-pinned migration).
+    # MAIN_MIGRATION_LOCK: main's migration-lock.json; a pin the tag shares with
+    # it must match (platform-db.ts refuses an edited, re-pinned migration), and
+    # a pin only on main is skipped when newer than the tag's newest.
     need PLATFORM_DB_ID; need MAIN_MIGRATION_LOCK
     node --experimental-strip-types --no-warnings "$root/scripts/ops/platform-db.ts" "$env"
     ;;

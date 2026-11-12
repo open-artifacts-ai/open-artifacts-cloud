@@ -561,27 +561,60 @@ describe("platform-db.ts", () => {
       // The tag's own lock vouches for the edit...
       expect(() => loadMigrations(t.dir, t.lock)).not.toThrow();
       // ...main's doesn't.
-      expect(pinDrift(LOCK, t.lock)).toEqual([
+      expect(pinDrift(LOCK, t.lock).problems).toEqual([
         "0007_signups.sql's pin differs from main's (an edited migration)",
       ]);
     });
-    it("refuses a pin main has that the tag dropped", () => {
+    it("refuses a pin main has that sorts at or before the tag's newest (dropped)", () => {
       const t = tagTree((_, pins) => {
-        delete pins["0008_provisioning.sql"];
+        delete pins["0007_signups.sql"];
       });
-      expect(pinDrift(LOCK, t.lock)).toEqual([
-        "0008_provisioning.sql is pinned on main, not in the tag",
-      ]);
+      expect(pinDrift(LOCK, t.lock)).toEqual({
+        problems: ["0007_signups.sql is pinned on main, not in the tag"],
+        aheadOnMain: [],
+      });
+    });
+    it("passes and reports one or two additive pins main has ahead of the tag", () => {
+      const one = tagTree((_, pins) => {
+        delete pins["0014_waitlist_emailed.sql"];
+      });
+      expect(pinDrift(LOCK, one.lock)).toEqual({
+        problems: [],
+        aheadOnMain: ["0014_waitlist_emailed.sql"],
+      });
+      const two = tagTree((_, pins) => {
+        delete pins["0013_signup_beta_gate.sql"];
+        delete pins["0014_waitlist_emailed.sql"];
+      });
+      expect(pinDrift(LOCK, two.lock)).toEqual({
+        problems: [],
+        aheadOnMain: ["0013_signup_beta_gate.sql", "0014_waitlist_emailed.sql"],
+      });
+    });
+    it("still refuses an edited pin while main is ahead", () => {
+      const t = tagTree((_, pins) => {
+        delete pins["0014_waitlist_emailed.sql"];
+        pins["0007_signups.sql"] = "0".repeat(64);
+      });
+      expect(pinDrift(LOCK, t.lock)).toEqual({
+        problems: [
+          "0007_signups.sql's pin differs from main's (an edited migration)",
+        ],
+        aheadOnMain: ["0014_waitlist_emailed.sql"],
+      });
     });
     it("accepts a new migration the tag pins", () => {
       const t = tagTree((dir, pins) => {
         const sql = "CREATE TABLE IF NOT EXISTS x (id TEXT PRIMARY KEY);\n";
-        writeFileSync(join(dir, "0009_x.sql"), sql);
-        pins["0009_x.sql"] = sha(sql);
+        writeFileSync(join(dir, "0015_x.sql"), sql);
+        pins["0015_x.sql"] = sha(sql);
       });
       expect(() => loadMigrations(t.dir, t.lock)).not.toThrow();
-      expect(pinDrift(LOCK, t.lock)).toEqual([]);
-      expect(pinDrift(LOCK, LOCK)).toEqual([]);
+      expect(pinDrift(LOCK, t.lock)).toEqual({
+        problems: [],
+        aheadOnMain: [],
+      });
+      expect(pinDrift(LOCK, LOCK)).toEqual({ problems: [], aheadOnMain: [] });
     });
     it("refuses a lock it can't read", () => {
       expect(() => pinDrift("/nonexistent/lock.json", LOCK)).toThrow(
@@ -591,6 +624,13 @@ describe("platform-db.ts", () => {
       writeFileSync(t.lock, "{}");
       expect(() => pinDrift(LOCK, t.lock)).toThrow(
         "the tag's migration lock has no pins",
+      );
+      writeFileSync(t.lock, '{"pins":{}}');
+      expect(() => pinDrift(LOCK, t.lock)).toThrow(
+        "the tag's migration lock has no pins",
+      );
+      expect(() => pinDrift(t.lock, LOCK)).toThrow(
+        "main's migration lock has no pins",
       );
     });
   });
