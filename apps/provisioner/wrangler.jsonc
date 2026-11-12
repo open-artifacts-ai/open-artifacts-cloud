@@ -52,7 +52,7 @@
         // The Workflow's env: it refuses any other value.
         "OA_ENV": "staging",
         // #1299 part 6: installs (exact slugs) that get the bus feature. Staging only.
-        "STAGING_BUS_SLUGS": "rl-agents,bus1299-b,m2-walk",
+        "STAGING_BUS_SLUGS": "rl-agents,bus1299-b,m2-walk,rl-busb",
         // open-artifacts#2325: "1" gives every staging install the bus feature. Staging only.
         "STAGING_BUS_ALL": "1",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.

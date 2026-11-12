@@ -248,7 +248,8 @@ export interface ResourceMetaInput {
   busSlugs?: readonly string[];
   /**
    * Staging only (open-artifacts#2325): every install gets `bus`, not just the
-   * named slugs. Never read when env is prod.
+   * named slugs, except red-line fixtures (slugs starting `rl-`; named slugs
+   * still get it). Never read when env is prod.
    */
   busAll?: boolean;
 }
@@ -410,7 +411,7 @@ export function userWorkerMetadata(
   const slug = i.appHost.split(".")[0] ?? "";
   const bus =
     r.env === "staging" &&
-    (r.busAll === true ||
+    ((r.busAll === true && !slug.startsWith("rl-")) ||
       (busSlugOk(slug) && (r.busSlugs ?? []).includes(slug)));
   const features = [
     ...new Set(
