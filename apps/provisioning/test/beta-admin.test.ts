@@ -302,7 +302,7 @@ describe("approve", () => {
       subject: "You're in: Open Artifacts beta",
     });
     expect(m.sent[0]?.text).toContain(
-      "Sign in with maya@acme.com at https://signup.hosted.test/. Your first 30 days are free.",
+      "Sign in with maya@acme.com at https://signup.hosted.test/. It's free during the private beta.",
     );
     const [a, ...rest] = await audits("beta.approve");
     expect(rest).toEqual([]);
@@ -945,6 +945,7 @@ describe("addresses", () => {
       from: "f@x.app",
       to: ` a${BIDI}b${ZW}@c.co\r\n `,
       appDomain: "x.app",
+      billing: true,
     });
     expect(m.to).toBe("ab@c.co");
     expect(m.text).toContain("Sign in with ab@c.co at");
@@ -1010,6 +1011,7 @@ describe("the approval email", () => {
       from: "noreply@mail.x.app",
       to: "maya@acme.com",
       appDomain: "open-artifacts.app",
+      billing: true,
     });
     expect(m.subject).toBe("You're in: Open Artifacts beta");
     expect(m.text).toContain(
@@ -1018,11 +1020,37 @@ describe("the approval email", () => {
     expect(m.html).toContain('href="https://signup.open-artifacts.app/"');
     expect(m.html).toContain("Create your Open Artifacts");
   });
+  it("billing bound: the trial line in text and html; unbound: the beta line", () => {
+    const o = {
+      from: "noreply@mail.x.app",
+      to: "maya@acme.com",
+      appDomain: "open-artifacts.app",
+    };
+    const on = approvalEmail({ ...o, billing: true });
+    const off = approvalEmail({ ...o, billing: false });
+    const flat = (s: string) => s.replace(/&#39;/g, "'");
+    for (const part of [on.text, flat(on.html)]) {
+      expect(part).toContain("Your first 30 days are free.");
+      expect(part).not.toContain("private beta");
+    }
+    for (const part of [off.text, flat(off.html)]) {
+      expect(part).toContain("It's free during the private beta.");
+      expect(part).not.toContain("30 days");
+    }
+  });
+  it("the sender picks the line from the BILLING binding", async () => {
+    const m = mailer();
+    const env = envWith(m, { BILLING: {} });
+    await wl("s1", "Maya@Acme.com");
+    await call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] });
+    expect(m.sent[0]?.text).toContain("Your first 30 days are free.");
+  });
   it("cannot inject headers or markup through the address", () => {
     const m = approvalEmail({
       from: "f@x.app",
       to: "a@b.co\r\nBcc: z@z.co<script>",
       appDomain: "x.app",
+      billing: true,
     });
     expect(m.text).not.toMatch(/[\r]/);
     expect(m.html).not.toContain("<script>");

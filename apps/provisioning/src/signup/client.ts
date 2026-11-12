@@ -112,7 +112,9 @@ export const CLIENT_JS = String.raw`(function () {
 
   // ---------- sign-in, then the address (design: round 2, address option A) ----------
   var refs = {};
-  var PRICE = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.";
+  var PRICE_TRIAL = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.";
+  var PRICE_BETA = "Free during the private beta. No card needed.";
+  function price() { return S.cfg && S.cfg.billing ? PRICE_TRIAL : PRICE_BETA; }
 
   function initials(email) {
     var l = String(email).split("@")[0].replace(/[^a-z0-9]+/gi, " ").trim().split(" ");
@@ -139,7 +141,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("h1", {}, ["Create your Open Artifacts"]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       action,
-      h("p", { class: "muted small mt" }, [PRICE])
+      h("p", { class: "muted small mt" }, [price()])
     ]));
   }
 
@@ -243,7 +245,7 @@ export const CLIENT_JS = String.raw`(function () {
       h("div", { class: "field" }, [h("label", { for: "slug" }, ["Address"]), refs.box, refs.help, refs.sugg, refs.chips]),
       refs.err, refs.ts, refs.btn,
       h("button", { class: "btn link back", type: "button", onclick: function () { S.step = "signin"; route(); } }, ["Back"]),
-      h("p", { class: "muted small mt" }, [PRICE])
+      h("p", { class: "muted small mt" }, [price()])
     ]));
     paintAvail();
     paintChips();

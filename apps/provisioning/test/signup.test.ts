@@ -221,6 +221,14 @@ describe("GET /api/v1/config", () => {
       expect(r.headers.get("cache-control")).toBe("no-store");
     }
   });
+  it("billing is true only where the BILLING binding exists", async () => {
+    const cfg = async (over: Record<string, unknown>) =>
+      (await (
+        await call(fakeEnv(over), `${SIGNUP}/api/v1/config`)
+      ).json()) as Record<string, unknown>;
+    expect((await cfg({})).billing).toBe(false);
+    expect((await cfg({ BILLING: {} })).billing).toBe(true);
+  });
 });
 
 describe("sign-in on the sign-up host", () => {

@@ -210,6 +210,7 @@ async function sendApproval(env: Env, to: string): Promise<SendResult> {
       from: env.WELCOME_FROM,
       to,
       appDomain: env.APP_DOMAIN,
+      billing: !!env.BILLING,
     });
     // Never send to an address with controls, bidi characters or spaces.
     if (msg.to !== to || !ADDRESS_RE.test(msg.to))

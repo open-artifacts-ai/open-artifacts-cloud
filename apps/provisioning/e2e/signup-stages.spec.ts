@@ -27,6 +27,8 @@ type Sc = {
   // create answers 403 forbidden with details.reason (the not_invited race)
   createReason?: string;
   path?: string;
+  // GET /api/v1/config billing flag (absent: true, as on staging)
+  billing?: boolean;
   // per-request override of GET /api/v1/signup (n counts calls, from 1)
   signup?: (n: number) => { status: number; body?: unknown };
 };
@@ -66,6 +68,7 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
         open: sc.open !== false,
         appDomain: "open-artifacts.app",
         turnstileSiteKey: "1x00000000000000000000AA",
+        billing: sc.billing !== false,
         docsUrl: "https://open-artifacts.com",
         githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
       });
@@ -532,6 +535,15 @@ test("form price line reads exactly", async ({ page }) => {
   await mount(page, { me: false });
   await expect(page.locator(".panel .muted.small")).toHaveText(
     "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.",
+  );
+});
+
+test("form price line reads the beta wording when billing is off", async ({
+  page,
+}) => {
+  await mount(page, { me: false, billing: false });
+  await expect(page.locator(".panel .muted.small")).toHaveText(
+    "Free during the private beta. No card needed.",
   );
 });
 

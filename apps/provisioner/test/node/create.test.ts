@@ -18,7 +18,11 @@ import {
 import { JOB_ERROR_TEXT, LOG_DETAIL_MAX } from "../../src/errors.js";
 import { jobStep } from "../../src/steps.js";
 import { welcomeEmail } from "../../src/welcome.js";
-import { REACHABLE_MS, runCreate } from "../../src/workflow.js";
+import {
+  type BillingProvisionerRpc,
+  REACHABLE_MS,
+  runCreate,
+} from "../../src/workflow.js";
 import {
   EMAIL,
   ENV,
@@ -245,8 +249,33 @@ describe("ProvisionInstall: create", () => {
       sendWelcome: true,
     });
     expect((await run(w, s.jobId)).error).toBeNull();
-    expect(w.mail.at(-1)?.text).toContain("You're on Solo");
+    expect(w.mail.at(-1)?.text).toContain("You're in the private beta");
+    expect(w.mail.at(-1)?.text).not.toContain("Solo");
     expect(w.mail.at(-1)?.text).toContain("Google account");
+  });
+
+  it("self-serve with a BILLING binding gets the Solo trial copy", async () => {
+    w.ctx.env.BILLING = {
+      soloStart: async () => ({
+        ok: true,
+        tier: "solo",
+        status: "active",
+        trialEndsAt: null,
+        graceUntil: null,
+        soloTrialEndsAt: 1,
+        version: 1,
+        asOf: 1,
+      }),
+    } as unknown as BillingProvisionerRpc;
+    const s = seedCreate(w, {
+      slug: "ssobill",
+      source: "self-serve",
+      tier: "trial",
+      sendWelcome: true,
+    });
+    expect((await run(w, s.jobId)).error).toBeNull();
+    expect(w.mail.at(-1)?.text).toContain("You're on Solo");
+    expect(w.mail.at(-1)?.text).not.toContain("private beta");
   });
 
   it("codes on: the env widget's pair is passed (cf.turnstileList, cf.turnstileWidget)", async () => {

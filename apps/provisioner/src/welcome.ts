@@ -59,6 +59,8 @@ export function welcomeEmail(o: {
    * method, no plan, no price.
    */
   selfServe?: boolean;
+  /** True where billing is configured (the BILLING binding exists): trial copy. Else beta copy. */
+  billing: boolean;
 }): Welcome {
   const url = new URL(`https://${o.appHost}/`);
   if (url.host !== o.appHost.toLowerCase()) throw new Error("invalid app host");
@@ -83,9 +85,11 @@ export function welcomeEmail(o: {
     ],
     plan: !selfServe
       ? null
-      : end
-        ? `You're on Solo: free until ${end}, then $10 a year or $1 a month. No card on file; we'll remind you a week before.`
-        : "You're on Solo: free for 30 days, then $10 a year or $1 a month. No card on file; we'll remind you a week before.",
+      : !o.billing
+        ? "You're in the private beta: free, no card needed. We'll email you before paid plans start."
+        : end
+          ? `You're on Solo: free until ${end}, then $10 a year or $1 a month. No card on file; we'll remind you a week before.`
+          : "You're on Solo: free for 30 days, then $10 a year or $1 a month. No card on file; we'll remind you a week before.",
     why: selfServe
       ? `You got this because you signed up and created ${host}.`
       : "You got this because you signed up for Open Artifacts.",
