@@ -108,7 +108,7 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied and 0006_overage are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage and 0007_retry are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
@@ -117,6 +117,7 @@ describe("migrations", () => {
       "0004_test_clock.sql",
       "0005_usage_applied.sql",
       "0006_overage.sql",
+      "0007_retry.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -174,6 +175,19 @@ describe("migrations", () => {
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
     );
+  });
+
+  it("0007 adds the retry and overage payment columns (#2210, #2246)", () => {
+    const sql = readFileSync(join(app, "migrations/0007_retry.sql"), "utf8");
+    for (const col of [
+      "usage ADD COLUMN retried_at INTEGER",
+      "overage ADD COLUMN paid_at INTEGER",
+      "overage ADD COLUMN failed_at INTEGER",
+      "overage ADD COLUMN voided_at INTEGER",
+      "overage ADD COLUMN amount_due INTEGER",
+      "overage ADD COLUMN payment_attempts INTEGER NOT NULL DEFAULT 0",
+    ])
+      expect(sql).toContain(`ALTER TABLE ${col};`);
   });
 
   it("0006 records the overage billed per install and month (#2235)", () => {
@@ -250,7 +264,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 96 KB per env", () => {
+  it("wrangler deploy --dry-run is under 104 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -261,8 +275,9 @@ describe("bundle", () => {
       // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths;
       // 64 KB until the staging test clocks (the clock call and its gate);
       // 72 KB until per-creator quantity (#2123: the usage apply path);
-      // 80 KB until the yearly overage invoice (#2235).
-      expect(bytes).toBeLessThan(96 * 1024);
+      // 80 KB until the yearly overage invoice (#2235);
+      // 96 KB until the cron retry and overage payment state (#2210, #2246).
+      expect(bytes).toBeLessThan(104 * 1024);
     }
   });
 });

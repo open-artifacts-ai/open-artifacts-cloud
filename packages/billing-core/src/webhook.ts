@@ -120,6 +120,9 @@ export const HANDLED = [
   "customer.subscription.deleted",
   "invoice.payment_failed",
   "invoice.paid",
+  // Overage invoices only (#2246): a void or write-off ends their failure.
+  "invoice.voided",
+  "invoice.marked_uncollectible",
 ] as const;
 
 const EVENT_ID = /^evt_[A-Za-z0-9_]{1,255}$/;
@@ -669,6 +672,88 @@ const lapses = (ev: StripeEvent): boolean =>
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 
+const INVOICE_ID = /^in_[A-Za-z0-9]{1,255}$/;
+const OVERAGE_INSTALL = /^i[a-z0-9]{11}$/;
+const OVERAGE_MONTH = /^\d{4}-(?:0[1-9]|1[0-2])$/;
+const OVERAGE_GUARD =
+  " WHERE install_id = ?1 AND month = ?2 AND invoice_id = ?3 AND changes() = 1 AND EXISTS (SELECT 1 FROM tiers WHERE install_id = ?1 AND stripe_customer_id = ?5) RETURNING 1 AS ok";
+const OVERAGE_PAID_SQL = `UPDATE overage SET paid_at = max(coalesce(paid_at, 0), ?4)${OVERAGE_GUARD}`;
+const OVERAGE_VOID_SQL = `UPDATE overage SET voided_at = max(coalesce(voided_at, 0), ?4)${OVERAGE_GUARD}`;
+const OVERAGE_FAILED_SQL = `UPDATE overage SET failed_at = max(coalesce(failed_at, 0), ?4), amount_due = coalesce(?6, amount_due), payment_attempts = payment_attempts + 1${OVERAGE_GUARD}`;
+
+/**
+ * invoice.paid / invoice.payment_failed of a yearly overage invoice (#2246):
+ * recorded on the overage row (paid_at / failed_at, Stripe's event time in
+ * ms, and the failure count) and nowhere else: tier, status, grace and the
+ * ordering keys are never touched. The row must hold this very invoice for
+ * the customer's own install. Deduped by event id like every event; an
+ * unknown customer is retried while young, as elsewhere.
+ */
+async function overagePayment(
+  db: D1Database,
+  ev: StripeEvent,
+  customer: string,
+  now: number,
+): Promise<Response> {
+  const m = isObj(ev.object.metadata) ? ev.object.metadata : {};
+  const install = m.install;
+  const month = m.month;
+  const invoice = ev.object.id;
+  const known = (
+    await db.prepare(KNOWN).bind(customer).first<{ known: number }>()
+  )?.known;
+  if (!known) {
+    if (now / 1000 - ev.created < UNKNOWN_RETRY_S) {
+      log("unknown_customer");
+      return json({ error: "unknown_customer" }, 409);
+    }
+    await db.prepare(INSERT_EVENT).bind(ev.id, now).run();
+    log("unknown_customer");
+    return json({ received: true });
+  }
+  if (
+    typeof install !== "string" ||
+    !OVERAGE_INSTALL.test(install) ||
+    typeof month !== "string" ||
+    !OVERAGE_MONTH.test(month) ||
+    typeof invoice !== "string" ||
+    !INVOICE_ID.test(invoice)
+  ) {
+    await db.prepare(INSERT_EVENT).bind(ev.id, now).run();
+    log("overage_bad_metadata");
+    return json({ received: true });
+  }
+  const sql =
+    ev.type === "invoice.paid"
+      ? OVERAGE_PAID_SQL
+      : ev.type === "invoice.payment_failed"
+        ? OVERAGE_FAILED_SQL
+        : OVERAGE_VOID_SQL;
+  const due = ev.object.amount_due;
+  const amount =
+    typeof due === "number" && Number.isSafeInteger(due) && due >= 0
+      ? due
+      : null;
+  const binds: (string | number | null)[] = [
+    install,
+    month,
+    invoice,
+    ev.created * 1000,
+    customer,
+  ];
+  if (sql === OVERAGE_FAILED_SQL) binds.push(amount);
+  const res = await db.batch<{ ok?: number }>([
+    db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
+    db.prepare(sql).bind(...binds),
+  ]);
+  if ((res[0]?.meta.changes ?? 0) === 0) {
+    log("replay");
+    return json({ received: true });
+  }
+  log(res[1]?.results[0]?.ok ? "overage_recorded" : "overage_no_row", install);
+  return json({ received: true });
+}
+
 /** One fixed-category line, the install id only (never a Stripe id). */
 const log = (category: string, install?: string | null) =>
   console.log("billing webhook", category, ...(install ? [install] : []));
@@ -896,6 +981,15 @@ export async function handleStripeWebhook(
   const customer = customerOf(ev.object);
   try {
     const db = env.BILLING_DB;
+    if (
+      customer &&
+      (ev.type === "invoice.paid" ||
+        ev.type === "invoice.payment_failed" ||
+        ev.type === "invoice.voided" ||
+        ev.type === "invoice.marked_uncollectible") &&
+      isOverage(ev.object)
+    )
+      return await overagePayment(db, ev, customer, now);
     if (!change || !customer) {
       const res = await db.batch([db.prepare(INSERT_EVENT).bind(ev.id, now)]);
       const fresh = (res[0]?.meta.changes ?? 0) > 0;

@@ -61,6 +61,7 @@ describe("billing-db.ts", () => {
       "0004_test_clock.sql",
       "0005_usage_applied.sql",
       "0006_overage.sql",
+      "0007_retry.sql",
     ]);
   });
 
@@ -75,13 +76,14 @@ describe("billing-db.ts", () => {
       "0004_test_clock.sql applied",
       "0005_usage_applied.sql applied",
       "0006_overage.sql applied",
-      "6 migrations tracked, tables present",
+      "0007_retry.sql applied",
+      "7 migrations tracked, tables present",
     ]);
     expect(tracked(f)).toEqual(
       migrations.map((m) => ({ name: m.name, sha256: m.sha256 })),
     );
     // Tracker creation, then one request per file carrying its own record.
-    expect(f.execs).toHaveLength(7);
+    expect(f.execs).toHaveLength(8);
     for (const [i, m] of migrations.entries()) {
       const e = f.execs[i + 1] as string;
       expect(e).toContain(m.sql.trimEnd());
@@ -95,6 +97,28 @@ describe("billing-db.ts", () => {
     );
   });
 
+  it("0007 marks closed months stored without an outcome 'legacy', so the cron never bills old reports (#2210)", async () => {
+    const f = fakeDb();
+    await go(f, { migrations: migrations.slice(0, 6) });
+    f.sqlite.exec(
+      "INSERT INTO usage (install_id, month, creators_json, count, received_at) VALUES ('i1', '2020-01', '[]', 3, 1), ('i1', '2999-01', '[]', 3, 1)",
+    );
+    f.sqlite.exec(
+      "INSERT INTO usage (install_id, month, creators_json, count, received_at, apply_outcome) VALUES ('i1', '2020-02', '[]', 3, 1, 'failed')",
+    );
+    const r = await go(f);
+    expect(r.err).toBe("");
+    expect(
+      f.sqlite
+        .prepare("SELECT month, apply_outcome AS o FROM usage ORDER BY month")
+        .all(),
+    ).toEqual([
+      { month: "2020-01", o: "legacy" },
+      { month: "2020-02", o: "failed" },
+      { month: "2999-01", o: null },
+    ]);
+  });
+
   it("a rerun on a migrated database changes nothing", async () => {
     const f = fakeDb();
     await go(f);
@@ -102,7 +126,7 @@ describe("billing-db.ts", () => {
     f.execs.length = 0;
     const r = await go(f);
     expect(r.ok, r.err).toBe(true);
-    expect(r.log).toEqual(["6 migrations tracked, tables present"]);
+    expect(r.log).toEqual(["7 migrations tracked, tables present"]);
     expect(f.execs).toEqual([
       expect.stringContaining("CREATE TABLE IF NOT EXISTS billing_migrations"),
     ]);
@@ -134,7 +158,7 @@ describe("billing-db.ts", () => {
     const pend = await go(f, { verifyOnly: true });
     expect(pend.ok).toBe(false);
     expect(pend.err).toContain(
-      "0002_solo_tier.sql, 0003_solo_checked_out.sql, 0004_test_clock.sql, 0005_usage_applied.sql, 0006_overage.sql pending (verify only)",
+      "0002_solo_tier.sql, 0003_solo_checked_out.sql, 0004_test_clock.sql, 0005_usage_applied.sql, 0006_overage.sql, 0007_retry.sql pending (verify only)",
     );
     expect(f.execs).toEqual([]);
     await go(f);

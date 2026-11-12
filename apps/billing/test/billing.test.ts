@@ -39,6 +39,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
+    db.prepare("DELETE FROM overage"),
     db.prepare("DELETE FROM stripe_events"),
   ]);
   clearRegistryCache();
@@ -544,6 +545,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 3,
       asOf: NOW,
     });
@@ -608,6 +610,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 0,
       asOf: NOW,
     });
@@ -661,6 +664,7 @@ describe("POST /trial/start", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 5,
       asOf: NOW,
     });
@@ -779,6 +783,7 @@ describe("POST /usage", () => {
         applied_quantity: null,
         applied_at: null,
         apply_outcome: null,
+        retried_at: null,
       },
       {
         install_id: A,
@@ -789,6 +794,7 @@ describe("POST /usage", () => {
         applied_quantity: null,
         applied_at: null,
         apply_outcome: null,
+        retried_at: null,
       },
     ]);
     expect(await usageOf(B)).toEqual([]);
@@ -962,7 +968,7 @@ describe("scheduled: prune stripe_events (#1479)", () => {
       },
     } as unknown as Env;
     await expect(run(NOW, broken)).resolves.toBeUndefined();
-    expect(lines).toEqual(["billing prune db_error"]);
+    expect(lines).toEqual(["billing retry db_error", "billing prune db_error"]);
   });
 });
 
@@ -1192,5 +1198,73 @@ describe("the Business trial snapshots a Solo only when it is known live (#1568)
       .run();
     await call(gated("POST", "/trial/start", { install: A }));
     expect(await rowOf(A)).toMatchObject({ tier: "trial", solo_status: null });
+  });
+});
+
+describe("overageDue in the tier answer (#2246)", () => {
+  const ask = async () => {
+    const r = await billing.fetch(
+      new Request("https://billing.oa.internal/tier", {
+        headers: { "x-oa-gate-install": A },
+      }) as Parameters<typeof billing.fetch>[0],
+      env,
+    );
+    return (await r.json()) as Record<string, unknown>;
+  };
+  const put = (
+    month: string,
+    o: {
+      failed?: number | null;
+      paid?: number | null;
+      voided?: number | null;
+      due?: number | null;
+      install?: string;
+    },
+  ) =>
+    db
+      .prepare(
+        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, invoice_id, outcome, failed_at, paid_at, voided_at, amount_due, payment_attempts, created_at, updated_at) VALUES (?1, ?2, 3, 5, 2, 1000, 'in_x', 'invoiced', ?3, ?4, ?5, ?6, 1, 0, 0)",
+      )
+      .bind(
+        o.install ?? A,
+        month,
+        o.failed ?? null,
+        o.paid ?? null,
+        o.voided ?? null,
+        o.due ?? null,
+      )
+      .run();
+
+  it("is null with no failure; failed unpaid invoices show the total of their own amounts and the months, the plan untouched; paid or voided clears one", async () => {
+    await seed([{ install: A, tier: "team" }]);
+    expect(await ask()).toMatchObject({ overageDue: null });
+    await put("2026-09", { failed: 5000, due: 2160 });
+    await put("2026-10", { failed: 5000 });
+    expect(await ask()).toMatchObject({
+      tier: "team",
+      status: "active",
+      graceUntil: null,
+      // 2026-09 uses its invoice's amount_due; 2026-10 falls back to 2 x $10.
+      overageDue: { amountCents: 4160, months: ["2026-09", "2026-10"] },
+    });
+    await db
+      .prepare("UPDATE overage SET paid_at = 6000 WHERE month = '2026-09'")
+      .run();
+    expect(await ask()).toMatchObject({
+      overageDue: { amountCents: 2000, months: ["2026-10"] },
+    });
+    await db
+      .prepare("UPDATE overage SET voided_at = 6000 WHERE month = '2026-10'")
+      .run();
+    expect(await ask()).toMatchObject({ tier: "team", overageDue: null });
+  });
+
+  it("another install's failed invoice is never shown", async () => {
+    await seed([
+      { install: A, tier: "team" },
+      { install: B, tier: "team" },
+    ]);
+    await put("2026-10", { failed: 5000, install: B });
+    expect(await ask()).toMatchObject({ overageDue: null });
   });
 });

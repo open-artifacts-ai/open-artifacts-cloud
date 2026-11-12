@@ -447,6 +447,11 @@ export async function retrieveSubscription(
 export type QuantityOutcome =
   /** The item's quantity was set (proration_behavior none). */
   | "updated"
+  /**
+   * With input.forbidMonthly: the subscription is now monthly, so nothing was
+   * written (a month from its yearly era must not set a monthly quantity).
+   */
+  | "plan_changed"
   /** The item already had this quantity: no write. */
   | "unchanged"
   /**
@@ -469,6 +474,11 @@ export interface QuantityInput {
   monthlyPriceIds: readonly string[];
   /** Billing's key, e.g. qty-<install>-<month>-<quantity>: a retry is one write. */
   idempotencyKey: string;
+  /**
+   * The month belongs to a yearly subscription's era: if the subscription is
+   * now a live monthly one, answer plan_changed and write nothing.
+   */
+  forbidMonthly?: boolean;
 }
 
 const PAYMENT_METHOD = /^pm_[A-Za-z0-9_]{1,255}$/;
@@ -574,6 +584,7 @@ export async function setSubscriptionQuantity(
     };
   const previous =
     typeof item.quantity === "number" ? item.quantity : undefined;
+  if (input.forbidMonthly) return { outcome: "plan_changed" };
   if (previous === quantity) return { outcome: "unchanged", previous };
   await post(
     cfg,
