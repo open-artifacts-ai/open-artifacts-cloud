@@ -27,7 +27,35 @@ on:
 permissions: {}
 
 jobs:
+  # A gate run and this one would both bring rl-a up and run the R26 revoke,
+  # which rotates rl-a's hook key: one would cut the other off. Whether the
+  # callee's own `concurrency: redline` holds for a called run is not
+  # documented, so refuse to start while any redline-staging run (or another
+  # dry run) is queued or running. A check, not a lock: dispatch by hand, when
+  # no gate is due.
+  idle:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    timeout-minutes: 5
+    steps:
+      - name: No red-line or other dry run in flight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SELF: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          busy=""
+          for wf in redline-staging.yml redline-nightly.yml t19-dry-run.yml; do
+            for st in queued in_progress waiting pending; do
+              busy+="$(gh api "repos/$REPO/actions/workflows/$wf/runs?status=$st&per_page=20" \
+                --jq ".workflow_runs[] | select(.id != $SELF) | \"\(.name) \(.id) \(.status)\n\"")"
+            done
+          done
+          if [ -n "$busy" ]; then printf 'refusing, runs in flight:\n%s' "$busy"; exit 1; fi
   redline:
+    needs: idle
     # Exactly what redline-nightly.yml gives the same callee: id-token for the
     # redline job, `actions: read` for the t19 hand-off.
     permissions:

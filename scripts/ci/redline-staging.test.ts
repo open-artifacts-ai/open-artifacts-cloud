@@ -1677,8 +1677,19 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
     expect(String(dry["run-name"]).startsWith("redline-staging")).toBe(false);
     expect(dry.name).toBe("t19-dry-run");
     expect(dry.permissions).toEqual({});
-    expect(Object.keys(dry.jobs)).toEqual(["redline"]);
+    expect(Object.keys(dry.jobs)).toEqual(["idle", "redline"]);
+    // The idle check: read-only, and the callee waits for it.
+    expect(dry.jobs.idle.permissions).toEqual({ actions: "read" });
+    const idle = String(dry.jobs.idle.steps[0].run);
+    for (const wf of [
+      "redline-staging.yml",
+      "redline-nightly.yml",
+      "t19-dry-run.yml",
+    ])
+      expect(idle).toContain(wf);
+    expect(idle).toMatch(/exit 1/);
     const j = dry.jobs.redline;
+    expect(j.needs).toBe("idle");
     expect(j.uses).toBe("./.github/workflows/redline-staging.yml");
     expect(j.secrets).toBeUndefined();
     expect(j.permissions).toEqual({
