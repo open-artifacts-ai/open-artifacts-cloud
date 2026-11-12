@@ -168,11 +168,11 @@ describe(".github/hosted/<env>.json", () => {
   // Design 155 and M4: prod stays closed. User decision 2026-11-10 (option
   // A): staging sign-ups are open to anyone, capped at 20 a day, for the M2
   // exit-test walk (it was test-users only, #1012, P29).
-  it("prod signups stay closed, staging is open with a cap of 20 for the M2 walk; the caps and alert addresses are the Manager's", () => {
+  it("prod signups stay closed, staging is invite-only (beta proof, #2096) with a cap of 20; the caps and alert addresses are the Manager's", () => {
     expect(read("prod").signup_daily_cap).toBe(50);
     expect(read("staging").signup_daily_cap).toBe(20);
     expect(read("prod").signups_enabled).toBe("false");
-    expect(read("staging").signups_enabled).toBe("true");
+    expect(read("staging").signups_enabled).toBe("invite");
     // #1084: the alert address is the owner's: never committed, it comes
     // from the OA_OWNER_EMAIL secret (hosted-constants.sh).
     for (const env of ["prod", "staging"])
