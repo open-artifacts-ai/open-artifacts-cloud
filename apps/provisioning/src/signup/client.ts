@@ -11,6 +11,9 @@ export const CLIENT_JS = String.raw`(function () {
     slug: "", avail: null, availSlug: "", seq: 0,
     gate: null, token: null, busy: false, joining: false, joinErr: "", note: "", step: "address", chips: [], chipsFor: "", err: "", notice: "", widget: null, poll: null
   };
+  // How long the ready view waits before it shows "Open your instance" as a
+  // fallback, when the automatic hand-off has not left the page.
+  var FALLBACK_MS = 3000;
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
   function h(tag, props, kids) {
@@ -586,7 +589,7 @@ export const CLIENT_JS = String.raw`(function () {
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
         refs.lab
       ]);
-      refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."]);
+      refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too."]);
       shell(refs.ld);
       startAnim(slot, word);
     }
@@ -605,9 +608,24 @@ export const CLIENT_JS = String.raw`(function () {
     var create = "Create your instance", email = "Send your welcome email";
     if (st === "ready") {
       label = "Ready";
-      head = [h("h1", {}, [nw(hostName), " is ready"])];
       steps = [reserve, step("done", create), step("done", email)];
-      body = [h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, ["Open your instance"])];
+      var btn = h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, ["Open your instance"]);
+      if (S.opening) {
+        // Seen going from in progress to ready in this page view: go in.
+        head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
+        body = [];
+        if (!S.openStarted) {
+          S.openStarted = true;
+          goToInstance(btn.href);
+          S.fbT = setTimeout(function () {
+            S.fbT = null;
+            if (S.view === "setup" && S.opening) document.querySelector(".panel").appendChild(btn);
+          }, FALLBACK_MS);
+        }
+      } else {
+        head = [h("h1", {}, [nw(hostName), " is ready"])];
+        body = [btn];
+      }
     } else {
       label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
@@ -630,8 +648,10 @@ export const CLIENT_JS = String.raw`(function () {
   // POST /auth/open mints a short-lived ticket so the instance can sign the
   // owner in without a second prompt; any failure is the plain link.
   function openInstance(ev) {
-    var a = ev.currentTarget, plain = a.href;
     ev.preventDefault();
+    goToInstance(ev.currentTarget.href);
+  }
+  function goToInstance(plain) {
     api("POST", "/auth/open").then(function (r) {
       var u = r.status === 200 && r.body && typeof r.body.url === "string" ? r.body.url : plain;
       window.location.assign(u);
@@ -676,6 +696,7 @@ export const CLIENT_JS = String.raw`(function () {
       }
       S.fails = 0;
       if (wasOffline) { S.offline = false; paintLive(); }
+      if (S.signup.stage === "ready" && before !== "ready" && before !== "failed") S.opening = true;
       if (S.signup.stage !== before) render();
       if (S.signup.stage === "ready" || S.signup.stage === "failed") stopPoll();
     });
@@ -685,6 +706,7 @@ export const CLIENT_JS = String.raw`(function () {
     S.polling = true; S.fails = 0; S.offline = false;
     S.poll = setInterval(pollOnce, 5000);
   }
+  window.addEventListener("pagehide", function () { clearTimeout(S.fbT); S.fbT = null; });
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden && S.polling) pollOnce();
   });
@@ -702,6 +724,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function route() {
     stopPoll(); stopAnim();
+    clearTimeout(S.fbT); S.fbT = null; S.opening = false; S.openStarted = false;
     refs = {};
     if (S.me && S.signup) {
       S.view = "setup";

@@ -7,6 +7,8 @@ import { SIGNUP_CSP, signupStatic } from "../src/signup/index.js";
 // and dark, desktop and phone.
 
 const ORIGIN = "https://signup.test";
+// What POST /auth/open answers: the #2026 silent sign-in hand-off URL.
+const HANDOFF = "https://acme.open-artifacts.app/welcome?ticket=t1";
 type Sc = {
   open?: boolean;
   me?: boolean;
@@ -76,6 +78,8 @@ async function mount(page: Page, sc: Sc): Promise<string[]> {
       return sc.me
         ? json({ principal: "user", email: "ada@acme.com", csrf: "c" })
         : json({ error: { code: "unauthorized" } }, 401);
+    if (url.pathname === "/auth/open" && req.method() === "POST")
+      return json({ url: HANDOFF });
     if (url.pathname === "/api/v1/signup" && sc.signup) {
       const o = sc.signup(++signupCalls);
       return json(o.body ?? {}, o.status);
@@ -625,7 +629,7 @@ test("loading: status line follows the stage, no step list", async ({
     "Creating acme.open-artifacts.app\u2026",
   );
   await expect(page.locator(".panel .hint")).toHaveText(
-    "This usually takes a minute or two. Keep this tab open, and it tells you when it's ready.",
+    "This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too.",
   );
   await expect(page.locator(".steps")).toHaveCount(0);
   await expect(page.locator(".anim")).toHaveCount(1);
@@ -644,6 +648,103 @@ test("loading: status line follows the stage, no step list", async ({
   stage = "queued";
   await tick(page);
   await expect(page.locator(".panel .hint")).toHaveCount(1);
+});
+
+// open-artifacts#2350: go straight in when creation finishes.
+// Records top-level navigations and cancels them, so the page stays put (as
+// when a browser blocks the redirect) and the timers keep running.
+const blockNavigation = (page: Page) =>
+  page.addInitScript(() => {
+    const w = window as unknown as { __nav: string[] };
+    w.__nav = [];
+    (
+      window as unknown as { navigation: EventTarget }
+    ).navigation.addEventListener("navigate", (e) => {
+      w.__nav.push(
+        (e as unknown as { destination: { url: string } }).destination.url,
+      );
+      e.preventDefault();
+    });
+  });
+const instance = async (page: Page) => {
+  const hits: string[] = [];
+  await page.route("https://acme.open-artifacts.app/**", (r) => {
+    hits.push(r.request().url());
+    return r.fulfill({ contentType: "text/html", body: "<h1>instance</h1>" });
+  });
+  return hits;
+};
+
+test("ready: the transition from in progress opens the instance by hand-off", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "creating";
+  const hits = await instance(page);
+  await mount(page, {
+    me: true,
+    stage: "creating",
+    signup: () => creating(stage),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  stage = "ready";
+  await tick(page);
+  await page.waitForURL(HANDOFF);
+  expect(hits).toEqual([HANDOFF]);
+});
+
+test("ready: the Open your instance fallback shows only after 3 s on the page", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let stage = "creating";
+  await blockNavigation(page);
+  await mount(page, {
+    me: true,
+    stage: "creating",
+    signup: () => creating(stage),
+  });
+  await expect(page.locator("h1")).toHaveText(
+    "Setting up acme.open-artifacts.app",
+  );
+  stage = "ready";
+  await tick(page);
+  const dom = () =>
+    page.evaluate(() => ({
+      h1: document.querySelector("h1")?.textContent,
+      btn: [...document.querySelectorAll("a.btn")].map((a) => a.textContent),
+      nav: (window as unknown as { __nav: string[] }).__nav,
+    }));
+  await expect.poll(dom).toEqual({
+    h1: "Ready. Opening acme.open-artifacts.app\u2026",
+    btn: [],
+    nav: [HANDOFF],
+  });
+  await page.clock.runFor(2000);
+  expect((await dom()).btn).toEqual([]);
+  await page.clock.runFor(1000);
+  expect((await dom()).btn).toEqual(["Open your instance"]);
+  expect(page.url()).toBe(`${ORIGIN}/`);
+});
+
+test("ready: a page loaded on an already ready instance does not navigate", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const hits = await instance(page);
+  await mount(page, { me: true, stage: "ready" });
+  await expect(page.locator("h1")).toHaveText(
+    "acme.open-artifacts.app is ready",
+  );
+  const btn = page.getByRole("link", { name: "Open your instance" });
+  await expect(btn).toBeVisible();
+  await page.clock.runFor(10000);
+  await new Promise((r) => setTimeout(r, 250));
+  expect(page.url()).toBe(`${ORIGIN}/`);
+  expect(hits).toEqual([]);
+  await expect(btn).toBeVisible();
 });
 
 test("loading: reduced motion shows the static mark, no rotation", async ({
@@ -692,6 +793,25 @@ const STATES: Record<string, Sc & { act?: (p: Page) => Promise<void> }> = {
   "setup-waiting-cap": { me: true, stage: "waiting_cap" },
   "setup-creating": { me: true, stage: "creating" },
   "setup-ready": { me: true, stage: "ready" },
+  // seen going from in progress to ready (open-artifacts#2350)
+  "setup-opening": {
+    me: true,
+    signup: (n) => creating(n === 1 ? "creating" : "ready"),
+    act: (p) =>
+      p
+        .locator("h1")
+        .filter({ hasText: "Ready. Opening" })
+        .waitFor({ timeout: 9000 }),
+  },
+  "setup-opening-fallback": {
+    me: true,
+    signup: (n) => creating(n === 1 ? "creating" : "ready"),
+    act: async (p) => {
+      await p
+        .getByRole("link", { name: "Open your instance" })
+        .waitFor({ timeout: 15000 });
+    },
+  },
   "setup-failed": { me: true, stage: "failed" },
 };
 test.describe("screenshots", () => {
@@ -708,6 +828,7 @@ test.describe("screenshots", () => {
             colorScheme: scheme,
             reducedMotion: "reduce",
           });
+          await blockNavigation(page);
           await mount(page, sc);
           await page.locator("h1").first().waitFor();
           await sc.act?.(page);

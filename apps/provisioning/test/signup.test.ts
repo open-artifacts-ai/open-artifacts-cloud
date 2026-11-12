@@ -766,6 +766,13 @@ describe("CSP: no inline styles on the sign-up page", () => {
     );
   });
 
+  it("the waiting copy promises the open, not a tab to keep (open-artifacts#2350)", () => {
+    expect(CLIENT_JS).toContain(
+      "This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too.",
+    );
+    expect(CLIENT_JS).not.toContain("Keep this tab open");
+  });
+
   it("every stage keeps a heading: no empty header branch", () => {
     for (const t of [
       '"Setting up ", nw(hostName)',
