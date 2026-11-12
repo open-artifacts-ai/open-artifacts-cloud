@@ -23,7 +23,8 @@ import {
 // PR 1's (migration 0013); the email goes through the WELCOME_EMAIL fake.
 
 type Sent = {
-  from: string;
+  from: { email: string; name: string };
+  replyTo: string;
   to: string;
   subject: string;
   text: string;
@@ -297,12 +298,13 @@ describe("approve", () => {
     ).toMatchObject([{ status: "approved" }]);
     expect(m.sent).toHaveLength(1);
     expect(m.sent[0]).toMatchObject({
-      from: "noreply@mail.hosted.test",
+      from: { email: "noreply@mail.hosted.test", name: "Open Artifacts" },
+      replyTo: "hello@open-artifacts.com",
       to: "maya@acme.com",
       subject: "You're in: Open Artifacts beta",
     });
     expect(m.sent[0]?.text).toContain(
-      "Sign in with maya@acme.com at https://signup.hosted.test/. It's free during the private beta.",
+      "Sign in with maya@acme.com. It's free during the private beta.",
     );
     const [a, ...rest] = await audits("beta.approve");
     expect(rest).toEqual([]);
@@ -948,7 +950,7 @@ describe("addresses", () => {
       billing: true,
     });
     expect(m.to).toBe("ab@c.co");
-    expect(m.text).toContain("Sign in with ab@c.co at");
+    expect(m.text).toContain("Sign in with ab@c.co.");
   });
   it("a waitlist address that isn't plain ASCII is approved but not emailed", async () => {
     const m = mailer();
@@ -1006,29 +1008,57 @@ describe("stats", () => {
 });
 
 describe("the approval email", () => {
-  it("has the final subject and words, and the sign-up link", () => {
-    const m = approvalEmail({
-      from: "noreply@mail.x.app",
-      to: "maya@acme.com",
-      appDomain: "open-artifacts.app",
-      billing: true,
-    });
+  const o = {
+    from: "noreply@mail.x.app",
+    to: "maya@acme.com",
+    appDomain: "open-artifacts.app",
+  };
+  const flat = (s: string) => s.replace(/&#39;/g, "'");
+  // Visible text of the html: tags dropped, entities decoded.
+  const visible = (h: string) =>
+    flat(h.replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, ""));
+  it("has the final subject, sender name, reply-to and the sign-up button", () => {
+    const m = approvalEmail({ ...o, billing: true });
     expect(m.subject).toBe("You're in: Open Artifacts beta");
-    expect(m.text).toContain(
-      "You can create your Open Artifacts now. Sign in with maya@acme.com at https://signup.open-artifacts.app/. Your first 30 days are free.",
-    );
+    expect(m.from).toEqual({
+      email: "noreply@mail.x.app",
+      name: "Open Artifacts",
+    });
+    expect(m.replyTo).toBe("hello@open-artifacts.com");
     expect(m.html).toContain('href="https://signup.open-artifacts.app/"');
-    expect(m.html).toContain("Create your Open Artifacts");
+    expect(m.html).toContain("Create your Open Artifacts</a>");
+  });
+  it("carries the headline, body, paste line, steps and footer in text and html", () => {
+    const m = approvalEmail({ ...o, billing: true });
+    const v = visible(m.html);
+    for (const part of [
+      "You're in.",
+      "You can create your Open Artifacts now. Sign in with maya@acme.com. Your first 30 days are free.",
+      "Create your Open Artifacts",
+      "Sign in and pick its address.",
+      "Connect your agent",
+      "One line to paste into Claude Code, Codex, Cursor or any agent that speaks MCP.",
+      "Ask for an artifact",
+      "Your agent publishes its work as a page. You read it, comment and share the link.",
+      "You're getting this because you joined the Open Artifacts waitlist with maya@acme.com.",
+      "Open Artifacts is open source. Questions? Just reply to this email.",
+    ]) {
+      expect(v, part).toContain(part);
+      expect(m.text, part).toContain(part);
+    }
+    expect(v).toContain(
+      "Or paste this into your browser: https://signup.open-artifacts.app",
+    );
+    expect(m.html).toContain(
+      "Create your Open Artifacts and connect your agent.",
+    );
+    expect(m.text).toContain("https://signup.open-artifacts.app/");
+    expect(m.text).not.toMatch(/[\u2014\u2013]/);
+    expect(m.html).not.toMatch(/[\u2014\u2013]/);
   });
   it("billing bound: the trial line in text and html; unbound: the beta line", () => {
-    const o = {
-      from: "noreply@mail.x.app",
-      to: "maya@acme.com",
-      appDomain: "open-artifacts.app",
-    };
     const on = approvalEmail({ ...o, billing: true });
     const off = approvalEmail({ ...o, billing: false });
-    const flat = (s: string) => s.replace(/&#39;/g, "'");
     for (const part of [on.text, flat(on.html)]) {
       expect(part).toContain("Your first 30 days are free.");
       expect(part).not.toContain("private beta");
@@ -1045,14 +1075,31 @@ describe("the approval email", () => {
     await call(env, ADMIN_P, "POST", "/waitlist/approve", { subs: ["s1"] });
     expect(m.sent[0]?.text).toContain("Your first 30 days are free.");
   });
+  it("has exactly one link, the button; no images; the address and paste line are not links", () => {
+    for (const billing of [true, false]) {
+      const h = approvalEmail({ ...o, billing }).html;
+      expect(h.match(/<a\b/g)).toHaveLength(1);
+      expect(h.match(/href=/g)).toHaveLength(1);
+      expect(h).not.toMatch(/<img|url\(|mailto:/i);
+      // the address is split at the @ so mail apps leave it alone
+      expect(h).not.toContain("maya@acme.com");
+      expect(h).toContain("<b ");
+      expect(h).toContain(
+        'content="telephone=no,address=no,email=no,date=no,url=no"',
+      );
+      expect(h).not.toContain("https://signup.open-artifacts.app<");
+    }
+  });
   it("cannot inject headers or markup through the address", () => {
     const m = approvalEmail({
       from: "f@x.app",
-      to: "a@b.co\r\nBcc: z@z.co<script>",
+      to: 'a@b.co\r\nBcc: z@z.co<script>"onmouseover=',
       appDomain: "x.app",
       billing: true,
     });
     expect(m.text).not.toMatch(/[\r]/);
     expect(m.html).not.toContain("<script>");
+    expect(m.html).not.toContain('"onmouseover');
+    expect(m.html.match(/<a\b/g)).toHaveLength(1);
   });
 });

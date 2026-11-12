@@ -547,6 +547,42 @@ test("form price line reads the beta wording when billing is off", async ({
   );
 });
 
+for (const scheme of ["light", "dark"] as const)
+  test(`header: the real Open Artifacts mark, ${scheme}, no placeholder`, async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: scheme });
+    await mount(page, { me: false });
+    const mark = page.locator("header.top svg.mark");
+    await expect(mark).toHaveCount(1);
+    await expect(mark).toHaveAttribute("viewBox", "0 0 32 32");
+    await expect(mark).toHaveAttribute("aria-hidden", "true");
+    await expect(page.locator("header.top .logo")).toHaveCount(0);
+    await expect(page.locator("header.top")).toContainText("Open Artifacts");
+    const box = await mark.boundingBox();
+    expect(box?.width).toBe(20);
+    // frame follows the text colour, corners and artifact the accent
+    const fills = await mark.evaluate((m) => ({
+      f: getComputedStyle(m.querySelector(".f") as Element).fill,
+      a: getComputedStyle(m.querySelector(".a") as Element).fill,
+    }));
+    expect(fills).toEqual(
+      scheme === "light"
+        ? { f: "rgb(21, 24, 28)", a: "rgb(35, 80, 208)" }
+        : { f: "rgb(233, 235, 238)", a: "rgb(127, 156, 255)" },
+    );
+    const icon = signupStatic(
+      new Request(`${ORIGIN}/favicon.svg`),
+      "/favicon.svg",
+    );
+    expect(icon?.headers.get("content-type")).toMatch(/^image\/svg\+xml/);
+    expect(await icon?.text()).toContain("Open Artifacts");
+    await expect(page.locator('link[rel="icon"]')).toHaveAttribute(
+      "href",
+      "/favicon.svg",
+    );
+  });
+
 test("first screen: only Google, no address field", async ({ page }) => {
   await mount(page, { me: false });
   await expect(page.locator("h1")).toHaveText("Sign up or log in");

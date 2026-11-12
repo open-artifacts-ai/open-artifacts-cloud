@@ -57,6 +57,25 @@ export const CLIENT_JS = String.raw`(function () {
     }).join("");
   }
 
+  // The Open Artifacts mark (open-artifacts packages/ui brand/mark.svg), inline:
+  // the frame follows the text colour, the corners and artifact the accent, so
+  // one SVG serves light and dark (classes, not style="", for the CSP).
+  function brandMark() {
+    var ns = "http://www.w3.org/2000/svg", s = document.createElementNS(ns, "svg"), p;
+    s.setAttribute("class", "mark");
+    s.setAttribute("viewBox", "0 0 32 32");
+    s.setAttribute("aria-hidden", "true");
+    [["f", "M22 2H5a3 3 0 0 0-3 3v17l4 4V6h20zM10 30h17a3 3 0 0 0 3-3V10l-4-4v20H6z"],
+     ["a", "M22 2h5a3 3 0 0 1 3 3v5zM2 22v5a3 3 0 0 0 3 3h5zM11 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z"]
+    ].forEach(function (d) {
+      p = document.createElementNS(ns, "path");
+      p.setAttribute("class", d[0]);
+      p.setAttribute("d", d[1]);
+      s.appendChild(p);
+    });
+    return s;
+  }
+
   function shell(panel) {
     var links = h("span", { class: "links" }, [
       h("a", { href: S.cfg.docsUrl, rel: "noopener" }, ["Docs"]), " · ",
@@ -65,7 +84,7 @@ export const CLIENT_JS = String.raw`(function () {
     ]);
     root.replaceChildren(
       h("header", { class: "top" }, [
-        h("span", { class: "logo", "aria-hidden": "true" }, [h("i")]),
+        brandMark(),
         "Open Artifacts", links
       ]),
       h("main", {}, [panel])

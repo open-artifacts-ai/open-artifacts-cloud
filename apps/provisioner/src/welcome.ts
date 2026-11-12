@@ -79,10 +79,7 @@ export function welcomeEmail(o: {
     button: `Open ${host}`,
     connect: "Then connect your agent.",
     paste: "Paste this into Claude Code, Cursor or any AI agent:",
-    prompt: [
-      `Set up Open Artifacts for me: follow ${origin}/llms.txt`,
-      "Sign in through the browser. Never ask me to paste a token into this chat.",
-    ],
+    prompt: [`Set up Open Artifacts for me: follow ${origin}/llms.txt`],
     plan: !selfServe
       ? null
       : !o.billing
