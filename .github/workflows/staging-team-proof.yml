@@ -1,0 +1,82 @@
+# #2123 (per-creator monthly billing), staging and Stripe test mode only: a Team
+# MONTHLY subscription on a throwaway `bill-proof-` install, so its webhook and
+# quantity sync can be proved on staging.
+#   create: take the install's customer (or make one mapped to it), attach
+#           pm_card_visa as the default card, subscribe it to staging's Team
+#           monthly price at quantity 1 (metadata tier=team, as Checkout does).
+#   cancel: cancel the install's proof subscription at once.
+#   read:   print the proof subscription's quantity, for read-back.
+# Output: subscription id, status, quantity, price id. The slug must start with
+# bill-proof-, be an active staging install, and have a broker registry entry
+# whose origin is exactly https://<slug>.open-artifacts-staging.app. The Stripe
+# test key is hosted-staging-deploy's STRIPE_SECRET_KEY; it never leaves this job
+# (scripts/ops/staging-team-proof.ts). Staging only, main only.
+name: staging-team-proof
+run-name: staging-team-proof ${{ inputs.action }} ${{ inputs.slug }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "The proof install's slug (bill-proof-...)"
+        required: true
+        type: string
+      action:
+        description: "create the Team monthly subscription, cancel it, or read its quantity"
+        required: true
+        type: choice
+        options:
+          - create
+          - cancel
+          - read
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-team-proof
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    environment: hosted-staging-deploy
+    timeout-minutes: 10
+    steps:
+      - name: Check the inputs
+        env:
+          REF: ${{ github.ref }}
+          SLUG: ${{ inputs.slug }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "dispatch staging-team-proof on main"; exit 1; }
+          [[ "$SLUG" =~ ^bill-proof-[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "slug must start with bill-proof-"; exit 1; }
+          case "$ACTION" in create | cancel | read) ;; *) echo "action is create, cancel or read"; exit 1 ;; esac
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ops
+            scripts/ci
+            .github/hosted
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # The cloud repo has no .nvmrc of its own; this job runs only node
+          # built-ins, so pin the major.
+          node-version: "22"
+      - name: Load the hosted constants
+        run: bash scripts/ci/hosted-constants.sh staging .github/hosted
+      - name: Resolve the staging databases and registry
+        env:
+          TARGETS: billing
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: bash scripts/ci/hosted-resource-ids.sh staging
+      - name: Team monthly proof
+        env:
+          SLUG: ${{ inputs.slug }}
+          ACTION: ${{ inputs.action }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node --experimental-strip-types --no-warnings scripts/ops/staging-team-proof.ts
