@@ -108,7 +108,7 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock and 0005_usage_applied are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied and 0006_overage are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
@@ -116,6 +116,7 @@ describe("migrations", () => {
       "0003_solo_checked_out.sql",
       "0004_test_clock.sql",
       "0005_usage_applied.sql",
+      "0006_overage.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -173,6 +174,12 @@ describe("migrations", () => {
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
     );
+  });
+
+  it("0006 records the overage billed per install and month (#2235)", () => {
+    const sql = readFileSync(join(app, "migrations/0006_overage.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE overage \(/);
+    expect(sql).toContain("PRIMARY KEY (install_id, month)");
   });
 
   it("0005 records what a usage report applied (#2123)", () => {
@@ -243,7 +250,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 80 KB per env", () => {
+  it("wrangler deploy --dry-run is under 96 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -253,8 +260,9 @@ describe("bundle", () => {
       expect(bytes).toBeGreaterThan(0);
       // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths;
       // 64 KB until the staging test clocks (the clock call and its gate);
-      // 72 KB until per-creator quantity (#2123: the usage apply path).
-      expect(bytes).toBeLessThan(80 * 1024);
+      // 72 KB until per-creator quantity (#2123: the usage apply path);
+      // 80 KB until the yearly overage invoice (#2235).
+      expect(bytes).toBeLessThan(96 * 1024);
     }
   });
 });

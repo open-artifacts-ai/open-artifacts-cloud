@@ -17,6 +17,8 @@ import billing, {
   BillingOperatorRpc,
   type Env,
   MAX_CREATORS,
+  MONTHLY_CENTS,
+  pricesCollide,
 } from "../src/index.js";
 
 // POST /checkout and POST /portal: signed like the other POSTs, redirect URLs
@@ -62,6 +64,7 @@ type StripeCall = {
   key: string | null;
   auth: string | null;
   form: Record<string, string>;
+  search: string;
 };
 
 type Override = (
@@ -93,6 +96,7 @@ function fakeStripe(override?: Override) {
         key: h.get("idempotency-key"),
         auth: h.get("authorization"),
         form: Object.fromEntries(new URLSearchParams(String(init?.body))),
+        search: url.search,
       };
       calls.push(c);
       const o = await override?.(c);
@@ -227,6 +231,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
+    db.prepare("DELETE FROM overage"),
   ]);
   clearRegistryCache();
   await register();
@@ -846,6 +851,7 @@ describe("POST /portal", () => {
         method: "POST",
         path: PORTAL,
         key: `portal-${A}-${ts}`,
+        search: "",
         auth: `Bearer ${SECRET}`,
         form: {
           customer: "cus_existingA",
@@ -2124,6 +2130,824 @@ describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => 
       );
       expect([r.status, await r.json()]).toEqual([503, { error: "config" }]);
     }
+    expect(s.calls).toEqual([]);
+  });
+});
+
+describe("POST /usage bills a yearly subscription's creators above its seats (#2235)", () => {
+  const SUB = "sub_yearA";
+  const SUBS = `/v1/subscriptions/${SUB}`;
+  const shift = (n: number) => {
+    const d = new Date();
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1))
+      .toISOString()
+      .slice(0, 7);
+  };
+  const closed = shift(-1);
+  const label = new Date(`${closed}-01T00:00:00Z`).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  const yEnv = (): Env => ({
+    ...baseEnv(),
+    STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
+    STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+  });
+  const report = (month: string, count: number) =>
+    req("/usage", {
+      install: A,
+      month,
+      creators: Array.from({ length: count }, (_, i) => `u${i}`),
+      count,
+    });
+  const send = (month: string, count: number) =>
+    call(report(month, count), yEnv());
+  async function live(tier = "team", status = "active") {
+    await seed(A, "cus_existingA", tier);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = ?1, status = ?2 WHERE install_id = ?3",
+      )
+      .bind(SUB, status, A)
+      .run();
+  }
+  const subscription = (
+    o: {
+      price?: string;
+      interval?: string;
+      seats?: number;
+      /** The subscription's card (default pm_card1; null = none). */
+      pm?: string | null;
+      /** billing_cycle_anchor, epoch s (default 2001; null = absent). */
+      anchor?: number | null;
+      /** start_date, epoch s (default 2001; null = absent). */
+      start?: number | null;
+    } = {},
+  ) =>
+    Response.json({
+      id: SUB,
+      status: "active",
+      ...(o.pm === null ? {} : { default_payment_method: o.pm ?? "pm_card1" }),
+      ...(o.anchor === null
+        ? {}
+        : { billing_cycle_anchor: o.anchor ?? 1_000_000_000 }),
+      ...(o.start === null ? {} : { start_date: o.start ?? 1_000_000_000 }),
+      items: {
+        data: [
+          {
+            id: "si_itemA",
+            quantity: o.seats ?? 3,
+            price: {
+              id: o.price ?? "price_teamY1",
+              recurring: { interval: o.interval ?? "year" },
+            },
+          },
+        ],
+      },
+    });
+  /**
+   * A small Stripe that remembers invoices and items, so a retry can find
+   * what an earlier attempt made. `fail` maps "METHOD /path" to a status
+   * answered before any effect; with `lose` the effect happens and the
+   * answer is a 500 (the answer was lost).
+   */
+  type Ledger = {
+    n: number;
+    invoices: {
+      id: string;
+      status: string;
+      metadata: Record<string, string>;
+    }[];
+    /** invoice "" is a pending item (attached to no invoice). */
+    items: { id: string; invoice: string; metadata: Record<string, string> }[];
+    /** Idempotency-Key -> first answer (Stripe replays it, without effect). */
+    replay: Map<string, unknown>;
+    /** Every finalize body, in order. */
+    finalizes: Record<string, string>[];
+  };
+  const newLedger = (): Ledger => ({
+    n: 0,
+    invoices: [],
+    items: [],
+    replay: new Map(),
+    finalizes: [],
+  });
+  type Opts = {
+    sub?: Parameters<typeof subscription>[0];
+    ledger?: Ledger;
+    fail?: Record<string, number>;
+    lose?: Record<string, boolean>;
+    /** The customer's invoice_settings.default_payment_method. */
+    customerPm?: string;
+  };
+  const metaOf = (form: Record<string, string>) => ({
+    kind: form["metadata[kind]"] ?? "",
+    install: form["metadata[install]"] ?? "",
+    month: form["metadata[month]"] ?? "",
+  });
+  const fake = (o: Opts = {}) => {
+    const L = o.ledger ?? newLedger();
+    const s = fakeStripe((c) => {
+      const key = `${c.method} ${c.path}`;
+      const bad = o.fail?.[key];
+      if (bad !== undefined)
+        return Response.json({ error: { type: "x" } }, { status: bad });
+      let out: Response | undefined;
+      if (key === `GET ${SUBS}`) return subscription(o.sub);
+      if (key === "GET /v1/customers/cus_existingA")
+        return Response.json({
+          id: "cus_existingA",
+          invoice_settings: { default_payment_method: o.customerPm ?? null },
+        });
+      // A repeated Idempotency-Key replays the first answer, no effect.
+      const replayed = c.key ? L.replay.get(c.key) : undefined;
+      if (replayed !== undefined) return Response.json(replayed);
+      const answer = (body: Record<string, unknown>) => {
+        if (c.key) L.replay.set(c.key, body);
+        return Response.json(body);
+      };
+      const detail = /^\/v1\/invoices\/(in_\w+)(\/finalize)?$/.exec(c.path);
+      const itemPath = /^\/v1\/invoiceitems\/(ii_\w+)$/.exec(c.path);
+      if (key === "POST /v1/invoices") {
+        const id = `in_inv${++L.n}`;
+        L.invoices.push({ id, status: "draft", metadata: metaOf(c.form) });
+        out = answer({ id });
+      } else if (key === "GET /v1/invoices") {
+        out = Response.json({
+          data: L.invoices.filter((i) => i.status === "draft"),
+        });
+      } else if (key === "POST /v1/invoiceitems") {
+        const id = `ii_item${++L.n}`;
+        L.items.push({
+          id,
+          invoice: c.form.invoice ?? "",
+          metadata: metaOf(c.form),
+        });
+        out = answer({ id });
+      } else if (key === "GET /v1/invoiceitems") {
+        const q = new URLSearchParams(c.search);
+        const inv = q.get("invoice");
+        out = Response.json({
+          data: L.items
+            .filter((i) =>
+              q.get("pending") === "true"
+                ? i.invoice === ""
+                : i.invoice === inv,
+            )
+            .map((i) => ({ ...i, invoice: i.invoice || null })),
+        });
+      } else if (itemPath && c.method === "DELETE") {
+        const at = L.items.findIndex((i) => i.id === itemPath[1]);
+        if (at < 0)
+          return Response.json({ error: { type: "x" } }, { status: 404 });
+        L.items.splice(at, 1);
+        out = Response.json({ id: itemPath[1], deleted: true });
+      } else if (detail) {
+        const inv = L.invoices.find((i) => i.id === detail[1]);
+        if (!inv)
+          return Response.json({ error: { type: "x" } }, { status: 404 });
+        if (detail[2]) {
+          inv.status = "open";
+          L.finalizes.push(c.form);
+          out = answer({ id: inv.id, status: inv.status });
+        } else out = Response.json({ id: inv.id, status: inv.status });
+      } else return undefined;
+      return o.lose?.[key]
+        ? Response.json({ error: { type: "x" } }, { status: 500 })
+        : out;
+    });
+    return Object.assign(s, { L });
+  };
+  const paths = (s: { calls: { method: string; path: string }[] }) =>
+    s.calls.map((c) => `${c.method} ${c.path}`);
+  const overageRow = () =>
+    db
+      .prepare(
+        "SELECT seats, creators, quantity, unit_amount, item_id, invoice_id, outcome FROM overage WHERE install_id = ?1 AND month = ?2",
+      )
+      .bind(A, closed)
+      .first();
+  const outcomeOf = async () =>
+    (
+      await db
+        .prepare(
+          "SELECT apply_outcome AS o, applied_quantity AS q FROM usage WHERE install_id = ?1 AND month = ?2",
+        )
+        .bind(A, closed)
+        .first<{ o: string; q: number | null }>()
+    )?.o;
+  /** The nth step write (1 = invoice recorded, 2 = item recorded) throws. */
+  const failStepWrite = (nth: number) => {
+    let n = 0;
+    const real = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+      if (sql.includes("coalesce(?3, item_id)") && ++n === nth)
+        throw new Error("d1 down");
+      return real(sql);
+    });
+  };
+  const FINALIZE = "POST /v1/invoices/in_inv1/finalize";
+
+  it("bills the extra creators at the monthly price: draft invoice, its item, finalize", async () => {
+    await live();
+    const s = fake();
+    const r = await send(closed, 5);
+    expect([r.status, await r.json()]).toEqual([
+      200,
+      { ok: true, month: closed, count: 5 },
+    ]);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices",
+      "POST /v1/invoices",
+      "GET /v1/invoiceitems",
+      "POST /v1/invoiceitems",
+      FINALIZE,
+    ]);
+    const meta = {
+      "metadata[kind]": "overage",
+      "metadata[install]": A,
+      "metadata[month]": closed,
+    };
+    // The invoice takes no pending items; the item is attached to it.
+    expect(s.calls[2]?.form).toEqual({
+      customer: "cus_existingA",
+      collection_method: "charge_automatically",
+      pending_invoice_items_behavior: "exclude",
+      // The draft never advances on its own; only the finalize does.
+      auto_advance: "false",
+      // A one-off invoice has no card of its own: the subscription's is used.
+      default_payment_method: "pm_card1",
+      ...meta,
+    });
+    // Finalize turns auto_advance on: without it the invoice is never charged.
+    expect(s.calls[5]?.form).toEqual({ auto_advance: "true" });
+    expect(s.L.finalizes).toEqual([{ auto_advance: "true" }]);
+    expect(s.calls[4]?.form).toEqual({
+      customer: "cus_existingA",
+      invoice: "in_inv1",
+      currency: "usd",
+      unit_amount: "1000",
+      quantity: "2",
+      description: `Extra creators, ${label}: 2 × $10`,
+      ...meta,
+    });
+    expect([2, 4, 5].map((i) => s.calls[i]?.key)).toEqual([
+      `ovg-inv-${A}-${closed}-g0`,
+      `ovg-item-${A}-${closed}-g0`,
+      `ovg-fin-${A}-${closed}-g0`,
+    ]);
+    expect(await overageRow()).toEqual({
+      seats: 3,
+      creators: 5,
+      quantity: 2,
+      unit_amount: 1000,
+      item_id: "ii_item2",
+      invoice_id: "in_inv1",
+      outcome: "invoiced",
+    });
+    expect(await outcomeOf()).toBe("overage_invoiced");
+    // The subscription's own quantity is never written.
+    expect(paths(s).some((p) => p.includes("subscription_items"))).toBe(false);
+  });
+
+  it("Business bills $25 a creator", async () => {
+    await live("business");
+    const s = fake({ sub: { price: "price_businessY1", seats: 1 } });
+    expect((await send(closed, 3)).status).toBe(200);
+    expect(s.calls[4]?.form).toMatchObject({
+      unit_amount: "2500",
+      quantity: "2",
+      description: `Extra creators, ${label}: 2 × $25`,
+    });
+  });
+
+  it("no overage (count at or under seats) makes no billing call and records none", async () => {
+    await live();
+    for (const count of [3, 1, 0]) {
+      const s = fake();
+      expect((await send(closed, count)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      expect(await overageRow()).toBeNull();
+      expect(await outcomeOf()).toBe("overage_none");
+    }
+  });
+
+  it("a repeat report for an invoiced month never bills again, even with a changed count", async () => {
+    await live();
+    const s = fake();
+    await send(closed, 5);
+    s.calls.length = 0;
+    for (const count of [5, 9, 2])
+      expect((await send(closed, count)).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect((await overageRow())?.quantity).toBe(2);
+  });
+
+  it("a failed invoice create leaves nothing; the retry makes the one invoice and item", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoices": 500 } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: null,
+      item_id: null,
+      outcome: "pending",
+    });
+    expect(await outcomeOf()).toBe("overage_failed");
+    fake({ ledger: L });
+    expect((await send(closed, 7)).status).toBe(200);
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    // The row keeps the quantity it first computed (5 - 3).
+    expect(await overageRow()).toMatchObject({
+      quantity: 2,
+      outcome: "invoiced",
+    });
+  });
+
+  it("the invoice's answer is lost: the retry finds the draft and makes no second invoice", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoices": true } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(L.invoices).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({ invoice_id: null });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect(L.invoices).toHaveLength(1);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      outcome: "invoiced",
+    });
+  });
+
+  it("the item's answer is lost and the retry comes after the key expired: no second item", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoiceitems": true } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      item_id: null,
+      outcome: "invoice_created",
+    });
+    // This Stripe keeps no idempotency keys: the key has expired.
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      "GET /v1/invoiceitems",
+      FINALIZE,
+    ]);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      item_id: "ii_item2",
+      outcome: "invoiced",
+    });
+  });
+
+  it("the D1 write that records the invoice fails: the retry finds the draft", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L });
+    failStepWrite(1);
+    expect((await send(closed, 5)).status).toBe(503);
+    vi.mocked(db.prepare).mockRestore();
+    expect(L.invoices).toHaveLength(1);
+    expect(L.items).toHaveLength(0);
+    expect(await overageRow()).toMatchObject({ invoice_id: null });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("the D1 write that records the item fails: the retry finds the item", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L });
+    failStepWrite(2);
+    expect((await send(closed, 5)).status).toBe(503);
+    vi.mocked(db.prepare).mockRestore();
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      item_id: null,
+    });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoiceitems");
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("a failed finalize is retried by finalizing the same draft", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      outcome: "item_created",
+    });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      FINALIZE,
+    ]);
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+  });
+
+  it("a finalize whose answer was lost is not finalized again", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { [FINALIZE]: true } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(L.invoices[0]?.status).toBe("open");
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([`GET ${SUBS}`, "GET /v1/invoices/in_inv1"]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("an invoice deleted in Stripe is made again under a new generation; its orphaned pending item is deleted first", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    await send(closed, 5);
+    // The draft is deleted; its item is left pending (not assumed deleted).
+    L.invoices.length = 0;
+    for (const i of L.items) i.invoice = "";
+    // An unrelated pending overage item of another month is never touched.
+    L.items.push({
+      id: "ii_other9",
+      invoice: "",
+      metadata: { kind: "overage", install: A, month: "2000-01" },
+    });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(
+      s.calls.filter((c) => c.method === "DELETE").map((c) => c.path),
+    ).toEqual(["/v1/invoiceitems/ii_item2"]);
+    // The delete comes before the new invoice and item.
+    const p = paths(s);
+    expect(p.indexOf("DELETE /v1/invoiceitems/ii_item2")).toBeLessThan(
+      p.indexOf("POST /v1/invoices"),
+    );
+    // New keys: the deleted invoice's key is not replayed.
+    expect(
+      s.calls.filter((c) => c.method === "POST").map((c) => c.key),
+    ).toEqual([
+      `ovg-inv-${A}-${closed}-g1`,
+      `ovg-item-${A}-${closed}-g1`,
+      `ovg-fin-${A}-${closed}-g1`,
+    ]);
+    expect(L.invoices.map((i) => [i.id, i.status])).toEqual([
+      ["in_inv3", "open"],
+    ]);
+    expect(L.items.map((i) => [i.id, i.invoice])).toEqual([
+      ["ii_other9", ""],
+      ["ii_item4", "in_inv3"],
+    ]);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv3",
+      outcome: "invoiced",
+    });
+  });
+
+  it("a failed delete of the orphaned item leaves the row as it was, to retry", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    await send(closed, 5);
+    L.invoices.length = 0;
+    for (const i of L.items) i.invoice = "";
+    fake({ ledger: L, fail: { "DELETE /v1/invoiceitems/ii_item2": 500 } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({ invoice_id: "in_inv1" });
+    fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(L.items.map((i) => i.invoice)).toEqual(["in_inv3"]);
+  });
+
+  it("a finalized invoice with no item recorded is invoiced only if our item is on it", async () => {
+    await live();
+    // The item's answer was lost, then the invoice was finalized elsewhere:
+    // the item is on it, so the month is billed.
+    let L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoiceitems": true } });
+    await send(closed, 5);
+    L.invoices[0]!.status = "open";
+    let s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      "GET /v1/invoiceitems",
+    ]);
+    expect(await overageRow()).toMatchObject({
+      item_id: "ii_item2",
+      outcome: "invoiced",
+    });
+    // Finalized with no item on it: start over, never mark it billed.
+    await db.batch([
+      db.prepare("DELETE FROM overage"),
+      db.prepare("DELETE FROM usage"),
+    ]);
+    L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoiceitems": 500 } });
+    await send(closed, 5);
+    L.invoices[0]!.status = "open";
+    s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("POST /v1/invoices");
+    expect(L.items.map((i) => i.invoice)).toEqual(["in_inv2"]);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv2",
+      outcome: "invoiced",
+    });
+  });
+
+  it("Stripe's key replay is modelled: a replayed key has no second effect", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoices": true } });
+    await send(closed, 5);
+    // Same generation, same key: Stripe would replay the first invoice.
+    const s = fake({ ledger: L });
+    await send(closed, 5);
+    expect(L.invoices).toHaveLength(1);
+    expect(s.calls.every((c) => c.key === null || /-g0$/.test(c.key))).toBe(
+      true,
+    );
+  });
+
+  it("the draft invoice takes the customer's default card when the subscription has none", async () => {
+    await live();
+    const s = fake({ sub: { pm: null }, customerPm: "pm_cust1" });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("GET /v1/customers/cus_existingA");
+    expect(
+      s.calls.find((c) => c.path === "/v1/invoices" && c.method === "POST")
+        ?.form.default_payment_method,
+    ).toBe("pm_cust1");
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("the subscription's card is used without asking the customer", async () => {
+    await live();
+    const s = fake({ customerPm: "pm_cust1" });
+    await send(closed, 5);
+    expect(paths(s)).not.toContain("GET /v1/customers/cus_existingA");
+  });
+
+  it("no card anywhere: nothing is created or finalized, the outcome is recorded and logged, and a repeat report tries again", async () => {
+    await live();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const L = newLedger();
+    const s = fake({ ledger: L, sub: { pm: null } });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect(paths(s)).not.toContain("POST /v1/invoiceitems");
+    expect([L.invoices.length, L.items.length, L.finalizes.length]).toEqual([
+      0, 0, 0,
+    ]);
+    expect(await outcomeOf()).toBe("no_payment_method");
+    expect(await overageRow()).toMatchObject({
+      invoice_id: null,
+      outcome: "pending",
+    });
+    expect(
+      err.mock.calls.some((c) => String(c[0]).includes("no payment method")),
+    ).toBe(true);
+    // The customer adds a card; the month is reported again.
+    fake({ ledger: L, sub: { pm: null }, customerPm: "pm_later1" });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+    expect(L.invoices).toHaveLength(1);
+  });
+
+  describe("only months in the yearly term are billed", () => {
+    const monthStart = (m: string) => Date.parse(`${m}-01T00:00:00Z`) / 1000;
+    const none = async (month: string, outcome: string, sub: object) => {
+      const s = fake({ sub });
+      expect((await send(month, 9)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      const r = await db
+        .prepare(
+          "SELECT apply_outcome AS o FROM usage WHERE install_id = ?1 AND month = ?2",
+        )
+        .bind(A, month)
+        .first<{ o: string }>();
+      expect(r?.o).toBe(outcome);
+      expect(
+        await db
+          .prepare("SELECT count(*) AS n FROM overage")
+          .first<{ n: number }>(),
+      ).toEqual({ n: 0 });
+    };
+
+    it("a monthly subscription switched to yearly this month: the earlier months are before_term, with no Stripe write", async () => {
+      await live();
+      // The switch reset the anchor to the start of the open month.
+      const anchor = monthStart(shift(0));
+      await none(closed, "before_term", { anchor });
+      await none(shift(-2), "before_term", { anchor });
+    });
+
+    it("a switch in the middle of the closed month: that month is before_term; the next is billed", async () => {
+      await live();
+      const anchor = monthStart(closed) + 10 * 86_400;
+      await none(closed, "before_term", { anchor });
+    });
+
+    it("a month that starts exactly at the term start is billed", async () => {
+      await live();
+      const s = fake({ sub: { anchor: monthStart(closed) } });
+      expect((await send(closed, 5)).status).toBe(200);
+      expect(paths(s)).toContain("POST /v1/invoices");
+      expect((await overageRow())?.outcome).toBe("invoiced");
+    });
+
+    it("falls back to start_date when there is no anchor; with neither, nothing is billed", async () => {
+      await live();
+      await none(closed, "before_term", {
+        anchor: null,
+        start: monthStart(shift(0)),
+      });
+      await db.prepare("DELETE FROM usage").run();
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      await none(closed, "no_term_start", { anchor: null, start: null });
+      expect(err).toHaveBeenCalled();
+    });
+  });
+
+  it("the monthly price is $10 Team and $25 Business, in usd", async () => {
+    expect(MONTHLY_CENTS).toEqual({ team: 1000, business: 2500 });
+    await live();
+    const s = fake();
+    await send(closed, 5);
+    expect(
+      s.calls.find((c) => c.method === "POST" && c.path === "/v1/invoiceitems")
+        ?.form,
+    ).toMatchObject({ currency: "usd", unit_amount: "1000" });
+  });
+
+  it("401, 403, 409, 429, 5xx and network errors are retried; other 4xx are logged and the 200 stands", async () => {
+    for (const [status, answer] of [
+      [401, 502],
+      [403, 502],
+      [409, 503],
+      [429, 502],
+      [500, 502],
+      [503, 502],
+      [400, 200],
+      [402, 200],
+      [404, 200],
+    ] as const) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+        db.prepare("DELETE FROM overage"),
+      ]);
+      await live();
+      fake({ fail: { "POST /v1/invoices": status } });
+      const r = await send(closed, 5);
+      expect([status, r.status]).toEqual([status, answer]);
+      expect(await outcomeOf()).toBe("overage_failed");
+    }
+    await db.batch([
+      db.prepare("DELETE FROM tiers"),
+      db.prepare("DELETE FROM usage"),
+      db.prepare("DELETE FROM overage"),
+    ]);
+    await live();
+    fakeStripe((c) => {
+      if (c.path === SUBS) return subscription();
+      throw new TypeError("network");
+    });
+    expect((await send(closed, 5)).status).toBe(502);
+  });
+
+  it("a permanent failure is tried again by the next report", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoiceitems": 400 } });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(await outcomeOf()).toBe("overage_failed");
+    fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("a monthly subscription is untouched by overage (its quantity follows the count)", async () => {
+    await live();
+    const s = fakeStripe((c) =>
+      c.method === "GET" && c.path === SUBS
+        ? Response.json({
+            id: SUB,
+            status: "active",
+            items: {
+              data: [
+                {
+                  id: "si_itemA",
+                  quantity: 1,
+                  price: {
+                    id: "price_team1",
+                    recurring: { interval: "month" },
+                  },
+                },
+              ],
+            },
+          })
+        : Response.json({ id: "si_itemA" }),
+    );
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "POST /v1/subscription_items/si_itemA",
+    ]);
+    expect(await overageRow()).toBeNull();
+  });
+
+  it("a yearly price that is not this tier's, a monthly interval, or an unset yearly price is left alone", async () => {
+    await live();
+    for (const [sub, e] of [
+      [{ price: "price_businessY1" }, yEnv()],
+      [{ price: "price_other" }, yEnv()],
+      [{}, baseEnv()],
+    ] as const) {
+      const s = fake({ sub });
+      expect((await call(report(closed, 5), e)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      expect(await outcomeOf()).toBe("not_monthly");
+    }
+    expect(await overageRow()).toBeNull();
+  });
+
+  it("the open month, and trial, lapsed, suspended and Solo rows, make no Stripe call", async () => {
+    await live();
+    let s = fake();
+    expect((await send(shift(0), 9)).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    for (const [tier, status] of [
+      ["trial", "active"],
+      ["solo", "active"],
+      ["team", "lapsed"],
+      ["team", "suspended"],
+    ] as const) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+      ]);
+      await live(tier, status);
+      s = fake();
+      expect((await send(closed, 9)).status).toBe(200);
+      expect(s.calls).toEqual([]);
+    }
+    expect(await overageRow()).toBeNull();
+  });
+});
+
+describe("two plans sharing a price id fail closed (#2235)", () => {
+  it("pricesCollide ignores unset ids and finds a repeated one", () => {
+    const e = baseEnv();
+    expect(pricesCollide(e)).toBe(false);
+    expect(
+      pricesCollide({ ...e, STRIPE_PRICE_TEAM_YEARLY: "price_team1" }),
+    ).toBe(true);
+    expect(
+      pricesCollide({
+        ...e,
+        STRIPE_PRICE_TEAM_YEARLY: "price_y",
+        STRIPE_PRICE_BUSINESS_YEARLY: "price_y",
+      }),
+    ).toBe(true);
+  });
+
+  it("the gate and webhook routes answer 500 config; /health still answers", async () => {
+    const bad: Env = { ...baseEnv(), STRIPE_PRICE_BUSINESS: "price_team1" };
+    const s = fakeStripe();
+    const r = await call(req("/checkout", { install: A, plan: "team" }), bad);
+    expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+    const w = await billing.fetch(
+      new Request(`${ORIGIN}/stripe/webhook`, {
+        method: "POST",
+        headers: { "cf-connecting-ip": "1.2.3.4" },
+        body: "{}",
+      }) as Parameters<typeof billing.fetch>[0],
+      bad,
+    );
+    expect(w.status).toBe(500);
     expect(s.calls).toEqual([]);
   });
 });
