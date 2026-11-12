@@ -1483,7 +1483,7 @@ async function detail(
 }
 
 /** The run's own install, expected to answer: `detail` stays one try for refusals. */
-const ownDetail = (run: Run, id: string): Promise<Res> =>
+export const ownDetail = (run: Run, id: string): Promise<Res> =>
   run.v1(`/installs/${id}`, { read: true });
 
 async function panelInstall(run: Run): Promise<string | null> {
@@ -1507,7 +1507,7 @@ async function panelInstall(run: Run): Promise<string | null> {
 /** The owner of every install O creates (rl-p, rl-q, ...); P49 searches it. */
 const OIDC_OWNER_EMAIL = `redline-owner@${STAGING_TEST_DOMAIN}`;
 
-const oidcCreate = (
+export const oidcCreate = (
   run: Run,
   slug: string,
   requestId: string,
@@ -3440,11 +3440,13 @@ export async function revokeCreds(
   slug: string,
   app: string,
   pat?: string,
+  /** The whole revoke's bound (cloud #202: the pair's revoke has what the job has left). */
+  within: number = JOB_WITHIN_MS,
 ): Promise<void> {
   // The run's last step, and it runs always: a job a failed bring-up left on
   // the install is still going. Its refusal stores nothing, so the same
   // request id is safe.
-  const end = run.io.now() + JOB_WITHIN_MS;
+  const end = run.io.now() + within;
   const ask = () =>
     run.v1(`/installs/${id}/redline-creds`, {
       body: { requestId: run.rid(`revoke-${slug}`), revoke: true },
@@ -3455,7 +3457,13 @@ export async function revokeCreds(
     r = await ask();
   }
   const a = run.accepted(r, `R26 revoke ${slug}`);
-  await run.done(a.job.id, `R26 revoke ${slug}`);
+  const j = await run.waitJob(a.job.id, {
+    within: Math.max(end - run.io.now(), 1),
+  });
+  if (j.status !== "done")
+    throw new ProbeFail(
+      `R26 revoke ${slug}: job ${j.status} (${j.lastErrorCode ?? j.error?.code ?? "no code"})${failText(j)}`,
+    );
   if (pat) {
     const r = await run.raw(`${app}/api/v1/me`, { auth: { bearer: pat } });
     if (r.status !== 401)

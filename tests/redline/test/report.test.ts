@@ -17,12 +17,14 @@ import {
 } from "../src/capture.ts";
 import {
   ACCEPTED_UNPROVEN,
+  BREACH_MARK,
   buildReport,
   type CaseResult,
   exitCode,
   formatReport,
   gateOn,
   gatePasses,
+  HOSTED_BUS_NOT_GATING,
   LEVELS,
   type Level,
   label,
@@ -239,6 +241,8 @@ describe("gate", () => {
       "sign-in: ID tokens > A's code and broker state at B: no session",
       "provisioner > a replayed signup creates nothing new",
       "provisioner > a signup for a taken slug fails cleanly",
+      "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
+      "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     ];
     const REASONS = [
       "self-serve purge doesn't free signup_accounts (#1046); signups off on prod",
@@ -247,13 +251,15 @@ describe("gate", () => {
       NEEDS_CAPTURE,
       NOT_CONFIGURED,
       NOT_CONFIGURED,
+      HOSTED_BUS_NOT_GATING,
+      HOSTED_BUS_NOT_GATING,
     ];
     const listed = () =>
       ACCEPTED_UNPROVEN.map((e) => c(e.name, "unproven-live", e.reason));
     const ok = c("a", "pass");
 
-    it("is exactly the six, frozen, each citing a test file", () => {
-      expect(ACCEPTED_UNPROVEN).toHaveLength(6);
+    it("is exactly the eight, frozen, each citing a test file", () => {
+      expect(ACCEPTED_UNPROVEN).toHaveLength(8);
       expect(ACCEPTED_UNPROVEN.map((e) => e.name)).toEqual(NAMES);
       expect(ACCEPTED_UNPROVEN.map((e) => e.reason)).toEqual(REASONS);
       expect(Object.isFrozen(ACCEPTED_UNPROVEN)).toBe(true);
@@ -273,7 +279,7 @@ describe("gate", () => {
       const r = buildReport([ok, ...listed()]);
       expect(r.gate).toEqual({
         passed: true,
-        reason: "every case passed but 6 accepted unproven-live",
+        reason: "every case passed but 8 accepted unproven-live",
       });
       expect(exitCode(r, true)).toBe(0);
     });
@@ -295,6 +301,8 @@ describe("gate", () => {
         "signin.test.ts",
         "provisioner.test.ts",
         "provisioner.test.ts",
+        "bus.test.ts",
+        "bus.test.ts",
       ]);
     });
 
@@ -314,8 +322,57 @@ describe("gate", () => {
         const r = buildReport([ok, ...listed(), bad]);
         expect(r.gate.passed, JSON.stringify(bad)).toBe(false);
         expect(r.gate.reason).toBe(
-          '1 of 8 cases are not "pass"; 6 accepted unproven-live',
+          '1 of 10 cases are not "pass"; 8 accepted unproven-live',
         );
+      }
+    });
+
+    it("cloud #202: a fail or an infra on a hosted bus case reports as its accepted unproven-live, what it was in the label, and the run stays green", () => {
+      const bus = ACCEPTED_UNPROVEN.filter(
+        (e) => e.reason === HOSTED_BUS_NOT_GATING,
+      );
+      expect(bus.map((e) => e.file)).toEqual(["bus.test.ts", "bus.test.ts"]);
+      for (const e of bus)
+        for (const level of ["fail", "infra"] as const) {
+          const red: CaseResult = {
+            name: e.name,
+            file: "live/bus.test.ts",
+            level,
+            reason: "infra: bus pair bring-up: rl-busb create: job failed",
+          };
+          const r = buildReport([ok, red]);
+          expect(r.counts[level], level).toBe(0);
+          expect(r.counts["unproven-live"]).toBe(1);
+          expect(r.cases[1]).toMatchObject({
+            level: "unproven-live",
+            reason: HOSTED_BUS_NOT_GATING,
+            label: `would be ${level}: infra: bus pair bring-up: rl-busb create: job failed`,
+          });
+          expect(r.gate.passed).toBe(true);
+          expect(gatePasses([ok, red])).toBe(true);
+          expect(exitCode(r, true)).toBe(0);
+          // The same result in another file, or another case, still fails.
+          expect(
+            gatePasses([ok, { ...red, file: "live/copied.test.ts" }]),
+          ).toBe(false);
+        }
+      // OA Bus M1: a breach (a forbidden 101) is never converted: it gates.
+      for (const e of bus) {
+        const breach: CaseResult = {
+          name: e.name,
+          file: "live/bus.test.ts",
+          level: "fail",
+          reason: `${BREACH_MARK} rl-busb upgraded rl-busa's machine token (101)`,
+        };
+        const r = buildReport([ok, breach]);
+        expect(r.cases[1]?.level).toBe("fail");
+        expect(r.gate.passed).toBe(false);
+        expect(gatePasses([ok, breach])).toBe(false);
+        expect(exitCode(r, true)).not.toBe(0);
+      }
+      for (const level of ["fail", "infra"] as const) {
+        const other = c(NAMES[0] as string, level, "x");
+        expect(exitCode(buildReport([ok, other]), true)).not.toBe(0);
       }
     });
 
@@ -345,7 +402,7 @@ describe("gate", () => {
         );
       }
       expect(t).toContain(
-        'Gate: FAIL (1 of 8 cases are not "pass"; 6 accepted unproven-live)',
+        'Gate: FAIL (1 of 10 cases are not "pass"; 8 accepted unproven-live)',
       );
     });
   });

@@ -1,7 +1,17 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { uptime } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
+import type { InstallDetail } from "@oa/provisioning-contract";
 import {
   claimHookSlot,
   HookBudgetError,
@@ -15,6 +25,22 @@ import {
   revokeMachines,
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
+import {
+  BUS_A,
+  BUS_B,
+  BUS_PAIR_LOG_FILE,
+  BUS_PAIR_REVOKE_WAIT_MS,
+  BUS_PAIR_SIDES_FILE,
+  BUS_PAIR_STARTED_FILE,
+  type BusPair,
+  busPairEnded,
+  busPairSides,
+  CASE_JOB_WITHIN_MS,
+  ensureResumed,
+  type PairSide,
+  writeBusPair,
+  writeBusPairError,
+} from "./hosted-bus.ts";
 import { hookReason } from "./http.ts";
 import {
   AUDIENCES,
@@ -28,7 +54,10 @@ import {
   type BusIo,
   bringUpgrade,
   type CredsOut,
+  desc,
   mintCreds,
+  oidcCreate,
+  ownDetail,
   POLL_MS,
   ProbeFail,
   type ProvIo,
@@ -311,6 +340,204 @@ export async function checkTier(
     );
 }
 
+/** One install of the pair by its exact slug (R2 q, then the slug itself); null when none is live. */
+async function findBySlug(
+  run: Run,
+  slug: string,
+): Promise<{ id: string; state: string } | null> {
+  const r = await run.v1(`/installs?${new URLSearchParams({ q: slug })}`, {
+    read: true,
+  });
+  if (r.status !== 200) throw new ProbeFail(`R2 q=${slug}: ${desc(r)}`);
+  const hit = (
+    (r.json as { items?: { id: string; slug: string; state: string }[] })
+      .items ?? []
+  ).filter(
+    (i) => i.slug === slug && !["deleted", "deleting"].includes(i.state),
+  );
+  if (hit.length > 1)
+    throw new ProbeFail(`R2: ${hit.length} live ${slug} rows`);
+  return hit[0] ?? null;
+}
+
+/** R3 for one install of the pair: active, test hooks on, both hosts set. */
+async function pairSide(run: Run, id: string, slug: string): Promise<PairSide> {
+  const d = await ownDetail(run, id);
+  if (d.status !== 200) throw new ProbeFail(`R3 ${slug}: ${desc(d)}`);
+  const i = d.json as InstallDetail;
+  if (i.slug !== slug) throw new ProbeFail(`${id} is ${i.slug}, not ${slug}`);
+  if (i.state !== "active")
+    throw new ProbeFail(`${slug} is ${i.state}, want active`);
+  if (i.testHooks !== true)
+    throw new ProbeFail(`${slug}: testHooks is not true`);
+  if (!i.appHost || !i.contentHost || !i.version)
+    throw new ProbeFail(`${slug}: no app host, content host or version`);
+  return {
+    name: slug,
+    installId: id,
+    app: `https://${i.appHost}`,
+    content: `https://${i.contentHost}`,
+    version: i.version,
+  };
+}
+
+/**
+ * The hosted bus pair's bring-up (cloud #202): rl-busa and rl-busb, red-line's
+ * own installs, each made the same way. Created over OIDC at the release under
+ * test when there is none (an rl- slug, testHooks, the STAGING_TEST_DOMAIN
+ * owner: oidcCreate, as rl-l), resumed when a cut-off run left it suspended,
+ * and upgraded to the release (bringUpgrade). Then R26 on each: the creds go
+ * to secretsDir as REDLINE_RL_BUSA_* and REDLINE_RL_BUSB_*, the new hook keys
+ * must be accepted (waitHookKey, paced), and the pair file is written. The two
+ * installs run at the same time; every failure names its install.
+ */
+export async function bringUpBusPair(
+  run: Run,
+  dir: string,
+  recipient: { publicKey: string; open: (sealed: string) => Promise<CredsOut> },
+  pace?: (app: string, deadline: number) => Promise<unknown>,
+): Promise<BusPair> {
+  const ready = async (slug: string, tag: string): Promise<string> => {
+    const found = await findBySlug(run, slug);
+    if (!found) {
+      const a = run.accepted(
+        await run.v1("/installs", {
+          body: oidcCreate(run, slug, run.rid(`${tag}-create`), run.c.version),
+        }),
+        `${slug} create`,
+      );
+      await run.done(a.job.id, `${slug} create`);
+      out(`${slug}: created (${run.c.version})\n`);
+      return a.install.id;
+    }
+    if (found.state === "suspended") {
+      const a = run.accepted(
+        await run.v1(`/installs/${found.id}/resume`, {
+          body: { requestId: run.rid(`${tag}-left-suspended`) },
+        }),
+        `${slug} resume`,
+      );
+      await run.done(a.job.id, `${slug} resume`);
+      out(`${slug}: resumed (a run left it suspended)\n`);
+    }
+    out(
+      `${slug}: ${await bringUpgrade(run, found.id, slug)} (${run.c.version})\n`,
+    );
+    return found.id;
+  };
+  // Recorded before its R26, so the run's revoke finds every install that
+  // may hold this run's creds, even when the pair never got ready.
+  const sides: PairSide[] = [];
+  const one = async (id: string, slug: string): Promise<PairSide> => {
+    const side = await pairSide(run, id, slug);
+    sides.push(side);
+    writeFileSync(join(dir, BUS_PAIR_SIDES_FILE), JSON.stringify(sides), {
+      mode: 0o600,
+    });
+    const c = await mintCreds(run, id, slug, recipient);
+    writeSecretFile(join(dir, secretFileName(slug, "PAT")), c.pat);
+    writeSecretFile(join(dir, secretFileName(slug, "HOOK_KEY")), c.hookKey);
+    out(`${slug}: R26 creds written\n`);
+    await waitHookKey(run, side.app, c.hookKey, pace);
+    out(`${slug}: the new hook key is accepted\n`);
+    return side;
+  };
+  const named = (slug: string) => (e: unknown) => {
+    const msg = errText(e);
+    if (e instanceof Error) {
+      if (!msg.startsWith(`${slug}:`)) e.message = `${slug}: ${msg}`;
+      throw e;
+    }
+    throw new Error(`${slug}: ${msg}`);
+  };
+  // Both always awaited to the end, as bringUp's two chains.
+  const [a, b] = await Promise.allSettled([
+    ready(BUS_A, "busa")
+      .then((id) => one(id, BUS_A))
+      .catch(named(BUS_A)),
+    ready(BUS_B, "busb")
+      .then((id) => one(id, BUS_B))
+      .catch(named(BUS_B)),
+  ]);
+  if (a.status === "rejected") throw a.reason;
+  if (b.status === "rejected") throw b.reason;
+  const pair = { busa: a.value, busb: b.value };
+  writeBusPair(dir, pair);
+  return pair;
+}
+
+/** scripts/provisioning.ts, which runs `bus-pair` in the child. */
+const PROVISIONING_SCRIPT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../scripts/provisioning.ts",
+);
+
+/**
+ * Starts the pair's bring-up (`provisioning bus-pair`, runBusPair) as a
+ * detached child of this step: its output goes to BUS_PAIR_LOG_FILE (the
+ * revoke prints it), its pid to BUS_PAIR_STARTED_FILE (the revoke stops only
+ * that process, if it is still going at its bound). A spawn that fails is
+ * written as the pair's error. Never throws.
+ */
+export function spawnBusPair(t: RawTargets): void {
+  try {
+    const log = openSync(join(t.secretsDir, BUS_PAIR_LOG_FILE), "a", 0o600);
+    const child = spawn(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--no-warnings",
+        PROVISIONING_SCRIPT,
+        "bus-pair",
+      ],
+      { detached: true, stdio: ["ignore", log, log], env: process.env },
+    );
+    child.unref();
+    if (!child.pid) throw new Error("no pid");
+    writeFileSync(join(t.secretsDir, BUS_PAIR_STARTED_FILE), `${child.pid}\n`, {
+      mode: 0o600,
+    });
+    out(`bus pair: started (pid ${child.pid})\n`);
+  } catch (e) {
+    writeBusPairError(t.secretsDir, `not started: ${errText(e)}`);
+    out("bus pair: not started\n");
+  }
+}
+
+/**
+ * The child's whole job (`provisioning bus-pair`): bringUpBusPair with its
+ * own Run and recipient; a failure is written as the pair's error, so the
+ * pair file or the error file always marks its end.
+ */
+export async function runBusPair(
+  env: Record<string, string | undefined>,
+  t: RawTargets,
+  run: Run = liveRun(env, t),
+  pace?: (app: string, deadline: number) => Promise<unknown>,
+): Promise<void> {
+  const m = mask(env);
+  const r = await newRecipient();
+  const open = async (sealed: string): Promise<CredsOut> => {
+    const c = parseCreds(await openSealed(r, sealed));
+    m(c.pat);
+    m(c.hookKey);
+    return c;
+  };
+  try {
+    await bringUpBusPair(
+      run,
+      t.secretsDir,
+      { publicKey: r.publicKey, open },
+      pace,
+    );
+    out("bus pair: ready\n");
+  } catch (e) {
+    const why = errText(e);
+    writeBusPairError(t.secretsDir, why);
+    out(`bus pair: not ready: ${why}\n`);
+  }
+}
+
 /**
  * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
  * creds, the two installs at the same time (#1730: the two upgrades are about
@@ -325,6 +552,7 @@ export async function bringUp(
   t: RawTargets,
   run: Run = liveRun(env, t),
   pace?: (app: string, deadline: number) => Promise<unknown>,
+  startPair: (t: RawTargets) => void = spawnBusPair,
 ): Promise<void> {
   const m = mask(env);
   const r = await newRecipient();
@@ -359,6 +587,12 @@ export async function bringUp(
       throw e;
     }
   };
+  // The hosted bus pair (cloud #202) in a process of its own, started first
+  // and never awaited here: this step's end (and after it the seal of rl-a's
+  // hook key for T19) never waits for rl-busa's and rl-busb's creates and
+  // upgrades. The bus lane waits for the pair itself (waitBusPair, its own
+  // deadline); the revoke waits for it, bounded, before revoking it.
+  startPair(t);
   const done = await Promise.allSettled([one("a", t.a), one("b", t.b)]);
   const failed = done.filter(
     (d): d is PromiseRejectedResult => d.status === "rejected",
@@ -371,13 +605,53 @@ export async function bringUp(
 const errText = (e: unknown): string =>
   e instanceof Error ? e.message : String(e);
 
+/**
+ * Before the revoke: waits for the pair's process to end (its pair or error
+ * file), up to `within`; one still going then is stopped by its own pid (the
+ * one spawnBusPair started, nothing else), so nothing mints after the revoke
+ * reads which installs to revoke. Then prints its log, without workflow
+ * command lines. No-op when no pair was started.
+ */
+export async function awaitPairEnd(
+  dir: string,
+  within = BUS_PAIR_REVOKE_WAIT_MS,
+  o: { wait?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<void> {
+  const started = join(dir, BUS_PAIR_STARTED_FILE);
+  if (!existsSync(started)) return;
+  const wait = o.wait ?? ((ms: number) => delay(ms));
+  const now = o.now ?? Date.now;
+  const end = now() + within;
+  while (!busPairEnded(dir) && now() < end) await wait(POLL_MS);
+  if (!busPairEnded(dir)) {
+    const pid = Number(readFileSync(started, "utf8").trim());
+    if (Number.isSafeInteger(pid) && pid > 0)
+      try {
+        process.kill(pid, "SIGTERM");
+        out(
+          `bus pair: still going after ${Math.round(within / 60_000)} min, stopped (pid ${pid})\n`,
+        );
+      } catch {
+        // Already gone.
+      }
+  }
+  const log = join(dir, BUS_PAIR_LOG_FILE);
+  if (existsSync(log))
+    for (const l of readFileSync(log, "utf8").split("\n"))
+      if (l && !l.startsWith("::")) out(`bus pair log: ${l.slice(0, 300)}\n`);
+}
+
 /** The workflow's last step: R26 revoke on rl-a and rl-b; both run, any failure fails. */
 export async function revokeAll(
   env: Record<string, string | undefined>,
   t: RawTargets,
+  o: { run?: Run; now?: () => number; deadline?: number } = {},
 ): Promise<number> {
-  const run = liveRun(env, t);
+  const run = o.run ?? liveRun(env, t);
+  const now = o.now ?? Date.now;
+  const deadline = o.deadline ?? jobDeadline(env);
   let failed = 0;
+  // rl-a and rl-b first, as ever: their own bound (JOB_WITHIN_MS each).
   for (const [name, side] of [
     ["a", t.a],
     ["b", t.b],
@@ -394,7 +668,83 @@ export async function revokeAll(
       out(`rl-${name}: revoke failed: ${(e as Error).message}\n`);
     }
   }
+  // The hosted bus pair (cloud #202), only in what the job has left before
+  // its deadline: its end (a late mint is revoked too), rl-busb resumed if
+  // something left it suspended (OA Bus M3), then each R26 revoke. Not gating
+  // for one release, so a pair revoke that fails or has no time left warns,
+  // loudly, and doesn't fail the step: the next run's R26 mint revokes it.
+  if (!existsSync(join(t.secretsDir, BUS_PAIR_STARTED_FILE)))
+    return failed ? 1 : 0;
+  const left = () => deadline - now();
+  const noTime = (names: string) =>
+    out(
+      `::warning::${names} R26 not revoked: no time left; the next run's mint revokes them\n`,
+    );
+  if (left() < MIN_PAIR_REVOKE_MS) {
+    noTime(`${BUS_A}/${BUS_B}`);
+    return failed ? 1 : 0;
+  }
+  await awaitPairEnd(
+    t.secretsDir,
+    Math.min(BUS_PAIR_REVOKE_WAIT_MS, left() - MIN_PAIR_REVOKE_MS),
+    { now },
+  );
+  const sides = busPairSides(t.secretsDir);
+  const busb = sides.find((s) => s.name === BUS_B);
+  if (busb && left() >= 2 * MIN_PAIR_REVOKE_MS)
+    await ensureResumed(
+      run,
+      busb.installId,
+      busb.name,
+      Math.min(CASE_JOB_WITHIN_MS, left() - MIN_PAIR_REVOKE_MS),
+      out,
+    );
+  for (const [i, side] of sides.entries()) {
+    if (left() < MIN_PAIR_REVOKE_MS) {
+      noTime(
+        sides
+          .slice(i)
+          .map((s) => s.name)
+          .join("/"),
+      );
+      break;
+    }
+    const f = join(t.secretsDir, secretFileName(side.name, "PAT"));
+    const pat = existsSync(f)
+      ? readSecretFile(f, secretFileName(side.name, "PAT"))
+      : undefined;
+    try {
+      await revokeCreds(run, side.installId, side.name, side.app, pat, left());
+      out(`${side.name}: R26 revoked\n`);
+    } catch (e) {
+      out(
+        `::warning::${side.name}: R26 revoke failed: ${(e as Error).message}; the next run's mint revokes it\n`,
+      );
+    }
+  }
   return failed ? 1 : 0;
+}
+
+/** The redline job's timeout (redline-staging.yml) and the margin the revoke keeps under it. */
+export const REDLINE_JOB_MS = 150 * 60_000;
+export const REVOKE_MARGIN_MS = 5 * 60_000;
+/** Less than this left: a pair revoke isn't started. */
+export const MIN_PAIR_REVOKE_MS = 2 * 60_000;
+
+/**
+ * When the revoke must be done: the job's start + REDLINE_JOB_MS -
+ * REVOKE_MARGIN_MS. The start is REDLINE_JOB_STARTED_AT (epoch ms) when set,
+ * else this runner VM's boot (now - uptime): a GitHub-hosted VM boots for its
+ * job, never after it starts, so the deadline is never later than the job's.
+ */
+export function jobDeadline(
+  env: Record<string, string | undefined>,
+  now: number = Date.now(),
+  uptimeSec: number = uptime(),
+): number {
+  const set = Number(env.REDLINE_JOB_STARTED_AT);
+  const start = Number.isFinite(set) && set > 0 ? set : now - uptimeSec * 1000;
+  return start + REDLINE_JOB_MS - REVOKE_MARGIN_MS;
 }
 
 /**

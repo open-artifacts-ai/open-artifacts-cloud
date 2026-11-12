@@ -29,6 +29,8 @@ const w: any = parse(text);
 const job: any = w.jobs.redline;
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const steps: Record<string, any>[] = job.steps;
+/** The steps after the job's start stamp (cloud #202), the first one. */
+const rest = steps.slice(1);
 // The T19 job (#1730): beside the suite, no id-token.
 // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
 const t19Job: any = w.jobs.t19;
@@ -309,18 +311,26 @@ describe("redline-staging.yml", () => {
     );
   });
 
+  it("records the job's start first: REDLINE_JOB_STARTED_AT in epoch ms, for every later step (cloud #202)", () => {
+    expect(steps[0]).toEqual({
+      name: "Record the job's start",
+      run: 'echo "REDLINE_JOB_STARTED_AT=$(date +%s%3N)" >> "$GITHUB_ENV"',
+    });
+  });
+
   it("checks the input before anything else, then runs from exactly the tag's checkout (#1137)", () => {
     const guard = named("On main, for a release tag");
-    expect(steps[0]).toBe(guard);
-    expect(steps[1]?.uses).toMatch(/^actions\/checkout@/);
+    // After the start stamp, which reads nothing of the input.
+    expect(rest[0]).toBe(guard);
+    expect(rest[1]?.uses).toMatch(/^actions\/checkout@/);
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(steps[1]?.with?.ref).toBe("refs/tags/${{ inputs.tag }}");
+    expect(rest[1]?.with?.ref).toBe("refs/tags/${{ inputs.tag }}");
     // The CLOUD tag goes to _cloud; the overlay action puts it on the public
     // tree at the tag's PUBLIC_PIN and refuses anything but exactly the tag.
-    expect(steps[1]?.with?.path).toBe("_cloud");
-    expect(steps[2]?.uses).toBe("./_cloud/.github/actions/overlay");
+    expect(rest[1]?.with?.path).toBe("_cloud");
+    expect(rest[2]?.uses).toBe("./_cloud/.github/actions/overlay");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(steps[2]?.with).toEqual({ "exact-tag": "${{ inputs.tag }}" });
+    expect(rest[2]?.with).toEqual({ "exact-tag": "${{ inputs.tag }}" });
     // Nothing else may check out a different ref, and the deploy logic stays
     // main's: platform-tags keeps its own checkout of the workflow's commit.
     expect(text.match(/refs\/tags\//g)).toHaveLength(2);
@@ -552,10 +562,10 @@ describe("redline-staging.yml", () => {
         name: "On main, for a release tag",
         env: { TAG: "${{ inputs.tag }}", REF: "${{ github.ref }}" },
       });
-      expect(t19Steps[0]?.run).toBe(steps[0]?.run);
+      expect(t19Steps[0]?.run).toBe(rest[0]?.run);
       expect(t19Steps[1]?.uses).toMatch(/^actions\/checkout@/);
-      expect(t19Steps[1]?.with).toEqual(steps[1]?.with);
-      expect(t19Steps[2]).toEqual(steps[2]);
+      expect(t19Steps[1]?.with).toEqual(rest[1]?.with);
+      expect(t19Steps[2]).toEqual(rest[2]);
     });
 
     it("keeps the pin: T19_EXPECT_VERSION is the staged version.txt handed over with the key, and no file or an empty one stops it (#1251)", () => {

@@ -309,6 +309,20 @@ describe("holdSocket on a loopback server", () => {
   const serverText = (t: string) =>
     Buffer.concat([Buffer.from([0x81, t.length]), Buffer.from(t)]);
 
+  it("reads the code of the server's close frame (#1954: suspend closes with 4403)", async () => {
+    let theirs!: Socket;
+    const base = await start((s) => {
+      theirs = s;
+    });
+    const h = await holdSocket(new Request(`${base}/bus/connect`));
+    expect(h.closeCode()).toBeNull();
+    const payload = Buffer.alloc(2);
+    payload.writeUInt16BE(4403);
+    theirs.end(Buffer.concat([Buffer.from([0x88, 2]), payload]));
+    expect(await within(h.closed, 2000)).toBe(true);
+    expect(h.closeCode()).toBe(4403);
+  });
+
   it("sends the token as a bearer, upgrade headers and the hello frame, and waits for hello_ok", async () => {
     let headers: Record<string, unknown> = {};
     const frames: Buffer[] = [];

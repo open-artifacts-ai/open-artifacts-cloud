@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { RECONNECT_AT_MS } from "../src/hosted-bus.ts";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
 import { derive, inShard } from "../src/surfaces.ts";
@@ -39,12 +40,34 @@ const fx = JSON.parse(
 ) as Fixture;
 const P = fx.phases;
 /**
- * Files added after the recording (#1299's live/bus.test.ts), so no wall was
- * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
- * case that is a few requests while the bus is off). The first live run that
- * includes them replaces it; test/cases-added.ts names what is estimated.
+ * Files added after the recording, in a lane the recording has no wall for
+ * (none today: live/bus.test.ts has its own lane, BUS_FILE below). The first
+ * live run that includes one replaces its ESTIMATE; test/cases-added.ts names
+ * what is estimated.
  */
-const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
+const ESTIMATED_WALL_SEC: Record<string, number> = {};
+
+/**
+ * Cloud #202: live/bus.test.ts on rl-busa and rl-busb, in its own lane
+ * ("busb"), after the recordings. Its wall is MODELED, not measured, from the
+ * cases' own steps (src/hosted-bus.ts): the pair's sign-in and two device
+ * flows, case 1's few upgrades, case 2's sockets, the suspend job, the
+ * reconnect probes to 125 s after it (RECONNECT_AT_MS; the 30 s close check
+ * falls inside them), the resume job and /healthz, the reopen. The first
+ * live run replaces it. The pair's bring-up runs beside rl-a's and rl-b's
+ * (each an upgrade, about as long as theirs), so it adds no step.
+ */
+const BUS_FILE = "live/bus.test.ts";
+const BUSB_MODEL = {
+  setupSec: 30,
+  crossSec: 10,
+  socketsSec: 10,
+  suspendJobSec: 20,
+  probesSec: RECONNECT_AT_MS[RECONNECT_AT_MS.length - 1] / 1000,
+  resumeSec: 30,
+  reopenSec: 15,
+};
+const BUSB_SEC = Object.values(BUSB_MODEL).reduce((n, v) => n + v, 0);
 
 // #859's live/provisioner.test.ts has its own lane ("provisioner"). The
 // recording predates it, so the replay of run 42402998826 leaves the file out
@@ -57,7 +80,10 @@ const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
     ph
       .filter((l) => l.shard !== "b")
-      .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
+      .map((l) => ({
+        ...l,
+        files: l.files.filter((f) => f !== NEW_FILE && f !== BUS_FILE),
+      }))
       .filter((l) => l.files.length > 0),
   );
 // Load-bearing: isProv() is true only for a lane of provisioning.test.ts
@@ -366,6 +392,8 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
   const ends = (walls: Record<string, number> = m.lanes) => {
     const out: Record<string, number> = { ...walls };
     out.provisioner = Math.max(REPLAY_SEC, out.prov ?? 0) + TAKEN_SEC;
+    // Cloud #202's busb lane, modeled (BUSB_MODEL).
+    out.busb ??= BUSB_SEC;
     return out;
   };
   const job = (e: Record<string, number>) =>
@@ -451,6 +479,8 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     creds: 271,
     guard: 85,
     front: 219,
+    // Cloud #202's busb lane, modeled (BUSB_MODEL).
+    busb: BUSB_SEC,
   });
 
   it("the fixture is the run's 220 cases, and every group names real cases", () => {
@@ -490,5 +520,14 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     const end = jobSec - (suiteSec - longest);
     expect(end).toBe(447);
     expect(end).toBeLessThan(600);
+  });
+
+  // Cloud #202. The busb lane starts with the suite and runs beside the
+  // others; modeled at 240 s, it is under creds' 271 s, so it adds nothing.
+  it("with the busb lane (modeled at 240 s), the job still ends at about 447 s, under 600", () => {
+    expect(BUSB_SEC).toBe(240);
+    expect(lanes().busb).toBe(BUSB_SEC);
+    expect(BUSB_SEC).toBeLessThan(Math.max(...Object.values(lanes())));
+    expect(jobSec - (suiteSec - Math.max(...Object.values(lanes())))).toBe(447);
   });
 });

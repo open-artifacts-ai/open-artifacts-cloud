@@ -44,6 +44,8 @@ function setup(): { f: FakeApi; t: RawTargets } {
 }
 /** No hook ledger on disk: the polls' pacing is its own concern. */
 const noPace = async () => {};
+/** The hosted bus pair is test/hosted-bus.test.ts's: none started here. */
+const noPair = () => {};
 const quiet = () => vi.spyOn(process.stdout, "write").mockReturnValue(true);
 const at = (log: string[], re: RegExp) => log.findIndex((l) => re.test(l));
 
@@ -51,7 +53,7 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
   it("both upgrades are sent before either install's creds are taken, and every file is written", async () => {
     const { f, t } = setup();
     const out = quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace, noPair);
     const up = (id: string) =>
       at(f.log, new RegExp(`/installs/${id}/upgrade$`));
     const creds = (id: string) =>
@@ -82,7 +84,7 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
   it("R26 creds are requested the same way as before: one mint per install, sealed to this run's key", async () => {
     const { f, t } = setup();
     quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace, noPair);
     const mints = f.log.filter((l) => /\/redline-creds$/.test(l));
     expect(mints).toHaveLength(2);
     expect(f.pats.size).toBe(2);
@@ -109,7 +111,7 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
     const { f, t } = setup();
     const out = quiet();
     await expect(
-      bringUp({}, t, refuseUp(f, CONFIG.rlA.id), noPace),
+      bringUp({}, t, refuseUp(f, CONFIG.rlA.id), noPace, noPair),
     ).rejects.toThrow(/^rl-a: /);
     // rl-b was awaited to the end: its creds exist, rl-a has none.
     expect(existsSync(credFile(t, "b", "PAT"))).toBe(true);
@@ -124,7 +126,7 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
     const { f, t } = setup();
     quiet();
     await expect(
-      bringUp({}, t, refuseUp(f, CONFIG.rlB.id), noPace),
+      bringUp({}, t, refuseUp(f, CONFIG.rlB.id), noPace, noPair),
     ).rejects.toThrow(/^rl-b: /);
     expect(existsSync(credFile(t, "a", "PAT"))).toBe(true);
     expect(existsSync(credFile(t, "b", "PAT"))).toBe(false);
@@ -141,7 +143,7 @@ describe("bringUp runs rl-a and rl-b at the same time", () => {
           ? Promise.resolve(new Response("{}", { status: 500 }))
           : a.io.fetch(u, i),
     });
-    const err = await bringUp({}, t, both, noPace).then(
+    const err = await bringUp({}, t, both, noPace, noPair).then(
       () => null,
       (e: Error) => e,
     );
@@ -158,7 +160,7 @@ describe("bringUp waits for the new hook key to take effect", () => {
     const { f, t } = setup();
     f.faults.add("hook_key_stale");
     const out = quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace, noPair);
     // Three old answers and the fourth accepted, per install.
     expect(calls(f)).toHaveLength(8);
     const text = out.mock.calls.map((c) => String(c[0])).join("");
@@ -169,7 +171,7 @@ describe("bringUp waits for the new hook key to take effect", () => {
   it("a key accepted at once is checked once per install", async () => {
     const { f, t } = setup();
     quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace, noPair);
     expect(calls(f)).toHaveLength(2);
   });
 
@@ -177,7 +179,13 @@ describe("bringUp waits for the new hook key to take effect", () => {
     const { f, t } = setup();
     f.faults.add("hook_key_never");
     quiet();
-    const err = await bringUp({}, t, new Run(CONFIG, f.io), noPace).then(
+    const err = await bringUp(
+      {},
+      t,
+      new Run(CONFIG, f.io),
+      noPace,
+      noPair,
+    ).then(
       () => null,
       (e: Error) => e,
     );
@@ -236,7 +244,7 @@ describe("bringUp checks the tier fixture (rl-a Team, rl-b Business)", () => {
   it("the right tiers pass, one /me read per install", async () => {
     const { f, t } = setup();
     const out = quiet();
-    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace, noPair);
     expect(me(f)).toHaveLength(2);
     const text = out.mock.calls.map((c) => String(c[0])).join("");
     expect(text).toContain("rl-a: tier is team");
@@ -252,7 +260,13 @@ describe("bringUp checks the tier fixture (rl-a Team, rl-b Business)", () => {
       const { f, t } = setup();
       f.tiers.set(id, got);
       quiet();
-      const err = await bringUp({}, t, new Run(CONFIG, f.io), noPace).then(
+      const err = await bringUp(
+        {},
+        t,
+        new Run(CONFIG, f.io),
+        noPace,
+        noPair,
+      ).then(
         () => null,
         (e: Error) => e,
       );
