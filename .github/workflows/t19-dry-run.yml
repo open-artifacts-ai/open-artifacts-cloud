@@ -1,0 +1,42 @@
+# T19 dry run (#166): the dashboard's staging suite (apps/dashboard/e2e/staging)
+# against staging with the specs of a PUBLIC BRANCH head, so a T19 PR can be
+# tried before it merges. It calls redline-staging.yml, which swaps only the
+# T19 specs after the overlay; everything else is the tag's.
+#
+# NEVER GATE EVIDENCE. A called run is not a run of redline-staging.yml: its
+# own workflow is this file, its event is workflow_dispatch of t19-dry-run.yml,
+# and its title never starts with redline-staging. staging-first-gate.sh and the
+# prod chain read runs of redline-staging.yml only, so neither counts it.
+# scripts/ci/redline-staging.test.ts pins all of that.
+name: t19-dry-run
+run-name: t19-dry-run ${{ inputs.public_branch }} ${{ inputs.public_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release staging runs (vX.Y.Z)"
+        required: true
+      public_branch:
+        description: "A branch of open-artifacts-ai/open-artifacts"
+        required: true
+      public_sha:
+        description: "The branch's head (40 hex): the specs under test"
+        required: true
+
+permissions: {}
+
+jobs:
+  redline:
+    # Exactly what redline-nightly.yml gives the same callee: id-token for the
+    # redline job, `actions: read` for the t19 hand-off.
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    uses: ./.github/workflows/redline-staging.yml
+    with:
+      tag: ${{ inputs.tag }}
+      t19_public_branch: ${{ inputs.public_branch }}
+      t19_public_sha: ${{ inputs.public_sha }}
+    # No secrets passed, as in the nightly.

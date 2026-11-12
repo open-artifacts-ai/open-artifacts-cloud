@@ -1652,3 +1652,201 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     );
   });
 });
+
+// t19-dry-run.yml (#166): T19 with a public branch's specs, never gate evidence.
+describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
+  const dryText = readFileSync(
+    join(root, ".github/workflows/t19-dry-run.yml"),
+    "utf8",
+  );
+  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+  const dry: any = parse(dryText);
+  const swap = pick(t19Steps, "Use a public branch's T19 specs");
+  const URL = "https://github.com/open-artifacts-ai/open-artifacts";
+
+  it("the dry run is workflow_dispatch only; its run name never starts with redline-staging; it calls the callee with the nightly's permissions", () => {
+    expect(Object.keys(dry.on)).toEqual(["workflow_dispatch"]);
+    expect(Object.keys(dry.on.workflow_dispatch.inputs).sort()).toEqual([
+      "public_branch",
+      "public_sha",
+      "tag",
+    ]);
+    expect(dry["run-name"]).toBe(
+      "t19-dry-run ${{ inputs.public_branch }} ${{ inputs.public_sha }}",
+    );
+    expect(String(dry["run-name"]).startsWith("redline-staging")).toBe(false);
+    expect(dry.name).toBe("t19-dry-run");
+    expect(dry.permissions).toEqual({});
+    expect(Object.keys(dry.jobs)).toEqual(["redline"]);
+    const j = dry.jobs.redline;
+    expect(j.uses).toBe("./.github/workflows/redline-staging.yml");
+    expect(j.secrets).toBeUndefined();
+    expect(j.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+      actions: "read",
+    });
+    expect(j.with).toEqual({
+      tag: "${{ inputs.tag }}",
+      t19_public_branch: "${{ inputs.public_branch }}",
+      t19_public_sha: "${{ inputs.public_sha }}",
+    });
+    const nightly = parse(
+      readFileSync(join(root, ".github/workflows/redline-nightly.yml"), "utf8"),
+    );
+    expect(nightly.jobs.redline.permissions).toEqual(j.permissions);
+  });
+
+  it("a gate run can't set the t19_public inputs: only workflow_call has them, defaulting to empty", () => {
+    expect(Object.keys(w.on.workflow_dispatch.inputs)).toEqual(["tag"]);
+    for (const k of ["t19_public_branch", "t19_public_sha"]) {
+      expect(w.on.workflow_call.inputs[k]).toEqual({
+        type: "string",
+        required: false,
+        default: "",
+      });
+    }
+    // Nothing but the swap step reads them.
+    const users = [...text.matchAll(/inputs\.t19_public_\w+/g)].length;
+    const inStep = JSON.stringify(swap).match(/inputs\.t19_public_\w+/g) ?? [];
+    expect(users).toBe(inStep.length);
+  });
+
+  it("the gate and the prod chain count only runs of redline-staging.yml with event workflow_dispatch", () => {
+    const gate = readFileSync(
+      join(root, "scripts/ci/staging-first-gate.sh"),
+      "utf8",
+    );
+    expect(gate).toContain("actions/workflows/redline-staging.yml/runs?");
+    expect(gate).toContain('.event == "workflow_dispatch"');
+    expect(gate).not.toContain("t19-dry-run");
+    const chain = readFileSync(
+      join(root, "scripts/ci/prod-release-chain.ts"),
+      "utf8",
+    );
+    expect(chain).toContain("actions/workflows/redline-staging.yml/runs?");
+    expect(chain).toContain("event=workflow_dispatch");
+    expect(chain).not.toContain("t19-dry-run");
+  });
+
+  it("the swap step sits in the t19 job only, after the overlay and before install, and runs only when an input is set", () => {
+    const i = t19Steps.indexOf(swap);
+    const overlay = t19Steps.findIndex((s) =>
+      String(s.uses ?? "").endsWith("/overlay"),
+    );
+    const install = t19Steps.findIndex(
+      (s) => s.run === "pnpm install --frozen-lockfile --ignore-scripts",
+    );
+    expect(overlay).toBeGreaterThan(-1);
+    expect(i).toBeGreaterThan(overlay);
+    expect(i).toBeLessThan(install);
+    expect(steps.some((s) => s.name === swap.name)).toBe(false);
+    expect(swap.if).toBe(
+      "inputs.t19_public_sha != '' || inputs.t19_public_branch != ''",
+    );
+    expect(swap.env).toEqual({
+      BRANCH: "${{ inputs.t19_public_branch }}",
+      SHA: "${{ inputs.t19_public_sha }}",
+    });
+  });
+
+  it("the swap step validates, compares ls-remote refs/heads with the sha, fetches that sha without credentials and touches only apps/dashboard/e2e/staging", () => {
+    const r = String(swap.run);
+    expect(r).toContain("^[0-9a-f]{40}$");
+    expect(r).toContain("^[A-Za-z0-9._/-]{1,200}$");
+    expect(r).toContain(`git ls-remote "$url" "refs/heads/$BRANCH"`);
+    expect(r).toContain(`[ "$head" = "$SHA" ]`);
+    expect(r).toContain(`url=${URL}\n`);
+    expect(r).not.toMatch(
+      /refs\/pull|GH_TOKEN|GITHUB_TOKEN|secrets|extraheader/,
+    );
+    // Removes and writes exactly one directory of the workspace.
+    expect(r.match(/rm -rf (?!"\$src")\S+/g)).toEqual([
+      "rm -rf apps/dashboard/e2e/staging",
+    ]);
+    expect(r).toContain(
+      `git -C "$src" archive "$SHA" apps/dashboard/e2e/staging | tar -x -C .`,
+    );
+    // Prints the sha and the file list, nothing else from the run.
+    expect(r).not.toMatch(
+      /handoff|hand-off|HOOK|targets\.json|echo "\$\{?(SECRET|KEY)/i,
+    );
+  });
+
+  it("the swap step swaps only the staging specs, for a branch head, and refuses anything else", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "t19swap-"));
+    try {
+      const git = (cwd: string, ...a: string[]) =>
+        spawnSync("git", a, { cwd, encoding: "utf8" });
+      const pub = join(tmp, "pub");
+      mkdirSync(join(pub, "apps/dashboard/e2e/staging"), { recursive: true });
+      writeFileSync(join(pub, "apps/dashboard/e2e/staging/new.spec.ts"), "new");
+      writeFileSync(
+        join(pub, "apps/dashboard/playwright.staging.config.ts"),
+        "PUB",
+      );
+      git(pub, "init", "-q", "-b", "feat/x");
+      git(pub, "-c", "user.name=t", "-c", "user.email=t@t", "add", ".");
+      git(
+        pub,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "c",
+      );
+      const sha = git(pub, "rev-parse", "HEAD").stdout.trim();
+      const run = String(swap.run).replace(`url=${URL}`, `url=${pub}`);
+      const work = () => {
+        const d = mkdtempSync(join(tmp, "ws-"));
+        mkdirSync(join(d, "apps/dashboard/e2e/staging"), { recursive: true });
+        writeFileSync(join(d, "apps/dashboard/e2e/staging/old.spec.ts"), "old");
+        writeFileSync(
+          join(d, "apps/dashboard/playwright.staging.config.ts"),
+          "TAG",
+        );
+        return d;
+      };
+      const go = (d: string, branch: string, s: string) =>
+        runBash(run, { BRANCH: branch, SHA: s, RUNNER_TEMP: tmp }, d);
+      const d = work();
+      const ok = go(d, "feat/x", sha);
+      expect(ok.status, ok.stderr).toBe(0);
+      expect(ok.stdout).toContain(sha);
+      expect(ok.stdout).toContain("apps/dashboard/e2e/staging/new.spec.ts");
+      expect(
+        existsSync(join(d, "apps/dashboard/e2e/staging/old.spec.ts")),
+      ).toBe(false);
+      expect(
+        readFileSync(join(d, "apps/dashboard/e2e/staging/new.spec.ts"), "utf8"),
+      ).toBe("new");
+      expect(
+        readFileSync(
+          join(d, "apps/dashboard/playwright.staging.config.ts"),
+          "utf8",
+        ),
+      ).toBe("TAG");
+      // Refused, and the workspace is left as it was.
+      for (const [b, s] of [
+        ["feat/x", "a".repeat(40)],
+        ["feat/x", sha.toUpperCase()],
+        ["feat/x", sha.slice(0, 39)],
+        ["feat/y", sha],
+        ["feat/x;id", sha],
+        ["", sha],
+        ["refs/pull/1/head", sha],
+      ]) {
+        const w2 = work();
+        const r = go(w2, b, s);
+        expect(r.status, `${b} ${s}`).not.toBe(0);
+        expect(
+          existsSync(join(w2, "apps/dashboard/e2e/staging/old.spec.ts")),
+        ).toBe(true);
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
