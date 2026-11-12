@@ -130,6 +130,26 @@ describe("provisionerOptions", () => {
     ).toBe(false);
   });
 
+  it('PROD_BUS_ALL: only "1" on prod turns it on; staging flag never does (#2325)', async () => {
+    const o = (e: Record<string, string>) =>
+      provisionerOptions(mkEnv(e), LABEL, io(), JOB);
+    expect((await o({ OA_ENV: "prod", PROD_BUS_ALL: "1" })).prodBusAll).toBe(
+      true,
+    );
+    for (const v of ["0", "true", "", " 1", "1 "])
+      expect((await o({ OA_ENV: "prod", PROD_BUS_ALL: v })).prodBusAll).toBe(
+        false,
+      );
+    expect((await o({ OA_ENV: "prod" })).prodBusAll).toBe(false);
+    // The staging var does nothing on prod; the prod var does nothing on staging.
+    const p = await o({ OA_ENV: "prod", STAGING_BUS_ALL: "1" });
+    expect(p.prodBusAll).toBe(false);
+    expect(p.stagingBusAll).toBe(false);
+    const s = await o({ OA_ENV: "staging", PROD_BUS_ALL: "1" });
+    expect(s.prodBusAll).toBe(false);
+    expect(s.stagingBusAll).toBe(false);
+  });
+
   it("reads PROVISION_TOKEN once and calls Cloudflare with it on ACCOUNT_ID", async () => {
     const gets: string[] = [];
     const calls: { url: string; auth: string | null }[] = [];

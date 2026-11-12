@@ -7556,6 +7556,22 @@ describe("stagingBusSlugs reaches the rendered metadata (#1299 part 6)", () => {
     expect(featuresOf(prod, pi.id).split(",")).not.toContain("bus");
   });
 
+  it("prodBusAll: bus on prod; ignored on staging; stagingBusAll never turns prod on (#2325)", async () => {
+    const prod = setup({ env: "prod" });
+    const pi = keep(await prod.mk({ prodBusAll: true }).create(input("x")));
+    expect(featuresOf(prod, pi.id).split(",")).toContain("bus");
+    const off = setup({ env: "prod" });
+    const oi = keep(
+      await off
+        .mk({ prodBusAll: false, stagingBusAll: true })
+        .create(input("x")),
+    );
+    expect(featuresOf(off, oi.id).split(",")).not.toContain("bus");
+    const s = setup();
+    const si = keep(await s.mk({ prodBusAll: true }).create(input("x")));
+    expect(featuresOf(s, si.id).split(",")).not.toContain("bus");
+  });
+
   it("without the option, or on prod with it, no bus", async () => {
     const s = setup();
     const inst = keep(await s.p.create(input("finqore")));

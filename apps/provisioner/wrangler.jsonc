@@ -138,6 +138,9 @@
         "ACCOUNT_ID": "{{ACCOUNT_ID_PROD}}",
         // The Workflow's env: it refuses any other value.
         "OA_ENV": "prod",
+        // open-artifacts#2325: "1" gives every prod install the bus feature. OFF ("0") until
+        // a reviewed PR flips it, after the hosted isolation red-line cases pass.
+        "PROD_BUS_ALL": "0",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },
