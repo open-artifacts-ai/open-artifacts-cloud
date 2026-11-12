@@ -630,6 +630,15 @@ export function changeFor(
 }
 
 /**
+ * A yearly overage invoice (metadata.kind "overage"): a one-off for extra
+ * creators. It names no subscription, so it never moves tier, status,
+ * last_invoice_created or the subscription's grace, even if a Stripe API
+ * version attached one.
+ */
+const isOverage = (o: Record<string, unknown>): boolean =>
+  isObj(o.metadata) && o.metadata.kind === "overage";
+
+/**
  * The subscription an event is about (null when it names none): a
  * subscription event's own id, an invoice's subscription (top level, or
  * under parent.subscription_details on newer API versions). Checkout is not
@@ -640,6 +649,7 @@ export function subscriptionOf(ev: StripeEvent): string | null {
   const idOf = (v: unknown) => (isObj(v) ? v.id : v);
   let v: unknown;
   if (ev.type.startsWith("customer.subscription.")) v = o.id;
+  else if (ev.type.startsWith("invoice.") && isOverage(o)) return null;
   else {
     v = idOf(o.subscription);
     if (v === undefined || v === null) {

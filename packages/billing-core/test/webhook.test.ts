@@ -3305,3 +3305,62 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
     expect(s.calls).toEqual(["GET sub_Solo1", "DELETE sub_Solo1"]);
   });
 });
+
+describe("a yearly overage invoice never touches the plan (#2235)", () => {
+  const overage = (o: Record<string, unknown> = {}) => ({
+    customer: CUS_A,
+    metadata: { kind: "overage", install: A, month: "2026-10" },
+    ...o,
+  });
+  const setup = async () => {
+    await ownSub(A);
+    // A row mid-grace, so a stray paid event would visibly clear it.
+    await db
+      .prepare(
+        "UPDATE tiers SET status = 'past_due', grace_until = ?, last_invoice_created = ? WHERE install_id = ?",
+      )
+      .bind(NOW + 1000, T - 100, A)
+      .run();
+    return row(A);
+  };
+
+  it("invoice.paid and invoice.payment_failed without a subscription change nothing", async () => {
+    const before = await setup();
+    await deliver(event("invoice.paid", overage()));
+    await deliver(event("invoice.payment_failed", overage()));
+    expect(await row(A)).toEqual(before);
+  });
+
+  it("even one that names the row's own subscription is ignored (metadata.kind overage)", async () => {
+    const before = await setup();
+    await deliver(
+      event("invoice.paid", overage({ subscription: "sub_Test1" })),
+    );
+    await deliver(
+      event(
+        "invoice.payment_failed",
+        overage({
+          parent: { subscription_details: { subscription: "sub_Test1" } },
+        }),
+      ),
+    );
+    expect(await row(A)).toEqual(before);
+  });
+
+  it("a failed overage invoice does not move an active row", async () => {
+    await ownSub(A);
+    await deliver(event("invoice.payment_failed", overage()));
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      status: "active",
+      grace_until: null,
+      last_invoice_created: null,
+    });
+  });
+
+  it("a subscription invoice still applies (the skip is only for overage)", async () => {
+    await ownSub(A);
+    await deliver(event("invoice.payment_failed", inv()));
+    expect(await row(A)).toMatchObject({ status: "past_due" });
+  });
+});

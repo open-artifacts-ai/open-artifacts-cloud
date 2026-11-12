@@ -43,12 +43,16 @@ import {
   type CheckoutTier,
   createCheckoutSession,
   createCustomer,
+  createOverageInvoice,
+  createOverageItem,
   createPortalSession,
   createSoloTrialSubscription,
   createTestClock,
   expireCheckoutSession,
+  finalizeInvoice,
   handleStripeWebhook,
   pruneStripeEvents,
+  retrieveInvoiceStatus,
   SET_TIER_TIERS,
   type SetTierError,
   type SetTierResult,
@@ -1068,13 +1072,179 @@ export class BillingOperatorRpc extends WorkerEntrypoint<Env> {
 const USAGE_STATE_SQL =
   "SELECT u.applied_quantity, u.apply_outcome, (SELECT max(l.month) FROM usage l WHERE l.install_id = ?1 AND l.month > ?2 AND l.applied_quantity IS NOT NULL) AS later FROM usage u WHERE u.install_id = ?1 AND u.month = ?2";
 const USAGE_TIER_SQL =
-  "SELECT tier, status, stripe_subscription_id FROM tiers WHERE install_id = ?1";
+  "SELECT tier, status, stripe_subscription_id, stripe_customer_id FROM tiers WHERE install_id = ?1";
 const USAGE_APPLIED_SQL =
   "UPDATE usage SET applied_quantity = ?3, applied_at = ?4, apply_outcome = ?5 WHERE install_id = ?1 AND month = ?2";
 const USAGE_OUTCOME_SQL =
   "UPDATE usage SET apply_outcome = ?3 WHERE install_id = ?1 AND month = ?2";
 /** A UTC calendar month, YYYY-MM. */
 const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
+
+/**
+ * The answer to a failed Stripe call on /usage. 401 and 403 (a revoked or
+ * rotated key) are billing's own config, like config: retried, never a 200
+ * that lets the server move past the month. Other 4xx are permanent: the
+ * 200 stands and the failure is logged.
+ */
+function usageRefusal(e: StripeFailure): Response | null {
+  const permanent =
+    e.code === "bad_upstream" ||
+    (e.code === "upstream" &&
+      e.status !== undefined &&
+      e.status >= 400 &&
+      e.status < 500 &&
+      e.status !== 401 &&
+      e.status !== 403 &&
+      e.status !== 429);
+  return permanent ? null : e.res;
+}
+
+/** The monthly per-creator price in cents; yearly overage bills at this. */
+const MONTHLY_CENTS = { team: 1000, business: 2500 } as const;
+const OVERAGE_SQL =
+  "SELECT seats, quantity, unit_amount, item_id, invoice_id, outcome FROM overage WHERE install_id = ?1 AND month = ?2";
+const OVERAGE_INSERT_SQL =
+  "INSERT OR IGNORE INTO overage (install_id, month, seats, creators, quantity, unit_amount, outcome, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)";
+const OVERAGE_STEP_SQL =
+  "UPDATE overage SET item_id = coalesce(?3, item_id), invoice_id = coalesce(?4, invoice_id), outcome = ?5, updated_at = ?6 WHERE install_id = ?1 AND month = ?2";
+
+/** "2026-10" -> "October 2026". */
+const monthLabel = (month: string) =>
+  new Date(`${month}-01T00:00:00Z`).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+
+type OverageRow = {
+  seats: number;
+  quantity: number;
+  unit_amount: number;
+  item_id: string | null;
+  invoice_id: string | null;
+  outcome: string;
+};
+
+/**
+ * Yearly prepaid seats (#2235): a closed month with more creators than
+ * seats bills the extra creators at the monthly price on a one-off invoice
+ * (an invoice item, then an invoice that takes pending items, finalized).
+ * Once per (install, month): the overage row is written before the first
+ * Stripe call and records each step, so a retry finishes the invoice and
+ * never adds a second item, and an invoiced month is never billed again
+ * whatever a later report counts. Each Stripe write is keyed per
+ * (install, month, step). Failures are classified as applyQuantity's. The
+ * invoice carries metadata.kind "overage" and no subscription, so the
+ * webhook never lets it touch the plan.
+ */
+async function billOverage(
+  env: Env,
+  install: string,
+  month: string,
+  count: number,
+  seats: number,
+  tier: "team" | "business",
+  customerId: string,
+  now: number,
+): Promise<Response | null> {
+  const db = env.BILLING_DB;
+  const done = async (o: string) => {
+    await db.prepare(USAGE_OUTCOME_SQL).bind(install, month, o).run();
+    console.log("billing usage overage", o, install);
+    return null;
+  };
+  const read = () =>
+    db.prepare(OVERAGE_SQL).bind(install, month).first<OverageRow>();
+  let row = await read();
+  if (!row) {
+    const extra = count - seats;
+    if (extra <= 0) return done("overage_none");
+    await db
+      .prepare(OVERAGE_INSERT_SQL)
+      .bind(install, month, seats, count, extra, MONTHLY_CENTS[tier], now)
+      .run();
+    row = await read();
+  }
+  if (!row) return done("overage_failed");
+  if (row.outcome === "invoiced") return done("overage_invoiced");
+  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const step = (item: string | null, invoice: string | null, o: string) =>
+    db
+      .prepare(OVERAGE_STEP_SQL)
+      .bind(install, month, item, invoice, o, now)
+      .run();
+  const { quantity, unit_amount: unit } = row;
+  try {
+    if (!row.item_id) {
+      const itemId = await stripe(install, () =>
+        createOverageItem(
+          {
+            customerId,
+            install,
+            month,
+            quantity,
+            unitAmount: unit,
+            description: `Extra creators, ${monthLabel(month)}: ${quantity} × $${unit / 100}`,
+            idempotencyKey: `ovg-item-${install}-${month}`,
+          },
+          cfg,
+        ),
+      );
+      await step(itemId, null, "item_created");
+    }
+    let invoiceId = row.invoice_id;
+    let draft = true;
+    if (!invoiceId) {
+      invoiceId = await stripe(install, () =>
+        createOverageInvoice(
+          {
+            customerId,
+            install,
+            month,
+            idempotencyKey: `ovg-inv-${install}-${month}`,
+          },
+          cfg,
+        ),
+      );
+      await step(null, invoiceId, "invoice_created");
+    } else {
+      // Resumed: finalize only a draft (an attempt whose answer was lost may
+      // have finalized it already).
+      const id = invoiceId;
+      const status = await stripe(install, () =>
+        retrieveInvoiceStatus({ invoiceId: id }, cfg),
+      );
+      if (status === "missing") {
+        await db
+          .prepare(USAGE_OUTCOME_SQL)
+          .bind(install, month, "overage_failed")
+          .run();
+        console.error("billing usage overage invoice missing", install);
+        return null;
+      }
+      draft = status === "draft";
+    }
+    if (draft) {
+      const id = invoiceId;
+      await stripe(install, () =>
+        finalizeInvoice(
+          { invoiceId: id, idempotencyKey: `ovg-fin-${install}-${month}` },
+          cfg,
+        ),
+      );
+    }
+    await step(null, null, "invoiced");
+  } catch (e) {
+    if (!(e instanceof StripeFailure)) throw e;
+    await db
+      .prepare(USAGE_OUTCOME_SQL)
+      .bind(install, month, "overage_failed")
+      .run();
+    console.error("billing usage overage failed", install);
+    return usageRefusal(e);
+  }
+  return done("overage_invoiced");
+}
 
 /**
  * Per-creator monthly billing (#2123): a closed month's report sets the
@@ -1088,7 +1258,7 @@ const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
  * month, a month older than one already applied, no row or subscription, and
  * Solo, trial, lapsed or suspended rows. billing-core leaves a subscription
  * whose price is not the tier's monthly price alone (not_monthly): a yearly
- * prepaid-seat price recurs yearly and is recognised there (PR 4b bills its
+ * prepaid-seat price recurs yearly and is recognised there (billOverage bills its
  * overage). Answers null when the route's 200 stands, or the refusal: a
  * Stripe failure the install should retry (network, 5xx, 401, 403, 409,
  * 429, config)
@@ -1124,11 +1294,22 @@ async function applyQuantity(
     console.log("billing usage quantity repeat", install);
     return null;
   }
+  const billed = await db
+    .prepare(
+      "SELECT 1 AS x FROM overage WHERE install_id = ?1 AND month = ?2 AND outcome = 'invoiced'",
+    )
+    .bind(install, month)
+    .first();
+  if (billed) {
+    console.log("billing usage overage repeat", install);
+    return null;
+  }
   if (state?.later) return outcome("stale");
   const row = await db.prepare(USAGE_TIER_SQL).bind(install).first<{
     tier: string | null;
     status: string | null;
     stripe_subscription_id: string | null;
+    stripe_customer_id: string | null;
   }>();
   if (!row?.stripe_subscription_id) return outcome("no_subscription");
   if (row.tier !== "team" && row.tier !== "business")
@@ -1160,18 +1341,32 @@ async function applyQuantity(
     if (!(e instanceof StripeFailure)) throw e;
     await db.prepare(USAGE_OUTCOME_SQL).bind(install, month, "failed").run();
     console.error("billing usage quantity failed", install);
-    // 401 and 403 (a revoked or rotated key) are billing's own config, like
-    // config: retried, never a 200 that lets the server move past the month.
-    const permanent =
-      e.code === "bad_upstream" ||
-      (e.code === "upstream" &&
-        e.status !== undefined &&
-        e.status >= 400 &&
-        e.status < 500 &&
-        e.status !== 401 &&
-        e.status !== 403 &&
-        e.status !== 429);
-    return permanent ? null : e.res;
+    return usageRefusal(e);
+  }
+  if (r.outcome === "not_monthly" && r.item && row.stripe_customer_id) {
+    // A yearly prepaid-seat subscription (#2235): its one item is this
+    // tier's yearly price, quantity = seats. Anything else is left alone.
+    const yearly =
+      row.tier === "team"
+        ? env.STRIPE_PRICE_TEAM_YEARLY
+        : env.STRIPE_PRICE_BUSINESS_YEARLY;
+    if (
+      yearly &&
+      r.item.priceId === yearly &&
+      r.item.interval === "year" &&
+      r.item.quantity !== null &&
+      r.item.quantity >= 1
+    )
+      return billOverage(
+        env,
+        install,
+        month,
+        count,
+        r.item.quantity,
+        row.tier,
+        row.stripe_customer_id,
+        now,
+      );
   }
   if (r.outcome !== "updated" && r.outcome !== "unchanged")
     return outcome(r.outcome);
@@ -1222,6 +1417,25 @@ const GATE = new Set([
   "POST /portal",
 ]);
 
+/** True when two of the configured Team/Business price ids are the same (unset ones are skipped). */
+export function pricesCollide(
+  env: Pick<
+    Env,
+    | "STRIPE_PRICE_TEAM"
+    | "STRIPE_PRICE_BUSINESS"
+    | "STRIPE_PRICE_TEAM_YEARLY"
+    | "STRIPE_PRICE_BUSINESS_YEARLY"
+  >,
+): boolean {
+  const ids = [
+    env.STRIPE_PRICE_TEAM,
+    env.STRIPE_PRICE_BUSINESS,
+    env.STRIPE_PRICE_TEAM_YEARLY,
+    env.STRIPE_PRICE_BUSINESS_YEARLY,
+  ].filter((v) => typeof v === "string" && v !== "");
+  return new Set(ids).size !== ids.length;
+}
+
 export default {
   async fetch(req, env) {
     let url: URL;
@@ -1231,6 +1445,17 @@ export default {
       return notFound();
     }
     const route = `${req.method} ${url.pathname}`;
+    // Two plans sharing a price id would bill one as the other: every route
+    // that reads a price fails closed (500 config) until the config is fixed.
+    if (
+      route !== "GET /health" &&
+      (route === "POST /stripe/webhook" || GATE.has(route)) &&
+      pricesCollide(env)
+    ) {
+      await req.body?.cancel();
+      console.error("billing config duplicate price ids");
+      return bad("config", 500);
+    }
     // The one public route: reachable with cf-connecting-ip (Stripe's
     // delivery). billing-core reads and verifies the body; billing doesn't.
     if (route === "POST /stripe/webhook") {

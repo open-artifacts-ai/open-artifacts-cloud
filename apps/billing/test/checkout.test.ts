@@ -17,6 +17,7 @@ import billing, {
   BillingOperatorRpc,
   type Env,
   MAX_CREATORS,
+  pricesCollide,
 } from "../src/index.js";
 
 // POST /checkout and POST /portal: signed like the other POSTs, redirect URLs
@@ -227,6 +228,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
+    db.prepare("DELETE FROM overage"),
   ]);
   clearRegistryCache();
   await register();
@@ -2124,6 +2126,390 @@ describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => 
       );
       expect([r.status, await r.json()]).toEqual([503, { error: "config" }]);
     }
+    expect(s.calls).toEqual([]);
+  });
+});
+
+describe("POST /usage bills a yearly subscription's creators above its seats (#2235)", () => {
+  const SUB = "sub_yearA";
+  const SUBS = `/v1/subscriptions/${SUB}`;
+  const shift = (n: number) => {
+    const d = new Date();
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1))
+      .toISOString()
+      .slice(0, 7);
+  };
+  const closed = shift(-1);
+  const label = new Date(`${closed}-01T00:00:00Z`).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  const yEnv = (): Env => ({
+    ...baseEnv(),
+    STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
+    STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+  });
+  const report = (month: string, count: number) =>
+    req("/usage", {
+      install: A,
+      month,
+      creators: Array.from({ length: count }, (_, i) => `u${i}`),
+      count,
+    });
+  const send = (month: string, count: number) =>
+    call(report(month, count), yEnv());
+  async function live(tier = "team", status = "active") {
+    await seed(A, "cus_existingA", tier);
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = ?1, status = ?2 WHERE install_id = ?3",
+      )
+      .bind(SUB, status, A)
+      .run();
+  }
+  const subscription = (
+    o: { price?: string; interval?: string; seats?: number } = {},
+  ) =>
+    Response.json({
+      id: SUB,
+      status: "active",
+      items: {
+        data: [
+          {
+            id: "si_itemA",
+            quantity: o.seats ?? 3,
+            price: {
+              id: o.price ?? "price_teamY1",
+              recurring: { interval: o.interval ?? "year" },
+            },
+          },
+        ],
+      },
+    });
+  type Opts = {
+    sub?: Parameters<typeof subscription>[0];
+    item?: () => Response | undefined;
+    invoice?: () => Response | undefined;
+    finalize?: () => Response | undefined;
+    status?: string;
+  };
+  const fake = (o: Opts = {}) =>
+    fakeStripe((c) => {
+      if (c.method === "GET" && c.path === SUBS) return subscription(o.sub);
+      if (c.path === "/v1/invoiceitems")
+        return o.item?.() ?? Response.json({ id: "ii_item1" });
+      if (c.method === "POST" && c.path === "/v1/invoices")
+        return o.invoice?.() ?? Response.json({ id: "in_inv1" });
+      if (c.method === "GET" && c.path === "/v1/invoices/in_inv1")
+        return Response.json({ id: "in_inv1", status: o.status ?? "draft" });
+      if (c.path === "/v1/invoices/in_inv1/finalize")
+        return o.finalize?.() ?? Response.json({ id: "in_inv1" });
+      return undefined;
+    });
+  const paths = (s: { calls: { method: string; path: string }[] }) =>
+    s.calls.map((c) => `${c.method} ${c.path}`);
+  const overageRow = () =>
+    db
+      .prepare(
+        "SELECT seats, creators, quantity, unit_amount, item_id, invoice_id, outcome FROM overage WHERE install_id = ?1 AND month = ?2",
+      )
+      .bind(A, closed)
+      .first();
+  const outcomeOf = async () =>
+    (
+      await db
+        .prepare(
+          "SELECT apply_outcome AS o, applied_quantity AS q FROM usage WHERE install_id = ?1 AND month = ?2",
+        )
+        .bind(A, closed)
+        .first<{ o: string; q: number | null }>()
+    )?.o;
+  const failing = (status: number) => () =>
+    Response.json({ error: { type: "x" } }, { status });
+
+  it("bills the extra creators at the monthly price: item, invoice, finalize", async () => {
+    await live();
+    const s = fake();
+    const r = await send(closed, 5);
+    expect([r.status, await r.json()]).toEqual([
+      200,
+      { ok: true, month: closed, count: 5 },
+    ]);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "POST /v1/invoiceitems",
+      "POST /v1/invoices",
+      "GET /v1/invoices/in_inv1".replace("GET", "POST") + "/finalize",
+    ]);
+    expect(s.calls[1]?.form).toEqual({
+      customer: "cus_existingA",
+      currency: "usd",
+      unit_amount: "1000",
+      quantity: "2",
+      description: `Extra creators, ${label}: 2 × $10`,
+      "metadata[kind]": "overage",
+      "metadata[install]": A,
+      "metadata[month]": closed,
+    });
+    expect(s.calls[2]?.form).toEqual({
+      customer: "cus_existingA",
+      collection_method: "charge_automatically",
+      pending_invoice_items_behavior: "include",
+      "metadata[kind]": "overage",
+      "metadata[install]": A,
+      "metadata[month]": closed,
+    });
+    expect(s.calls.slice(1).map((c) => c.key)).toEqual([
+      `ovg-item-${A}-${closed}`,
+      `ovg-inv-${A}-${closed}`,
+      `ovg-fin-${A}-${closed}`,
+    ]);
+    expect(await overageRow()).toEqual({
+      seats: 3,
+      creators: 5,
+      quantity: 2,
+      unit_amount: 1000,
+      item_id: "ii_item1",
+      invoice_id: "in_inv1",
+      outcome: "invoiced",
+    });
+    expect(await outcomeOf()).toBe("overage_invoiced");
+    // The subscription's own quantity is never written.
+    expect(paths(s).some((p) => p.includes("subscription_items"))).toBe(false);
+  });
+
+  it("Business bills $25 a creator", async () => {
+    await live("business");
+    const s = fake({ sub: { price: "price_businessY1", seats: 1 } });
+    expect((await send(closed, 3)).status).toBe(200);
+    expect(s.calls[1]?.form).toMatchObject({
+      unit_amount: "2500",
+      quantity: "2",
+      description: `Extra creators, ${label}: 2 × $25`,
+    });
+  });
+
+  it("no overage (count at or under seats) makes no billing call and records none", async () => {
+    await live();
+    for (const count of [3, 1, 0]) {
+      const s = fake();
+      expect((await send(closed, count)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      expect(await overageRow()).toBeNull();
+      expect(await outcomeOf()).toBe("overage_none");
+    }
+  });
+
+  it("a repeat report for an invoiced month never bills again, even with a changed count", async () => {
+    await live();
+    const s = fake();
+    await send(closed, 5);
+    s.calls.length = 0;
+    for (const count of [5, 9, 2])
+      expect((await send(closed, count)).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect((await overageRow())?.quantity).toBe(2);
+  });
+
+  it("a failure after the item resumes without a second item", async () => {
+    await live();
+    let s = fake({ invoice: failing(500) });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({
+      item_id: "ii_item1",
+      invoice_id: null,
+      outcome: "item_created",
+    });
+    expect(await outcomeOf()).toBe("overage_failed");
+    s = fake();
+    // The retry comes with another count: the item already made is what bills.
+    expect((await send(closed, 7)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "POST /v1/invoices",
+      "POST /v1/invoices/in_inv1/finalize",
+    ]);
+    expect(await overageRow()).toMatchObject({
+      quantity: 2,
+      outcome: "invoiced",
+    });
+  });
+
+  it("a failure after the invoice is made finishes the draft and makes no second invoice", async () => {
+    await live();
+    let s = fake({ finalize: failing(503) });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      outcome: "invoice_created",
+    });
+    s = fake();
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      "POST /v1/invoices/in_inv1/finalize",
+    ]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("a resumed invoice that is already open is not finalized again", async () => {
+    await live();
+    fake({ finalize: failing(503) });
+    await send(closed, 5);
+    const s = fake({ status: "open" });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([`GET ${SUBS}`, "GET /v1/invoices/in_inv1"]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("401, 403, 409, 429, 5xx and network errors are retried; other 4xx are logged and the 200 stands", async () => {
+    for (const [status, answer] of [
+      [401, 502],
+      [403, 502],
+      [409, 503],
+      [429, 502],
+      [500, 502],
+      [503, 502],
+      [400, 200],
+      [402, 200],
+      [404, 200],
+    ] as const) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+        db.prepare("DELETE FROM overage"),
+      ]);
+      await live();
+      fake({ item: failing(status) });
+      const r = await send(closed, 5);
+      expect([status, r.status]).toEqual([status, answer]);
+      expect(await outcomeOf()).toBe("overage_failed");
+    }
+    await db.batch([
+      db.prepare("DELETE FROM tiers"),
+      db.prepare("DELETE FROM usage"),
+      db.prepare("DELETE FROM overage"),
+    ]);
+    await live();
+    fake({
+      item: () => {
+        throw new TypeError("network");
+      },
+    });
+    expect((await send(closed, 5)).status).toBe(502);
+  });
+
+  it("a permanent failure is tried again by the next report", async () => {
+    await live();
+    fake({ item: failing(400) });
+    expect((await send(closed, 5)).status).toBe(200);
+    const s = fake();
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("POST /v1/invoiceitems");
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("a monthly subscription is untouched by overage (its quantity follows the count)", async () => {
+    await live();
+    const s = fakeStripe((c) =>
+      c.method === "GET" && c.path === SUBS
+        ? Response.json({
+            id: SUB,
+            status: "active",
+            items: {
+              data: [
+                {
+                  id: "si_itemA",
+                  quantity: 1,
+                  price: {
+                    id: "price_team1",
+                    recurring: { interval: "month" },
+                  },
+                },
+              ],
+            },
+          })
+        : Response.json({ id: "si_itemA" }),
+    );
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "POST /v1/subscription_items/si_itemA",
+    ]);
+    expect(await overageRow()).toBeNull();
+  });
+
+  it("a yearly price that is not this tier's, a monthly interval, or an unset yearly price is left alone", async () => {
+    await live();
+    for (const [sub, e] of [
+      [{ price: "price_businessY1" }, yEnv()],
+      [{ price: "price_other" }, yEnv()],
+      [{}, baseEnv()],
+    ] as const) {
+      const s = fake({ sub });
+      expect((await call(report(closed, 5), e)).status).toBe(200);
+      expect(paths(s)).toEqual([`GET ${SUBS}`]);
+      expect(await outcomeOf()).toBe("not_monthly");
+    }
+    expect(await overageRow()).toBeNull();
+  });
+
+  it("the open month, and trial, lapsed, suspended and Solo rows, make no Stripe call", async () => {
+    await live();
+    let s = fake();
+    expect((await send(shift(0), 9)).status).toBe(200);
+    expect(s.calls).toEqual([]);
+    for (const [tier, status] of [
+      ["trial", "active"],
+      ["solo", "active"],
+      ["team", "lapsed"],
+      ["team", "suspended"],
+    ] as const) {
+      await db.batch([
+        db.prepare("DELETE FROM tiers"),
+        db.prepare("DELETE FROM usage"),
+      ]);
+      await live(tier, status);
+      s = fake();
+      expect((await send(closed, 9)).status).toBe(200);
+      expect(s.calls).toEqual([]);
+    }
+    expect(await overageRow()).toBeNull();
+  });
+});
+
+describe("two plans sharing a price id fail closed (#2235)", () => {
+  it("pricesCollide ignores unset ids and finds a repeated one", () => {
+    const e = baseEnv();
+    expect(pricesCollide(e)).toBe(false);
+    expect(
+      pricesCollide({ ...e, STRIPE_PRICE_TEAM_YEARLY: "price_team1" }),
+    ).toBe(true);
+    expect(
+      pricesCollide({
+        ...e,
+        STRIPE_PRICE_TEAM_YEARLY: "price_y",
+        STRIPE_PRICE_BUSINESS_YEARLY: "price_y",
+      }),
+    ).toBe(true);
+  });
+
+  it("the gate and webhook routes answer 500 config; /health still answers", async () => {
+    const bad: Env = { ...baseEnv(), STRIPE_PRICE_BUSINESS: "price_team1" };
+    const s = fakeStripe();
+    const r = await call(req("/checkout", { install: A, plan: "team" }), bad);
+    expect([r.status, await r.json()]).toEqual([500, { error: "config" }]);
+    const w = await billing.fetch(
+      new Request(`${ORIGIN}/stripe/webhook`, {
+        method: "POST",
+        headers: { "cf-connecting-ip": "1.2.3.4" },
+        body: "{}",
+      }) as Parameters<typeof billing.fetch>[0],
+      bad,
+    );
+    expect(w.status).toBe(500);
     expect(s.calls).toEqual([]);
   });
 });
