@@ -54,6 +54,25 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.166.0 (#2263): the pick answer's passkey challenge, and the ten
+    // passkey routes (browser session only, so deny-only like the bus writes).
+    ...[
+      "artifact comments answer challenge [session]",
+      "artifact comments answer challenge [pat]",
+      "org GET /api/v1/passkeys [session]",
+      "org POST /api/v1/passkeys/register/begin [session]",
+      "org POST /api/v1/passkeys/register/challenge [session]",
+      "org POST /api/v1/passkeys/register/finish [session]",
+      "org POST /api/v1/passkeys/:id/challenge [session]",
+      "org DELETE /api/v1/passkeys/:id [session]",
+      "org POST /api/v1/passkeys/:id/cancel-removal [session]",
+      "org GET /api/v1/passkeys/settings [session]",
+      "org PATCH /api/v1/passkeys/settings [session]",
+      "org POST /api/v1/passkeys/settings/challenge [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",

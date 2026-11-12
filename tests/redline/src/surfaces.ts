@@ -349,6 +349,28 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
   // #1372: offered only while the bus is on; never on a hosted install.
   "tool:bus_role_propose":
     "bus-off: the tool isn't offered on a hosted install (the bus is off until #1299)",
+  // #2263: passkeys. Every handler refuses anything but a browser session
+  // (routes/passkeys.ts member() calls interactiveSession).
+  "GET /api/v1/passkeys":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/register/begin":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/register/challenge":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/register/finish":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/:id/challenge":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "DELETE /api/v1/passkeys/:id":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/:id/cancel-removal":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "GET /api/v1/passkeys/settings":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "PATCH /api/v1/passkeys/settings":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  "POST /api/v1/passkeys/settings/challenge":
+    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
   // Self-serve billing (hosted only): an allowed caller's request reaches
   // billing (a Stripe session or a usage report), so no success leg runs
   // live. A at B is deny-only.
@@ -393,6 +415,17 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "GET /bus/reach/confirm",
   "POST /bus/reach/confirm/view",
   "POST /bus/reach/confirm",
+  // #2263: passkeys, browser sessions only.
+  "GET /api/v1/passkeys",
+  "POST /api/v1/passkeys/register/begin",
+  "POST /api/v1/passkeys/register/challenge",
+  "POST /api/v1/passkeys/register/finish",
+  "POST /api/v1/passkeys/:id/challenge",
+  "DELETE /api/v1/passkeys/:id",
+  "POST /api/v1/passkeys/:id/cancel-removal",
+  "GET /api/v1/passkeys/settings",
+  "PATCH /api/v1/passkeys/settings",
+  "POST /api/v1/passkeys/settings/challenge",
   // Hosted billing: Checkout, Portal and the usage report open Stripe or
   // reach billing only for a person in a browser session (billing.ts
   // requireBillingManager), so a hook-minted session is 404 here.
@@ -413,6 +446,18 @@ const REACH_D = "reach REST (#1346)";
 const REACH_GATE_TESTS = "apps/server/test/bus/bus.billing-gate.test.ts";
 const REACH_GATE_D = "role reach for a plan-capped member under %s";
 const PROPOSAL_TESTS = "apps/server/test/bus/roles.proposals.test.ts";
+const PASSKEY_TESTS: readonly Citation[] = [
+  {
+    file: "apps/server/test/passkeys.test.ts",
+    describe: "registering a passkey",
+    test: "needs a fresh re-auth, in a browser session",
+  },
+  {
+    file: "apps/server/test/passkeys.test.ts",
+    describe: "the passkey settings",
+    test: "a token cannot read or change them",
+  },
+];
 const PROPOSAL_D = "role proposals over MCP (#1372)";
 
 /**
@@ -724,6 +769,46 @@ export const DROPPED: Readonly<
   "org POST /api/v1/billing/usage": {
     why: "interactive-only",
     coveredBy: [INSTANCE, BILLING_AUTHZ],
+  },
+  "org GET /api/v1/passkeys": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/register/begin": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/register/challenge": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/register/finish": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/:id/challenge": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org DELETE /api/v1/passkeys/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/:id/cancel-removal": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org GET /api/v1/passkeys/settings": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org PATCH /api/v1/passkeys/settings": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  "org POST /api/v1/passkeys/settings/challenge": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
   },
   "org DELETE /api/v1/spaces/:id/mappings/:groupId": {
     why: "real-only",
