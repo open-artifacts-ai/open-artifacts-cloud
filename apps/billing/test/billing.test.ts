@@ -1211,26 +1211,51 @@ describe("overageDue in the tier answer (#2246)", () => {
     );
     return (await r.json()) as Record<string, unknown>;
   };
-  const put = (failed: number | null, paid: number | null) =>
+  const put = (
+    month: string,
+    o: {
+      failed?: number | null;
+      paid?: number | null;
+      voided?: number | null;
+      due?: number | null;
+      install?: string;
+    },
+  ) =>
     db
       .prepare(
-        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, invoice_id, outcome, failed_at, paid_at, payment_attempts, created_at, updated_at) VALUES (?1, '2026-10', 3, 5, 2, 1000, 'in_x', 'invoiced', ?2, ?3, 1, 0, 0)",
+        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, invoice_id, outcome, failed_at, paid_at, voided_at, amount_due, payment_attempts, created_at, updated_at) VALUES (?1, ?2, 3, 5, 2, 1000, 'in_x', 'invoiced', ?3, ?4, ?5, ?6, 1, 0, 0)",
       )
-      .bind(A, failed, paid)
+      .bind(
+        o.install ?? A,
+        month,
+        o.failed ?? null,
+        o.paid ?? null,
+        o.voided ?? null,
+        o.due ?? null,
+      )
       .run();
 
-  it("is null with no failure; a failed unpaid invoice shows its month and amount and leaves the plan alone; a later payment clears it", async () => {
+  it("is null with no failure; failed unpaid invoices show the total of their own amounts and the months, the plan untouched; paid or voided clears one", async () => {
     await seed([{ install: A, tier: "team" }]);
     expect(await ask()).toMatchObject({ overageDue: null });
-    await put(5000, null);
-    const due = await ask();
-    expect(due).toMatchObject({
+    await put("2026-09", { failed: 5000, due: 2160 });
+    await put("2026-10", { failed: 5000 });
+    expect(await ask()).toMatchObject({
       tier: "team",
       status: "active",
       graceUntil: null,
-      overageDue: { month: "2026-10", amountCents: 2000 },
+      // 2026-09 uses its invoice's amount_due; 2026-10 falls back to 2 x $10.
+      overageDue: { amountCents: 4160, months: ["2026-09", "2026-10"] },
     });
-    await db.prepare("UPDATE overage SET paid_at = 6000").run();
+    await db
+      .prepare("UPDATE overage SET paid_at = 6000 WHERE month = '2026-09'")
+      .run();
+    expect(await ask()).toMatchObject({
+      overageDue: { amountCents: 2000, months: ["2026-10"] },
+    });
+    await db
+      .prepare("UPDATE overage SET voided_at = 6000 WHERE month = '2026-10'")
+      .run();
     expect(await ask()).toMatchObject({ tier: "team", overageDue: null });
   });
 
@@ -1239,12 +1264,7 @@ describe("overageDue in the tier answer (#2246)", () => {
       { install: A, tier: "team" },
       { install: B, tier: "team" },
     ]);
-    await db
-      .prepare(
-        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, outcome, failed_at, created_at, updated_at) VALUES (?1, '2026-10', 3, 5, 2, 1000, 'invoiced', 5000, 0, 0)",
-      )
-      .bind(B)
-      .run();
+    await put("2026-10", { failed: 5000, install: B });
     expect(await ask()).toMatchObject({ overageDue: null });
   });
 });

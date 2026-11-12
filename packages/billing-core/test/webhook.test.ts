@@ -3427,6 +3427,41 @@ describe("overage invoice payment state is recorded on the overage row (#2246)",
     expect(await planOf()).toEqual(before);
   });
 
+  it("voided and marked_uncollectible set voided_at; payment_failed stores the invoice's amount_due", async () => {
+    await put();
+    await ownSub(A);
+    const before = await planOf();
+    const failed = event(
+      "invoice.payment_failed",
+      paidInv("in_ovg1", { amount_due: 2160 }),
+    );
+    await deliver(failed);
+    const amount = () =>
+      db
+        .prepare(
+          "SELECT amount_due, voided_at FROM overage WHERE install_id = ?1",
+        )
+        .bind(A)
+        .first();
+    expect(await amount()).toEqual({ amount_due: 2160, voided_at: null });
+    const v = event("invoice.voided", paidInv());
+    expect((await deliver(v)).status).toBe(200);
+    expect(await amount()).toMatchObject({ voided_at: v.created * 1000 });
+    await db.prepare("UPDATE overage SET voided_at = NULL").run();
+    const u = event("invoice.marked_uncollectible", paidInv());
+    await deliver(u);
+    expect(await amount()).toMatchObject({ voided_at: u.created * 1000 });
+    expect(await planOf()).toEqual(before);
+  });
+
+  it("voided and marked_uncollectible of a subscription invoice are ignored", async () => {
+    await ownSub(A);
+    const before = await planOf();
+    await deliver(event("invoice.voided", inv()));
+    await deliver(event("invoice.marked_uncollectible", inv()));
+    expect(await planOf()).toEqual(before);
+  });
+
   it("an event for another invoice, another install's row, or an unknown customer records nothing", async () => {
     await put();
     await deliver(event("invoice.payment_failed", paidInv("in_other")));

@@ -183,6 +183,8 @@ describe("migrations", () => {
       "usage ADD COLUMN retried_at INTEGER",
       "overage ADD COLUMN paid_at INTEGER",
       "overage ADD COLUMN failed_at INTEGER",
+      "overage ADD COLUMN voided_at INTEGER",
+      "overage ADD COLUMN amount_due INTEGER",
       "overage ADD COLUMN payment_attempts INTEGER NOT NULL DEFAULT 0",
     ])
       expect(sql).toContain(`ALTER TABLE ${col};`);
@@ -262,7 +264,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 96 KB per env", () => {
+  it("wrangler deploy --dry-run is under 104 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -273,8 +275,9 @@ describe("bundle", () => {
       // 50 KB until Solo (#1568) added the trial, upgrade and cancel paths;
       // 64 KB until the staging test clocks (the clock call and its gate);
       // 72 KB until per-creator quantity (#2123: the usage apply path);
-      // 80 KB until the yearly overage invoice (#2235).
-      expect(bytes).toBeLessThan(96 * 1024);
+      // 80 KB until the yearly overage invoice (#2235);
+      // 96 KB until the cron retry and overage payment state (#2210, #2246).
+      expect(bytes).toBeLessThan(104 * 1024);
     }
   });
 });

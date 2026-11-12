@@ -156,20 +156,30 @@ const yearlyOn = (env: Env) => {
   );
 };
 
-/** The newest unpaid, failed overage invoice: its month and amount. */
-export type OverageDue = { month: string; amountCents: number };
+/**
+ * Every yearly overage invoice whose payment failed and is still unpaid
+ * (not paid, voided or marked uncollectible since): the total due in cents
+ * (each invoice's own amount_due, tax and discounts included) and the months.
+ */
+export type OverageDue = { amountCents: number; months: string[] };
 
 const OVERAGE_DUE_SQL =
-  "SELECT month, quantity * unit_amount AS amount FROM overage WHERE install_id = ?1 AND failed_at IS NOT NULL AND (paid_at IS NULL OR paid_at < failed_at) ORDER BY month DESC LIMIT 1";
+  "SELECT month, coalesce(amount_due, quantity * unit_amount) AS amount FROM overage WHERE install_id = ?1 AND failed_at IS NOT NULL AND failed_at > coalesce(paid_at, 0) AND failed_at > coalesce(voided_at, 0) ORDER BY month";
 async function overageDueOf(
   db: D1Database,
   install: string,
 ): Promise<OverageDue | null> {
-  const r = await db
-    .prepare(OVERAGE_DUE_SQL)
-    .bind(install)
-    .first<{ month: string; amount: number }>();
-  return r ? { month: r.month, amountCents: r.amount } : null;
+  const rows = (
+    await db
+      .prepare(OVERAGE_DUE_SQL)
+      .bind(install)
+      .all<{ month: string; amount: number }>()
+  ).results;
+  if (rows.length === 0) return null;
+  return {
+    amountCents: rows.reduce((n, r) => n + r.amount, 0),
+    months: rows.map((r) => r.month),
+  };
 }
 
 /** What an install sees: no Stripe ids, ever. */
@@ -1163,7 +1173,7 @@ const OVERAGE_STEP_SQL =
   "UPDATE overage SET item_id = coalesce(?3, item_id), invoice_id = coalesce(?4, invoice_id), outcome = ?5, updated_at = ?6 WHERE install_id = ?1 AND month = ?2";
 
 const OVERAGE_RESET_SQL =
-  "UPDATE overage SET item_id = NULL, invoice_id = NULL, outcome = 'pending', generation = generation + 1, updated_at = ?3 WHERE install_id = ?1 AND month = ?2";
+  "UPDATE overage SET item_id = NULL, invoice_id = NULL, outcome = 'pending', generation = generation + 1, failed_at = NULL, paid_at = NULL, voided_at = NULL, amount_due = NULL, payment_attempts = 0, updated_at = ?3 WHERE install_id = ?1 AND month = ?2";
 
 /** "2026-10" -> "October 2026". */
 const monthLabel = (month: string) =>
@@ -1408,6 +1418,7 @@ async function applyQuantity(
   month: string,
   count: number,
   now: number,
+  force = false,
 ): Promise<Response | null> {
   if (month >= monthOf(now)) return null;
   const db = env.BILLING_DB;
@@ -1423,6 +1434,7 @@ async function applyQuantity(
     later: string | null;
   }>();
   if (
+    !force &&
     state?.applied_quantity === quantity &&
     (state.apply_outcome === "updated" || state.apply_outcome === "unchanged")
   ) {
@@ -1436,6 +1448,11 @@ async function applyQuantity(
     .bind(install, month)
     .first();
   if (billed) {
+    // Billed: the month leaves the cron's retry set.
+    await db
+      .prepare(USAGE_OUTCOME_SQL)
+      .bind(install, month, "overage_invoiced")
+      .run();
     console.log("billing usage overage repeat", install);
     return null;
   }
@@ -1548,19 +1565,29 @@ async function usage(
 
 /** Closed months the daily cron re-tries per run (oldest last try first). */
 export const RETRY_BATCH = 50;
-/** A month closed longer ago than this is no longer retried (logged instead). */
+/** Only months in the last 90 days are scanned. */
 export const RETRY_MAX_AGE_MS = 90 * 86_400_000;
 /** A month still unapplied this long after it closed is logged at error level. */
 export const RETRY_ALERT_AGE_MS = 3 * 86_400_000;
+/** A report received within this long is left to the live /usage apply. */
+export const RETRY_QUIET_MS = 24 * 3_600_000;
 
-// Unapplied: a month the instance sent once and billing never applied: a
-// failed or never-tried quantity, or a yearly overage that is pending, failed
-// or had no card. Months with usage.count NULL were never stored whole.
-const UNAPPLIED_WHERE =
-  "month < ?1 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome IN ('failed', 'overage_failed', 'no_payment_method'))";
+// Unapplied: a month the instance sent once and billing never applied.
+// A yearly overage that failed or had no card (its own outcomes) is per
+// month: the invoices are independent. A monthly quantity is a "latest
+// wins" setting, so only the install's latest closed month with a stored
+// report is retried (outcome NULL or failed); older ones are 'superseded'.
+// Months with usage.count NULL were never stored whole. Binds: ?1 the
+// current month, ?2 the oldest month scanned, ?3 the latest received_at.
+const LATEST_CLOSED =
+  "SELECT max(l.month) FROM usage l WHERE l.install_id = usage.install_id AND l.month < ?1 AND l.count IS NOT NULL";
+const UNAPPLIED_WHERE = `month < ?1 AND month >= ?2 AND received_at <= ?3 AND count IS NOT NULL AND (apply_outcome IN ('overage_failed', 'no_payment_method') OR ((apply_outcome IS NULL OR apply_outcome = 'failed') AND month = (${LATEST_CLOSED})))`;
 const UNAPPLIED_SQL = `SELECT install_id, month, count FROM usage WHERE ${UNAPPLIED_WHERE} ORDER BY coalesce(retried_at, 0), month, install_id`;
+const SUPERSEDE_SQL = `UPDATE usage SET apply_outcome = 'superseded' WHERE month < ?1 AND month >= ?2 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome = 'failed') AND month < (${LATEST_CLOSED})`;
 const RETRIED_SQL =
   "UPDATE usage SET retried_at = ?3 WHERE install_id = ?1 AND month = ?2";
+const LATEST_APPLIED_SQL =
+  "SELECT month, applied_quantity FROM usage WHERE install_id = ?1 AND applied_quantity IS NOT NULL ORDER BY month DESC LIMIT 1";
 
 /** The first instant after a closed month, epoch ms. */
 const closedAt = (month: string) => {
@@ -1569,51 +1596,73 @@ const closedAt = (month: string) => {
 };
 
 /**
- * The daily cron's retry: each unapplied closed month goes back through
- * applyQuantity (which hands yearly installs to billOverage) with the same
- * rules and idempotency as a report. At most RETRY_BATCH per run, the one
- * tried longest ago first (then oldest month, then install id), so a month
- * that keeps failing cannot starve the others. Months closed more than 90
- * days ago are skipped and logged. A month unapplied more than 3 days after
- * it closed is logged at error level.
+ * The daily cron's retry: each unapplied closed month of the last 90 days
+ * goes back through applyQuantity (which hands yearly installs to
+ * billOverage) with the same rules and idempotency as a report. Reports
+ * received in the last 24 hours are left to the live apply. At most
+ * RETRY_BATCH per run, the one tried longest ago first (then oldest month,
+ * then install id), so a month that keeps failing cannot starve the others.
+ * After a Stripe write, if a later month got applied meanwhile (a live
+ * report), that month's quantity is set again so the latest report wins. A
+ * month unapplied more than 3 days after it closed is logged at error level.
  */
 export async function retryUnapplied(env: Env, now: number): Promise<void> {
   const db = env.BILLING_DB;
+  const binds = [
+    monthOf(now),
+    monthOf(now - RETRY_MAX_AGE_MS),
+    now - RETRY_QUIET_MS,
+  ];
+  await db.prepare(SUPERSEDE_SQL).bind(binds[0], binds[1]).run();
   const rows = (
-    await db.prepare(UNAPPLIED_SQL).bind(monthOf(now)).all<{
-      install_id: string;
-      month: string;
-      count: number;
-    }>()
+    await db
+      .prepare(UNAPPLIED_SQL)
+      .bind(...binds)
+      .all<{
+        install_id: string;
+        month: string;
+        count: number;
+      }>()
   ).results;
   let tried = 0;
   for (const r of rows) {
-    const age = now - closedAt(r.month);
-    if (age > RETRY_MAX_AGE_MS) {
-      console.log("billing usage retry too_old", r.install_id);
-      continue;
-    }
-    if (tried >= RETRY_BATCH) continue;
+    if (tried >= RETRY_BATCH) break;
     tried += 1;
     try {
       await db.prepare(RETRIED_SQL).bind(r.install_id, r.month, now).run();
       await applyQuantity(env, r.install_id, r.month, r.count, now);
+      const latest = await db
+        .prepare(LATEST_APPLIED_SQL)
+        .bind(r.install_id)
+        .first<{ month: string; applied_quantity: number }>();
+      if (latest && latest.month > r.month) {
+        console.log("billing usage retry reapply", r.install_id);
+        await applyQuantity(
+          env,
+          r.install_id,
+          latest.month,
+          latest.applied_quantity,
+          now,
+          true,
+        );
+      }
     } catch {
       console.error("billing usage retry error", r.install_id);
     }
   }
   // After the tries: what is still unapplied three days after its month closed.
   const still = (
-    await db.prepare(UNAPPLIED_SQL).bind(monthOf(now)).all<{
-      install_id: string;
-      month: string;
-    }>()
+    await db
+      .prepare(UNAPPLIED_SQL)
+      .bind(...binds)
+      .all<{
+        install_id: string;
+        month: string;
+      }>()
   ).results;
-  for (const r of still) {
-    const age = now - closedAt(r.month);
-    if (age > RETRY_ALERT_AGE_MS && age <= RETRY_MAX_AGE_MS)
+  for (const r of still)
+    if (now - closedAt(r.month) > RETRY_ALERT_AGE_MS)
       console.error("billing usage unapplied", r.install_id);
-  }
   if (tried > 0) console.log("billing usage retry", tried);
 }
 

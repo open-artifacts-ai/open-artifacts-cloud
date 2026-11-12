@@ -97,6 +97,28 @@ describe("billing-db.ts", () => {
     );
   });
 
+  it("0007 marks closed months stored without an outcome 'legacy', so the cron never bills old reports (#2210)", async () => {
+    const f = fakeDb();
+    await go(f, { migrations: migrations.slice(0, 6) });
+    f.sqlite.exec(
+      "INSERT INTO usage (install_id, month, creators_json, count, received_at) VALUES ('i1', '2020-01', '[]', 3, 1), ('i1', '2999-01', '[]', 3, 1)",
+    );
+    f.sqlite.exec(
+      "INSERT INTO usage (install_id, month, creators_json, count, received_at, apply_outcome) VALUES ('i1', '2020-02', '[]', 3, 1, 'failed')",
+    );
+    const r = await go(f);
+    expect(r.err).toBe("");
+    expect(
+      f.sqlite
+        .prepare("SELECT month, apply_outcome AS o FROM usage ORDER BY month")
+        .all(),
+    ).toEqual([
+      { month: "2020-01", o: "legacy" },
+      { month: "2020-02", o: "failed" },
+      { month: "2999-01", o: null },
+    ]);
+  });
+
   it("a rerun on a migrated database changes nothing", async () => {
     const f = fakeDb();
     await go(f);
