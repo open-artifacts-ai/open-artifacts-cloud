@@ -67,4 +67,11 @@ jobs:
       tag: ${{ inputs.tag }}
       t19_public_branch: ${{ inputs.public_branch }}
       t19_public_sha: ${{ inputs.public_sha }}
-    # No secrets passed, as in the nightly.
+    # By name, never inherit: only the four secrets the callee declares
+    # (on.workflow_call.secrets). Undeclared, a called run's jobs got none
+    # (t19-dry-run 43183209806); the t19 job references none of them.
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      REDLINE_PROD_R2_TOKEN: ${{ secrets.REDLINE_PROD_R2_TOKEN }}
+      REDLINE_PROD_SCRIPTS_TOKEN: ${{ secrets.REDLINE_PROD_SCRIPTS_TOKEN }}
+      REDLINE_STG_PROVISIONER_TOKEN: ${{ secrets.REDLINE_STG_PROVISIONER_TOKEN }}
