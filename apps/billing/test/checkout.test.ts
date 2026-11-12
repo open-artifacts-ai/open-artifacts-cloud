@@ -63,6 +63,7 @@ type StripeCall = {
   key: string | null;
   auth: string | null;
   form: Record<string, string>;
+  search: string;
 };
 
 type Override = (
@@ -94,6 +95,7 @@ function fakeStripe(override?: Override) {
         key: h.get("idempotency-key"),
         auth: h.get("authorization"),
         form: Object.fromEntries(new URLSearchParams(String(init?.body))),
+        search: url.search,
       };
       calls.push(c);
       const o = await override?.(c);
@@ -848,6 +850,7 @@ describe("POST /portal", () => {
         method: "POST",
         path: PORTAL,
         key: `portal-${A}-${ts}`,
+        search: "",
         auth: `Bearer ${SECRET}`,
         form: {
           customer: "cus_existingA",
@@ -2187,26 +2190,78 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
         ],
       },
     });
+  /**
+   * A small Stripe that remembers invoices and items, so a retry can find
+   * what an earlier attempt made. `fail` maps "METHOD /path" to a status
+   * answered before any effect; with `lose` the effect happens and the
+   * answer is a 500 (the answer was lost).
+   */
+  type Ledger = {
+    n: number;
+    invoices: {
+      id: string;
+      status: string;
+      metadata: Record<string, string>;
+    }[];
+    items: { id: string; invoice: string; metadata: Record<string, string> }[];
+  };
+  const newLedger = (): Ledger => ({ n: 0, invoices: [], items: [] });
   type Opts = {
     sub?: Parameters<typeof subscription>[0];
-    item?: () => Response | undefined;
-    invoice?: () => Response | undefined;
-    finalize?: () => Response | undefined;
-    status?: string;
+    ledger?: Ledger;
+    fail?: Record<string, number>;
+    lose?: Record<string, boolean>;
   };
-  const fake = (o: Opts = {}) =>
-    fakeStripe((c) => {
-      if (c.method === "GET" && c.path === SUBS) return subscription(o.sub);
-      if (c.path === "/v1/invoiceitems")
-        return o.item?.() ?? Response.json({ id: "ii_item1" });
-      if (c.method === "POST" && c.path === "/v1/invoices")
-        return o.invoice?.() ?? Response.json({ id: "in_inv1" });
-      if (c.method === "GET" && c.path === "/v1/invoices/in_inv1")
-        return Response.json({ id: "in_inv1", status: o.status ?? "draft" });
-      if (c.path === "/v1/invoices/in_inv1/finalize")
-        return o.finalize?.() ?? Response.json({ id: "in_inv1" });
-      return undefined;
+  const metaOf = (form: Record<string, string>) => ({
+    kind: form["metadata[kind]"] ?? "",
+    install: form["metadata[install]"] ?? "",
+    month: form["metadata[month]"] ?? "",
+  });
+  const fake = (o: Opts = {}) => {
+    const L = o.ledger ?? newLedger();
+    const s = fakeStripe((c) => {
+      const key = `${c.method} ${c.path}`;
+      const bad = o.fail?.[key];
+      if (bad !== undefined)
+        return Response.json({ error: { type: "x" } }, { status: bad });
+      let out: Response | undefined;
+      if (key === `GET ${SUBS}`) return subscription(o.sub);
+      if (key === "POST /v1/invoices") {
+        const id = `in_inv${++L.n}`;
+        L.invoices.push({ id, status: "draft", metadata: metaOf(c.form) });
+        out = Response.json({ id });
+      } else if (key === "GET /v1/invoices") {
+        out = Response.json({
+          data: L.invoices.filter((i) => i.status === "draft"),
+        });
+      } else if (key === "POST /v1/invoiceitems") {
+        const id = `ii_item${++L.n}`;
+        L.items.push({
+          id,
+          invoice: c.form.invoice ?? "",
+          metadata: metaOf(c.form),
+        });
+        out = Response.json({ id });
+      } else if (key === "GET /v1/invoiceitems") {
+        const inv = new URLSearchParams(c.search).get("invoice");
+        out = Response.json({
+          data: L.items.filter((i) => i.invoice === inv),
+        });
+      } else {
+        const m = /^\/v1\/invoices\/(in_\w+)(\/finalize)?$/.exec(c.path);
+        const inv = L.invoices.find((i) => i.id === m?.[1]);
+        if (!m) return undefined;
+        if (!inv)
+          return Response.json({ error: { type: "x" } }, { status: 404 });
+        if (m[2]) inv.status = "open";
+        out = Response.json({ id: inv.id, status: inv.status });
+      }
+      return o.lose?.[key]
+        ? Response.json({ error: { type: "x" } }, { status: 500 })
+        : out;
     });
+    return Object.assign(s, { L });
+  };
   const paths = (s: { calls: { method: string; path: string }[] }) =>
     s.calls.map((c) => `${c.method} ${c.path}`);
   const overageRow = () =>
@@ -2225,10 +2280,19 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
         .bind(A, closed)
         .first<{ o: string; q: number | null }>()
     )?.o;
-  const failing = (status: number) => () =>
-    Response.json({ error: { type: "x" } }, { status });
+  /** The nth step write (1 = invoice recorded, 2 = item recorded) throws. */
+  const failStepWrite = (nth: number) => {
+    let n = 0;
+    const real = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+      if (sql.includes("coalesce(?3, item_id)") && ++n === nth)
+        throw new Error("d1 down");
+      return real(sql);
+    });
+  };
+  const FINALIZE = "POST /v1/invoices/in_inv1/finalize";
 
-  it("bills the extra creators at the monthly price: item, invoice, finalize", async () => {
+  it("bills the extra creators at the monthly price: draft invoice, its item, finalize", async () => {
     await live();
     const s = fake();
     const r = await send(closed, 5);
@@ -2238,31 +2302,36 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     ]);
     expect(paths(s)).toEqual([
       `GET ${SUBS}`,
-      "POST /v1/invoiceitems",
+      "GET /v1/invoices",
       "POST /v1/invoices",
-      "GET /v1/invoices/in_inv1".replace("GET", "POST") + "/finalize",
+      "GET /v1/invoiceitems",
+      "POST /v1/invoiceitems",
+      FINALIZE,
     ]);
-    expect(s.calls[1]?.form).toEqual({
+    const meta = {
+      "metadata[kind]": "overage",
+      "metadata[install]": A,
+      "metadata[month]": closed,
+    };
+    // The invoice takes no pending items; the item is attached to it.
+    expect(s.calls[2]?.form).toEqual({
       customer: "cus_existingA",
+      collection_method: "charge_automatically",
+      pending_invoice_items_behavior: "exclude",
+      ...meta,
+    });
+    expect(s.calls[4]?.form).toEqual({
+      customer: "cus_existingA",
+      invoice: "in_inv1",
       currency: "usd",
       unit_amount: "1000",
       quantity: "2",
       description: `Extra creators, ${label}: 2 × $10`,
-      "metadata[kind]": "overage",
-      "metadata[install]": A,
-      "metadata[month]": closed,
+      ...meta,
     });
-    expect(s.calls[2]?.form).toEqual({
-      customer: "cus_existingA",
-      collection_method: "charge_automatically",
-      pending_invoice_items_behavior: "include",
-      "metadata[kind]": "overage",
-      "metadata[install]": A,
-      "metadata[month]": closed,
-    });
-    expect(s.calls.slice(1).map((c) => c.key)).toEqual([
-      `ovg-item-${A}-${closed}`,
+    expect([2, 4, 5].map((i) => s.calls[i]?.key)).toEqual([
       `ovg-inv-${A}-${closed}`,
+      `ovg-item-${A}-${closed}`,
       `ovg-fin-${A}-${closed}`,
     ]);
     expect(await overageRow()).toEqual({
@@ -2270,7 +2339,7 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       creators: 5,
       quantity: 2,
       unit_amount: 1000,
-      item_id: "ii_item1",
+      item_id: "ii_item2",
       invoice_id: "in_inv1",
       outcome: "invoiced",
     });
@@ -2283,7 +2352,7 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     await live("business");
     const s = fake({ sub: { price: "price_businessY1", seats: 1 } });
     expect((await send(closed, 3)).status).toBe(200);
-    expect(s.calls[1]?.form).toMatchObject({
+    expect(s.calls[4]?.form).toMatchObject({
       unit_amount: "2500",
       quantity: "2",
       description: `Extra creators, ${label}: 2 × $25`,
@@ -2312,56 +2381,159 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     expect((await overageRow())?.quantity).toBe(2);
   });
 
-  it("a failure after the item resumes without a second item", async () => {
+  it("a failed invoice create leaves nothing; the retry makes the one invoice and item", async () => {
     await live();
-    let s = fake({ invoice: failing(500) });
+    const L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoices": 500 } });
     expect((await send(closed, 5)).status).toBe(502);
     expect(await overageRow()).toMatchObject({
-      item_id: "ii_item1",
       invoice_id: null,
-      outcome: "item_created",
+      item_id: null,
+      outcome: "pending",
     });
     expect(await outcomeOf()).toBe("overage_failed");
-    s = fake();
-    // The retry comes with another count: the item already made is what bills.
+    fake({ ledger: L });
     expect((await send(closed, 7)).status).toBe(200);
-    expect(paths(s)).toEqual([
-      `GET ${SUBS}`,
-      "POST /v1/invoices",
-      "POST /v1/invoices/in_inv1/finalize",
-    ]);
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    // The row keeps the quantity it first computed (5 - 3).
     expect(await overageRow()).toMatchObject({
       quantity: 2,
       outcome: "invoiced",
     });
   });
 
-  it("a failure after the invoice is made finishes the draft and makes no second invoice", async () => {
+  it("the invoice's answer is lost: the retry finds the draft and makes no second invoice", async () => {
     await live();
-    let s = fake({ finalize: failing(503) });
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoices": true } });
     expect((await send(closed, 5)).status).toBe(502);
+    expect(L.invoices).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({ invoice_id: null });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect(L.invoices).toHaveLength(1);
+    expect(L.items).toHaveLength(1);
     expect(await overageRow()).toMatchObject({
       invoice_id: "in_inv1",
+      outcome: "invoiced",
+    });
+  });
+
+  it("the item's answer is lost and the retry comes after the key expired: no second item", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoiceitems": true } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      item_id: null,
       outcome: "invoice_created",
     });
-    s = fake();
+    // This Stripe keeps no idempotency keys: the key has expired.
+    const s = fake({ ledger: L });
     expect((await send(closed, 5)).status).toBe(200);
     expect(paths(s)).toEqual([
       `GET ${SUBS}`,
       "GET /v1/invoices/in_inv1",
-      "POST /v1/invoices/in_inv1/finalize",
+      "GET /v1/invoiceitems",
+      FINALIZE,
     ]);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      item_id: "ii_item2",
+      outcome: "invoiced",
+    });
+  });
+
+  it("the D1 write that records the invoice fails: the retry finds the draft", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L });
+    failStepWrite(1);
+    expect((await send(closed, 5)).status).toBe(503);
+    vi.mocked(db.prepare).mockRestore();
+    expect(L.invoices).toHaveLength(1);
+    expect(L.items).toHaveLength(0);
+    expect(await overageRow()).toMatchObject({ invoice_id: null });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoices");
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
     expect((await overageRow())?.outcome).toBe("invoiced");
   });
 
-  it("a resumed invoice that is already open is not finalized again", async () => {
+  it("the D1 write that records the item fails: the retry finds the item", async () => {
     await live();
-    fake({ finalize: failing(503) });
-    await send(closed, 5);
-    const s = fake({ status: "open" });
+    const L = newLedger();
+    fake({ ledger: L });
+    failStepWrite(2);
+    expect((await send(closed, 5)).status).toBe(503);
+    vi.mocked(db.prepare).mockRestore();
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      item_id: null,
+    });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).not.toContain("POST /v1/invoiceitems");
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+    expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("a failed finalize is retried by finalizing the same draft", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv1",
+      outcome: "item_created",
+    });
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      FINALIZE,
+    ]);
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+  });
+
+  it("a finalize whose answer was lost is not finalized again", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { [FINALIZE]: true } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(L.invoices[0]?.status).toBe("open");
+    const s = fake({ ledger: L });
     expect((await send(closed, 5)).status).toBe(200);
     expect(paths(s)).toEqual([`GET ${SUBS}`, "GET /v1/invoices/in_inv1"]);
     expect((await overageRow())?.outcome).toBe("invoiced");
+  });
+
+  it("an invoice deleted in Stripe is made again, with its item, instead of leaving the row stuck", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    await send(closed, 5);
+    // The draft and its attached item are gone.
+    L.invoices.length = 0;
+    L.items.length = 0;
+    const s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("POST /v1/invoices");
+    expect(paths(s)).toContain("POST /v1/invoiceitems");
+    expect(L.invoices.map((i) => [i.id, i.status])).toEqual([
+      ["in_inv3", "open"],
+    ]);
+    expect(L.items).toHaveLength(1);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv3",
+      outcome: "invoiced",
+    });
   });
 
   it("401, 403, 409, 429, 5xx and network errors are retried; other 4xx are logged and the 200 stands", async () => {
@@ -2382,7 +2554,7 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
         db.prepare("DELETE FROM overage"),
       ]);
       await live();
-      fake({ item: failing(status) });
+      fake({ fail: { "POST /v1/invoices": status } });
       const r = await send(closed, 5);
       expect([status, r.status]).toEqual([status, answer]);
       expect(await outcomeOf()).toBe("overage_failed");
@@ -2393,21 +2565,22 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       db.prepare("DELETE FROM overage"),
     ]);
     await live();
-    fake({
-      item: () => {
-        throw new TypeError("network");
-      },
+    fakeStripe((c) => {
+      if (c.path === SUBS) return subscription();
+      throw new TypeError("network");
     });
     expect((await send(closed, 5)).status).toBe(502);
   });
 
   it("a permanent failure is tried again by the next report", async () => {
     await live();
-    fake({ item: failing(400) });
+    const L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoiceitems": 400 } });
     expect((await send(closed, 5)).status).toBe(200);
-    const s = fake();
+    expect(await outcomeOf()).toBe("overage_failed");
+    fake({ ledger: L });
     expect((await send(closed, 5)).status).toBe(200);
-    expect(paths(s)).toContain("POST /v1/invoiceitems");
+    expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
     expect((await overageRow())?.outcome).toBe("invoiced");
   });
 

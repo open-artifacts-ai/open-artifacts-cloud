@@ -50,6 +50,8 @@ import {
   createTestClock,
   expireCheckoutSession,
   finalizeInvoice,
+  findOverageInvoice,
+  findOverageItem,
   handleStripeWebhook,
   pruneStripeEvents,
   retrieveInvoiceStatus,
@@ -1108,6 +1110,9 @@ const OVERAGE_INSERT_SQL =
 const OVERAGE_STEP_SQL =
   "UPDATE overage SET item_id = coalesce(?3, item_id), invoice_id = coalesce(?4, invoice_id), outcome = ?5, updated_at = ?6 WHERE install_id = ?1 AND month = ?2";
 
+const OVERAGE_RESET_SQL =
+  "UPDATE overage SET item_id = NULL, invoice_id = NULL, outcome = 'pending', updated_at = ?3 WHERE install_id = ?1 AND month = ?2";
+
 /** "2026-10" -> "October 2026". */
 const monthLabel = (month: string) =>
   new Date(`${month}-01T00:00:00Z`).toLocaleString("en-US", {
@@ -1127,15 +1132,19 @@ type OverageRow = {
 
 /**
  * Yearly prepaid seats (#2235): a closed month with more creators than
- * seats bills the extra creators at the monthly price on a one-off invoice
- * (an invoice item, then an invoice that takes pending items, finalized).
+ * seats bills the extra creators at the monthly price on a one-off invoice:
+ * a draft invoice that takes no pending items, then its one item attached to
+ * it, then finalize. Nothing is swept in from, or into, another invoice.
+ * Seats are the subscription's quantity when the report arrives: a seat
+ * change between the month's close and the report uses the new count.
  * Once per (install, month): the overage row is written before the first
- * Stripe call and records each step, so a retry finishes the invoice and
- * never adds a second item, and an invoiced month is never billed again
- * whatever a later report counts. Each Stripe write is keyed per
- * (install, month, step). Failures are classified as applyQuantity's. The
- * invoice carries metadata.kind "overage" and no subscription, so the
- * webhook never lets it touch the plan.
+ * Stripe call and records each step (the invoice id before the item is
+ * made). A retry finds what a lost answer already made (the draft by its
+ * metadata, the item on the invoice) instead of relying on Stripe's 24-hour
+ * idempotency keys, so it never adds a second invoice or item. An invoiced
+ * month is never billed again whatever a later report counts. Failures are
+ * classified as applyQuantity's. The invoice carries metadata.kind
+ * "overage" and no subscription, so the webhook never lets it touch the plan.
  */
 async function billOverage(
   env: Env,
@@ -1175,64 +1184,76 @@ async function billOverage(
       .run();
   const { quantity, unit_amount: unit } = row;
   try {
-    if (!row.item_id) {
-      const itemId = await stripe(install, () =>
-        createOverageItem(
-          {
-            customerId,
-            install,
-            month,
-            quantity,
-            unitAmount: unit,
-            description: `Extra creators, ${monthLabel(month)}: ${quantity} × $${unit / 100}`,
-            idempotencyKey: `ovg-item-${install}-${month}`,
-          },
-          cfg,
-        ),
-      );
-      await step(itemId, null, "item_created");
-    }
     let invoiceId = row.invoice_id;
-    let draft = true;
-    if (!invoiceId) {
-      invoiceId = await stripe(install, () =>
-        createOverageInvoice(
-          {
-            customerId,
-            install,
-            month,
-            idempotencyKey: `ovg-inv-${install}-${month}`,
-          },
-          cfg,
-        ),
-      );
-      await step(null, invoiceId, "invoice_created");
-    } else {
-      // Resumed: finalize only a draft (an attempt whose answer was lost may
-      // have finalized it already).
+    let itemId = row.item_id;
+    if (invoiceId) {
+      // Resumed: only a draft can take the item and be finalized (an attempt
+      // whose answer was lost may have finalized it already).
       const id = invoiceId;
       const status = await stripe(install, () =>
         retrieveInvoiceStatus({ invoiceId: id }, cfg),
       );
       if (status === "missing") {
-        await db
-          .prepare(USAGE_OUTCOME_SQL)
-          .bind(install, month, "overage_failed")
-          .run();
+        // Deleted in Stripe: start over with a new draft. Its item was
+        // attached to it (never pending), so nothing is left to bill twice.
+        await db.prepare(OVERAGE_RESET_SQL).bind(install, month, now).run();
         console.error("billing usage overage invoice missing", install);
-        return null;
+        invoiceId = null;
+        itemId = null;
+      } else if (status !== "draft") {
+        await step(null, null, "invoiced");
+        return done("overage_invoiced");
       }
-      draft = status === "draft";
     }
-    if (draft) {
-      const id = invoiceId;
-      await stripe(install, () =>
-        finalizeInvoice(
-          { invoiceId: id, idempotencyKey: `ovg-fin-${install}-${month}` },
-          cfg,
-        ),
+    if (!invoiceId) {
+      const found = await stripe(install, () =>
+        findOverageInvoice({ customerId, install, month }, cfg),
       );
+      invoiceId =
+        found ??
+        (await stripe(install, () =>
+          createOverageInvoice(
+            {
+              customerId,
+              install,
+              month,
+              idempotencyKey: `ovg-inv-${install}-${month}`,
+            },
+            cfg,
+          ),
+        ));
+      // Recorded before the item is made, so a retry always knows the invoice.
+      await step(null, invoiceId, "invoice_created");
     }
+    const invoice = invoiceId;
+    if (!itemId) {
+      itemId =
+        (await stripe(install, () =>
+          findOverageItem({ invoiceId: invoice, month }, cfg),
+        )) ??
+        (await stripe(install, () =>
+          createOverageItem(
+            {
+              customerId,
+              invoiceId: invoice,
+              install,
+              month,
+              quantity,
+              unitAmount: unit,
+              description: `Extra creators, ${monthLabel(month)}: ${quantity} × $${unit / 100}`,
+              idempotencyKey: `ovg-item-${install}-${month}`,
+            },
+            cfg,
+          ),
+        ));
+      await step(itemId, null, "item_created");
+    }
+    await stripe(install, () =>
+      finalizeInvoice(
+        { invoiceId: invoice, idempotencyKey: `ovg-fin-${install}-${month}` },
+        cfg,
+      ),
+    );
     await step(null, null, "invoiced");
   } catch (e) {
     if (!(e instanceof StripeFailure)) throw e;

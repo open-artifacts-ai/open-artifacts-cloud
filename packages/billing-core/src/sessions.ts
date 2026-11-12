@@ -576,6 +576,8 @@ const idOf = (
 
 export interface OverageItemInput {
   customerId: string;
+  /** The draft overage invoice the item is attached to (never a pending item). */
+  invoiceId: string;
   install: string;
   /** The closed month, YYYY-MM. */
   month: string;
@@ -598,14 +600,16 @@ function overageMeta(install: string, month: string, p: string) {
 }
 
 /**
- * A pending invoice item on the customer for the extra creators: no
- * subscription, so it can only land on a one-off invoice. Answers its id.
+ * An invoice item for the extra creators, attached to the given draft
+ * invoice (so it is never a pending item another invoice could sweep up).
+ * Answers its id.
  */
 export async function createOverageItem(
   input: OverageItemInput,
   cfg: StripeConfig,
 ): Promise<string> {
   check(CUSTOMER, "customerId", input.customerId);
+  check(INVOICE, "invoiceId", input.invoiceId);
   check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
   if (
     !Number.isInteger(input.quantity) ||
@@ -620,6 +624,7 @@ export async function createOverageItem(
     "/v1/invoiceitems",
     {
       customer: input.customerId,
+      invoice: input.invoiceId,
       currency: "usd",
       unit_amount: String(input.unitAmount),
       quantity: String(input.quantity),
@@ -632,8 +637,8 @@ export async function createOverageItem(
 }
 
 /**
- * A draft one-off invoice that takes the customer's pending items,
- * charged automatically. Answers its id.
+ * A draft one-off invoice, charged automatically, that takes no pending
+ * items (its one item is attached to it). Answers its id.
  */
 export async function createOverageInvoice(
   input: {
@@ -652,12 +657,84 @@ export async function createOverageInvoice(
     {
       customer: input.customerId,
       collection_method: "charge_automatically",
-      pending_invoice_items_behavior: "include",
+      pending_invoice_items_behavior: "exclude",
       ...overageMeta(input.install, input.month, "metadata"),
     },
     input.idempotencyKey,
   );
   return idOf(out, INVOICE, status);
+}
+
+const metaOf = (o: unknown): Record<string, unknown> =>
+  typeof o === "object" && o !== null && "metadata" in o
+    ? ((o as { metadata?: Record<string, unknown> }).metadata ?? {})
+    : {};
+
+/**
+ * The draft overage invoice already made for (install, month), if any: how a
+ * retry finds an invoice whose answer was lost, without relying on an
+ * idempotency key that Stripe forgets after 24 hours. Reads the customer's
+ * drafts (the first 100).
+ */
+export async function findOverageInvoice(
+  input: { customerId: string; install: string; month: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const customer = check(CUSTOMER, "customerId", input.customerId);
+  overageMeta(input.install, input.month, "metadata");
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoices?customer=${customer}&status=draft&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  for (const inv of out.data as unknown[]) {
+    const m = metaOf(inv);
+    const id = (inv as { id?: unknown }).id;
+    if (
+      m.kind === "overage" &&
+      m.install === input.install &&
+      m.month === input.month &&
+      typeof id === "string" &&
+      INVOICE.test(id)
+    )
+      return id;
+  }
+  return null;
+}
+
+/**
+ * The overage item already attached to an invoice for `month`, if any (a
+ * retry whose item answer was lost reuses it instead of adding a second).
+ */
+export async function findOverageItem(
+  input: { invoiceId: string; month: string },
+  cfg: StripeConfig,
+): Promise<string | null> {
+  const invoice = check(INVOICE, "invoiceId", input.invoiceId);
+  check(MONTH_KEY, "month", input.month);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoiceitems?invoice=${invoice}&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  for (const it of out.data as unknown[]) {
+    const m = metaOf(it);
+    const id = (it as { id?: unknown }).id;
+    if (
+      m.kind === "overage" &&
+      m.month === input.month &&
+      typeof id === "string" &&
+      INVOICE_ITEM.test(id)
+    )
+      return id;
+  }
+  return null;
 }
 
 /** An invoice's status (draft, open, paid, ...), or "missing" for a 404. */

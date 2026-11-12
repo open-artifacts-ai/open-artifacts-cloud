@@ -18,6 +18,8 @@ export {
   createTestClock,
   expireCheckoutSession,
   finalizeInvoice,
+  findOverageInvoice,
+  findOverageItem,
   type OverageItemInput,
   type PortalInput,
   type QuantityInput,
