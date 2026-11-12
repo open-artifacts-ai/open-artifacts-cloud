@@ -36,6 +36,7 @@ import {
   runManage,
 } from "../../src/manage.js";
 import {
+  CLOSE_AUDIT_FAILED,
   CLOSE_SOCKETS_FAILED,
   CLOSE_SOCKETS_JOB,
   closeInstallSockets,
@@ -105,6 +106,11 @@ async function manage(
   );
   return { id, error, log: r.log, job: w.job(id) };
 }
+
+const closeAudit = () =>
+  w.all(
+    "SELECT actor_kind, action, install_id, job_id, outcome, code FROM admin_audit WHERE action = 'suspend.close_sockets'",
+  );
 
 const plain = (id: string, name: string) =>
   (
@@ -738,6 +744,16 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         hosts: [`paused:${s.installId}`, `paused:${s.installId}`],
       },
     ]);
+    expect(closeAudit()).toEqual([
+      {
+        actor_kind: "system",
+        action: "suspend.close_sockets",
+        install_id: s.installId,
+        job_id: r.id,
+        outcome: "ok",
+        code: "ok",
+      },
+    ]);
     // Resume needs nothing new: no call.
     const n = w.fake.scheduledCalls.length;
     expect((await manage("resume", s.installId)).error).toBeNull();
@@ -766,6 +782,9 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         suspended_at: expect.any(Number),
       });
       expect(w.status(s.installId)?.state).toBe("suspended");
+      expect(closeAudit()).toMatchObject([
+        { outcome: "error", code: cat, job_id: r.id },
+      ]);
       const lines = (warn?.mock.calls ?? []).filter(
         (c) => c[0] === CLOSE_SOCKETS_FAILED,
       );
@@ -775,6 +794,27 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
       expect(JSON.stringify(lines)).not.toContain("a@b.co");
     },
   );
+
+  it("a failing audit write logs a fixed line and the suspend completes", async () => {
+    const s = await active({ slug: "auditfail" });
+    const db = w.ctx.env.PLATFORM_DB;
+    const prepare = db.prepare.bind(db);
+    db.prepare = ((q: string) => {
+      if (q.includes("INTO admin_audit")) throw new Error("boom a@b.co");
+      return prepare(q);
+    }) as typeof db.prepare;
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    db.prepare = prepare;
+    expect(r.error).toBeNull();
+    expect(w.status(s.installId)?.state).toBe("suspended");
+    expect(closeAudit()).toEqual([]);
+    const lines = (warn?.mock.calls ?? []).filter(
+      (c) => c[0] === CLOSE_AUDIT_FAILED,
+    );
+    expect(lines).toEqual([[CLOSE_AUDIT_FAILED]]);
+  });
 
   it("a close-sockets call that never settles times out, logged; it never throws", async () => {
     const s = await active({ slug: "stallco" });
