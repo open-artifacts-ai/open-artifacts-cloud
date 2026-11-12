@@ -17,7 +17,7 @@ import {
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
 import {
-  BUS_AGENTS,
+  BUS_A,
   BUS_B,
   BUS_PAIR_SIDES_FILE,
   type BusPair,
@@ -367,15 +367,14 @@ async function pairSide(run: Run, id: string, slug: string): Promise<PairSide> {
 }
 
 /**
- * The hosted bus pair's bring-up (cloud #202): rl-agents is found by slug and
- * left at its version (it is TEST_MEMBER's install; never upgraded or
- * suspended here); rl-busb is created over OIDC at the release under test
- * when there is none (an rl- slug, testHooks, the STAGING_TEST_DOMAIN owner:
- * oidcCreate, as rl-l), resumed when a cut-off run left it suspended, and
- * upgraded to the release (bringUpgrade). Then R26 on each: the creds go to
- * secretsDir as REDLINE_RL_AGENTS_* and REDLINE_RL_BUSB_*, the new hook keys
- * must be accepted (waitHookKey, paced), and the pair file is written. Every
- * failure names its install.
+ * The hosted bus pair's bring-up (cloud #202): rl-busa and rl-busb, red-line's
+ * own installs, each made the same way. Created over OIDC at the release under
+ * test when there is none (an rl- slug, testHooks, the STAGING_TEST_DOMAIN
+ * owner: oidcCreate, as rl-l), resumed when a cut-off run left it suspended,
+ * and upgraded to the release (bringUpgrade). Then R26 on each: the creds go
+ * to secretsDir as REDLINE_RL_BUSA_* and REDLINE_RL_BUSB_*, the new hook keys
+ * must be accepted (waitHookKey, paced), and the pair file is written. The two
+ * installs run at the same time; every failure names its install.
  */
 export async function bringUpBusPair(
   run: Run,
@@ -383,37 +382,34 @@ export async function bringUpBusPair(
   recipient: { publicKey: string; open: (sealed: string) => Promise<CredsOut> },
   pace?: (app: string, deadline: number) => Promise<unknown>,
 ): Promise<BusPair> {
-  const agents = await findBySlug(run, BUS_AGENTS);
-  if (!agents)
-    throw new InfraError(
-      `${BUS_AGENTS} is not on staging (TEST_MEMBER's install, docs/ops/hosted.md)`,
-    );
-  let busb = await findBySlug(run, BUS_B);
-  if (!busb) {
-    const a = run.accepted(
-      await run.v1("/installs", {
-        body: oidcCreate(run, BUS_B, run.rid("busb-create"), run.c.version),
-      }),
-      `${BUS_B} create`,
-    );
-    await run.done(a.job.id, `${BUS_B} create`);
-    busb = { id: a.install.id, state: "active" };
-    out(`${BUS_B}: created (${run.c.version})\n`);
-  } else {
-    if (busb.state === "suspended") {
+  const ready = async (slug: string, tag: string): Promise<string> => {
+    const found = await findBySlug(run, slug);
+    if (!found) {
       const a = run.accepted(
-        await run.v1(`/installs/${busb.id}/resume`, {
-          body: { requestId: run.rid("busb-left-suspended") },
+        await run.v1("/installs", {
+          body: oidcCreate(run, slug, run.rid(`${tag}-create`), run.c.version),
         }),
-        `${BUS_B} resume`,
+        `${slug} create`,
       );
-      await run.done(a.job.id, `${BUS_B} resume`);
-      out(`${BUS_B}: resumed (a run left it suspended)\n`);
+      await run.done(a.job.id, `${slug} create`);
+      out(`${slug}: created (${run.c.version})\n`);
+      return a.install.id;
+    }
+    if (found.state === "suspended") {
+      const a = run.accepted(
+        await run.v1(`/installs/${found.id}/resume`, {
+          body: { requestId: run.rid(`${tag}-left-suspended`) },
+        }),
+        `${slug} resume`,
+      );
+      await run.done(a.job.id, `${slug} resume`);
+      out(`${slug}: resumed (a run left it suspended)\n`);
     }
     out(
-      `${BUS_B}: ${await bringUpgrade(run, busb.id, BUS_B)} (${run.c.version})\n`,
+      `${slug}: ${await bringUpgrade(run, found.id, slug)} (${run.c.version})\n`,
     );
-  }
+    return found.id;
+  };
   // Recorded before its R26, so the run's revoke finds every install that
   // may hold this run's creds, even when the pair never got ready.
   const sides: PairSide[] = [];
@@ -441,12 +437,16 @@ export async function bringUpBusPair(
   };
   // Both always awaited to the end, as bringUp's two chains.
   const [a, b] = await Promise.allSettled([
-    one(agents.id, BUS_AGENTS).catch(named(BUS_AGENTS)),
-    one(busb.id, BUS_B).catch(named(BUS_B)),
+    ready(BUS_A, "busa")
+      .then((id) => one(id, BUS_A))
+      .catch(named(BUS_A)),
+    ready(BUS_B, "busb")
+      .then((id) => one(id, BUS_B))
+      .catch(named(BUS_B)),
   ]);
   if (a.status === "rejected") throw a.reason;
   if (b.status === "rejected") throw b.reason;
-  const pair = { agents: a.value, busb: b.value };
+  const pair = { busa: a.value, busb: b.value };
   writeBusPair(dir, pair);
   return pair;
 }

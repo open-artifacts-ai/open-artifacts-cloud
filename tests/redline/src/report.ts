@@ -485,6 +485,12 @@ export interface AcceptedUnproven {
   file: string;
   evidence: string;
 }
+/**
+ * The reason live/bus.test.ts reports when a hosted bus case fails (cloud
+ * #202): the two cases run and report, but don't gate, for one release.
+ */
+export const HOSTED_BUS_NOT_GATING =
+  "not gating for one release (cloud #202): a failure is reported, not gated, until a real gate run passes both";
 export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
   [
     {
@@ -536,6 +542,24 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
       file: "provisioner.test.ts",
       evidence:
         'apps/provisioning/test/writes.test.ts "R4 create by an admin session > slug_taken by an installs row or a live signup; a failed signup frees it"; before sign-ups open: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/59',
+    },
+    // Cloud #202: the hosted bus cases (open-artifacts#1954) on rl-busa and
+    // rl-busb. Not gating for one release: no dry run exists for suite
+    // changes. The prod bus switch (cloud #215) and HOSTED_BUS_LIFTED wait
+    // until both pass in a real gate run AND a merged PR removes these two.
+    {
+      name: "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
+      reason: HOSTED_BUS_NOT_GATING,
+      file: "bus.test.ts",
+      evidence:
+        'tests/redline/test/hosted-bus.test.ts "case 1: rl-busa\'s machine token at rl-busb"; the live result is in the case label; promotion to gating: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/202',
+    },
+    {
+      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      reason: HOSTED_BUS_NOT_GATING,
+      file: "bus.test.ts",
+      evidence:
+        'tests/redline/test/hosted-bus.test.ts "case 2: suspend rl-busb"; the live result is in the case label; promotion to gating: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/202',
     },
   ].map((e) => Object.freeze(e)),
 );

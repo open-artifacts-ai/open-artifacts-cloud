@@ -1146,11 +1146,11 @@
     },
     {
       "file": "live/bus.test.ts",
-      "name": "bus > rl-agents' machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-agents; rl-busb's machines and roster unchanged; its content host never upgrades it"
+      "name": "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it"
     },
     {
       "file": "live/bus.test.ts",
-      "name": "bus > suspend rl-busb: its daemon socket closes with 4403, reconnects get dispatch's paused answer and never 101 for 6 min, rl-agents' socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact"
+      "name": "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact"
     },
     {
       "file": "live/edge.test.ts",

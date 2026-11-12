@@ -32,7 +32,7 @@ const bound = boundFetch(transportFetch(globalThis.fetch, resets));
 // request's timeout. setupFetch re-bounds `unbound(fetch)`: that gets the
 // same rules around the raw fetch.
 // Fails closed: a live run never loses its pacing, lock or tripwire silently.
-// The hosted bus pair (rl-agents, rl-busb; src/hosted-bus.ts) after rl-a and
+// The hosted bus pair (rl-busa, rl-busb; src/hosted-bus.ts) after rl-a and
 // rl-b, when bring-up wrote it: their device-flow requests spend the same
 // account-wide RL_ANON keys, so they are paced and tripwired the same way.
 const targets = [...liveTargetsFromEnv(), ...busPairTargets()];

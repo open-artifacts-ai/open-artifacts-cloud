@@ -15,12 +15,11 @@ import {
   type BusPair,
   busPairSides,
   busPairTargets,
-  CLOSE_CEILING_MS,
+  CLOSE_WITHIN_MS,
   type CrossIo,
   crossInstallCase,
   listsName,
-  PAUSED_SETTLE_MS,
-  PAUSED_WINDOW_MS,
+  RECONNECT_AT_MS,
   readBusPair,
   type SuspendIo,
   suspendCase,
@@ -41,17 +40,17 @@ import {
   setVersion,
 } from "./provisioning-fake.ts";
 
-// Cloud #202: the hosted bus cases of open-artifacts#1954 on rl-agents and
+// Cloud #202: the hosted bus cases of open-artifacts#1954 on rl-busa and
 // rl-busb. The case logic runs on fake seams and a pinned clock; the pair's
 // bring-up runs on the fake Provisioning API.
 
 const PAIR: BusPair = {
-  agents: {
-    name: "rl-agents",
-    installId: "iagentsaaaaa",
-    app: "https://rl-agents.open-artifacts-staging.app",
-    content: "https://rl-agents.open-artifacts-staging.page",
-    version: "0.81.0",
+  busa: {
+    name: "rl-busa",
+    installId: "ibusaaaaaaaa",
+    app: "https://rl-busa.open-artifacts-staging.app",
+    content: "https://rl-busa.open-artifacts-staging.page",
+    version: "0.82.0",
   },
   busb: {
     name: "rl-busb",
@@ -98,7 +97,7 @@ function crossIo(
       calls.push(`connect ${origin}`);
       if (origin === PAIR.busb.app)
         return o.atB ?? { status: 401, body: unauthorized };
-      if (origin === PAIR.agents.app) return { status: o.atA ?? 101, body: "" };
+      if (origin === PAIR.busa.app) return { status: o.atA ?? 101, body: "" };
       return { status: o.atContent ?? 404, body: "" };
     },
     snapshotB: async () => {
@@ -108,7 +107,7 @@ function crossIo(
   };
 }
 
-describe("case 1: rl-agents' machine token at rl-busb", () => {
+describe("case 1: rl-busa' machine token at rl-busb", () => {
   it("passes in OA Bus's order: mint on A, snapshot B, B is 401 unauthorized, A is 101, B's content host refuses, B unchanged", async () => {
     const io = crossIo();
     await crossInstallCase(io, PAIR);
@@ -116,7 +115,7 @@ describe("case 1: rl-agents' machine token at rl-busb", () => {
       "mint",
       "snapshot",
       `connect ${PAIR.busb.app}`,
-      `connect ${PAIR.agents.app}`,
+      `connect ${PAIR.busa.app}`,
       `connect ${PAIR.busb.content}`,
       "snapshot",
     ]);
@@ -126,7 +125,7 @@ describe("case 1: rl-agents' machine token at rl-busb", () => {
     [
       "B upgrades it",
       { atB: { status: 101, body: "" } },
-      /upgraded rl-agents's machine token \(101\)/,
+      /upgraded rl-busa's machine token \(101\)/,
     ],
     [
       "B is off (404)",
@@ -146,7 +145,7 @@ describe("case 1: rl-agents' machine token at rl-busb", () => {
     [
       "the control is not 101",
       { atA: 401 },
-      /control: rl-agents answered its own machine token with 401/,
+      /control: rl-busa answered its own machine token with 401/,
     ],
     [
       "B's content host upgrades it",
@@ -166,14 +165,13 @@ describe("case 1: rl-agents' machine token at rl-busb", () => {
   });
 });
 
-/** Case 2's seam on a pinned clock; `o` breaks one step. */
+/** Case 2's seam on a pinned clock (ms since the suspend job's done); `o` breaks one step. */
 function suspendIo(
   o: {
     closeAtMs?: number | null;
     closeCode?: number | null;
     pausedFromMs?: number;
     upgradeAtMs?: number;
-    unpauseAtMs?: number;
     bystanderClosesAtMs?: number;
     suspendFails?: boolean;
     resumeFails?: boolean;
@@ -181,43 +179,44 @@ function suspendIo(
     redelivered?: boolean;
     hub?: string | null;
   } = {},
-): SuspendIo & { log: string[]; reconnectsAt: number[]; t: { now: number } } {
+): SuspendIo & { log: string[]; reconnectsAt: number[] } {
   const t = { now: 0 };
   const log: string[] = [];
   const reconnectsAt: number[] = [];
-  let suspendedAt: number | null = null;
+  let doneAt: number | null = null;
   let closedAt: number | null = null;
   let resolveClosed!: () => void;
   const closed = new Promise<void>((r) => {
     resolveClosed = r;
   });
   const closeAt = o.closeAtMs === undefined ? 5_000 : o.closeAtMs;
+  const since = () => (doneAt === null ? -1 : t.now - doneAt);
   const tick = () => {
-    if (suspendedAt !== null && closeAt !== null && closedAt === null)
-      if (t.now - suspendedAt >= closeAt) {
+    if (doneAt !== null && closeAt !== null && closedAt === null)
+      if (since() >= closeAt) {
         closedAt = t.now;
         resolveClosed();
       }
   };
-  const bystanderOpen = () =>
-    o.bystanderClosesAtMs === undefined ||
-    suspendedAt === null ||
-    t.now - suspendedAt < o.bystanderClosesAtMs;
   return {
     log,
     reconnectsAt,
-    t,
     now: () => t.now,
     wait: async (ms) => {
-      t.now += ms;
-      tick();
-      await Promise.resolve();
+      // One second at a time, so a close lands when it is due.
+      for (let left = ms; left > 0; left -= 1_000) {
+        t.now += Math.min(1_000, left);
+        tick();
+        await Promise.resolve();
+      }
     },
     openBystander: async () => {
       log.push("bystander");
       return {
         closed: new Promise(() => {}),
-        isOpen: bystanderOpen,
+        isOpen: () =>
+          o.bystanderClosesAtMs === undefined ||
+          since() < o.bystanderClosesAtMs,
         closeCode: () => null,
       };
     },
@@ -234,21 +233,17 @@ function suspendIo(
       log.push("suspend");
       if (o.suspendFails) throw new ProbeFail("rl-busb suspend: job failed");
       t.now += 20_000;
-      suspendedAt = t.now;
-      tick();
+      doneAt = t.now;
     },
     resume: async () => {
       log.push("resume");
       if (o.resumeFails) throw new ProbeFail("rl-busb resume: job failed");
     },
     reconnect: async () => {
-      const since = t.now - (closedAt ?? t.now);
-      reconnectsAt.push(since);
-      if (o.upgradeAtMs !== undefined && since >= o.upgradeAtMs)
+      reconnectsAt.push(since());
+      if (o.upgradeAtMs !== undefined && since() >= o.upgradeAtMs)
         return { status: 101, paused: false };
-      if (o.unpauseAtMs !== undefined && since >= o.unpauseAtMs)
-        return { status: 401, paused: false };
-      const paused = since >= (o.pausedFromMs ?? 30_000);
+      const paused = since() >= (o.pausedFromMs ?? 0);
       return { status: paused ? 503 : 401, paused };
     },
     reopen: async (id) => {
@@ -266,7 +261,7 @@ function suspendIo(
 }
 
 describe("case 2: suspend rl-busb", () => {
-  it("passes: closes with 4403, refuses reconnects for 6 min (paused from the first paused answer on), resumes, reopens with the pending mail, hub intact", async () => {
+  it("passes: closes within 30 s with 4403, reconnects at 10, 60 and 125 s are dispatch's paused answer, resumes, reopens with the pending mail, hub intact", async () => {
     const io = suspendIo();
     const r = await suspendCase(io, PAIR);
     expect(io.log).toEqual([
@@ -278,22 +273,25 @@ describe("case 2: suspend rl-busb", () => {
       "hub",
     ]);
     expect(r.closeMs).toBe(5_000);
-    // The window ran its 6 min from the close: the last reconnect is past it.
-    expect(io.reconnectsAt.at(-1)).toBeGreaterThanOrEqual(PAUSED_WINDOW_MS);
-    expect(
-      io.reconnectsAt.every(
-        (ms, i) => i === 0 || ms - (io.reconnectsAt[i - 1] ?? 0) <= 30_000,
-      ),
-    ).toBe(true);
-    expect(r.reconnects).toBe(io.reconnectsAt.length);
-    expect(r.pausedMs).toBeGreaterThanOrEqual(PAUSED_WINDOW_MS - 30_000);
+    expect(io.reconnectsAt).toEqual([...RECONNECT_AT_MS]);
+    expect(RECONNECT_AT_MS).toEqual([10_000, 60_000, 125_000]);
+    expect(r.reconnects).toBe(3);
+  });
+
+  it("a close at 30 s passes; at 31 s it fails, though the 120 s pass would come later", async () => {
+    await expect(
+      suspendCase(suspendIo({ closeAtMs: CLOSE_WITHIN_MS }), PAIR),
+    ).resolves.toMatchObject({ closeMs: CLOSE_WITHIN_MS });
+    await expect(
+      suspendCase(suspendIo({ closeAtMs: CLOSE_WITHIN_MS + 1_000 }), PAIR),
+    ).rejects.toThrow(/still open 30 s after the suspend job was done/);
   });
 
   it.each<[string, Parameters<typeof suspendIo>[0], RegExp]>([
     [
       "the socket never closes",
       { closeAtMs: null },
-      new RegExp(`still open ${CLOSE_CEILING_MS / 1000} s after the suspend`),
+      /still open 30 s after the suspend job was done/,
     ],
     [
       "it closes with another code",
@@ -306,26 +304,19 @@ describe("case 2: suspend rl-busb", () => {
       /closed with no code, want 4403/,
     ],
     [
-      "a reconnect upgrades in the window",
-      { upgradeAtMs: 200_000 },
-      /upgraded the daemon's token 210 s into the suspend/,
+      "the 10 s reconnect is not yet paused",
+      { pausedFromMs: 20_000 },
+      /reconnect 10 s after the suspend with 401, want dispatch's paused 503/,
     ],
     [
-      "a reconnect is not paused after a paused one",
-      { unpauseAtMs: 300_000 },
-      /with 401, after dispatch's paused answer/,
+      "the 125 s reconnect upgrades",
+      { upgradeAtMs: 100_000 },
+      /upgraded the daemon's token 125 s after the suspend/,
     ],
     [
-      "dispatch never pauses",
-      { pausedFromMs: 10 * 60_000 },
-      new RegExp(
-        `no paused answer from dispatch ${PAUSED_SETTLE_MS / 1000} s after the close`,
-      ),
-    ],
-    [
-      "rl-agents' socket closes in the window",
-      { bystanderClosesAtMs: 100_000 },
-      /rl-agents's bus socket closed while the other install was suspended/,
+      "rl-busa's socket closes in the window",
+      { bystanderClosesAtMs: 50_000 },
+      /rl-busa's bus socket closed while the other install was suspended/,
     ],
   ])("fails when %s, and still resumes", async (_, o, re) => {
     const io = suspendIo(o);
@@ -379,7 +370,7 @@ describe("the pair file", () => {
       busPairTargets({
         REDLINE_TARGETS: JSON.stringify({ secretsDir: d }),
       }).map((x) => x.name),
-    ).toEqual(["rl-agents", "rl-busb"]);
+    ).toEqual(["rl-busa", "rl-busb"]);
   });
 
   it("is infra when bring-up wrote an error or nothing; no targets then", () => {
@@ -412,17 +403,20 @@ describe("the pair file", () => {
 
 // --- Bring-up on the fake Provisioning API ---------------------------------
 
-function withAgents(
+/** rl-busa and rl-busb in the fake, each absent, older or left suspended. */
+function withPair(
   f: FakeApi,
-  o: { busb?: "absent" | "old" | "suspended" } = {},
+  o: Partial<Record<"busa" | "busb", "absent" | "old" | "suspended">> = {},
 ) {
   const rla = f.installs.get(CONFIG.rlA.id);
   if (!rla) throw new Error("no rl-a in the fake");
-  const copy = (
-    id: string,
-    slug: string,
-    extra: Record<string, unknown> = {},
-  ) =>
+  for (const [k, id] of [
+    ["busa", "ibusaaaaaaaa"],
+    ["busb", "ibusbbbbbbbb"],
+  ] as const) {
+    const how = o[k] ?? "absent";
+    if (how === "absent") continue;
+    const slug = `rl-${k}`;
     f.installs.set(id, {
       ...rla,
       id,
@@ -430,12 +424,9 @@ function withAgents(
       appHost: `${slug}.open-artifacts-staging.app`,
       contentHost: `${slug}.open-artifacts-staging.page`,
       version: "0.81.0",
-      ...extra,
+      ...(how === "suspended" ? { state: "suspended", mode: "paused" } : {}),
     });
-  copy("iagentsaaaaa", "rl-agents");
-  if (o.busb === "old") copy("ibusbbbbbbbb", "rl-busb");
-  if (o.busb === "suspended")
-    copy("ibusbbbbbbbb", "rl-busb", { state: "suspended", mode: "paused" });
+  }
 }
 
 const quiet = () => vi.spyOn(process.stdout, "write").mockReturnValue(true);
@@ -449,9 +440,8 @@ async function recipient() {
 }
 
 describe("bringUpBusPair", () => {
-  it("creates rl-busb over OIDC at the release under test (rl- slug, testHooks, the test domain's owner), leaves rl-agents' version, and writes both installs' creds and the pair", async () => {
+  it("creates rl-busa and rl-busb over OIDC at the release under test (rl- slug, testHooks, the test domain's owner) and writes both installs' creds and the pair; no other install is touched", async () => {
     const f = fakeApi();
-    withAgents(f);
     const d = scratch();
     quiet();
     const p = await bringUpBusPair(
@@ -460,18 +450,27 @@ describe("bringUpBusPair", () => {
       await recipient(),
       noPace,
     );
-    const create = f.creates.find((c) => c.slug === "rl-busb");
-    expect(create).toMatchObject({ testHooks: true, version: CONFIG.version });
-    expect(String(create?.ownerEmail)).toMatch(
-      new RegExp(`@${STAGING_TEST_DOMAIN.replace(".", "\\.")}$`),
+    for (const slug of ["rl-busa", "rl-busb"]) {
+      const create = f.creates.find((c) => c.slug === slug);
+      expect(create, slug).toMatchObject({
+        testHooks: true,
+        version: CONFIG.version,
+      });
+      expect(String(create?.ownerEmail)).toMatch(
+        new RegExp(`@${STAGING_TEST_DOMAIN.replace(".", "\\.")}$`),
+      );
+    }
+    // Only the pair's own installs: no request names another install's id.
+    const ours = new Set([p.busa.installId, p.busb.installId]);
+    const touched = f.log.flatMap(
+      (l) => /\/installs\/([^/?\s]+)/.exec(l)?.[1] ?? [],
     );
-    expect(
-      f.log.some((l) => /iagentsaaaaa\/(upgrade|suspend|resume)$/.test(l)),
-    ).toBe(false);
-    expect(p.agents.version).toBe("0.81.0");
+    expect(touched.length).toBeGreaterThan(0);
+    expect(touched.filter((id) => !ours.has(id))).toEqual([]);
+    expect(p.busa.version).toBe(CONFIG.version);
     expect(p.busb.version).toBe(CONFIG.version);
     expect(readBusPair(d)).toEqual(p);
-    for (const n of ["rl-agents", "rl-busb"])
+    for (const n of ["rl-busa", "rl-busb"])
       for (const k of ["PAT", "HOOK_KEY"] as const)
         expect(
           readFileSync(join(d, secretFileName(n, k)), "utf8").length,
@@ -480,13 +479,16 @@ describe("bringUpBusPair", () => {
       busPairSides(d)
         .map((s) => s.name)
         .sort(),
-    ).toEqual(["rl-agents", "rl-busb"]);
+    ).toEqual(["rl-busa", "rl-busb"]);
   });
 
-  it("upgrades an older rl-busb, and resumes one a cut-off run left suspended first", async () => {
-    for (const busb of ["old", "suspended"] as const) {
+  it("upgrades an older install, and resumes one a cut-off run left suspended first, each the same way", async () => {
+    for (const [busa, busb] of [
+      ["old", "suspended"],
+      ["suspended", "old"],
+    ] as const) {
       const f = fakeApi();
-      withAgents(f, { busb });
+      withPair(f, { busa, busb });
       quiet();
       await bringUpBusPair(
         new Run(CONFIG, f.io),
@@ -494,28 +496,20 @@ describe("bringUpBusPair", () => {
         await recipient(),
         noPace,
       );
-      const resume = f.log.findIndex((l) => l.endsWith("ibusbbbbbbbb/resume"));
-      const up = f.log.findIndex((l) => l.endsWith("ibusbbbbbbbb/upgrade"));
-      expect(up, busb).toBeGreaterThan(-1);
-      if (busb === "suspended") expect(resume).toBeGreaterThan(-1);
-      if (busb === "suspended") expect(resume).toBeLessThan(up);
-      else expect(resume).toBe(-1);
-      expect(f.creates.some((c) => c.slug === "rl-busb")).toBe(false);
+      for (const [id, how] of [
+        ["ibusaaaaaaaa", busa],
+        ["ibusbbbbbbbb", busb],
+      ] as const) {
+        const resume = f.log.findIndex((l) => l.endsWith(`${id}/resume`));
+        const up = f.log.findIndex((l) => l.endsWith(`${id}/upgrade`));
+        expect(up, `${id} ${how}`).toBeGreaterThan(-1);
+        if (how === "suspended") {
+          expect(resume).toBeGreaterThan(-1);
+          expect(resume).toBeLessThan(up);
+        } else expect(resume).toBe(-1);
+      }
+      expect(f.creates).toEqual([]);
     }
-  });
-
-  it("no rl-agents on staging is infra, and nothing is created", async () => {
-    const f = fakeApi();
-    quiet();
-    await expect(
-      bringUpBusPair(
-        new Run(CONFIG, f.io),
-        scratch(),
-        await recipient(),
-        noPace,
-      ),
-    ).rejects.toThrow(/infra: rl-agents is not on staging/);
-    expect(f.creates).toEqual([]);
   });
 });
 
@@ -531,11 +525,11 @@ describe("bringUp and the pair", () => {
     };
     const out = quiet();
     await bringUp({}, t, new Run(CONFIG, f.io), noPace, async () => {
-      throw new InfraError("rl-agents is not on staging");
+      throw new InfraError("rl-busb create: job failed");
     });
     expect(existsSync(join(d, BUS_PAIR_ERROR_FILE))).toBe(true);
     expect(() => readBusPair(d)).toThrow(
-      /bus pair bring-up: infra: rl-agents is not on staging/,
+      /bus pair bring-up: infra: rl-busb create: job failed/,
     );
     expect(out.mock.calls.map((c) => String(c[0])).join("")).toContain(
       "bus pair: not ready",

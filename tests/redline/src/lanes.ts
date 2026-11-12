@@ -126,7 +126,8 @@ export const CLAIMS: Record<string, Claims> = {
     buckets: installBuckets(),
   },
   "live/live.test.ts": { state: installs(), buckets: installBuckets() },
-  // #1954 (cloud #202): the hosted bus pair, never rl-a or rl-b. A machine on
+  // #1954 (cloud #202): the hosted bus pair rl-busa and rl-busb, red-line's
+  // own, never rl-a or rl-b. A machine on
   // each side (labelled, revoked at the end) and its device-flow requests,
   // which the rl-anon ledgers pace (bus-dev, bus-tok, bus-code, bus-approve in
   // src/rl-anon.ts; live/setup.ts adds the pair to the guard's targets). One
@@ -136,11 +137,11 @@ export const CLAIMS: Record<string, Claims> = {
   // RL_PV_* limit (the prov-done order is for the file that overspends).
   "live/bus.test.ts": {
     state: {
-      "rl-agents/redline-admin-bus": "write",
+      "rl-busa/install": "write",
       "rl-busb/install": "write",
     },
     buckets: {
-      "rl-agents/hooks": paced("hook-ledger/rl-agents"),
+      "rl-busa/hooks": paced("hook-ledger/rl-busa"),
       "rl-busb/hooks": paced("hook-ledger/rl-busb"),
       "rl-anon": paced("rl-anon"),
       "provisioning-api": ordered("prov-done"),
@@ -276,9 +277,9 @@ const shardLane = (
  *   cases about 194 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
  * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it);
- * - busb: bus (#1954, cloud #202) on rl-agents and rl-busb, its own lane: its
- *   suspend case holds a 6 min paused window, which runs beside prov and the
- *   others from the suite's start instead of after anything;
+ * - busb: bus (#1954, cloud #202) on rl-busa and rl-busb, its own lane: its
+ *   suspend case (a suspend job, 125 s of probes, a resume job) runs beside
+ *   prov and the others from the suite's start instead of after anything;
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
  */

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { RECONNECT_AT_MS } from "../src/hosted-bus.ts";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
 import { derive, inShard } from "../src/surfaces.ts";
@@ -47,12 +48,14 @@ const P = fx.phases;
 const ESTIMATED_WALL_SEC: Record<string, number> = {};
 
 /**
- * Cloud #202: live/bus.test.ts on rl-agents and rl-busb, in its own lane
+ * Cloud #202: live/bus.test.ts on rl-busa and rl-busb, in its own lane
  * ("busb"), after the recordings. Its wall is MODELED, not measured, from the
- * case's own bounds (src/hosted-bus.ts): the pair's sign-in and two device
- * flows, case 1's few upgrades, case 2's sockets, the suspend job, the close
- * (target 30 s), the 6 min paused window from the close, the resume job and
- * /healthz, the reopen. The first live run replaces it.
+ * cases' own steps (src/hosted-bus.ts): the pair's sign-in and two device
+ * flows, case 1's few upgrades, case 2's sockets, the suspend job, the
+ * reconnect probes to 125 s after it (RECONNECT_AT_MS; the 30 s close check
+ * falls inside them), the resume job and /healthz, the reopen. The first
+ * live run replaces it. The pair's bring-up runs beside rl-a's and rl-b's
+ * (each an upgrade, about as long as theirs), so it adds no step.
  */
 const BUS_FILE = "live/bus.test.ts";
 const BUSB_MODEL = {
@@ -60,8 +63,7 @@ const BUSB_MODEL = {
   crossSec: 10,
   socketsSec: 10,
   suspendJobSec: 20,
-  closeSec: 30,
-  windowSec: 360,
+  probesSec: RECONNECT_AT_MS[RECONNECT_AT_MS.length - 1] / 1000,
   resumeSec: 30,
   reopenSec: 15,
 };
@@ -390,6 +392,8 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
   const ends = (walls: Record<string, number> = m.lanes) => {
     const out: Record<string, number> = { ...walls };
     out.provisioner = Math.max(REPLAY_SEC, out.prov ?? 0) + TAKEN_SEC;
+    // Cloud #202's busb lane, modeled (BUSB_MODEL).
+    out.busb ??= BUSB_SEC;
     return out;
   };
   const job = (e: Record<string, number>) =>
@@ -400,11 +404,11 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
     m.mergeSec +
     m.revokeSec;
 
-  it("the simulated lanes are the plan's lanes, busb aside (modeled below)", () => {
+  it("the simulated lanes are the plan's lanes", () => {
     // The recording ran surfaces whole: #26's second shard is not in it.
     expect(Object.keys(ends()).sort()).toEqual(
       (PLAN[0] ?? [])
-        .filter((l) => l.shard !== "b" && l.name !== "busb")
+        .filter((l) => l.shard !== "b")
         .map((l) => l.name)
         .sort(),
     );
@@ -475,6 +479,8 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     creds: 271,
     guard: 85,
     front: 219,
+    // Cloud #202's busb lane, modeled (BUSB_MODEL).
+    busb: BUSB_SEC,
   });
 
   it("the fixture is the run's 220 cases, and every group names real cases", () => {
@@ -497,11 +503,11 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     expect(lanes()["surfaces-b"]).toBeCloseTo(239.6, 1);
   });
 
-  it("the simulated lanes are the plan's lanes (provisioner and busb aside), none of surfaces over 280 s", () => {
+  it("the simulated lanes are the plan's lanes (provisioner aside), none of surfaces over 280 s", () => {
     expect(Object.keys(lanes()).sort()).toEqual(
       (PLAN[0] ?? [])
         .map((l) => l.name)
-        .filter((n) => n !== "provisioner" && n !== "busb")
+        .filter((n) => n !== "provisioner")
         .sort(),
     );
     expect(lanes().surfaces).toBeLessThan(280);
@@ -516,17 +522,12 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     expect(end).toBeLessThan(600);
   });
 
-  // Cloud #202. The paused window starts with the suite (its own lane), so it
-  // overlaps every other lane: of the 6 min, only what runs past the longest
-  // other lane adds to the job. That is still past 10 minutes (the modeled
-  // wall, BUSB_MODEL): a known cost of OA Bus's 6 min window, not hidden here.
-  it("with the busb lane (modeled): it is the longest, and the job ends at about 681 s", () => {
-    expect(BUSB_SEC).toBe(505);
-    const all = { ...lanes(), busb: BUSB_SEC };
-    expect(Math.max(...Object.values(all))).toBe(BUSB_SEC);
-    const end = jobSec - (suiteSec - BUSB_SEC);
-    expect(end).toBe(681);
-    // Run after the longest other lane instead of beside it: 952 s.
-    expect(jobSec - suiteSec + 271 + BUSB_SEC).toBe(952);
+  // Cloud #202. The busb lane starts with the suite and runs beside the
+  // others; modeled at 240 s, it is under creds' 271 s, so it adds nothing.
+  it("with the busb lane (modeled at 240 s), the job still ends at about 447 s, under 600", () => {
+    expect(BUSB_SEC).toBe(240);
+    expect(lanes().busb).toBe(BUSB_SEC);
+    expect(BUSB_SEC).toBeLessThan(Math.max(...Object.values(lanes())));
+    expect(jobSec - (suiteSec - Math.max(...Object.values(lanes())))).toBe(447);
   });
 });

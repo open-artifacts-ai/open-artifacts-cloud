@@ -24,15 +24,15 @@ import { type Held, holdSocket, wsHandshake } from "./ws.ts";
 // The hosted bus cases of open-artifacts#1954 (cloud #202), on two staging
 // installs whose bus is on through STAGING_BUS_SLUGS (apps/provisioner
 // wrangler.jsonc env.staging), not on the HOSTED_BUS_LIFTED switch:
-// - rl-agents: TEST_MEMBER's install (docs/ops/hosted.md). Case 1's A (the
-//   token is minted there) and case 2's bystander (its socket must stay up).
-// - rl-busb: red-line's own. Case 1's B (it must refuse A's token) and the
-//   install case 2 suspends, so the shared agents install is never suspended.
-// Bring-up (provisioning-live.ts bringUpBusPair) creates or upgrades rl-busb,
-// takes both installs' R26 creds into secretsDir and writes the pair file
-// read here. No token, PAT, key or cookie is ever put in a message.
+// - rl-busa: case 1's A (the token is minted there) and case 2's bystander
+//   (its socket must stay up).
+// - rl-busb: case 1's B (it must refuse A's token) and the install case 2
+//   suspends.
+// Both are red-line's own; no other install is touched. Bring-up
+// (provisioning-live.ts bringUpBusPair) creates or upgrades both, takes their
+// R26 creds into secretsDir and writes the pair file read here. No token, PAT, key or cookie is ever put in a message.
 
-export const BUS_AGENTS = "rl-agents";
+export const BUS_A = "rl-busa";
 export const BUS_B = "rl-busb";
 /** The pair's hosts and ids, written by bring-up into secretsDir (not secret). */
 export const BUS_PAIR_FILE = "REDLINE_BUS_PAIR";
@@ -49,7 +49,7 @@ export interface PairSide {
   version: string;
 }
 export interface BusPair {
-  agents: PairSide;
+  busa: PairSide;
   busb: PairSide;
 }
 
@@ -67,7 +67,7 @@ export function busPairSides(
   return v.flatMap((x) => {
     const s = x as Partial<PairSide>;
     return typeof s.name === "string" &&
-      [BUS_AGENTS, BUS_B].includes(s.name) &&
+      [BUS_A, BUS_B].includes(s.name) &&
       typeof s.installId === "string" &&
       typeof s.app === "string"
       ? [{ name: s.name, installId: s.installId, app: s.app }]
@@ -106,7 +106,7 @@ export function readBusPair(dir: string): BusPair {
   if (!existsSync(f))
     throw new InfraError("bus pair bring-up wrote no pair file");
   const j = JSON.parse(readFileSync(f, "utf8")) as Record<string, unknown>;
-  return { agents: sideOf(j.agents, BUS_AGENTS), busb: sideOf(j.busb, BUS_B) };
+  return { busa: sideOf(j.busa, BUS_A), busb: sideOf(j.busb, BUS_B) };
 }
 
 /**
@@ -127,7 +127,7 @@ export function busPairTargets(
     if (typeof dir !== "string" || !existsSync(join(dir, BUS_PAIR_FILE)))
       return [];
     const p = readBusPair(dir);
-    return [p.agents, p.busb].map((s) => ({
+    return [p.busa, p.busb].map((s) => ({
       name: s.name,
       installId: s.installId,
       app: s.app,
@@ -142,7 +142,7 @@ export function busPairTargets(
 
 /** What case 1 needs; the live wiring is liveCrossIo. */
 export interface CrossIo {
-  /** A real machine token on A (rl-agents), by the device flow. */
+  /** A real machine token on A (rl-busa), by the device flow. */
   mintA(): Promise<string>;
   /** GET <origin>/bus/connect with Upgrade: websocket and the bearer. */
   connect(
@@ -174,50 +174,51 @@ export async function crossInstallCase(io: CrossIo, p: BusPair): Promise<void> {
   const atB = await io.connect(p.busb.app, token);
   if (atB.status === 101)
     throw new ProbeFail(
-      `${p.busb.name} upgraded ${p.agents.name}'s machine token (101)`,
+      `${p.busb.name} upgraded ${p.busa.name}'s machine token (101)`,
     );
   if (atB.status !== 401 || codeOf(atB.body) !== "unauthorized")
     throw new ProbeFail(
-      `${p.busb.name} /bus/connect with ${p.agents.name}'s machine token answered ${atB.status} ${codeOf(atB.body) ?? "no code"}, want 401 unauthorized`,
+      `${p.busb.name} /bus/connect with ${p.busa.name}'s machine token answered ${atB.status} ${codeOf(atB.body) ?? "no code"}, want 401 unauthorized`,
     );
-  const control = await io.connect(p.agents.app, token);
+  const control = await io.connect(p.busa.app, token);
   if (control.status !== 101)
     throw new ProbeFail(
-      `control: ${p.agents.name} answered its own machine token with ${control.status}, want 101`,
+      `control: ${p.busa.name} answered its own machine token with ${control.status}, want 101`,
     );
   const content = await io.connect(p.busb.content, token);
   if (content.status === 101)
     throw new ProbeFail(
-      `${p.busb.name}'s content host upgraded ${p.agents.name}'s machine token (101)`,
+      `${p.busb.name}'s content host upgraded ${p.busa.name}'s machine token (101)`,
     );
   if ((await io.snapshotB()) !== before)
     throw new ProbeFail(
-      `${p.busb.name}'s /api/v1/bus/machines or roster changed after ${p.agents.name}'s token was tried there`,
+      `${p.busb.name}'s /api/v1/bus/machines or roster changed after ${p.busa.name}'s token was tried there`,
     );
 }
 
 // --- Case 2: suspend -----------------------------------------------------
 
-/** OA Bus's target for the close; the case notes a slower one. */
-export const CLOSE_SOON_MS = 30_000;
-/** The install index's second close pass (apps/server runtime/presence.ts SECOND_PASS_MS). */
-export const SECOND_PASS_MS = 120_000;
-/** The ceiling: that pass, and slack for the poll. */
-export const CLOSE_CEILING_MS = SECOND_PASS_MS + 15_000;
+/**
+ * OA Bus: the open daemon socket closes within this of the suspend job's
+ * done, or the case fails. The install index's 120 s pass is the hard
+ * ceiling of the design; anything past 30 s already fails here.
+ */
+export const CLOSE_WITHIN_MS = 30_000;
 /** The close code the hub closes a suspended member's daemon sockets with. */
 export const SUSPEND_CLOSE_CODE = 4403;
-/** How long reconnects must be refused after the close: past the 300 s last pass. */
-export const PAUSED_WINDOW_MS = 6 * 60_000;
-/** One reconnect per this, through the window. */
-export const PAUSED_POLL_MS = 30_000;
-/** Dispatch reads HOSTS (KV, up to 60 s to show): two periods for the first paused answer. */
-export const PAUSED_SETTLE_MS = 120_000;
+/**
+ * The reconnects, in ms after the suspend job's done. Dispatch refuses a
+ * paused install at the edge (OA Bus), so the install index's later passes
+ * (120 s, 300 s) don't bear on a reconnect: three probes across the first
+ * pass, the last just past it, each dispatch's paused answer, never 101.
+ */
+export const RECONNECT_AT_MS = [10_000, 60_000, 125_000] as const;
 /** A redelivery after the resume, and every frame wait. */
 export const FRAME_WAIT_MS = 30_000;
 const CLOSE_POLL_MS = 1_000;
-/** Case 2's vitest bound: two jobs at their bound, the close, the window and slack. */
+/** Case 2's vitest bound: two jobs at their bound, the probes and slack. */
 export const BUS_CASE_TIMEOUT_MS =
-  2 * JOB_WITHIN_MS + CLOSE_CEILING_MS + PAUSED_WINDOW_MS + 10 * 60_000;
+  2 * JOB_WITHIN_MS + (RECONNECT_AT_MS.at(-1) ?? 0) + 10 * 60_000;
 /** Case 1's: the pair's sign-in, a device flow (polls 5 s apart) and pacing waits. */
 export const CROSS_CASE_TIMEOUT_MS = 5 * 60_000;
 
@@ -239,7 +240,7 @@ export interface Daemon extends HeldSock {
 export interface SuspendIo {
   now(): number;
   wait(ms: number): Promise<void>;
-  /** On B (rl-agents' side of case 2): a bus socket with hello_ok. */
+  /** On rl-busa: a bus socket with hello_ok. */
   openBystander(): Promise<HeldSock>;
   /** On the suspended install: a daemon socket, two agents up, one message delivered, not acked. */
   openDaemon(): Promise<Daemon>;
@@ -258,30 +259,28 @@ export interface SuspendIo {
 export interface SuspendResult {
   closeMs: number;
   reconnects: number;
-  pausedMs: number;
 }
 
 /**
  * Case 2, OA Bus's assertions in order: with a daemon socket (an agent up and
- * one message pending) on the install and a socket on the other, suspend;
- * the daemon socket closes within CLOSE_CEILING_MS (target CLOSE_SOON_MS)
- * with 4403; for PAUSED_WINDOW_MS after the close every reconnect with the
- * same token is refused, never 101, and is dispatch's paused answer from the
- * first one that is (within PAUSED_SETTLE_MS) to the end; the other socket
- * stays open throughout; after the resume the same token gets 101, the
- * pending mail comes again and the hub still lists the machine and agent.
- * The resume is sent whatever failed after the suspend was sent; the first
- * failure is the one thrown.
+ * one message pending) on rl-busb and a socket on rl-busa, suspend rl-busb;
+ * the daemon socket closes within CLOSE_WITHIN_MS of the job's done with
+ * 4403; a reconnect with the same token at each RECONNECT_AT_MS is
+ * dispatch's paused answer, never 101; rl-busa's socket stays open
+ * throughout; after the resume the same token gets 101, the pending mail
+ * comes again and the hub still lists the machine and agent. The resume is
+ * sent whatever failed after the suspend was sent; the first failure is the
+ * one thrown.
  */
 export async function suspendCase(
   io: SuspendIo,
   p: BusPair,
 ): Promise<SuspendResult> {
   const X = p.busb.name;
-  const Y = p.agents.name;
+  const Y = p.busa.name;
   const bystander = await io.openBystander();
   const d = await io.openDaemon();
-  const out: SuspendResult = { closeMs: 0, reconnects: 0, pausedMs: 0 };
+  const out: SuspendResult = { closeMs: 0, reconnects: 0 };
   const stillUp = (when: string) => {
     if (!bystander.isOpen())
       throw new ProbeFail(`${Y}'s bus socket closed ${when}`);
@@ -294,48 +293,47 @@ export async function suspendCase(
     suspended = true;
     await io.suspend();
     const t0 = io.now();
-    let closed = false;
+    let closedAt: number | null = null;
     void d.closed.then(() => {
-      closed = true;
+      closedAt ??= io.now();
     });
-    while (!closed && io.now() - t0 < CLOSE_CEILING_MS)
-      await io.wait(CLOSE_POLL_MS);
-    if (!closed)
-      throw new ProbeFail(
-        `${X}'s daemon socket was still open ${CLOSE_CEILING_MS / 1000} s after the suspend`,
-      );
-    out.closeMs = io.now() - t0;
-    const code = d.closeCode();
-    if (code !== SUSPEND_CLOSE_CODE)
-      throw new ProbeFail(
-        `${X}'s daemon socket closed with ${code ?? "no code"}, want ${SUSPEND_CLOSE_CODE}`,
-      );
-    const start = io.now();
-    let pausedAt: number | null = null;
-    for (;;) {
+    const closeChecked = { done: false };
+    const checkClose = async () => {
+      // Waits to the deadline at most: slower than CLOSE_WITHIN_MS fails.
+      while (closedAt === null && io.now() - t0 < CLOSE_WITHIN_MS)
+        await io.wait(CLOSE_POLL_MS);
+      await Promise.resolve();
+      if (closedAt === null || closedAt - t0 > CLOSE_WITHIN_MS)
+        throw new ProbeFail(
+          `${X}'s daemon socket was still open ${CLOSE_WITHIN_MS / 1000} s after the suspend job was done`,
+        );
+      out.closeMs = closedAt - t0;
+      const code = d.closeCode();
+      if (code !== SUSPEND_CLOSE_CODE)
+        throw new ProbeFail(
+          `${X}'s daemon socket closed with ${code ?? "no code"}, want ${SUSPEND_CLOSE_CODE}`,
+        );
+      closeChecked.done = true;
+    };
+    for (const at of RECONNECT_AT_MS) {
+      // The close is judged at its deadline, between the probes around it.
+      if (!closeChecked.done && CLOSE_WITHIN_MS <= at) await checkClose();
+      const left = t0 + at - io.now();
+      if (left > 0) await io.wait(left);
       stillUp("while the other install was suspended");
       const r = await io.reconnect();
       out.reconnects++;
-      const at = io.now() - start;
+      const s = Math.round((io.now() - t0) / 1000);
       if (r.status === 101)
         throw new ProbeFail(
-          `${X} upgraded the daemon's token ${Math.round(at / 1000)} s into the suspend`,
+          `${X} upgraded the daemon's token ${s} s after the suspend`,
         );
-      if (r.paused) pausedAt ??= at;
-      else if (pausedAt !== null)
+      if (!r.paused)
         throw new ProbeFail(
-          `${X} answered a reconnect ${Math.round(at / 1000)} s into the suspend with ${r.status}, after dispatch's paused answer`,
+          `${X} answered a reconnect ${s} s after the suspend with ${r.status}, want dispatch's paused 503`,
         );
-      else if (at >= PAUSED_SETTLE_MS)
-        throw new ProbeFail(
-          `${X}: no paused answer from dispatch ${PAUSED_SETTLE_MS / 1000} s after the close (last ${r.status})`,
-        );
-      if (pausedAt !== null && at >= PAUSED_WINDOW_MS) {
-        out.pausedMs = at - pausedAt;
-        break;
-      }
-      await io.wait(PAUSED_POLL_MS);
     }
+    if (!closeChecked.done) await checkClose();
   } catch (e) {
     failure = e;
   }
@@ -767,7 +765,7 @@ export function listsName(v: unknown, name: string, depth = 0): boolean {
 /** The live case's wiring: the pair, both signed in, the Run for R7 and R8. */
 export interface LivePair {
   pair: BusPair;
-  agents: Signed;
+  busa: Signed;
   busb: Signed;
   run: Run;
 }
@@ -778,7 +776,7 @@ export async function livePair(
   const t = rawTargets(env.REDLINE_TARGETS);
   const pair = readBusPair(t.secretsDir);
   const m = mask(env);
-  const agents = await signIn(t.secretsDir, pair.agents, m);
+  const busa = await signIn(t.secretsDir, pair.busa, m);
   const busb = await signIn(t.secretsDir, pair.busb, m);
-  return { pair, agents, busb, run: liveRun(env, t) };
+  return { pair, busa, busb, run: liveRun(env, t) };
 }
