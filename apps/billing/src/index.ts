@@ -157,6 +157,26 @@ const yearlyOn = (env: Env) => {
 };
 
 /**
+ * True only when live Stripe is set up here: the secret key and the Solo
+ * monthly, Team and Business prices are all set (a deploy placeholder is not
+ * a price id). Install-facing, so it answers yes or no and never the values.
+ */
+const checkoutOn = (env: Env) =>
+  typeof env.STRIPE_SECRET_KEY === "string" &&
+  /^sk_[A-Za-z0-9_]+$/.test(env.STRIPE_SECRET_KEY) &&
+  [
+    env.STRIPE_PRICE_SOLO_MONTHLY,
+    env.STRIPE_PRICE_TEAM,
+    env.STRIPE_PRICE_BUSINESS,
+  ].every((v) => typeof v === "string" && PRICE_ID.test(v));
+
+/** The env-wide flags every tier answer carries. */
+const flagsOf = (env: Env) => ({
+  yearlyTeamBusiness: yearlyOn(env),
+  checkout: checkoutOn(env),
+});
+
+/**
  * Every yearly overage invoice whose payment failed and is still unpaid
  * (not paid, voided or marked uncollectible since): the total due in cents
  * (each invoice's own amount_due, tax and discounts included) and the months.
@@ -186,7 +206,7 @@ async function overageDueOf(
 function view(
   r: TierRow | null,
   now: number,
-  yearlyTeamBusiness: boolean,
+  flags: { yearlyTeamBusiness: boolean; checkout: boolean },
   overageDue: OverageDue | null = null,
 ) {
   if (!r)
@@ -197,7 +217,7 @@ function view(
       graceUntil: null,
       soloTrialEndsAt: null,
       hasCustomer: false,
-      yearlyTeamBusiness,
+      ...flags,
       overageDue: null,
       version: 0,
       asOf: now,
@@ -217,7 +237,7 @@ function view(
     // Whether a Stripe customer exists (the portal needs one). The id
     // itself never leaves billing.
     hasCustomer: r.has_customer === 1,
-    yearlyTeamBusiness,
+    ...flags,
     // A yearly overage invoice whose payment failed and is unpaid (#2246).
     // A notice only: it never moves tier, status or grace.
     overageDue,
@@ -774,7 +794,7 @@ async function tier(env: Env, install: string, now: number) {
   const r = await db.prepare(READ_SQL).bind(install, now).first<TierRow>();
   console.log("billing tier", r ? "row" : "default", install);
   return Response.json(
-    view(r, now, yearlyOn(env), r ? await overageDueOf(db, install) : null),
+    view(r, now, flagsOf(env), r ? await overageDueOf(db, install) : null),
   );
 }
 
@@ -838,14 +858,14 @@ async function trialStart(
   if (started) {
     console.log("billing trial started", install);
     return Response.json(
-      view(started, now, yearlyOn(env), await overageDueOf(db, install)),
+      view(started, now, flagsOf(env), await overageDueOf(db, install)),
     );
   }
   // Any other state: unchanged, and still a 200.
   const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
   console.log("billing trial unchanged", install);
   return Response.json(
-    view(r, now, yearlyOn(env), r ? await overageDueOf(db, install) : null),
+    view(r, now, flagsOf(env), r ? await overageDueOf(db, install) : null),
   );
 }
 
@@ -890,7 +910,7 @@ async function soloStartCore(
   const unchanged = async (): Promise<SoloStartResult> => {
     const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
     console.log("billing solo unchanged", install);
-    return soloOk(view(r, now, yearlyOn(env)));
+    return soloOk(view(r, now, flagsOf(env)));
   };
   // One trial per install, and nothing beside a subscription already there.
   if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
@@ -923,7 +943,7 @@ async function soloStartCore(
     .first<TierRow>();
   if (started) {
     console.log("billing solo started", install);
-    return soloOk(view(started, now, yearlyOn(env)));
+    return soloOk(view(started, now, flagsOf(env)));
   }
   return unchanged();
 }

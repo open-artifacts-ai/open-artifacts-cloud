@@ -545,6 +545,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      checkout: false,
       overageDue: null,
       version: 3,
       asOf: NOW,
@@ -564,6 +565,40 @@ describe("GET /tier", () => {
       await call(gated("GET", "/tier", undefined, { "x-oa-gate-install": B }))
     ).json();
     expect(b).toMatchObject({ hasCustomer: true });
+  });
+
+  it("checkout is true only when the Stripe key and the Solo monthly, Team and Business prices are all set", async () => {
+    at();
+    await seed([{ install: A }]);
+    const ask = async (e: Env) =>
+      (
+        await billing.fetch(
+          (await gated("GET", "/tier")) as Parameters<typeof billing.fetch>[0],
+          e,
+        )
+      ).json();
+    const live = {
+      ...env,
+      STRIPE_SECRET_KEY: "sk_test_x",
+      STRIPE_PRICE_SOLO_MONTHLY: "price_s",
+      STRIPE_PRICE_TEAM: "price_t",
+      STRIPE_PRICE_BUSINESS: "price_b",
+    } as Env;
+    expect(await ask(live)).toMatchObject({ checkout: true });
+    for (const k of [
+      "STRIPE_SECRET_KEY",
+      "STRIPE_PRICE_SOLO_MONTHLY",
+      "STRIPE_PRICE_TEAM",
+      "STRIPE_PRICE_BUSINESS",
+    ] as const) {
+      for (const bad of [undefined, "", " ", `{{${k}_PROD}}`]) {
+        expect(await ask({ ...live, [k]: bad } as Env)).toMatchObject({
+          checkout: false,
+        });
+      }
+    }
+    // The key itself never leaves billing.
+    expect(JSON.stringify(await ask(live))).not.toContain("sk_test_x");
   });
 
   it("yearlyTeamBusiness is true only when both yearly price ids are set", async () => {
@@ -610,6 +645,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness: false,
+      checkout: false,
       overageDue: null,
       version: 0,
       asOf: NOW,
@@ -664,6 +700,7 @@ describe("POST /trial/start", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      checkout: false,
       overageDue: null,
       version: 5,
       asOf: NOW,
