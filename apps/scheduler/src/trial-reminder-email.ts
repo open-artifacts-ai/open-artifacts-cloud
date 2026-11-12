@@ -66,7 +66,7 @@ export function trialReminderEmail(o: {
     "Add a card before then to keep publishing. If you do nothing, your workspace turns read-only when the trial ends. Nothing is deleted.";
   const button = "Add a card";
   const preheader = `Your free 30 days end on ${date}. Add a card to keep Solo for $10 a year or $1 a month.`;
-  const why = `You got this because you created ${host}. We send one a week before the free 30 days end and one on its last day.`;
+  const why = `You got this because you created ${host}. We send one a week before your free 30 days end, and one on the last day.`;
   const to = oneLine(o.to);
 
   const text = [
