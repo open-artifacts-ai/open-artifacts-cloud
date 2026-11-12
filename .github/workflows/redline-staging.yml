@@ -24,8 +24,10 @@
 # Why T19 may run beside the suite (it once ran after it, "both write to rl-a
 # through its hooks"): the hook rate limit, the code caps and every RL_ANON key
 # are per IP, per user or per client, and the t19 job is another runner with
-# its own hook ledger and its own users (t19-<run>-*). That it also has its own
-# IP is ASSUMED (separate GitHub-hosted VMs), not verified. If the two runners
+# its own hook ledger and its own users (t19-<run>-*), plus one shared member:
+# the oauth-client hook's fixed p5-oauth@TEST_DOMAIN (#2285), whose every call
+# mints a new OAuth client and which the suite uses only as a credential. That it
+# also has its own IP is ASSUMED (separate GitHub-hosted VMs), not verified. If the two runners
 # did share an IP, the hook bucket (30 a minute) would be spent by both ledgers
 # (25 each) and a hook call could get RL_ANON's bare 404; T19's code-caps reset
 # could clear the suite's per-IP caps. Cases then fail, never pass wrongly: the

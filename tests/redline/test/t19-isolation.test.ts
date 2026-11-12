@@ -103,12 +103,20 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     return out;
   };
 
-  it("calls three hooks only: session, codeCapsReset (its own IP's caps) and otpLatest", () => {
+  it("calls four hooks only: session, oauthClient (the p5-oauth member's grant, #2285), codeCapsReset (its own IP's caps) and otpLatest", () => {
     const used = new Set<string>();
     for (const f of t19Files())
       for (const m of read(f).matchAll(/TEST_HOOKS\.(\w+)/g))
         used.add(m[1] as string);
-    expect([...used].sort()).toEqual(["codeCapsReset", "otpLatest", "session"]);
+    // oauthClient signs in only the fixed member p5-oauth@TEST_DOMAIN and mints a
+    // new OAuth client per call (no shared tok: bucket); the suite uses that
+    // member only as a credential, never reading its artifacts or comments.
+    expect([...used].sort()).toEqual([
+      "codeCapsReset",
+      "oauthClient",
+      "otpLatest",
+      "session",
+    ]);
   });
 
   it("the hook rate limit is per install and IP, and the caps reset deletes only the caller's IP's rows", () => {
