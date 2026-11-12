@@ -1532,6 +1532,35 @@ async function applyQuantity(
     .bind(install, month, quantity, now, r.outcome)
     .run();
   console.log("billing usage quantity", r.outcome, install, quantity);
+  if (r.outcome === "updated" && !force) {
+    // A concurrent write for an older month (the cron's retry) may have landed
+    // after ours and before this was recorded: if this month is still the
+    // latest applied, make sure Stripe holds its quantity (one more read, and
+    // one more write only when it differs; never a loop).
+    try {
+      const latest = await db
+        .prepare(LATEST_APPLIED_SQL)
+        .bind(install)
+        .first<{ month: string }>();
+      if (latest?.month === month) {
+        const v = await stripe(install, () =>
+          setSubscriptionQuantity(
+            {
+              subscriptionId,
+              quantity,
+              monthlyPriceIds: typeof priceId === "string" ? [priceId] : [],
+              idempotencyKey: `qty-${install}-${month}-${quantity}-${now}-v`,
+            },
+            cfg,
+          ),
+        );
+        if (v.outcome === "updated")
+          console.log("billing usage quantity corrected", install);
+      }
+    } catch {
+      console.error("billing usage quantity verify failed", install);
+    }
+  }
   return null;
 }
 
@@ -1575,15 +1604,18 @@ export const RETRY_QUIET_MS = 24 * 3_600_000;
 // Unapplied: a month the instance sent once and billing never applied.
 // A yearly overage that failed or had no card (its own outcomes) is per
 // month: the invoices are independent. A monthly quantity is a "latest
-// wins" setting, so only the install's latest closed month with a stored
-// report is retried (outcome NULL or failed); older ones are 'superseded'.
+// wins" setting: a NULL or failed month is 'superseded' only when a LATER
+// month was applied as a quantity (which only a monthly subscription ever
+// records); a yearly install's months never are, so its overage is kept.
+// applyQuantity itself answers 'stale' for the same case.
 // Months with usage.count NULL were never stored whole. Binds: ?1 the
 // current month, ?2 the oldest month scanned, ?3 the latest received_at.
-const LATEST_CLOSED =
-  "SELECT max(l.month) FROM usage l WHERE l.install_id = usage.install_id AND l.month < ?1 AND l.count IS NOT NULL";
-const UNAPPLIED_WHERE = `month < ?1 AND month >= ?2 AND received_at <= ?3 AND count IS NOT NULL AND (apply_outcome IN ('overage_failed', 'no_payment_method') OR ((apply_outcome IS NULL OR apply_outcome = 'failed') AND month = (${LATEST_CLOSED})))`;
+const LATER_APPLIED =
+  "EXISTS (SELECT 1 FROM usage l WHERE l.install_id = usage.install_id AND l.month > usage.month AND l.month < ?1 AND l.applied_quantity IS NOT NULL)";
+const UNAPPLIED_WHERE =
+  "month < ?1 AND month >= ?2 AND received_at <= ?3 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome IN ('failed', 'overage_failed', 'no_payment_method'))";
 const UNAPPLIED_SQL = `SELECT install_id, month, count FROM usage WHERE ${UNAPPLIED_WHERE} ORDER BY coalesce(retried_at, 0), month, install_id`;
-const SUPERSEDE_SQL = `UPDATE usage SET apply_outcome = 'superseded' WHERE month < ?1 AND month >= ?2 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome = 'failed') AND month < (${LATEST_CLOSED})`;
+const SUPERSEDE_SQL = `UPDATE usage SET apply_outcome = 'superseded' WHERE month < ?1 AND month >= ?2 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome = 'failed') AND ${LATER_APPLIED}`;
 const RETRIED_SQL =
   "UPDATE usage SET retried_at = ?3 WHERE install_id = ?1 AND month = ?2";
 const LATEST_APPLIED_SQL =
