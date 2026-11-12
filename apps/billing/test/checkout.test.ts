@@ -1834,6 +1834,45 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
     expect(q).toBe(7);
   });
 
+  it("a live report that answers unchanged is verified too: Stripe already at 7, the cron's older write lands after the read, and it ends at 7", async () => {
+    await live();
+    const older = shift(-2);
+    await db
+      .prepare(
+        "INSERT INTO usage (install_id, month, creators_json, count, received_at, apply_outcome) VALUES (?1, ?2, '[]', 3, 1, 'failed')",
+      )
+      .bind(A, older)
+      .run();
+    let q = 7;
+    const posts: number[] = [];
+    let gets = 0;
+    let nested = false;
+    fakeStripe(async (c) => {
+      if (c.method === "GET" && c.path === SUBS) {
+        const snapshot = subscription({ quantity: q });
+        gets += 1;
+        if (gets === 1 && !nested) {
+          nested = true;
+          // After /usage read 7 (so it will answer unchanged), the cron writes.
+          await billing.scheduled(
+            { scheduledTime: Date.now(), cron: "17 3 * * *", noRetry() {} },
+            env,
+          );
+        }
+        return snapshot;
+      }
+      if (c.method === "POST" && c.path === ITEM) {
+        q = Number(c.form.quantity);
+        posts.push(q);
+        return Response.json({ id: "si_itemA", quantity: q });
+      }
+      return undefined;
+    });
+    expect((await call(report(closed, 7))).status).toBe(200);
+    expect(posts).toEqual([3, 7]);
+    expect(q).toBe(7);
+  });
+
   it("a closed month sets the quantity once, with no proration; a repeat is a no-op", async () => {
     await live();
     const s = fake();
@@ -1870,7 +1909,11 @@ describe("POST /usage sets the monthly Team or Business quantity (#2123)", () =>
     await live("business");
     const s = fake({ price: "price_business1", quantity: 4 });
     expect((await call(report(closed, 4))).status).toBe(200);
-    expect(s.calls.map((c) => [c.method, c.path])).toEqual([["GET", SUBS]]);
+    // The second read is the /usage verify after recording.
+    expect(s.calls.map((c) => [c.method, c.path])).toEqual([
+      ["GET", SUBS],
+      ["GET", SUBS],
+    ]);
     expect(await usageRow(closed)).toMatchObject({
       applied_quantity: 4,
       apply_outcome: "unchanged",
@@ -3115,6 +3158,18 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       await cron();
       expect(s.calls).toEqual([]);
       expect(await outcomeOf()).toBe("overage_invoiced");
+    });
+
+    it("a month from the yearly era never sets a monthly subscription's quantity: it ends plan_changed", async () => {
+      await live();
+      await insertUsage(A, closed, "no_payment_method");
+      const s = fake({ sub: { price: "price_team1", interval: "month" } });
+      await cron();
+      expect(s.calls.filter((c) => c.method === "POST")).toEqual([]);
+      expect(await outcomeOf()).toBe("plan_changed");
+      s.calls.length = 0;
+      await cron();
+      expect(s.calls).toEqual([]);
     });
 
     it("rows marked legacy are never retried", async () => {

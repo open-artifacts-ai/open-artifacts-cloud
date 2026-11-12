@@ -1419,6 +1419,7 @@ async function applyQuantity(
   count: number,
   now: number,
   force = false,
+  yearlyEra = false,
 ): Promise<Response | null> {
   if (month >= monthOf(now)) return null;
   const db = env.BILLING_DB;
@@ -1485,6 +1486,7 @@ async function applyQuantity(
           // month-and-quantity key would leave 3 -> 5 -> 3 at 5. The write
           // sets an absolute quantity, so a new key per attempt is safe.
           idempotencyKey: `qty-${install}-${month}-${quantity}-${now}`,
+          ...(yearlyEra ? { forbidMonthly: true } : {}),
         },
         cfg,
       ),
@@ -1525,6 +1527,8 @@ async function applyQuantity(
         now,
       );
   }
+  if (r.outcome === "plan_changed")
+    console.log("billing usage plan_changed", install);
   if (r.outcome !== "updated" && r.outcome !== "unchanged")
     return outcome(r.outcome);
   await db
@@ -1532,7 +1536,7 @@ async function applyQuantity(
     .bind(install, month, quantity, now, r.outcome)
     .run();
   console.log("billing usage quantity", r.outcome, install, quantity);
-  if (r.outcome === "updated" && !force) {
+  if ((r.outcome === "updated" || r.outcome === "unchanged") && !force) {
     // A concurrent write for an older month (the cron's retry) may have landed
     // after ours and before this was recorded: if this month is still the
     // latest applied, make sure Stripe holds its quantity (one more read, and
@@ -1614,7 +1618,7 @@ const LATER_APPLIED =
   "EXISTS (SELECT 1 FROM usage l WHERE l.install_id = usage.install_id AND l.month > usage.month AND l.month < ?1 AND l.applied_quantity IS NOT NULL)";
 const UNAPPLIED_WHERE =
   "month < ?1 AND month >= ?2 AND received_at <= ?3 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome IN ('failed', 'overage_failed', 'no_payment_method'))";
-const UNAPPLIED_SQL = `SELECT install_id, month, count FROM usage WHERE ${UNAPPLIED_WHERE} ORDER BY coalesce(retried_at, 0), month, install_id`;
+const UNAPPLIED_SQL = `SELECT install_id, month, count, apply_outcome FROM usage WHERE ${UNAPPLIED_WHERE} ORDER BY coalesce(retried_at, 0), month, install_id`;
 const SUPERSEDE_SQL = `UPDATE usage SET apply_outcome = 'superseded' WHERE month < ?1 AND month >= ?2 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome = 'failed') AND ${LATER_APPLIED}`;
 const RETRIED_SQL =
   "UPDATE usage SET retried_at = ?3 WHERE install_id = ?1 AND month = ?2";
@@ -1654,6 +1658,7 @@ export async function retryUnapplied(env: Env, now: number): Promise<void> {
         install_id: string;
         month: string;
         count: number;
+        apply_outcome: string | null;
       }>()
   ).results;
   let tried = 0;
@@ -1662,7 +1667,18 @@ export async function retryUnapplied(env: Env, now: number): Promise<void> {
     tried += 1;
     try {
       await db.prepare(RETRIED_SQL).bind(r.install_id, r.month, now).run();
-      await applyQuantity(env, r.install_id, r.month, r.count, now);
+      // A month left from the yearly era must not set a monthly quantity if
+      // the subscription is monthly now (it ends 'plan_changed').
+      await applyQuantity(
+        env,
+        r.install_id,
+        r.month,
+        r.count,
+        now,
+        false,
+        r.apply_outcome === "overage_failed" ||
+          r.apply_outcome === "no_payment_method",
+      );
       const latest = await db
         .prepare(LATEST_APPLIED_SQL)
         .bind(r.install_id)
