@@ -77,6 +77,11 @@ ALLOW=(
   scripts/ci/turnstile-domains.sh
   scripts/ci/turnstile-domains.test.ts
   .github/workflows/t19-dry-run.yml
+  # The read-only prod TIER-binding audit (#218), this repo's own.
+  .github/workflows/tier-audit.yml
+  scripts/ci/tier-audit.sh
+  scripts/ci/tier-audit.test.ts
+  scripts/ci/tier-audit-workflow.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
