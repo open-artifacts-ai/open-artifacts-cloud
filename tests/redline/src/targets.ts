@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { describeRes, readBody, retryIdempotent } from "./http.ts";
 import { AUDIENCES, canMint, jwtSource, mask, OIDC_FILES } from "./oidc.ts";
 
+// Billing fixture of the two installs (bring-up checks it, docs/ops/hosted.md):
+// rl-a: Team (T19 checks its features); rl-b: Business (directory sync is
+// Business-only, #2169).
+//
 // REDLINE_TARGETS: the two installs (and the prod probe) the suite runs
 // against. Secrets are never in the JSON: only paths of 0600 files, read here
 // and kept off the Target object (a WeakMap), so printing a Target, a test

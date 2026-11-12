@@ -229,3 +229,37 @@ describe("bringUp waits for the new hook key to take effect", () => {
     expect(Date.now() - t0).toBeLessThan(1500);
   });
 });
+
+describe("bringUp checks the tier fixture (rl-a Team, rl-b Business)", () => {
+  const me = (f: FakeApi) => f.log.filter((l) => l.endsWith("/api/v1/me"));
+
+  it("the right tiers pass, one /me read per install", async () => {
+    const { f, t } = setup();
+    const out = quiet();
+    await bringUp({}, t, new Run(CONFIG, f.io), noPace);
+    expect(me(f)).toHaveLength(2);
+    const text = out.mock.calls.map((c) => String(c[0])).join("");
+    expect(text).toContain("rl-a: tier is team");
+    expect(text).toContain("rl-b: tier is business");
+  });
+
+  it.each([
+    ["a", CONFIG.rlA.id, "rl-a", "business", "team"],
+    ["b", CONFIG.rlB.id, "rl-b", "team", "business"],
+  ])(
+    "a wrong tier on %s fails as infra with the fixture message",
+    async (_k, id, slug, got, want) => {
+      const { f, t } = setup();
+      f.tiers.set(id, got);
+      quiet();
+      const err = await bringUp({}, t, new Run(CONFIG, f.io), noPace).then(
+        () => null,
+        (e: Error) => e,
+      );
+      expect(err?.name).toBe("InfraError");
+      expect(err?.message).toContain(
+        `${slug} is on ${got}, want ${want}: the red-line fixture is rl-a Team, rl-b Business (docs/ops/hosted.md). Fix the staging tier, then rerun.`,
+      );
+    },
+  );
+});
