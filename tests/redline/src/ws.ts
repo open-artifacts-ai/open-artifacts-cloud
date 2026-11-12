@@ -173,6 +173,16 @@ export function textFrame(text: string): Buffer {
   return Buffer.concat([head, mask, body]);
 }
 
+/** One masked client close frame (RFC 6455 5.5.1) echoing `code` (none if null). */
+export function closeFrame(code: number | null): Buffer {
+  const mask = randomBytes(4);
+  const body = Buffer.alloc(code === null ? 0 : 2);
+  if (code !== null) body.writeUInt16BE(code);
+  for (let i = 0; i < body.length; i++)
+    body[i] = (body[i] as number) ^ (mask[i % 4] as number);
+  return Buffer.concat([Buffer.from([0x88, 0x80 | body.length]), mask, body]);
+}
+
 /** The bus keepalive cadence (bus-protocol limits.pingIntervalMs). */
 export const KEEPALIVE_MS = 25_000;
 
@@ -216,16 +226,20 @@ export async function holdSocket(
     };
   let ended = false;
   const waiters = new Set<() => void>();
+  let endNow!: () => void;
   const closed = new Promise<void>((resolve) => {
     const end = () => {
       ended = true;
       for (const w of waiters) w();
       resolve();
     };
+    endNow = end;
     socket.once("close", end);
     socket.once("end", end);
     socket.once("error", end);
   });
+  // Writes after the peer is gone may error; closed already settled.
+  socket.on("error", () => {});
   let buf: Buffer = Buffer.alloc(0);
   let code: number | null = null;
   socket.on("data", (d: Buffer) => {
@@ -247,13 +261,28 @@ export async function holdSocket(
       const op = (buf[0] as number) & 0x0f;
       if (op === 1) texts.push(buf.subarray(off, off + len).toString("utf8"));
       // A close frame: its first two payload bytes are the code.
-      if (op === 8 && code === null && len >= 2) code = buf.readUInt16BE(off);
+      if (op === 8) {
+        if (code === null && len >= 2) code = buf.readUInt16BE(off);
+        // Echo the close (the server waits for it, e.g. behind an edge),
+        // settle `closed`, then end the socket; destroy if it lingers.
+        if (!ended) {
+          endNow();
+          clearInterval(ping);
+          if (!socket.destroyed) {
+            socket.write(closeFrame(code));
+            socket.end();
+            setTimeout(() => socket.destroy(), 1000).unref();
+          }
+        }
+        buf = Buffer.alloc(0);
+        return;
+      }
       buf = buf.subarray(off + len);
     }
     for (const w of waiters) w();
   });
   const ping = setInterval(() => {
-    if (!socket.destroyed) socket.write(textFrame("ping"));
+    if (!socket.destroyed && !ended) socket.write(textFrame("ping"));
   }, o.pingMs ?? KEEPALIVE_MS);
   ping.unref();
   void closed.then(() => clearInterval(ping));
@@ -262,7 +291,7 @@ export async function holdSocket(
     closed,
     texts,
     send: (text) => {
-      if (!socket.destroyed) socket.write(textFrame(text));
+      if (!socket.destroyed && !ended) socket.write(textFrame(text));
     },
     destroy: () => {
       clearInterval(ping);
