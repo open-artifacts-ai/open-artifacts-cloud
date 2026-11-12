@@ -1,5 +1,5 @@
-// tier-audit.sh: which prod install Workers have a binding named TIER, names
-// only. curl is a stub that refuses any non-GET shape; the token reaches it on
+// tier-audit.sh: which prod install Workers lack a binding named TIER. Job logs are
+// public: no count, no name of an install that is fine. curl is a stub that refuses any non-GET shape; the token reaches it on
 // stdin only; no binding value, type or other name may reach the output.
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -78,7 +78,7 @@ const run = (
 const ids = (...n: string[]) => ok(n.map((id) => ({ id })));
 
 describe("tier-audit.sh", () => {
-  it("prints names and yes/no only, and counts, even when a TIER value is present", () => {
+  it("prints only the scripts without TIER and a without-count, even when a TIER value is present", () => {
     const r = run({
       "list-1": ids("i-a", "i-b", "i-c"),
       "set-i-a": settings([OTHER_B, TIER_B]),
@@ -87,12 +87,23 @@ describe("tier-audit.sh", () => {
     });
     expect(r.code).toBe(0);
     expect(r.out.split("\n")).toEqual([
-      "i-a TIER=yes",
       "i-b TIER=no",
       "i-c TIER=no",
-      "total=3 with_tier=1 without_tier=2 errors=0",
+      "2 without TIER",
       "",
     ]);
+    expect(r.out).not.toContain("i-a");
+    expect(r.out).not.toMatch(/total|with_tier|TIER=yes/);
+  });
+
+  it("says every install has TIER and prints no name or count", () => {
+    const r = run({
+      "list-1": ids("i-a", "i-b"),
+      "set-i-a": settings([TIER_B]),
+      "set-i-b": settings([OTHER_B, TIER_B]),
+    });
+    expect(r.code).toBe(0);
+    expect(r.out).toBe("every install has TIER\n");
   });
 
   it("matches the binding name exactly", () => {
@@ -100,7 +111,7 @@ describe("tier-audit.sh", () => {
       "list-1": ids("i-a"),
       "set-i-a": settings([{ name: "TIER_X" }, { name: "tier" }]),
     });
-    expect(r.out).toContain("i-a TIER=no");
+    expect(r.out).toBe("i-a TIER=no\n1 without TIER\n");
   });
 
   it("follows pagination and counts each script once", () => {
@@ -112,7 +123,7 @@ describe("tier-audit.sh", () => {
       "set-i-c": settings([]),
     });
     expect(r.code).toBe(0);
-    expect(r.out).toContain("total=3 with_tier=2 without_tier=1 errors=0");
+    expect(r.out).toBe("i-c TIER=no\n1 without TIER\n");
     const lists = r.log.filter((l) => l.includes("per_page="));
     expect(lists).toHaveLength(2);
     expect(lists[1]).toContain("page=2");
@@ -127,7 +138,7 @@ describe("tier-audit.sh", () => {
     for (const x of full) files[`set-${x.id}`] = settings([]);
     const r = run(files);
     expect(r.code).toBe(0);
-    expect(r.out).toContain("total=100 with_tier=0 without_tier=100 errors=0");
+    expect(r.out).toContain("100 without TIER");
   });
 
   it("names a failing script with status and error codes only, and exits 1", () => {
@@ -142,7 +153,9 @@ describe("tier-audit.sh", () => {
     });
     expect(r.code).toBe(1);
     expect(r.out).toContain("i-b ERROR HTTP 403 codes=10000");
-    expect(r.out).toContain("total=2 with_tier=1 without_tier=0 errors=1");
+    expect(r.out).toContain("errors=1");
+    expect(r.out).not.toContain("every install has TIER");
+    expect(r.out).not.toContain("i-a");
   });
 
   it.each([
@@ -168,12 +181,14 @@ describe("tier-audit.sh", () => {
     const r = run({ "list-1": ids("i-a"), "set-i-a": ok({}) });
     expect(r.code).toBe(1);
     expect(r.out).toContain("i-a ERROR no bindings list");
+    expect(r.out).toContain("errors=1");
   });
 
   it("skips a script name that is not a plain name, without requesting it", () => {
     const r = run({ "list-1": ids("../x", "i-a"), "set-i-a": settings([]) });
     expect(r.code).toBe(1);
-    expect(r.out).toContain("ERROR unexpected name");
+    expect(r.out).toContain("ERROR unexpected script name");
+    expect(r.out).not.toMatch(/#\d/);
     expect(r.out).not.toContain("../x");
     expect(r.log.filter((l) => l.includes("settings"))).toHaveLength(1);
   });

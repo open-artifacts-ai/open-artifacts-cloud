@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Read-only audit of prod's install Workers (tier-audit.yml, #218): lists every
 # script in the Workers-for-Platforms dispatch namespace and prints one line
-# per script, "<script> TIER=yes|no", for whether it has a binding NAMED TIER.
-# Job logs are public: only script names, yes/no and counts are printed. A
-# binding's value, type or any other binding never leaves jq, and no response
-# body is echoed. A failed call prints the script name and the HTTP status and
-# Cloudflare error codes only.
+# per script WITHOUT a binding NAMED TIER, "<script> TIER=no", and nothing for
+# the ones that have it.
+# Job logs are public (so is this repo): the install count and the names of
+# installs that are fine are never printed. Only scripts without TIER, ERROR
+# lines and one closing line ("every install has TIER" or "N without TIER",
+# plus "errors=N" when nonzero) reach the log. A binding's value, type or any
+# other binding never leaves jq, and no response body is echoed. A failed call
+# prints the script name and the HTTP status and Cloudflare error codes only.
 # GET only: the one request helper (get) takes a path and no method, and the
 # curl line carries no -X, --request or body flag.
 # The token reaches curl on stdin (-K -), never argv.
@@ -70,7 +73,7 @@ while IFS= read -r s; do
   [ -n "$s" ] || continue
   total=$((total + 1))
   if ! [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-    echo "script #$total ERROR unexpected name"
+    echo "ERROR unexpected script name"
     errors=$((errors + 1))
     continue
   fi
@@ -88,11 +91,18 @@ while IFS= read -r s; do
   has="$(jq -r 'if (.result.bindings | type) == "array"
     then (any(.result.bindings[]; .name == "TIER") | tostring) else "bad" end' <<< "$BODY" 2> /dev/null || echo bad)"
   case "$has" in
-    true) echo "$s TIER=yes"; with=$((with + 1)) ;;
+    true) with=$((with + 1)) ;;
     false) echo "$s TIER=no"; without=$((without + 1)) ;;
     *) echo "$s ERROR no bindings list"; errors=$((errors + 1)) ;;
   esac
 done <<< "$names"
 
-echo "total=$total with_tier=$with without_tier=$without errors=$errors"
-[ "$errors" -eq 0 ] || exit 1
+if [ "$without" -gt 0 ]; then
+  echo "$without without TIER"
+elif [ "$errors" -eq 0 ] && [ "$total" -gt 0 ]; then
+  echo "every install has TIER"
+elif [ "$total" -eq 0 ]; then
+  echo "no installs listed"
+  errors=$((errors + 1))
+fi
+[ "$errors" -eq 0 ] || { echo "errors=$errors"; exit 1; }

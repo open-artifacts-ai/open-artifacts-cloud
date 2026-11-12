@@ -1,7 +1,9 @@
 # Lists prod's install Workers and whether each has a binding named TIER, by
 # hand only (docs/ops/hosted.md, #218): GET calls through scripts/ci/tier-audit.sh,
-# which prints script names, yes/no and counts, never a binding's value or
-# type. Job logs are public. Only main may run it, in the prod Environment.
+# which prints only the scripts without TIER, errors and one closing line:
+# never the install count, the names of installs that are fine, or a binding's
+# value or type. This repo and its job logs are public. Only main may run it,
+# in the prod Environment.
 name: tier-audit
 
 on:

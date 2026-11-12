@@ -639,7 +639,7 @@ TODO (Platform): before directory sync is enabled on any env that already has br
 
 ### Which prod install Workers have a TIER binding (`tier-audit.yml`, #218)
 
-`tier-audit.yml` is dispatch-only, has no inputs and runs only from main, in `hosted-prod-deploy`. It runs `scripts/ci/tier-audit.sh`, which lists every Worker in the `dispatch_namespace` of `.github/hosted/prod.json` (all pages) and reads each one's settings, with GET calls only. It prints `<script> TIER=yes|no` (whether a binding is named `TIER`) and a final `total`, `with_tier`, `without_tier` and `errors` line. Job logs are public, so it never prints a binding's value, type or any other binding's name; a failed call prints the script name, the HTTP status and the Cloudflare error codes only, and the job then fails.
+`tier-audit.yml` is dispatch-only, has no inputs and runs only from main, in `hosted-prod-deploy`. It runs `scripts/ci/tier-audit.sh`, which lists every Worker in the `dispatch_namespace` of `.github/hosted/prod.json` (all pages) and reads each one's settings, with GET calls only. This repo and its job logs are public, so it prints only the scripts without a binding named `TIER` (`<script> TIER=no`), any `ERROR` lines, and one closing line: `every install has TIER` or `N without TIER`, plus `errors=N` when nonzero. It never prints the install count, the names of installs that have `TIER`, or a binding's value, type or any other binding's name. A failed call prints the script name, the HTTP status and the Cloudflare error codes only, and the job then fails.
 
 ### Staging test admin for agents (`staging-test-admin.yml`, #1053)
 
