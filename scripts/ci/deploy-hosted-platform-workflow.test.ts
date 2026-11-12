@@ -278,7 +278,7 @@ describe("deploy-hosted-platform.yml", () => {
     );
     // The constants and the id lookup are main's too, never the tag's.
     expect(use).toContain(
-      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh; do",
+      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh; do",
     );
     expect(use).toContain(
       'cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"',
@@ -315,7 +315,13 @@ describe("deploy-hosted-platform.yml", () => {
     expect(i("The tag is newer than prod's")).toBe(
       i("Resolve the resource ids") - 1,
     );
-    expect(i("Resolve the resource ids")).toBe(i("Deploy and verify") - 1);
+    // The Email Sending check (#967) is the last gate before the deploy.
+    expect(i("Resolve the resource ids")).toBe(
+      i("The senders' domain is onboarded in Email Sending") - 1,
+    );
+    expect(i("The senders' domain is onboarded in Email Sending")).toBe(
+      i("Deploy and verify") - 1,
+    );
     expect(named("Load the hosted constants")).toMatchObject({
       env: { DEPLOY_ENV: "${{ inputs.env }}" },
       run: 'bash "$RUNNER_TEMP/main-ci/hosted-constants.sh" "$DEPLOY_ENV" "$RUNNER_TEMP/main-ci/hosted"',
@@ -385,6 +391,7 @@ describe("deploy-hosted-platform.yml", () => {
       "The deploy token is the Environment's",
       "The tag is newer than prod's",
       "Resolve the resource ids",
+      "The senders' domain is onboarded in Email Sending",
       "Deploy and verify",
       "Zones",
       "Scheduler, last",
@@ -1191,7 +1198,32 @@ describe("deploy-hosted-platform.yml", () => {
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|continue-on-error/);
     expect(g.shell).toBeUndefined();
     expect(text).toContain(
-      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh;",
+      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh;",
     );
+  });
+
+  it("proves the senders' domain is onboarded in Email Sending before the first target, verify_only included (#967)", () => {
+    const at = steps.findIndex(
+      (s) => s.name === "The senders' domain is onboarded in Email Sending",
+    );
+    const deploy = steps.findIndex((s) => s.name === "Deploy and verify");
+    // Before every target: the deploy loop, the zones and the scheduler.
+    for (const n of ["Deploy and verify", "Zones", "Scheduler, last"])
+      expect(at).toBeLessThan(steps.findIndex((s) => s.name === n));
+    expect(at).toBe(deploy - 1);
+    const g = steps[at];
+    // main's copy of the script and constants, GETs through the deploy token,
+    // and no condition that would skip it: verify_only runs it too.
+    expect(g.run).toBe(
+      'bash "$RUNNER_TEMP/main-ci/provapi-token-verify.sh" "$DEPLOY_ENV" sending',
+    );
+    expect(g.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+      HOSTED_DIR: "${{ runner.temp }}/main-ci/hosted",
+    });
+    expect(g.if).toBeUndefined();
+    expect(g["continue-on-error"]).toBeUndefined();
+    expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|verify_only/);
   });
 });
