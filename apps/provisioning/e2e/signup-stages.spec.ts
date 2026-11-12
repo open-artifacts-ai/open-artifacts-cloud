@@ -771,12 +771,14 @@ test("returning owner: goes straight in, no checklist, button after 3 s, once pe
     page.evaluate(() => ({
       h1: document.querySelector("h1")?.textContent,
       line: document.querySelector(".panel p")?.textContent,
+      who: document.querySelector(".panel .who")?.textContent,
       steps: document.querySelectorAll(".steps").length,
       btn: [...document.querySelectorAll("a.btn")].map((a) => a.textContent),
       nav: (window as unknown as { __nav: string[] }).__nav,
     }));
   await expect.poll(dom).toEqual({
     h1: "Log in",
+    who: "Logged in as ada@acme.comNot you? Sign out",
     line: "You have acme.open-artifacts.app.",
     steps: 0,
     btn: [],

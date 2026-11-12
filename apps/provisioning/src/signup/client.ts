@@ -85,13 +85,22 @@ export const CLIENT_JS = String.raw`(function () {
       h("a", { href: HOSTED_URL, rel: "noopener" }, ["Hosted"]), " · ",
       h("a", { href: S.cfg.githubUrl, rel: "noopener" }, ["GitHub"])
     ]);
-    root.replaceChildren(
-      h("header", { class: "top" }, [
-        brandMark(),
-        "Open Artifacts", links
+    var ghost = brandMark(); ghost.setAttribute("class", "mark ghost");
+    var big = brandMark(); big.setAttribute("class", "mark lg");
+    root.replaceChildren(h("div", { class: "login" }, [
+      h("section", { class: "pitch" }, [
+        h("header", { class: "top" }, [
+          h("div", { class: "brand" }, [brandMark(), "Open Artifacts"]),
+          h("div", { class: "pitchtext" }, [
+            h("p", { class: "pt" }, ["Where any AI agent publishes for your team."]),
+            h("p", { class: "ps" }, ["Pages, docs, code and PDFs, private by default and shared when you choose."])
+          ]),
+          links
+        ]),
+        ghost
       ]),
-      h("main", {}, [panel])
-    );
+      h("main", { class: "side" }, [h("div", { class: "col" }, [big, panel])])
+    ]));
   }
 
   var NOTICES = {
@@ -639,7 +648,12 @@ export const CLIENT_JS = String.raw`(function () {
         head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
         steps = [reserve, step("done", create), step("done", email)];
       } else {
-        head = [h("h1", {}, ["Log in"]), h("p", {}, ["You have ", nw(hostName), "."])];
+        head = [h("h1", {}, ["Log in"]),
+          h("div", { class: "who" }, [
+            h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
+            h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
+          ]),
+          h("p", {}, ["You have ", nw(hostName), "."])];
         steps = null;
       }
       body = [];
