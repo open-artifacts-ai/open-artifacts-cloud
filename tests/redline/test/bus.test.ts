@@ -323,6 +323,38 @@ describe("holdSocket on a loopback server", () => {
     expect(h.closeCode()).toBe(4403);
   });
 
+  it("a server close frame closes the held socket and is echoed masked, though the server keeps TCP open (#202)", async () => {
+    let theirs!: Socket;
+    const got: Buffer[] = [];
+    const base = await start((s) => {
+      theirs = s;
+      s.on("data", (b: Buffer) => got.push(b));
+    });
+    const h = await holdSocket(new Request(`${base}/bus/connect`), {
+      pingMs: 20,
+    });
+    const payload = Buffer.alloc(2);
+    payload.writeUInt16BE(4403);
+    theirs.write(Buffer.concat([Buffer.from([0x88, 2]), payload]));
+    expect(await within(h.closed, 500)).toBe(true);
+    expect(h.closeCode()).toBe(4403);
+    for (let i = 0; i < 100 && !got.some((b) => b[0] === 0x88); i++)
+      await new Promise((r) => setTimeout(r, 10));
+    const f = got.find((b) => b[0] === 0x88) as Buffer;
+    const at = 0;
+    expect(f[at + 1]).toBe(0x80 | 2);
+    const mask = f.subarray(at + 2, at + 6);
+    const code =
+      (((f[at + 6] as number) ^ (mask[0] as number)) << 8) |
+      ((f[at + 7] as number) ^ (mask[1] as number));
+    expect(code).toBe(4403);
+    // No pings after the close.
+    const n = got.length;
+    await new Promise((r) => setTimeout(r, 80));
+    expect(got.length).toBe(n);
+    theirs.destroy();
+  });
+
   it("sends the token as a bearer, upgrade headers and the hello frame, and waits for hello_ok", async () => {
     let headers: Record<string, unknown> = {};
     const frames: Buffer[] = [];
