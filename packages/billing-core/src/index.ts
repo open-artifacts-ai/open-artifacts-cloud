@@ -16,6 +16,7 @@ export {
   createPortalSession,
   createSoloTrialSubscription,
   createTestClock,
+  deletePendingOverageItems,
   expireCheckoutSession,
   finalizeInvoice,
   findOverageInvoice,

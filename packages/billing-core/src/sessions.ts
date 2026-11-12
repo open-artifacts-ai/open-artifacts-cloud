@@ -658,6 +658,7 @@ export async function createOverageInvoice(
       customer: input.customerId,
       collection_method: "charge_automatically",
       pending_invoice_items_behavior: "exclude",
+      auto_advance: "false",
       ...overageMeta(input.install, input.month, "metadata"),
     },
     input.idempotencyKey,
@@ -760,12 +761,67 @@ export async function retrieveInvoiceStatus(
   }
 }
 
-/** Finalizes a draft invoice (Stripe then collects it automatically). */
+/**
+ * Finalizes a draft invoice with auto_advance true: an API-created invoice
+ * defaults to false, and a finalized one with it false is never charged.
+ * (The draft itself stays at auto_advance false, so an empty draft can't
+ * finalize on its own.)
+ */
 export async function finalizeInvoice(
   input: { invoiceId: string; idempotencyKey: string },
   cfg: StripeConfig,
 ): Promise<void> {
   const id = check(INVOICE, "invoiceId", input.invoiceId);
   check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
-  await post(cfg, `/v1/invoices/${id}/finalize`, {}, input.idempotencyKey);
+  await post(
+    cfg,
+    `/v1/invoices/${id}/finalize`,
+    { auto_advance: "true" },
+    input.idempotencyKey,
+  );
+}
+
+/**
+ * Deletes this (install, month)'s overage items that are still pending
+ * (attached to no invoice), so a reset never leaves one a later invoice
+ * could sweep up. Reads the customer's pending items (the first 100).
+ * Answers how many it deleted.
+ */
+export async function deletePendingOverageItems(
+  input: { customerId: string; install: string; month: string },
+  cfg: StripeConfig,
+): Promise<number> {
+  const customer = check(CUSTOMER, "customerId", input.customerId);
+  overageMeta(input.install, input.month, "metadata");
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/invoiceitems?customer=${customer}&pending=true&limit=100`,
+    null,
+    null,
+  );
+  if (!Array.isArray(out?.data)) throw new StripeApiError(status, "bad_answer");
+  let n = 0;
+  for (const it of out.data as unknown[]) {
+    const m = metaOf(it);
+    const { id, invoice } = it as { id?: unknown; invoice?: unknown };
+    if (
+      m.kind === "overage" &&
+      m.install === input.install &&
+      m.month === input.month &&
+      (invoice === null || invoice === undefined) &&
+      typeof id === "string" &&
+      INVOICE_ITEM.test(id)
+    ) {
+      try {
+        await send(cfg, "DELETE", `/v1/invoiceitems/${id}`, null, null);
+      } catch (e) {
+        // Already gone.
+        if (!(e instanceof StripeApiError && e.status === 404)) throw e;
+        continue;
+      }
+      n++;
+    }
+  }
+  return n;
 }

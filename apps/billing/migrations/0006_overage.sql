@@ -14,6 +14,9 @@ CREATE TABLE overage (
   item_id TEXT,
   invoice_id TEXT,
   outcome TEXT NOT NULL,
+  -- Bumped each time the row is reset after Stripe lost its invoice; part of
+  -- every idempotency key, so a reset never replays a deleted invoice's key.
+  generation INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (install_id, month)

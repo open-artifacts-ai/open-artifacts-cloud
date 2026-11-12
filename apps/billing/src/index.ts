@@ -48,6 +48,7 @@ import {
   createPortalSession,
   createSoloTrialSubscription,
   createTestClock,
+  deletePendingOverageItems,
   expireCheckoutSession,
   finalizeInvoice,
   findOverageInvoice,
@@ -1104,14 +1105,14 @@ function usageRefusal(e: StripeFailure): Response | null {
 /** The monthly per-creator price in cents; yearly overage bills at this. */
 const MONTHLY_CENTS = { team: 1000, business: 2500 } as const;
 const OVERAGE_SQL =
-  "SELECT seats, quantity, unit_amount, item_id, invoice_id, outcome FROM overage WHERE install_id = ?1 AND month = ?2";
+  "SELECT seats, quantity, unit_amount, item_id, invoice_id, outcome, generation FROM overage WHERE install_id = ?1 AND month = ?2";
 const OVERAGE_INSERT_SQL =
   "INSERT OR IGNORE INTO overage (install_id, month, seats, creators, quantity, unit_amount, outcome, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)";
 const OVERAGE_STEP_SQL =
   "UPDATE overage SET item_id = coalesce(?3, item_id), invoice_id = coalesce(?4, invoice_id), outcome = ?5, updated_at = ?6 WHERE install_id = ?1 AND month = ?2";
 
 const OVERAGE_RESET_SQL =
-  "UPDATE overage SET item_id = NULL, invoice_id = NULL, outcome = 'pending', updated_at = ?3 WHERE install_id = ?1 AND month = ?2";
+  "UPDATE overage SET item_id = NULL, invoice_id = NULL, outcome = 'pending', generation = generation + 1, updated_at = ?3 WHERE install_id = ?1 AND month = ?2";
 
 /** "2026-10" -> "October 2026". */
 const monthLabel = (month: string) =>
@@ -1128,6 +1129,7 @@ type OverageRow = {
   item_id: string | null;
   invoice_id: string | null;
   outcome: string;
+  generation: number;
 };
 
 /**
@@ -1186,6 +1188,21 @@ async function billOverage(
   try {
     let invoiceId = row.invoice_id;
     let itemId = row.item_id;
+    // Every key carries the generation, so a restart never replays the key
+    // of an invoice or item Stripe has lost.
+    let gen = row.generation;
+    const restart = async () => {
+      // Deleting a draft may leave its item pending (not assumed either
+      // way): delete this month's pending overage items first, so none can
+      // be swept into another invoice. If that fails the row is unchanged.
+      await stripe(install, () =>
+        deletePendingOverageItems({ customerId, install, month }, cfg),
+      );
+      await db.prepare(OVERAGE_RESET_SQL).bind(install, month, now).run();
+      gen += 1;
+      invoiceId = null;
+      itemId = null;
+    };
     if (invoiceId) {
       // Resumed: only a draft can take the item and be finalized (an attempt
       // whose answer was lost may have finalized it already).
@@ -1194,15 +1211,22 @@ async function billOverage(
         retrieveInvoiceStatus({ invoiceId: id }, cfg),
       );
       if (status === "missing") {
-        // Deleted in Stripe: start over with a new draft. Its item was
-        // attached to it (never pending), so nothing is left to bill twice.
-        await db.prepare(OVERAGE_RESET_SQL).bind(install, month, now).run();
         console.error("billing usage overage invoice missing", install);
-        invoiceId = null;
-        itemId = null;
+        await restart();
       } else if (status !== "draft") {
-        await step(null, null, "invoiced");
-        return done("overage_invoiced");
+        // Finalized: billed only if our item is on it. With no item recorded,
+        // look; none means it went out without the overage, so start over.
+        const onIt =
+          itemId ??
+          (await stripe(install, () =>
+            findOverageItem({ invoiceId: id, month }, cfg),
+          ));
+        if (onIt) {
+          await step(onIt, null, "invoiced");
+          return done("overage_invoiced");
+        }
+        console.error("billing usage overage invoice without item", install);
+        await restart();
       }
     }
     if (!invoiceId) {
@@ -1217,7 +1241,7 @@ async function billOverage(
               customerId,
               install,
               month,
-              idempotencyKey: `ovg-inv-${install}-${month}`,
+              idempotencyKey: `ovg-inv-${install}-${month}-g${gen}`,
             },
             cfg,
           ),
@@ -1241,7 +1265,7 @@ async function billOverage(
               quantity,
               unitAmount: unit,
               description: `Extra creators, ${monthLabel(month)}: ${quantity} × $${unit / 100}`,
-              idempotencyKey: `ovg-item-${install}-${month}`,
+              idempotencyKey: `ovg-item-${install}-${month}-g${gen}`,
             },
             cfg,
           ),
@@ -1250,7 +1274,10 @@ async function billOverage(
     }
     await stripe(install, () =>
       finalizeInvoice(
-        { invoiceId: invoice, idempotencyKey: `ovg-fin-${install}-${month}` },
+        {
+          invoiceId: invoice,
+          idempotencyKey: `ovg-fin-${install}-${month}-g${gen}`,
+        },
         cfg,
       ),
     );

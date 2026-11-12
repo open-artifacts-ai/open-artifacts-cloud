@@ -2203,9 +2203,20 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       status: string;
       metadata: Record<string, string>;
     }[];
+    /** invoice "" is a pending item (attached to no invoice). */
     items: { id: string; invoice: string; metadata: Record<string, string> }[];
+    /** Idempotency-Key -> first answer (Stripe replays it, without effect). */
+    replay: Map<string, unknown>;
+    /** Every finalize body, in order. */
+    finalizes: Record<string, string>[];
   };
-  const newLedger = (): Ledger => ({ n: 0, invoices: [], items: [] });
+  const newLedger = (): Ledger => ({
+    n: 0,
+    invoices: [],
+    items: [],
+    replay: new Map(),
+    finalizes: [],
+  });
   type Opts = {
     sub?: Parameters<typeof subscription>[0];
     ledger?: Ledger;
@@ -2226,10 +2237,19 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
         return Response.json({ error: { type: "x" } }, { status: bad });
       let out: Response | undefined;
       if (key === `GET ${SUBS}`) return subscription(o.sub);
+      // A repeated Idempotency-Key replays the first answer, no effect.
+      const replayed = c.key ? L.replay.get(c.key) : undefined;
+      if (replayed !== undefined) return Response.json(replayed);
+      const answer = (body: Record<string, unknown>) => {
+        if (c.key) L.replay.set(c.key, body);
+        return Response.json(body);
+      };
+      const detail = /^\/v1\/invoices\/(in_\w+)(\/finalize)?$/.exec(c.path);
+      const itemPath = /^\/v1\/invoiceitems\/(ii_\w+)$/.exec(c.path);
       if (key === "POST /v1/invoices") {
         const id = `in_inv${++L.n}`;
         L.invoices.push({ id, status: "draft", metadata: metaOf(c.form) });
-        out = Response.json({ id });
+        out = answer({ id });
       } else if (key === "GET /v1/invoices") {
         out = Response.json({
           data: L.invoices.filter((i) => i.status === "draft"),
@@ -2241,21 +2261,35 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
           invoice: c.form.invoice ?? "",
           metadata: metaOf(c.form),
         });
-        out = Response.json({ id });
+        out = answer({ id });
       } else if (key === "GET /v1/invoiceitems") {
-        const inv = new URLSearchParams(c.search).get("invoice");
+        const q = new URLSearchParams(c.search);
+        const inv = q.get("invoice");
         out = Response.json({
-          data: L.items.filter((i) => i.invoice === inv),
+          data: L.items
+            .filter((i) =>
+              q.get("pending") === "true"
+                ? i.invoice === ""
+                : i.invoice === inv,
+            )
+            .map((i) => ({ ...i, invoice: i.invoice || null })),
         });
-      } else {
-        const m = /^\/v1\/invoices\/(in_\w+)(\/finalize)?$/.exec(c.path);
-        const inv = L.invoices.find((i) => i.id === m?.[1]);
-        if (!m) return undefined;
+      } else if (itemPath && c.method === "DELETE") {
+        const at = L.items.findIndex((i) => i.id === itemPath[1]);
+        if (at < 0)
+          return Response.json({ error: { type: "x" } }, { status: 404 });
+        L.items.splice(at, 1);
+        out = Response.json({ id: itemPath[1], deleted: true });
+      } else if (detail) {
+        const inv = L.invoices.find((i) => i.id === detail[1]);
         if (!inv)
           return Response.json({ error: { type: "x" } }, { status: 404 });
-        if (m[2]) inv.status = "open";
-        out = Response.json({ id: inv.id, status: inv.status });
-      }
+        if (detail[2]) {
+          inv.status = "open";
+          L.finalizes.push(c.form);
+          out = answer({ id: inv.id, status: inv.status });
+        } else out = Response.json({ id: inv.id, status: inv.status });
+      } else return undefined;
       return o.lose?.[key]
         ? Response.json({ error: { type: "x" } }, { status: 500 })
         : out;
@@ -2318,8 +2352,13 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       customer: "cus_existingA",
       collection_method: "charge_automatically",
       pending_invoice_items_behavior: "exclude",
+      // The draft never advances on its own; only the finalize does.
+      auto_advance: "false",
       ...meta,
     });
+    // Finalize turns auto_advance on: without it the invoice is never charged.
+    expect(s.calls[5]?.form).toEqual({ auto_advance: "true" });
+    expect(s.L.finalizes).toEqual([{ auto_advance: "true" }]);
     expect(s.calls[4]?.form).toEqual({
       customer: "cus_existingA",
       invoice: "in_inv1",
@@ -2330,9 +2369,9 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
       ...meta,
     });
     expect([2, 4, 5].map((i) => s.calls[i]?.key)).toEqual([
-      `ovg-inv-${A}-${closed}`,
-      `ovg-item-${A}-${closed}`,
-      `ovg-fin-${A}-${closed}`,
+      `ovg-inv-${A}-${closed}-g0`,
+      `ovg-item-${A}-${closed}-g0`,
+      `ovg-fin-${A}-${closed}-g0`,
     ]);
     expect(await overageRow()).toEqual({
       seats: 3,
@@ -2514,26 +2553,116 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     expect((await overageRow())?.outcome).toBe("invoiced");
   });
 
-  it("an invoice deleted in Stripe is made again, with its item, instead of leaving the row stuck", async () => {
+  it("an invoice deleted in Stripe is made again under a new generation; its orphaned pending item is deleted first", async () => {
     await live();
     const L = newLedger();
     fake({ ledger: L, fail: { [FINALIZE]: 503 } });
     await send(closed, 5);
-    // The draft and its attached item are gone.
+    // The draft is deleted; its item is left pending (not assumed deleted).
     L.invoices.length = 0;
-    L.items.length = 0;
+    for (const i of L.items) i.invoice = "";
+    // An unrelated pending overage item of another month is never touched.
+    L.items.push({
+      id: "ii_other9",
+      invoice: "",
+      metadata: { kind: "overage", install: A, month: "2000-01" },
+    });
     const s = fake({ ledger: L });
     expect((await send(closed, 5)).status).toBe(200);
-    expect(paths(s)).toContain("POST /v1/invoices");
-    expect(paths(s)).toContain("POST /v1/invoiceitems");
+    expect(
+      s.calls.filter((c) => c.method === "DELETE").map((c) => c.path),
+    ).toEqual(["/v1/invoiceitems/ii_item2"]);
+    // The delete comes before the new invoice and item.
+    const p = paths(s);
+    expect(p.indexOf("DELETE /v1/invoiceitems/ii_item2")).toBeLessThan(
+      p.indexOf("POST /v1/invoices"),
+    );
+    // New keys: the deleted invoice's key is not replayed.
+    expect(
+      s.calls.filter((c) => c.method === "POST").map((c) => c.key),
+    ).toEqual([
+      `ovg-inv-${A}-${closed}-g1`,
+      `ovg-item-${A}-${closed}-g1`,
+      `ovg-fin-${A}-${closed}-g1`,
+    ]);
     expect(L.invoices.map((i) => [i.id, i.status])).toEqual([
       ["in_inv3", "open"],
     ]);
-    expect(L.items).toHaveLength(1);
+    expect(L.items.map((i) => [i.id, i.invoice])).toEqual([
+      ["ii_other9", ""],
+      ["ii_item4", "in_inv3"],
+    ]);
     expect(await overageRow()).toMatchObject({
       invoice_id: "in_inv3",
       outcome: "invoiced",
     });
+  });
+
+  it("a failed delete of the orphaned item leaves the row as it was, to retry", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, fail: { [FINALIZE]: 503 } });
+    await send(closed, 5);
+    L.invoices.length = 0;
+    for (const i of L.items) i.invoice = "";
+    fake({ ledger: L, fail: { "DELETE /v1/invoiceitems/ii_item2": 500 } });
+    expect((await send(closed, 5)).status).toBe(502);
+    expect(await overageRow()).toMatchObject({ invoice_id: "in_inv1" });
+    fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(L.items.map((i) => i.invoice)).toEqual(["in_inv3"]);
+  });
+
+  it("a finalized invoice with no item recorded is invoiced only if our item is on it", async () => {
+    await live();
+    // The item's answer was lost, then the invoice was finalized elsewhere:
+    // the item is on it, so the month is billed.
+    let L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoiceitems": true } });
+    await send(closed, 5);
+    L.invoices[0]!.status = "open";
+    let s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toEqual([
+      `GET ${SUBS}`,
+      "GET /v1/invoices/in_inv1",
+      "GET /v1/invoiceitems",
+    ]);
+    expect(await overageRow()).toMatchObject({
+      item_id: "ii_item2",
+      outcome: "invoiced",
+    });
+    // Finalized with no item on it: start over, never mark it billed.
+    await db.batch([
+      db.prepare("DELETE FROM overage"),
+      db.prepare("DELETE FROM usage"),
+    ]);
+    L = newLedger();
+    fake({ ledger: L, fail: { "POST /v1/invoiceitems": 500 } });
+    await send(closed, 5);
+    L.invoices[0]!.status = "open";
+    s = fake({ ledger: L });
+    expect((await send(closed, 5)).status).toBe(200);
+    expect(paths(s)).toContain("POST /v1/invoices");
+    expect(L.items.map((i) => i.invoice)).toEqual(["in_inv2"]);
+    expect(await overageRow()).toMatchObject({
+      invoice_id: "in_inv2",
+      outcome: "invoiced",
+    });
+  });
+
+  it("Stripe's key replay is modelled: a replayed key has no second effect", async () => {
+    await live();
+    const L = newLedger();
+    fake({ ledger: L, lose: { "POST /v1/invoices": true } });
+    await send(closed, 5);
+    // Same generation, same key: Stripe would replay the first invoice.
+    const s = fake({ ledger: L });
+    await send(closed, 5);
+    expect(L.invoices).toHaveLength(1);
+    expect(s.calls.every((c) => c.key === null || /-g0$/.test(c.key))).toBe(
+      true,
+    );
   });
 
   it("401, 403, 409, 429, 5xx and network errors are retried; other 4xx are logged and the 200 stands", async () => {
