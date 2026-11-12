@@ -2916,6 +2916,123 @@ describe("POST /usage bills a yearly subscription's creators above its seats (#2
     }
     expect(await overageRow()).toBeNull();
   });
+
+  describe("the daily cron re-tries unapplied months (#2210, #2246)", () => {
+    const cron = (e: Env = yEnv(), at = Date.now()) =>
+      billing.scheduled(
+        { scheduledTime: at, cron: "17 3 * * *", noRetry() {} },
+        e,
+      );
+    const withLines = async (fn: () => Promise<void>) => {
+      const out: string[] = [];
+      for (const k of ["log", "error"] as const)
+        vi.spyOn(console, k).mockImplementation((...a: unknown[]) => {
+          out.push(`${k} ${a.map(String).join(" ")}`);
+        });
+      await fn();
+      return out;
+    };
+    const retriedAt = (month: string, install = A) =>
+      db
+        .prepare(
+          "SELECT retried_at AS r FROM usage WHERE install_id = ?1 AND month = ?2",
+        )
+        .bind(install, month)
+        .first<{ r: number | null }>()
+        .then((x) => x?.r ?? null);
+
+    it("a no_payment_method month is billed once the card is there, and a later run changes nothing", async () => {
+      await live();
+      fake({ sub: { pm: null } });
+      expect((await send(closed, 5)).status).toBe(200);
+      expect(await outcomeOf()).toBe("no_payment_method");
+      expect(await overageRow()).toMatchObject({
+        invoice_id: null,
+        outcome: "pending",
+      });
+      const s = fake({ sub: { pm: null }, customerPm: "pm_late" });
+      await cron();
+      expect(await overageRow()).toMatchObject({
+        quantity: 2,
+        invoice_id: "in_inv1",
+        outcome: "invoiced",
+      });
+      expect(await outcomeOf()).toBe("overage_invoiced");
+      expect(paths(s)).toContain(FINALIZE);
+      s.calls.length = 0;
+      await cron();
+      expect(s.calls).toEqual([]);
+      expect(s.L.invoices).toHaveLength(1);
+    });
+
+    it("a month whose invoice failed permanently is retried through billOverage, one invoice and one item", async () => {
+      await live();
+      const L = newLedger();
+      fake({ ledger: L, fail: { "POST /v1/invoices": 400 } });
+      expect((await send(closed, 5)).status).toBe(200);
+      expect(await outcomeOf()).toBe("overage_failed");
+      fake({ ledger: L });
+      await cron();
+      await cron();
+      expect([L.invoices.length, L.items.length]).toEqual([1, 1]);
+      expect((await overageRow())?.outcome).toBe("invoiced");
+    });
+
+    it("nothing older than 90 days is retried; it is logged", async () => {
+      await live();
+      const old = shift(-5);
+      await db
+        .prepare(
+          "INSERT INTO usage (install_id, month, creators_json, count, received_at, apply_outcome) VALUES (?1, ?2, '[]', 5, 0, 'failed')",
+        )
+        .bind(A, old)
+        .run();
+      const s = fake();
+      const out = await withLines(() => cron());
+      expect(s.calls).toEqual([]);
+      expect(await retriedAt(old)).toBeNull();
+      expect(out).toContain(`log billing usage retry too_old ${A}`);
+    });
+
+    it("a month still unapplied more than 3 days after it closed is logged at error level", async () => {
+      await live();
+      const stuck = shift(-2);
+      fake({ sub: { pm: null } });
+      await call(report(stuck, 5), yEnv());
+      const out = await withLines(() => cron());
+      expect(out).toContain(`error billing usage unapplied ${A}`);
+    });
+
+    it("a batch is bounded; the month tried longest ago goes first, so the rest are reached next run", async () => {
+      const ids = Array.from(
+        { length: 55 },
+        (_, i) => `i${String(i).padStart(11, "0")}`,
+      );
+      await db.batch(
+        ids.map((id) =>
+          db
+            .prepare(
+              "INSERT INTO usage (install_id, month, creators_json, count, received_at, apply_outcome) VALUES (?1, ?2, '[]', 2, 0, 'failed')",
+            )
+            .bind(id, closed),
+        ),
+      );
+      await cron();
+      const tried = async () =>
+        (
+          await db
+            .prepare(
+              "SELECT count(*) AS n FROM usage WHERE retried_at IS NOT NULL",
+            )
+            .first<{ n: number }>()
+        )?.n;
+      expect(await tried()).toBe(50);
+      expect(await retriedAt(closed, ids[54] as string)).toBeNull();
+      await cron();
+      expect(await retriedAt(closed, ids[54] as string)).not.toBeNull();
+      expect(await tried()).toBe(55);
+    });
+  });
 });
 
 describe("two plans sharing a price id fail closed (#2235)", () => {

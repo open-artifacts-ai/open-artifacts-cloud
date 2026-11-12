@@ -39,6 +39,7 @@ beforeEach(async () => {
   await db.batch([
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
+    db.prepare("DELETE FROM overage"),
     db.prepare("DELETE FROM stripe_events"),
   ]);
   clearRegistryCache();
@@ -544,6 +545,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 3,
       asOf: NOW,
     });
@@ -608,6 +610,7 @@ describe("GET /tier", () => {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 0,
       asOf: NOW,
     });
@@ -661,6 +664,7 @@ describe("POST /trial/start", () => {
       soloTrialEndsAt: null,
       hasCustomer: true,
       yearlyTeamBusiness: false,
+      overageDue: null,
       version: 5,
       asOf: NOW,
     });
@@ -779,6 +783,7 @@ describe("POST /usage", () => {
         applied_quantity: null,
         applied_at: null,
         apply_outcome: null,
+        retried_at: null,
       },
       {
         install_id: A,
@@ -789,6 +794,7 @@ describe("POST /usage", () => {
         applied_quantity: null,
         applied_at: null,
         apply_outcome: null,
+        retried_at: null,
       },
     ]);
     expect(await usageOf(B)).toEqual([]);
@@ -962,7 +968,7 @@ describe("scheduled: prune stripe_events (#1479)", () => {
       },
     } as unknown as Env;
     await expect(run(NOW, broken)).resolves.toBeUndefined();
-    expect(lines).toEqual(["billing prune db_error"]);
+    expect(lines).toEqual(["billing retry db_error", "billing prune db_error"]);
   });
 });
 
@@ -1192,5 +1198,53 @@ describe("the Business trial snapshots a Solo only when it is known live (#1568)
       .run();
     await call(gated("POST", "/trial/start", { install: A }));
     expect(await rowOf(A)).toMatchObject({ tier: "trial", solo_status: null });
+  });
+});
+
+describe("overageDue in the tier answer (#2246)", () => {
+  const ask = async () => {
+    const r = await billing.fetch(
+      new Request("https://billing.oa.internal/tier", {
+        headers: { "x-oa-gate-install": A },
+      }) as Parameters<typeof billing.fetch>[0],
+      env,
+    );
+    return (await r.json()) as Record<string, unknown>;
+  };
+  const put = (failed: number | null, paid: number | null) =>
+    db
+      .prepare(
+        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, invoice_id, outcome, failed_at, paid_at, payment_attempts, created_at, updated_at) VALUES (?1, '2026-10', 3, 5, 2, 1000, 'in_x', 'invoiced', ?2, ?3, 1, 0, 0)",
+      )
+      .bind(A, failed, paid)
+      .run();
+
+  it("is null with no failure; a failed unpaid invoice shows its month and amount and leaves the plan alone; a later payment clears it", async () => {
+    await seed([{ install: A, tier: "team" }]);
+    expect(await ask()).toMatchObject({ overageDue: null });
+    await put(5000, null);
+    const due = await ask();
+    expect(due).toMatchObject({
+      tier: "team",
+      status: "active",
+      graceUntil: null,
+      overageDue: { month: "2026-10", amountCents: 2000 },
+    });
+    await db.prepare("UPDATE overage SET paid_at = 6000").run();
+    expect(await ask()).toMatchObject({ tier: "team", overageDue: null });
+  });
+
+  it("another install's failed invoice is never shown", async () => {
+    await seed([
+      { install: A, tier: "team" },
+      { install: B, tier: "team" },
+    ]);
+    await db
+      .prepare(
+        "INSERT INTO overage (install_id, month, seats, creators, quantity, unit_amount, outcome, failed_at, created_at, updated_at) VALUES (?1, '2026-10', 3, 5, 2, 1000, 'invoiced', 5000, 0, 0)",
+      )
+      .bind(B)
+      .run();
+    expect(await ask()).toMatchObject({ overageDue: null });
   });
 });

@@ -33,7 +33,9 @@
 // the body first. A missing STRIPE_WEBHOOK_SECRET (a Worker secret) is 500
 // config, body unread. Any other method or path stays the plain 404.
 //
-// A daily cron prunes stripe_events older than 30 days (#1479).
+// A daily cron prunes stripe_events older than 30 days (#1479) and re-tries
+// closed months the instance's usage tick sent once and never again
+// (#2210, #2246).
 //
 // Logs carry fixed categories and install ids only: never bodies, headers or
 // URLs.
@@ -154,8 +156,29 @@ const yearlyOn = (env: Env) => {
   );
 };
 
+/** The newest unpaid, failed overage invoice: its month and amount. */
+export type OverageDue = { month: string; amountCents: number };
+
+const OVERAGE_DUE_SQL =
+  "SELECT month, quantity * unit_amount AS amount FROM overage WHERE install_id = ?1 AND failed_at IS NOT NULL AND (paid_at IS NULL OR paid_at < failed_at) ORDER BY month DESC LIMIT 1";
+async function overageDueOf(
+  db: D1Database,
+  install: string,
+): Promise<OverageDue | null> {
+  const r = await db
+    .prepare(OVERAGE_DUE_SQL)
+    .bind(install)
+    .first<{ month: string; amount: number }>();
+  return r ? { month: r.month, amountCents: r.amount } : null;
+}
+
 /** What an install sees: no Stripe ids, ever. */
-function view(r: TierRow | null, now: number, yearlyTeamBusiness: boolean) {
+function view(
+  r: TierRow | null,
+  now: number,
+  yearlyTeamBusiness: boolean,
+  overageDue: OverageDue | null = null,
+) {
   if (!r)
     return {
       tier: "solo",
@@ -165,6 +188,7 @@ function view(r: TierRow | null, now: number, yearlyTeamBusiness: boolean) {
       soloTrialEndsAt: null,
       hasCustomer: false,
       yearlyTeamBusiness,
+      overageDue: null,
       version: 0,
       asOf: now,
     };
@@ -184,6 +208,9 @@ function view(r: TierRow | null, now: number, yearlyTeamBusiness: boolean) {
     // itself never leaves billing.
     hasCustomer: r.has_customer === 1,
     yearlyTeamBusiness,
+    // A yearly overage invoice whose payment failed and is unpaid (#2246).
+    // A notice only: it never moves tier, status or grace.
+    overageDue,
     version: r.version,
     asOf: now,
   };
@@ -736,7 +763,9 @@ async function tier(env: Env, install: string, now: number) {
   await materialize(db, install, now);
   const r = await db.prepare(READ_SQL).bind(install, now).first<TierRow>();
   console.log("billing tier", r ? "row" : "default", install);
-  return Response.json(view(r, now, yearlyOn(env)));
+  return Response.json(
+    view(r, now, yearlyOn(env), r ? await overageDueOf(db, install) : null),
+  );
 }
 
 // Solo trials ending in (from, to], oldest install id first, after a cursor.
@@ -798,12 +827,16 @@ async function trialStart(
     .first<TierRow>();
   if (started) {
     console.log("billing trial started", install);
-    return Response.json(view(started, now, yearlyOn(env)));
+    return Response.json(
+      view(started, now, yearlyOn(env), await overageDueOf(db, install)),
+    );
   }
   // Any other state: unchanged, and still a 200.
   const r = await db.prepare(SELECT_SQL).bind(install).first<TierRow>();
   console.log("billing trial unchanged", install);
-  return Response.json(view(r, now, yearlyOn(env)));
+  return Response.json(
+    view(r, now, yearlyOn(env), r ? await overageDueOf(db, install) : null),
+  );
 }
 
 /**
@@ -1513,6 +1546,77 @@ async function usage(
   return Response.json({ ok: true, month, count });
 }
 
+/** Closed months the daily cron re-tries per run (oldest last try first). */
+export const RETRY_BATCH = 50;
+/** A month closed longer ago than this is no longer retried (logged instead). */
+export const RETRY_MAX_AGE_MS = 90 * 86_400_000;
+/** A month still unapplied this long after it closed is logged at error level. */
+export const RETRY_ALERT_AGE_MS = 3 * 86_400_000;
+
+// Unapplied: a month the instance sent once and billing never applied: a
+// failed or never-tried quantity, or a yearly overage that is pending, failed
+// or had no card. Months with usage.count NULL were never stored whole.
+const UNAPPLIED_WHERE =
+  "month < ?1 AND count IS NOT NULL AND (apply_outcome IS NULL OR apply_outcome IN ('failed', 'overage_failed', 'no_payment_method'))";
+const UNAPPLIED_SQL = `SELECT install_id, month, count FROM usage WHERE ${UNAPPLIED_WHERE} ORDER BY coalesce(retried_at, 0), month, install_id`;
+const RETRIED_SQL =
+  "UPDATE usage SET retried_at = ?3 WHERE install_id = ?1 AND month = ?2";
+
+/** The first instant after a closed month, epoch ms. */
+const closedAt = (month: string) => {
+  const [y, m] = month.split("-").map(Number) as [number, number];
+  return Date.UTC(y, m, 1);
+};
+
+/**
+ * The daily cron's retry: each unapplied closed month goes back through
+ * applyQuantity (which hands yearly installs to billOverage) with the same
+ * rules and idempotency as a report. At most RETRY_BATCH per run, the one
+ * tried longest ago first (then oldest month, then install id), so a month
+ * that keeps failing cannot starve the others. Months closed more than 90
+ * days ago are skipped and logged. A month unapplied more than 3 days after
+ * it closed is logged at error level.
+ */
+export async function retryUnapplied(env: Env, now: number): Promise<void> {
+  const db = env.BILLING_DB;
+  const rows = (
+    await db.prepare(UNAPPLIED_SQL).bind(monthOf(now)).all<{
+      install_id: string;
+      month: string;
+      count: number;
+    }>()
+  ).results;
+  let tried = 0;
+  for (const r of rows) {
+    const age = now - closedAt(r.month);
+    if (age > RETRY_MAX_AGE_MS) {
+      console.log("billing usage retry too_old", r.install_id);
+      continue;
+    }
+    if (tried >= RETRY_BATCH) continue;
+    tried += 1;
+    try {
+      await db.prepare(RETRIED_SQL).bind(r.install_id, r.month, now).run();
+      await applyQuantity(env, r.install_id, r.month, r.count, now);
+    } catch {
+      console.error("billing usage retry error", r.install_id);
+    }
+  }
+  // After the tries: what is still unapplied three days after its month closed.
+  const still = (
+    await db.prepare(UNAPPLIED_SQL).bind(monthOf(now)).all<{
+      install_id: string;
+      month: string;
+    }>()
+  ).results;
+  for (const r of still) {
+    const age = now - closedAt(r.month);
+    if (age > RETRY_ALERT_AGE_MS && age <= RETRY_MAX_AGE_MS)
+      console.error("billing usage unapplied", r.install_id);
+  }
+  if (tried > 0) console.log("billing usage retry", tried);
+}
+
 /** Gate routes: method, path. /health takes no install. */
 const GATE = new Set([
   "GET /tier",
@@ -1649,6 +1753,11 @@ export default {
   // The daily cron (wrangler.jsonc triggers): prune the webhook dedupe table
   // (#1479). A failure is logged by category only and retried by the next run.
   async scheduled(controller, env) {
+    try {
+      await retryUnapplied(env, controller.scheduledTime);
+    } catch {
+      console.error("billing retry db_error");
+    }
     try {
       const n = await pruneStripeEvents(
         env.BILLING_DB,
