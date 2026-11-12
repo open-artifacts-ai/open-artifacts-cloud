@@ -586,6 +586,14 @@ describe("GET /tier", () => {
     expect(
       await ask({ ...both, STRIPE_PRICE_BUSINESS_YEARLY: "" } as Env),
     ).toMatchObject({ yearlyTeamBusiness: false });
+    for (const bad of [" ", "bogus"]) {
+      expect(
+        await ask({ ...both, STRIPE_PRICE_TEAM_YEARLY: bad } as Env),
+      ).toMatchObject({ yearlyTeamBusiness: false });
+      expect(
+        await ask({ ...both, STRIPE_PRICE_BUSINESS_YEARLY: bad } as Env),
+      ).toMatchObject({ yearlyTeamBusiness: false });
+    }
     expect(await ask(env)).toMatchObject({ yearlyTeamBusiness: false });
   });
 

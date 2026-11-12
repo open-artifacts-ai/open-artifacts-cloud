@@ -139,8 +139,12 @@ interface TierRow {
 }
 
 /** True exactly when both per-creator yearly prices (Team and Business) are configured. */
-const yearlyOn = (env: Env) =>
-  !!env.STRIPE_PRICE_TEAM_YEARLY && !!env.STRIPE_PRICE_BUSINESS_YEARLY;
+const yearlyOn = (env: Env) => {
+  const ok = (s?: string) => typeof s === "string" && PRICE_ID.test(s);
+  return (
+    ok(env.STRIPE_PRICE_TEAM_YEARLY) && ok(env.STRIPE_PRICE_BUSINESS_YEARLY)
+  );
+};
 
 /** What an install sees: no Stripe ids, ever. */
 function view(r: TierRow | null, now: number, yearlyTeamBusiness: boolean) {
