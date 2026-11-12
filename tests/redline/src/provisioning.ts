@@ -1483,7 +1483,7 @@ async function detail(
 }
 
 /** The run's own install, expected to answer: `detail` stays one try for refusals. */
-const ownDetail = (run: Run, id: string): Promise<Res> =>
+export const ownDetail = (run: Run, id: string): Promise<Res> =>
   run.v1(`/installs/${id}`, { read: true });
 
 async function panelInstall(run: Run): Promise<string | null> {
@@ -1507,7 +1507,7 @@ async function panelInstall(run: Run): Promise<string | null> {
 /** The owner of every install O creates (rl-p, rl-q, ...); P49 searches it. */
 const OIDC_OWNER_EMAIL = `redline-owner@${STAGING_TEST_DOMAIN}`;
 
-const oidcCreate = (
+export const oidcCreate = (
   run: Run,
   slug: string,
   requestId: string,

@@ -126,10 +126,26 @@ export const CLAIMS: Record<string, Claims> = {
     buckets: installBuckets(),
   },
   "live/live.test.ts": { state: installs(), buckets: installBuckets() },
-  // #1299: a machine on each side (labelled, revoked at the end) and its
-  // device-flow requests, which the rl-anon ledgers pace (bus-dev, bus-tok,
-  // bus-code, bus-approve in src/rl-anon.ts).
-  "live/bus.test.ts": { state: installs(), buckets: installBuckets() },
+  // #1954 (cloud #202): the hosted bus pair, never rl-a or rl-b. A machine on
+  // each side (labelled, revoked at the end) and its device-flow requests,
+  // which the rl-anon ledgers pace (bus-dev, bus-tok, bus-code, bus-approve in
+  // src/rl-anon.ts; live/setup.ts adds the pair to the guard's targets). One
+  // session per install through its own hook ledger. R7 and R8 on rl-busb only:
+  // its HOSTS mode flips to paused and back, a host no other file reads; two
+  // jobs and their polls, like one more provisioning chain, never past an
+  // RL_PV_* limit (the prov-done order is for the file that overspends).
+  "live/bus.test.ts": {
+    state: {
+      "rl-agents/redline-admin-bus": "write",
+      "rl-busb/install": "write",
+    },
+    buckets: {
+      "rl-agents/hooks": paced("hook-ledger/rl-agents"),
+      "rl-busb/hooks": paced("hook-ledger/rl-busb"),
+      "rl-anon": paced("rl-anon"),
+      "provisioning-api": ordered("prov-done"),
+    },
+  },
   "live/surfaces.test.ts": {
     state: {
       ...installs(),
@@ -247,7 +263,7 @@ const shardLane = (
 });
 
 /**
- * The run (#1730, #26): one phase, seven lanes.
+ * The run (#1730, #26, cloud #202): one phase, eight lanes.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
  *   barrier;
  * - provisioner: #859's provisioner file, in a lane of its own so its 60 s
@@ -259,8 +275,10 @@ const shardLane = (
  *   lane, about 235 s each (about 41 s of setup and cleanup in each, the
  *   cases about 194 s);
  * - creds: credentials (234.8 s), its link cases under the exclusive members lock;
- * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it), then bus (#1299:
- *   one case, a few requests; unproven-live while the bus is off);
+ * - guard: guard (130.8 s; prodClean checks four releases or installs at a time inside it);
+ * - busb: bus (#1954, cloud #202) on rl-agents and rl-busb, its own lane: its
+ *   suspend case holds a 6 min paused window, which runs beside prov and the
+ *   others from the suite's start instead of after anything;
  * - front: signin, edge, live. The only files that spend `codes`, so it stays
  *   in one lane; signin goes first, so its broker cases end early.
  */
@@ -271,7 +289,8 @@ export const PLAN: readonly Phase[] = [
     shardLane("surfaces", "surfaces", "a", "REDLINE_SURFACES_SHARD"),
     shardLane("surfaces-b", "surfaces", "b", "REDLINE_SURFACES_SHARD"),
     lane("creds", "credentials"),
-    lane("guard", "guard", "bus"),
+    lane("guard", "guard"),
+    lane("busb", "bus"),
     lane("front", "signin", "edge", "live"),
   ],
 ];

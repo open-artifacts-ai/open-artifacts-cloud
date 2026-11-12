@@ -5,13 +5,19 @@
 // schedule.test.ts hold the manifest to the snapshot plus exactly this list.
 export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
   [
-    // #1299 part 4: the bus's cross-install machine token and P51. Both pass
-    // or fail on a real assertion before and after the lift (src/bus-gate.ts);
-    // neither is an accepted unproven.
+    // #1954 (cloud #202): the hosted bus's two cases on rl-agents and rl-busb
+    // (their bus is on through STAGING_BUS_SLUGS, not the lift). Neither is an
+    // accepted unproven.
     {
       file: "live/bus.test.ts",
-      name: "bus > A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)",
+      name: "bus > rl-agents' machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-agents; rl-busb's machines and roster unchanged; its content host never upgrades it",
     },
+    {
+      file: "live/bus.test.ts",
+      name: "bus > suspend rl-busb: its daemon socket closes with 4403, reconnects get dispatch's paused answer and never 101 for 6 min, rl-agents' socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+    },
+    // #1299 part 4: P51 passes or fails on a real assertion before and after
+    // the lift (src/bus-gate.ts); it is not an accepted unproven.
     {
       file: "live/provisioning.test.ts",
       name: "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",

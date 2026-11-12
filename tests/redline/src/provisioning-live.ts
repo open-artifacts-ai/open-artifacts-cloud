@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
+import type { InstallDetail } from "@oa/provisioning-contract";
 import {
   claimHookSlot,
   HookBudgetError,
@@ -15,6 +16,16 @@ import {
   revokeMachines,
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
+import {
+  BUS_AGENTS,
+  BUS_B,
+  BUS_PAIR_SIDES_FILE,
+  type BusPair,
+  busPairSides,
+  type PairSide,
+  writeBusPair,
+  writeBusPairError,
+} from "./hosted-bus.ts";
 import { hookReason } from "./http.ts";
 import {
   AUDIENCES,
@@ -28,7 +39,10 @@ import {
   type BusIo,
   bringUpgrade,
   type CredsOut,
+  desc,
   mintCreds,
+  oidcCreate,
+  ownDetail,
   POLL_MS,
   ProbeFail,
   type ProvIo,
@@ -311,6 +325,132 @@ export async function checkTier(
     );
 }
 
+/** One install of the pair by its exact slug (R2 q, then the slug itself); null when none is live. */
+async function findBySlug(
+  run: Run,
+  slug: string,
+): Promise<{ id: string; state: string } | null> {
+  const r = await run.v1(`/installs?${new URLSearchParams({ q: slug })}`, {
+    read: true,
+  });
+  if (r.status !== 200) throw new ProbeFail(`R2 q=${slug}: ${desc(r)}`);
+  const hit = (
+    (r.json as { items?: { id: string; slug: string; state: string }[] })
+      .items ?? []
+  ).filter(
+    (i) => i.slug === slug && !["deleted", "deleting"].includes(i.state),
+  );
+  if (hit.length > 1)
+    throw new ProbeFail(`R2: ${hit.length} live ${slug} rows`);
+  return hit[0] ?? null;
+}
+
+/** R3 for one install of the pair: active, test hooks on, both hosts set. */
+async function pairSide(run: Run, id: string, slug: string): Promise<PairSide> {
+  const d = await ownDetail(run, id);
+  if (d.status !== 200) throw new ProbeFail(`R3 ${slug}: ${desc(d)}`);
+  const i = d.json as InstallDetail;
+  if (i.slug !== slug) throw new ProbeFail(`${id} is ${i.slug}, not ${slug}`);
+  if (i.state !== "active")
+    throw new ProbeFail(`${slug} is ${i.state}, want active`);
+  if (i.testHooks !== true)
+    throw new ProbeFail(`${slug}: testHooks is not true`);
+  if (!i.appHost || !i.contentHost || !i.version)
+    throw new ProbeFail(`${slug}: no app host, content host or version`);
+  return {
+    name: slug,
+    installId: id,
+    app: `https://${i.appHost}`,
+    content: `https://${i.contentHost}`,
+    version: i.version,
+  };
+}
+
+/**
+ * The hosted bus pair's bring-up (cloud #202): rl-agents is found by slug and
+ * left at its version (it is TEST_MEMBER's install; never upgraded or
+ * suspended here); rl-busb is created over OIDC at the release under test
+ * when there is none (an rl- slug, testHooks, the STAGING_TEST_DOMAIN owner:
+ * oidcCreate, as rl-l), resumed when a cut-off run left it suspended, and
+ * upgraded to the release (bringUpgrade). Then R26 on each: the creds go to
+ * secretsDir as REDLINE_RL_AGENTS_* and REDLINE_RL_BUSB_*, the new hook keys
+ * must be accepted (waitHookKey, paced), and the pair file is written. Every
+ * failure names its install.
+ */
+export async function bringUpBusPair(
+  run: Run,
+  dir: string,
+  recipient: { publicKey: string; open: (sealed: string) => Promise<CredsOut> },
+  pace?: (app: string, deadline: number) => Promise<unknown>,
+): Promise<BusPair> {
+  const agents = await findBySlug(run, BUS_AGENTS);
+  if (!agents)
+    throw new InfraError(
+      `${BUS_AGENTS} is not on staging (TEST_MEMBER's install, docs/ops/hosted.md)`,
+    );
+  let busb = await findBySlug(run, BUS_B);
+  if (!busb) {
+    const a = run.accepted(
+      await run.v1("/installs", {
+        body: oidcCreate(run, BUS_B, run.rid("busb-create"), run.c.version),
+      }),
+      `${BUS_B} create`,
+    );
+    await run.done(a.job.id, `${BUS_B} create`);
+    busb = { id: a.install.id, state: "active" };
+    out(`${BUS_B}: created (${run.c.version})\n`);
+  } else {
+    if (busb.state === "suspended") {
+      const a = run.accepted(
+        await run.v1(`/installs/${busb.id}/resume`, {
+          body: { requestId: run.rid("busb-left-suspended") },
+        }),
+        `${BUS_B} resume`,
+      );
+      await run.done(a.job.id, `${BUS_B} resume`);
+      out(`${BUS_B}: resumed (a run left it suspended)\n`);
+    }
+    out(
+      `${BUS_B}: ${await bringUpgrade(run, busb.id, BUS_B)} (${run.c.version})\n`,
+    );
+  }
+  // Recorded before its R26, so the run's revoke finds every install that
+  // may hold this run's creds, even when the pair never got ready.
+  const sides: PairSide[] = [];
+  const one = async (id: string, slug: string): Promise<PairSide> => {
+    const side = await pairSide(run, id, slug);
+    sides.push(side);
+    writeFileSync(join(dir, BUS_PAIR_SIDES_FILE), JSON.stringify(sides), {
+      mode: 0o600,
+    });
+    const c = await mintCreds(run, id, slug, recipient);
+    writeSecretFile(join(dir, secretFileName(slug, "PAT")), c.pat);
+    writeSecretFile(join(dir, secretFileName(slug, "HOOK_KEY")), c.hookKey);
+    out(`${slug}: R26 creds written\n`);
+    await waitHookKey(run, side.app, c.hookKey, pace);
+    out(`${slug}: the new hook key is accepted\n`);
+    return side;
+  };
+  const named = (slug: string) => (e: unknown) => {
+    const msg = errText(e);
+    if (e instanceof Error) {
+      if (!msg.startsWith(`${slug}:`)) e.message = `${slug}: ${msg}`;
+      throw e;
+    }
+    throw new Error(`${slug}: ${msg}`);
+  };
+  // Both always awaited to the end, as bringUp's two chains.
+  const [a, b] = await Promise.allSettled([
+    one(agents.id, BUS_AGENTS).catch(named(BUS_AGENTS)),
+    one(busb.id, BUS_B).catch(named(BUS_B)),
+  ]);
+  if (a.status === "rejected") throw a.reason;
+  if (b.status === "rejected") throw b.reason;
+  const pair = { agents: a.value, busb: b.value };
+  writeBusPair(dir, pair);
+  return pair;
+}
+
 /**
  * The workflow's bring-up (P24, R26): upgrade rl-a and rl-b, then mint their
  * creds, the two installs at the same time (#1730: the two upgrades are about
@@ -325,6 +465,7 @@ export async function bringUp(
   t: RawTargets,
   run: Run = liveRun(env, t),
   pace?: (app: string, deadline: number) => Promise<unknown>,
+  busPair?: typeof bringUpBusPair,
 ): Promise<void> {
   const m = mask(env);
   const r = await newRecipient();
@@ -359,7 +500,24 @@ export async function bringUp(
       throw e;
     }
   };
+  // The hosted bus pair (cloud #202) beside them. Its failure never fails the
+  // bring-up: it is written for the two bus cases, which report it as infra,
+  // so the rest of the suite still runs.
+  const pair = (busPair ?? bringUpBusPair)(
+    run,
+    t.secretsDir,
+    { publicKey: r.publicKey, open },
+    pace,
+  ).then(
+    () => out("bus pair: ready\n"),
+    (e) => {
+      const why = errText(e);
+      writeBusPairError(t.secretsDir, why);
+      out(`bus pair: not ready: ${why}\n`);
+    },
+  );
   const done = await Promise.allSettled([one("a", t.a), one("b", t.b)]);
+  await pair;
   const failed = done.filter(
     (d): d is PromiseRejectedResult => d.status === "rejected",
   );
@@ -392,6 +550,20 @@ export async function revokeAll(
     } catch (e) {
       failed++;
       out(`rl-${name}: revoke failed: ${(e as Error).message}\n`);
+    }
+  }
+  // The hosted bus pair's installs that bring-up took R26 creds on (cloud #202).
+  for (const side of busPairSides(t.secretsDir)) {
+    const f = join(t.secretsDir, secretFileName(side.name, "PAT"));
+    const pat = existsSync(f)
+      ? readSecretFile(f, secretFileName(side.name, "PAT"))
+      : undefined;
+    try {
+      await revokeCreds(run, side.installId, side.name, side.app, pat);
+      out(`${side.name}: R26 revoked\n`);
+    } catch (e) {
+      failed++;
+      out(`${side.name}: revoke failed: ${(e as Error).message}\n`);
     }
   }
   return failed ? 1 : 0;

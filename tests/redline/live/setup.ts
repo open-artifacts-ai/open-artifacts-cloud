@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { getCurrentTest } from "vitest/suite";
 import { boundFetch, INNER_KEY, unbound } from "../src/fetch-timeout.ts";
+import { busPairTargets } from "../src/hosted-bus.ts";
 import { setCurrentTest, takeFileNotes } from "../src/notes.ts";
 import { watchResets } from "../src/resets.ts";
 import {
@@ -31,7 +32,10 @@ const bound = boundFetch(transportFetch(globalThis.fetch, resets));
 // request's timeout. setupFetch re-bounds `unbound(fetch)`: that gets the
 // same rules around the raw fetch.
 // Fails closed: a live run never loses its pacing, lock or tripwire silently.
-const targets = liveTargetsFromEnv();
+// The hosted bus pair (rl-agents, rl-busb; src/hosted-bus.ts) after rl-a and
+// rl-b, when bring-up wrote it: their device-flow requests spend the same
+// account-wide RL_ANON keys, so they are paced and tripwired the same way.
+const targets = [...liveTargetsFromEnv(), ...busPairTargets()];
 // The wait budget is per case (#24). Code outside a case (beforeAll and
 // afterAll hooks) gets one per phase: the hooks before the first test share
 // one, and each test's end starts a new one for what follows (the next test's

@@ -39,12 +39,33 @@ const fx = JSON.parse(
 ) as Fixture;
 const P = fx.phases;
 /**
- * Files added after the recording (#1299's live/bus.test.ts), so no wall was
- * recorded: an ESTIMATE, not a measurement (a setup of two sides and one
- * case that is a few requests while the bus is off). The first live run that
- * includes them replaces it; test/cases-added.ts names what is estimated.
+ * Files added after the recording, in a lane the recording has no wall for
+ * (none today: live/bus.test.ts has its own lane, BUS_FILE below). The first
+ * live run that includes one replaces its ESTIMATE; test/cases-added.ts names
+ * what is estimated.
  */
-const ESTIMATED_WALL_SEC: Record<string, number> = { "live/bus.test.ts": 20 };
+const ESTIMATED_WALL_SEC: Record<string, number> = {};
+
+/**
+ * Cloud #202: live/bus.test.ts on rl-agents and rl-busb, in its own lane
+ * ("busb"), after the recordings. Its wall is MODELED, not measured, from the
+ * case's own bounds (src/hosted-bus.ts): the pair's sign-in and two device
+ * flows, case 1's few upgrades, case 2's sockets, the suspend job, the close
+ * (target 30 s), the 6 min paused window from the close, the resume job and
+ * /healthz, the reopen. The first live run replaces it.
+ */
+const BUS_FILE = "live/bus.test.ts";
+const BUSB_MODEL = {
+  setupSec: 30,
+  crossSec: 10,
+  socketsSec: 10,
+  suspendJobSec: 20,
+  closeSec: 30,
+  windowSec: 360,
+  resumeSec: 30,
+  reopenSec: 15,
+};
+const BUSB_SEC = Object.values(BUSB_MODEL).reduce((n, v) => n + v, 0);
 
 // #859's live/provisioner.test.ts has its own lane ("provisioner"). The
 // recording predates it, so the replay of run 42402998826 leaves the file out
@@ -57,7 +78,10 @@ const recorded = (plan: readonly Phase[]): readonly Phase[] =>
   plan.map((ph) =>
     ph
       .filter((l) => l.shard !== "b")
-      .map((l) => ({ ...l, files: l.files.filter((f) => f !== NEW_FILE) }))
+      .map((l) => ({
+        ...l,
+        files: l.files.filter((f) => f !== NEW_FILE && f !== BUS_FILE),
+      }))
       .filter((l) => l.files.length > 0),
   );
 // Load-bearing: isProv() is true only for a lane of provisioning.test.ts
@@ -376,11 +400,11 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
     m.mergeSec +
     m.revokeSec;
 
-  it("the simulated lanes are the plan's lanes", () => {
+  it("the simulated lanes are the plan's lanes, busb aside (modeled below)", () => {
     // The recording ran surfaces whole: #26's second shard is not in it.
     expect(Object.keys(ends()).sort()).toEqual(
       (PLAN[0] ?? [])
-        .filter((l) => l.shard !== "b")
+        .filter((l) => l.shard !== "b" && l.name !== "busb")
         .map((l) => l.name)
         .sort(),
     );
@@ -473,11 +497,11 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     expect(lanes()["surfaces-b"]).toBeCloseTo(239.6, 1);
   });
 
-  it("the simulated lanes are the plan's lanes (provisioner aside), none of surfaces over 280 s", () => {
+  it("the simulated lanes are the plan's lanes (provisioner and busb aside), none of surfaces over 280 s", () => {
     expect(Object.keys(lanes()).sort()).toEqual(
       (PLAN[0] ?? [])
         .map((l) => l.name)
-        .filter((n) => n !== "provisioner")
+        .filter((n) => n !== "provisioner" && n !== "busb")
         .sort(),
     );
     expect(lanes().surfaces).toBeLessThan(280);
@@ -490,5 +514,19 @@ describe("surfaces in two lanes (#26, run 43007228059)", () => {
     const end = jobSec - (suiteSec - longest);
     expect(end).toBe(447);
     expect(end).toBeLessThan(600);
+  });
+
+  // Cloud #202. The paused window starts with the suite (its own lane), so it
+  // overlaps every other lane: of the 6 min, only what runs past the longest
+  // other lane adds to the job. That is still past 10 minutes (the modeled
+  // wall, BUSB_MODEL): a known cost of OA Bus's 6 min window, not hidden here.
+  it("with the busb lane (modeled): it is the longest, and the job ends at about 681 s", () => {
+    expect(BUSB_SEC).toBe(505);
+    const all = { ...lanes(), busb: BUSB_SEC };
+    expect(Math.max(...Object.values(all))).toBe(BUSB_SEC);
+    const end = jobSec - (suiteSec - BUSB_SEC);
+    expect(end).toBe(681);
+    // Run after the longest other lane instead of beside it: 952 s.
+    expect(jobSec - suiteSec + 271 + BUSB_SEC).toBe(952);
   });
 });
