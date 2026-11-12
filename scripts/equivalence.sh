@@ -46,6 +46,7 @@ set -uo pipefail
 # are in the private list, this pair is not).
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
+# And the T19 dry-run workflow (#166): a workflow that public never had.
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
@@ -72,6 +73,7 @@ ALLOW=(
   # The read-only Turnstile widget check (#179), this repo's own.
   scripts/ci/turnstile-domains.sh
   scripts/ci/turnstile-domains.test.ts
+  .github/workflows/t19-dry-run.yml
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

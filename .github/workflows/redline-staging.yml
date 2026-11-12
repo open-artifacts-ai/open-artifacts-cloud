@@ -51,6 +51,14 @@
 #
 # staging-first-gate.sh reads only the run's conclusion: the run passes only if
 # every job does, t19 included.
+#
+# T19 with a public branch's specs (t19-dry-run.yml, never gate evidence): a
+# CALLED run may set t19_public_branch and t19_public_sha. Then only the t19
+# job swaps apps/dashboard/e2e/staging/ for that commit's copy, after the
+# overlay and before install; config, deps, lockfile and the cloud suite stay
+# the tag's. The sha must be the head of refs/heads/<branch> in the public repo
+# (git ls-remote), fetched with no credentials. workflow_dispatch has no such
+# inputs, so a gate run can't set them; empty inputs change nothing.
 name: redline-staging
 # scripts/ci/staging-first-gate.sh finds this run by the tag in its name.
 run-name: redline-staging ${{ inputs.tag }}
@@ -68,6 +76,15 @@ on:
       tag:
         type: string
         required: true
+      # t19-dry-run.yml only; both empty (the default) means the tag's own specs.
+      t19_public_branch:
+        type: string
+        required: false
+        default: ""
+      t19_public_sha:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -154,6 +171,33 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
+      # t19-dry-run.yml only (empty inputs skip this step). Swaps ONLY the T19
+      # specs for a public branch head's copy; nothing from the hand-off or any
+      # secret is in scope here.
+      - name: Use a public branch's T19 specs
+        if: inputs.t19_public_sha != '' || inputs.t19_public_branch != ''
+        env:
+          BRANCH: ${{ inputs.t19_public_branch }}
+          SHA: ${{ inputs.t19_public_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "t19_public_sha must be 40 lowercase hex"; exit 1; }
+          [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || { echo "t19_public_branch has characters outside A-Za-z0-9._/-"; exit 1; }
+          url=https://github.com/open-artifacts-ai/open-artifacts
+          head="$(git ls-remote "$url" "refs/heads/$BRANCH" | awk -v r="refs/heads/$BRANCH" '$2 == r { print $1 }')"
+          [ "$head" = "$SHA" ] || { echo "refs/heads/$BRANCH is not at $SHA in the public repo"; exit 1; }
+          src="$RUNNER_TEMP/t19-public"
+          rm -rf "$src"
+          git init -q "$src"
+          git -C "$src" fetch -q --depth=1 --no-tags "$url" "$SHA"
+          [ "$(git -C "$src" rev-parse FETCH_HEAD)" = "$SHA" ]
+          git -C "$src" cat-file -e "$SHA:apps/dashboard/e2e/staging" || { echo "no apps/dashboard/e2e/staging at $SHA"; exit 1; }
+          rm -rf apps/dashboard/e2e/staging
+          mkdir -p apps/dashboard/e2e
+          git -C "$src" archive "$SHA" apps/dashboard/e2e/staging | tar -x -C .
+          rm -rf "$src"
+          echo "T19 specs from public $SHA (branch $BRANCH):"
+          find apps/dashboard/e2e/staging -type f | LC_ALL=C sort
       - run: pnpm install --frozen-lockfile --ignore-scripts
       # The provisioning CLI (it makes the key pair and opens the hand-off)
       # needs provision and shared built; Chromium installs beside the builds
