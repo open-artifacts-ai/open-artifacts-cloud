@@ -2068,6 +2068,7 @@ describe("deploy-hosted-platform.sh", () => {
         ["STRIPE_PRICE_TEAM", "prod_1Abc", "price id"],
         ["STRIPE_PRICE_SOLO_YEARLY", "price_1 Abc", "price id"],
         ["STRIPE_PRICE_TEAM_YEARLY", "prod_1Abc", "price id"],
+        ["STRIPE_PORTAL_CONFIG", "bpc_1 Abc", "portal configuration id"],
       ] as const) {
         const r = stg().run("billing", { [k]: v }, "staging");
         expect(r.code, `${k}=${v}`).toBe(2);

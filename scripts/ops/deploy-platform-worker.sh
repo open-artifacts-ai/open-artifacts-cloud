@@ -152,6 +152,14 @@ case "$app" in
     # (scripts/ops/stripe-prices.ts); unset deploys them empty.
     fill_opt "STRIPE_PRICE_TEAM_YEARLY_${up}" "${STRIPE_PRICE_TEAM_YEARLY:-}"
     fill_opt "STRIPE_PRICE_BUSINESS_YEARLY_${up}" "${STRIPE_PRICE_BUSINESS_YEARLY:-}"
+    # The Customer Portal configuration (bpc_...): optional; unset deploys it
+    # empty and billing uses Stripe's default portal.
+    if [ -z "${STRIPE_PORTAL_CONFIG:-}" ]; then
+      sed -i.bak "s/{{STRIPE_PORTAL_CONFIG_${up}}}//g" "$copy"
+      command rm -f "$copy.bak"
+    else
+      fill "STRIPE_PORTAL_CONFIG_${up}" "$STRIPE_PORTAL_CONFIG" '^bpc_[A-Za-z0-9]{1,255}$'
+    fi
     # Its D1 migrations are pinned once deployed: the lock must be frozen and
     # match every file (MIGRATION_LOCK overrides the lock path, tests only).
     node ../../scripts/ops/check-migration-lock.mjs migrations "${MIGRATION_LOCK:-migration-lock.json}"

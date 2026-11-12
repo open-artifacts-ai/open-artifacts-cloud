@@ -112,6 +112,11 @@ export interface Env {
   STRIPE_PRICE_TEAM_YEARLY: string;
   STRIPE_PRICE_BUSINESS_YEARLY: string;
   /**
+   * The Stripe Customer Portal configuration (bpc_...) with seats and plan
+   * changes off. Optional: unset or empty uses Stripe's default configuration.
+   */
+  STRIPE_PORTAL_CONFIG?: string;
+  /**
    * Staging only: comma list of exact install ids whose customer is made on a
    * Stripe test clock (test-clock.ts). Absent in prod; ignored unless staging
    * with a test key.
@@ -751,6 +756,9 @@ async function portal(
         customerId,
         returnUrl: `https://${appHost}${PLAN_PATH}`,
         idempotencyKey: `portal-${install}-${body.ts}`,
+        ...(env.STRIPE_PORTAL_CONFIG
+          ? { configuration: env.STRIPE_PORTAL_CONFIG }
+          : {}),
       },
       cfg,
     ),
