@@ -248,11 +248,13 @@ export interface ResourceMetaInput {
   busSlugs?: readonly string[];
   /**
    * Staging only (open-artifacts#2325): every install gets `bus`, not just the
-   * named slugs. Never read when env is prod.
+   * named slugs, except red-line fixtures (slugs starting `rl-`; named slugs
+   * still get it). Never read when env is prod.
    */
   busAll?: boolean;
   /**
-   * Prod only (open-artifacts#2325): every install gets `bus`. Never read when
+   * Prod only (open-artifacts#2325): every install gets `bus`, except red-line
+   * fixtures (slugs starting `rl-`, such as `rl-p-*`). Never read when
    * env is staging; the staging flags are never read when env is prod.
    */
   busAllProd?: boolean;
@@ -415,9 +417,9 @@ export function userWorkerMetadata(
   const slug = i.appHost.split(".")[0] ?? "";
   const bus =
     (r.env === "staging" &&
-      (r.busAll === true ||
+      ((r.busAll === true && !slug.startsWith("rl-")) ||
         (busSlugOk(slug) && (r.busSlugs ?? []).includes(slug)))) ||
-    (r.env === "prod" && r.busAllProd === true);
+    (r.env === "prod" && r.busAllProd === true && !slug.startsWith("rl-"));
   const features = [
     ...new Set(
       (tier ? TIER_FEATURES[tier].join(",") : (i.vars.FEATURES ?? ""))

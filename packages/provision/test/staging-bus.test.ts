@@ -100,6 +100,20 @@ describe("staging bus slugs in userWorkerMetadata", () => {
     expect(on("anything", {}, { busAll: false })).not.toMatch(/\bbus\b/);
   });
 
+  it("busAll on staging: red-line fixtures (rl-*) get no bus unless named; normal slugs do (#2325)", () => {
+    for (const s of ["rl-l", "rl-p-123-1"])
+      expect(on(s, { TIER: "team" }, { busAll: true }), s).not.toMatch(
+        /\bbus\b/,
+      );
+    const named = ["rl-agents", "rl-busb"];
+    for (const s of named)
+      expect(
+        on(s, { TIER: "team" }, { busAll: true, busSlugs: named }),
+        s,
+      ).toMatch(/\bbus\b/);
+    expect(on("normal", { TIER: "team" }, { busAll: true })).toMatch(/\bbus\b/);
+  });
+
   it("busAll on prod: nothing, even with the list (#2325)", () => {
     const base = on("anything", { TIER: "team" }, { env: "prod" });
     expect(
@@ -124,6 +138,17 @@ describe("staging bus slugs in userWorkerMetadata", () => {
     const st = on("anything", { TIER: "team" }, {});
     expect(on("anything", { TIER: "team" }, { busAllProd: true })).toBe(st);
     expect(st).not.toMatch(/\bbus\b/);
+  });
+
+  it("busAllProd: red-line fixtures (rl-*) get no bus on prod; normal slugs do (#2325)", () => {
+    for (const s of ["rl-p-123-1", "rl-l", "rl-agents"])
+      expect(
+        on(s, { TIER: "team" }, { env: "prod", busAllProd: true }),
+        s,
+      ).not.toMatch(/\bbus\b/);
+    expect(
+      on("normal", { TIER: "team" }, { env: "prod", busAllProd: true }),
+    ).toMatch(/\bbus\b/);
   });
 
   it("prod and listed: unchanged", () => {
