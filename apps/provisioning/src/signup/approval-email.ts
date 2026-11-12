@@ -1,7 +1,7 @@
 // The approval email of the private beta (#2096), sent when an admin approves
 // someone from the waitlist. Words are Product's, final: subject "You're in:
 // Open Artifacts beta"; body "You can create your Open Artifacts now. Sign in
-// with <email> at <sign-up link>. Your first month is free." The button and
+// with <email> at <sign-up link>. Your first 30 days are free." The button and
 // footer are Design's (jL29NAp7gLQFqT9U). The link carries no token.
 
 export interface ApprovalEmail {
@@ -50,7 +50,7 @@ export function approvalEmail(o: {
   const link = signupLink(o.appDomain);
   const url = new URL(link);
   if (url.origin !== link.replace(/\/$/, "")) throw new Error("invalid domain");
-  const body = `You can create your Open Artifacts now. Sign in with ${to} at ${link}. Your first month is free.`;
+  const body = `You can create your Open Artifacts now. Sign in with ${to} at ${link}. Your first 30 days are free.`;
   const footer = `You're getting this because you joined the Open Artifacts waitlist with ${to}.`;
   const text = [
     body,
@@ -61,7 +61,7 @@ export function approvalEmail(o: {
   ].join("\n");
   const FONT =
     "Geist,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
-  const htmlBody = `You can create your Open Artifacts now. Sign in with ${esc(to)} at <a href="${esc(link)}" style="color:#1D45B8;">${esc(url.host)}</a>. Your first month is free.`;
+  const htmlBody = `You can create your Open Artifacts now. Sign in with ${esc(to)} at <a href="${esc(link)}" style="color:#1D45B8;">${esc(url.host)}</a>. Your first 30 days are free.`;
   const html = `<!doctype html>
 <html lang="en">
 <head>

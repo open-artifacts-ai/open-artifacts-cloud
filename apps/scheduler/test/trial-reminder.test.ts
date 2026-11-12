@@ -122,7 +122,7 @@ describe("trial reminder: the due window", () => {
     expect(m.to).toBe(row.owner_email);
     expect(m.from).toBe("hello@mail.test");
     expect(m.subject).toBe(
-      "Your free month ends on Nov 15. Keep Solo for $1/month.",
+      "Your free 30 days end on Nov 15. Keep Solo for $10 a year or $1 a month.",
     );
     expect(m.text).toContain("Add a card:");
     expect(m.html).toContain(">Add a card</a>");
@@ -174,7 +174,7 @@ describe("trial reminder: the last day", () => {
     expect(f.mails).toHaveLength(1);
     const m = f.mails[0] as Mail;
     expect(m.subject).toBe(
-      "Your free month ends on Nov 9. Keep Solo for $1/month.",
+      "Your free 30 days end on Nov 9. Keep Solo for $10 a year or $1 a month.",
     );
     expect(m.html).toContain(`href="https://${row.app_host}/settings/plan"`);
     expect(m.html).toContain(">Add a card</a>");

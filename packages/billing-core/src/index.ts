@@ -16,6 +16,8 @@ export {
   createTestClock,
   expireCheckoutSession,
   type PortalInput,
+  type QuantityInput,
+  type QuantityOutcome,
   retrieveSubscription,
   SOLO_TRIAL_DAYS,
   type SoloTrialInput,
@@ -24,6 +26,7 @@ export {
   type StripeConfig,
   StripeConfigError,
   type StripeSession,
+  setSubscriptionQuantity,
 } from "./sessions.js";
 export {
   SET_TIER_TIERS,

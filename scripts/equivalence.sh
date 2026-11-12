@@ -66,6 +66,9 @@ ALLOW=(
   # read-backs, this repo's own. diff -rq reports a wholly extra directory by
   # its own path, so the entry is exact.
   scripts/ops/test-fixtures
+  # The read-only Turnstile widget check (#179), this repo's own.
+  scripts/ci/turnstile-domains.sh
+  scripts/ci/turnstile-domains.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

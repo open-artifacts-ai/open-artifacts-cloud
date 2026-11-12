@@ -1,6 +1,6 @@
 /**
  * The self-serve trial-ending reminders (cloud #39, #41): one 7 days before
- * the free month ends and one on its last day, the same copy (OA Design
+ * the free 30 days end and one on its last day, the same copy (OA Design
  * audit #8). The welcome email says "we'll remind you a week before".
  *
  * An hourly gate on the 2-minute tick (platform_state) asks billing for the Solo

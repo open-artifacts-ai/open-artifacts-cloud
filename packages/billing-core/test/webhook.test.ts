@@ -17,6 +17,7 @@ import {
   MAX_WEBHOOK_BODY,
   parseEvent,
   parseSignatureHeader,
+  pricesOf,
   pruneStripeEvents,
   STRIPE_EVENT_RETENTION_MS,
   STRIPE_TOLERANCE_S,
@@ -26,6 +27,7 @@ import {
   verifyStripeSignature,
   type WebhookEnv,
 } from "../src/index.js";
+import { unknownPrice } from "../src/webhook.js";
 
 // The webhook against the tier store's real tables (#849 0001_init.sql).
 // Signatures are made here with a test secret; no Stripe call is made.
@@ -1278,6 +1280,26 @@ describe("Solo (#1568)", () => {
       )
       .bind(A)
       .run();
+
+  it("the yearly Team and Business prices name team and business, and are not unknown (#2136)", () => {
+    const yp = {
+      ...prices,
+      teamYearly: "price_TY",
+      businessYearly: "price_BY",
+    };
+    const one = (id: string) => sub({ items: { data: [{ price: { id } }] } });
+    expect(tierFromSubscription(one("price_TY"), yp)).toBe("team");
+    expect(tierFromSubscription(one("price_BY"), yp)).toBe("business");
+    expect(unknownPrice(one("price_TY"), yp)).toBe(false);
+    expect(unknownPrice(one("price_BY"), yp)).toBe(false);
+    expect(unknownPrice(one("price_Z"), yp)).toBe(true);
+    // Unset (empty env) yearly ids match nothing, even an empty price id.
+    expect(
+      pricesOf({ STRIPE_PRICE_TEAM_YEARLY: "" } as never).teamYearly,
+    ).toBeUndefined();
+    expect(tierFromSubscription(one("price_TY"), prices)).toBeNull();
+    expect(unknownPrice(one("price_TY"), prices)).toBe(true);
+  });
 
   it("either Solo price names the tier solo; an unknown price does not", () => {
     expect(tierFromSubscription(soloSub(), prices)).toBe("solo");

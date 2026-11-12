@@ -436,6 +436,16 @@ jobs:
           while :; do
             rm -rf "$pub"
             if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$pub" > /dev/null 2>&1; then break; fi
+            # The t19 job uploads its key before it ends, so a t19 job that has
+            # concluded with no key up (checked once more, for the race) will
+            # never send one. An API error reads as "not ended": keep waiting.
+            t19_done=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select((.name | test("(^| / )t19$")) and .status == "completed")] | length' 2> /dev/null) || t19_done=0
+            if [ "${t19_done:-0}" -gt 0 ] 2> /dev/null; then
+              rm -rf "$pub"
+              if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "$pub" > /dev/null 2>&1; then break; fi
+              echo "the t19 job has ended without sending a public key: not waiting for one"
+              exit 1
+            fi
             [ "$(date +%s)" -lt "$deadline" ] || { echo "no public key from the t19 job within ${wait_s} s"; exit 1; }
             sleep "${POLL_S:-10}"
           done

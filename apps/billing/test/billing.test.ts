@@ -740,6 +740,9 @@ describe("POST /usage", () => {
         creators_json: '["u3"]',
         count: 1,
         received_at: NOW + 1,
+        applied_quantity: null,
+        applied_at: null,
+        apply_outcome: null,
       },
       {
         install_id: A,
@@ -747,6 +750,9 @@ describe("POST /usage", () => {
         creators_json: '["u1","u2"]',
         count: 2,
         received_at: NOW + 1,
+        applied_quantity: null,
+        applied_at: null,
+        apply_outcome: null,
       },
     ]);
     expect(await usageOf(B)).toEqual([]);
@@ -840,6 +846,8 @@ describe("logs", () => {
       `billing tier row ${A}`,
       `billing trial started ${A}`,
       `billing usage ${A}`,
+      // A closed month on a trial row: stored, its quantity skipped (#2123).
+      `billing usage quantity trial ${A}`,
     ]);
   });
 
