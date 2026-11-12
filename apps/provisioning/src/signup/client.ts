@@ -112,7 +112,7 @@ export const CLIENT_JS = String.raw`(function () {
 
   // ---------- sign-in, then the address (design: round 2, address option A) ----------
   var refs = {};
-  var PRICE = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 monthly. No card needed.";
+  var PRICE = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.";
 
   function initials(email) {
     var l = String(email).split("@")[0].replace(/[^a-z0-9]+/gi, " ").trim().split(" ");

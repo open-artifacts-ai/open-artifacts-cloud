@@ -531,7 +531,7 @@ test("closed view: field and Go to it read as one group (10px)", async ({
 test("form price line reads exactly", async ({ page }) => {
   await mount(page, { me: false });
   await expect(page.locator(".panel .muted.small")).toHaveText(
-    "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 monthly. No card needed.",
+    "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.",
   );
 });
 
