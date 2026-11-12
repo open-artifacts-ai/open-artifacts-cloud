@@ -108,6 +108,10 @@ jobs:
       # level: every step that reads the signups constant (Deploy and verify,
       # Scheduler, last) sees it.
       ALLOW_SIGNUPS: ${{ inputs.env == 'staging' && '1' || '' }}
+      # Prod may deploy SIGNUPS_ENABLED=invite (the private beta, #2096) and
+      # nothing more open: ALLOW_INVITE admits invite only, never true or
+      # test-users. The committed prod.json stays false until it is flipped.
+      ALLOW_INVITE: ${{ inputs.env == 'prod' && '1' || '' }}
     timeout-minutes: 30
     steps:
       - name: Check the inputs

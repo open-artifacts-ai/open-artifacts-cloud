@@ -591,6 +591,41 @@ describe("deploy-platform-worker.sh", () => {
       }
     });
 
+    it("ALLOW_INVITE=1 (prod's allowance) admits invite and false, never true or test-users; staging is unchanged", () => {
+      const inv = { ...OK, ALLOW_INVITE: "1" };
+      const on = run(["provisioner", "prod"], {
+        ...inv,
+        SIGNUPS_ENABLED: "invite",
+      });
+      expect(on.code).toBe(0);
+      expect(readFileSync(on.snap, "utf8")).toContain(
+        '"SIGNUPS_ENABLED": "invite"',
+      );
+      expect(
+        run(["provisioner", "prod"], { ...inv, SIGNUPS_ENABLED: "false" }).code,
+      ).toBe(0);
+      for (const v of ["true", "test-users"]) {
+        const r = run(["provisioner", "prod"], { ...inv, SIGNUPS_ENABLED: v });
+        expect(r.code, v).toBe(1);
+        expect(r.log).toEqual([]);
+      }
+      // Staging: invite needs one of the two; true still needs ALLOW_SIGNUPS=1.
+      expect(
+        run(["provisioner", "staging"], { ...inv, SIGNUPS_ENABLED: "true" })
+          .code,
+      ).toBe(1);
+      expect(
+        run(["provisioner", "staging"], {
+          ...inv,
+          SIGNUPS_ENABLED: "test-users",
+        }).code,
+      ).toBe(0);
+      expect(
+        run(["provisioner", "staging"], { ...OK, SIGNUPS_ENABLED: "invite" })
+          .code,
+      ).toBe(1);
+    });
+
     it("refuses an unfilled or invalid value", () => {
       const bad: Record<string, string[]> = {
         SIGNUP_DAILY_CAP: ["", "0", "10000", "020", "1e3", "-1", "20 "],

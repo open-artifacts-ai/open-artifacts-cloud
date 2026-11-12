@@ -66,8 +66,9 @@ cap='^[1-9][0-9]{0,3}$'
 # The signups gate: false; staging also test-users (design v7 7). true opens
 # self-serve, which waits until after M1: it needs ALLOW_SIGNUPS=1 (a change the
 # Manager approves), so a deploy can't admit real signups into stub Workflow steps.
-# invite (#2096) opens self-serve to the allow list, so it needs it too.
-if [ "${ALLOW_SIGNUPS:-}" = 1 ]; then on='true|invite|'; else on=''; fi
+# invite (#2096) opens self-serve to the allow list, so it needs it too, or
+# ALLOW_INVITE=1 (the prod deploy's allowance), which admits invite and never true.
+if [ "${ALLOW_SIGNUPS:-}" = 1 ]; then on='true|invite|'; elif [ "${ALLOW_INVITE:-}" = 1 ]; then on='invite|'; else on=''; fi
 if [ "$env" = staging ]; then onoff="^(${on}false|test-users)\$"; else onoff="^(${on}false)\$"; fi
 price='^price_[A-Za-z0-9]{1,255}$'
 # One plain address: no slash, ampersand, backslash, quote, comma or space, so
