@@ -128,7 +128,10 @@ case "$kind" in
     elif [ -f "$STATE/$w.exists" ]; then echo '{"success":true,"result":{"bindings":[]}}'
     else echo '{"success":false,"errors":[{"code":10007,"message":"not found"}]}'; fi ;;
   secrets)
+    echo "$w" >> "$STATE/secret-reads"
     if [ -f "$STATE/fail-secrets" ]; then echo '{"success":false,"errors":[{"code":1}]}'
+    elif [ -f "$STATE/empty-secret-reads" ] && [ "$(cat "$STATE/empty-secret-reads")" -gt 0 ]; then
+      echo $(( $(cat "$STATE/empty-secret-reads") - 1 )) > "$STATE/empty-secret-reads"; echo '{"success":true,"result":[]}'
     else touch "$STATE/$w.secrets"; jq -nR '{success: true, result: [inputs | select(length > 0) | {name: .}]}' < "$STATE/$w.secrets"; fi ;;
   schedules) cat "$STATE/$w.schedules.json" ;;
 esac`;
@@ -1705,6 +1708,39 @@ describe("deploy-hosted-platform.sh", () => {
     );
     expect(r.out).toContain("staging auth-broker: deployed and verified");
     clean(r);
+  });
+  describe("an empty secret list read is read again (#227)", () => {
+    const verify = (empty?: number) => {
+      const s = setup({
+        exists: ["oa-p-auth-broker"],
+        secrets: {
+          "oa-p-auth-broker": ["BROKER_STATE_KEY", "GOOGLE_CLIENT_SECRET"],
+        },
+        files: empty === undefined ? {} : { "empty-secret-reads": `${empty}` },
+      });
+      const r = s.run("auth-broker", {
+        VERIFY_ONLY: "1",
+        GOOGLE_CLIENT_SECRET: "",
+      });
+      const reads = readFileSync(join(s.state, "secret-reads"), "utf8")
+        .split("\n")
+        .filter(Boolean).length;
+      return { r, reads };
+    };
+    it("an empty list then a full one passes, with one more read", () => {
+      const base = verify();
+      expect(base.r.code, base.r.err).toBe(0);
+      const once = verify(1);
+      expect(once.r.code, once.r.err).toBe(0);
+      expect(once.reads).toBe(base.reads + 1);
+    });
+    it("always empty still fails closed, after three reads", () => {
+      const always = verify(99);
+      expect(always.r.code).toBe(1);
+      expect(always.r.err).toContain("secrets are ''");
+      // Each empty read is tried three times in all, then given up.
+      expect(always.reads).toBeGreaterThan(verify().reads);
+    });
   });
   it("verify only: no deploy and no secret written, every check still runs", () => {
     const s = setup({

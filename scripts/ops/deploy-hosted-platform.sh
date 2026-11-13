@@ -126,7 +126,29 @@ need_queue() {
 need() { # name: a required, non-empty env var
   [ -n "${!1:-}" ] || { echo "$1 is required for $target" >&2; exit 2; }
 }
-secret_names() { cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name'; }
+# secret_names <worker>: the names of its secrets, one per line. Cloudflare
+# sometimes answers a success with an empty list for a Worker that has secrets
+# (#227), so an EMPTY list is read again, up to PUT_ATTEMPTS times in all,
+# PUT_RETRY_SLEEP seconds (default 5) after the first and three times that
+# after the second. The first non-empty read is returned; after the last
+# attempt the empty list is, so a caller's exact comparison still fails
+# closed. A failed read still fails (no retry, as before). Defined before
+# PUT_ATTEMPTS is set but only called after.
+secret_names() {
+  local pause="${PUT_RETRY_SLEEP:-5}" a out
+  [[ "$pause" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; return 1; }
+  for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+    out="$(cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name')" || return 1
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+      sleep "$pause"
+      pause=$((pause * 3))
+    fi
+  done
+}
 # put_secret <worker> <app dir> <name>: the value comes on stdin. A failed put
 # is tried PUT_ATTEMPTS (3) times in all, PUT_RETRY_SLEEP seconds (default 5)
 # after the first failure and three times that after the second: Cloudflare
