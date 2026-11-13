@@ -6,6 +6,7 @@ import { ApiError, errorResponse } from "../errors.js";
 import { charge, HOUR_MS, ipKeyOf } from "../services/counters.js";
 import { ulid } from "../ulid.js";
 import { ADDRESS_RE, REPLY_TO, SENDER_NAME } from "./approval-email.js";
+import { checkTurnstile } from "./turnstile.js";
 
 // POST /api/v1/contact on the sign-up host (open-artifacts#2404): the Business
 // "Contact us" form. No session: Origin (checked by the router), a Turnstile
@@ -156,14 +157,13 @@ export async function submitContact(
     const parsed = ContactSchema.safeParse(await readJsonBody(req));
     if (!parsed.success) throw new ApiError("invalid_input");
     const b = parsed.data;
-    const t = await env.PROVISIONER.verifyTurnstile({
+    await checkTurnstile(env, {
       token: b.turnstile,
       remoteIp: ip,
       action: "signup",
       hostname: new URL(req.url).hostname,
       testUser: false,
     });
-    if (!t.ok) throw new ApiError("turnstile_failed");
     const key = `contact_ip:${await hmac16(env, ipKeyOf(ip))}`;
     if (!(await charge(env, key, CONTACT_PER_HOUR, HOUR_MS)))
       throw new ApiError("rate_limited");

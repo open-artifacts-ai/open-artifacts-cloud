@@ -16,6 +16,7 @@ import type { Principal } from "../principal.js";
 import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
 import { admission } from "../signup/gate.js";
+import { checkTurnstile } from "../signup/turnstile.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
 import { releaseDeletedSignupSlug, slugState } from "./reads.js";
@@ -86,14 +87,13 @@ async function selfServePolicy(
   // Self-serve is HTTP only: /mcp answers a user 401 before this (4.2).
   if (surface.kind !== "http") throw new ApiError("forbidden");
   if (body.turnstile === undefined) throw new ApiError("turnstile_failed");
-  const t = await env.PROVISIONER.verifyTurnstile({
+  await checkTurnstile(env, {
     token: body.turnstile,
     remoteIp: surface.client.ip,
     action: "signup",
     hostname: surface.client.host,
     testUser,
   });
-  if (!t.ok) throw new ApiError("turnstile_failed");
   if (!(await chargeSelfServeCreate(env, surface.client.ip)))
     throw new ApiError("rate_limited");
   if (!p.email || !p.sub) throw new ApiError("forbidden");
