@@ -554,6 +554,9 @@ async function checkout(
   const { plan, interval, creators, seats } = body;
   if (plan !== "solo" && plan !== "team" && plan !== "business")
     return bad("bad_plan");
+  // #2404: Business has no self-serve checkout; nothing is created for it.
+  // Existing Business subscriptions keep the portal and webhooks.
+  if (plan === "business") return bad("business_contact_only", 409);
   // Team and Business bill per creator (#2123): the instance's own count for
   // this month (0..MAX_CREATORS), billed as at least 1. Solo takes none.
   if (
