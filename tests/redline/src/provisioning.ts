@@ -35,6 +35,7 @@ export const HOSTED_TOOL_NAMES: readonly string[] = [
   "allow_signup",
   "approve_waitlist",
   "beta_stats",
+  "list_business_requests",
   "list_waitlist",
   "remove_allowed",
 ];

@@ -576,38 +576,41 @@ describe("platform-db.ts", () => {
     });
     it("passes and reports one or two additive pins main has ahead of the tag", () => {
       const one = tagTree((_, pins) => {
-        delete pins["0014_waitlist_emailed.sql"];
+        delete pins["0015_business_requests.sql"];
       });
       expect(pinDrift(LOCK, one.lock)).toEqual({
         problems: [],
-        aheadOnMain: ["0014_waitlist_emailed.sql"],
+        aheadOnMain: ["0015_business_requests.sql"],
       });
       const two = tagTree((_, pins) => {
-        delete pins["0013_signup_beta_gate.sql"];
         delete pins["0014_waitlist_emailed.sql"];
+        delete pins["0015_business_requests.sql"];
       });
       expect(pinDrift(LOCK, two.lock)).toEqual({
         problems: [],
-        aheadOnMain: ["0013_signup_beta_gate.sql", "0014_waitlist_emailed.sql"],
+        aheadOnMain: [
+          "0014_waitlist_emailed.sql",
+          "0015_business_requests.sql",
+        ],
       });
     });
     it("still refuses an edited pin while main is ahead", () => {
       const t = tagTree((_, pins) => {
-        delete pins["0014_waitlist_emailed.sql"];
+        delete pins["0015_business_requests.sql"];
         pins["0007_signups.sql"] = "0".repeat(64);
       });
       expect(pinDrift(LOCK, t.lock)).toEqual({
         problems: [
           "0007_signups.sql's pin differs from main's (an edited migration)",
         ],
-        aheadOnMain: ["0014_waitlist_emailed.sql"],
+        aheadOnMain: ["0015_business_requests.sql"],
       });
     });
     it("accepts a new migration the tag pins", () => {
       const t = tagTree((dir, pins) => {
         const sql = "CREATE TABLE IF NOT EXISTS x (id TEXT PRIMARY KEY);\n";
-        writeFileSync(join(dir, "0015_x.sql"), sql);
-        pins["0015_x.sql"] = sha(sql);
+        writeFileSync(join(dir, "0016_x.sql"), sql);
+        pins["0016_x.sql"] = sha(sql);
       });
       expect(() => loadMigrations(t.dir, t.lock)).not.toThrow();
       expect(pinDrift(LOCK, t.lock)).toEqual({

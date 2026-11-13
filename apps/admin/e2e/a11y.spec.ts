@@ -18,6 +18,7 @@ const ROUTES = [
   "/beta",
   "/beta?mock=beta-open",
   "/beta?mock=beta-empty",
+  "/business-requests",
   "/audit",
   "/audit?mock=test-admin",
   "/tokens",

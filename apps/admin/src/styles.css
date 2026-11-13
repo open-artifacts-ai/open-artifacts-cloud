@@ -2142,6 +2142,14 @@ code.oa-code,
   color: var(--oa-text);
   font: 400 13px / 1.4 var(--oa-font-sans);
 }
+.oa-beta-fs {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
 .oa-beta-card {
   margin-bottom: 0;
 }

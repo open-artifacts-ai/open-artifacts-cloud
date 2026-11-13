@@ -18,6 +18,11 @@ import {
   stats,
 } from "./routes/beta.js";
 import {
+  BUSINESS_TOOL,
+  ListBusinessInput,
+  listBusinessRequests,
+} from "./routes/business.js";
+import {
   SET_TIER_TOOL,
   SetTierInputSchema,
   setTier,
@@ -116,6 +121,18 @@ export const HOSTED_TOOLS: readonly HostedTool[] = [
       if (typeof a.status === "string") u.searchParams.set("status", a.status);
       if (typeof a.q === "string") u.searchParams.set("q", a.q);
       return listWaitlist(env, u);
+    },
+    json,
+  ),
+  betaTool(
+    BUSINESS_TOOL,
+    "List the Business contact requests, newest first (status new, contacted, closed or all; all by default). Read-only.",
+    ListBusinessInput,
+    false,
+    (env, _p, a) => {
+      const u = new URL("https://business.invalid/");
+      if (typeof a.status === "string") u.searchParams.set("status", a.status);
+      return listBusinessRequests(env, u);
     },
     json,
   ),
