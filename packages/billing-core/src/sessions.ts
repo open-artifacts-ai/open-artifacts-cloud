@@ -5,14 +5,21 @@
 // Idempotency-Key.
 //
 // Every URL is billing's own (passed in by billing, never taken from a
-// request), https only. Stripe test mode only: a key that isn't sk_test_ or
-// rk_test_ is refused before any call. Errors never carry Stripe's body.
+// request), https only. Test mode by default: a key that isn't sk_test_ or
+// rk_test_ is refused before any call. Live mode (live: true, set only on prod)
+// takes a restricted rk_live_ key and nothing else; sk_live_ is never accepted.
+// Errors never carry Stripe's body.
 
 export const STRIPE_API = "https://api.stripe.com";
 
 export interface StripeConfig {
-  /** sk_test_... or rk_test_... (a Worker secret; never in code or argv). */
+  /**
+   * sk_test_... or rk_test_...; with live, an rk_live_... restricted key (a
+   * Worker secret; never in code or argv).
+   */
   secretKey: string;
+  /** Prod only: accept rk_live_ and refuse test keys. Absent or false: test keys only. */
+  live?: boolean;
   /** Test seam; defaults to the global fetch. */
   fetch?: typeof fetch;
   /** Test seam; defaults to STRIPE_API. */
@@ -86,6 +93,7 @@ export class StripeApiError extends Error {
 }
 
 const TEST_KEY = /^(sk|rk)_test_[A-Za-z0-9]{8,255}$/;
+const LIVE_KEY = /^rk_live_[A-Za-z0-9]{8,255}$/;
 const CUSTOMER = /^cus_[A-Za-z0-9]{1,255}$/;
 const PORTAL_CONFIG = /^bpc_[A-Za-z0-9]{1,255}$/;
 const PRICE = /^price_[A-Za-z0-9]{1,255}$/;
@@ -125,7 +133,7 @@ async function send(
   form: Record<string, string> | null,
   idempotencyKey: string | null,
 ): Promise<{ status: number; out: Record<string, unknown> | null }> {
-  check(TEST_KEY, "secretKey", cfg.secretKey);
+  check(cfg.live ? LIVE_KEY : TEST_KEY, "secretKey", cfg.secretKey);
   if (idempotencyKey !== null)
     check(IDEMPOTENCY, "idempotencyKey", idempotencyKey);
   const res = await (cfg.fetch ?? fetch)(

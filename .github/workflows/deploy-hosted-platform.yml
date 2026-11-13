@@ -21,12 +21,11 @@
 # One version everywhere (#1040): the default is every target, in order. Any
 # other list is break-glass: it needs a reason and opens an issue naming the
 # run (verify_only is a check, so it needs neither). `billing` (the Stripe
-# billing service, #1568) is a STAGING-ONLY target between directory-broker and
-# provision-token: prod refuses it, so prod's list, bindings, routes and
-# secrets are unchanged. The staging full list is the default list with
-# billing in it (no reason needed); the default list itself stays every
-# target prod has, so a default staging run leaves billing on its own tag
-# (the tag read-back checks billing only when the run included it). Every Worker version is
+# billing service, #1568) sits between directory-broker and provision-token, on
+# staging (Stripe test mode) and on prod (Stripe live mode, a restricted
+# rk_live_ key). The full list with billing is the one-version list on either
+# env (no reason needed); the default list without it leaves billing on its own
+# tag (the tag read-back checks billing only when the run included it). Every Worker version is
 # tagged with the release (the "workers/tag" annotation), which
 # redline-staging.yml checks before it starts (scripts/ci/platform-tags.sh).
 name: deploy-hosted-platform
@@ -45,7 +44,7 @@ on:
         required: true
         type: string
       targets:
-        description: "Comma-separated, in order: platform-db,auth-broker,directory-broker,billing (staging only),provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
+        description: "Comma-separated, in order: platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
         required: true
         default: "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"
         type: string
@@ -122,11 +121,11 @@ jobs:
           REASON: ${{ inputs.reason }}
           VERIFY_ONLY: ${{ inputs.verify_only }}
           OA_OWNER_EMAIL: ${{ secrets.OA_OWNER_EMAIL }}
-          # Billing's Stripe secrets (#1568): only a staging run that includes the
-          # billing target holds them; any other run (prod included) gets neither,
-          # whatever its Environment has.
-          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
-          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
+          # Billing's Stripe secrets (#1568): only a run that includes the billing
+          # target holds them (staging: test key; prod: restricted live key); any
+          # other run gets neither, whatever its Environment has.
+          STRIPE_SECRET_KEY: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           # Defense in depth: the env is checked here too.
@@ -138,9 +137,10 @@ jobs:
           case ",$TARGETS," in
             *,scheduler,*) [ -n "$OA_OWNER_EMAIL" ] || { echo "OA_OWNER_EMAIL is not set; the scheduler target needs it"; exit 1; } ;;
           esac
-          # #1568: the billing target needs both Stripe secrets, test-mode shapes.
+          # #1568: the billing target needs both Stripe secrets: a test-mode key
+          # on staging, a restricted live key (rk_live_, never sk_live_) on prod.
           # This check runs before any target, so a run that includes billing
-          # without them (or with a live key) fails here, not after the earlier
+          # without them (or with the other mode's key) fails here, not after the earlier
           # targets deployed; verify only reads, so it needs neither. It checks
           # the secrets only: a tag cut before the billing migration lock was
           # frozen is refused later, at the billing target (billing-db.ts), after
@@ -148,9 +148,13 @@ jobs:
           case ",$TARGETS," in
             *,billing,*)
               if [ "${VERIFY_ONLY:-}" != true ]; then
-                [ -n "$STRIPE_SECRET_KEY" ] || { echo "STRIPE_SECRET_KEY is not set in hosted-staging-deploy; the billing target needs it"; exit 1; }
-                [ -n "$STRIPE_WEBHOOK_SECRET" ] || { echo "STRIPE_WEBHOOK_SECRET is not set in hosted-staging-deploy; the billing target needs it"; exit 1; }
-                [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] || { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_); a live key is refused"; exit 1; }
+                [ -n "$STRIPE_SECRET_KEY" ] || { echo "STRIPE_SECRET_KEY is not set in hosted-$DEPLOY_ENV-deploy; the billing target needs it"; exit 1; }
+                [ -n "$STRIPE_WEBHOOK_SECRET" ] || { echo "STRIPE_WEBHOOK_SECRET is not set in hosted-$DEPLOY_ENV-deploy; the billing target needs it"; exit 1; }
+                if [ "$DEPLOY_ENV" = prod ]; then
+                  [[ "$STRIPE_SECRET_KEY" =~ ^rk_live_[A-Za-z0-9]{8,255}$ ]] || { echo "STRIPE_SECRET_KEY must be a restricted live key (rk_live_) on prod; a test key or sk_live_ is refused"; exit 1; }
+                else
+                  [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] || { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_) on staging; a live key is refused"; exit 1; }
+                fi
                 [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] || { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)"; exit 1; }
               fi ;;
           esac
@@ -172,8 +176,6 @@ jobs:
             for o in $order; do [ "$o" = "$t" ] && pos=$i; i=$((i + 1)); done
             [ "$pos" -ge 0 ] || { echo "unknown target: $t"; exit 1; }
             case " $seen " in *" $t "*) echo "duplicate target: $t"; exit 1 ;; esac
-            # Staging only: prod has no billing Worker, binding, route or secret.
-            [ "$t" != billing ] || [ "$DEPLOY_ENV" = staging ] || { echo "billing is a staging-only target"; exit 1; }
             [ "$pos" -gt "$last" ] || { echo "targets out of order: $TARGETS"; exit 1; }
             last=$pos; seen="$seen $t"
           done
@@ -297,13 +299,13 @@ jobs:
       - name: Build and test the Workers being deployed
         env:
           DEPLOY_ENV: ${{ inputs.env }}
+          TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
           pnpm --filter @oa/provision build
           pnpm --filter @oa/auth-broker --filter @oa/directory-broker --filter @oa/dispatch --filter @oa/scheduler --filter @oa/inventory --filter @oa/provisioner --filter @oa/provisioning --filter @oa/admin test
-          # Staging's billing service and its Stripe core (#1568): staging only,
-          # so prod's run builds and tests exactly what it did before.
-          if [ "$DEPLOY_ENV" = staging ]; then pnpm --filter @oa/billing --filter @oa/billing-core test; fi
+          # The billing service and its Stripe core (#1568): tested when the run deploys it.
+          case ",$TARGETS," in *,billing,*) pnpm --filter @oa/billing --filter @oa/billing-core test ;; esac
       # main's committed constants (account id, email, Google client ids),
       # and the alert address from the OA_OWNER_EMAIL secret (#1084: never
       # committed, masked in the log).
@@ -374,11 +376,11 @@ jobs:
           # The OIDC principal's repository (inventory, staging's provisioning);
           # GITHUB_REPOSITORY (owner/repo) is the runner's own.
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
-          # Billing's Stripe secrets (#1568): only a staging run that includes the
+          # Billing's Stripe secrets (#1568): only a run that includes the
           # billing target holds them; the target refuses without them and puts
-          # them on oa-s-billing alone.
-          STRIPE_SECRET_KEY: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
-          STRIPE_WEBHOOK_SECRET: ${{ inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
+          # them on the env's billing Worker alone.
+          STRIPE_SECRET_KEY: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
+          STRIPE_WEBHOOK_SECRET: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
           IFS=, read -ra list <<< "$TARGETS"

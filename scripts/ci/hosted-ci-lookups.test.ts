@@ -380,14 +380,29 @@ describe("hosted-resource-ids.sh", () => {
     expect(two.ghEnv).toBe("");
   });
 
-  it("billing is refused for prod before any call", () => {
-    const r = run(["bash", script("hosted-resource-ids.sh"), "prod"], good(), {
-      TARGETS: "billing",
-    });
-    expect(r.code).toBe(2);
-    expect(r.err).toContain("staging-only");
-    expect(r.sb.log().filter((l) => l.startsWith("curl"))).toEqual([]);
-    expect(r.ghEnv).toBe("");
+  it("billing on prod: the D1 oa-p-billing by exact name when TARGETS names it; absent fails naming it", () => {
+    const BUUID = "99999999-9999-4999-8999-999999999999";
+    const r = run(
+      ["bash", script("hosted-resource-ids.sh"), "prod"],
+      {
+        ...good(),
+        d1: [
+          ok(d1([{ uuid: BUUID, name: "oa-p-billing" }]), { total_pages: 1 }),
+        ],
+      },
+      { TARGETS: "billing" },
+    );
+    expect(r.code, r.err).toBe(0);
+    expect(r.ghEnv).toContain(`BILLING_DB_ID=${BUUID}\n`);
+    expect(r.out).toContain(`oa-p-billing: ${BUUID}`);
+    const missing = run(
+      ["bash", script("hosted-resource-ids.sh"), "prod"],
+      good(),
+      { TARGETS: "billing" },
+    );
+    expect(missing.code).toBe(1);
+    expect(missing.err).toContain("oa-p-billing");
+    expect(missing.ghEnv).toBe("");
   });
 
   it("the sending zone: a zone of that name on another account never counts", () => {

@@ -9,14 +9,14 @@
 #           admin.<app>/* and api.<app>/* -> oa-<p>-provisioning
 #   signup.<app>/* -> oa-<p>-provisioning: staging, and prod only with
 #           signup_deploy on (#40)
-#   staging only (#1568), while oa-s-billing EXISTS: the exact route
-#           billing.<app>/stripe/webhook -> oa-s-billing (Stripe's webhook). It is
+#   (#1568), while oa-<p>-billing EXISTS: the exact route
+#           billing.<app>/stripe/webhook -> oa-<p>-billing (Stripe's webhook). It is
 #           state-based, never keyed on a target list: with the Worker deployed
 #           the route is in the expected set (a later run keeps it; otherwise
 #           *.<app>/* would see it as a foreign route and refuse); without it the
 #           route is left out, the plan says so, and the run does not refuse.
-#           A lookup that fails (not a clear "not found") fails the run. Prod
-#           never looks and has no such route.
+#           A lookup that fails (not a clear "not found") fails the run. Same
+#           on staging and prod.
 # `plan` reads only and prints each change (and "ok" for what already matches),
 # also to $GITHUB_STEP_SUMMARY. `apply` plans first, refuses unless every change
 # is an addition or setting change from that fixed set, makes them, then reads
@@ -72,12 +72,12 @@ for w in "${WORKERS[@]}"; do
   ok="$(cf "$CLOUDFLARE_API_TOKEN" GET "$CF/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$w/settings" | jq -r '.success' 2> /dev/null)"
   [ "$ok" = true ] || { echo "$w does not exist: deploy it first" >&2; exit 1; }
 done
-# Staging only (#1568): does oa-s-billing exist? Only a clear "not found"
+# (#1568): does oa-<p>-billing exist? Only a clear "not found"
 # (Cloudflare's code 10007) reads as absent; any other failure stops the run, so
 # a lookup error never silently drops the route (and with it a live one would
-# look foreign to the *.<app>/* pattern). Prod never looks.
+# look foreign to the *.<app>/* pattern).
 BILLING_UP=""
-if [ "$env" = staging ]; then
+if [ "$env" = staging ] || [ "$env" = prod ]; then
   b="$(cf "$CLOUDFLARE_API_TOKEN" GET "$CF/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/oa-$P-billing/settings")" ||
     { echo "look up oa-$P-billing failed: no answer; refusing" >&2; exit 1; }
   if [ "$(jq -r '.success' <<< "$b" 2> /dev/null)" = true ]; then
@@ -115,12 +115,12 @@ ROUTES=("$APP_ZONE auth.$APP/* oa-$P-auth-broker" "$APP_ZONE directory.$APP/* oa
 if [ "$env" = staging ] || { [ "$env" = prod ] && [ "${PROD_SIGNUP_DEPLOY:-}" = on ]; }; then
   ROUTES+=("$APP_ZONE signup.$APP/* oa-$P-provisioning")
 fi
-# Staging only (#1568), while oa-s-billing exists: Stripe's webhook, one exact
+# (#1568), while oa-<p>-billing exists: Stripe's webhook, one exact
 # path, to the billing Worker. The wildcard AAAA above already makes
 # billing.<app> resolve, and an exact pattern beats *.<app>/* (dispatch) for it;
 # every other path on that host still goes to dispatch, which has no such install.
 [ -z "$BILLING_UP" ] || ROUTES+=("$APP_ZONE billing.$APP/stripe/webhook oa-$P-billing")
-if [ "$env" = staging ] && [ -z "$BILLING_UP" ]; then
+if [ -z "$BILLING_UP" ]; then
   say "oa-$P-billing does not exist yet: its webhook route (billing.$APP/stripe/webhook) is left out"
 fi
 EXPECTED=()

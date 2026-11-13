@@ -1,5 +1,5 @@
 # Written by scripts/sync-from-public.sh: the public commit the private
 # paths were last copied from.
-sha=be55b0aa89dea32a5ee6312f957afe11b0bc0824
-tag=v0.171.0
+sha=51750ca7472d0837e540ddd305a4d764fe9bb2de
+tag=v0.173.0
 list=public:scripts/ci/private-paths.txt

@@ -161,16 +161,14 @@ describe("wrangler.jsonc", () => {
       for (const k of ["durable_objects", "triggers", "assets"])
         expect(e).not.toHaveProperty(k);
       // The one service binding (#1568): billing's BillingProvisionerRpc, on
-      // STAGING only, to start an install's Solo trial. Prod has none.
-      if (env === "staging")
-        expect(e.services).toEqual([
-          {
-            binding: "BILLING",
-            service: platformNames("staging").billing,
-            entrypoint: "BillingProvisionerRpc",
-          },
-        ]);
-      else expect(e).not.toHaveProperty("services");
+      // both envs, to start an install's Solo trial.
+      expect(e.services).toEqual([
+        {
+          binding: "BILLING",
+          service: platformNames(env).billing,
+          entrypoint: "BillingProvisionerRpc",
+        },
+      ]);
     }
   });
 

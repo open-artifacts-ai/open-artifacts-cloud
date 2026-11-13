@@ -67,20 +67,15 @@ describe("wrangler.jsonc", () => {
       const provisioner = names.provisioner;
       // BrokerGate's bindings: this env's two brokers, never the other env's;
       // and the provisioner's ProvisionerRpc entrypoint (tokenStatus).
-      // BILLING on STAGING only (#1568), with dispatch's: the calls then carry
-      // the billing gate and the */2 health check runs. Prod has none.
-      expect(JSON.stringify(e.services).includes("BILLING")).toBe(
-        env === "staging",
-      );
+      // BILLING on both envs (#1568), with dispatch's: the calls then carry
+      // the billing gate and the */2 health check runs.
       expect(e.services).toEqual([
         { binding: "AUTH_BROKER", service: platformNames(env).broker },
         {
           binding: "DIRECTORY_BROKER",
           service: platformNames(env).directoryBroker,
         },
-        ...(env === "staging"
-          ? [{ binding: "BILLING", service: platformNames(env).billing }]
-          : []),
+        { binding: "BILLING", service: platformNames(env).billing },
         {
           binding: "PROVISIONER",
           service: provisioner,
@@ -237,8 +232,8 @@ describe("BILLING is bound on dispatch and the scheduler together (#1514)", () =
       const s = bound(cfg);
       expect(d).toEqual(s);
       expect(d.length).toBeLessThanOrEqual(1);
-      // Staging binds it on both; prod on neither (#1568).
-      expect(d.length).toBe(env === "staging" ? 1 : 0);
+      // Both envs bind it on both (#1568).
+      expect(d.length).toBe(1);
       for (const b of [...d, ...s])
         expect(b).toEqual({
           binding: "BILLING",

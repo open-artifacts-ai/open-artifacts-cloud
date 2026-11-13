@@ -288,13 +288,16 @@ describe("prod-release-chain.yml", () => {
     expect(deploy.on.workflow_dispatch.inputs.targets.default).toBe(FULL);
     const steps = deploy.jobs.deploy.steps as Record<string, string>[];
     const ifOf = (n: string) => steps.find((s) => s.name === n)?.if;
-    // Prod's list is unchanged; staging's full list adds billing (#1568), a
-    // staging-only target that prod refuses, so the chain never carries it.
+    // The full list with billing (#1568) is the same list the deploy accepts
+    // on both envs; the chain carries it only when prod's billing prices are
+    // filled in prod.json (chain-dispatch.test.ts), and the deploy job's
+    // checkout has .github/hosted for that read.
     const FULLB = FULL.replace(
       "directory-broker,",
       "directory-broker,billing,",
     );
-    expect(sh).not.toContain("billing");
+    expect(sh).toContain(`"${FULLB}"`);
+    expect(sh).toContain("billingConfigured");
     expect(ifOf("Every platform Worker runs the tag")).toBe(
       `\${{ !cancelled() && (steps.deploy.outcome != 'skipped' || steps.scheduler.outcome != 'skipped') && (inputs.targets == '${FULL}' || inputs.targets == '${FULLB}') }}`,
     );
