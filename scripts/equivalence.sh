@@ -77,6 +77,9 @@ ALLOW=(
   scripts/ci/turnstile-domains.sh
   scripts/ci/turnstile-domains.test.ts
   .github/workflows/t19-dry-run.yml
+  # The report-only orphaned Durable Object namespaces check (open-artifacts#2360).
+  scripts/ci/do-orphans.sh
+  scripts/ci/do-orphans.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

@@ -126,6 +126,8 @@ describe("redline-staging.yml", () => {
       ps[0]?.uses,
       "Load the hosted constants",
       "Every staging platform Worker runs the tag",
+      "Read the dispatch namespace",
+      "Durable Object namespaces without their install Worker",
     ]);
     expect(ps[1]?.run).toBe(
       "bash scripts/ci/hosted-constants.sh staging .github/hosted > /dev/null",
@@ -137,10 +139,26 @@ describe("redline-staging.yml", () => {
       },
       run: 'bash scripts/ci/platform-tags.sh staging "$TAG"',
     });
-    // Only that step sees the token.
+    // The orphan read is unproven, so its step is continue-on-error: it never
+    // blocks a release gate, whatever the script exits.
     expect(
-      ps.filter((s) => JSON.stringify(s).includes("secrets.")),
-    ).toHaveLength(1);
+      ps.find((s) => s.name?.startsWith("Durable Object namespaces"))?.[
+        "continue-on-error"
+      ],
+    ).toBe(true);
+    expect(ps.filter((s) => s["continue-on-error"] !== undefined).length).toBe(
+      1,
+    );
+    // The tag check and the report-only orphan read (open-artifacts#2360) are
+    // the only steps that see the token.
+    expect(
+      ps
+        .filter((s) => JSON.stringify(s).includes("secrets."))
+        .map((s) => s.run),
+    ).toEqual([
+      'bash scripts/ci/platform-tags.sh staging "$TAG"',
+      "bash scripts/ci/do-orphans.sh",
+    ]);
     expect(JSON.stringify(job)).not.toContain("CLOUDFLARE_API_TOKEN");
     expect(JSON.stringify(t19Job)).not.toContain("CLOUDFLARE_API_TOKEN");
   });
