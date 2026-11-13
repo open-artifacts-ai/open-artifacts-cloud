@@ -261,6 +261,16 @@ export const SUSPEND_CLOSE_CODE = 4403;
  * pass, the last just past it, each dispatch's paused answer, never 101.
  */
 export const RECONNECT_AT_MS = [10_000, 60_000, 125_000] as const;
+/**
+ * The platform's contract (P20): a suspended install is paused at the edge
+ * within 120 s. Dispatch reads HOSTS on eventually consistent KV (cacheTtl
+ * 60), so a reconnect before this may still get 101; the install's later
+ * close pass (120 s, 300 s after its close-sockets job runs) then closes it
+ * with 4403. A stricter product fix (cloud #228) restores the strict probe.
+ */
+export const PAUSE_WINDOW_MS = 120_000;
+/** A socket opened inside the window is closed with 4403 by this, from the suspend job's done. */
+export const WINDOW_CLOSE_DEADLINE_MS = PAUSE_WINDOW_MS + 30_000;
 /** A redelivery after the resume, and every frame wait. */
 export const FRAME_WAIT_MS = 30_000;
 const CLOSE_POLL_MS = 1_000;
@@ -370,8 +380,16 @@ export interface SuspendIo {
   suspend(): Promise<void>;
   /** R8, to done, then its /healthz 200. */
   resume(): Promise<void>;
-  /** One upgrade with the daemon's token: its status, and whether it is dispatch's paused 503. */
-  reconnect(): Promise<{ status: number; paused: boolean }>;
+  /**
+   * One upgrade with the daemon's token: its status, whether it is dispatch's
+   * paused 503, and on a 101 the socket, kept open (hello sent, closed in the
+   * cleanup).
+   */
+  reconnectHold(): Promise<{
+    status: number;
+    paused: boolean;
+    sock?: HeldSock;
+  }>;
   /** After the resume: the same token's upgrade, hello, the receiver up again, and whether msgId came again. */
   reopen(msgId: string): Promise<{ status: number; redelivered: boolean }>;
   /** The suspended install's machines and roster (hubView), and whether the case's machine and receiver are on them. */
@@ -381,14 +399,19 @@ export interface SuspendIo {
 export interface SuspendResult {
   closeMs: number;
   reconnects: number;
+  /** Reconnects inside the pause window that got 101, and when each was closed (ms after the job's done; null if never). */
+  windowOpens: number;
+  windowCloseMs: (number | null)[];
 }
 
 /**
  * Case 2, OA Bus's assertions in order: with a daemon socket (an agent up and
  * one message pending) on rl-busb and a socket on rl-busa, suspend rl-busb;
  * the daemon socket closes within CLOSE_WITHIN_MS of the job's done with
- * 4403; a reconnect with the same token at each RECONNECT_AT_MS is
- * dispatch's paused answer, never 101; rl-busa's socket stays open
+ * 4403; a reconnect with the same token at each RECONNECT_AT_MS before
+ * PAUSE_WINDOW_MS is dispatch's paused answer or a 101 that the install's
+ * later pass closes with 4403 by WINDOW_CLOSE_DEADLINE_MS, and at or after
+ * it dispatch's paused answer, never 101; rl-busa's socket stays open
  * throughout; after the resume the same token gets 101, the pending mail
  * comes again and the hub still lists the machine and agent. The resume is
  * sent whatever failed after the suspend was sent; the first failure is the
@@ -409,7 +432,14 @@ export async function suspendCase(
     throw new ProbeFail(
       `${X}'s roster does not list the case's machine and receiver before the suspend`,
     );
-  const out: SuspendResult = { closeMs: 0, reconnects: 0 };
+  const out: SuspendResult = {
+    closeMs: 0,
+    reconnects: 0,
+    windowOpens: 0,
+    windowCloseMs: [],
+  };
+  // Sockets a window 101 left open: judged at WINDOW_CLOSE_DEADLINE_MS.
+  const windowSocks: { sock: HeldSock; index: number }[] = [];
   const stillUp = (when: string) => {
     if (!bystander.isOpen())
       throw new ProbeFail(`${Y}'s bus socket closed ${when}`);
@@ -452,19 +482,47 @@ export async function suspendCase(
       const left = t0 + at - io.now();
       if (left > 0) await io.wait(left);
       stillUp("while the other install was suspended");
-      const r = await io.reconnect();
+      const r = await io.reconnectHold();
       out.reconnects++;
-      const s = Math.round((io.now() - t0) / 1000);
-      if (r.status === 101)
-        throw new BreachFail(
-          `${X} upgraded the daemon's token ${s} s after the suspend`,
-        );
+      const sinceMs = io.now() - t0;
+      const s = Math.round(sinceMs / 1000);
+      if (r.status === 101) {
+        if (sinceMs >= PAUSE_WINDOW_MS || !r.sock)
+          throw new BreachFail(
+            `${X} upgraded the daemon's token ${s} s after the suspend`,
+          );
+        const index = out.windowCloseMs.push(null) - 1;
+        out.windowOpens++;
+        const sock = r.sock;
+        void sock.closed.then(() => {
+          out.windowCloseMs[index] ??= io.now() - t0;
+        });
+        windowSocks.push({ sock, index });
+        continue;
+      }
       if (!r.paused)
         throw new ProbeFail(
           `${X} answered a reconnect ${s} s after the suspend with ${r.status}, want dispatch's paused 503`,
         );
     }
     if (!closeChecked.done) await checkClose();
+    while (
+      windowSocks.some((w) => w.sock.isOpen()) &&
+      io.now() - t0 < WINDOW_CLOSE_DEADLINE_MS
+    )
+      await io.wait(CLOSE_POLL_MS);
+    await Promise.resolve();
+    for (const { sock } of windowSocks) {
+      if (sock.isOpen())
+        throw new BreachFail(
+          `${X}: a socket opened in the pause window was still open ${Math.round((io.now() - t0) / 1000)} s after the suspend`,
+        );
+      const code = sock.closeCode();
+      if (code !== SUSPEND_CLOSE_CODE)
+        throw new BreachFail(
+          `${X}: a socket opened in the pause window closed with ${code ?? "no code"}, want ${SUSPEND_CLOSE_CODE}`,
+        );
+    }
   } catch (e) {
     failure = e;
   }
@@ -889,14 +947,23 @@ export function liveSuspendIo(
         async () => (await run.page(xHost)).status === 200,
       );
     },
-    async reconnect() {
-      const r = await upgradeOnce(x.side.app, await minted.token(x));
+    async reconnectHold() {
+      const h = await holdSocket(
+        connectRequest(x.side.app, await minted.token(x)),
+      );
+      held.push(h);
+      if (h.status === 101) {
+        // The install's later pass answers this with a 4403 close.
+        h.send(helloFrame("h1"));
+        return { status: 101, paused: false, sock: asSock(h) };
+      }
       // Dispatch's own 503 (apps/dispatch/src/unavailable.ts): text for a
       // client that does not ask for HTML.
       return {
-        status: r.status,
+        status: h.status,
         paused:
-          r.status === 503 && r.body.startsWith("This workspace is paused"),
+          h.status === 503 &&
+          (h.body ?? "").startsWith("This workspace is paused"),
       };
     },
     async reopen(msgId) {
