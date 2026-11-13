@@ -219,7 +219,12 @@ export interface InstallMetaInput {
 
 export interface ResourceMetaInput {
   d1Id: string;
-  kvId: string;
+  /**
+   * The install's OAuth KV namespace, or null for one with none: born on d1
+   * or past its namespace removal (#1008). Null renders no kv_namespace
+   * binding, so OAUTH_KV is unbound and the server serves d1.
+   */
+  kvId: string | null;
   version: string;
   /** 1_000_000 x envIndex + 8 x seq; envIndex 1 (staging) or 2 (prod). */
   rlNs: number;
@@ -345,8 +350,8 @@ function checkInputs(i: InstallMetaInput, r: ResourceMetaInput): void {
     )
   )
     throw new Error("d1Id must be a UUID");
-  if (!/^[0-9a-f]{32}$/.test(r.kvId))
-    throw new Error("kvId must be 32 hex characters");
+  if (r.kvId !== null && !/^[0-9a-f]{32}$/.test(r.kvId))
+    throw new Error("kvId must be 32 hex characters or null");
   for (const [k, v] of [
     ["appHost", i.appHost],
     ["contentHost", i.contentHost],
@@ -439,7 +444,8 @@ export function userWorkerMetadata(
     D1_NAME: n.d1,
     D1_ID: r.d1Id,
     R2_BUCKET: n.r2,
-    KV_ID: r.kvId,
+    // Absent with no namespace: a template placeholder for it is unfilled.
+    ...(r.kvId === null ? {} : { KV_ID: r.kvId }),
     EMAIL_FROM: emailFrom,
   };
   const render = (s: string, where: string) => {
@@ -509,12 +515,14 @@ export function userWorkerMetadata(
     bindings.push({ type: "d1", name: e.binding, id: r.d1Id });
   for (const e of (t.r2_buckets ?? []) as { binding: string }[])
     bindings.push({ type: "r2_bucket", name: e.binding, bucket_name: n.r2 });
-  for (const e of (t.kv_namespaces ?? []) as { binding: string }[])
-    bindings.push({
-      type: "kv_namespace",
-      name: e.binding,
-      namespace_id: r.kvId,
-    });
+  // No namespace (born on d1, or removed): no binding at all.
+  if (r.kvId !== null)
+    for (const e of (t.kv_namespaces ?? []) as { binding: string }[])
+      bindings.push({
+        type: "kv_namespace",
+        name: e.binding,
+        namespace_id: r.kvId,
+      });
   for (const e of (t.durable_objects?.bindings ?? []) as {
     name: string;
     class_name: string;

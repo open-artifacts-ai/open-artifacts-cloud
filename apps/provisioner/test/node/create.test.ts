@@ -142,6 +142,55 @@ describe("ProvisionInstall: create", () => {
     );
   });
 
+  describe("born on d1 (#1008)", () => {
+    const kvTitles = () =>
+      [...w.fake.kv.values()]
+        .map((k) => k.title)
+        .filter((t) => t.endsWith("-oauth"));
+    const binding = (id: string, name: string) =>
+      w.fake
+        .script(NAMESPACES[ENV], `oa-s-${id}`)
+        ?.metadata.bindings.find((b: { name: string }) => b.name === name);
+
+    it("OAUTH_BORN_D1=1: the install has OAUTH_STORE=d1 stored and rendered, no OAUTH_KV binding, no namespace, no kv_id", async () => {
+      w.env.OAUTH_BORN_D1 = "1";
+      const s = seedCreate(w, { slug: "born" });
+      const { error } = await run(w, s.jobId);
+      expect(error).toBeNull();
+      expect(w.job(s.jobId)?.status).toBe("done");
+      expect(JSON.parse(w.install(s.installId)?.vars as string)).toMatchObject({
+        OAUTH_STORE: "d1",
+      });
+      expect(plain(w, s.installId, "OAUTH_STORE")?.text).toBe("d1");
+      expect(binding(s.installId, "OAUTH_KV")).toBeUndefined();
+      expect(kvTitles()).toEqual([]);
+      expect(w.install(s.installId)?.kv_id).toBeNull();
+    });
+
+    it("OAUTH_BORN_D1 off or absent: the namespace, the binding and no OAUTH_STORE, as before", async () => {
+      for (const v of [undefined, "0"]) {
+        w = await world();
+        if (v !== undefined) w.env.OAUTH_BORN_D1 = v;
+        const s = seedCreate(w, { slug: "plain" });
+        const { error } = await run(w, s.jobId);
+        expect(error).toBeNull();
+        expect(binding(s.installId, "OAUTH_KV")).toBeDefined();
+        expect(kvTitles()).toHaveLength(1);
+        expect(plain(w, s.installId, "OAUTH_STORE")).toBeUndefined();
+        expect(w.install(s.installId)?.kv_id).not.toBeNull();
+      }
+    });
+
+    it("a replay of every step changes nothing", async () => {
+      w.env.OAUTH_BORN_D1 = "1";
+      const s = seedCreate(w, { slug: "born" });
+      const { error } = await run(w, s.jobId, { twice: true });
+      expect(error).toBeNull();
+      expect(kvTitles()).toEqual([]);
+      expect(w.install(s.installId)?.kv_id).toBeNull();
+    });
+  });
+
   it("the latest installable release unless the job names one; redline iff testHooks", async () => {
     const a = seedCreate(w, { slug: "pinned", version: V1 });
     expect((await run(w, a.jobId)).error).toBeNull();

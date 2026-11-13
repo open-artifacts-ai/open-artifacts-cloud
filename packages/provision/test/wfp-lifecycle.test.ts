@@ -7582,3 +7582,220 @@ describe("stagingBusSlugs reaches the rendered metadata (#1299 part 6)", () => {
     expect(featuresOf(prod, pi.id).split(",")).not.toContain("bus");
   });
 });
+
+// open-artifacts#1008: installs born on d1, and the namespace's removal.
+describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
+  const bindingsOf = (s: S, id: string) =>
+    (s.scriptOf(id)?.metadata.bindings ?? []) as {
+      type: string;
+      name: string;
+      text?: string;
+    }[];
+  const hasKvBinding = (s: S, id: string) =>
+    bindingsOf(s, id).some(
+      (b) => b.type === "kv_namespace" && b.name === "OAUTH_KV",
+    );
+  const oauthStore = (s: S, id: string) =>
+    bindingsOf(s, id).find((b) => b.name === "OAUTH_STORE")?.text;
+  const oauthNamespaces = (s: S) =>
+    [...s.fake.kv.values()].filter((k) => k.title.endsWith("-oauth"));
+  const storedVars = (s: S, id: string) => JSON.parse(s.row(id).vars);
+
+  it("flag on: a new install has OAUTH_STORE=d1 stored and rendered, no OAUTH_KV binding, no namespace, no kv_id", async () => {
+    const s = setup();
+    const p = s.mk({ oauthBornD1: true });
+    const inst = keep(await p.create(input("born")));
+    expect(storedVars(s, inst.id).OAUTH_STORE).toBe("d1");
+    expect(oauthStore(s, inst.id)).toBe("d1");
+    expect(hasKvBinding(s, inst.id)).toBe(false);
+    expect(oauthNamespaces(s)).toEqual([]);
+    expect(s.row(inst.id).kv_id).toBeNull();
+    expect(s.row(inst.id).state).toBe("active");
+  });
+
+  it("every later render keeps it: an upgrade, a var change and a rollback add no binding and make no namespace, even with the flag off", async () => {
+    const s = setup();
+    const inst = keep(await s.mk({ oauthBornD1: true }).create(input("born")));
+    const off = s.mk({ oauthBornD1: false });
+    await off.upgrade(inst.id, "0.24.0");
+    expect(hasKvBinding(s, inst.id)).toBe(false);
+    await off.updateVars(inst.id, {
+      ...storedVars(s, inst.id),
+      EMAIL_DAILY_CAP: "50",
+    });
+    expect(hasKvBinding(s, inst.id)).toBe(false);
+    expect(oauthStore(s, inst.id)).toBe("d1");
+    await off.rollback(inst.id);
+    expect(hasKvBinding(s, inst.id)).toBe(false);
+    expect(oauthNamespaces(s)).toEqual([]);
+    expect(s.row(inst.id).kv_id).toBeNull();
+    expect(s.row(inst.id).state).toBe("active");
+  });
+
+  it("flag off: a new install is as before (namespace, binding, no OAUTH_STORE)", async () => {
+    const s = setup();
+    const inst = keep(await s.mk({ oauthBornD1: false }).create(input("kv")));
+    expect(hasKvBinding(s, inst.id)).toBe(true);
+    expect(oauthNamespaces(s)).toHaveLength(1);
+    expect(s.row(inst.id).kv_id).toBe(
+      [...s.fake.kv.entries()].find(([, k]) => k.title.endsWith("-oauth"))?.[0],
+    );
+    expect(storedVars(s, inst.id).OAUTH_STORE).toBeUndefined();
+    expect(oauthStore(s, inst.id)).toBeUndefined();
+  });
+
+  it("existing installs are unchanged when the flag turns on: they keep the namespace and the binding through an upgrade", async () => {
+    const s = setup();
+    const inst = keep(await s.mk({ oauthBornD1: false }).create(input("old")));
+    await s.mk({ oauthBornD1: true }).upgrade(inst.id, "0.24.0");
+    expect(hasKvBinding(s, inst.id)).toBe(true);
+    expect(oauthNamespaces(s)).toHaveLength(1);
+    expect(storedVars(s, inst.id).OAUTH_STORE).toBeUndefined();
+  });
+
+  it("a create started before the flag flipped still resumes (its inputs hash is the other side's)", async () => {
+    const s = setup();
+    const first = keep(
+      await s
+        .mk({ oauthBornD1: false })
+        .create(input("flip", { installId: undefined })),
+    );
+    // The same inputs again, flag now on: a replay of the finished create, not a refusal.
+    const again = await s
+      .mk({ oauthBornD1: true })
+      .create(input("flip", { installId: first.id }));
+    expect(again.id).toBe(first.id);
+    expect(oauthNamespaces(s)).toHaveLength(1);
+  });
+
+  describe("updateVars dropKv", () => {
+    const onD1WithNamespace = async () => {
+      const s = setup();
+      const inst = keep(
+        await s
+          .mk({ oauthBornD1: false })
+          .create(input("drop", { vars: { OAUTH_STORE: "d1" } })),
+      );
+      expect(hasKvBinding(s, inst.id)).toBe(true);
+      return { s, inst };
+    };
+
+    it("renders without the binding, then deletes the namespace and forgets the id", async () => {
+      const { s, inst } = await onD1WithNamespace();
+      const from = s.fake.log.length;
+      const r = await s.p.updateVars(inst.id, storedVars(s, inst.id), {
+        dropKv: true,
+      });
+      expect(r).toMatchObject({ ok: true });
+      expect(hasKvBinding(s, inst.id)).toBe(false);
+      expect(oauthStore(s, inst.id)).toBe("d1");
+      expect(oauthNamespaces(s)).toEqual([]);
+      expect(s.row(inst.id)).toMatchObject({
+        kv_id: null,
+        state: "active",
+        lease: null,
+      });
+      // The upload comes first; the namespace's delete is after it.
+      const log = s.fake.log.slice(from);
+      const upload = log.findIndex(
+        (e) => e.method === "PUT" && /\/scripts\/[^/?]+$/.test(e.path),
+      );
+      const del = log.findIndex(
+        (e) =>
+          e.method === "DELETE" &&
+          /\/storage\/kv\/namespaces\/[^/]+$/.test(e.path),
+      );
+      expect(upload).toBeGreaterThanOrEqual(0);
+      expect(del).toBeGreaterThan(upload);
+    });
+
+    it("a second run finds nothing to drop and changes nothing", async () => {
+      const { s, inst } = await onD1WithNamespace();
+      await s.p.updateVars(inst.id, storedVars(s, inst.id), { dropKv: true });
+      const r = await s.p.updateVars(inst.id, storedVars(s, inst.id), {
+        dropKv: true,
+      });
+      expect(r).toMatchObject({ ok: true });
+      expect(hasKvBinding(s, inst.id)).toBe(false);
+      expect(s.row(inst.id).kv_id).toBeNull();
+    });
+
+    it("refuses an install that is not on d1, before any write", async () => {
+      const s = setup();
+      const inst = keep(await s.p.create(input("kvmode")));
+      const w = s.fake.writes().length;
+      const e = await fails(
+        s.p.updateVars(inst.id, storedVars(s, inst.id), { dropKv: true }),
+      );
+      expect(e).toBeInstanceOf(ProvisionRefused);
+      expect(e.message).toMatch(/only dropped from an install on d1/);
+      expect(s.fake.writes().length).toBe(w);
+      expect(oauthNamespaces(s)).toHaveLength(1);
+      expect(hasKvBinding(s, inst.id)).toBe(true);
+    });
+
+    it("refuses next vars that leave d1", async () => {
+      const { s, inst } = await onD1WithNamespace();
+      const e = await fails(
+        s.p.updateVars(inst.id, { OAUTH_STORE: "dual" }, { dropKv: true }),
+      );
+      expect(e).toBeInstanceOf(ProvisionRefused);
+      expect(oauthNamespaces(s)).toHaveLength(1);
+    });
+
+    it("a namespace that will not delete leaves the Worker without the binding, the row without the id, and the next run finishes", async () => {
+      const { s, inst } = await onD1WithNamespace();
+      s.fake.inject(
+        (m, p) => m === "DELETE" && /\/storage\/kv\/namespaces\/[^/]+$/.test(p),
+        { status: 403, times: 1 },
+      );
+      const r = await s.p
+        .updateVars(inst.id, storedVars(s, inst.id), { dropKv: true })
+        .catch((e) => e);
+      expect(r instanceof Error || r?.ok === false).toBe(true);
+      expect(hasKvBinding(s, inst.id)).toBe(false);
+      expect(s.row(inst.id).kv_id).toBeNull();
+      expect(oauthNamespaces(s)).toHaveLength(1);
+      const again = await s.p.updateVars(inst.id, storedVars(s, inst.id), {
+        dropKv: true,
+      });
+      expect(again).toMatchObject({ ok: true });
+      expect(oauthNamespaces(s)).toEqual([]);
+    });
+  });
+
+  describe("delete", () => {
+    it("deletes the namespace of an install that still has one", async () => {
+      const s = setup();
+      const inst = keep(await s.p.create(input("withns")));
+      expect(oauthNamespaces(s)).toHaveLength(1);
+      expect(await s.p.delete(inst.id, inst.id)).toMatchObject({
+        ok: true,
+        state: "deleted",
+      });
+      expect(oauthNamespaces(s)).toEqual([]);
+    });
+
+    it("is not troubled by an install born on d1, which has none", async () => {
+      const s = setup();
+      const inst = keep(
+        await s.mk({ oauthBornD1: true }).create(input("born")),
+      );
+      const r = await s.p.delete(inst.id, inst.id);
+      expect(r).toEqual({ id: inst.id, ok: true, state: "deleted" });
+      expect(oauthNamespaces(s)).toEqual([]);
+    });
+
+    it("is not troubled by an install whose namespace was removed", async () => {
+      const s = setup();
+      const inst = keep(
+        await s
+          .mk({ oauthBornD1: false })
+          .create(input("gone", { vars: { OAUTH_STORE: "d1" } })),
+      );
+      await s.p.updateVars(inst.id, storedVars(s, inst.id), { dropKv: true });
+      const r = await s.p.delete(inst.id, inst.id);
+      expect(r).toEqual({ id: inst.id, ok: true, state: "deleted" });
+    });
+  });
+});

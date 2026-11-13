@@ -226,6 +226,13 @@ export interface WfpOptions {
    */
   prodBusAll?: boolean;
   /**
+   * open-artifacts#1008, per environment (the provisioner's OAUTH_BORN_D1,
+   * "1" is on): a new install is born on d1 (OAUTH_STORE=d1 in its stored
+   * vars, no OAUTH_KV binding, no <id>-oauth namespace). Existing installs
+   * are unchanged; every later render keeps what the install has.
+   */
+  oauthBornD1?: boolean;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -963,7 +970,7 @@ interface RollbackPlan {
   m: Meta;
   rel: Checked;
   d1Id: string;
-  kvId: string;
+  kvId: string | null;
   /** Absent with ciOwnerToken: the selftest uses the in-memory CI token. */
   patFile?: string;
   /** R-L1: the PAT was refused; the rollback checks /healthz only. */
@@ -1859,10 +1866,7 @@ export class WfpProvisioner {
         );
     const testHooks = i.testHooks === true;
     // A caller value wins; a default is rendered and stored only at create.
-    const vars = withDefaultVars(
-      i.vars ?? {},
-      this.o.defaultVars ?? HOSTED_DEFAULT_VARS[this.env],
-    );
+    const vars = withDefaultVars(i.vars ?? {}, this.createDefaults());
     this.brokerVars(vars);
     this.checkVariant(i, vars);
     // The owner PAT and test-hook key files without a CI token; with one,
@@ -1878,7 +1882,12 @@ export class WfpProvisioner {
     // Earlier defaults hashed differently. A run started under one of them
     // hashes the caller's vars plus that set; resume and replay accept
     // those hashes too, and a resume keeps that run's own vars.
-    const legacy = PREVIOUS_DEFAULT_VARS.map((d) => {
+    // #1008: the other side of the born-d1 switch is as legacy as an older
+    // default set, so a create started before the flag flipped still resumes.
+    const legacy = [
+      ...PREVIOUS_DEFAULT_VARS,
+      ...this.otherCreateDefaults(),
+    ].map((d) => {
       const lv = withDefaultVars(i.vars ?? {}, d);
       return {
         vars: lv,
@@ -2116,7 +2125,7 @@ export class WfpProvisioner {
   private async verifyClean(
     script: string,
     v: VerifyCleanInput,
-    ids: { d1Id: string; kvId: string; template: Template },
+    ids: { d1Id: string; kvId: string | null; template: Template },
   ): Promise<void> {
     const attempts = Math.max(
       1,
@@ -2171,7 +2180,7 @@ export class WfpProvisioner {
     script: string,
     o: {
       d1Id: string;
-      kvId: string;
+      kvId: string | null;
       template: Template;
       bindings?: readonly SettingsBinding[];
     },
@@ -2196,7 +2205,9 @@ export class WfpProvisioner {
         rowKvId: row.kv_id,
         r2: names(id, this.env).r2,
         script,
-        planned: plannedBindings(o.template, row.rl_ns),
+        planned: plannedBindings(o.template, row.rl_ns).filter(
+          (b) => o.kvId !== null || b.type !== "kv_namespace",
+        ),
       });
       if (expired) return;
       await this.platform.audit(id, "verify_clean.binding_ids", {
@@ -2381,7 +2392,7 @@ export class WfpProvisioner {
     b: { rec: ReleaseRecord; mainModule: string; template: Template },
     r: {
       d1Id: string;
-      kvId: string;
+      kvId: string | null;
       rlNs: number;
       tag: string | null;
       mode: "create" | "update";
@@ -2471,8 +2482,14 @@ export class WfpProvisioner {
       await this.hold();
       await cf.r2Create(n.r2);
     }
-    let kvId = res.kv;
-    if (!kvId) {
+    // #1008: an install born on d1 has no OAuth namespace to make (its stored
+    // vars say OAUTH_STORE=d1 only when the env's flag was on at create). One
+    // that already has its namespace keeps it, whatever the flag says now.
+    let kvId: string | null = res.kv;
+    if (
+      !kvId &&
+      !(this.o.oauthBornD1 === true && m.vars.OAUTH_STORE === "d1")
+    ) {
       assertOwnResource(n.kv, env);
       await this.hold();
       kvId = await cf.kvCreate(n.kv);
@@ -2670,7 +2687,7 @@ export class WfpProvisioner {
     rec: ReleaseRecord;
     m: Meta;
     d1Id: string;
-    kvId: string;
+    kvId: string | null;
     rlNs: number;
     exists: boolean;
     journal: string | null;
@@ -3077,6 +3094,29 @@ export class WfpProvisioner {
       testHooks,
       sitekey: ts?.sitekey ?? null,
     };
+  }
+
+  /**
+   * What create adds to the caller's vars: the env's defaults, and with
+   * oauthBornD1 (#1008) OAUTH_STORE=d1. Stored with the install, so every
+   * later render keeps it.
+   */
+  private createDefaults(): Readonly<Record<string, string>> {
+    const base = this.o.defaultVars ?? HOSTED_DEFAULT_VARS[this.env];
+    return this.o.oauthBornD1 === true ? { ...base, OAUTH_STORE: "d1" } : base;
+  }
+
+  /** The default set the other side of the born-d1 switch would have used. */
+  private otherCreateDefaults(): Readonly<Record<string, string>>[] {
+    const base = this.o.defaultVars ?? HOSTED_DEFAULT_VARS[this.env];
+    return [
+      this.o.oauthBornD1 === true ? base : { ...base, OAUTH_STORE: "d1" },
+    ];
+  }
+
+  /** currentVars, or {} for a row that has none stored (it is then on kv). */
+  private storedVarsOrEmpty(row: InstallRow): Record<string, string> {
+    return row.vars === null ? {} : this.currentVars(row);
   }
 
   /** installs.vars: what the install runs with now (create and updateVars write it). */
@@ -3559,15 +3599,28 @@ export class WfpProvisioner {
     return dir === copy || dir === reg ? null : { id, kind: "mismatch" };
   }
 
-  /** The install's D1 and script, both present, and every secret create sends. */
+  /**
+   * The install's D1 and script, both present, and every secret create sends.
+   * Its OAuth namespace is present too, unless the install's stored vars say
+   * d1 (#1008: born on d1, or past the namespace's removal): then there is
+   * none to bind, and one that still exists is bound until a removal drops it
+   * (dropKv: render without it; the caller deletes it once that is live).
+   */
   private async liveInstall(
     row: InstallRow,
     m: Meta,
-  ): Promise<{ d1Id: string; kvId: string }> {
+    dropKv = false,
+  ): Promise<{ d1Id: string; kvId: string | null; kvToDrop: string | null }> {
     const res = await this.resources(row);
-    if (!res.d1 || !res.kv)
+    const onD1 = this.storedVarsOrEmpty(row).OAUTH_STORE === "d1";
+    if (!res.d1 || (!res.kv && !onD1))
       throw new ProvisionRefused(
         `install ${row.id} has no D1 or KV`,
+        "invalid_state",
+      );
+    if (dropKv && !(onD1 && m.vars.OAUTH_STORE === "d1"))
+      throw new ProvisionRefused(
+        `install ${row.id}: the OAuth namespace is only dropped from an install on d1`,
         "invalid_state",
       );
     const script = names(row.id, this.env).script;
@@ -3586,7 +3639,11 @@ export class WfpProvisioner {
         `install ${row.id} is missing secret ${missing.join(", ")}; repair it first`,
         "invalid_state",
       );
-    return { d1Id: res.d1, kvId: res.kv };
+    return {
+      d1Id: res.d1,
+      kvId: dropKv ? null : res.kv,
+      kvToDrop: dropKv ? res.kv : null,
+    };
   }
 
   /** L4 in pre-flight: read-only, the install's applied migrations against the release's. */
@@ -4334,6 +4391,15 @@ export class WfpProvisioner {
   async updateVars(
     id: InstallId,
     nextVars: Record<string, string>,
+    opts: {
+      /**
+       * #1008: render without the OAUTH_KV binding and, once that version
+       * serves, delete the <id>-oauth namespace. Only for an install already
+       * on d1 (stored and next vars), and the caller has judged it safe: the
+       * namespace's data is gone for good.
+       */
+      dropKv?: boolean;
+    } = {},
   ): Promise<VarsResult> {
     return this.guarded(async () => {
       if (!nextVars || typeof nextVars !== "object" || Array.isArray(nextVars))
@@ -4377,7 +4443,11 @@ export class WfpProvisioner {
         version,
         bundle: m.testHooks ? "redline" : "release",
       });
-      const { d1Id, kvId } = await this.liveInstall(row, m);
+      const { d1Id, kvId, kvToDrop } = await this.liveInstall(
+        row,
+        m,
+        opts.dropKv === true,
+      );
       const own = await this.ownerToken(row, m.appHost);
       const n = names(id, this.env);
       const have = await this.cf.secretList(this.target, n.script);
@@ -4486,6 +4556,19 @@ export class WfpProvisioner {
         );
         await this.health(id, m.appHost, version, "rerun the var change");
         await this.checkSelf(m.appHost, own.patFile);
+        // #1008: the version without the binding serves; now the namespace.
+        // The row forgets it first, so a delete that fails leaves a row that
+        // agrees with the Worker, and a rerun finishes the job.
+        if (kvToDrop !== null) {
+          const title = await this.cf.kvTitleOf(kvToDrop);
+          if (title !== null) this.assertDeletes(title, n.kv);
+          await this.write({ kv_id: null });
+          if (title !== null) {
+            await this.hold();
+            await this.cf.kvDelete(kvToDrop);
+          }
+          await this.logged("vars.kv_dropped", { version });
+        }
         await this.logged("vars.done", { version });
         await this.release("active");
         return { id, version, ok: true, sessionCut };
