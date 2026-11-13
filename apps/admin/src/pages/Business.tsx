@@ -46,8 +46,10 @@ function Row({
         <div className="nm">{r.name}</div>
         <div className="dt eml">{r.email}</div>
       </td>
-      <td className="co">{r.company}</td>
-      <td className="sz">{TEAM_SIZE_LABEL[r.teamSize]}</td>
+      <td className="co">
+        <div className="nm">{r.company}</div>
+        <div className="dt">{TEAM_SIZE_LABEL[r.teamSize]} publishers</div>
+      </td>
       <td className="nd">
         {r.needs.length
           ? r.needs.map((n) => NEED_LABEL[n] ?? n).join(", ")
@@ -64,7 +66,13 @@ function Row({
         {r.source === "dashboard" ? "Dashboard" : "Landing"}
         {r.instanceHost && (
           <div className="dt" title="Unverified">
-            {r.instanceHost}
+            {r.instanceHost.split(".").map((part, i) => (
+              // A break may fall after a dot, never inside a label.
+              <span key={`${i}-${part}`}>
+                {i > 0 && <wbr />}
+                {i > 0 ? `.${part}` : part}
+              </span>
+            ))}
           </div>
         )}
       </td>
@@ -153,7 +161,6 @@ export function Business() {
                 <th>Received</th>
                 <th className="who">Who</th>
                 <th className="co">Company</th>
-                <th className="sz">Publishers</th>
                 <th className="nd">Needs</th>
                 <th className="nt">Note</th>
                 <th className="fr">From</th>
