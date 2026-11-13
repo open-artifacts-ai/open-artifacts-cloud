@@ -210,15 +210,25 @@ describe("committedBilling", () => {
       /more than one/,
     );
   });
-  it("the real apps: staging binds BILLING, prod does not", () => {
-    for (const app of ["dispatch", "scheduler", "provisioner"]) {
+  it("the real apps: staging and prod both bind BILLING, each to its own Worker, with the same entrypoints", () => {
+    const entry: Record<string, string | null> = {
+      dispatch: null,
+      scheduler: null,
+      provisioner: "BillingProvisionerRpc",
+      provisioning: "BillingOperatorRpc",
+    };
+    for (const app of Object.keys(entry)) {
       expect(committedBilling(cfg(app), "staging")?.service, app).toBe(
         "oa-s-billing",
       );
-      expect(committedBilling(cfg(app), "prod"), app).toBeNull();
+      expect(committedBilling(cfg(app), "prod")?.service, app).toBe(
+        "oa-p-billing",
+      );
+      for (const env of ["staging", "prod"] as const)
+        expect(
+          committedBilling(cfg(app), env)?.entrypoint,
+          `${app} ${env}`,
+        ).toBe(entry[app]);
     }
-    expect(committedBilling(cfg("provisioner"), "staging")?.entrypoint).toBe(
-      "BillingProvisionerRpc",
-    );
   });
 });

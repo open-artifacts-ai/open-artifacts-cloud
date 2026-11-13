@@ -212,6 +212,32 @@ describe("POST /stripe/webhook", () => {
     expect(await events()).toBe(0);
   });
 
+  it("OA_ENV picks the event mode: prod applies a live event and ignores a test one; staging the reverse (live mode on prod)", async () => {
+    const live = (id: string) =>
+      subEvent(id, CUS_A, "team").replace(
+        '"livemode":false',
+        '"livemode":true',
+      );
+    const prod = { ...env, OA_ENV: "prod" } as Env;
+    const staging = { ...env, OA_ENV: "staging" } as Env;
+    // Staging ignores a live event.
+    expect(
+      (await call(await hook(live("evt_TestLive1")), staging)).status,
+    ).toBe(200);
+    expect((await rowOf(A))?.version).toBe(1);
+    // Prod ignores a test event.
+    expect(
+      (await call(await hook(subEvent("evt_TestTest1", CUS_A, "team")), prod))
+        .status,
+    ).toBe(200);
+    expect((await rowOf(A))?.version).toBe(1);
+    // Prod applies a live one.
+    expect((await call(await hook(live("evt_TestLive2")), prod)).status).toBe(
+      200,
+    );
+    expect(await rowOf(A)).toMatchObject({ tier: "team", version: 2 });
+  });
+
   it("logs fixed categories only: never the secret, a Stripe id, a header or the body", async () => {
     const lines: string[] = [];
     for (const k of ["log", "info", "warn", "error", "debug"] as const)

@@ -337,7 +337,7 @@ describe("hosted-zones.sh", () => {
     );
   });
 
-  describe("billing's webhook route (staging only, state-based, #1568)", () => {
+  describe("billing's webhook route (staging and prod, state-based, #1568)", () => {
     const BASE = [
       "oa-s-dispatch",
       "oa-s-auth-broker",
@@ -448,25 +448,30 @@ describe("hosted-zones.sh", () => {
       }
     });
 
-    it("prod never looks: no lookup of oa-p-billing, no billing route, even if that Worker exists", () => {
-      for (const workers of [
-        undefined,
-        [
-          "oa-p-dispatch",
-          "oa-p-auth-broker",
-          "oa-p-directory-broker",
-          "oa-p-provisioning",
-          "oa-p-billing",
-        ],
-      ]) {
-        const r = setup({}, workers).run("apply", "prod");
-        expect(r.code, r.err).toBe(0);
-        expect(r.log.filter((l) => l.includes("billing"))).toEqual([]);
-        expect(r.out).not.toContain("billing");
-        expect(
-          r.writes.filter((w) => w.includes("/workers/routes ")),
-        ).toHaveLength(6);
-      }
+    it("prod looks like staging: oa-p-billing up adds exactly the webhook route to it; down leaves it out and says so", () => {
+      const PROD_BASE = [
+        "oa-p-dispatch",
+        "oa-p-auth-broker",
+        "oa-p-directory-broker",
+        "oa-p-provisioning",
+      ];
+      const PROD_ROUTE = "billing.open-artifacts.app/stripe/webhook";
+      const up = setup({}, [...PROD_BASE, "oa-p-billing"]).run("apply", "prod");
+      expect(up.code, up.err).toBe(0);
+      expect(up.out).toContain(`route ${PROD_ROUTE} -> oa-p-billing`);
+      const routes = up.writes.filter((w) => w.includes("/workers/routes "));
+      expect(routes).toHaveLength(7);
+      expect(routes.filter((w) => w.includes("billing"))).toEqual([
+        `WRITE POST /zones/${APPZ}/workers/routes {"pattern":"${PROD_ROUTE}","script":"oa-p-billing"}`,
+      ]);
+      const down = setup({}, PROD_BASE).run("apply", "prod");
+      expect(down.code, down.err).toBe(0);
+      expect(down.out).toContain(
+        `oa-p-billing does not exist yet: its webhook route (${PROD_ROUTE}) is left out`,
+      );
+      expect(
+        down.writes.filter((w) => w.includes("/workers/routes ")),
+      ).toHaveLength(6);
     });
 
     it("a billing route that already points at another Worker is refused, in plan and apply", () => {

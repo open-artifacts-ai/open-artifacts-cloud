@@ -212,7 +212,7 @@ describe("billing-db.ts", () => {
     expect(tracked(f).map((t) => t.name)).toEqual(["0001_init.sql"]);
   });
 
-  it("the script refuses before any call: not staging, no token, a bad account or database id, no main lock", () => {
+  it("the script refuses before any call: not staging or prod, no token, a bad account or database id, no main lock", () => {
     const base = {
       PATH: process.env.PATH ?? "",
       CLOUDFLARE_API_TOKEN: "t",
@@ -231,7 +231,10 @@ describe("billing-db.ts", () => {
         ],
         { env, encoding: "utf8" },
       );
-    expect(exec("prod", base).status).toBe(2);
+    expect(exec("dev", base).status).toBe(2);
+    // Prod takes the same arguments and refuses the same way.
+    expect(exec("prod", { ...base, CLOUDFLARE_API_TOKEN: "" }).status).toBe(2);
+    expect(exec("prod", { ...base, BILLING_DB_ID: "x" }).status).toBe(2);
     expect(exec("staging", { ...base, CLOUDFLARE_API_TOKEN: "" }).status).toBe(
       2,
     );

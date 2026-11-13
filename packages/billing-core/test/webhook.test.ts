@@ -1176,6 +1176,39 @@ describe("handleStripeWebhook", () => {
     expect(await row(A)).toEqual(before);
   });
 
+  it("livemode follows OA_ENV: prod ignores a test event and applies a live one; staging and unset ignore a live one", async () => {
+    const failed = (extra: Record<string, unknown>) =>
+      event("invoice.payment_failed", { customer: CUS_A }, extra);
+    const before = await row(A);
+    // Prod: a test-mode event changes nothing.
+    const prod = { ...env, OA_ENV: "prod" } as WebhookEnv;
+    expect(
+      (await deliver(failed({ livemode: false }), { env: prod })).status,
+    ).toBe(200);
+    expect(await row(A)).toEqual(before);
+    // Staging and unset: a live event changes nothing.
+    for (const e of [{ ...env, OA_ENV: "staging" }, env] as WebhookEnv[]) {
+      expect(
+        (await deliver(failed({ livemode: true }), { env: e })).status,
+      ).toBe(200);
+      expect(await row(A)).toEqual(before);
+    }
+  });
+
+  it("prod applies a livemode event (it reaches the same handler as a test one on staging)", async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    const prod = { ...env, OA_ENV: "prod" } as WebhookEnv;
+    await deliver(
+      event("invoice.paid", { customer: "cus_Nobody" }, { livemode: true }),
+      { env: prod },
+    );
+    // Past the livemode gate: it reached the customer lookup.
+    expect(lines).toEqual(["billing webhook unknown_customer"]);
+  });
+
   it("logs carry fixed categories and install ids only: no body, header or Stripe id", async () => {
     const lines: string[] = [];
     for (const m of ["log", "warn", "error", "info"] as const)

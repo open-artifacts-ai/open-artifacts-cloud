@@ -160,12 +160,19 @@ describe("platform-tags.sh", () => {
     expect(plain.log.some((l) => l.includes("oa-s-billing"))).toBe(false);
   });
 
-  it("billing is refused for prod", () => {
-    const r = run(allTagged("p"), ["prod", TAG], {
-      PLATFORM_TAGS_BILLING: "1",
-    });
-    expect(r.code).toBe(2);
-    expect(r.err).toContain("staging-only");
+  it("prod reads oa-p-billing back too when the run deployed it, and not otherwise", () => {
+    const fx = allTagged("p");
+    fx["oa-p-billing"] = {
+      deployments: deployment([{ version_id: vid(9), percentage: 100 }]),
+      versions: [[vid(9), version(vid(9), TAG)]],
+    };
+    const r = run(fx, ["prod", TAG], { PLATFORM_TAGS_BILLING: "1" });
+    expect(r.err).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`ok oa-p-billing runs ${TAG}`);
+    const plain = run(fx, ["prod", TAG]);
+    expect(plain.code, plain.err).toBe(0);
+    expect(plain.log.some((l) => l.includes("oa-p-billing"))).toBe(false);
   });
 
   it("prod reads the oa-p- Workers", () => {

@@ -12,12 +12,14 @@
 # committed (#1084), it comes from OA_OWNER_EMAIL (the Actions secret) when
 # set, goes to $GITHUB_ENV only and is never printed. Unset, no ALERT_TO is
 # written, and a scheduler deploy refuses (deploy-hosted-platform.sh).
-# STAGING ONLY (#1568): the billing service's four Stripe test-mode price ids
-# (stripe_price_team, _business, _solo_monthly, _solo_yearly: not secrets) load
-# as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS, STRIPE_PRICE_SOLO_MONTHLY and
-# STRIPE_PRICE_SOLO_YEARLY, each a price id; stripe_price_team_yearly and
-# stripe_price_business_yearly are optional (STRIPE_PRICE_TEAM_YEARLY, _BUSINESS_YEARLY). Prod's file must hold no stripe_*
-# key (prod has no billing Worker, and no Stripe value reaches its run).
+# (#1568): the billing service's four Stripe price ids (test mode on staging,
+# live mode on prod; stripe_price_team, _business, _solo_monthly, _solo_yearly:
+# not secrets) load as STRIPE_PRICE_TEAM, STRIPE_PRICE_BUSINESS,
+# STRIPE_PRICE_SOLO_MONTHLY and STRIPE_PRICE_SOLO_YEARLY, each a price id;
+# stripe_price_team_yearly and stripe_price_business_yearly are optional
+# (STRIPE_PRICE_TEAM_YEARLY, _BUSINESS_YEARLY). Staging requires the four.
+# Prod's file holds all six keys; an empty value is "not filled yet" and loads
+# nothing (the billing target then refuses for the missing price).
 # PROD ONLY (#40): signup_deploy, exactly "on" or "off" (case-sensitive, a
 # string), loads as PROD_SIGNUP_DEPLOY: prod's sign-up steps (the signup.<app>
 # route, the i00000signup registry entry, SIGNUP_BROKER_KEY and
@@ -64,40 +66,38 @@ signup_daily_cap SIGNUP_DAILY_CAP $cap
 signups_enabled SIGNUPS_ENABLED $onoff
 welcome_from WELCOME_FROM $email
 EOF
-# Billing's prices: staging only. Prod refuses any stripe_* key.
-if [ "$1" = staging ]; then
-  price='^price_[A-Za-z0-9]{1,255}$'
-  while read -r k name rule; do
-    v="$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else "" end' "$file")" || exit 1
-    [ -n "$v" ] || { echo "$file: $k is missing" >&2; exit 1; }
-    [[ "$v" =~ $rule ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
-    lines+="$name=$v"$'\n'
-  done << LIST
-stripe_price_team STRIPE_PRICE_TEAM $price
-stripe_price_business STRIPE_PRICE_BUSINESS $price
-stripe_price_solo_monthly STRIPE_PRICE_SOLO_MONTHLY $price
-stripe_price_solo_yearly STRIPE_PRICE_SOLO_YEARLY $price
-LIST
-  # The yearly Team and Business prices: optional until the ops script has
-  # made them; when present they must be price ids.
-  for pair in stripe_price_team_yearly:STRIPE_PRICE_TEAM_YEARLY stripe_price_business_yearly:STRIPE_PRICE_BUSINESS_YEARLY; do
-    k="${pair%%:*}"; name="${pair##*:}"
-    v="$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else "" end' "$file")" || exit 1
-    [ -n "$v" ] || continue
-    [[ "$v" =~ $price ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
-    lines+="$name=$v"$'\n'
-  done
-  # The portal configuration (bpc_...; Stripe Customer Portal with seats and
-  # plan changes off): optional until made (scripts/ops/staging-portal-config.ts).
-  v="$(jq -r '.stripe_portal_config | if type == "string" then . else "" end' "$file")" || exit 1
-  if [ -n "$v" ]; then
-    [[ "$v" =~ ^bpc_[A-Za-z0-9]{1,255}$ ]] || { echo "$file: stripe_portal_config is not a valid value: $v" >&2; exit 1; }
-    lines+="STRIPE_PORTAL_CONFIG=$v"$'\n'
+# Billing's prices. Staging: the four are required, the two yearly ones optional.
+# Prod: live-mode prices, all six keys committed; an empty value means "not
+# filled yet" and loads nothing (every other prod run is unaffected, and the
+# billing target refuses without them); a filled one must be a price id. Any
+# other stripe_* key is refused in both envs.
+price='^price_[A-Za-z0-9]{1,255}$'
+while read -r k name required; do
+  v="$(jq -r --arg k "$k" '.[$k] | if type == "string" then . else "" end' "$file")" || exit 1
+  if [ -z "$v" ]; then
+    [ "$required" = 1 ] && [ "$1" = staging ] && { echo "$file: $k is missing" >&2; exit 1; }
+    continue
   fi
-else
-  [ "$(jq -r '[keys[] | select(startswith("stripe_"))] | length' "$file")" = 0 ] ||
-    { echo "$file: prod holds no stripe_* constant (billing is staging only)" >&2; exit 1; }
+  [[ "$v" =~ $price ]] || { echo "$file: $k is not a valid value: $v" >&2; exit 1; }
+  lines+="$name=$v"$'\n'
+done << LIST
+stripe_price_team STRIPE_PRICE_TEAM 1
+stripe_price_business STRIPE_PRICE_BUSINESS 1
+stripe_price_solo_monthly STRIPE_PRICE_SOLO_MONTHLY 1
+stripe_price_solo_yearly STRIPE_PRICE_SOLO_YEARLY 1
+stripe_price_team_yearly STRIPE_PRICE_TEAM_YEARLY 0
+stripe_price_business_yearly STRIPE_PRICE_BUSINESS_YEARLY 0
+LIST
+# The Stripe portal configuration (bpc_...; Customer Portal with seats and plan
+# changes off): optional until made (scripts/ops/staging-portal-config.ts), in
+# either env; when present it must be a bpc_ id.
+v="$(jq -r '.stripe_portal_config | if type == "string" then . else "" end' "$file")" || exit 1
+if [ -n "$v" ]; then
+  [[ "$v" =~ ^bpc_[A-Za-z0-9]{1,255}$ ]] || { echo "$file: stripe_portal_config is not a valid value: $v" >&2; exit 1; }
+  lines+="STRIPE_PORTAL_CONFIG=$v"$'\n'
 fi
+[ "$(jq -r '[keys[] | select(startswith("stripe_") and (. as $k | ["stripe_price_team","stripe_price_business","stripe_price_solo_monthly","stripe_price_solo_yearly","stripe_price_team_yearly","stripe_price_business_yearly","stripe_portal_config"] | index($k) | not))] | length' "$file")" = 0 ] ||
+  { echo "$file: holds a stripe_* constant that is not a price id or the portal configuration" >&2; exit 1; }
 if [ "$1" = prod ]; then
   sd="$(jq -r '.signup_deploy | if type == "string" then . else "" end' "$file")" || exit 1
   [ "$sd" = on ] || [ "$sd" = off ] || { echo "$file: signup_deploy must be exactly \"on\" or \"off\"" >&2; exit 1; }
