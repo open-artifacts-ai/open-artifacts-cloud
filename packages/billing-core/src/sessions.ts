@@ -435,7 +435,12 @@ export async function expireCheckoutSession(
 export async function retrieveSubscription(
   input: { subscriptionId: string },
   cfg: StripeConfig,
-): Promise<{ id: string; status: string }> {
+): Promise<{
+  id: string;
+  status: string;
+  /** Stripe's subscription object (absent when it is missing). */
+  subscription?: Record<string, unknown>;
+}> {
   const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
   try {
     const { status, out } = await send(
@@ -447,7 +452,7 @@ export async function retrieveSubscription(
     );
     if (typeof out?.status !== "string")
       throw new StripeApiError(status, "bad_answer");
-    return { id, status: out.status };
+    return { id, status: out.status, subscription: out };
   } catch (e) {
     if (e instanceof StripeApiError && e.status === 404)
       return { id, status: "missing" };

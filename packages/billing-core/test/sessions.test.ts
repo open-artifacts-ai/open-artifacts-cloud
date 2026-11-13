@@ -717,7 +717,7 @@ describe("retrieveSubscription (#1568)", () => {
       return Response.json(b, { status: st });
     }) as unknown as typeof fetch;
 
-  it("one GET; answers the id and status only", async () => {
+  it("one GET; answers the id, status and Stripe's object", async () => {
     expect(
       await retrieveSubscription(
         { subscriptionId: "sub_Test1" },
@@ -731,7 +731,16 @@ describe("retrieveSubscription (#1568)", () => {
           }),
         },
       ),
-    ).toEqual({ id: "sub_Test1", status: "past_due" });
+    ).toEqual({
+      id: "sub_Test1",
+      status: "past_due",
+      subscription: {
+        id: "sub_Test1",
+        status: "past_due",
+        customer: "cus_1",
+        items: {},
+      },
+    });
     expect(seen).toEqual([
       {
         method: "GET",
