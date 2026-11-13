@@ -32,6 +32,7 @@ import {
   selectPlan,
 } from "../src/lanes.ts";
 import { LOCK_DIR_ENV, lockDirOf } from "../src/locks.ts";
+import { prefixed } from "../src/prefixed.ts";
 import { exitCode, formatReport, gateOn, type Report } from "../src/report.ts";
 import { finalReport, type LanePart, writeReport } from "../src/reporter.ts";
 
@@ -80,24 +81,6 @@ const forward = (sig: NodeJS.Signals) => () => {
 process.on("SIGINT", forward("SIGINT"));
 process.on("SIGTERM", forward("SIGTERM"));
 process.on("SIGHUP", forward("SIGHUP"));
-
-/** Copies `from` to `to` a whole line at a time, each line prefixed. */
-function prefixed(
-  from: NodeJS.ReadableStream,
-  to: NodeJS.WriteStream,
-  p: string,
-) {
-  let rest = "";
-  from.setEncoding("utf8");
-  from.on("data", (chunk: string) => {
-    const lines = (rest + chunk).split("\n");
-    rest = lines.pop() ?? "";
-    for (const l of lines) to.write(`${p}${l}\n`);
-  });
-  from.on("end", () => {
-    if (rest) to.write(`${p}${rest}\n`);
-  });
-}
 
 function runLane(lane: Lane, prefix: boolean): Promise<LaneResult> {
   const name = laneName(lane);
