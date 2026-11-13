@@ -189,9 +189,8 @@ export interface CrossIo {
 /**
  * A 101 where none may be (OA Bus, M1): a machine token upgrading at an
  * install it isn't of, at a content host, or at a suspended install. Its
- * message starts with BREACH_MARK, which the not-gating rule (src/report.ts
- * notGating, live/bus.test.ts) never turns into an unproven: it fails the
- * run even while HOSTED_BUS_NOT_GATING applies.
+ * message starts with BREACH_MARK; like any failure of these cases it fails
+ * the run.
  */
 export { BREACH_MARK };
 export class BreachFail extends ProbeFail {

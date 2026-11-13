@@ -100,7 +100,7 @@ describe("the same pass bar", () => {
       ...ACCEPTED_UNPROVEN_ADDED_SINCE_1730,
     ]);
     expect(main.acceptedUnproven).toHaveLength(4);
-    expect(ACCEPTED_UNPROVEN_ADDED_SINCE_1730).toHaveLength(4);
+    expect(ACCEPTED_UNPROVEN_ADDED_SINCE_1730).toHaveLength(2);
   });
 
   it("the gate accepts each declared provisioner probe as unproven-live, by exact name, file and reason, and no sibling", () => {
