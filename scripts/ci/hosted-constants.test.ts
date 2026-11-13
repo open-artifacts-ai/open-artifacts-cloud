@@ -70,7 +70,20 @@ describe(".github/hosted/<env>.json", () => {
       [...KEYS, "signup_deploy"].sort(),
     );
     expect(Object.keys(read("staging")).sort()).toEqual(
-      [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS].sort(),
+      [
+        ...KEYS,
+        ...STRIPE_KEYS,
+        ...STRIPE_YEARLY_KEYS,
+        "stripe_portal_config",
+      ].sort(),
+    );
+  });
+
+  // #2208: the staging sandbox's portal configuration (plan changes and
+  // quantities off), made by staging-portal-config portal-ensure on 11-13.
+  it("staging pins its portal configuration, from the staging sandbox", () => {
+    expect(read("staging").stripe_portal_config).toBe(
+      "bpc_1UbKyQJuK8jgC2cZNSV0UYXl",
     );
   });
 
