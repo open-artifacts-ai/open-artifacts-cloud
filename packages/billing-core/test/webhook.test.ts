@@ -1835,6 +1835,42 @@ describe("a paid checkout records the subscription's interval and renewal (#2135
     });
   });
 
+  it("redelivering the same checkout leaves the row identical and makes no other Stripe write", async () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${new URL(url).pathname}`);
+      return Response.json(live("year"));
+    }) as unknown as typeof fetch;
+    const e = { ...env, stripeFetch: f } as WebhookEnv;
+    const ev = checkout(T + 100);
+    await deliver(ev, { env: e });
+    const first = await row(A);
+    await deliver(ev, { env: e });
+    expect(await row(A)).toEqual(first);
+    expect(calls.every((c) => c.startsWith("GET "))).toBe(true);
+    expect(await pending()).toEqual([]);
+  });
+
+  it("no extra read for the row's own subscription when a cancel is scheduled", async () => {
+    await ownSub(A);
+    await db
+      .prepare(
+        "UPDATE tiers SET billing_interval = 'year', cancels_at = ?2 WHERE install_id = ?1",
+      )
+      .bind(A, PERIOD_END * 1000)
+      .run();
+    const calls: string[] = [];
+    const f = (async (url: string) => {
+      calls.push(url);
+      return Response.json(live("year"));
+    }) as unknown as typeof fetch;
+    await deliver(checkout(T + 100), {
+      env: { ...env, stripeFetch: f } as WebhookEnv,
+    });
+    expect(calls).toEqual([]);
+    expect((await row(A)).renews_at).toBeNull();
+  });
+
   it("an unpaid checkout and a subscription that is not live record nothing", async () => {
     await deliver(checkout(T + 100, { payment_status: "unpaid" }), {
       env: stripeOf(live("year")),

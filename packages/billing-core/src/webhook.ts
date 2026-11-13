@@ -980,10 +980,7 @@ async function settleCancels(
       current_id: string | null;
     }>();
   if (results.length === 0) return [];
-  const cfg: StripeConfig = {
-    secretKey: env.STRIPE_SECRET_KEY ?? "",
-    ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
-  };
+  const cfg = stripeConfigOf(env);
   const failed: { id: string; event: string | null }[] = [];
   for (const { subscription_id: id, event_id, current_id } of results) {
     // Never the row's own subscription: dropped without a Stripe call (a
@@ -1019,6 +1016,12 @@ async function settleCancels(
 
 const QUEUE_UNADOPTED =
   "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
+
+/** The one Stripe config every read and cancel of the webhook uses. */
+const stripeConfigOf = (env: WebhookEnv): StripeConfig => ({
+  secretKey: env.STRIPE_SECRET_KEY ?? "",
+  ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+});
 
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
@@ -1121,7 +1124,7 @@ export async function handleStripeWebhook(
     if (paidSub) {
       const cur = await db
         .prepare(
-          "SELECT stripe_subscription_id AS id, tier, status, billing_interval, renews_at FROM tiers WHERE stripe_customer_id = ?",
+          "SELECT stripe_subscription_id AS id, tier, status, billing_interval, renews_at, cancels_at FROM tiers WHERE stripe_customer_id = ?",
         )
         .bind(customer)
         .first<{
@@ -1130,6 +1133,7 @@ export async function handleStripeWebhook(
           status: string | null;
           billing_interval: string | null;
           renews_at: number | null;
+          cancels_at: number | null;
         }>();
       const heldByTeam =
         (cur?.tier === "team" || cur?.tier === "business") &&
@@ -1139,10 +1143,7 @@ export async function handleStripeWebhook(
       const soloPaid =
         isObj(ev.object.metadata) && asTier(ev.object.metadata.tier) === "solo";
       if (cur && cur.id !== paidSub && !(soloPaid && heldByTeam)) {
-        const cfg: StripeConfig = {
-          secretKey: env.STRIPE_SECRET_KEY ?? "",
-          ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
-        };
+        const cfg = stripeConfigOf(env);
         let state: string;
         try {
           const got = await retrieveSubscription(
@@ -1188,7 +1189,8 @@ export async function handleStripeWebhook(
       } else if (
         cur &&
         cur.id === paidSub &&
-        (cur.billing_interval === null || cur.renews_at === null)
+        (cur.billing_interval === null ||
+          (cur.renews_at === null && cur.cancels_at === null))
       ) {
         // The row's own subscription, whose renewal data its subscription
         // events never delivered (they were older than this checkout): read
@@ -1196,10 +1198,7 @@ export async function handleStripeWebhook(
         try {
           const got = await retrieveSubscription(
             { subscriptionId: paidSub },
-            {
-              secretKey: env.STRIPE_SECRET_KEY ?? "",
-              ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
-            },
+            stripeConfigOf(env),
           );
           const st = statusFromSubscription(got.status);
           if (st === "active" || st === "past_due") live = got.subscription ?? null;
