@@ -302,6 +302,8 @@ describe("hosted-constants.sh", () => {
           STRIPE_KEYS.length +
           STRIPE_YEARLY_KEYS.length +
           (env === "prod" ? 1 : 0) +
+          // staging pins its portal configuration (#2208)
+          (env === "staging" ? 1 : 0) +
           1,
       );
     }
@@ -466,8 +468,13 @@ describe("hosted-constants.sh", () => {
   });
 
   it("stripe_portal_config is optional, validated when present, in both envs", () => {
-    const st = load(read("staging"), "staging");
+    const { stripe_portal_config: _pinned, ...unpinned } = read("staging");
+    const st = load(unpinned, "staging");
+    expect(st.code, st.err).toBe(0);
     expect(st.ghEnv).not.toContain("STRIPE_PORTAL_CONFIG");
+    expect(load(read("staging"), "staging").ghEnv).toContain(
+      "STRIPE_PORTAL_CONFIG=bpc_1UbKyQJuK8jgC2cZNSV0UYXl\n",
+    );
     const ok = load(
       { ...read("staging"), stripe_portal_config: "bpc_1Abc" },
       "staging",
