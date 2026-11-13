@@ -27,6 +27,15 @@ const STATUS_LABEL: Record<BusinessStatus, string> = {
   closed: "Closed",
 };
 
+/** A host as [unique key, text] pieces; a line may break before each dot, never inside a label. */
+const hostParts = (host: string): [string, string][] => {
+  const labels = host.split(".");
+  return labels.map((l, i) => [
+    labels.slice(0, i + 1).join("."),
+    i > 0 ? `.${l}` : l,
+  ]);
+};
+
 function Row({
   r,
   onStatus,
@@ -66,11 +75,10 @@ function Row({
         {r.source === "dashboard" ? "Dashboard" : "Landing"}
         {r.instanceHost && (
           <div className="dt" title="Unverified">
-            {r.instanceHost.split(".").map((part, i) => (
-              // A break may fall after a dot, never inside a label.
-              <span key={`${i}-${part}`}>
+            {hostParts(r.instanceHost).map(([key, part], i) => (
+              <span key={key}>
                 {i > 0 && <wbr />}
-                {i > 0 ? `.${part}` : part}
+                {part}
               </span>
             ))}
           </div>
