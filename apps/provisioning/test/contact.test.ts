@@ -123,7 +123,7 @@ describe("the page", () => {
       "1 to 10",
       "11 to 50",
       "51 to 200",
-      "More than 200",
+      "200+",
       "What do you need? (optional)",
       "Google group sync",
       "Outside-sharing controls",
@@ -132,9 +132,20 @@ describe("the page", () => {
       "Something else",
       "Anything else? (optional)",
       "Send request",
-      "Thanks. We have your request and will email you at ",
+      "Thanks. We have your request.",
+      "We'll email you at ",
+      "What Business adds to Team",
+      "Decide who may share pages outside the company.",
+      "per creator per month. Viewers are free.",
+      "What happens next",
+      "A person reads every request.",
+      "Self-hosting? There are no plans to buy: every feature that ships is yours.",
+      "Back to Open Artifacts",
+      "We use this only to reply to you. ",
+      ", where you're an owner.",
       "That didn't send. Try again.",
-      "We already have your request from today. We'll be in touch.",
+      "We already have your request from today.",
+      "We'll be in touch.",
       'q.get("name")',
       'q.get("email")',
       'q.get("instance")',
@@ -143,7 +154,7 @@ describe("the page", () => {
       expect(CONTACT_JS, s).toContain(s);
     expect(CONTACT_JS).not.toMatch(/innerHTML|—/);
     expect(CONTACT_JS).toContain('theme: "auto"');
-    expect(CONTACT_JS).toContain('class: "lead body"');
+    expect(CONTACT_JS).toContain('class: "panel cx-done", role: "status"');
   });
 
   it("a GET to the API is 405", async () => {
