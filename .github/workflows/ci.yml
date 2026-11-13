@@ -25,6 +25,8 @@ jobs:
         run: shellcheck scripts/*.sh
       - name: overlay and sync tests
         run: scripts/overlay.test.sh
+      - name: Workers do not hardcode settings the hosted env files own
+        run: node --experimental-strip-types --no-warnings scripts/ci/check-hosted-owned-vars.ts
 
   overlay:
     runs-on: ubuntu-latest
