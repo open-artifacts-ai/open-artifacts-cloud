@@ -126,7 +126,48 @@ need_queue() {
 need() { # name: a required, non-empty env var
   [ -n "${!1:-}" ] || { echo "$1 is required for $target" >&2; exit 2; }
 }
-secret_names() { cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name'; }
+# secret_names <worker>: the names of its secrets, one per line. Cloudflare
+# sometimes answers a success with an empty list for a Worker that has secrets
+# (#227), so an EMPTY list is read again, up to PUT_ATTEMPTS times in all,
+# PUT_RETRY_SLEEP seconds (default 5) after the first and three times that
+# after the second. The first non-empty read is returned; after the last
+# attempt the empty list is, so a caller's exact comparison still fails
+# closed. A failed read still fails (no retry, as before). Defined before
+# PUT_ATTEMPTS is set but only called after.
+secret_names() {
+  local pause="${PUT_RETRY_SLEEP:-5}" a out
+  [[ "$pause" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; return 1; }
+  for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+    out="$(cf_get "/workers/scripts/$1/secrets" | must "list $1 secrets" | jq -r '.result[].name')" || return 1
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+      sleep "$pause"
+      pause=$((pause * 3))
+    fi
+  done
+}
+# secret_absent <worker> <name>: a generate-if-missing path asks this after the
+# list says the secret is missing (#231). The list can be read wrongly empty
+# (#227), and generating over a live key rotates it, so the one secret is read
+# directly (GET /workers/scripts/<w>/secrets/<name>, which answers the name and
+# type, never the value). Returns 0 only on HTTP 404 (Cloudflare's 10056, the
+# code the delete path also meets); 1 on 200 (it is there: do not generate);
+# any other answer or a network error fails the run. The body is never printed.
+secret_absent() {
+  local out code
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" |
+    curl -sS -K - -w '\n%{http_code}' "$ACCT/workers/scripts/$1/secrets/$2")" ||
+    { echo "read secret $2 of $1 failed: network error" >&2; exit 1; }
+  code="${out##*$'\n'}"
+  case "$code" in
+    404) return 0 ;;
+    200) return 1 ;;
+    *) echo "read secret $2 of $1 failed: HTTP $code; not generating it" >&2; exit 1 ;;
+  esac
+}
 # put_secret <worker> <app dir> <name>: the value comes on stdin. A failed put
 # is tried PUT_ATTEMPTS (3) times in all, PUT_RETRY_SLEEP seconds (default 5)
 # after the first failure and three times that after the second: Cloudflare
@@ -528,7 +569,7 @@ case "$target" in
       SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioning
     W="oa-$P-provisioning"
     have="$(secret_names "$W")"
-    if ! grep -qx ADMIN_SESSION_KEY <<< "$have"; then
+    if ! grep -qx ADMIN_SESSION_KEY <<< "$have" && secret_absent "$W" ADMIN_SESSION_KEY; then
       openssl rand -base64 32 | put_secret "$W" provisioning ADMIN_SESSION_KEY
     fi
     # The admin's registry entry (4.3) carries the public half of
@@ -540,7 +581,7 @@ case "$target" in
     rc=0
     entry="$(kv_get "$BROKER_REGISTRY_ID" "$KEY")" || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit 1
-    if [ -z "$VERIFY_ONLY" ] && { [ "$rc" -eq 3 ] || ! grep -qx ADMIN_BROKER_KEY <<< "$have"; }; then
+    if [ -z "$VERIFY_ONLY" ] && { [ "$rc" -eq 3 ] || { ! grep -qx ADMIN_BROKER_KEY <<< "$have" && secret_absent "$W" ADMIN_BROKER_KEY; }; }; then
       key="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/broker-key.ts")"
       entry="$(jq -c --arg o "https://admin.$ZONE" '{installId: "i000000admin", origin: $o, keys: [{kid, x}], domains: []}' <<< "$key")"
       cf_send PUT "/storage/kv/namespaces/$BROKER_REGISTRY_ID/values/$KEY" "$entry" | must "write $KEY" > /dev/null
@@ -568,7 +609,7 @@ case "$target" in
       rc=0
       entry="$(kv_get "$BROKER_REGISTRY_ID" "$SKEY")" || rc=$?
       [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit 1
-      if [ -z "$VERIFY_ONLY" ] && { [ "$rc" -eq 3 ] || ! grep -qx SIGNUP_BROKER_KEY <<< "$have"; }; then
+      if [ -z "$VERIFY_ONLY" ] && { [ "$rc" -eq 3 ] || { ! grep -qx SIGNUP_BROKER_KEY <<< "$have" && secret_absent "$W" SIGNUP_BROKER_KEY; }; }; then
         key="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/broker-key.ts")"
         entry="$(jq -c --arg o "https://signup.$ZONE" '{installId: "i00000signup", origin: $o, keys: [{kid, x}], domains: []}' <<< "$key")"
         cf_send PUT "/storage/kv/namespaces/$BROKER_REGISTRY_ID/values/$SKEY" "$entry" | must "write $SKEY" > /dev/null
@@ -685,7 +726,7 @@ case "$target" in
       echo "oa-$P-auth-broker has no GOOGLE_CLIENT_SECRET: set it in the Environment and rerun" >&2
       exit 1
     fi
-    if ! grep -qx BROKER_STATE_KEY <<< "$have"; then
+    if ! grep -qx BROKER_STATE_KEY <<< "$have" && secret_absent oa-$P-auth-broker BROKER_STATE_KEY; then
       openssl rand -base64 32 | put_secret oa-$P-auth-broker auth-broker BROKER_STATE_KEY
     fi
     # Again after the secrets: the serving version carries the tag.
@@ -720,7 +761,7 @@ case "$target" in
       echo "oa-$P-directory-broker has no GOOGLE_DIRECTORY_CLIENT_SECRET: set it in the Environment and rerun" >&2
       exit 1
     fi
-    if ! grep -qx DIRECTORY_STATE_KEY <<< "$have"; then
+    if ! grep -qx DIRECTORY_STATE_KEY <<< "$have" && secret_absent oa-$P-directory-broker DIRECTORY_STATE_KEY; then
       openssl rand -base64 32 | put_secret oa-$P-directory-broker directory-broker DIRECTORY_STATE_KEY
     fi
     # Again after the secrets: the serving version carries the tag.
@@ -746,6 +787,9 @@ case "$target" in
     for k in STRIPE_PRICE_TEAM_YEARLY STRIPE_PRICE_BUSINESS_YEARLY; do
       [ -z "${!k:-}" ] || [[ "${!k}" =~ ^price_[A-Za-z0-9]{1,255}$ ]] || { echo "$k is not a Stripe price id" >&2; exit 2; }
     done
+    # The portal configuration is optional (unset: Stripe's default portal).
+    [ -z "${STRIPE_PORTAL_CONFIG:-}" ] || [[ "$STRIPE_PORTAL_CONFIG" =~ ^bpc_[A-Za-z0-9]{1,255}$ ]] ||
+      { echo "STRIPE_PORTAL_CONFIG is not a Stripe portal configuration id" >&2; exit 2; }
     if [ -z "$VERIFY_ONLY" ]; then
       need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
       # Test mode only (billing-core refuses a live key too); never printed.
@@ -764,6 +808,7 @@ case "$target" in
         STRIPE_PRICE_TEAM="$STRIPE_PRICE_TEAM" STRIPE_PRICE_BUSINESS="$STRIPE_PRICE_BUSINESS" \
         STRIPE_PRICE_SOLO_MONTHLY="$STRIPE_PRICE_SOLO_MONTHLY" STRIPE_PRICE_SOLO_YEARLY="$STRIPE_PRICE_SOLO_YEARLY" \
         STRIPE_PRICE_TEAM_YEARLY="${STRIPE_PRICE_TEAM_YEARLY:-}" STRIPE_PRICE_BUSINESS_YEARLY="${STRIPE_PRICE_BUSINESS_YEARLY:-}" \
+        STRIPE_PORTAL_CONFIG="${STRIPE_PORTAL_CONFIG:-}" \
         deploy billing
     }
     billing_deploy

@@ -73,6 +73,10 @@ export const KEY_TABLE: Record<string, KeyRow> = {
   "bus-dev:ip:": { paced: true, why: "POST /bus/device, per IP" },
   "bus-tok:ip:": { paced: true, why: "POST /bus/device/token, per IP" },
   "bus-tok:dc:": { paced: false, why: "per device code" },
+  "bus-conn:ip:": {
+    paced: false,
+    why: "GET /bus/connect, per IP; the bus lane's few raw-socket connects (src/ws.ts holdSocket) never go through the paced fetch, and stay far under 30 a minute",
+  },
   "bus-approve:u:": { paced: true, why: "POST /bus/approve, per member" },
   "bus-code:u:": {
     paced: true,

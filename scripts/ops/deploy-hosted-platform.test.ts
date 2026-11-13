@@ -109,6 +109,13 @@ case "$path" in
     exit 0 ;;
   secrets_store/stores/*/secrets\\?*) [ -f "$STATE/fail-store" ] && { bad; exit 0; }; ok "$(cat "$STATE/store-secrets.json" 2>/dev/null || echo '[]')"; exit 0 ;;
   workers/scripts/*/secrets/*) w="\${path#workers/scripts/}"; w="\${w%%/*}"; n="\${path##*/}"
+    if [ "$m" = GET ]; then
+      echo "secret-get $w $n" >> "$STUB_LOG"
+      if [ -f "$STATE/fail-secret-get" ]; then echo '{"success":false,"errors":[{"code":10000}]}'; printf '\\n403'
+      elif [ -f "$STATE/$w.secrets" ] && grep -qx "$n" "$STATE/$w.secrets"; then ok "{\\"name\\":\\"$n\\",\\"type\\":\\"secret_text\\"}"; printf '\\n200'
+      else echo '{"success":false,"errors":[{"code":10056}]}'; printf '\\n404'; fi
+      exit 0
+    fi
     if [ "$m" = DELETE ] && [ ! -f "$STATE/fail-delete" ] && [ -f "$STATE/$w.secrets" ] && grep -qx "$n" "$STATE/$w.secrets"; then
       grep -vx "$n" "$STATE/$w.secrets" > "$STATE/s.new" || true; mv "$STATE/s.new" "$STATE/$w.secrets"
       [ ! -f "$STATE/$w.settings.json" ] || { jq --arg n "$n" '.result.bindings |= map(select(.name != $n))' "$STATE/$w.settings.json" > "$STATE/b.new"; mv "$STATE/b.new" "$STATE/$w.settings.json"; }
@@ -128,7 +135,10 @@ case "$kind" in
     elif [ -f "$STATE/$w.exists" ]; then echo '{"success":true,"result":{"bindings":[]}}'
     else echo '{"success":false,"errors":[{"code":10007,"message":"not found"}]}'; fi ;;
   secrets)
+    echo "$w" >> "$STATE/secret-reads"
     if [ -f "$STATE/fail-secrets" ]; then echo '{"success":false,"errors":[{"code":1}]}'
+    elif [ -f "$STATE/empty-secret-reads" ] && [ "$(cat "$STATE/empty-secret-reads")" -gt 0 ]; then
+      echo $(( $(cat "$STATE/empty-secret-reads") - 1 )) > "$STATE/empty-secret-reads"; echo '{"success":true,"result":[]}'
     else touch "$STATE/$w.secrets"; jq -nR '{success: true, result: [inputs | select(length > 0) | {name: .}]}' < "$STATE/$w.secrets"; fi ;;
   schedules) cat "$STATE/$w.schedules.json" ;;
 esac`;
@@ -1711,6 +1721,159 @@ describe("deploy-hosted-platform.sh", () => {
     expect(r.out).toContain("staging auth-broker: deployed and verified");
     clean(r);
   });
+  describe("a secret the list wrongly misses is not generated again (#231)", () => {
+    const KEY = "install:i000000admin";
+    const SKEY = "install:i00000signup";
+    const entry = (id: string, origin: string) =>
+      JSON.stringify({
+        installId: id,
+        origin,
+        keys: [{ kid: "k".repeat(16), x: "x".repeat(43) }],
+        domains: [],
+      });
+    const brokers = ["oa-p-provisioner", "oa-p-auth-broker"];
+    const live = {
+      "kvns.json": JSON.stringify([
+        { id: OAUTH, title: "oa-p-provisioning-oauth" },
+      ]),
+      [`kv-${REG}-${KEY}`]: entry(
+        "i000000admin",
+        "https://admin.open-artifacts.app",
+      ),
+      [`kv-${REG}-${SKEY}`]: entry(
+        "i00000signup",
+        "https://signup.open-artifacts.app",
+      ),
+    };
+    const all = [
+      "ADMIN_BROKER_KEY",
+      "ADMIN_IDENTITIES",
+      "ADMIN_SESSION_KEY",
+      "SIGNUP_BROKER_KEY",
+    ];
+    const gets = (log: string[]) =>
+      log
+        .filter((l) => l.startsWith("secret-get "))
+        .map((l) => l.split(" ")[2]);
+    const prov = (secrets: string[], files: Record<string, string> = {}) =>
+      setup({
+        exists: [...brokers, "oa-p-provisioning"],
+        files: { ...live, ...files },
+        secrets: { "oa-p-provisioning": secrets },
+      }).run("provisioning", { PROD_SIGNUP_DEPLOY: "on" });
+
+    for (const k of [
+      "ADMIN_SESSION_KEY",
+      "ADMIN_BROKER_KEY",
+      "SIGNUP_BROKER_KEY",
+    ]) {
+      it(`provisioning ${k}: a list read wrongly empty but a GET of 200 means no put and no new registry entry`, () => {
+        const r = prov(all, { "empty-secret-reads": "99" });
+        expect(gets(r.log)).toContain(k);
+        expect(puts(r.log)).not.toContain(k);
+        expect(r.writes.filter((w) => w.includes("/values/install:"))).toEqual(
+          [],
+        );
+      });
+      it(`provisioning ${k}: a GET of 404 means a put`, () => {
+        const r = prov(all.filter((n) => n !== k));
+        expect(gets(r.log)).toContain(k);
+        expect(puts(r.log)).toContain(k);
+      });
+      it(`provisioning ${k}: any other answer fails the run with no put`, () => {
+        const r = prov(
+          all.filter((n) => n !== k),
+          { "fail-secret-get": "" },
+        );
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("not generating it");
+        expect(puts(r.log)).not.toContain(k);
+      });
+    }
+    it("a brand-new provisioning Worker still gets its keys", () => {
+      const r = setup({ exists: brokers }).run("provisioning");
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([
+        "ADMIN_SESSION_KEY",
+        "ADMIN_BROKER_KEY",
+        "ADMIN_IDENTITIES",
+      ]);
+    });
+
+    for (const [target, w, state, google] of [
+      [
+        "auth-broker",
+        "oa-p-auth-broker",
+        "BROKER_STATE_KEY",
+        "GOOGLE_CLIENT_SECRET",
+      ],
+      [
+        "directory-broker",
+        "oa-p-directory-broker",
+        "DIRECTORY_STATE_KEY",
+        "GOOGLE_DIRECTORY_CLIENT_SECRET",
+      ],
+    ] as const) {
+      const go = (secrets: string[], files: Record<string, string> = {}) =>
+        setup({ exists: [w], secrets: { [w]: secrets }, files }).run(target, {
+          [google]: "given",
+        });
+      it(`${target} ${state}: a list read wrongly empty but a GET of 200 means no put`, () => {
+        const r = go([state, google], { "empty-secret-reads": "99" });
+        expect(gets(r.log)).toContain(state);
+        expect(puts(r.log)).not.toContain(state);
+      });
+      it(`${target} ${state}: a GET of 404 means a put`, () => {
+        const r = go([google]);
+        expect(gets(r.log)).toContain(state);
+        expect(puts(r.log)).toContain(state);
+      });
+      it(`${target} ${state}: any other answer fails the run with no put`, () => {
+        const r = go([google], { "fail-secret-get": "" });
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("not generating it");
+        expect(puts(r.log)).not.toContain(state);
+      });
+      it(`${target}: a brand-new Worker still gets its state key`, () => {
+        const r = setup().run(target);
+        expect(r.code, r.err).toBe(0);
+        expect(puts(r.log)).toContain(state);
+      });
+    }
+  });
+  describe("an empty secret list read is read again (#227)", () => {
+    const verify = (empty?: number) => {
+      const s = setup({
+        exists: ["oa-p-auth-broker"],
+        secrets: {
+          "oa-p-auth-broker": ["BROKER_STATE_KEY", "GOOGLE_CLIENT_SECRET"],
+        },
+        files: empty === undefined ? {} : { "empty-secret-reads": `${empty}` },
+      });
+      const r = s.run("auth-broker", {
+        VERIFY_ONLY: "1",
+        GOOGLE_CLIENT_SECRET: "",
+      });
+      const reads = readFileSync(join(s.state, "secret-reads"), "utf8")
+        .split("\n")
+        .filter(Boolean).length;
+      return { r, reads };
+    };
+    it("an empty list then a full one passes, with one more read", () => {
+      const base = verify();
+      expect(base.r.code, base.r.err).toBe(0);
+      const once = verify(1);
+      expect(once.r.code, once.r.err).toBe(0);
+      expect(once.reads).toBe(base.reads + 1);
+    });
+    it("always empty still fails closed, after three reads", () => {
+      const always = verify(99);
+      expect(always.r.code).toBe(1);
+      expect(always.r.err).toContain("secrets are ''");
+      // Each empty read is tried three times in all, then given up.
+      expect(always.reads).toBeGreaterThan(verify().reads);
+    });
+  });
   it("verify only: no deploy and no secret written, every check still runs", () => {
     const s = setup({
       exists: ["oa-p-auth-broker"],
@@ -2073,6 +2236,7 @@ describe("deploy-hosted-platform.sh", () => {
         ["STRIPE_PRICE_TEAM", "prod_1Abc", "price id"],
         ["STRIPE_PRICE_SOLO_YEARLY", "price_1 Abc", "price id"],
         ["STRIPE_PRICE_TEAM_YEARLY", "prod_1Abc", "price id"],
+        ["STRIPE_PORTAL_CONFIG", "bpc_1 Abc", "portal configuration id"],
       ] as const) {
         const r = stg().run("billing", { [k]: v }, "staging");
         expect(r.code, `${k}=${v}`).toBe(2);

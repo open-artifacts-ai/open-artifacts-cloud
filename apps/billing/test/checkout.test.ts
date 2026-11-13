@@ -861,6 +861,28 @@ describe("POST /portal", () => {
     ]);
   });
 
+  it("STRIPE_PORTAL_CONFIG set: the session carries it as configuration; unset or empty: it does not", async () => {
+    await seed(A, "cus_existingA");
+    let s = fakeStripe();
+    await call(req("/portal", { install: A, ts: Date.now() }), {
+      ...env,
+      STRIPE_PORTAL_CONFIG: "bpc_1Abc",
+    } as Env);
+    expect(s.calls[0]?.form).toEqual({
+      customer: "cus_existingA",
+      return_url: `https://${HOST_A}/settings/plan`,
+      configuration: "bpc_1Abc",
+    });
+    for (const v of [undefined, ""]) {
+      s = fakeStripe();
+      await call(req("/portal", { install: A, ts: Date.now() + 1 }), {
+        ...env,
+        STRIPE_PORTAL_CONFIG: v,
+      } as Env);
+      expect(s.calls[0]?.form).not.toHaveProperty("configuration");
+    }
+  });
+
   it("a body with any field beyond install and ts is 400 bad_body", async () => {
     await seed(A, "cus_existingA");
     const s = fakeStripe();

@@ -87,3 +87,15 @@ it("shows no token banner when the token is fine", async () => {
   await screen.findByRole("heading", { name: "Audit log" });
   expect(screen.queryByTestId("token-banner")).toBeNull();
 });
+
+it("draws the real Open Artifacts mark in the sidebar brand, not a placeholder box", async () => {
+  use(http.get("*/api/v1/me", () => me()));
+  const { container } = renderApp("/installs");
+  expect(await screen.findByText("leo@example.com")).toBeInTheDocument();
+  const brand = container.querySelector(".oa-brand");
+  const mark = brand?.querySelector("svg.oa-mark");
+  expect(mark?.getAttribute("viewBox")).toBe("0 0 32 32");
+  expect(mark?.getAttribute("aria-hidden")).toBe("true");
+  expect(mark?.querySelectorAll("path")).toHaveLength(2);
+  expect(brand).toHaveTextContent("Platform admin");
+});

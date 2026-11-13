@@ -134,7 +134,7 @@ describe("wrangler.jsonc", () => {
         // #1299 part 6: staging only, exact slugs; prod has no such key.
         ...(env === "staging"
           ? {
-              STAGING_BUS_SLUGS: "rl-agents,bus1299-b,m2-walk,rl-busb",
+              STAGING_BUS_SLUGS: "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb",
               STAGING_BUS_ALL: "1",
             }
           : { PROD_BUS_ALL: "0" }),

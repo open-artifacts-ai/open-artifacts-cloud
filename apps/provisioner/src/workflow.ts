@@ -618,6 +618,7 @@ async function notify(
       to,
       appHost,
       selfServe: job.source === "self-serve",
+      billing: !!ctx.env.BILLING,
     });
   } catch (e) {
     console.error("welcome email not built", {

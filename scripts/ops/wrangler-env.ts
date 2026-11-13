@@ -70,6 +70,7 @@ function block(src: string, env: Env): Block {
 const OPTIONAL = new Set([
   "STRIPE_PRICE_TEAM_YEARLY",
   "STRIPE_PRICE_BUSINESS_YEARLY",
+  "STRIPE_PORTAL_CONFIG",
 ]);
 
 /** One var's committed value, each {{NAME_<ENV>}} filled from `values[NAME]`. */

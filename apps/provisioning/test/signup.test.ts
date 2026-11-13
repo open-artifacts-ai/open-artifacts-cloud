@@ -221,6 +221,14 @@ describe("GET /api/v1/config", () => {
       expect(r.headers.get("cache-control")).toBe("no-store");
     }
   });
+  it("billing is true only where the BILLING binding exists", async () => {
+    const cfg = async (over: Record<string, unknown>) =>
+      (await (
+        await call(fakeEnv(over), `${SIGNUP}/api/v1/config`)
+      ).json()) as Record<string, unknown>;
+    expect((await cfg({})).billing).toBe(false);
+    expect((await cfg({ BILLING: {} })).billing).toBe(true);
+  });
 });
 
 describe("sign-in on the sign-up host", () => {
@@ -758,10 +766,18 @@ describe("CSP: no inline styles on the sign-up page", () => {
     );
   });
 
+  it("the waiting copy promises the open, not a tab to keep (open-artifacts#2350)", () => {
+    expect(CLIENT_JS).toContain(
+      "This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too.",
+    );
+    expect(CLIENT_JS).not.toContain("Keep this tab open");
+  });
+
   it("every stage keeps a heading: no empty header branch", () => {
     for (const t of [
       '"Setting up ", nw(hostName)',
-      'nw(hostName), " is ready"',
+      '"Ready. Opening ", nw(hostName)',
+      '"You have ", nw(hostName)',
       '"We couldn\'t set up ", nw(hostName)',
     ])
       expect(CLIENT_JS).toContain(t);

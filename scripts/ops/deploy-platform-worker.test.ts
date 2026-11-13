@@ -1117,6 +1117,35 @@ describe("deploy-platform-worker.sh", () => {
       expect(bad.code).toBe(1);
     });
 
+    it("fills STRIPE_PORTAL_CONFIG when set, leaves it empty when unset, refuses a malformed one", () => {
+      const set = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PORTAL_CONFIG: "bpc_1Abc",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(set.code).toBe(0);
+      expect(readFileSync(set.snap, "utf8")).toContain(
+        '"STRIPE_PORTAL_CONFIG": "bpc_1Abc"',
+      );
+      const unset = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(unset.code).toBe(0);
+      expect(readFileSync(unset.snap, "utf8")).toContain(
+        '"STRIPE_PORTAL_CONFIG": ""',
+      );
+      const bad = run(["billing", "staging"], {
+        ...PRICES,
+        ...IDS,
+        STRIPE_PORTAL_CONFIG: "price_1",
+        MIGRATION_LOCK: FROZEN,
+      });
+      expect(bad.code).toBe(1);
+    });
+
     it("refuses a missing or malformed D1 or registry id", () => {
       for (const env of [
         {},

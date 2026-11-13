@@ -17,6 +17,7 @@ import {
 } from "../src/capture.ts";
 import {
   ACCEPTED_UNPROVEN,
+  BREACH_MARK,
   buildReport,
   type CaseResult,
   exitCode,
@@ -316,6 +317,40 @@ describe("gate", () => {
         expect(r.gate.reason).toBe(
           '1 of 8 cases are not "pass"; 6 accepted unproven-live',
         );
+      }
+    });
+
+    it("cloud #202: the hosted bus cases are not accepted: a fail or an infra on either gates, and a breach always does", () => {
+      const BUS = [
+        "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
+        "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      ];
+      for (const name of BUS) {
+        expect(ACCEPTED_UNPROVEN.some((e) => e.name === name)).toBe(false);
+        for (const level of ["fail", "infra", "unproven-live"] as const) {
+          const red: CaseResult = {
+            name,
+            file: "live/bus.test.ts",
+            level,
+            reason: "infra: bus pair bring-up: rl-busb create: job failed",
+          };
+          const r = buildReport([ok, red]);
+          expect(r.counts[level], level).toBe(1);
+          expect(r.cases[1]?.level).toBe(level);
+          expect(r.gate.passed, level).toBe(false);
+          expect(gatePasses([ok, red]), level).toBe(false);
+          expect(exitCode(r, true), level).not.toBe(0);
+        }
+        const breach: CaseResult = {
+          name,
+          file: "live/bus.test.ts",
+          level: "fail",
+          reason: `${BREACH_MARK} rl-busb upgraded rl-busa's machine token (101)`,
+        };
+        expect(gatePasses([ok, breach])).toBe(false);
+        expect(
+          gatePasses([ok, { ...breach, level: "pass", reason: undefined }]),
+        ).toBe(true);
       }
     });
 

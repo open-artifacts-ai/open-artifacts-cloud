@@ -11,6 +11,9 @@ export const CLIENT_JS = String.raw`(function () {
     slug: "", avail: null, availSlug: "", seq: 0,
     gate: null, token: null, busy: false, joining: false, joinErr: "", note: "", step: "address", chips: [], chipsFor: "", err: "", notice: "", widget: null, poll: null
   };
+  // How long the ready view waits before it shows "Open your instance" as a
+  // fallback, when the automatic hand-off has not left the page.
+  var FALLBACK_MS = 3000;
   var SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
   function h(tag, props, kids) {
@@ -57,19 +60,48 @@ export const CLIENT_JS = String.raw`(function () {
     }).join("");
   }
 
+  // The Open Artifacts mark (open-artifacts packages/ui brand/mark.svg), inline:
+  // the frame follows the text colour, the corners and artifact the accent, so
+  // one SVG serves light and dark (classes, not style="", for the CSP).
+  function brandMark() {
+    var ns = "http://www.w3.org/2000/svg", s = document.createElementNS(ns, "svg"), p;
+    s.setAttribute("class", "mark");
+    s.setAttribute("viewBox", "0 0 32 32");
+    s.setAttribute("aria-hidden", "true");
+    [["f", "M22 2H5a3 3 0 0 0-3 3v17l4 4V6h20zM10 30h17a3 3 0 0 0 3-3V10l-4-4v20H6z"],
+     ["a", "M22 2h5a3 3 0 0 1 3 3v5zM2 22v5a3 3 0 0 0 3 3h5zM11 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z"]
+    ].forEach(function (d) {
+      p = document.createElementNS(ns, "path");
+      p.setAttribute("class", d[0]);
+      p.setAttribute("d", d[1]);
+      s.appendChild(p);
+    });
+    return s;
+  }
+
   function shell(panel) {
     var links = h("span", { class: "links" }, [
       h("a", { href: S.cfg.docsUrl, rel: "noopener" }, ["Docs"]), " · ",
       h("a", { href: HOSTED_URL, rel: "noopener" }, ["Hosted"]), " · ",
       h("a", { href: S.cfg.githubUrl, rel: "noopener" }, ["GitHub"])
     ]);
-    root.replaceChildren(
-      h("header", { class: "top" }, [
-        h("span", { class: "logo", "aria-hidden": "true" }, [h("i")]),
-        "Open Artifacts", links
+    var foot = links.cloneNode(true); foot.setAttribute("class", "foot");
+    var ghost = brandMark(); ghost.setAttribute("class", "mark ghost");
+    var big = brandMark(); big.setAttribute("class", "mark lg");
+    root.replaceChildren(h("div", { class: "login" }, [
+      h("section", { class: "pitch" }, [
+        h("header", { class: "top" }, [
+          h("div", { class: "brand" }, [brandMark(), "Open Artifacts"]),
+          h("div", { class: "pitchtext" }, [
+            h("p", { class: "pt" }, ["Where any AI agent publishes for your team."]),
+            h("p", { class: "ps" }, ["Pages, docs, code and PDFs, private by default and shared when you choose."])
+          ]),
+          links
+        ]),
+        ghost
       ]),
-      h("main", {}, [panel])
-    );
+      h("main", { class: "side" }, [h("div", { class: "col" }, [big, panel]), foot])
+    ]));
   }
 
   var NOTICES = {
@@ -112,7 +144,9 @@ export const CLIENT_JS = String.raw`(function () {
 
   // ---------- sign-in, then the address (design: round 2, address option A) ----------
   var refs = {};
-  var PRICE = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.";
+  var PRICE_TRIAL = "Solo: free for 30 days, then $10 a year ($0.83 a month) or $1 a month. No card needed.";
+  var PRICE_BETA = "Free during the private beta. No card needed.";
+  function price() { return S.cfg && S.cfg.billing ? PRICE_TRIAL : PRICE_BETA; }
 
   function initials(email) {
     var l = String(email).split("@")[0].replace(/[^a-z0-9]+/gi, " ").trim().split(" ");
@@ -127,19 +161,20 @@ export const CLIENT_JS = String.raw`(function () {
     if (S.me) {
       action = h("div", {}, [
         h("div", { class: "who" }, [
-          h("span", {}, ["Signed in as ", h("b", {}, [S.me.email])]),
-          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you? Sign out"])
+          h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
+          h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
         ]),
         h("button", { class: "btn pri", type: "button", onclick: function () { S.step = "address"; route(); } }, ["Continue"])
       ]);
     } else {
-      action = h("a", { class: "btn gsign", href: "/auth/start" }, [googleMark(), "Sign in with Google"]);
+      action = h("a", { class: "btn pri gsign", href: "/auth/start" }, [googleMark(), "Continue with Google"]);
     }
     shell(h("div", { class: "panel" }, [
-      h("h1", {}, ["Create your Open Artifacts"]),
+      h("h1", {}, [S.me ? "Continue to Open Artifacts" : "Sign up or log in"]),
+      S.me ? null : h("p", { class: "lead signin-lead" }, ["Use your Google account. If you already have an instance, we'll take you to it."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       action,
-      h("p", { class: "muted small mt" }, [PRICE])
+      h("p", { class: "muted small mt" }, [price()])
     ]));
   }
 
@@ -159,7 +194,7 @@ export const CLIENT_JS = String.raw`(function () {
   function whoRow() {
     return h("div", { class: "who" }, [
       h("span", { class: "av", "aria-hidden": "true" }, [initials(S.me.email)]),
-      h("span", { class: "wt" }, ["Signed in as ", h("b", {}, [S.me.email])]),
+      h("span", { class: "wt" }, ["Logged in as ", h("b", {}, [S.me.email])]),
       h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
     ]);
   }
@@ -181,8 +216,8 @@ export const CLIENT_JS = String.raw`(function () {
     ta.addEventListener("input", function () { S.note = ta.value; paintCount(); });
     paintCount();
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["Open Artifacts is in private beta"]),
+      whoRow(),
       h("p", { class: "lead" }, ["We're letting people in a few at a time. Join the waitlist and we'll email you when it's your turn."]),
       h("div", { class: "field roomy" }, [h("label", { for: "use" }, ["What would you use it for? (optional)"]), ta, cnt]),
       S.joinErr ? h("div", { class: "note bad", role: "alert" }, [S.joinErr]) : null,
@@ -206,8 +241,8 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function viewListed() {
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["You're on the list"]),
+      whoRow(),
       h("p", { class: "lead" }, ["We'll email " + S.me.email + " when you're in. Nothing else to do for now."]),
       h("p", { class: "muted small mt" }, ["Don't want to wait? ", h("a", { href: "https://open-artifacts.com/docs/setup/", rel: "noopener" }, ["Run it yourself, free."])])
     ]));
@@ -236,14 +271,14 @@ export const CLIENT_JS = String.raw`(function () {
     refs.ts = h("div", { class: "ts" });
 
     shell(h("div", { class: "panel" }, [
-      whoRow(),
       h("h1", {}, ["Choose your address"]),
+      whoRow(),
       h("p", { class: "lead" }, ["It's where you and your team open your artifacts. You can't change it later."]),
       S.notice ? h("div", { class: "note warn", role: "alert" }, [S.notice]) : null,
       h("div", { class: "field" }, [h("label", { for: "slug" }, ["Address"]), refs.box, refs.help, refs.sugg, refs.chips]),
       refs.err, refs.ts, refs.btn,
       h("button", { class: "btn link back", type: "button", onclick: function () { S.step = "signin"; route(); } }, ["Back"]),
-      h("p", { class: "muted small mt" }, [PRICE])
+      h("p", { class: "muted small mt" }, [price()])
     ]));
     paintAvail();
     paintChips();
@@ -584,7 +619,7 @@ export const CLIENT_JS = String.raw`(function () {
         h("p", { class: "verb", "aria-hidden": "true" }, [word, "…"]),
         refs.lab
       ]);
-      refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. Keep this tab open, and it tells you when it's ready."]);
+      refs.hint = h("p", { class: "hint" }, ["This usually takes a minute or two. We'll open your instance as soon as it's ready, and email you the link too."]);
       shell(refs.ld);
       startAnim(slot, word);
     }
@@ -603,9 +638,40 @@ export const CLIENT_JS = String.raw`(function () {
     var create = "Create your instance", email = "Send your welcome email";
     if (st === "ready") {
       label = "Ready";
-      head = [h("h1", {}, [nw(hostName), " is ready"])];
-      steps = [reserve, step("done", create), step("done", email)];
-      body = [h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, ["Open your instance"])];
+      var btn = h("a", { class: "btn pri", href: "https://" + hostName + "/", onclick: openInstance }, S.opening ? ["Open your instance"] : ["Open " + hostName]);
+      // Seen going from in progress to ready in this page view: "fresh", with
+      // the checklist. Otherwise a returning owner whose instance is ready.
+      // Either way we go in once per tab session (sessionStorage guard, so a
+      // failed hand-off that reloads the page cannot loop).
+      var key = "oa-signup-opened:" + hostName, seen = false;
+      try { seen = !!window.sessionStorage.getItem(key); } catch (e) { seen = false; }
+      var auto = S.opening || !seen;
+      if (S.opening) {
+        head = [h("h1", {}, ["Ready. Opening ", nw(hostName), "\u2026"])];
+        steps = [reserve, step("done", create), step("done", email)];
+      } else {
+        head = [h("h1", {}, ["Log in"]),
+          h("div", { class: "who" }, [
+            h("span", {}, ["Logged in as ", h("b", {}, [S.me.email])]),
+            h("button", { class: "btn link", type: "button", onclick: signOut }, ["Not you?"])
+          ]),
+          h("p", {}, ["You have ", nw(hostName), "."])];
+        steps = null;
+      }
+      body = [];
+      if (!S.openStarted) {
+        S.openStarted = true;
+        if (auto) {
+          try { window.sessionStorage.setItem(key, "1"); } catch (e) { /* no storage: still once per page view */ }
+          goToInstance(btn.href);
+          S.auto = true;
+          S.fbT = setTimeout(function () {
+            S.fbT = null;
+            if (S.view === "setup" && S.auto) document.querySelector(".panel").appendChild(btn);
+          }, FALLBACK_MS);
+        }
+      }
+      if (!auto) body = [btn];
     } else {
       label = "Something went wrong while we were building it.";
       head = [h("h1", {}, ["We couldn't set up ", nw(hostName)])];
@@ -620,16 +686,18 @@ export const CLIENT_JS = String.raw`(function () {
         ])
       ];
     }
-    shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat([
+    shell(h("div", { class: "panel", "aria-live": "polite" }, head.concat(steps ? [
       h("div", { class: "state" }, [h("div", { class: "lab" }, [label]), h("ul", { class: "steps" }, steps)])
-    ], body)));
+    ] : [], body)));
   }
 
   // POST /auth/open mints a short-lived ticket so the instance can sign the
   // owner in without a second prompt; any failure is the plain link.
   function openInstance(ev) {
-    var a = ev.currentTarget, plain = a.href;
     ev.preventDefault();
+    goToInstance(ev.currentTarget.href);
+  }
+  function goToInstance(plain) {
     api("POST", "/auth/open").then(function (r) {
       var u = r.status === 200 && r.body && typeof r.body.url === "string" ? r.body.url : plain;
       window.location.assign(u);
@@ -674,6 +742,7 @@ export const CLIENT_JS = String.raw`(function () {
       }
       S.fails = 0;
       if (wasOffline) { S.offline = false; paintLive(); }
+      if (S.signup.stage === "ready" && before !== "ready" && before !== "failed") S.opening = true;
       if (S.signup.stage !== before) render();
       if (S.signup.stage === "ready" || S.signup.stage === "failed") stopPoll();
     });
@@ -683,6 +752,7 @@ export const CLIENT_JS = String.raw`(function () {
     S.polling = true; S.fails = 0; S.offline = false;
     S.poll = setInterval(pollOnce, 5000);
   }
+  window.addEventListener("pagehide", function () { clearTimeout(S.fbT); S.fbT = null; });
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden && S.polling) pollOnce();
   });
@@ -700,6 +770,7 @@ export const CLIENT_JS = String.raw`(function () {
   }
   function route() {
     stopPoll(); stopAnim();
+    clearTimeout(S.fbT); S.fbT = null; S.opening = false; S.openStarted = false; S.auto = false;
     refs = {};
     if (S.me && S.signup) {
       S.view = "setup";

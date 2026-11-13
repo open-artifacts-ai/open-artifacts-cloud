@@ -63,6 +63,9 @@ ALLOW=(
   .github/workflows/staging-team-proof.yml
   scripts/ops/staging-team-proof.ts
   scripts/ops/staging-team-proof.test.ts
+  .github/workflows/staging-portal-config.yml
+  scripts/ops/staging-portal-config.ts
+  scripts/ops/staging-portal-config.test.ts
   .github/workflows/staging-stripe-prices.yml
   scripts/ops/stripe-prices.ts
   scripts/ops/stripe-prices.test.ts
@@ -74,6 +77,9 @@ ALLOW=(
   scripts/ci/turnstile-domains.sh
   scripts/ci/turnstile-domains.test.ts
   .github/workflows/t19-dry-run.yml
+  # The report-only orphaned Durable Object namespaces check (open-artifacts#2360).
+  scripts/ci/do-orphans.sh
+  scripts/ci/do-orphans.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

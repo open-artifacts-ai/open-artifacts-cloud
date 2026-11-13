@@ -140,6 +140,8 @@ function upgrade(req: Request): Promise<Response> {
 export interface Held {
   /** The handshake's status: 101 when the server upgraded. */
   status: number;
+  /** The reply's body when the server did not upgrade (status not 101). */
+  body?: string;
   /** Resolves when the connection ends, whoever ended it. Never rejects. */
   closed: Promise<void>;
   /** Writes one masked text frame (a client frame must be masked). */
@@ -150,6 +152,11 @@ export interface Held {
   waitText: (pred: (t: string) => boolean, ms: number) => Promise<boolean>;
   /** Ends it from this side; safe to call twice. */
   destroy: () => void;
+  /**
+   * The code of the server's close frame (RFC 6455 5.5.1), once one came;
+   * null before that, for a close frame with no code, and with nothing open.
+   */
+  closeCode: () => number | null;
 }
 
 /** One masked client text frame (RFC 6455 5.2), for a short payload. */
@@ -166,6 +173,16 @@ export function textFrame(text: string): Buffer {
   for (let i = 0; i < n; i++)
     body[i] = (body[i] as number) ^ (mask[i % 4] as number);
   return Buffer.concat([head, mask, body]);
+}
+
+/** One masked client close frame (RFC 6455 5.5.1) echoing `code` (none if null). */
+export function closeFrame(code: number | null): Buffer {
+  const mask = randomBytes(4);
+  const body = Buffer.alloc(code === null ? 0 : 2);
+  if (code !== null) body.writeUInt16BE(code);
+  for (let i = 0; i < body.length; i++)
+    body[i] = (body[i] as number) ^ (mask[i % 4] as number);
+  return Buffer.concat([Buffer.from([0x88, 0x80 | body.length]), mask, body]);
 }
 
 /** The bus keepalive cadence (bus-protocol limits.pingIntervalMs). */
@@ -202,25 +219,32 @@ export async function holdSocket(
   if (!socket)
     return {
       status: res.status,
+      body: await res.text().catch(() => ""),
       closed: Promise.resolve(),
       send: () => {},
       destroy: () => {},
       texts,
       waitText: async () => false,
+      closeCode: () => null,
     };
   let ended = false;
   const waiters = new Set<() => void>();
+  let endNow!: () => void;
   const closed = new Promise<void>((resolve) => {
     const end = () => {
       ended = true;
       for (const w of waiters) w();
       resolve();
     };
+    endNow = end;
     socket.once("close", end);
     socket.once("end", end);
     socket.once("error", end);
   });
+  // Writes after the peer is gone may error; closed already settled.
+  socket.on("error", () => {});
   let buf: Buffer = Buffer.alloc(0);
+  let code: number | null = null;
   socket.on("data", (d: Buffer) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -237,14 +261,31 @@ export async function holdSocket(
         off = 10;
       }
       if (buf.length < off + len) break;
-      if (((buf[0] as number) & 0x0f) === 1)
-        texts.push(buf.subarray(off, off + len).toString("utf8"));
+      const op = (buf[0] as number) & 0x0f;
+      if (op === 1) texts.push(buf.subarray(off, off + len).toString("utf8"));
+      // A close frame: its first two payload bytes are the code.
+      if (op === 8) {
+        if (code === null && len >= 2) code = buf.readUInt16BE(off);
+        // Echo the close (the server waits for it, e.g. behind an edge),
+        // settle `closed`, then end the socket; destroy if it lingers.
+        if (!ended) {
+          endNow();
+          clearInterval(ping);
+          if (!socket.destroyed) {
+            socket.write(closeFrame(code));
+            socket.end();
+            setTimeout(() => socket.destroy(), 1000).unref();
+          }
+        }
+        buf = Buffer.alloc(0);
+        return;
+      }
       buf = buf.subarray(off + len);
     }
     for (const w of waiters) w();
   });
   const ping = setInterval(() => {
-    if (!socket.destroyed) socket.write(textFrame("ping"));
+    if (!socket.destroyed && !ended) socket.write(textFrame("ping"));
   }, o.pingMs ?? KEEPALIVE_MS);
   ping.unref();
   void closed.then(() => clearInterval(ping));
@@ -253,12 +294,13 @@ export async function holdSocket(
     closed,
     texts,
     send: (text) => {
-      if (!socket.destroyed) socket.write(textFrame(text));
+      if (!socket.destroyed && !ended) socket.write(textFrame(text));
     },
     destroy: () => {
       clearInterval(ping);
       socket.destroy();
     },
+    closeCode: () => code,
     waitText: (pred, ms) =>
       new Promise<boolean>((resolve) => {
         const done = (v: boolean) => {

@@ -29,15 +29,25 @@ const HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Create your Open Artifacts</title>
+<title>Sign up or log in</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <div id="app"></div>
-<noscript><main class="ns"><h1>Create your Open Artifacts</h1><p>This page needs JavaScript to sign you in and create your instance.</p></main></noscript>
+<noscript><main class="ns"><h1>Sign up or log in</h1><p>This page needs JavaScript to log you in and create your instance.</p></main></noscript>
 <script src="/app.js"></script>
 </body>
 </html>
+`;
+
+// The product favicon (same file as apps/admin/public/favicon.svg), light and dark.
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-label="Open Artifacts">
+  <title>Open Artifacts</title>
+  <style>.f{fill:#15181C}.a{fill:#2350D0}@media (prefers-color-scheme: dark){.f{fill:#E9EBEE}.a{fill:#7F9CFF}}</style>
+  <path class="f" d="M10 0H2.5A2.5 2.5 0 0 0 0 2.5V10l3 3V3h10zM6 16h7.5a2.5 2.5 0 0 0 2.5-2.5V6l-3-3v10H3z"/>
+  <path class="a" d="M10 0h3.5A2.5 2.5 0 0 1 16 2.5V6zM0 10v3.5A2.5 2.5 0 0 0 2.5 16H6zM6 5h4a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/>
+</svg>
 `;
 
 const json = (body: unknown, status: number, headers: HeadersInit = {}) =>
@@ -60,6 +70,8 @@ export function signupStatic(req: Request, path: string): Response | null {
   if (path === "/app.css") return asset(CSS, "text/css", "public, max-age=300");
   if (path === "/app.js")
     return asset(CLIENT_JS, "text/javascript", "public, max-age=300");
+  if (path === "/favicon.svg")
+    return asset(FAVICON, "image/svg+xml", "public, max-age=86400");
   if (path === "/") return asset(HTML, "text/html", "no-store");
   return null;
 }
@@ -71,6 +83,8 @@ export function signupConfig(env: Env): Response {
       open: env.SIGNUPS_ENABLED !== "false",
       appDomain: env.APP_DOMAIN,
       turnstileSiteKey: env.TURNSTILE_SITEKEY ?? null,
+      // Billing is configured only where the BILLING binding exists (staging).
+      billing: !!env.BILLING,
       docsUrl: "https://open-artifacts.com",
       githubUrl: "https://github.com/open-artifacts-ai/open-artifacts",
     },

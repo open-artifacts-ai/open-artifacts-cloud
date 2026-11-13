@@ -485,6 +485,12 @@ export interface AcceptedUnproven {
   file: string;
   evidence: string;
 }
+/**
+ * The start of a hosted bus failure that is a breach (src/hosted-bus.ts
+ * BreachFail): a 101 where none may be. It always gates.
+ */
+export const BREACH_MARK = "BREACH:";
+
 export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
   [
     {
@@ -605,10 +611,11 @@ export function gatePasses(
 }
 
 export function buildReport(
-  cases: readonly CaseResult[],
+  raw: readonly CaseResult[],
   mode = "unknown",
   run: RunKind = {},
 ): Report {
+  const cases = raw;
   const counts = Object.fromEntries(LEVELS.map((l) => [l, 0])) as Record<
     Level,
     number

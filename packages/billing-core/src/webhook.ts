@@ -269,6 +269,49 @@ const HOLD =
 const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,255}$/;
 const NOT_PAID = "coalesce(tier, '') NOT IN ('solo', 'team', 'business')";
 
+/**
+ * When a subscription's scheduled cancel takes effect, in ms (#2138): its
+ * cancel_at, else (cancel_at_period_end) the end of the period, which is the
+ * trial's end while it is trialing. null: no cancel is scheduled (resumed).
+ * undefined: a cancel is scheduled but Stripe named no date, so nothing is
+ * recorded. The period end sits on the subscription, or on its first item
+ * from newer API versions.
+ */
+const toMs = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v * 1000 : null;
+const firstItem = (o: Record<string, unknown>): Record<string, unknown> => {
+  const items =
+    isObj(o.items) && Array.isArray(o.items.data) ? o.items.data : [];
+  return isObj(items[0]) ? items[0] : {};
+};
+/** The end of the current period, in ms: on the subscription, or on its first item (newer API versions). */
+const periodEndOf = (o: Record<string, unknown>): number | null =>
+  toMs(o.current_period_end) ?? toMs(firstItem(o).current_period_end);
+
+export function cancelsAtOf(
+  o: Record<string, unknown>,
+): number | null | undefined {
+  const cancelAt = toMs(o.cancel_at);
+  if (cancelAt !== null) return cancelAt;
+  if (o.cancel_at_period_end !== true) return null;
+  const end =
+    o.status === "trialing"
+      ? (toMs(o.trial_end) ?? periodEndOf(o))
+      : periodEndOf(o);
+  return end ?? undefined;
+}
+
+/** The subscription item's price interval, when it is month or year. */
+export function intervalOf(
+  o: Record<string, unknown>,
+): "month" | "year" | null {
+  const price = firstItem(o).price;
+  const rec = isObj(price) && isObj(price.recurring) ? price.recurring : null;
+  return rec && (rec.interval === "month" || rec.interval === "year")
+    ? rec.interval
+    : null;
+}
+
 /** One column assignment in the row update: SQL and its binds. */
 type Set = { sql: string; args: unknown[] };
 
@@ -565,6 +608,28 @@ export function changeFor(
           sql: "solo_trial_ends_at = CASE WHEN solo_trial_ends_at IS NULL OR solo_trial_ends_at > ? THEN ? ELSE solo_trial_ends_at END",
           args: [ev.created * 1000, ev.created * 1000],
         });
+      // A scheduled cancel, or its resume (#2138), on a live subscription of
+      // any tier. Under the same ordering guard as everything above.
+      if (
+        tierFromSubscription(o, prices) &&
+        (status === "active" || status === "past_due")
+      ) {
+        const ends = cancelsAtOf(o);
+        if (ends !== undefined)
+          sets.push({ sql: "cancels_at = ?", args: [ends] });
+        // The renewal (#2135): the period's end, none while a cancel is set.
+        const interval = intervalOf(o);
+        if (interval)
+          sets.push({ sql: "billing_interval = ?", args: [interval] });
+        if (o.cancel_at_period_end === true || toMs(o.cancel_at) !== null)
+          sets.push({ sql: "renews_at = NULL", args: [] });
+        else {
+          const end =
+            periodEndOf(o) ??
+            (o.status === "trialing" ? toMs(o.trial_end) : null);
+          if (end !== null) sets.push({ sql: "renews_at = ?", args: [end] });
+        }
+      }
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
         sets.push({ sql: "stripe_subscription_id = ?", args: [subId] });
@@ -575,6 +640,9 @@ export function changeFor(
       // subscription that ends under a running Business trial is recorded
       // for when the trial ends.
       return [
+        { sql: "cancels_at = NULL", args: [] },
+        { sql: "renews_at = NULL", args: [] },
+        { sql: "billing_interval = NULL", args: [] },
         guarded("status", "'lapsed'", [], { paid: true }),
         guarded("grace_until", "NULL", [], { paid: true }),
         ...(tierFromSubscription(o, prices) === "solo"

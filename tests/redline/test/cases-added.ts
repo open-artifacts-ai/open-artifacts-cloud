@@ -5,13 +5,19 @@
 // schedule.test.ts hold the manifest to the snapshot plus exactly this list.
 export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
   [
-    // #1299 part 4: the bus's cross-install machine token and P51. Both pass
-    // or fail on a real assertion before and after the lift (src/bus-gate.ts);
-    // neither is an accepted unproven.
+    // #1954 (cloud #202): the hosted bus's two cases on rl-busa and rl-busb
+    // (their bus is on through STAGING_BUS_SLUGS, not the lift). Both gate
+    // like any other case (promoted, cloud #202).
     {
       file: "live/bus.test.ts",
-      name: "bus > A's machine token at B: /bus/connect is 401, no 101 (each token upgrades at its own install)",
+      name: "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
     },
+    {
+      file: "live/bus.test.ts",
+      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+    },
+    // #1299 part 4: P51 passes or fails on a real assertion before and after
+    // the lift (src/bus-gate.ts); it is not an accepted unproven.
     {
       file: "live/provisioning.test.ts",
       name: "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume",
@@ -42,6 +48,25 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       "artifact comments thread agent put [pat]",
       "artifact comments thread agent delete [session]",
       "artifact comments thread agent delete [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.166.0 (#2263): the pick answer's passkey challenge, and the ten
+    // passkey routes (browser session only, so deny-only like the bus writes).
+    ...[
+      "artifact comments answer challenge [session]",
+      "artifact comments answer challenge [pat]",
+      "org GET /api/v1/passkeys [session]",
+      "org POST /api/v1/passkeys/register/begin [session]",
+      "org POST /api/v1/passkeys/register/challenge [session]",
+      "org POST /api/v1/passkeys/register/finish [session]",
+      "org POST /api/v1/passkeys/:id/challenge [session]",
+      "org DELETE /api/v1/passkeys/:id [session]",
+      "org POST /api/v1/passkeys/:id/cancel-removal [session]",
+      "org GET /api/v1/passkeys/settings [session]",
+      "org PATCH /api/v1/passkeys/settings [session]",
+      "org POST /api/v1/passkeys/settings/challenge [session]",
     ].map((n) => ({
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,

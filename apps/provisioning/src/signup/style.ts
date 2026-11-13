@@ -10,11 +10,38 @@ html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column;min-height:100vh}
 a{color:var(--accent-fg)}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.top{display:flex;align-items:center;gap:8px;padding:12px 16px;font-weight:700}
-.top .links{margin-left:auto;font-weight:500;font-size:12.5px;color:var(--text2);display:flex;gap:6px}
+.login{flex:1;display:grid;grid-template-columns:3fr 2fr;min-height:100vh}
+.pitch{position:relative;overflow:hidden;display:flex}
+.top{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;padding:28px 48px;font-weight:700}
+.brand{display:flex;align-items:center;gap:8px}
+.pitchtext{margin:auto 0;max-width:30em}
+.pitchtext .pt{font-size:32px;line-height:1.2;font-weight:700;letter-spacing:-.02em;margin:0 0 12px}
+.pitchtext .ps{font-size:16px;font-weight:400;color:var(--text2);margin:0}
+.top .links{font-weight:500;font-size:12.5px;color:var(--text2);display:flex;gap:6px}
+.mark.ghost{position:absolute;right:-40px;bottom:-40px;width:340px;height:340px;opacity:.06;pointer-events:none}
+.mark.lg{width:36px;height:36px;margin-bottom:20px}
+.login main.side{max-width:none;width:auto;margin:0;padding:32px;background:var(--surface);border-left:1px solid var(--divider);display:flex;align-items:center;justify-content:center}
+.col{width:100%;max-width:360px}
+.foot{display:none}
+.col:has(.panel.ld) .mark.lg{display:none}
+.side .panel{background:none;border:0;box-shadow:none;padding:0;border-radius:0}
+.side h1{font-size:23px}
+@media (max-width:700px){
+.login{grid-template-columns:1fr;grid-template-rows:auto 1fr}
+.top{padding:20px 20px 0}
+.pitchtext{margin:20px 0}
+.pitchtext .pt{font-size:21px;margin:0 0 6px}
+.pitchtext .ps{font-size:14px}
+.top .links,.mark.ghost,.mark.lg{display:none}
+.login main.side{flex-direction:column;align-items:stretch;justify-content:space-between;gap:32px;padding-bottom:24px}
+.foot{display:block;font-size:13px;color:var(--muted)}
+.foot a{color:var(--muted)}
+.login main.side{border-left:0;border-top:1px solid var(--divider);padding:24px 20px 24px}
+}
 .top .links a{color:var(--text2)}
-.logo{width:18px;height:18px;border-radius:4px;border:2px solid var(--accent);display:grid;place-items:center;flex:none}
-.logo i{width:8px;height:8px;background:var(--accent);border-radius:1px}
+.mark{width:20px;height:20px;flex:none;color:var(--text)}
+.mark .f{fill:currentColor}
+.mark .a{fill:var(--accent)}
 main{flex:1;width:100%;max-width:452px;margin:0 auto;padding:24px 16px 48px}
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px;box-shadow:var(--shadow)}
 h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
@@ -57,7 +84,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin:16px 0}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--divider)}
 .stack{display:grid;gap:10px}
-.panel .mt{margin:10px 0 0;text-align:center}
+.panel .mt{margin:10px 0 0;text-align:left}
 .panel .lead{margin:4px 0 0}
 .note .btn{display:flex;width:fit-content}
 .ns{max-width:420px;margin:24px auto;padding:0 16px}
@@ -73,6 +100,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 .who .av{width:24px;height:24px;border-radius:50%;background:#1e7a5a;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
 .who .wt{flex:1;min-width:0}
 .panel .lead{color:var(--text2);margin:8px 0 0}
+.panel .signin-lead{margin:8px 0 16px}
 .help.ok{display:flex;align-items:center;gap:6px}
 .help svg{width:14px;height:14px;flex:none}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
@@ -126,5 +154,5 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.dot.now{animation:none}}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-@media (max-width:480px){.panel{padding:18px 16px}main{padding-top:12px}}
+
 `;

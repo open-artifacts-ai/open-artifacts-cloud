@@ -48,6 +48,8 @@ export interface PortalInput {
   customerId: string;
   returnUrl: string;
   idempotencyKey: string;
+  /** A billing_portal configuration id (bpc_...); unset or empty: Stripe's default. */
+  configuration?: string;
 }
 
 export type StripeSession = { id: string; url: string };
@@ -85,6 +87,7 @@ export class StripeApiError extends Error {
 
 const TEST_KEY = /^(sk|rk)_test_[A-Za-z0-9]{8,255}$/;
 const CUSTOMER = /^cus_[A-Za-z0-9]{1,255}$/;
+const PORTAL_CONFIG = /^bpc_[A-Za-z0-9]{1,255}$/;
 const PRICE = /^price_[A-Za-z0-9]{1,255}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9_:.-]{8,255}$/;
 const INSTALL = /^i[a-z0-9]{11}$/;
@@ -237,6 +240,15 @@ export function createPortalSession(
       {
         customer: check(CUSTOMER, "customerId", input.customerId),
         return_url: https("returnUrl", input.returnUrl),
+        ...(input.configuration
+          ? {
+              configuration: check(
+                PORTAL_CONFIG,
+                "configuration",
+                input.configuration,
+              ),
+            }
+          : {}),
       },
       input.idempotencyKey,
     ),

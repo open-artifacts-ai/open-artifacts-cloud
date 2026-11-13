@@ -6,6 +6,7 @@ const base = {
   to: "ana@example.com",
   appHost: "acme.open-artifacts.app",
   selfServe: true,
+  billing: true,
 };
 
 describe("welcomeEmail", () => {
@@ -31,6 +32,18 @@ describe("welcomeEmail", () => {
     }
   });
 
+  it("billing unbound: beta copy, no trial or price, in text and html", () => {
+    for (const trialEndsAt of [undefined, Date.UTC(2026, 11, 9, 23)]) {
+      const m = welcomeEmail({ ...base, billing: false, trialEndsAt });
+      for (const part of [m.text, m.html.replace(/&#39;/g, "'")]) {
+        expect(part).toContain(
+          "You're in the private beta: free, no card needed. We'll email you before paid plans start.",
+        );
+        expect(part).not.toMatch(/Solo|30 days|\$10|free until/);
+      }
+    }
+  });
+
   it("text and html carry the same words", () => {
     const m = welcomeEmail(base);
     const flat = (s: string) =>
@@ -50,12 +63,21 @@ describe("welcomeEmail", () => {
       "Open acme.open-artifacts.app",
       "Then connect your agent. Paste this into Claude Code, Cursor or any AI agent:",
       "Set up Open Artifacts for me: follow https://acme.open-artifacts.app/llms.txt",
-      "Sign in through the browser. Never ask me to paste a token into this chat.",
       "You got this because you signed up and created acme.open-artifacts.app.",
     ]) {
       expect(m.text).toContain(s);
       expect(html).toContain(s);
     }
+  });
+
+  it("the setup prompt is one line", () => {
+    const m = welcomeEmail(base);
+    expect(m.text).not.toContain("paste a token");
+    expect(m.html).not.toContain("paste a token");
+    expect(m.text).toContain(
+      "\n  Set up Open Artifacts for me: follow https://acme.open-artifacts.app/llms.txt\n\n",
+    );
+    expect(m.html).not.toMatch(/llms\.txt<\/td>.*<br>/);
   });
 
   it("button label never breaks the host at a hyphen", () => {

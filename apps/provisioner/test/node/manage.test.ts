@@ -36,6 +36,7 @@ import {
   runManage,
 } from "../../src/manage.js";
 import {
+  CLOSE_AUDIT_FAILED,
   CLOSE_SOCKETS_FAILED,
   CLOSE_SOCKETS_JOB,
   closeInstallSockets,
@@ -105,6 +106,11 @@ async function manage(
   );
   return { id, error, log: r.log, job: w.job(id) };
 }
+
+const closeAudit = () =>
+  w.all(
+    "SELECT actor_kind, action, install_id, job_id, outcome, code FROM admin_audit WHERE action = 'suspend.close_sockets'",
+  );
 
 const plain = (id: string, name: string) =>
   (
@@ -738,10 +744,20 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         hosts: [`paused:${s.installId}`, `paused:${s.installId}`],
       },
     ]);
-    // Resume needs nothing new: no call.
+    expect(closeAudit()).toEqual([
+      {
+        actor_kind: "system",
+        action: "suspend.close_sockets",
+        install_id: s.installId,
+        job_id: r.id,
+        outcome: "ok",
+        code: "ok",
+      },
+    ]);
+    // Resume asks the install to clear the marker (#228).
     const n = w.fake.scheduledCalls.length;
     expect((await manage("resume", s.installId)).error).toBeNull();
-    expect(w.fake.scheduledCalls.length).toBe(n);
+    expect(w.fake.scheduledCalls.length - n).toBe(1);
   });
 
   it.each([
@@ -766,6 +782,9 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         suspended_at: expect.any(Number),
       });
       expect(w.status(s.installId)?.state).toBe("suspended");
+      expect(closeAudit()).toMatchObject([
+        { outcome: "error", code: cat, job_id: r.id },
+      ]);
       const lines = (warn?.mock.calls ?? []).filter(
         (c) => c[0] === CLOSE_SOCKETS_FAILED,
       );
@@ -776,6 +795,27 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     },
   );
 
+  it("a failing audit write logs a fixed line and the suspend completes", async () => {
+    const s = await active({ slug: "auditfail" });
+    const db = w.ctx.env.PLATFORM_DB;
+    const prepare = db.prepare.bind(db);
+    db.prepare = ((q: string) => {
+      if (q.includes("INTO admin_audit")) throw new Error("boom a@b.co");
+      return prepare(q);
+    }) as typeof db.prepare;
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    db.prepare = prepare;
+    expect(r.error).toBeNull();
+    expect(w.status(s.installId)?.state).toBe("suspended");
+    expect(closeAudit()).toEqual([]);
+    const lines = (warn?.mock.calls ?? []).filter(
+      (c) => c[0] === CLOSE_AUDIT_FAILED,
+    );
+    expect(lines).toEqual([[CLOSE_AUDIT_FAILED]]);
+  });
+
   it("a close-sockets call that never settles times out, logged; it never throws", async () => {
     const s = await active({ slug: "stallco" });
     w.fake.onScheduled = () => new Promise(() => {});
@@ -783,6 +823,87 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     expect(
       (warn?.mock.calls ?? []).filter((c) => c[0] === CLOSE_SOCKETS_FAILED),
     ).toEqual([[CLOSE_SOCKETS_FAILED, "timeout"]]);
+  });
+
+  describe("#228: resume clears the install's bus suspend marker", () => {
+    const resumeAudit = () =>
+      w.all(
+        "SELECT action, install_id, job_id, outcome, code, detail FROM admin_audit WHERE action = 'resume.clear_suspended'",
+      );
+
+    it("calls oa:resume while HOSTS is still paused, and records ok", async () => {
+      const s = await active({ slug: "resnew" });
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.slice(n)).toEqual([
+        {
+          script: expect.stringMatching(new RegExp(`${s.installId}$`)),
+          cron: "oa:resume",
+          hosts: [`paused:${s.installId}`, `paused:${s.installId}`],
+        },
+      ]);
+      expect(w.hosts("resnew")).toEqual([s.installId, s.installId]);
+      expect(resumeAudit()).toEqual([
+        {
+          action: "resume.clear_suspended",
+          install_id: s.installId,
+          job_id: r.id,
+          outcome: "ok",
+          code: "ok",
+          detail: "attempts=1",
+        },
+      ]);
+    });
+
+    it("a call that throws 3 times: the resume still completes, audit code throw", async () => {
+      const s = await active({ slug: "resthrow" });
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      w.fake.onScheduled = () => Promise.reject(new Error("unknown job"));
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.length - n).toBe(3);
+      expect(w.hosts("resthrow")).toEqual([s.installId, s.installId]);
+      expect(w.status(s.installId)?.state).toBe("active");
+      expect(resumeAudit()).toMatchObject([
+        { outcome: "error", code: "throw", detail: "attempts=3", job_id: r.id },
+      ]);
+    });
+  });
+
+  it("suspend retries a failing close-sockets up to 3 times, then still completes", async () => {
+    const s = await active({ slug: "retryco" });
+    const before = w.fake.scheduledCalls.length;
+    w.fake.onScheduled = () => Promise.reject(new Error("nope"));
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(3);
+    expect(w.status(s.installId)?.state).toBe("suspended");
+    expect(closeAudit()).toMatchObject([{ outcome: "error", code: "throw" }]);
+  });
+
+  it("suspend stops retrying close-sockets at the first ok", async () => {
+    const s = await active({ slug: "retryok" });
+    const before = w.fake.scheduledCalls.length;
+    let n = 0;
+    w.fake.onScheduled = () =>
+      ++n < 2 ? Promise.reject(new Error("once")) : Promise.resolve(undefined);
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(2);
+    expect(closeAudit()).toMatchObject([{ outcome: "ok", code: "ok" }]);
   });
 
   it("delete closes and starts the grace; restore reopens (paused if it was suspended)", async () => {
