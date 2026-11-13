@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// The billing target's migrations (deploy-hosted-platform.sh, staging only):
-// brings oa-s-billing up to every pinned migration in apps/billing, and reads
-// it back. The platform-db runner's rules, for a database that never had a
+// The billing target's migrations (deploy-hosted-platform.sh, staging and
+// prod): brings oa-<p>-billing up to every pinned migration in apps/billing,
+// and reads it back (an empty D1 on first prod bring-up). The platform-db runner's rules, for a database that never had a
 // legacy schema:
 //   1. The lock holds (check-migration-lock.mjs): frozen, every file pinned and
 //      unchanged; and every pin the tag shares with main's lock
@@ -19,7 +19,7 @@
 // VERIFY_ONLY=1 reads and compares only, and fails while a file is pending.
 // The token goes in a request header, never argv, and is never printed.
 // Usage: CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID BILLING_DB_ID
-//   MAIN_BILLING_MIGRATION_LOCK [VERIFY_ONLY]  node scripts/ops/billing-db.ts staging
+//   MAIN_BILLING_MIGRATION_LOCK [VERIFY_ONLY]  node scripts/ops/billing-db.ts staging|prod
 import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -113,7 +113,10 @@ if (
     console.error(msg);
     process.exit(code);
   };
-  if (process.argv[2] !== "staging") fail("usage: billing-db.ts staging", 2);
+  const env = process.argv[2];
+  if (env !== "staging" && env !== "prod")
+    fail("usage: billing-db.ts staging|prod", 2);
+  const worker = `oa-${env === "prod" ? "p" : "s"}-billing`;
   const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, BILLING_DB_ID } =
     process.env;
   if (!CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required", 2);
@@ -137,9 +140,7 @@ if (
     const drift = pinDrift(mainLock as string, lockFile);
     if (drift.problems.length) throw new Refused(drift.problems.join("; "));
     for (const n of drift.aheadOnMain)
-      console.error(
-        `oa-s-billing: main pins ${n}, not in this tag yet; skipped`,
-      );
+      console.error(`${worker}: main pins ${n}, not in this tag yet; skipped`);
     await run({
       db: d1({
         token: CLOUDFLARE_API_TOKEN as string,
@@ -152,11 +153,9 @@ if (
       ),
       verifyOnly: Boolean(process.env.VERIFY_ONLY),
       now: () => Date.now(),
-      log: (s) => console.log(`oa-s-billing: ${s}`),
+      log: (s) => console.log(`${worker}: ${s}`),
     });
   } catch (e) {
-    fail(
-      `oa-s-billing: ${e instanceof Refused ? e.message : "failed"}; refusing`,
-    );
+    fail(`${worker}: ${e instanceof Refused ? e.message : "failed"}; refusing`);
   }
 }

@@ -145,6 +145,17 @@
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },
+      // billing's BillingProvisionerRpc entrypoint (#1568), how the provisioner
+      // starts an install's 30-day no-card Solo trial. oa-p-billing must be
+      // deployed first (the billing target), and the deploy reads the binding
+      // back when the tag declares it.
+      "services": [
+        {
+          "binding": "BILLING",
+          "service": "oa-p-billing",
+          "entrypoint": "BillingProvisionerRpc"
+        }
+      ],
       "queues": {
         "consumers": [
           {

@@ -682,6 +682,39 @@ describe("GET /tier", () => {
       (await db.prepare("SELECT COUNT(*) AS n FROM tiers").first())?.n,
     ).toBe(0);
   });
+
+  // Prod bring-up (existing installs have no row until their trial starts): the
+  // answer is the same version-0 default on prod as on staging, which an install
+  // with a provisioned TIER reads as "no information" and keeps its tier
+  // (apps/server/test/billing.test.ts, "billing's no-row default (version 0)
+  // never overrides a provisioned TIER"). Billing writes no row for the read.
+  it("prod, a missing row: the same version-0 default, nothing written, no Stripe call", async () => {
+    at();
+    const calls: string[] = [];
+    const f = vi.spyOn(globalThis, "fetch").mockImplementation(async (u) => {
+      calls.push(String(u));
+      return new Response("{}");
+    });
+    const r = await billing.fetch(
+      (await gated("GET", "/tier")) as Parameters<typeof billing.fetch>[0],
+      { ...env, OA_ENV: "prod" } as Env,
+    );
+    expect(await r.json()).toMatchObject({
+      tier: "solo",
+      status: "active",
+      trialEndsAt: null,
+      graceUntil: null,
+      soloTrialEndsAt: null,
+      hasCustomer: false,
+      overageDue: null,
+      version: 0,
+    });
+    expect(
+      (await db.prepare("SELECT COUNT(*) AS n FROM tiers").first())?.n,
+    ).toBe(0);
+    expect(calls).toEqual([]);
+    f.mockRestore();
+  });
 });
 
 describe("trial/start and usage take the body's own fields only, like /checkout (L4)", () => {

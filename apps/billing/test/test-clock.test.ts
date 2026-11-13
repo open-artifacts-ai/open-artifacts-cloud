@@ -1,5 +1,5 @@
 import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
-import { env as testEnv, exports } from "cloudflare:workers";
+import { exports, env as testEnv } from "cloudflare:workers";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { keyId, publicFromPkcs8 } from "@oa/auth-core";
 import { clearRegistryCache } from "@oa/broker-core";
@@ -156,9 +156,15 @@ describe("slugs", () => {
       expect(parseClockInstalls(raw), raw).toBeNull();
   });
   it("matches the first label of an app-host origin", () => {
-    expect(isClockInstall(e, "m2-walk", B, `https://m2-walk.${APP}`)).toBe(true);
-    expect(isClockInstall(e, `x,${A}`, A, "https://nope.example.test")).toBe(true);
-    expect(isClockInstall(e, "m2-walk", B, `https://m2-other.${APP}`)).toBe(false);
+    expect(isClockInstall(e, "m2-walk", B, `https://m2-walk.${APP}`)).toBe(
+      true,
+    );
+    expect(isClockInstall(e, `x,${A}`, A, "https://nope.example.test")).toBe(
+      true,
+    );
+    expect(isClockInstall(e, "m2-walk", B, `https://m2-other.${APP}`)).toBe(
+      false,
+    );
   });
   it("refuses an origin that is not exactly <label>.<app domain>", () => {
     for (const o of [
@@ -299,7 +305,11 @@ describe("soloStart for a listed install", () => {
     });
     expect((await start(listed())).ok).toBe(true);
     expect(stripe[1]?.form.test_clock).toBe("clock_winner");
-    expect(err).toHaveBeenCalledWith("billing test_clock lost", A, "clock_fake1");
+    expect(err).toHaveBeenCalledWith(
+      "billing test_clock lost",
+      A,
+      "clock_fake1",
+    );
   });
 
   it("keeps a customer already on a clock", async () => {
@@ -329,7 +339,15 @@ describe("soloStart where the list does not apply", () => {
   };
   it("an install not listed gets a plain customer", () =>
     plain(listed({ STAGING_TEST_CLOCK_INSTALLS: B })));
-  it("prod ignores the var", () => plain(listed({ OA_ENV: "prod" })));
+  it("prod (live key) ignores the var", () =>
+    plain(
+      listed({ OA_ENV: "prod", STRIPE_SECRET_KEY: "rk_live_FAKEfakeFAKE0123" }),
+    ));
+  it("prod with a live key never uses a test clock", () => {
+    expect(
+      isClockInstall({ OA_ENV: "prod", STRIPE_SECRET_KEY: "rk_live_x" }, A, A),
+    ).toBe(false);
+  });
   it("a non-test key ignores the var (and billing-core refuses the key: no Stripe call at all)", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const stripe = fakeStripe();

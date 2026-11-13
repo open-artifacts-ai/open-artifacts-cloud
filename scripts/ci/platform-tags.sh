@@ -91,10 +91,9 @@ check() {
 
 bad=0
 apps=(auth-broker directory-broker provisioner dispatch scheduler inventory provisioning)
-# Staging's billing service (#1568; staging only): read back too when the run
-# deployed it (the workflow sets PLATFORM_TAGS_BILLING). Prod has none.
+# The billing service (#1568): read back too when the run deployed it (the
+# workflow sets PLATFORM_TAGS_BILLING), on staging and on prod.
 if [ -n "${PLATFORM_TAGS_BILLING:-}" ]; then
-  [ "$p" = s ] || { echo "billing is a staging-only Worker" >&2; exit 2; }
   apps+=(billing)
 fi
 for app in "${apps[@]}"; do

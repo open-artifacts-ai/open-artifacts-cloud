@@ -200,7 +200,7 @@ export const DUMMY_TURNSTILE = "XXXX.DUMMY.TOKEN.XXXX";
 export const EVIL = "https://evil.example";
 /** P29's unproven reason after a done create and delete (fixed: no run-specific text). */
 export const P29_UNPROVEN =
-  "self-serve purge doesn't free signup_accounts (#1046); signups off on prod";
+  "a run can't purge a self-serve install, which is what frees its claim (#1046: freeing proven live on staging 2026-11-10)";
 
 // --- HTTP ----------------------------------------------------------------
 

@@ -297,15 +297,44 @@ describe("POST /checkout", () => {
     expect(await rowOf(B)).toBeNull();
   });
 
+  it("Business has no self-serve checkout (#2404): 409 business_contact_only, nothing created, any row, any shape", async () => {
+    for (const held of [null, "trial", "team", "business"]) {
+      if (held) await seed(A, "cus_existingA", held);
+      const s = fakeStripe();
+      for (const extra of [
+        {},
+        { interval: "month" },
+        { interval: "year", seats: 3 },
+        { creators: 2 },
+      ]) {
+        const r = await call(
+          req("/checkout", { install: A, plan: "business", ...extra }),
+        );
+        expect([r.status, await r.json()], String(held)).toEqual([
+          409,
+          { error: "business_contact_only" },
+        ]);
+      }
+      expect(s.calls).toEqual([]);
+      s.spy.mockRestore();
+      await db.prepare("DELETE FROM tiers").run();
+    }
+    // Team is unchanged.
+    fakeStripe();
+    expect(
+      (await call(req("/checkout", { install: A, plan: "team" }))).status,
+    ).toBe(200);
+  });
+
   it("an existing mapping is used as is: no customer call, the row's tier untouched", async () => {
     await seed(A, "cus_existingA", "trial");
     const s = fakeStripe();
-    const r = await call(req("/checkout", { install: A, plan: "business" }));
+    const r = await call(req("/checkout", { install: A, plan: "team" }));
     expect(r.status).toBe(200);
     expect(s.calls.map((c) => c.path)).toEqual([CHECKOUT]);
     expect(s.calls[0]?.form.customer).toBe("cus_existingA");
-    expect(s.calls[0]?.form["line_items[0][price]"]).toBe("price_business1");
-    expect(s.calls[0]?.form["metadata[tier]"]).toBe("business");
+    expect(s.calls[0]?.form["line_items[0][price]"]).toBe("price_team1");
+    expect(s.calls[0]?.form["metadata[tier]"]).toBe("team");
     expect(await rowOf(A)).toMatchObject({ tier: "trial", version: 3 });
   });
 
@@ -332,7 +361,7 @@ describe("POST /checkout", () => {
         .bind(status, A)
         .run();
       const s = fakeStripe();
-      const r = await call(req("/checkout", { install: A, plan: "business" }));
+      const r = await call(req("/checkout", { install: A, plan: "team" }));
       expect([r.status, await r.json()]).toEqual([
         409,
         { error: "subscription_exists" },
@@ -351,7 +380,7 @@ describe("POST /checkout", () => {
       .run();
     fakeStripe();
     expect(
-      (await call(req("/checkout", { install: A, plan: "business" }))).status,
+      (await call(req("/checkout", { install: A, plan: "team" }))).status,
     ).toBe(200);
   });
 
@@ -410,7 +439,7 @@ describe("POST /checkout", () => {
       .bind(A)
       .run();
     const s = fakeStripe();
-    const r = await call(req("/checkout", { install: A, plan: "business" }));
+    const r = await call(req("/checkout", { install: A, plan: "team" }));
     expect([r.status, await r.json()]).toEqual([
       409,
       { error: "subscription_exists" },
@@ -491,7 +520,7 @@ describe("POST /checkout", () => {
     const ts = Date.now();
     const r1 = await call(req("/checkout", { install: A, ts, plan: "team" }));
     const r2 = await call(
-      req("/checkout", { install: A, ts, plan: "business" }),
+      req("/checkout", { install: A, ts, plan: "solo", interval: "month" }),
     );
     expect([r1.status, r2.status]).toEqual([200, 200]);
     const [u1, u2] = (await Promise.all([r1.json(), r2.json()])) as {
@@ -500,7 +529,7 @@ describe("POST /checkout", () => {
     expect(u1?.url).not.toBe(u2?.url);
     expect(
       s.calls.filter((c) => c.path === CHECKOUT).map((c) => c.key),
-    ).toEqual([`checkout-${A}-team-${ts}`, `checkout-${A}-business-${ts}`]);
+    ).toEqual([`checkout-${A}-team-${ts}`, `checkout-${A}-solo-month-${ts}`]);
   });
 
   it("an unfilled or malformed price for the plan: 500 config before any customer is made", async () => {
@@ -521,10 +550,13 @@ describe("POST /checkout", () => {
     }
     // Only the requested plan's price is checked.
     const s = fakeStripe();
-    const r = await call(req("/checkout", { install: A, plan: "business" }), {
-      ...baseEnv(),
-      STRIPE_PRICE_TEAM: "{{STRIPE_PRICE_TEAM_STAGING}}",
-    });
+    const r = await call(
+      req("/checkout", { install: A, plan: "solo", interval: "month" }),
+      {
+        ...baseEnv(),
+        STRIPE_PRICE_TEAM: "{{STRIPE_PRICE_TEAM_STAGING}}",
+      },
+    );
     expect(r.status).toBe(200);
     expect(s.calls.map((c) => c.path)).toEqual([CUSTOMERS, CHECKOUT]);
   });
@@ -990,7 +1022,11 @@ describe("the redirect origin comes only from the gate's app host", () => {
   it("prod checks the prod app domain", async () => {
     await seed(A, "cus_existingA");
     const s = fakeStripe();
-    env = { ...baseEnv(), OA_ENV: "prod" };
+    env = {
+      ...baseEnv(),
+      OA_ENV: "prod",
+      STRIPE_SECRET_KEY: "rk_live_FAKEfakeFAKE0123",
+    };
     expect(
       (await call(req("/portal", { install: A }, { appHost: HOST_A }))).status,
     ).toBe(500);
@@ -1001,6 +1037,22 @@ describe("the redirect origin comes only from the gate's app host", () => {
     expect(s.calls[0]?.form.return_url).toBe(
       "https://acme.open-artifacts.app/settings/plan",
     );
+  });
+
+  it("prod refuses a test key and sk_live_; staging refuses a live key: no Stripe call", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    for (const [OA_ENV, STRIPE_SECRET_KEY, appHost] of [
+      ["prod", "sk_test_FAKEfakeFAKE0123", "acme.open-artifacts.app"],
+      ["prod", "sk_live_FAKEfakeFAKE0123", "acme.open-artifacts.app"],
+      ["staging", "rk_live_FAKEfakeFAKE0123", HOST_A],
+    ] as const) {
+      env = { ...baseEnv(), OA_ENV, STRIPE_SECRET_KEY };
+      const r = await call(req("/portal", { install: A }, { appHost }));
+      expect(r.status, `${OA_ENV} ${STRIPE_SECRET_KEY.slice(0, 7)}`).toBe(500);
+    }
+    expect(s.calls).toEqual([]);
   });
 });
 
@@ -1303,13 +1355,13 @@ describe("POST /checkout, Solo in its no-card trial (#1568)", () => {
     }
   });
 
-  it("team and business Checkout are allowed while the Solo subscription is live, trial or paid or past_due (the upgrade)", async () => {
+  it("team Checkout is allowed while the Solo subscription is live, trial or paid or past_due (the upgrade)", async () => {
     for (const [why, set, bind] of [
       ["no-card trial", "solo_trial_ends_at = ?1", NOW + 10 * DAY],
       ["paid", "solo_trial_ends_at = ?1", NOW - DAY],
       ["past_due", "status = 'past_due'", 0],
     ] as const) {
-      for (const plan of ["team", "business"] as const) {
+      for (const plan of ["team"] as const) {
         await db.prepare("DELETE FROM tiers").run();
         await solo(set, bind);
         const s = fakeStripe();
@@ -1351,14 +1403,10 @@ describe("POST /checkout on a row in its Business trial over a Solo subscription
       req("/checkout", { install: A, plan, ...(interval ? { interval } : {}) }),
     );
 
-  it("team and business are allowed (the upgrade); Solo only while the Solo subscription is its no-card trial", async () => {
+  it("team is allowed (the upgrade); Solo only while the Solo subscription is its no-card trial", async () => {
     await trial("active", NOW + 10 * DAY);
     fakeStripe();
-    for (const [plan, interval] of [
-      ["team"],
-      ["business"],
-      ["solo", "month"],
-    ] as const)
+    for (const [plan, interval] of [["team"], ["solo", "month"]] as const)
       expect((await buy(plan, interval)).status, plan).toBe(200);
     // A Solo that has paid: Solo again is 409, the upgrade is not.
     await db.prepare("DELETE FROM tiers").run();
@@ -1674,7 +1722,7 @@ describe("Team and Business Checkout bill the instance's creators (#2123)", () =
     const ts = Date.now();
     for (const [plan, creators, q] of [
       ["team", 7, "7"],
-      ["business", 0, "1"],
+      ["team", 0, "1"],
       ["team", MAX_CREATORS, String(MAX_CREATORS)],
     ] as const) {
       const r = await call(
@@ -1696,8 +1744,8 @@ describe("Team and Business Checkout bill the instance's creators (#2123)", () =
       { plan: "team", creators: -1 },
       { plan: "team", creators: MAX_CREATORS + 1 },
       { plan: "team", creators: 1.5 },
-      { plan: "business", creators: "3" },
-      { plan: "business", creators: null },
+      { plan: "team", creators: "3" },
+      { plan: "team", creators: null },
     ]) {
       const r = await call(req("/checkout", { install: A, ...body }));
       expect([r.status, await r.json()]).toEqual([
@@ -2212,7 +2260,7 @@ describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => 
     const ts = Date.now();
     for (const [plan, seats, price] of [
       ["team", 5, "price_teamY1"],
-      ["business", 1, "price_businessY1"],
+      ["team", 1, "price_teamY1"],
       ["team", MAX_CREATORS, "price_teamY1"],
     ] as const) {
       const r = await call(
@@ -2251,9 +2299,9 @@ describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => 
         { plan: "team", interval: "year", seats: MAX_CREATORS + 1 },
         "bad_seats",
       ],
-      [{ plan: "business", interval: "year", seats: 1.5 }, "bad_seats"],
-      [{ plan: "business", interval: "year", seats: "3" }, "bad_seats"],
-      [{ plan: "business", interval: "year", seats: null }, "bad_seats"],
+      [{ plan: "team", interval: "year", seats: 1.5 }, "bad_seats"],
+      [{ plan: "team", interval: "year", seats: "3" }, "bad_seats"],
+      [{ plan: "team", interval: "year", seats: null }, "bad_seats"],
       [{ plan: "solo", interval: "year", seats: 3 }, "bad_seats"],
       [
         { plan: "team", interval: "year", seats: 3, creators: 3 },
@@ -2272,7 +2320,7 @@ describe("Team and Business yearly Checkout sells prepaid seats (#2136)", () => 
   it("yearly with the price id unset is a 503 config error, never an empty price", async () => {
     await seed(A, "cus_existingA");
     const s = fakeStripe();
-    for (const plan of ["team", "business"]) {
+    for (const plan of ["team"]) {
       const r = await call(
         req("/checkout", { install: A, plan, interval: "year", seats: 2 }),
         baseEnv(),

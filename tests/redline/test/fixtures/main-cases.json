@@ -1321,7 +1321,7 @@
   "acceptedUnproven": [
     {
       "name": "provisioning > P29: SIGNUPS_ENABLED=test-users: test user b self-serve create reaches done; delete leaves it deleting",
-      "reason": "self-serve purge doesn't free signup_accounts (#1046); signups off on prod",
+      "reason": "a run can't purge a self-serve install, which is what frees its claim (#1046: freeing proven live on staging 2026-11-10)",
       "file": "provisioning.test.ts"
     },
     {
