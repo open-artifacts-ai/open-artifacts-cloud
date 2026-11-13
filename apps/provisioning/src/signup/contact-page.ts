@@ -32,7 +32,7 @@ export const CONTACT_JS = `(function () {
   var root = document.getElementById("app");
   var TITLE = "Let's talk Business";
   var SUB = "Tell us about your team and we'll email you to set up the Business plan.";
-  var SIZES = [["1-10", "1 to 10"], ["11-50", "11 to 50"], ["51-200", "51 to 200"], ["200+", "More than 200"]];
+  var SIZES = [["1-10", "1 to 10"], ["11-50", "11 to 50"], ["51-200", "51 to 200"], ["200+", "200+"]];
   var NEEDS = [["group_sync", "Google group sync"], ["sharing_controls", "Outside-sharing controls"], ["audit_log", "Audit log"], ["custom_domain", "Custom domain"], ["other", "Something else"]];
   var q = new URLSearchParams(window.location.search);
   var pre = {
@@ -75,58 +75,120 @@ export const CONTACT_JS = `(function () {
     return s;
   }
 
-  function shell(panel) {
-    root.replaceChildren(h("div", { class: "login" }, [
-      h("section", { class: "pitch" }, [
-        h("header", { class: "top" }, [
-          h("div", { class: "brand" }, [brandMark(), "Open Artifacts"]),
-          h("div", { class: "pitchtext" }, [
-            h("h1", { class: "pt" }, [TITLE]),
-            h("p", { class: "ps" }, [SUB])
-          ])
-        ]),
-        brandMark("mark ghost")
+  var HOME = "https://open-artifacts.com";
+  var PLANS = HOME + "/pricing";
+  var PRIVACY = HOME + "/privacy";
+  var ADDS = [
+    ["Google group sync", "People join and leave with your Google groups.", false],
+    ["Outside-sharing controls", "Decide who may share pages outside the company.", false],
+    ["Audit log", "Who opened, shared or changed what, and when.", true],
+    ["Custom domain", "Your pages on an address of your own.", true]
+  ];
+  var NEXT = [
+    ["You send this", "It takes a minute."],
+    ["We email you", "A person reads every request."],
+    ["We set it up", "On your existing instance, or a new one."]
+  ];
+
+  function tick() {
+    var ns = "http://www.w3.org/2000/svg", s = document.createElementNS(ns, "svg"), p = document.createElementNS(ns, "path");
+    s.setAttribute("viewBox", "0 0 24 24");
+    s.setAttribute("aria-hidden", "true");
+    p.setAttribute("d", "M5 12l5 5 9-10");
+    s.appendChild(p);
+    return s;
+  }
+
+  function link(href, text) {
+    return h("a", { href: href, target: "_blank", rel: "noopener" }, [text]);
+  }
+
+  function details() {
+    return h("div", { class: "cx-more" }, [
+      h("div", { class: "cx-adds" }, [
+        h("p", { class: "cx-kick" }, ["What Business adds to Team"]),
+        h("ul", {}, ADDS.map(function (a) {
+          return h("li", {}, [tick(), h("div", {}, [
+            h("b", {}, [a[0], a[2] ? h("em", { class: "soon" }, ["Soon"]) : null]),
+            h("span", {}, [a[1]])
+          ])]);
+        }))
       ]),
-      h("main", { class: "side" }, [h("div", { class: "col" }, [panel])])
+      h("div", { class: "cx-price" }, [h("b", {}, ["$25"]), h("span", {}, ["per creator per month. Viewers are free."])]),
+      h("div", { class: "cx-next" }, [
+        h("p", { class: "cx-kick" }, ["What happens next"]),
+        h("div", {}, NEXT.map(function (n) { return h("div", {}, [h("b", {}, [n[0]]), n[1]]); }))
+      ]),
+      h("div", { class: "cx-foot" }, [
+        link(PLANS, "See all plans"), link(PRIVACY, "Privacy"),
+        h("span", { class: "cx-self" }, ["Self-hosting? There are no plans to buy: every feature that ships is yours."])
+      ])
+    ]);
+  }
+
+  function shell(panel) {
+    root.replaceChildren(h("div", { class: "cx" }, [
+      h("section", { class: "cx-head" }, [
+        h("div", { class: "brand" }, [brandMark(), "Open Artifacts"]),
+        h("div", {}, [h("h1", { class: "cx-t" }, [TITLE]), h("p", { class: "cx-s" }, [SUB])])
+      ]),
+      h("main", { class: "cx-form" }, [h("div", { class: "cx-col" }, [panel])]),
+      details()
     ]));
   }
 
-  function field(label, id, input, optional) {
+  function field(label, id, input) {
     return h("div", { class: "field" }, [
       h("label", { for: id }, [label]),
       h("div", { class: "inp" }, [input])
     ]);
   }
 
-  function done(text) {
-    shell(h("div", { class: "panel", role: "status" }, [h("p", { class: "lead body" }, [text])]));
+  function done(title, text) {
+    shell(h("div", { class: "panel cx-done", role: "status" }, [
+      h("div", { class: "cx-tick" }, [tick()]),
+      h("h2", {}, [title]),
+      h("p", {}, [text]),
+      h("a", { class: "btn", href: HOME }, ["Back to Open Artifacts"])
+    ]));
   }
 
   function form() {
-    var name = h("input", { type: "text", id: "c-name", name: "name", autocomplete: "name", required: true, maxlength: "100", value: pre.name });
-    var email = h("input", { type: "email", id: "c-email", name: "email", autocomplete: "email", required: true, maxlength: "254", value: pre.email });
+    var locked = pre.source === "dashboard";
+    var name = h("input", { type: "text", id: "c-name", name: "name", autocomplete: "name", required: true, maxlength: "100", value: pre.name, readonly: locked && pre.name ? true : null });
+    var email = h("input", { type: "email", id: "c-email", name: "email", autocomplete: "email", required: true, maxlength: "254", value: pre.email, readonly: locked && pre.email ? true : null });
     var company = h("input", { type: "text", id: "c-company", name: "company", autocomplete: "organization", required: true, maxlength: "100" });
     var note = h("textarea", { class: "ta", id: "c-note", name: "note", maxlength: "1000", rows: "3" });
     var err = h("div", { "aria-live": "polite" });
     var ts = h("div", { class: "ts" });
     var btn = h("button", { class: "btn pri cta", type: "submit" }, ["Send request"]);
     var sizeBoxes = SIZES.map(function (s, i) {
-      return h("label", { class: "opt" }, [
-        h("input", { type: "radio", name: "teamSize", value: s[0], required: i === 0 ? true : null }), s[1]
+      return h("label", { class: "opt pick" }, [
+        h("input", { type: "radio", name: "teamSize", value: s[0], required: i === 0 ? true : null }), h("span", {}, [s[1]])
       ]);
     });
     var needBoxes = NEEDS.map(function (n) {
       return h("label", { class: "opt" }, [h("input", { type: "checkbox", name: "needs", value: n[0] }), n[1]]);
     });
+    var from = locked && pre.instance
+      ? h("div", { class: "cx-from" }, [brandMark("mark"), "For " + pre.instance + ", where you're an owner."])
+      : null;
     var f = h("form", { class: "panel contact" }, [
-      field("Your name", "c-name", name),
-      field("Work email", "c-email", email),
+      from,
+      h("div", { class: "two" }, [
+        field("Your name", "c-name", name),
+        field("Work email", "c-email", email)
+      ]),
       field("Company", "c-company", company),
-      h("fieldset", { class: "grp" }, [h("legend", {}, ["How many people will publish pages?"]), h("div", { class: "opts" }, sizeBoxes)]),
-      h("fieldset", { class: "grp" }, [h("legend", {}, ["What do you need? (optional)"]), h("div", { class: "opts" }, needBoxes)]),
-      h("div", { class: "field" }, [h("label", { for: "c-note" }, ["Anything else? (optional)"]), note]),
-      ts, err, btn
+      h("fieldset", { class: "grp" }, [h("legend", {}, ["How many people will publish pages?"]), h("div", { class: "opts picks" }, sizeBoxes)]),
+      h("fieldset", { class: "grp" }, [h("legend", {}, [h("span", {}, ["What do you need? (optional)"])]), h("div", { class: "opts checks" }, needBoxes)]),
+      h("div", { class: "field roomy" }, [h("label", { for: "c-note" }, ["Anything else? (optional)"]), note]),
+      ts, err, btn,
+      h("p", { class: "cx-priv" }, ["We use this only to reply to you. ", link(PRIVACY, "Privacy")])
     ]);
+    if (locked) {
+      f.querySelectorAll("input[readonly]").forEach(function (i) { i.parentNode.classList.add("off"); });
+    }
 
     function fail() {
       err.replaceChildren(h("div", { class: "note bad", role: "alert" }, ["That didn't send. Try again."]));
@@ -156,8 +218,8 @@ export const CONTACT_JS = `(function () {
         return r.json().catch(function () { return null; }).then(function (j) { return { ok: r.ok, body: j }; });
       }).then(function (r) {
         if (!r.ok || !r.body) { fail(); return; }
-        if (r.body.duplicate) done("We already have your request from today. We'll be in touch.");
-        else done("Thanks. We have your request and will email you at " + body.email + ".");
+        if (r.body.duplicate) done("We already have your request from today.", "We'll be in touch.");
+        else done("Thanks. We have your request.", "We'll email you at " + body.email + ".");
       }).catch(fail);
     });
 
