@@ -65,7 +65,7 @@ const brokerPin = (env: string): string => {
 };
 
 describe(".github/hosted/<env>.json", () => {
-  it("prod and staging hold the same keys; both hold billing's six price ids (prod's empty until live ones are filled), prod adds signup_deploy", () => {
+  it("prod and staging hold the same keys; both hold billing's six price ids (prod's are the live-mode ids), prod adds signup_deploy", () => {
     expect(Object.keys(read("prod")).sort()).toEqual(
       [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS, "signup_deploy"].sort(),
     );
@@ -226,6 +226,21 @@ describe("hosted-constants.sh", () => {
     return { ...r, ghEnv: readFileSync(ghEnv, "utf8") };
   };
   const PROD = () => read("prod");
+  const PRICE_KEYS = [...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS];
+  // The loader's order: the four, then the two yearly (team before business).
+  const PROD_PRICE_LINES = () =>
+    [
+      "stripe_price_team",
+      "stripe_price_business",
+      "stripe_price_solo_monthly",
+      "stripe_price_solo_yearly",
+      "stripe_price_team_yearly",
+      "stripe_price_business_yearly",
+    ].map((k) => `${k.toUpperCase()}=${String(read("prod")[k])}`);
+  const BLANK_PRICES = () => ({
+    ...PROD(),
+    ...Object.fromEntries(PRICE_KEYS.map((k) => [k, ""])),
+  });
 
   it("loads every constant into GITHUB_ENV", () => {
     const r = load(PROD(), "prod", undefined, {
@@ -243,6 +258,7 @@ describe("hosted-constants.sh", () => {
         "SIGNUP_DAILY_CAP=20",
         "SIGNUPS_ENABLED=false",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
+        ...PROD_PRICE_LINES(),
         "PROD_SIGNUP_DEPLOY=off",
         "ALERT_TO=me@test.invalid",
         "",
@@ -270,9 +286,8 @@ describe("hosted-constants.sh", () => {
       const lines = readFileSync(ghEnv, "utf8").split("\n");
       expect(lines).toHaveLength(
         LOADED.length +
-          (env === "staging"
-            ? STRIPE_KEYS.length + STRIPE_YEARLY_KEYS.length
-            : 0) +
+          STRIPE_KEYS.length +
+          STRIPE_YEARLY_KEYS.length +
           (env === "prod" ? 1 : 0) +
           1,
       );
@@ -508,12 +523,18 @@ describe("hosted-constants.sh", () => {
     }
   }, 30_000);
 
-  it("prod's price ids: empty (not filled yet) loads nothing and breaks no other run; filled, each loads as STRIPE_PRICE_*; malformed fails; any other stripe_* key is refused", () => {
-    // Committed: all six empty until the live-mode ids are filled (never a
-    // test-mode id), so nothing is loaded and no other prod run breaks.
-    for (const k of [...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS])
-      expect(read("prod")[k], k).toBe("");
-    const ok = load(PROD(), "prod");
+  it("prod's price ids: committed, six filled well-formed ids each load as STRIPE_PRICE_*; blanked, they load nothing and break no other run; malformed fails; any other stripe_* key is refused", () => {
+    // Committed: the six live-mode ids, each well-formed and loaded.
+    const committed = load(PROD(), "prod");
+    expect(committed.code, committed.err).toBe(0);
+    for (const k of PRICE_KEYS) {
+      expect(read("prod")[k], k).toMatch(/^price_[A-Za-z0-9]+$/);
+      expect(committed.ghEnv, k).toContain(
+        `${k.toUpperCase()}=${String(read("prod")[k])}\n`,
+      );
+    }
+    // Blanked (override object): nothing is loaded and no other prod run breaks.
+    const ok = load(BLANK_PRICES(), "prod");
     expect(ok.code, ok.err).toBe(0);
     expect(ok.ghEnv).not.toContain("STRIPE");
     // Filled with made-up ids: loaded.
