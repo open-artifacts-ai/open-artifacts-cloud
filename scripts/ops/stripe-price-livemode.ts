@@ -42,7 +42,9 @@ export async function livemodeProblems(
       });
       if (res.status !== 200) {
         out.push(
-          `${name}: Stripe answered ${res.status} (not found in live mode?)`,
+          res.status === 401 || res.status === 403
+            ? `${name}: Stripe answered ${res.status}; the restricted key needs Read on Prices (and Products)`
+            : `${name}: Stripe answered ${res.status} (not found in live mode?)`,
         );
         continue;
       }

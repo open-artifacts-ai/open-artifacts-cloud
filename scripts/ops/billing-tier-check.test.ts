@@ -49,11 +49,23 @@ describe("tierProblemCount", () => {
     for (const [i, vars] of bad.entries())
       expect(tierProblemCount([row(`i${i}`, vars)]), String(vars)).toBe(1);
   });
-  it("ignores installs that are not active", () => {
+  it("ignores deleted and deleting installs", () => {
     expect(
       tierProblemCount([
         row("ia", "{}", "deleted"),
-        row("ib", null, "suspended"),
+        row("ib", null, "deleting"),
+      ]),
+    ).toBe(0);
+  });
+  it("refuses a suspended, upgrading, failed or provisioning install without a TIER", () => {
+    for (const state of ["suspended", "upgrading", "failed", "provisioning"])
+      expect(tierProblemCount([row("ia", "{}", state)]), state).toBe(1);
+  });
+  it("passes a deleted install without TIER next to a suspended one with TIER", () => {
+    expect(
+      tierProblemCount([
+        row("ia", null, "deleted"),
+        row("ib", JSON.stringify({ TIER: "team" }), "suspended"),
       ]),
     ).toBe(0);
   });
@@ -116,7 +128,7 @@ describe("the script", () => {
     expect(r.status).toBe(1);
     const all = r.stdout + r.stderr;
     expect(all).toContain(
-      "refusing: an active install has no valid TIER; read the list with oa-admin-prod",
+      "refusing: a live install has no valid TIER; read the list with oa-admin-prod",
     );
     expect(all).not.toMatch(/\d/);
     expect(all).toContain("oa-admin-prod");

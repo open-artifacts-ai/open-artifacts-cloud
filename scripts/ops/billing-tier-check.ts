@@ -25,14 +25,14 @@ export interface InstallRow {
 }
 
 /**
- * How many active installs have rendered vars without a valid TIER (missing,
+ * How many live installs (every state but deleted or deleting) have rendered vars without a valid TIER (missing,
  * unreadable or non-object vars count). A count only: the cloud repo's Actions
  * logs are public, so no install id or slug is ever returned or printed.
  */
 export function tierProblemCount(rows: InstallRow[]): number {
   let n = 0;
   for (const r of rows) {
-    if (r.state !== "active") continue;
+    if (r.state === "deleted" || r.state === "deleting") continue;
     let v: unknown;
     try {
       v = typeof r.vars === "string" ? JSON.parse(r.vars) : null;
@@ -83,7 +83,7 @@ if (
   }
   if (bad)
     fail(
-      "refusing: an active install has no valid TIER; read the list with oa-admin-prod",
+      "refusing: a live install has no valid TIER; read the list with oa-admin-prod",
     );
   console.log("billing bind check: ok");
 }

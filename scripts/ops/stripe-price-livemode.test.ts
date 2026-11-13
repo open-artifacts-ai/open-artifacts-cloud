@@ -65,6 +65,20 @@ describe("livemodeProblems", () => {
       ).toHaveLength(1);
     }
   });
+  it("names the missing Prices permission on 401 and 403, and keeps 404 as not found", async () => {
+    for (const status of [401, 403]) {
+      const { f } = fake(() => Response.json({ error: {} }, { status }));
+      expect(
+        await livemodeProblems({ STRIPE_PRICE_TEAM: "price_Team1" }, KEY, f),
+      ).toEqual([
+        `STRIPE_PRICE_TEAM: Stripe answered ${status}; the restricted key needs Read on Prices (and Products)`,
+      ]);
+    }
+    const { f } = fake(() => Response.json({ error: {} }, { status: 404 }));
+    expect(
+      (await livemodeProblems({ STRIPE_PRICE_TEAM: "price_Team1" }, KEY, f))[0],
+    ).toContain("not found in live mode");
+  });
   it("refuses a malformed price id without a call", async () => {
     const { f, seen } = fake(() => Response.json({ livemode: true }));
     expect(
