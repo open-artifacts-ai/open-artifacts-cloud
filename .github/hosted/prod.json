@@ -11,12 +11,12 @@
   "signup_daily_cap": 20,
   "signup_deploy": "off",
   "signups_enabled": "false",
-  "stripe_price_business": "",
-  "stripe_price_business_yearly": "",
-  "stripe_price_solo_monthly": "",
-  "stripe_price_solo_yearly": "",
-  "stripe_price_team": "",
-  "stripe_price_team_yearly": "",
+  "stripe_price_business": "price_1UbHrCFXnzkboexsnYZYBmo4",
+  "stripe_price_business_yearly": "price_1UbHrBFXnzkboexsYtoHtT0U",
+  "stripe_price_solo_monthly": "price_1UbHrGFXnzkboexsWhwsSZIy",
+  "stripe_price_solo_yearly": "price_1UbHrFFXnzkboexsxeWooFhL",
+  "stripe_price_team": "price_1UbHrCFXnzkboexsX7fjaf5D",
+  "stripe_price_team_yearly": "price_1UbHrBFXnzkboexsPe5jMTqQ",
   "welcome_from": "welcome@mail.open-artifacts.app",
   "deploy_token_id": "983a18d829cffab9ae164d994ceb8dfc"
 }
