@@ -5,9 +5,9 @@
 // only through textContent: no innerHTML. Keep backticks and dollar-brace out
 // of CONTACT_JS (it is a template literal).
 
-export const CONTACT_TITLE = "Talk to us about Business";
+export const CONTACT_TITLE = "Let's talk Business";
 export const CONTACT_SUBLINE =
-  "Tell us about your team and we'll email you to set it up.";
+  "Tell us about your team and we'll email you to set up the Business plan.";
 
 export const CONTACT_HTML = `<!doctype html>
 <html lang="en">
@@ -30,8 +30,8 @@ export const CONTACT_HTML = `<!doctype html>
 export const CONTACT_JS = `(function () {
   "use strict";
   var root = document.getElementById("app");
-  var TITLE = "Talk to us about Business";
-  var SUB = "Tell us about your team and we'll email you to set it up.";
+  var TITLE = "Let's talk Business";
+  var SUB = "Tell us about your team and we'll email you to set up the Business plan.";
   var SIZES = [["1-10", "1 to 10"], ["11-50", "11 to 50"], ["51-200", "51 to 200"], ["200+", "More than 200"]];
   var NEEDS = [["group_sync", "Google group sync"], ["sharing_controls", "Outside-sharing controls"], ["audit_log", "Audit log"], ["custom_domain", "Custom domain"], ["other", "Something else"]];
   var q = new URLSearchParams(window.location.search);
