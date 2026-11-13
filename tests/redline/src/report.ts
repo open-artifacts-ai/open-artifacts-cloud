@@ -475,8 +475,10 @@ export function preProdGuardNa(c: CaseResult): boolean {
  * name and exact reason, with the in-repo non-live test that covers what the
  * live run cannot. Any other unproven-live fails the gate, and so does a
  * listed case that fails. The report prints them in their own section.
- * P29 is listed for M1 only: #1046 (Post-M1) builds the purge that frees
- * signup_accounts, blocks opening self-serve, and takes it off.
+ * P29 stays listed: purging a self-serve install frees its signup_accounts
+ * claim (#1046, proven live on staging 2026-11-10 and by the provisioner's
+ * manage.test.ts), but no principal can purge a self-serve install within a
+ * run (the scheduler does at purge_at), so the live run can't re-prove it.
  */
 export interface AcceptedUnproven {
   name: string;
@@ -496,10 +498,10 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
     {
       name: "provisioning > P29: SIGNUPS_ENABLED=test-users: test user b self-serve create reaches done; delete leaves it deleting",
       reason:
-        "self-serve purge doesn't free signup_accounts (#1046); signups off on prod",
+        "a run can't purge a self-serve install, which is what frees its claim (#1046: freeing proven live on staging 2026-11-10)",
       file: "provisioning.test.ts",
       evidence:
-        'scripts/ci/hosted-constants.test.ts "prod signups stay closed, staging admits test users only; the caps and alert addresses are the Manager\'s" (#1022 pins prod SIGNUPS_ENABLED=false); the free-on-purge path and its test: #1046',
+        'apps/provisioner/test/node/manage.test.ts "purging a deleted self-serve install frees its account; the same account signs up again (#1046)"; proven live on staging 2026-11-10 (open-artifacts#1046: acme purged, claim freed, the same account signed up again as m2-walk)',
     },
     {
       name: "provisioning > P30: dispatch only: 5 callbacks with a forged flow cookie are refused; signin_refused_burst opens",
