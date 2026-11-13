@@ -42,29 +42,33 @@ function Row({
       <td className="dt" title={new Date(r.createdAt).toISOString()}>
         {fmtDayClock(r.createdAt)}
       </td>
-      <td className="em">
-        {r.name}
-        <div className="dt">{r.email}</div>
+      <td className="who">
+        <div className="nm">{r.name}</div>
+        <div className="dt eml">{r.email}</div>
       </td>
-      <td>{r.company}</td>
-      <td>{TEAM_SIZE_LABEL[r.teamSize]}</td>
-      <td>
+      <td className="co">{r.company}</td>
+      <td className="sz">{TEAM_SIZE_LABEL[r.teamSize]}</td>
+      <td className="nd">
         {r.needs.length
           ? r.needs.map((n) => NEED_LABEL[n] ?? n).join(", ")
           : "-"}
       </td>
-      <td>
+      <td className="nt">
         {note ? (
           <span className="oa-beta-nt">{note}</span>
         ) : (
           <span className="oa-beta-nt oa-beta-none">No note</span>
         )}
       </td>
-      <td className="dt">
+      <td className="fr">
         {r.source === "dashboard" ? "Dashboard" : "Landing"}
-        {r.instanceHost && <div>{r.instanceHost} (unverified)</div>}
+        {r.instanceHost && (
+          <div className="dt" title="Unverified">
+            {r.instanceHost}
+          </div>
+        )}
       </td>
-      <td>
+      <td className="st">
         <select
           className="oa-beta-search"
           aria-label={`Status of ${r.email}`}
@@ -140,17 +144,20 @@ export function Business() {
         {rows.length === 0 && !list.isLoading ? (
           <p className="oa-beta-empty">No requests here.</p>
         ) : (
-          <table className="oa-beta-table" aria-label="Business requests">
+          <table
+            className="oa-beta-table oa-biz-table"
+            aria-label="Business requests"
+          >
             <thead>
               <tr>
                 <th>Received</th>
-                <th>Who</th>
-                <th>Company</th>
-                <th>Publishers</th>
-                <th>Needs</th>
-                <th>Note</th>
-                <th>From</th>
-                <th>Status</th>
+                <th className="who">Who</th>
+                <th className="co">Company</th>
+                <th className="sz">Publishers</th>
+                <th className="nd">Needs</th>
+                <th className="nt">Note</th>
+                <th className="fr">From</th>
+                <th className="st">Status</th>
               </tr>
             </thead>
             <tbody>

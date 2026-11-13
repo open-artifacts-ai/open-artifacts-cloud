@@ -2150,6 +2150,47 @@ code.oa-code,
   border: 0;
   min-width: 0;
 }
+.oa-biz-table {
+  min-width: 1040px;
+}
+.oa-biz-table td,
+.oa-biz-table th {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.oa-biz-table .who,
+.oa-biz-table .nt {
+  min-width: 180px;
+}
+.oa-biz-table .co {
+  min-width: 100px;
+}
+.oa-biz-table .sz {
+  min-width: 90px;
+}
+.oa-biz-table .nd {
+  min-width: 140px;
+}
+.oa-biz-table .fr {
+  width: 96px;
+  min-width: 96px;
+}
+.oa-biz-table .st {
+  width: 150px;
+  min-width: 150px;
+}
+.oa-biz-table .st select {
+  width: 150px;
+}
+.oa-biz-table .nm {
+  font-weight: 500;
+}
+.oa-biz-table .eml {
+  overflow-wrap: anywhere;
+}
+.oa-biz-table .oa-beta-nt {
+  overflow-wrap: normal;
+}
 .oa-beta-card {
   margin-bottom: 0;
 }

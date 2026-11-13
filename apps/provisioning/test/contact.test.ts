@@ -142,6 +142,8 @@ describe("the page", () => {
     ])
       expect(CONTACT_JS, s).toContain(s);
     expect(CONTACT_JS).not.toMatch(/innerHTML|—/);
+    expect(CONTACT_JS).toContain('theme: "auto"');
+    expect(CONTACT_JS).toContain('class: "lead body"');
   });
 
   it("a GET to the API is 405", async () => {

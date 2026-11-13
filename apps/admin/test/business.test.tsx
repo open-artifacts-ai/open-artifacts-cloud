@@ -20,7 +20,7 @@ it("lists the new requests first by default, newest first, with the page copy", 
   expect(rows[0]).toContain("northwind.io");
   expect(rows[0]).toContain("51 to 200");
   expect(rows[0]).toContain("Google group sync, Audit log");
-  expect(rows[0]).toContain("northwind.open-artifacts.app (unverified)");
+  expect(rows[0]).toContain("northwind.open-artifacts.app");
   expect(screen.getByRole("link", { name: /Business requests/ })).toBeTruthy();
 });
 

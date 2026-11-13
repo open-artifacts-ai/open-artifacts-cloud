@@ -155,6 +155,7 @@ h1{font-size:19px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
 @media (prefers-reduced-motion:reduce){.dot.now{animation:none}}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
+.panel .lead.body{font-size:14px;line-height:1.5;color:var(--text)}
 .contact .grp{border:0;padding:0;margin:14px 0 0;min-width:0}
 .contact legend{font-weight:600;font-size:12px;color:var(--text2);padding:0;margin-bottom:6px}
 .contact .opts{display:grid;gap:6px}

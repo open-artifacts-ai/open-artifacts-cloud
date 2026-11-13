@@ -99,7 +99,7 @@ export const CONTACT_JS = `(function () {
   }
 
   function done(text) {
-    shell(h("div", { class: "panel", role: "status" }, [h("p", { class: "lead" }, [text])]));
+    shell(h("div", { class: "panel", role: "status" }, [h("p", { class: "lead body" }, [text])]));
   }
 
   function form() {
@@ -174,7 +174,7 @@ export const CONTACT_JS = `(function () {
     function render() {
       if (!window.turnstile || !document.body.contains(el)) return;
       S.widget = window.turnstile.render(el, {
-        sitekey: S.siteKey, action: "signup",
+        sitekey: S.siteKey, action: "signup", theme: "auto",
         callback: function (t) { S.token = t; },
         "expired-callback": function () { S.token = null; },
         "error-callback": function () { S.token = null; }
