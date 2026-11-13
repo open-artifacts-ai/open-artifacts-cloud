@@ -94,7 +94,7 @@ describe("the page", () => {
     expect(page.status).toBe(200);
     expect(page.headers.get("content-type")).toContain("text/html");
     const html = await page.text();
-    expect(html).toContain("<title>Talk to us about Business</title>");
+    expect(html).toContain("<title>Let's talk Business</title>");
     expect(html).toContain('href="/app.css"');
     expect(html).toContain('src="/contact.js"');
     expect(page.headers.get("content-security-policy")).toContain(
@@ -114,8 +114,8 @@ describe("the page", () => {
 
   it("carries the approved copy and prefill params, and never innerHTML", () => {
     for (const s of [
-      "Talk to us about Business",
-      "Tell us about your team and we'll email you to set it up.",
+      "Let's talk Business",
+      "Tell us about your team and we'll email you to set up the Business plan.",
       "Your name",
       "Work email",
       "Company",
