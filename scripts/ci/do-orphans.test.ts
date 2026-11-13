@@ -62,25 +62,30 @@ const run = (files: Record<string, string>) => {
 };
 
 describe("do-orphans.sh", () => {
-  it("prints each orphan's script, class and namespace id, then the counts, and exits 0", () => {
+  it("prints counts only: live and orphan, then the orphans per class; no script name or id", () => {
     const r = run({
       "do-1": ok([
-        ns("n1", "oa-s-iaaa", "BusHub"),
-        ns("n2", "oa-s-iaaa", "Other"),
-        ns("n3", "oa-s-ibbb", "BusHub"),
-        ns("n4", "oa-s-ibbb", "Other"),
-        ns("n5", "oa-s-provisioner", "Wf"),
-        ns("n6", "oa-p-iccc", "BusHub"),
+        ns("n1-id", "oa-s-iaaa", "BusHub"),
+        ns("n2-id", "oa-s-iaaa", "Other"),
+        ns("n3-id", "oa-s-ibbb", "BusHub"),
+        ns("n4-id", "oa-s-ibbb", "Other"),
+        ns("n7-id", "oa-s-iddd", "BusHub"),
+        ns("n8-id", "oa-s-iddd", "we ird/Class"),
+        ns("n5-id", "oa-s-provisioner", "Wf"),
+        ns("n6-id", "oa-p-iccc", "BusHub"),
       ]),
       "scripts-1": sc("oa-s-iaaa", "oa-s-provisioner"),
     });
     expect(r.code, r.err).toBe(0);
     expect(r.out.split("\n")).toEqual([
-      "orphan oa-s-ibbb BusHub n3",
-      "orphan oa-s-ibbb Other n4",
-      "live=2 orphan=2",
+      "live=2 orphan=4",
+      "orphan BusHub=2",
+      "orphan Other=1",
+      "orphan other=1",
       "",
     ]);
+    for (const secret of ["oa-s-i", "n1-id", "n3-id", "n8-id", "ird"])
+      expect(r.out + r.err).not.toContain(secret);
   });
 
   it("no orphans: only the counts", () => {
@@ -100,7 +105,7 @@ describe("do-orphans.sh", () => {
       "scripts-2": ok([{ id: "other" }], 2),
     });
     expect(r.code, r.err).toBe(0);
-    expect(r.out).toBe("orphan oa-s-ibbb BusHub n3\nlive=1 orphan=1\n");
+    expect(r.out).toBe("live=1 orphan=1\norphan BusHub=1\n");
     expect(r.log.filter((l) => l.includes("page=2"))).toHaveLength(2);
   });
 
@@ -132,6 +137,7 @@ describe("do-orphans.sh", () => {
       expect(r.err).toContain(
         "the namespace list does not show namespaced scripts",
       );
+      expect(r.err).not.toContain("oa-s-i");
     }
   });
 

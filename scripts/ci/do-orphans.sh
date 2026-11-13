@@ -12,8 +12,10 @@
 #  3. at least one namespace whose script is live AND whose class is BusHub,
 #     or the list does not show namespaced scripts and the run fails;
 #  4. an orphan is a namespace whose script is no longer in the dispatch
-#     namespace: each prints "orphan <script> <class> <namespace id>", then
-#     "live=N orphan=M".
+#     namespace. Job logs are public, so only counts are printed, never a
+#     script name or a namespace id: "live=N orphan=M", then one
+#     "orphan <class>=K" line per class (a class name that is not a plain
+#     identifier prints as "other").
 # Exits 0 with orphans (report-only for now); 1 when a list call fails or step
 # 3 does. GET only; the token reaches curl on stdin (hosted-cf.sh), never argv.
 # Needs CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, DISPATCH_NAMESPACE.
@@ -70,7 +72,8 @@ if ! grep -q "^live	[^	]*	BusHub	" <<< "$rows"; then
   echo "the namespace list does not show namespaced scripts: no live staging install has a BusHub namespace (live=$live orphan=$orphan)" >&2
   exit 1
 fi
-{ grep '^orphan	' <<< "$rows" || true; } | sort | while IFS=$'\t' read -r _ script class id; do
-  echo "orphan $script $class $id"
-done
 echo "live=$live orphan=$orphan"
+# Per class counts only: the script and the namespace id never leave jq/awk.
+{ grep '^orphan	' <<< "$rows" || true; } | awk -F'\t' '{c = ($3 ~ /^[A-Za-z_][A-Za-z0-9_]*$/) ? $3 : "other"; n[c]++} END {for (c in n) print c, n[c]}' | LC_ALL=C sort | while read -r class k; do
+  echo "orphan $class=$k"
+done
