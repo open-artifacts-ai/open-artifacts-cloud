@@ -3575,6 +3575,39 @@ describe("H-T4b round 1", () => {
   });
 
   describe("F3: the welcome text comes from the release", () => {
+    it("open-artifacts#2422: the self-test deletes the Welcome page after reading it back", async () => {
+      const s = setup();
+      await s.p.create(input());
+      const calls = s.fake.mcpCalls;
+      expect(calls.indexOf("publish_artifact")).toBeGreaterThanOrEqual(0);
+      expect(calls.indexOf("delete_artifact")).toBeGreaterThan(
+        calls.lastIndexOf("get_artifact", calls.indexOf("delete_artifact")),
+      );
+      expect(calls.indexOf("get_artifact")).toBeLessThan(
+        calls.indexOf("delete_artifact"),
+      );
+      // and a get_artifact after the delete checks it is gone
+      expect(calls.slice(calls.indexOf("delete_artifact"))).toEqual([
+        "delete_artifact",
+        "get_artifact",
+      ]);
+      expect([...s.fake.artifacts.values()].every((a) => a.deleted)).toBe(true);
+    });
+
+    it("open-artifacts#2422: a failed delete fails the self-test", async () => {
+      const s = setup();
+      s.fake.failDelete = true;
+      const e = await fails(s.p.create(input()));
+      expect(e.message).toMatch(/delete_artifact failed/);
+    });
+
+    it("open-artifacts#2422: a page still readable after delete fails the self-test", async () => {
+      const s = setup();
+      s.fake.ignoreDelete = true;
+      const e = await fails(s.p.create(input()));
+      expect(e.message).toMatch(/still returns the welcome artifact/);
+    });
+
     it("the published Welcome artifact is the release's text", async () => {
       const s = setup();
       await s.p.create(input());

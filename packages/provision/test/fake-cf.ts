@@ -196,7 +196,16 @@ export class FakeCf {
   /** How many missing files the assets session puts in each bucket. */
   assetsPerBucket = 1;
   private completions = new Set<string>();
-  readonly artifacts = new Map<string, { title: string; content: string }>();
+  readonly artifacts = new Map<
+    string,
+    { title: string; content: string; deleted?: boolean }
+  >();
+  /** MCP tools/call names in order. */
+  readonly mcpCalls: string[] = [];
+  /** delete_artifact answers an error (and deletes nothing). */
+  failDelete = false;
+  /** delete_artifact says it deleted but the page stays readable. */
+  ignoreDelete = false;
   private faults: Fault[] = [];
   tokenInfo: Record<string, unknown>;
   scriptsReadStatus = 200;
@@ -1187,11 +1196,26 @@ export class FakeCf {
           tools: [
             { name: "publish_artifact" },
             { name: "get_artifact" },
+            { name: "delete_artifact" },
             { name: "list_artifacts" },
           ],
         });
       if (msg.method === "tools/call") {
         const { name, arguments: args } = msg.params;
+        this.mcpCalls.push(name);
+        if (name === "delete_artifact") {
+          const a = this.artifacts.get(args.id);
+          if (this.failDelete || !a)
+            return reply({
+              isError: true,
+              content: [{ type: "text", text: "delete failed" }],
+            });
+          if (!this.ignoreDelete) a.deleted = true;
+          return reply({
+            content: [{ type: "text", text: `Deleted ${args.id}` }],
+            structuredContent: { id: args.id, deleted: true },
+          });
+        }
         if (name === "publish_artifact") {
           const id = `art${this.artifacts.size + 1}`;
           this.artifacts.set(id, { title: args.title, content: args.content });
@@ -1204,12 +1228,14 @@ export class FakeCf {
           return reply({
             content: [{ type: "text", text: String(this.artifacts.size) }],
             structuredContent: {
-              items: [...this.artifacts.keys()].map((id) => ({ id })),
+              items: [...this.artifacts.entries()]
+                .filter(([, a]) => !a.deleted)
+                .map(([id]) => ({ id })),
             },
           });
         if (name === "get_artifact") {
           const a = this.artifacts.get(args.id);
-          if (!a)
+          if (!a || a.deleted)
             return reply({
               isError: true,
               content: [{ type: "text", text: "not_found" }],
