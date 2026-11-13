@@ -131,7 +131,10 @@ w="$(printf %s "$url" | sed -E 's#.*/workers/scripts/([^/]+)/.*#\\1#')"
 kind="\${url##*/}"
 case "$kind" in
   settings)
-    if [ -f "$STATE/$w.exists" ] && [ -f "$STATE/$w.settings.json" ]; then cat "$STATE/$w.settings.json"
+    echo "$w" >> "$STATE/settings-reads"
+    if [ -f "$STATE/empty-settings-reads" ] && [ "$(cat "$STATE/empty-settings-reads")" -gt 0 ] && [ -f "$STATE/$w.exists" ]; then
+      echo $(( $(cat "$STATE/empty-settings-reads") - 1 )) > "$STATE/empty-settings-reads"; echo '{"success":true,"result":{"bindings":[]}}'
+    elif [ -f "$STATE/$w.exists" ] && [ -f "$STATE/$w.settings.json" ]; then cat "$STATE/$w.settings.json"
     elif [ -f "$STATE/$w.exists" ]; then echo '{"success":true,"result":{"bindings":[]}}'
     else echo '{"success":false,"errors":[{"code":10007,"message":"not found"}]}'; fi ;;
   secrets)
@@ -1835,6 +1838,39 @@ describe("deploy-hosted-platform.sh", () => {
         expect(puts(r.log)).toContain(state);
       });
     }
+  });
+  describe("a settings result with no bindings is read again (#238)", () => {
+    const verify = (empty?: number) => {
+      const s = setup({
+        exists: ["oa-p-auth-broker"],
+        secrets: {
+          "oa-p-auth-broker": ["BROKER_STATE_KEY", "GOOGLE_CLIENT_SECRET"],
+        },
+        files: empty === undefined ? {} : { "empty-settings-reads": `${empty}` },
+      });
+      const r = s.run("auth-broker", {
+        VERIFY_ONLY: "1",
+        GOOGLE_CLIENT_SECRET: "",
+      });
+      const reads = readFileSync(join(s.state, "settings-reads"), "utf8")
+        .split("\n")
+        .filter((l) => l === "oa-p-auth-broker").length;
+      return { r, reads };
+    };
+    it("no bindings then full passes, with one more read", () => {
+      const base = verify();
+      expect(base.r.code, base.r.err).toBe(0);
+      const once = verify(1);
+      expect(once.r.code, once.r.err).toBe(0);
+      expect(once.reads).toBe(base.reads + 1);
+    });
+    it("always without bindings still fails at the first expect, after three reads", () => {
+      const base = verify();
+      const always = verify(99);
+      expect(always.r.code).toBe(1);
+      expect(always.r.err).toContain("BROKER_REGISTRY: got");
+      expect(always.reads).toBeGreaterThan(base.reads);
+    });
   });
   describe("an empty secret list read is read again (#227)", () => {
     const verify = (empty?: number) => {

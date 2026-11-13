@@ -211,7 +211,29 @@ deploy() {
   if [ -n "$VERIFY_ONLY" ]; then echo "$target: verify only, not deploying"; return; fi
   DEPLOY_TAG="${DEPLOY_TAG:-}" bash "$wrapper" "$1" "$env"
 }
-settings() { cf_get "/workers/scripts/$1/settings" | must "read $1 settings"; }
+# settings <worker>: the settings body the read-back's expects and jq checks run
+# on. Cloudflare sometimes answers a success with no .result.bindings, or an
+# empty list, for a Worker that has bindings (#238, as #227's empty secret
+# list), so that result is read again, up to PUT_ATTEMPTS times in all,
+# PUT_RETRY_SLEEP seconds (default 5) after the first and three times that
+# after the second. The first read with bindings is returned; after the last
+# attempt the last read is, so the expects still fail closed. A failed read
+# still fails at once.
+settings() {
+  local pause="${PUT_RETRY_SLEEP:-5}" a body
+  [[ "$pause" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; return 1; }
+  for ((a = 1; a <= PUT_ATTEMPTS; a++)); do
+    body="$(cf_get "/workers/scripts/$1/settings" | must "read $1 settings")" || return 1
+    if jq -e '(.result.bindings | type) == "array" and (.result.bindings | length) > 0' <<< "$body" > /dev/null 2>&1; then
+      break
+    fi
+    if [ "$a" -lt "$PUT_ATTEMPTS" ]; then
+      sleep "$pause"
+      pause=$((pause * 3))
+    fi
+  done
+  printf '%s' "$body"
+}
 # list_all <path ending in ? or &> <what>: every page's .result as one array; a
 # failed page stops the run (never reads as "absent").
 list_all() {
