@@ -535,7 +535,7 @@ const setup = (
     openssl,
     ...(opts.node === "billing"
       ? {
-          node: `case "$*" in *billing-db.ts*) exit "\${NODE_EXIT:-0}" ;; *billing-tier-check.ts*) exit "\${TIER_CHECK_EXIT:-0}" ;; esac\nexec "$REAL_NODE" "$@"`,
+          node: `case "$*" in *billing-db.ts*) exit "\${NODE_EXIT:-0}" ;; *billing-tier-check.ts*) exit "\${TIER_CHECK_EXIT:-0}" ;; *stripe-price-livemode.ts*) exit "\${PRICE_CHECK_EXIT:-0}" ;; esac\nexec "$REAL_NODE" "$@"`,
         }
       : opts.node
         ? { node: `exit "\${NODE_EXIT:-0}"` }
@@ -2133,6 +2133,51 @@ describe("deploy-hosted-platform.sh", () => {
         expect(r.code).toBe(2);
         expect(r.err).toContain("STRIPE_PRICE_TEAM is required for billing");
         BAD(r);
+      });
+      it("the prices must resolve livemode true: a refusal stops the run before anything is migrated, deployed or put; staging and verify only never run the check", () => {
+        const ran = (l: string[]) =>
+          l.filter((x) => x.includes("stripe-price-livemode.ts"));
+        const bad = prod().run(
+          "billing",
+          { ...live, PRICE_CHECK_EXIT: "1" },
+          "prod",
+        );
+        expect(bad.code).toBe(2);
+        expect(bad.err).toContain("the Stripe prices are not live mode");
+        expect(ran(bad.log)).toHaveLength(1);
+        BAD(bad);
+        expect(puts(bad.log)).toEqual([]);
+        clean(bad);
+        const ok = prod().run("billing", live, "prod");
+        expect(ok.code, ok.err).toBe(0);
+        expect(ran(ok.log)).toHaveLength(1);
+        // The check comes after the key is validated, so a test key never reaches it.
+        const testKey = prod().run(
+          "billing",
+          { STRIPE_SECRET_KEY: STRIPE_KEY },
+          "prod",
+        );
+        expect(testKey.code).toBe(2);
+        expect(ran(testKey.log)).toEqual([]);
+        const stg = prod().run("billing", { PRICE_CHECK_EXIT: "1" }, "staging");
+        expect(stg.code, stg.err).toBe(0);
+        expect(ran(stg.log)).toEqual([]);
+        const v = prod({
+          exists: ["oa-p-billing"],
+          secrets: {
+            "oa-p-billing": ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"],
+          },
+        }).run(
+          "billing",
+          {
+            VERIFY_ONLY: "1",
+            STRIPE_SECRET_KEY: "",
+            STRIPE_WEBHOOK_SECRET: "",
+            PRICE_CHECK_EXIT: "1",
+          },
+          "prod",
+        );
+        expect(ran(v.log)).toEqual([]);
       });
       it("verify only: nothing deployed or put, no secret needed, every check runs", () => {
         const r = prod({

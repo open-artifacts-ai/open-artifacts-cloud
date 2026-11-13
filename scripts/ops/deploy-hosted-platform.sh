@@ -765,6 +765,13 @@ case "$target" in
       fi
       [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] ||
         { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)" >&2; exit 2; }
+      # Prod: every configured price must resolve under the live key with
+      # livemode true (a test key under the live name, or a test-mode price, stops
+      # the deploy here, before anything changes). Fail closed; never prints the key.
+      if [ "$env" = prod ]; then
+        node --experimental-strip-types --no-warnings "$root/scripts/ops/stripe-price-livemode.ts" prod ||
+          { echo "refusing to deploy billing on prod: the Stripe prices are not live mode" >&2; exit 2; }
+      fi
     fi
     # The schema first: the Worker never runs on a stale one. billing-db.ts
     # applies each pinned file once (a frozen lock, main's pins kept) and reads
