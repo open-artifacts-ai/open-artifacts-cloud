@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
+import { FULL_BILLING } from "./chain-dispatch.ts";
 import {
   DEPLOY_TITLE_RE,
   dispatch,
@@ -244,6 +245,23 @@ describe("dispatch", () => {
     const joined = started[0]?.join(" ") ?? "";
     for (const k of ["targets=", "verify_only", "reason", "require_newer"])
       expect(joined).not.toContain(k);
+  });
+  it("billing configured: the billing-inclusive full list; otherwise the default", () => {
+    const wd = world();
+    dispatch({
+      exec: wd.exec,
+      repo: REPO,
+      next: "deploy",
+      tag: TAG,
+      chainId: "sc9-1",
+      billing: true,
+    });
+    const a = wd.calls.find((c) => c[0] === "workflow") ?? [];
+    expect(a).toContain(`targets=${FULL_BILLING}`);
+    expect(FULL_BILLING).toContain("directory-broker,billing,provision-token");
+    expect(call({}, "deploy").started[0]?.join(" ")).not.toContain("targets=");
+    // the gate never takes targets
+    expect(call({}, "gate").started[0]?.join(" ")).not.toContain("targets=");
   });
   it("dispatches the gate with the tag only", () => {
     const { started } = call({}, "gate");

@@ -36,10 +36,10 @@ const WORKFLOWS: Record<Which, { file: string; name: string }> = {
   publish: { file: "hosted-publish.yml", name: "hosted-publish" },
 };
 const BOT = "github-actions[bot]";
-const FULL =
+export const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
 /** The full list with billing (#1568), between the directory broker and provision-token. */
-const FULL_BILLING =
+export const FULL_BILLING =
   "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
 const PRICE_RE = /^price_[A-Za-z0-9]{1,255}$/;
 const REQUIRED_PRICES = [

@@ -28,8 +28,9 @@
 // Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <name> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id>
 //        node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo o/n --next deploy|gate --tag vX.Y.Z --chain-id <id>
 import { spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { billingConfigured, FULL_BILLING } from "./chain-dispatch.ts";
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
@@ -169,6 +170,8 @@ export function dispatch(o: {
   next: Next;
   tag: string;
   chainId: string;
+  /** Staging's billing is configured (chain-dispatch.ts billingConfigured): deploy the billing-inclusive list. */
+  billing?: boolean;
 }): { started: boolean; why?: string } {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
   if (!CHAIN_RE.test(o.chainId)) throw new Error("bad chain id");
@@ -179,8 +182,10 @@ export function dispatch(o: {
       .length > 0
   )
     return { started: false, why: `a run for ${o.tag} already exists` };
-  // Deploy: env, tag and the chain id only, so every other input keeps the
-  // workflow's default (every target, no reason, not verify_only).
+  // Deploy: env, tag and the chain id, so every other input keeps the
+  // workflow's default (no reason, not verify_only); the targets too, unless
+  // billing is configured: then the full list with billing, the one-version
+  // list prod-release-chain deploys (chain-dispatch.ts).
   const args =
     o.next === "deploy"
       ? [
@@ -190,6 +195,7 @@ export function dispatch(o: {
           `tag=${o.tag}`,
           "-f",
           `chain_id=${o.chainId}`,
+          ...(o.billing ? ["-f", `targets=${FULL_BILLING}`] : []),
         ]
       : ["-f", `tag=${o.tag}`];
   gh(o.exec, [
@@ -256,9 +262,18 @@ function main(argv: string[]) {
   } else if (cmd === "dispatch") {
     const next = flag(argv, "next");
     if (next !== "deploy" && next !== "gate") throw new Error("bad --next");
+    const billing =
+      next === "deploy" &&
+      billingConfigured(
+        readFileSync(
+          flag(argv, "hosted-file") || ".github/hosted/staging.json",
+          "utf8",
+        ),
+      );
     const r = dispatch({
       exec: realExec,
       repo,
+      billing,
       next,
       tag: flag(argv, "tag"),
       chainId: flag(argv, "chain-id"),
