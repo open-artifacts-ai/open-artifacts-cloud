@@ -754,10 +754,10 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         code: "ok",
       },
     ]);
-    // Resume needs nothing new: no call.
+    // Resume asks the install to clear the marker (#228).
     const n = w.fake.scheduledCalls.length;
     expect((await manage("resume", s.installId)).error).toBeNull();
-    expect(w.fake.scheduledCalls.length).toBe(n);
+    expect(w.fake.scheduledCalls.length - n).toBe(1);
   });
 
   it.each([
@@ -828,18 +828,11 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
   describe("#228: resume clears the install's bus suspend marker", () => {
     const resumeAudit = () =>
       w.all(
-        "SELECT action, install_id, job_id, outcome, code FROM admin_audit WHERE action = 'resume.clear_suspended'",
+        "SELECT action, install_id, job_id, outcome, code, detail FROM admin_audit WHERE action = 'resume.clear_suspended'",
       );
-    const setVersion = (id: string, v: string) =>
-      w.ctx.env.PLATFORM_DB.prepare(
-        "UPDATE installs SET version = ? WHERE id = ?",
-      )
-        .bind(v, id)
-        .run();
 
-    it("calls oa:resume on a new-enough install, while HOSTS is still paused, and records ok", async () => {
+    it("calls oa:resume while HOSTS is still paused, and records ok", async () => {
       const s = await active({ slug: "resnew" });
-      await setVersion(s.installId, "1.0.0");
       expect(
         (await manage("suspend", s.installId, { args: { reason: "billing" } }))
           .error,
@@ -862,44 +855,27 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
           job_id: r.id,
           outcome: "ok",
           code: "ok",
+          detail: "attempts=1",
         },
       ]);
     });
 
-    it("skips an install below RESUME_JOB_MIN_VERSION: no call, skipped_version", async () => {
-      const s = await active({ slug: "resold" });
+    it("a call that throws 3 times: the resume still completes, audit code throw", async () => {
+      const s = await active({ slug: "resthrow" });
       expect(
         (await manage("suspend", s.installId, { args: { reason: "billing" } }))
           .error,
       ).toBeNull();
       const n = w.fake.scheduledCalls.length;
+      w.fake.onScheduled = () => Promise.reject(new Error("unknown job"));
       const r = await manage("resume", s.installId);
       expect(r.error).toBeNull();
-      expect(w.fake.scheduledCalls.length).toBe(n);
+      expect(w.fake.scheduledCalls.length - n).toBe(3);
+      expect(w.hosts("resthrow")).toEqual([s.installId, s.installId]);
+      expect(w.status(s.installId)?.state).toBe("active");
       expect(resumeAudit()).toMatchObject([
-        { outcome: "ok", code: "skipped_version", job_id: r.id },
+        { outcome: "error", code: "throw", detail: "attempts=3", job_id: r.id },
       ]);
-    });
-
-    it("a throw on a new-enough install fails the step (retried), and HOSTS stays paused", async () => {
-      const s = await active({ slug: "resthrow" });
-      await setVersion(s.installId, "1.0.0");
-      expect(
-        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
-          .error,
-      ).toBeNull();
-      w.fake.onScheduled = () => Promise.reject(new Error("boom"));
-      const r = await manage("resume", s.installId);
-      expect(r.error).not.toBeNull();
-      expect(w.hosts("resthrow")).toEqual([
-        `paused:${s.installId}`,
-        `paused:${s.installId}`,
-      ]);
-      // One row per retry of the step.
-      const rows = resumeAudit();
-      expect(rows.length).toBeGreaterThan(1);
-      for (const row of rows)
-        expect(row).toMatchObject({ outcome: "error", code: "throw" });
     });
   });
 

@@ -324,12 +324,17 @@ async function operate(
       );
       await s("unpause", LEASED_STEP, async () => {
         // The install's bus suspend marker goes first: HOSTS is still paused,
-        // so a serving install never refuses bus connects. A failure here
-        // fails the step (retried, LEASED_STEP); the call is idempotent.
-        const cleared = await clearInstallSuspendMarker(ctx, job.installId);
-        await auditResumeClear(ctx, job.installId, jobId, cleared);
-        if (cleared !== "ok" && cleared !== "skipped_version")
-          throw new Error(`resume clear_suspended ${cleared}`);
+        // so a serving install never refuses bus connects. Retried inside,
+        // never throws, never fails the resume (an older install rejects the
+        // unknown job); the final outcome is audited.
+        const clear = await clearInstallSuspendMarker(ctx, job.installId);
+        await auditResumeClear(
+          ctx,
+          job.installId,
+          jobId,
+          clear.outcome,
+          clear.attempts,
+        );
         await (await p(job)).unpause(job.installId, { kind: "resume" });
         await transient(modeStatement(ctx, job.installId, "serving").run());
         return { mode: "serving" };

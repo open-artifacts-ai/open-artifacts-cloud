@@ -9,16 +9,6 @@ export const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
  */
 export const REVOKE_MIN_VERSION = "0.57.1";
 
-/**
- * The first release whose install Worker has the `oa:resume` system job
- * (open-artifacts #2387: clears the bus suspend marker that `oa:close-sockets`
- * writes). An older install rejects it as unknown, so the provisioner calls it
- * only at or above this version.
- * TODO: set to the first release containing open-artifacts #2387. The
- * placeholder is above any current release, so nothing calls the job yet.
- */
-export const RESUME_JOB_MIN_VERSION = "0.999.0";
-
 /** Semver order (prerelease below its release); throws on a non-semver string. */
 export function compareVersions(a: string, b: string): number {
   const pa = SEMVER.exec(String(a));

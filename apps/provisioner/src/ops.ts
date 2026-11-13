@@ -6,19 +6,16 @@ import {
   type Cf,
   cfClient,
   codesOn,
-  compareVersions,
   directFetch,
   googleNewlyEnabled,
   HOSTED_DOMAINS,
   hostsKvTitle,
-  isReleaseVersion,
   names,
   parseHostsValue,
   type WfpOptions,
   WfpProvisioner,
   type WfpStep,
 } from "@oa/provision";
-import { RESUME_JOB_MIN_VERSION } from "@oa/provision/versions";
 import type { ServingMode } from "@oa/provisioning-contract";
 import {
   deployEnv,
@@ -213,50 +210,54 @@ export async function closeInstallSockets(
   return (await closeInstallSocketsCounted(ctx, installId, timeoutMs)).outcome;
 }
 
+/** callSystemJob, retried up to `attempts` times (backoff n * CLOSE_SOCKETS_BACKOFF_MS) until ok. */
+async function callWithRetry(
+  ctx: OpsCtx,
+  installId: string,
+  cron: string,
+  timeoutMs: number,
+): Promise<{ outcome: SystemJobOutcome; attempts: number }> {
+  let outcome: SystemJobOutcome = "throw";
+  let attempts = 0;
+  while (attempts < CLOSE_SOCKETS_ATTEMPTS) {
+    if (attempts > 0)
+      await ctx.io.sleep(attempts * CLOSE_SOCKETS_BACKOFF_MS).catch(() => {});
+    attempts++;
+    outcome = await callSystemJob(ctx, installId, cron, timeoutMs);
+    if (outcome === "ok") break;
+  }
+  return { outcome, attempts };
+}
+
 /** closeInstallSockets, with the number of attempts it took. */
 export async function closeInstallSocketsCounted(
   ctx: OpsCtx,
   installId: string,
   timeoutMs = CLOSE_SOCKETS_TIMEOUT_MS,
 ): Promise<{ outcome: CloseSocketsOutcome; attempts: number }> {
-  let outcome: CloseSocketsOutcome = "throw";
-  let attempts = 0;
-  while (attempts < CLOSE_SOCKETS_ATTEMPTS) {
-    if (attempts > 0)
-      await ctx.io.sleep(attempts * CLOSE_SOCKETS_BACKOFF_MS).catch(() => {});
-    attempts++;
-    outcome = await callSystemJob(ctx, installId, CLOSE_SOCKETS_JOB, timeoutMs);
-    if (outcome === "ok") break;
-  }
-  if (outcome !== "ok") console.warn(CLOSE_SOCKETS_FAILED, outcome);
-  return { outcome, attempts };
+  const r = await callWithRetry(ctx, installId, CLOSE_SOCKETS_JOB, timeoutMs);
+  if (r.outcome !== "ok") console.warn(CLOSE_SOCKETS_FAILED, r.outcome);
+  return r;
 }
 
 /** The install's system job that deletes the bus suspend marker (#2387). */
 export const RESUME_JOB = "oa:resume";
 export const RESUME_TIMEOUT_MS = 15_000;
-export type ResumeOutcome = SystemJobOutcome | "skipped_version";
+export type ResumeOutcome = SystemJobOutcome;
 
 /**
- * On resume, before the HOSTS flip to serving: clears the install's marker so
- * a serving install never refuses bus connects. Skipped (no call) for an
- * install below RESUME_JOB_MIN_VERSION, which would reject the job as unknown.
- * Returns the outcome; the caller fails the step on anything but ok or
- * skipped_version, since a stuck marker blocks the bus.
+ * On resume, before the HOSTS flip to serving: asks the install to clear its
+ * bus suspend marker, retried up to 3 times. Never throws and never fails the
+ * resume: an install on a release without the job rejects it as unknown, and
+ * that can't be told from a real failure (the error text isn't read). The
+ * final outcome is audited.
  */
 export async function clearInstallSuspendMarker(
   ctx: OpsCtx,
   installId: string,
   timeoutMs = RESUME_TIMEOUT_MS,
-): Promise<ResumeOutcome> {
-  const v = (await installRow(ctx, installId))?.version ?? null;
-  if (
-    v === null ||
-    !isReleaseVersion(v) ||
-    compareVersions(v, RESUME_JOB_MIN_VERSION) < 0
-  )
-    return "skipped_version";
-  return callSystemJob(ctx, installId, RESUME_JOB, timeoutMs);
+): Promise<{ outcome: ResumeOutcome; attempts: number }> {
+  return callWithRetry(ctx, installId, RESUME_JOB, timeoutMs);
 }
 
 export const CLOSE_AUDIT_FAILED = "suspend close_sockets audit failed";
@@ -289,6 +290,7 @@ export async function auditResumeClear(
   installId: string,
   jobId: string,
   out: ResumeOutcome,
+  attempts: number,
 ): Promise<void> {
   await auditSystemJob(
     ctx,
@@ -296,7 +298,7 @@ export async function auditResumeClear(
     installId,
     jobId,
     out,
-    null,
+    `attempts=${attempts}`,
   );
 }
 
@@ -316,7 +318,7 @@ async function auditSystemJob(
         ctx.io.now(),
         installId,
         jobId,
-        out === "ok" || out === "skipped_version" ? "ok" : "error",
+        out === "ok" ? "ok" : "error",
         out,
         action,
         detail,
