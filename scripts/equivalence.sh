@@ -43,7 +43,9 @@ set -uo pipefail
 # public's release-alert.yml so the two never share a path in the overlay.
 # And the billing database's migration runner for the staging deploy (#1568):
 # a script and its test that public never had (the deploy scripts that call it
-# are in the private list, this pair is not).
+# are in the private list, this pair is not). And prod's bring-up guards (the
+# TIER check before BILLING binds, the live-mode price check): two more such
+# script and test pairs.
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
 # And the T19 dry-run workflow (#166): a workflow that public never had.
@@ -57,6 +59,10 @@ ALLOW=(
   scripts/ci/hosted-release-alert.test.ts
   scripts/ops/billing-db.ts
   scripts/ops/billing-db.test.ts
+  scripts/ops/billing-tier-check.ts
+  scripts/ops/billing-tier-check.test.ts
+  scripts/ops/stripe-price-livemode.ts
+  scripts/ops/stripe-price-livemode.test.ts
   .github/workflows/staging-solo-clock.yml
   scripts/ops/staging-solo-clock.ts
   scripts/ops/staging-solo-clock.test.ts
