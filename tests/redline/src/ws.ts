@@ -140,6 +140,8 @@ function upgrade(req: Request): Promise<Response> {
 export interface Held {
   /** The handshake's status: 101 when the server upgraded. */
   status: number;
+  /** The reply's body when the server did not upgrade (status not 101). */
+  body?: string;
   /** Resolves when the connection ends, whoever ended it. Never rejects. */
   closed: Promise<void>;
   /** Writes one masked text frame (a client frame must be masked). */
@@ -217,6 +219,7 @@ export async function holdSocket(
   if (!socket)
     return {
       status: res.status,
+      body: await res.text().catch(() => ""),
       closed: Promise.resolve(),
       send: () => {},
       destroy: () => {},

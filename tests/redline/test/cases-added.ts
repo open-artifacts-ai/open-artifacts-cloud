@@ -16,7 +16,7 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
     },
     {
       file: "live/bus.test.ts",
-      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     },
     // #1299 part 4: P51 passes or fails on a real assertion before and after
     // the lift (src/bus-gate.ts); it is not an accepted unproven.
@@ -112,7 +112,7 @@ export const ACCEPTED_UNPROVEN_ADDED_SINCE_1730: readonly {
     file: "bus.test.ts",
   },
   {
-    name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+    name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     reason: HOSTED_BUS_NOT_GATING,
     file: "bus.test.ts",
   },
