@@ -7,6 +7,7 @@ import { limitRoute } from "../limits.js";
 import { isRefusal } from "../principal.js";
 import { refuse } from "../refuse.js";
 import { admission, normEmail } from "./gate.js";
+import { sendWaitlistEmail } from "./waitlist-email.js";
 
 // POST /api/v1/signup/waitlist on the sign-up host: "Join the waitlist".
 // Session, exact Origin, CSRF and the write rate limit, like /auth/open. The
@@ -44,6 +45,7 @@ export async function joinWaitlist(
   const lim = await limitRoute(env, "write", p, "signup_waitlist");
   if (lim) return refuse(env, "auth", lim.code, req);
 
+  let inserted = false;
   try {
     if (env.SIGNUPS_ENABLED !== "invite")
       throw new ApiError("invalid_state", "invalid_state", {
@@ -57,17 +59,22 @@ export async function joinWaitlist(
     // Idempotent: a re-join keeps the first joined_at and note, and never
     // reopens an approved or declined row (a declined person still reads as
     // waitlisted).
-    await env.PLATFORM_DB.prepare(
+    const res = await env.PLATFORM_DB.prepare(
       `INSERT INTO signup_waitlist (sub, email, note, joined_at)
        VALUES (?1, ?2, ?3, ?4) ON CONFLICT (sub) DO NOTHING`,
     )
       .bind(p.sub as string, normEmail(p.email as string), note, now)
       .run();
+    inserted = (res.meta.changes ?? 0) === 1;
   } catch (e) {
     if (e instanceof ApiError)
       return errorResponse(e.code, e.message, e.details);
     throw e;
   }
+  // Only a new row gets the email; a repeat join sends nothing. Best effort:
+  // sendWaitlistEmail never throws.
+  if (inserted)
+    await sendWaitlistEmail(env, p.email as string, new URL(req.url).host);
   return new Response(JSON.stringify({ gate: "waitlisted" }), {
     status: 200,
     headers: {

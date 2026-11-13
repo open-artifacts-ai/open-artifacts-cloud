@@ -6,7 +6,7 @@ import {
   type JWK,
   SignJWT,
 } from "jose";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { handle as appHandle } from "../src/app.js";
 import { csrfToken } from "../src/auth/csrf.js";
 import { BROKER_GOOGLE_CLIENT_ID } from "../src/auth/google.js";
@@ -18,6 +18,10 @@ import {
 import type { Env } from "../src/env.js";
 import { admission, gateOf, isAllowed } from "../src/signup/gate.js";
 import { NOTE_MAX } from "../src/signup/waitlist.js";
+import {
+  sendWaitlistEmail,
+  waitlistEmail,
+} from "../src/signup/waitlist-email.js";
 import { platformDb } from "./db.js";
 import { APP, ctx, db, fakeEnv, insert, resetDb, SIGNUP } from "./fakes.js";
 
@@ -572,5 +576,170 @@ describe("POST /api/v1/signup/waitlist", () => {
         })
       ).status,
     ).not.toBe(200);
+  });
+});
+
+describe("waitlist join email (#2460)", () => {
+  type Sent = {
+    from: { email: string; name: string };
+    replyTo: string;
+    to: string;
+    subject: string;
+    text: string;
+    html: string;
+  };
+  const mailer = (fail?: Error) => {
+    const sent: Sent[] = [];
+    const rpc = {
+      async send(m: Sent) {
+        if (fail) throw fail;
+        sent.push(m);
+        return { messageId: "m1" };
+      },
+    } as unknown as SendEmail;
+    return { sent, rpc };
+  };
+  const withMail = (m = mailer()) =>
+    env({ WELCOME_EMAIL: m.rpc, WELCOME_FROM: "noreply@mail.hosted.test" });
+
+  it("a new join sends exactly one email, to the session address", async () => {
+    const m = mailer();
+    const e = withMail(m);
+    const { sid } = await signIn(e, { email: "Ana@Acme.test" });
+    const r = await join(e, sid, { email: "evil@x.test" });
+    expect(r.status).toBe(200);
+    expect(m.sent).toHaveLength(1);
+    const [msg] = m.sent as [Sent];
+    expect(msg).toMatchObject({
+      subject: "You're on the Open Artifacts waitlist",
+      to: "ana@acme.test",
+      from: { email: "noreply@mail.hosted.test", name: "Open Artifacts" },
+      replyTo: "hello@open-artifacts.com",
+    });
+    expect(msg.text).toContain("You're on the list");
+    expect(msg.html).toContain("You&#39;re on the list");
+    expect(msg.html).toContain(
+      "Thanks for joining. Open Artifacts is in private beta, and we&#39;re letting people in a few at a time. We&#39;ll email you at this address when it&#39;s your turn.",
+    );
+    expect(msg.text).toContain(
+      "Thanks for joining. Open Artifacts is in private beta, and we're letting people in a few at a time. We'll email you at this address when it's your turn.",
+    );
+    for (const part of [msg.text, msg.html]) {
+      expect(part).toContain("https://open-artifacts.com/docs/setup/");
+      expect(part).toContain("Run it yourself");
+    }
+    expect(msg.text).toContain(
+      "Don't want to wait? Open Artifacts is open source, and you can run it yourself today.",
+    );
+    expect(msg.text).toContain(
+      `You're getting this because you joined the waitlist at signup.${APP}.`,
+    );
+    expect(msg.text).toContain(
+      "If that wasn't you, you can ignore this email.",
+    );
+    expect(msg.text).not.toContain("—");
+  });
+
+  it("a repeat join sends none", async () => {
+    const m = mailer();
+    const e = withMail(m);
+    const { sid } = await signIn(e);
+    await join(e, sid);
+    await join(e, sid, { note: "again" });
+    expect(m.sent).toHaveLength(1);
+  });
+
+  it("an allowed person sends none", async () => {
+    await allow("ana@acme.test");
+    const m = mailer();
+    const e = withMail(m);
+    const { sid } = await signIn(e);
+    expect((await join(e, sid)).status).toBe(409);
+    expect(m.sent).toHaveLength(0);
+  });
+
+  it("a refused join (bad note, closed mode) sends none", async () => {
+    const m = mailer();
+    const e = withMail(m);
+    const { sid } = await signIn(e);
+    expect((await join(e, sid, { note: 5 })).status).toBe(400);
+    const closed = withMail(m);
+    closed.env.SIGNUPS_ENABLED = "true";
+    expect((await join(closed, sid)).status).not.toBe(200);
+    expect(m.sent).toHaveLength(0);
+  });
+
+  it("a send that throws still answers the same 200 and keeps the row", async () => {
+    const e = withMail(
+      mailer(Object.assign(new Error("boom"), { code: "E_X" })),
+    );
+    const { sid } = await signIn(e);
+    const r = await join(e, sid);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ gate: "waitlisted" });
+    expect((await rows()).results).toHaveLength(1);
+  });
+
+  it("no binding: no send, join OK", async () => {
+    const e = env();
+    const { sid } = await signIn(e);
+    const r = await join(e, sid);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ gate: "waitlisted" });
+  });
+
+  it("a send that never answers times out after 10 seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      const env = {
+        WELCOME_EMAIL: {
+          send: () => new Promise(() => {}),
+        } as unknown as SendEmail,
+        WELCOME_FROM: "noreply@mail.hosted.test",
+      };
+      let done = false;
+      const p = sendWaitlistEmail(env, "ana@acme.test", "s.test").then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await p;
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("waitlistEmail render", () => {
+  const msg = (host: string) =>
+    waitlistEmail({ from: "n@mail.test", to: "ana@acme.test", host });
+
+  it("the footer names the host the request came to, in both parts", () => {
+    const m = msg("signup.open-artifacts-staging.app");
+    expect(m.text).toContain(
+      "You're getting this because you joined the waitlist at signup.open-artifacts-staging.app.",
+    );
+    expect(m.html.replace(/<[^>]+>/g, "")).toContain(
+      "joined the waitlist at signup.open-artifacts-staging.app.",
+    );
+  });
+
+  it("escapes a hostile host and strips control characters from the address", () => {
+    const m = waitlistEmail({
+      from: "n@mail.test",
+      to: "a\r\nBcc: x@y.test",
+      host: `"><script>alert(1)</script>`,
+    });
+    expect(m.html).not.toContain("<script>");
+    expect(m.html).toContain("&lt;script&gt;");
+    expect(m.to).not.toMatch(/[\r\n]/);
+  });
+
+  it("has the link and no em dashes", () => {
+    const m = msg("s.test");
+    expect(m.html).toContain('href="https://open-artifacts.com/docs/setup/"');
+    expect(m.html + m.text).not.toContain("—");
   });
 });
