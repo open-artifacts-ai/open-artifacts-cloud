@@ -3602,17 +3602,25 @@ export class WfpProvisioner {
   /**
    * The install's D1 and script, both present, and every secret create sends.
    * Its OAuth namespace is present too, unless the install's stored vars say
-   * d1 (#1008: born on d1): then there is none to bind.
+   * d1 (#1008: born on d1, or past the namespace's removal): then there is
+   * none to bind, and one that still exists is bound until a removal drops it
+   * (dropKv: render without it; the caller deletes it once that is live).
    */
   private async liveInstall(
     row: InstallRow,
     m: Meta,
-  ): Promise<{ d1Id: string; kvId: string | null }> {
+    dropKv = false,
+  ): Promise<{ d1Id: string; kvId: string | null; kvToDrop: string | null }> {
     const res = await this.resources(row);
     const onD1 = this.storedVarsOrEmpty(row).OAUTH_STORE === "d1";
     if (!res.d1 || (!res.kv && !onD1))
       throw new ProvisionRefused(
         `install ${row.id} has no D1 or KV`,
+        "invalid_state",
+      );
+    if (dropKv && !(onD1 && m.vars.OAUTH_STORE === "d1"))
+      throw new ProvisionRefused(
+        `install ${row.id}: the OAuth namespace is only dropped from an install on d1`,
         "invalid_state",
       );
     const script = names(row.id, this.env).script;
@@ -3631,7 +3639,11 @@ export class WfpProvisioner {
         `install ${row.id} is missing secret ${missing.join(", ")}; repair it first`,
         "invalid_state",
       );
-    return { d1Id: res.d1, kvId: res.kv };
+    return {
+      d1Id: res.d1,
+      kvId: dropKv ? null : res.kv,
+      kvToDrop: dropKv ? res.kv : null,
+    };
   }
 
   /** L4 in pre-flight: read-only, the install's applied migrations against the release's. */
@@ -4379,6 +4391,15 @@ export class WfpProvisioner {
   async updateVars(
     id: InstallId,
     nextVars: Record<string, string>,
+    opts: {
+      /**
+       * #1008: render without the OAUTH_KV binding and, once that version
+       * serves, delete the <id>-oauth namespace. Only for an install already
+       * on d1 (stored and next vars), and the caller has judged it safe: the
+       * namespace's data is gone for good.
+       */
+      dropKv?: boolean;
+    } = {},
   ): Promise<VarsResult> {
     return this.guarded(async () => {
       if (!nextVars || typeof nextVars !== "object" || Array.isArray(nextVars))
@@ -4422,7 +4443,11 @@ export class WfpProvisioner {
         version,
         bundle: m.testHooks ? "redline" : "release",
       });
-      const { d1Id, kvId } = await this.liveInstall(row, m);
+      const { d1Id, kvId, kvToDrop } = await this.liveInstall(
+        row,
+        m,
+        opts.dropKv === true,
+      );
       const own = await this.ownerToken(row, m.appHost);
       const n = names(id, this.env);
       const have = await this.cf.secretList(this.target, n.script);
@@ -4531,6 +4556,19 @@ export class WfpProvisioner {
         );
         await this.health(id, m.appHost, version, "rerun the var change");
         await this.checkSelf(m.appHost, own.patFile);
+        // #1008: the version without the binding serves; now the namespace.
+        // The row forgets it first, so a delete that fails leaves a row that
+        // agrees with the Worker, and a rerun finishes the job.
+        if (kvToDrop !== null) {
+          const title = await this.cf.kvTitleOf(kvToDrop);
+          if (title !== null) this.assertDeletes(title, n.kv);
+          await this.write({ kv_id: null });
+          if (title !== null) {
+            await this.hold();
+            await this.cf.kvDelete(kvToDrop);
+          }
+          await this.logged("vars.kv_dropped", { version });
+        }
         await this.logged("vars.done", { version });
         await this.release("active");
         return { id, version, ok: true, sessionCut };

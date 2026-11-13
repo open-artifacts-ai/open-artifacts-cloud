@@ -221,6 +221,69 @@ async function modeLive(
   return { mode: want };
 }
 
+/**
+ * How long kv writes must have been off before the install's <id>-oauth
+ * namespace may go (#1008: the Manager's N = 7 days of kvWritesOff). Until
+ * then the namespace is the way back.
+ */
+export const OAUTH_KV_REMOVE_AFTER_MS = 7 * 24 * 60 * 60_000;
+
+/** Why a d1 install's namespace was not removed by this run (never an error). */
+export type KvRemoval =
+  | { removed: true }
+  | { removed: false; why: "no_kv" | "not_backfilled" | "soaking" };
+
+/**
+ * R29's d1 path, last: removes the install's OAuth namespace when that is
+ * safe, else leaves it and says why. Safe is every one of: /healthz shows d1
+ * with a complete copy (`backfilled`), the OAUTH_KV binding is still there
+ * (an install born on d1, or one already past its removal, has nothing to
+ * remove), and kv writes have been off for OAUTH_KV_REMOVE_AFTER_MS. It then
+ * renders the install without the binding (provision's updateVars, dropKv),
+ * and that call deletes the namespace once the new version serves. Repeat
+ * R29 with d1 on an install after the soak to remove the namespace: the
+ * flip itself never does, because it only just stamped kvWritesOffSince.
+ */
+async function removeKv(
+  ctx: CreateCtx,
+  job: ManageJob,
+  label: string,
+): Promise<KvRemoval> {
+  const i = await installOf(ctx, job);
+  const h = await health(i);
+  if (h.mode !== "d1") throw refused("the install is not on d1");
+  const e = deployEnv(ctx.env.OA_ENV);
+  const { bindings } = await (await cfFor(ctx)).scriptSettings(
+    { kind: "namespace", ns: NAMESPACES[e] },
+    names(i.row.id, e).script,
+  );
+  if (!bindings.some((b) => b.name === "OAUTH_KV"))
+    return { removed: false, why: "no_kv" };
+  if (!h.backfilled) return { removed: false, why: "not_backfilled" };
+  if (
+    h.kvWritesOffSince === null ||
+    ctx.io.now() - h.kvWritesOffSince < OAUTH_KV_REMOVE_AFTER_MS
+  )
+    return { removed: false, why: "soaking" };
+  const vars = { ...storedVars(i.row.vars), OAUTH_STORE: "d1" };
+  const w = await renderOptions(ctx, {
+    jobId: job.jobId,
+    label,
+    installId: job.installId,
+    appHost: i.row.app_host,
+    vars,
+    testHooks: i.row.test_hooks === 1,
+    registryDisabled: job.registryDisabled,
+  });
+  const r = await w.updateVars(job.installId, vars, { dropKv: true });
+  if (!r.ok)
+    throw new ProvisionRefused(
+      "the checks after dropping the namespace failed",
+      "upgrade_incomplete",
+    );
+  return { removed: true };
+}
+
 /** R29's steps. No catch here: LostLease must reach the step as it is. */
 export async function setOAuthStore(
   ctx: CreateCtx,
@@ -239,6 +302,17 @@ export async function setOAuthStore(
   await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
     modeLive(ctx, job, want),
   );
+  // Marked as mode_live: the update kind's steps are fixed (JOB_STEPS).
+  if (want === "d1")
+    await jobStep(
+      ctx,
+      step,
+      jobId,
+      "remove_kv",
+      OAUTH_UPLOAD_STEP,
+      () => removeKv(ctx, job, label),
+      "mode_live",
+    );
 }
 
 /** A copy's preconditions, before the key exists. */

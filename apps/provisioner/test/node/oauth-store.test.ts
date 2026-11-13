@@ -385,6 +385,122 @@ describe("update: set OAUTH_STORE (R29)", () => {
     expect(plain(id, "OAUTH_STORE")).toBe("d1");
   });
 
+  describe("the d1 path ends with the namespace's removal when that is safe (#1008)", () => {
+    const DAY = 24 * 60 * MIN;
+    const removeStep = (r: Awaited<ReturnType<typeof run>>) =>
+      r.log.find((l) => l.name === "remove_kv")?.output;
+    const nsTitles = () =>
+      [...w.fake.kv.values()]
+        .map((k) => k.title)
+        .filter((t) => t.endsWith("-oauth"));
+    const hasBinding = (id: string) =>
+      scriptOf(id).metadata.bindings.some(
+        (b: { name: string }) => b.name === "OAUTH_KV",
+      );
+    /** dual, copied, with a stamp we move. */
+    const copied = async () => {
+      const id = await active();
+      const o = { backfilled: true, off: null as number | null };
+      await dual(id, o);
+      return { id, o };
+    };
+
+    it("after the soak: the binding goes, then the namespace, and the install serves d1 on", async () => {
+      const { id, o } = await copied();
+      o.off = w.clock.t - 8 * DAY;
+      expect(nsTitles()).toHaveLength(1);
+      const r = await run(setMode("d1"), id);
+      expect(r.job.status).toBe("done");
+      expect(removeStep(r)).toEqual({ removed: true });
+      expect(hasBinding(id)).toBe(false);
+      expect(plain(id, "OAUTH_STORE")).toBe("d1");
+      expect(nsTitles()).toEqual([]);
+      expect(w.install(id)).toMatchObject({ kv_id: null, state: "active" });
+      expect(JSON.parse(w.install(id)?.vars as string).OAUTH_STORE).toBe("d1");
+      // jobs.step only ever holds the update kind's own steps.
+      expect(r.job.step).toBe("done");
+    });
+
+    it("right after the flip nothing is removed: the soak has just started", async () => {
+      const { id, o } = await copied();
+      o.off = w.clock.t - 1 * DAY;
+      const r = await run(setMode("d1"), id);
+      expect(r.job.status).toBe("done");
+      expect(removeStep(r)).toEqual({ removed: false, why: "soaking" });
+      expect(hasBinding(id)).toBe(true);
+      expect(nsTitles()).toHaveLength(1);
+      expect(w.install(id)?.kv_id).not.toBeNull();
+    });
+
+    it("a repeat of d1 once the soak is over removes it (the flip is not repeated, only the removal)", async () => {
+      const { id, o } = await copied();
+      o.off = w.clock.t;
+      const first = await run(setMode("d1"), id);
+      expect(removeStep(first)).toEqual({ removed: false, why: "soaking" });
+      w.clock.t += 7 * DAY;
+      const again = await run(setMode("d1"), id);
+      expect(removeStep(again)).toEqual({ removed: true });
+      expect(nsTitles()).toEqual([]);
+      const third = await run(setMode("d1"), id);
+      expect(third.job.status).toBe("done");
+      expect(removeStep(third)).toEqual({ removed: false, why: "no_kv" });
+    });
+
+    it("no stamp means nothing is removed", async () => {
+      const { id } = await copied();
+      const r = await run(setMode("d1"), id);
+      expect(removeStep(r)).toEqual({ removed: false, why: "soaking" });
+      expect(nsTitles()).toHaveLength(1);
+    });
+
+    it("an install without a complete copy on /healthz is left alone", async () => {
+      const id = await active();
+      install(id, {
+        mode: () => "d1",
+        backfilled: false,
+        off: w.clock.t - 30 * DAY,
+      });
+      const r = await run(setMode("d1"), id);
+      expect(r.job.status).toBe("done");
+      expect(removeStep(r)).toEqual({ removed: false, why: "not_backfilled" });
+      expect(nsTitles()).toHaveLength(1);
+    });
+
+    it("an install with no OAUTH_KV binding (born on d1) has nothing to remove", async () => {
+      w.env.OAUTH_BORN_D1 = "1";
+      const id = await active();
+      expect(nsTitles()).toEqual([]);
+      install(id);
+      const r = await run(setMode("d1"), id);
+      expect(r.job.status).toBe("done");
+      expect(removeStep(r)).toEqual({ removed: false, why: "no_kv" });
+    });
+
+    it("dual and kv never run it", async () => {
+      const id = await active();
+      install(id);
+      const r = await run(setMode("dual"), id);
+      expect(removeStep(r)).toBeUndefined();
+      expect(nsTitles()).toHaveLength(1);
+    });
+
+    it("a namespace that will not delete fails the job, and the same job's rerun finishes it", async () => {
+      const { id, o } = await copied();
+      o.off = w.clock.t - 8 * DAY;
+      w.fake.inject(
+        (m, p) => m === "DELETE" && /\/storage\/kv\/namespaces\/[^/]+$/.test(p),
+        { status: 403, times: 1 },
+      );
+      const first = await run(setMode("d1"), id);
+      expect(first.job.status).toBe("failed");
+      expect(hasBinding(id)).toBe(false);
+      expect(nsTitles()).toHaveLength(1);
+      const again = await run(setMode("d1"), id);
+      expect(again.job.status).toBe("done");
+      expect(nsTitles()).toEqual([]);
+    });
+  });
+
   it.each([
     ["kv", "d1 on /healthz", { mode: () => "d1" }],
     ["dual", "d1 on /healthz", { mode: () => "d1" }],
