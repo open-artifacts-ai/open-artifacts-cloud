@@ -1846,7 +1846,8 @@ describe("deploy-hosted-platform.sh", () => {
         secrets: {
           "oa-p-auth-broker": ["BROKER_STATE_KEY", "GOOGLE_CLIENT_SECRET"],
         },
-        files: empty === undefined ? {} : { "empty-settings-reads": `${empty}` },
+        files:
+          empty === undefined ? {} : { "empty-settings-reads": `${empty}` },
       });
       const r = s.run("auth-broker", {
         VERIFY_ONLY: "1",
