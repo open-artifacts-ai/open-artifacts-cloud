@@ -1266,10 +1266,12 @@ describe("deploy-hosted-platform.sh", () => {
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) => !b.name.startsWith("WELCOME_"),
         );
-      // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325): its provisioner has no such var.
+      // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
+      // (open-artifacts#1008): its provisioner has neither var.
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
-          (b: { name: string }) => b.name !== "PROD_BUS_ALL",
+          (b: { name: string }) =>
+            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
         );
       return JSON.stringify(next);
     };

@@ -1068,6 +1068,29 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     expect(w.status(s.installId)?.state).toBe("deleted");
   });
 
+  it("a purge deletes an install's OAuth namespace if it has one, and is not troubled when it has none (#1008)", async () => {
+    const titles = () =>
+      [...w.fake.kv.values()]
+        .map((k) => k.title)
+        .filter((t) => t.endsWith("-oauth"));
+    const withNs = await active({ slug: "withns" });
+    expect(titles()).toHaveLength(1);
+    await manage("delete", withNs.installId);
+    expect((await manage("purge", withNs.installId)).error).toBeNull();
+    expect(w.install(withNs.installId)?.state).toBe("deleted");
+    expect(titles()).toEqual([]);
+
+    w.env.OAUTH_BORN_D1 = "1";
+    const born = await active({ slug: "bornco" });
+    expect(titles()).toEqual([]);
+    expect(w.install(born.installId)?.kv_id).toBeNull();
+    await manage("delete", born.installId);
+    const r = await manage("purge", born.installId);
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done" });
+    expect(w.install(born.installId)?.state).toBe("deleted");
+  });
+
   it("the scheduler's purge waits for purge_at", async () => {
     const s = await active({ slug: "graceco" });
     await manage("delete", s.installId);

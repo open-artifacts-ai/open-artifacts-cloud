@@ -30,6 +30,12 @@ export interface ProvisionerEnv {
   STAGING_BUS_ALL?: string;
   /** Prod only (open-artifacts#2325): "1" gives every install `bus`; anything else is off. Set to "0" until flipped. */
   PROD_BUS_ALL?: string;
+  /**
+   * open-artifacts#1008, per environment: "1" makes a new install born on d1
+   * (OAUTH_STORE=d1, no OAUTH_KV binding, no <id>-oauth namespace); anything
+   * else is off. "1" in staging, "0" in prod. Existing installs are unchanged.
+   */
+  OAUTH_BORN_D1?: string;
 }
 
 /** The runtime's network and clock; the tests' run on fakes. */
@@ -86,6 +92,7 @@ export async function provisionerOptions(
       e === "staging" ? parseBusSlugs(env.STAGING_BUS_SLUGS) : [],
     stagingBusAll: e === "staging" && env.STAGING_BUS_ALL === "1",
     prodBusAll: e === "prod" && env.PROD_BUS_ALL === "1",
+    oauthBornD1: env.OAUTH_BORN_D1 === "1",
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),

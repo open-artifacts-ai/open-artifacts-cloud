@@ -145,6 +145,8 @@ describe("wrangler.jsonc", () => {
               STAGING_BUS_ALL: "1",
             }
           : { PROD_BUS_ALL: "0" }),
+        // open-artifacts#1008: born on d1 in staging, off in prod.
+        OAUTH_BORN_D1: env === "staging" ? "1" : "0",
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
