@@ -205,8 +205,8 @@ describe("tag-passed-checks.sh", () => {
     ],
     [
       "extra job still running",
-      extraJob("deploy-landing", "in_progress", null),
-      /job deploy-landing: not completed \(in_progress\)/,
+      extraJob("deploy-prod", "in_progress", null),
+      /job deploy-prod: not completed \(in_progress\)/,
     ],
     [
       "runs error",
@@ -325,6 +325,32 @@ describe("tag-passed-checks.sh", () => {
 
   it("passes with deploy-demo skipped", () => {
     expect(run(extraJob("deploy-demo", "completed", "skipped")).code).toBe(0);
+  });
+
+  it("ignores a failed deploy-landing (red on purpose while sign-ups are closed, #2139), for both envs", () => {
+    for (const conclusion of ["failure", "cancelled", "success"])
+      for (const env of ["staging", "prod"]) {
+        const r = run(extraJob("deploy-landing", "completed", conclusion), env);
+        expect(r.code, r.err).toBe(0);
+        expect(r.out).toContain("passed every check");
+      }
+    expect(run(extraJob("deploy-landing", "in_progress", null)).code).toBe(0);
+  });
+
+  it("still fails on a failed deploy-prod, even next to a failed deploy-landing", () => {
+    const r = run(extraJob("deploy-prod", "completed", "failure"));
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/job deploy-prod: failure/);
+    const s = edit((x) => {
+      x.jobs.jobs.push(
+        { name: "deploy-landing", status: "completed", conclusion: "failure" },
+        { name: "deploy-prod", status: "completed", conclusion: "failure" },
+      );
+    });
+    const both = run(s);
+    expect(both.code).toBe(1);
+    expect(both.err).toMatch(/job deploy-prod: failure/);
+    expect(both.err).not.toMatch(/deploy-landing/);
   });
 
   it("staging needs hosted-attach-staging, not prod's", () => {
@@ -483,6 +509,20 @@ cat "$STATE/$k.json"`;
       expect(r.out).toContain(`hosted commit ${CSHA}`);
       for (const c of r.calls.filter((c) => c.startsWith("gh ")))
         expect(c).toMatch(/^gh api -X GET /);
+    }
+  });
+
+  it("ignores a failed deploy-landing in the public run, but not a failed deploy-prod", () => {
+    const withJob = (name: string, conclusion: string) =>
+      tweak((s) =>
+        s["pub-jobs"].jobs.push({ name, status: "completed", conclusion }),
+      );
+    for (const env of ["staging", "prod"]) {
+      const ok = runTwo(withJob("deploy-landing", "failure"), env);
+      expect(ok.code, ok.err).toBe(0);
+      const bad = runTwo(withJob("deploy-prod", "failure"), env);
+      expect(bad.code).toBe(1);
+      expect(bad.err).toMatch(/job deploy-prod: failure/);
     }
   });
 
