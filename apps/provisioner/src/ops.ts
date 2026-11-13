@@ -6,16 +6,19 @@ import {
   type Cf,
   cfClient,
   codesOn,
+  compareVersions,
   directFetch,
   googleNewlyEnabled,
   HOSTED_DOMAINS,
   hostsKvTitle,
+  isReleaseVersion,
   names,
   parseHostsValue,
   type WfpOptions,
   WfpProvisioner,
   type WfpStep,
 } from "@oa/provision";
+import { RESUME_JOB_MIN_VERSION } from "@oa/provision/versions";
 import type { ServingMode } from "@oa/provisioning-contract";
 import {
   deployEnv,
@@ -147,56 +150,113 @@ interface ScheduledFetcher {
   scheduled(o: { cron?: string; scheduledTime?: Date }): Promise<unknown>;
 }
 
+/** What a system-job call came to. */
+export type SystemJobOutcome = "ok" | "throw" | "timeout" | "outcome";
 /** What a close-sockets call came to. */
-export type CloseSocketsOutcome = "ok" | "throw" | "timeout" | "outcome";
+export type CloseSocketsOutcome = SystemJobOutcome;
 
 /**
- * After a suspend's HOSTS pause: asks the install to close every open
- * WebSocket (events and data, signed-in and anonymous). Never throws: the
- * pause is the hard stop and this is cleanup, so a failure (an install on a
- * release without the job rejects it as unknown, a stall, an exception) logs
- * CLOSE_SOCKETS_FAILED with its category and the suspend goes on. Failing
- * the job instead would leave a paused install with no suspended_at record,
- * and make every suspend of an older release fail. Bounded by
- * CLOSE_SOCKETS_TIMEOUT_MS; the install does the fan-out itself (its socket
- * index, CLOSE_FANOUT per run), so this is one call.
+ * Calls one of the install's system jobs through DISPATCHER with .scheduled(
+ * only. Never throws: it returns the category. Bounded by timeoutMs.
  */
-export async function closeInstallSockets(
+export async function callSystemJob(
   ctx: OpsCtx,
   installId: string,
-  timeoutMs = CLOSE_SOCKETS_TIMEOUT_MS,
-): Promise<CloseSocketsOutcome> {
+  cron: string,
+  timeoutMs: number,
+): Promise<SystemJobOutcome> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let out: CloseSocketsOutcome;
   try {
     const script = names(installId, deployEnv(ctx.env.OA_ENV)).script;
     const r = await Promise.race([
       (ctx.env.DISPATCHER.get(script) as unknown as ScheduledFetcher).scheduled(
-        {
-          cron: CLOSE_SOCKETS_JOB,
-          scheduledTime: new Date(ctx.io.now()),
-        },
+        { cron, scheduledTime: new Date(ctx.io.now()) },
       ),
       new Promise<"timeout">((res) => {
         timer = setTimeout(() => res("timeout"), timeoutMs);
       }),
     ]);
     // A { outcome } result (the experimental types) is read defensively.
-    out =
-      r === "timeout"
-        ? "timeout"
-        : r === undefined ||
-            (r as { outcome?: unknown } | null)?.outcome === "ok"
-          ? "ok"
-          : "outcome";
+    return r === "timeout"
+      ? "timeout"
+      : r === undefined || (r as { outcome?: unknown } | null)?.outcome === "ok"
+        ? "ok"
+        : "outcome";
   } catch {
     // Never the error text: it can carry the install's own message.
-    out = "throw";
+    return "throw";
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
-  if (out !== "ok") console.warn(CLOSE_SOCKETS_FAILED, out);
-  return out;
+}
+
+/** Close-sockets attempts per suspend (the marker write may fail once). */
+export const CLOSE_SOCKETS_ATTEMPTS = 3;
+/** Backoff before attempt n+1: n * this. */
+export const CLOSE_SOCKETS_BACKOFF_MS = 500;
+
+/**
+ * After a suspend's HOSTS pause: asks the install to close every open
+ * WebSocket (and, from #2387, write its bus suspend marker). Never throws:
+ * the pause is the hard stop and this is cleanup, so a failure (an install on
+ * a release without the job rejects it as unknown, a stall, an exception)
+ * logs CLOSE_SOCKETS_FAILED with its category and the suspend goes on.
+ * Retried up to CLOSE_SOCKETS_ATTEMPTS times while the outcome isn't "ok", so
+ * a failed marker write gets another chance. Each call is bounded by
+ * timeoutMs; the install does the fan-out itself, so one call per attempt.
+ */
+export async function closeInstallSockets(
+  ctx: OpsCtx,
+  installId: string,
+  timeoutMs = CLOSE_SOCKETS_TIMEOUT_MS,
+): Promise<CloseSocketsOutcome> {
+  return (await closeInstallSocketsCounted(ctx, installId, timeoutMs)).outcome;
+}
+
+/** closeInstallSockets, with the number of attempts it took. */
+export async function closeInstallSocketsCounted(
+  ctx: OpsCtx,
+  installId: string,
+  timeoutMs = CLOSE_SOCKETS_TIMEOUT_MS,
+): Promise<{ outcome: CloseSocketsOutcome; attempts: number }> {
+  let outcome: CloseSocketsOutcome = "throw";
+  let attempts = 0;
+  while (attempts < CLOSE_SOCKETS_ATTEMPTS) {
+    if (attempts > 0)
+      await ctx.io.sleep(attempts * CLOSE_SOCKETS_BACKOFF_MS).catch(() => {});
+    attempts++;
+    outcome = await callSystemJob(ctx, installId, CLOSE_SOCKETS_JOB, timeoutMs);
+    if (outcome === "ok") break;
+  }
+  if (outcome !== "ok") console.warn(CLOSE_SOCKETS_FAILED, outcome);
+  return { outcome, attempts };
+}
+
+/** The install's system job that deletes the bus suspend marker (#2387). */
+export const RESUME_JOB = "oa:resume";
+export const RESUME_TIMEOUT_MS = 15_000;
+export type ResumeOutcome = SystemJobOutcome | "skipped_version";
+
+/**
+ * On resume, before the HOSTS flip to serving: clears the install's marker so
+ * a serving install never refuses bus connects. Skipped (no call) for an
+ * install below RESUME_JOB_MIN_VERSION, which would reject the job as unknown.
+ * Returns the outcome; the caller fails the step on anything but ok or
+ * skipped_version, since a stuck marker blocks the bus.
+ */
+export async function clearInstallSuspendMarker(
+  ctx: OpsCtx,
+  installId: string,
+  timeoutMs = RESUME_TIMEOUT_MS,
+): Promise<ResumeOutcome> {
+  const v = (await installRow(ctx, installId))?.version ?? null;
+  if (
+    v === null ||
+    !isReleaseVersion(v) ||
+    compareVersions(v, RESUME_JOB_MIN_VERSION) < 0
+  )
+    return "skipped_version";
+  return callSystemJob(ctx, installId, RESUME_JOB, timeoutMs);
 }
 
 export const CLOSE_AUDIT_FAILED = "suspend close_sockets audit failed";
@@ -211,12 +271,56 @@ export async function auditCloseSockets(
   installId: string,
   jobId: string,
   out: CloseSocketsOutcome,
+  attempts?: number,
+): Promise<void> {
+  await auditSystemJob(
+    ctx,
+    "suspend.close_sockets",
+    installId,
+    jobId,
+    out,
+    attempts !== undefined && attempts > 1 ? `attempts=${attempts}` : null,
+  );
+}
+
+/** Appends the resume's marker-clear outcome: action resume.clear_suspended. */
+export async function auditResumeClear(
+  ctx: OpsCtx,
+  installId: string,
+  jobId: string,
+  out: ResumeOutcome,
+): Promise<void> {
+  await auditSystemJob(
+    ctx,
+    "resume.clear_suspended",
+    installId,
+    jobId,
+    out,
+    null,
+  );
+}
+
+async function auditSystemJob(
+  ctx: OpsCtx,
+  action: string,
+  installId: string,
+  jobId: string,
+  out: string,
+  detail: string | null,
 ): Promise<void> {
   try {
     await ctx.env.PLATFORM_DB.prepare(
-      "INSERT INTO admin_audit (at, actor_kind, actor_label, action, install_id, job_id, outcome, code) VALUES (?1, 'system', 'provisioner', 'suspend.close_sockets', ?2, ?3, ?4, ?5)",
+      "INSERT INTO admin_audit (at, actor_kind, actor_label, action, install_id, job_id, outcome, code, detail) VALUES (?1, 'system', 'provisioner', ?6, ?2, ?3, ?4, ?5, ?7)",
     )
-      .bind(ctx.io.now(), installId, jobId, out === "ok" ? "ok" : "error", out)
+      .bind(
+        ctx.io.now(),
+        installId,
+        jobId,
+        out === "ok" || out === "skipped_version" ? "ok" : "error",
+        out,
+        action,
+        detail,
+      )
       .run();
   } catch {
     console.warn(CLOSE_AUDIT_FAILED);

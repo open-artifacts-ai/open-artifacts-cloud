@@ -825,6 +825,111 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     ).toEqual([[CLOSE_SOCKETS_FAILED, "timeout"]]);
   });
 
+  describe("#228: resume clears the install's bus suspend marker", () => {
+    const resumeAudit = () =>
+      w.all(
+        "SELECT action, install_id, job_id, outcome, code FROM admin_audit WHERE action = 'resume.clear_suspended'",
+      );
+    const setVersion = (id: string, v: string) =>
+      w.ctx.env.PLATFORM_DB.prepare(
+        "UPDATE installs SET version = ? WHERE id = ?",
+      )
+        .bind(v, id)
+        .run();
+
+    it("calls oa:resume on a new-enough install, while HOSTS is still paused, and records ok", async () => {
+      const s = await active({ slug: "resnew" });
+      await setVersion(s.installId, "1.0.0");
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.slice(n)).toEqual([
+        {
+          script: expect.stringMatching(new RegExp(`${s.installId}$`)),
+          cron: "oa:resume",
+          hosts: [`paused:${s.installId}`, `paused:${s.installId}`],
+        },
+      ]);
+      expect(w.hosts("resnew")).toEqual([s.installId, s.installId]);
+      expect(resumeAudit()).toEqual([
+        {
+          action: "resume.clear_suspended",
+          install_id: s.installId,
+          job_id: r.id,
+          outcome: "ok",
+          code: "ok",
+        },
+      ]);
+    });
+
+    it("skips an install below RESUME_JOB_MIN_VERSION: no call, skipped_version", async () => {
+      const s = await active({ slug: "resold" });
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.length).toBe(n);
+      expect(resumeAudit()).toMatchObject([
+        { outcome: "ok", code: "skipped_version", job_id: r.id },
+      ]);
+    });
+
+    it("a throw on a new-enough install fails the step (retried), and HOSTS stays paused", async () => {
+      const s = await active({ slug: "resthrow" });
+      await setVersion(s.installId, "1.0.0");
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      w.fake.onScheduled = () => Promise.reject(new Error("boom"));
+      const r = await manage("resume", s.installId);
+      expect(r.error).not.toBeNull();
+      expect(w.hosts("resthrow")).toEqual([
+        `paused:${s.installId}`,
+        `paused:${s.installId}`,
+      ]);
+      // One row per retry of the step.
+      const rows = resumeAudit();
+      expect(rows.length).toBeGreaterThan(1);
+      for (const row of rows)
+        expect(row).toMatchObject({ outcome: "error", code: "throw" });
+    });
+  });
+
+  it("suspend retries a failing close-sockets up to 3 times, then still completes", async () => {
+    const s = await active({ slug: "retryco" });
+    const before = w.fake.scheduledCalls.length;
+    w.fake.onScheduled = () => Promise.reject(new Error("nope"));
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(3);
+    expect(w.status(s.installId)?.state).toBe("suspended");
+    expect(closeAudit()).toMatchObject([{ outcome: "error", code: "throw" }]);
+  });
+
+  it("suspend stops retrying close-sockets at the first ok", async () => {
+    const s = await active({ slug: "retryok" });
+    const before = w.fake.scheduledCalls.length;
+    let n = 0;
+    w.fake.onScheduled = () =>
+      ++n < 2 ? Promise.reject(new Error("once")) : Promise.resolve(undefined);
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(2);
+    expect(closeAudit()).toMatchObject([{ outcome: "ok", code: "ok" }]);
+  });
+
   it("delete closes and starts the grace; restore reopens (paused if it was suspended)", async () => {
     const s = await active({ slug: "delco" });
     const d = await manage("delete", s.installId);
