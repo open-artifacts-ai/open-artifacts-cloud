@@ -277,7 +277,10 @@ function main(argv: string[]) {
     const billing =
       flag(argv, "workflow") !== "publish" &&
       billingConfigured(
-        readFileSync(flag(argv, "hosted-file") || ".github/hosted/prod.json", "utf8"),
+        readFileSync(
+          flag(argv, "hosted-file") || ".github/hosted/prod.json",
+          "utf8",
+        ),
       );
     if (flag(argv, "workflow") !== "publish")
       console.log(

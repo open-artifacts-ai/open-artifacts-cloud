@@ -141,10 +141,14 @@ describe("chain-dispatch", () => {
     expect(billingConfigured(JSON.stringify(empty))).toBe(false);
     expect(billingConfigured(JSON.stringify({}))).toBe(false);
     expect(() =>
-      billingConfigured(JSON.stringify({ ...empty, stripe_price_team: "price_1" })),
+      billingConfigured(
+        JSON.stringify({ ...empty, stripe_price_team: "price_1" }),
+      ),
     ).toThrow("partly filled");
     expect(() =>
-      billingConfigured(JSON.stringify({ ...four, stripe_price_team: "prod_1" })),
+      billingConfigured(
+        JSON.stringify({ ...four, stripe_price_team: "prod_1" }),
+      ),
     ).toThrow("not a Stripe price id");
     expect(() => billingConfigured("{not json")).toThrow();
   });
