@@ -33,7 +33,7 @@ describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
   });
 
   it('with the merged prod config, a prod install gets no bus until PROD_BUS_ALL flips to "1"', async () => {
-    const opts = (vars: Record<string, string>) =>
+    const opts = (vars: typeof cfg.env.prod.vars) =>
       provisionerOptions(
         {
           ...vars,
