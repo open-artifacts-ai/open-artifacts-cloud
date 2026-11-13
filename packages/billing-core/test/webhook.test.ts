@@ -1897,7 +1897,8 @@ describe("a paid checkout records the subscription's interval and renewal (#2135
       STRIPE_SECRET_KEY: "rk_live_abcdefgh12345678",
       stripeFetch: f,
     } as WebhookEnv;
-    expect((await deliver(checkout(T + 100), { env: prod })).status).toBe(200);
+    const ev = { ...checkout(T + 100), livemode: true };
+    expect((await deliver(ev, { env: prod })).status).toBe(200);
     expect(calls).toEqual(["/v1/subscriptions/sub_Test1"]);
     expect(await row(A)).toMatchObject({
       billing_interval: "year",
