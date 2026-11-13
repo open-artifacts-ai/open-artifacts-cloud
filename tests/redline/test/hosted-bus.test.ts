@@ -211,6 +211,7 @@ function suspendIo(
     pausedFromMs?: number;
     upgradeAtMs?: number;
     bystanderClosesAtMs?: number;
+    bystanderClose?: { code: number | null; reason: string; errored?: boolean };
     suspendFails?: boolean;
     resumeFails?: boolean;
     reopenStatus?: number;
@@ -257,7 +258,9 @@ function suspendIo(
         isOpen: () =>
           o.bystanderClosesAtMs === undefined ||
           since() < o.bystanderClosesAtMs,
-        closeCode: () => null,
+        closeCode: () => o.bystanderClose?.code ?? null,
+        closeReason: () => o.bystanderClose?.reason ?? "",
+        erroredFirst: () => o.bystanderClose?.errored ?? false,
       };
     },
     openDaemon: async () => {
@@ -325,6 +328,16 @@ describe("case 2: suspend rl-busb", () => {
     expect(io.reconnectsAt).toEqual([...RECONNECT_AT_MS]);
     expect(RECONNECT_AT_MS).toEqual([10_000, 60_000, 125_000]);
     expect(r.reconnects).toBe(3);
+  });
+
+  it("the bystander failure names the close code and reason", async () => {
+    const io = suspendIo({
+      bystanderClosesAtMs: 50_000,
+      bystanderClose: { code: 1006, reason: "gone", errored: true },
+    });
+    await expect(suspendCase(io, PAIR)).rejects.toThrow(
+      /bus socket closed while the other install was suspended \(code 1006, reason 'gone', errored first\)/,
+    );
   });
 
   it("a close at 30 s passes; at 31 s it fails, though the 120 s pass would come later", async () => {
