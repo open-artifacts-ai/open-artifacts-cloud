@@ -5495,10 +5495,33 @@ export class WfpProvisioner {
           `MCP get_artifact did not return the welcome artifact ${artId}`,
         );
     };
-    return { post, initialize, getWelcome };
+    // open-artifacts#2422: the self-test's page must not outlive it. The
+    // server soft-deletes (Trash), after which get_artifact reports not_found.
+    const deleteWelcome = async (artId: string) => {
+      const del = await post("tools/call", {
+        name: "delete_artifact",
+        arguments: { id: artId },
+      });
+      if (del?.isError || del?.structuredContent?.deleted !== true)
+        throw new Error(`MCP delete_artifact failed for ${artId}`);
+      const after = await post("tools/call", {
+        name: "get_artifact",
+        arguments: { id: artId },
+      });
+      if (after?.isError !== true)
+        throw new Error(
+          `MCP get_artifact still returns the welcome artifact ${artId} after delete_artifact`,
+        );
+    };
+    return { post, initialize, getWelcome, deleteWelcome };
   }
 
-  /** As setup's selftest: publish a private Welcome artifact over MCP and read it back. Create only. */
+  /**
+   * As setup's selftest: publish a private Welcome artifact over MCP, read it
+   * back, then delete it and check it is gone (open-artifacts#2422: on hosted
+   * it would otherwise sit in the owner's Library as their "first artifact").
+   * A failed delete fails the self-test like a failed publish. Create only.
+   */
   private async selftest(
     rec: ReleaseRecord,
     appHost: string,
@@ -5519,6 +5542,7 @@ export class WfpProvisioner {
     if (pub?.isError || typeof artId !== "string")
       throw new Error("MCP publish_artifact failed");
     await c.getWelcome(artId);
+    await c.deleteWelcome(artId);
     return artId;
   }
 
