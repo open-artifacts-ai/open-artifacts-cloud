@@ -126,6 +126,31 @@ describe("staging bus slugs in userWorkerMetadata", () => {
     expect(base).not.toMatch(/\bbus\b/);
   });
 
+  it("busAllProd: bus on prod only; staging ignores it; the staging flag never turns prod on (#2325)", () => {
+    const base = on("anything", { TIER: "team" }, { env: "prod" });
+    expect(base).not.toMatch(/\bbus\b/);
+    expect(
+      on("anything", { TIER: "team" }, { env: "prod", busAllProd: true }),
+    ).toBe(`${base},bus`);
+    expect(
+      on("anything", { TIER: "team" }, { env: "prod", busAllProd: false }),
+    ).toBe(base);
+    const st = on("anything", { TIER: "team" }, {});
+    expect(on("anything", { TIER: "team" }, { busAllProd: true })).toBe(st);
+    expect(st).not.toMatch(/\bbus\b/);
+  });
+
+  it("busAllProd: red-line fixtures (rl-*) get no bus on prod; normal slugs do (#2325)", () => {
+    for (const s of ["rl-p-123-1", "rl-l", "rl-agents"])
+      expect(
+        on(s, { TIER: "team" }, { env: "prod", busAllProd: true }),
+        s,
+      ).not.toMatch(/\bbus\b/);
+    expect(
+      on("normal", { TIER: "team" }, { env: "prod", busAllProd: true }),
+    ).toMatch(/\bbus\b/);
+  });
+
   it("prod and listed: unchanged", () => {
     const base = on("rl-agents", { TIER: "team" }, { env: "prod" });
     expect(

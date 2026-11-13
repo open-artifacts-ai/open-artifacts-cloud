@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NAMESPACES, platformNames } from "@oa/provision";
 import { describe, expect, it } from "vitest";
+import { provisionerOptions } from "../../src/provisioner.js";
 
 const app = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const apps = join(app, "..");
@@ -22,6 +23,43 @@ const api = read(join(apps, "provisioning/wrangler.jsonc"));
 const ENVS = ["staging", "prod"] as const;
 const P = { staging: "s", prod: "p" } as const;
 const ROUTING = ["route", "routes", "custom_domain", "custom_domains"];
+
+describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
+  it('prod has PROD_BUS_ALL "0" and no staging var; staging has no PROD_BUS_ALL', () => {
+    expect(cfg.env.prod.vars.PROD_BUS_ALL).toBe("0");
+    expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_ALL");
+    expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
+    expect(cfg.env.staging.vars).not.toHaveProperty("PROD_BUS_ALL");
+  });
+
+  it('with the merged prod config, a prod install gets no bus until PROD_BUS_ALL flips to "1"', async () => {
+    const opts = (vars: typeof cfg.env.prod.vars) =>
+      provisionerOptions(
+        {
+          ...vars,
+          ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+          RELEASES: {} as R2Bucket,
+          PROVISION_TOKEN: { get: async () => "t" } as SecretsStoreSecret,
+        },
+        "ss-01JBQ4ZKXW5V9R3M2N8P6T7Y0A",
+        {
+          fetch: (async () => new Response("{}")) as typeof fetch,
+          now: () => 0,
+          sleep: async () => {},
+        },
+        "01JOB0000000000000000000AA",
+      );
+    const o = await opts(cfg.env.prod.vars);
+    expect(o.prodBusAll).toBe(false);
+    expect(o.stagingBusAll).toBe(false);
+    expect(o.stagingBusSlugs).toEqual([]);
+    // The flip is that one var: the same config with "1" turns prod on, and
+    // nothing else does.
+    const flipped = await opts({ ...cfg.env.prod.vars, PROD_BUS_ALL: "1" });
+    expect(flipped.prodBusAll).toBe(true);
+    expect(flipped.stagingBusAll).toBe(false);
+  });
+});
 
 describe("wrangler.jsonc", () => {
   it("each env has the queue, its DLQ, both workflows, the dispatcher and the token binding (design v7 2.4)", () => {
@@ -106,7 +144,7 @@ describe("wrangler.jsonc", () => {
               STAGING_BUS_SLUGS: "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb",
               STAGING_BUS_ALL: "1",
             }
-          : {}),
+          : { PROD_BUS_ALL: "0" }),
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
