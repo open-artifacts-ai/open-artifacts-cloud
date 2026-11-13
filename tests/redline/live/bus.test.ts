@@ -132,7 +132,7 @@ describe("bus", () => {
         const w = r.windowCloseMs
           .map((m) => (m === null ? "never" : `${Math.round(m / 1000)} s`))
           .join(", ");
-        return `closed ${Math.round(r.closeMs / 1000)} s after the suspend job; ${r.reconnects} reconnects, ${r.windowOpens} got 101 in the pause window${r.windowOpens ? ` (closed ${w} after the suspend job)` : ""}`;
+        return `closed ${Math.round(r.closeMs / 1000)} s after the suspend job; ${r.reconnects} reconnects, ${r.windowOpens} got 101 in the pause window${r.windowOpens ? ` (closed ${w} after the suspend job; frames ${JSON.stringify(r.windowFrames)}${r.windowDelivery ? "; DELIVERY FRAME on a window socket" : ""})` : ""}`;
       }),
     BUS_CASE_TIMEOUT_MS,
   );

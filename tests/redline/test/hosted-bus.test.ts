@@ -225,6 +225,7 @@ function suspendIo(
     /** When the install's later pass closes a window socket (ms after the job's done; null: never) and with what code. */
     windowCloseAtMs?: number | null;
     windowCloseCode?: number | null;
+    windowTexts?: string[];
   } = {},
 ): SuspendIo & { log: string[]; reconnectsAt: number[] } {
   const t = { now: 0 };
@@ -312,6 +313,7 @@ function suspendIo(
             isOpen: () => open,
             closeCode: () =>
               o.windowCloseCode === undefined ? 4403 : o.windowCloseCode,
+            texts: () => o.windowTexts ?? [],
           },
         };
       }
@@ -372,6 +374,22 @@ describe("case 2: suspend rl-busb", () => {
       expect(r.windowOpens).toBe(2);
       expect(r.windowCloseMs).toEqual([121_000, 121_000]);
       expect(io.log).toContain("resume");
+    });
+
+    it("frames on window sockets are counted by type and a delivery is flagged, never failed on", async () => {
+      const r = await suspendCase(
+        suspendIo({
+          windowUntilMs: PAUSE_WINDOW_MS,
+          windowTexts: [
+            JSON.stringify({ type: "hello_ok" }),
+            JSON.stringify({ type: "deliver" }),
+            "nope",
+          ],
+        }),
+        PAIR,
+      );
+      expect(r.windowFrames).toEqual({ hello_ok: 2, deliver: 2, unparsed: 2 });
+      expect(r.windowDelivery).toBe(true);
     });
 
     it("a window socket still open at the deadline is a breach, and still resumes", async () => {

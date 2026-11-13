@@ -361,6 +361,25 @@ export interface HeldSock {
   closed: Promise<void>;
   isOpen(): boolean;
   closeCode(): number | null;
+  /** The text frames received so far (optional: only window sockets are read). */
+  texts?(): string[];
+}
+
+/** Frame types that deliver mail or a notice: reported on a window socket, never failed on. */
+export const DELIVERY_FRAME_TYPES = ["deliver", "notice"] as const;
+
+/** Counts frames by type ("unparsed" for non-JSON). */
+export function countFrames(texts: string[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const t of texts) {
+    let type = "unparsed";
+    try {
+      const f = JSON.parse(t) as { type?: unknown };
+      if (typeof f.type === "string") type = f.type;
+    } catch {}
+    out[type] = (out[type] ?? 0) + 1;
+  }
+  return out;
 }
 
 export interface Daemon extends HeldSock {
@@ -402,6 +421,10 @@ export interface SuspendResult {
   /** Reconnects inside the pause window that got 101, and when each was closed (ms after the job's done; null if never). */
   windowOpens: number;
   windowCloseMs: (number | null)[];
+  /** Frames the window sockets received after hello, by type, summed. */
+  windowFrames: Record<string, number>;
+  /** True when a window socket received a mail or notice delivery frame (reported, not failed on). */
+  windowDelivery: boolean;
 }
 
 /**
@@ -437,6 +460,8 @@ export async function suspendCase(
     reconnects: 0,
     windowOpens: 0,
     windowCloseMs: [],
+    windowFrames: {},
+    windowDelivery: false,
   };
   // Sockets a window 101 left open: judged at WINDOW_CLOSE_DEADLINE_MS.
   const windowSocks: { sock: HeldSock; index: number }[] = [];
@@ -512,6 +537,13 @@ export async function suspendCase(
     )
       await io.wait(CLOSE_POLL_MS);
     await Promise.resolve();
+    for (const { sock } of windowSocks) {
+      for (const [k, n] of Object.entries(countFrames(sock.texts?.() ?? [])))
+        out.windowFrames[k] = (out.windowFrames[k] ?? 0) + n;
+    }
+    out.windowDelivery = DELIVERY_FRAME_TYPES.some(
+      (k) => (out.windowFrames[k] ?? 0) > 0,
+    );
     for (const { sock } of windowSocks) {
       if (sock.isOpen())
         throw new BreachFail(
@@ -839,6 +871,7 @@ const asSock = (h: Held): HeldSock => {
     closed: h.closed,
     isOpen: () => open,
     closeCode: () => h.closeCode(),
+    texts: () => [...h.texts],
   };
 };
 
