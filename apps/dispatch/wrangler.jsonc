@@ -63,13 +63,14 @@
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts.app"
       },
       // Installs reach the brokers only through BrokerGate stubs built on
-      // these (a same-zone fetch to a broker Route fails; see the gates).
-      // No BILLING binding yet: it and the billing deploy target land
-      // together in the cloud repo. Without it dispatch hands installs no
-      // billing gate.
+      // these (a same-zone fetch to a broker Route fails; see the gates), and
+      // billing through BillingGate on BILLING (#1568), bound with the
+      // scheduler's together. oa-p-billing must be deployed first (the billing
+      // target, in the same run).
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-p-auth-broker" },
-        { "binding": "DIRECTORY_BROKER", "service": "oa-p-directory-broker" }
+        { "binding": "DIRECTORY_BROKER", "service": "oa-p-directory-broker" },
+        { "binding": "BILLING", "service": "oa-p-billing" }
       ],
       "observability": {
         "enabled": true,

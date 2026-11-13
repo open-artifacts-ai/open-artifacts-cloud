@@ -5,8 +5,9 @@
 #   HOSTS_KV_ID            KV oa-<p>-hosts
 #   BROKER_REGISTRY_ID     KV oa-<p>-broker-registry
 #   DIRECTORY_REGISTRY_ID  KV oa-<p>-directory-registry
-#   BILLING_DB_ID          D1 oa-s-billing (its uuid), only when TARGETS names
-#                          billing (staging only; the database must exist)
+#   BILLING_DB_ID          D1 oa-<p>-billing (its uuid), only when TARGETS names
+#                          billing (the database must exist; Platform creates
+#                          it on prod, empty)
 #   EMAIL_ZONE_TAGS        the id of the sending zone $EMAIL_ZONE, on this account
 #   SECRETS_STORE_ID       the account's Secrets Store default_secrets_store
 #                          (the provisioner's PROVISION_TOKEN, design v7 2.5),
@@ -40,7 +41,6 @@ ACCT="/accounts/$CLOUDFLARE_ACCOUNT_ID"
 
 want_billing=""
 case ",${TARGETS:-}," in *,billing,*) want_billing=1 ;; esac
-[ -z "$want_billing" ] || [ "$P" = s ] || { echo "billing is a staging-only target" >&2; exit 2; }
 
 db="oa-$P-platform"
 kvs=("oa-$P-hosts" "oa-$P-broker-registry" "oa-$P-directory-registry")

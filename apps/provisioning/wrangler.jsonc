@@ -259,6 +259,14 @@
         {
           "binding": "AUTH_BROKER",
           "service": "oa-p-auth-broker"
+        },
+        // billing's BillingOperatorRpc entrypoint (#66): how an operator sets
+        // an install's tier (set_install_tier). oa-p-billing must be deployed
+        // first, and the deploy reads the binding back when the tag declares it.
+        {
+          "binding": "BILLING",
+          "service": "oa-p-billing",
+          "entrypoint": "BillingOperatorRpc"
         }
       ],
       "queues": {

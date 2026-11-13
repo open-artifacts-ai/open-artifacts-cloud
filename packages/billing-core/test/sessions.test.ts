@@ -940,3 +940,48 @@ describe("setSubscriptionQuantity (#2123)", () => {
     expect((e as StripeApiError).type).toBe("bad_answer");
   });
 });
+
+// Live mode (prod only): the caller sets live: true from OA_ENV=prod. The key
+// is a made-up one; a live key never appears in code.
+describe("live mode (prod)", () => {
+  const LIVE = "rk_live_notarealkey0000";
+  const ok = { id: "cus_Test1" };
+  const customer = {
+    installId: "iabc123def45",
+    idempotencyKey: "cust-iabc123def45",
+  };
+  it("accepts a restricted live key, and only that", async () => {
+    const { seen, f } = fake(ok);
+    await createCustomer(customer, { secretKey: LIVE, live: true, fetch: f });
+    expect(seen).toHaveLength(1);
+    expect(header(seen[0] as Seen, "authorization")).toBe(`Bearer ${LIVE}`);
+  });
+  it("refuses sk_live_ and a test key before any call", async () => {
+    const { seen, f } = fake(ok);
+    for (const secretKey of [
+      "sk_live_notarealkey0000",
+      KEY,
+      "rk_test_notarealkey0000",
+    ]) {
+      const e = await createCustomer(customer, {
+        secretKey,
+        live: true,
+        fetch: f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+    }
+    expect(seen).toEqual([]);
+  });
+  it("test mode (the default, staging) still refuses every live key", async () => {
+    const { seen, f } = fake(ok);
+    for (const live of [undefined, false]) {
+      const e = await createCustomer(customer, {
+        secretKey: LIVE,
+        ...(live === undefined ? {} : { live }),
+        fetch: f,
+      }).catch((x) => x);
+      expect(e).toBeInstanceOf(StripeConfigError);
+    }
+    expect(seen).toEqual([]);
+  });
+});

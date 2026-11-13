@@ -30,7 +30,8 @@
 //    with version = version + 1 (installs never accept an older version).
 //
 // Logs: fixed categories and the install id only; never a body, header or
-// Stripe id. Stripe test mode only: a livemode event changes nothing.
+// Stripe id. Test mode on staging, live mode on prod (OA_ENV picks it): an
+// event of the other mode changes nothing.
 
 /** Webhook bodies are a few KB; anything this large is refused unread. */
 export const MAX_WEBHOOK_BODY = 1024 * 1024;
@@ -50,11 +51,13 @@ export interface WebhookEnv {
   STRIPE_PRICE_SOLO_MONTHLY?: string;
   STRIPE_PRICE_SOLO_YEARLY?: string;
   /**
-   * Stripe test-mode key (a Worker secret), only for cancelling the
-   * subscription an upgrade replaces. Without it (or with a live key) that
-   * cancel can't run: the webhook answers 500 and keeps the intent.
+   * Stripe key (a Worker secret: test on staging, restricted live on prod),
+   * only for cancelling the subscription an upgrade replaces. Without it (or
+   * with the other mode's key) that cancel can't run: the webhook answers 500 and keeps the intent.
    */
   STRIPE_SECRET_KEY?: string;
+  /** staging or prod. Prod takes live events and a live key; anything else, test ones. */
+  OA_ENV?: string;
   /** Test seam for that cancel; defaults to the global fetch. */
   stripeFetch?: typeof fetch;
 }
@@ -965,6 +968,7 @@ async function settleCancels(
   if (results.length === 0) return [];
   const cfg: StripeConfig = {
     secretKey: env.STRIPE_SECRET_KEY ?? "",
+    ...(env.OA_ENV === "prod" ? { live: true } : {}),
     ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
   };
   const failed: { id: string; event: string | null }[] = [];
@@ -1039,9 +1043,9 @@ export async function handleStripeWebhook(
     log("bad_event");
     return json({ error: "bad_event" }, 400);
   }
-  // No live keys anywhere: a live event (only possible on a misconfigured
-  // endpoint) is acknowledged and changes nothing.
-  if (ev.livemode) {
+  // Prod is live mode, everything else is test mode: an event of the other
+  // mode (a misconfigured endpoint) is acknowledged and changes nothing.
+  if (ev.livemode !== (env.OA_ENV === "prod")) {
     log("livemode_ignored");
     return json({ received: true });
   }
@@ -1121,6 +1125,7 @@ export async function handleStripeWebhook(
       if (cur && cur.id !== paidSub && !(soloPaid && heldByTeam)) {
         const cfg: StripeConfig = {
           secretKey: env.STRIPE_SECRET_KEY ?? "",
+          ...(env.OA_ENV === "prod" ? { live: true } : {}),
           ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
         };
         let state: string;

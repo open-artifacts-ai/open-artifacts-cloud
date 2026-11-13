@@ -65,9 +65,9 @@ const brokerPin = (env: string): string => {
 };
 
 describe(".github/hosted/<env>.json", () => {
-  it("prod and staging hold the same keys; staging adds billing's four price ids, prod holds none", () => {
+  it("prod and staging hold the same keys; both hold billing's six price ids (prod's empty until live ones are filled), prod adds signup_deploy", () => {
     expect(Object.keys(read("prod")).sort()).toEqual(
-      [...KEYS, "signup_deploy"].sort(),
+      [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS, "signup_deploy"].sort(),
     );
     expect(Object.keys(read("staging")).sort()).toEqual(
       [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS].sort(),
@@ -437,7 +437,7 @@ describe("hosted-constants.sh", () => {
     expect(bad.code).toBe(1);
   });
 
-  it("stripe_portal_config is optional, validated when present, and never on prod", () => {
+  it("stripe_portal_config is optional, validated when present, in both envs", () => {
     const st = load(read("staging"), "staging");
     expect(st.ghEnv).not.toContain("STRIPE_PORTAL_CONFIG");
     const ok = load(
@@ -451,8 +451,15 @@ describe("hosted-constants.sh", () => {
         load({ ...read("staging"), stripe_portal_config: v }, "staging").code,
         v,
       ).toBe(1);
+    // Prod takes its own (live) portal configuration the same way.
+    const prod = load(
+      { ...read("prod"), stripe_portal_config: "bpc_1Live" },
+      "prod",
+    );
+    expect(prod.code, prod.err).toBe(0);
+    expect(prod.ghEnv).toContain("STRIPE_PORTAL_CONFIG=bpc_1Live\n");
     expect(
-      load({ ...read("prod"), stripe_portal_config: "bpc_1Abc" }, "prod").code,
+      load({ ...read("prod"), stripe_portal_config: "pc_1" }, "prod").code,
     ).toBe(1);
   });
 
@@ -501,17 +508,48 @@ describe("hosted-constants.sh", () => {
     }
   }, 30_000);
 
-  it("prod loads no Stripe value and refuses a file that holds one", () => {
+  it("prod's price ids: empty (not filled yet) loads nothing and breaks no other run; filled, each loads as STRIPE_PRICE_*; malformed fails; any other stripe_* key is refused", () => {
+    // Committed: all six empty until the live-mode ids are filled (never a
+    // test-mode id), so nothing is loaded and no other prod run breaks.
+    for (const k of [...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS])
+      expect(read("prod")[k], k).toBe("");
     const ok = load(PROD(), "prod");
     expect(ok.code, ok.err).toBe(0);
     expect(ok.ghEnv).not.toContain("STRIPE");
-    for (const k of [...STRIPE_KEYS, "stripe_secret_key"]) {
-      const r = load(
-        { ...PROD(), [k]: "price_1UYx2tJuK8jgC2cZS0mg3Uiz" },
-        "prod",
-      );
+    // Filled with made-up ids: loaded.
+    const filled = {
+      ...PROD(),
+      stripe_price_team: "price_ProdTeam1",
+      stripe_price_business: "price_ProdBusiness1",
+      stripe_price_solo_monthly: "price_ProdSoloM1",
+      stripe_price_solo_yearly: "price_ProdSoloY1",
+      stripe_price_team_yearly: "price_ProdTeamY1",
+      stripe_price_business_yearly: "price_ProdBusinessY1",
+    };
+    const f = load(filled, "prod");
+    expect(f.code, f.err).toBe(0);
+    for (const l of [
+      "STRIPE_PRICE_TEAM=price_ProdTeam1",
+      "STRIPE_PRICE_BUSINESS=price_ProdBusiness1",
+      "STRIPE_PRICE_SOLO_MONTHLY=price_ProdSoloM1",
+      "STRIPE_PRICE_SOLO_YEARLY=price_ProdSoloY1",
+      "STRIPE_PRICE_TEAM_YEARLY=price_ProdTeamY1",
+      "STRIPE_PRICE_BUSINESS_YEARLY=price_ProdBusinessY1",
+    ])
+      expect(f.ghEnv).toContain(`${l}\n`);
+    for (const k of [...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS]) {
+      for (const v of ["prod_1Abc", "price_1 Abc", "price_{{FILL}}"]) {
+        const r = load({ ...PROD(), [k]: v }, "prod");
+        expect(r.code, `${k}=${v}`).toBe(1);
+        expect(r.err).toContain(k);
+        expect(r.ghEnv).toBe("");
+      }
+    }
+    // A secret (or any other stripe_* key) in the file is refused.
+    for (const k of ["stripe_secret_key", "stripe_webhook_secret"]) {
+      const r = load({ ...PROD(), [k]: "x" }, "prod");
       expect(r.code, k).toBe(1);
-      expect(r.err).toContain("prod holds no stripe_* constant");
+      expect(r.err).toContain("stripe_* constant");
       expect(r.ghEnv).toBe("");
     }
   });

@@ -48,10 +48,9 @@ describe("ALLOW_SIGNUPS", () => {
 
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
-// The gate on billing's Stripe secrets: staging and the billing target (#1568).
-const HOLD =
-  "inputs.env == 'staging' && contains(format(',{0},', inputs.targets), ',billing,') &&";
-// Staging's full list: the same with billing (a staging-only target, #1568).
+// The gate on billing's Stripe secrets: the billing target, on either env (#1568).
+const HOLD = "contains(format(',{0},', inputs.targets), ',billing,') &&";
+// The full list with billing (staging and prod, #1568).
 const FULLB =
   "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
 
@@ -94,7 +93,7 @@ describe("deploy-hosted-platform.yml", () => {
       REASON: "${{ inputs.reason }}",
       VERIFY_ONLY: "${{ inputs.verify_only }}",
       OA_OWNER_EMAIL: "${{ secrets.OA_OWNER_EMAIL }}",
-      // Billing's Stripe secrets: a staging run that includes billing only (#1568).
+      // Billing's Stripe secrets: a run that includes billing only (#1568).
       STRIPE_SECRET_KEY: `\${{ ${HOLD} secrets.STRIPE_SECRET_KEY || '' }}`,
       STRIPE_WEBHOOK_SECRET: `\${{ ${HOLD} secrets.STRIPE_WEBHOOK_SECRET || '' }}`,
     });
@@ -113,24 +112,27 @@ describe("deploy-hosted-platform.yml", () => {
           REASON,
           VERIFY_ONLY,
           OA_OWNER_EMAIL: "me@test.invalid",
-          STRIPE_SECRET_KEY: "sk_test_abcdefgh12345678",
+          STRIPE_SECRET_KEY:
+            DEPLOY_ENV === "prod"
+              ? "rk_live_abcdefgh12345678"
+              : "sk_test_abcdefgh12345678",
           STRIPE_WEBHOOK_SECRET: "whsec_abcdefgh12345678",
         },
         encoding: "utf8",
       });
     expect(go(FULL, "").status).toBe(0);
-    // Staging's full list (with billing) is a full list: no reason needed.
+    // The full list with billing is a full list on either env: no reason needed.
     expect(go(FULLB, "", "false", "staging").status).toBe(0);
+    expect(go(FULLB, "", "false", "prod").status).toBe(0);
     // billing alone, or without the rest, is break-glass like any fewer targets.
     expect(go("billing", "", "false", "staging").status).toBe(1);
     expect(go("billing", "stage it", "false", "staging").status).toBe(0);
-    // Prod refuses billing in any list, with or without a reason, verify only too.
-    for (const t of [FULLB, "billing", "directory-broker,billing,dispatch"])
-      for (const v of ["false", "true"]) {
-        const r = go(t, "because", v, "prod");
-        expect(r.status, `${t} ${v}`).toBe(1);
-        expect(r.stdout).toContain("billing is a staging-only target");
-      }
+    expect(go("billing", "", "false", "prod").status).toBe(1);
+    expect(go("billing", "bring up", "false", "prod").status).toBe(0);
+    // Prod keeps the dependency order for billing too.
+    const wrong = go("billing,directory-broker", "because", "false", "prod");
+    expect(wrong.status).toBe(1);
+    expect(wrong.stdout).toContain("targets out of order");
     const no = go("dispatch", "");
     expect(no.status).toBe(1);
     expect(no.stdout).toContain("need a reason");
@@ -564,7 +566,7 @@ describe("deploy-hosted-platform.yml", () => {
       expect(go(tag as string, t as string), `${tag} ${t}`).toBe(1);
   });
 
-  it("billing's Stripe secrets: staging only, and a billing run without them fails in the input check, before any target runs (#1568)", () => {
+  it("billing's Stripe secrets: only a billing run holds them (staging test key, prod restricted live key), and a run without them fails in the input check, before any target runs (#1568)", () => {
     const c = named("Check the inputs");
     const SECRET = "sk_test_abcdefgh12345678";
     const WH = "whsec_abcdefgh12345678";
@@ -617,6 +619,32 @@ describe("deploy-hosted-platform.yml", () => {
       // The value is never printed.
       if (v) expect(r.stdout + r.stderr).not.toContain(v);
     }
+    // Prod: a restricted live key and a signing secret pass; a test key and
+    // sk_live_ do not; a missing one names hosted-prod-deploy.
+    const LIVE = "rk_live_abcdefgh12345678";
+    expect(go(FULLB, { STRIPE_SECRET_KEY: LIVE }, "prod").status).toBe(0);
+    expect(go("billing", { STRIPE_SECRET_KEY: LIVE }, "prod").status).toBe(0);
+    for (const [k, v, want] of [
+      [
+        "STRIPE_SECRET_KEY",
+        "",
+        "STRIPE_SECRET_KEY is not set in hosted-prod-deploy",
+      ],
+      [
+        "STRIPE_WEBHOOK_SECRET",
+        "",
+        "STRIPE_WEBHOOK_SECRET is not set in hosted-prod-deploy",
+      ],
+      ["STRIPE_SECRET_KEY", "sk_test_abcdefgh12345678", "restricted live key"],
+      ["STRIPE_SECRET_KEY", "rk_test_abcdefgh12345678", "restricted live key"],
+      ["STRIPE_SECRET_KEY", "sk_live_abcdefgh12345678", "restricted live key"],
+      ["STRIPE_WEBHOOK_SECRET", "abcdefgh12345678", "signing secret"],
+    ] as const) {
+      const r = go(FULLB, { STRIPE_SECRET_KEY: LIVE, [k]: v }, "prod");
+      expect(r.status, `prod ${k}=${v}`).toBe(1);
+      expect(r.stdout).toContain(want);
+      if (v) expect(r.stdout + r.stderr).not.toContain(v);
+    }
     // verify only reads: no secret needed.
     expect(
       go(
@@ -626,15 +654,13 @@ describe("deploy-hosted-platform.yml", () => {
         "true",
       ).status,
     ).toBe(0);
-    // Prod: billing is refused whatever the secrets say.
-    expect(go("billing", {}, "prod").status).toBe(1);
     // The deploy step gets them by the same expression.
     for (const k of ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"])
       expect(named("Deploy and verify").env[k]).toBe(
         `\${{ ${HOLD} secrets.${k} || '' }}`,
       );
-    // Evaluated: only staging with billing in the targets holds a secret; a
-    // prod run, or a staging run without billing, holds none.
+    // Evaluated: only a run with billing in the targets holds a secret, on
+    // either env; a run without billing holds none.
     const held = (env: string, targets: string, k: string) => {
       const expr = (named("Deploy and verify").env[k] as string)
         .replace(/^\$\{\{\s*/, "")
@@ -651,8 +677,10 @@ describe("deploy-hosted-platform.yml", () => {
       expect(held("staging", "billing", k)).toBe("the-secret");
       expect(held("staging", FULL, k), "staging default list").toBe("");
       expect(held("staging", "dispatch,scheduler", k)).toBe("");
-      expect(held("prod", FULL, k), "prod").toBe("");
-      expect(held("prod", "billing", k), "prod billing").toBe("");
+      expect(held("prod", FULL, k), "prod default list").toBe("");
+      expect(held("prod", "dispatch,scheduler", k)).toBe("");
+      expect(held("prod", FULLB, k), "prod with billing").toBe("the-secret");
+      expect(held("prod", "billing", k), "prod billing").toBe("the-secret");
     }
     // No other step sees them.
     const seeing = steps
@@ -717,8 +745,8 @@ describe("deploy-hosted-platform.yml", () => {
           order.indexOf(app),
         );
       }
-    // Staging binds billing (#1568) on dispatch and the scheduler: it
-    // deploys before both, and prod binds it nowhere.
+    // Both envs bind billing (#1568) on dispatch, the scheduler, the
+    // provisioner and provisioning: it deploys before all four.
     const stagingBound = (app: string): string[] => {
       const cfg = JSON.parse(
         strip(readFileSync(join(root, `apps/${app}/wrangler.jsonc`), "utf8")),
@@ -727,12 +755,17 @@ describe("deploy-hosted-platform.yml", () => {
         String(s.service).replace(/^oa-s-/, ""),
       );
     };
-    for (const app of ["dispatch", "scheduler", "provisioner"]) {
+    for (const app of [
+      "dispatch",
+      "scheduler",
+      "provisioner",
+      "provisioning",
+    ]) {
       expect(stagingBound(app), app).toContain("billing");
+      expect(bound(app), `prod ${app}`).toContain("billing");
       expect(order.indexOf("billing"), `billing before ${app}`).toBeLessThan(
         order.indexOf(app),
       );
-      expect(bound(app), `prod ${app}`).not.toContain("billing");
     }
     expect(order.indexOf("billing")).toBeGreaterThan(
       order.indexOf("directory-broker"),
@@ -811,12 +844,15 @@ describe("deploy-hosted-platform.yml", () => {
       .run as string;
     for (const p of ["@oa/provisioner", "@oa/provisioning", "@oa/admin"])
       expect(run).toContain(`--filter ${p}`);
-    // Staging's billing service and its Stripe core, staging only (#1568): the
-    // step covers each Worker target, and prod's run is exactly what it was.
+    // The billing service and its Stripe core (#1568): built and tested only
+    // when the run deploys it, on either env; a run without it is what it was.
     const step = named("Build and test the Workers being deployed");
-    expect(step.env).toEqual({ DEPLOY_ENV: "${{ inputs.env }}" });
+    expect(step.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TARGETS: "${{ inputs.targets }}",
+    });
     expect(run).toContain(
-      'if [ "$DEPLOY_ENV" = staging ]; then pnpm --filter @oa/billing --filter @oa/billing-core test; fi',
+      'case ",$TARGETS," in *,billing,*) pnpm --filter @oa/billing --filter @oa/billing-core test ;; esac',
     );
     const main =
       run.split("\n").find((l) => l.includes("--filter @oa/admin test")) ?? "";

@@ -98,7 +98,7 @@ export interface Env {
   BROKER_REGISTRY: KVNamespace;
   /** staging or prod: picks the app domain the gate's app host must be on. */
   OA_ENV: OaEnv;
-  /** Stripe test-mode secret key (a Worker secret; billing-core refuses live keys). */
+  /** Stripe secret key (a Worker secret): a test key on staging, a restricted rk_live_ key on prod; billing-core refuses the other mode's key and sk_live_. */
   STRIPE_SECRET_KEY?: string;
   /** Stripe webhook signing secret (a Worker secret: never a var, never logged). */
   STRIPE_WEBHOOK_SECRET?: string;
@@ -123,6 +123,12 @@ export interface Env {
    */
   STAGING_TEST_CLOCK_INSTALLS?: string;
 }
+
+/** The Stripe config for this env: prod is live mode (rk_live_ only), the rest test mode. */
+const stripeConfig = (env: Env): StripeConfig => ({
+  secretKey: env.STRIPE_SECRET_KEY ?? "",
+  ...(env.OA_ENV === "prod" ? { live: true } : {}),
+});
 
 export { TRIAL_MS };
 /** The most creators one usage report may list. */
@@ -666,7 +672,7 @@ async function checkout(
     console.log("billing checkout plan_conflict", install);
     return bad("plan_conflict", 409);
   }
-  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const cfg = stripeConfig(env);
   const customerId = await customerFor(
     env.BILLING_DB,
     install,
@@ -772,7 +778,7 @@ async function portal(
     console.log("billing portal no_customer", install);
     return bad("no_customer", 409);
   }
-  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const cfg = stripeConfig(env);
   const s = await stripe(install, () =>
     createPortalSession(
       {
@@ -926,7 +932,7 @@ async function soloStartCore(
   // One trial per install, and nothing beside a subscription already there.
   if (held?.stripe_subscription_id || held?.solo_trial_ends_at != null)
     return unchanged();
-  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const cfg = stripeConfig(env);
   const customerId = await customerFor(
     db,
     install,
@@ -1287,7 +1293,7 @@ async function billOverage(
   }
   if (!row) return done("overage_failed");
   if (row.outcome === "invoiced") return done("overage_invoiced");
-  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const cfg = stripeConfig(env);
   const step = (item: string | null, invoice: string | null, o: string) =>
     db
       .prepare(OVERAGE_STEP_SQL)
@@ -1502,7 +1508,7 @@ async function applyQuantity(
     return outcome(row.status === "suspended" ? "suspended" : "lapsed");
   const priceId =
     row.tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
-  const cfg: StripeConfig = { secretKey: env.STRIPE_SECRET_KEY ?? "" };
+  const cfg = stripeConfig(env);
   const subscriptionId = row.stripe_subscription_id;
   let r: Awaited<ReturnType<typeof setSubscriptionQuantity>>;
   try {
@@ -1816,6 +1822,7 @@ export default {
           STRIPE_PRICE_SOLO_MONTHLY: env.STRIPE_PRICE_SOLO_MONTHLY,
           STRIPE_PRICE_SOLO_YEARLY: env.STRIPE_PRICE_SOLO_YEARLY,
           STRIPE_SECRET_KEY: env.STRIPE_SECRET_KEY,
+          OA_ENV: env.OA_ENV,
         },
         Date.now(),
       );
