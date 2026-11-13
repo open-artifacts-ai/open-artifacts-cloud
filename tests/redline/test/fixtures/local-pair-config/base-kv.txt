@@ -42,6 +42,10 @@
       {
         "name": "BUS_HUB",
         "class_name": "BusHub"
+      },
+      {
+        "name": "DOC_ROOM",
+        "class_name": "DocRoom"
       }
     ]
   },
@@ -68,6 +72,12 @@
       "tag": "v4",
       "new_sqlite_classes": [
         "BusHub"
+      ]
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": [
+        "DocRoom"
       ]
     }
   ],
