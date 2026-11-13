@@ -50,7 +50,9 @@ import {
 } from "./oauth-store.js";
 import {
   auditCloseSockets,
-  closeInstallSockets,
+  auditResumeClear,
+  clearInstallSuspendMarker,
+  closeInstallSocketsCounted,
   installRow,
   liveMode,
   modeStatement,
@@ -290,8 +292,15 @@ async function operate(
         });
         await transient(modeStatement(ctx, job.installId, "paused").run());
         // #1182: then the sockets opened before the pause; never throws.
-        const closeSockets = await closeInstallSockets(ctx, job.installId);
-        await auditCloseSockets(ctx, job.installId, jobId, closeSockets);
+        const { outcome: closeSockets, attempts } =
+          await closeInstallSocketsCounted(ctx, job.installId);
+        await auditCloseSockets(
+          ctx,
+          job.installId,
+          jobId,
+          closeSockets,
+          attempts,
+        );
         return { mode: "paused", closeSockets };
       });
       await s("record", undefined, () =>
@@ -314,6 +323,18 @@ async function operate(
         ),
       );
       await s("unpause", LEASED_STEP, async () => {
+        // The install's bus suspend marker goes first: HOSTS is still paused,
+        // so a serving install never refuses bus connects. Retried inside,
+        // never throws, never fails the resume (an older install rejects the
+        // unknown job); the final outcome is audited.
+        const clear = await clearInstallSuspendMarker(ctx, job.installId);
+        await auditResumeClear(
+          ctx,
+          job.installId,
+          jobId,
+          clear.outcome,
+          clear.attempts,
+        );
         await (await p(job)).unpause(job.installId, { kind: "resume" });
         await transient(modeStatement(ctx, job.installId, "serving").run());
         return { mode: "serving" };

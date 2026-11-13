@@ -754,10 +754,10 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
         code: "ok",
       },
     ]);
-    // Resume needs nothing new: no call.
+    // Resume asks the install to clear the marker (#228).
     const n = w.fake.scheduledCalls.length;
     expect((await manage("resume", s.installId)).error).toBeNull();
-    expect(w.fake.scheduledCalls.length).toBe(n);
+    expect(w.fake.scheduledCalls.length - n).toBe(1);
   });
 
   it.each([
@@ -823,6 +823,87 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
     expect(
       (warn?.mock.calls ?? []).filter((c) => c[0] === CLOSE_SOCKETS_FAILED),
     ).toEqual([[CLOSE_SOCKETS_FAILED, "timeout"]]);
+  });
+
+  describe("#228: resume clears the install's bus suspend marker", () => {
+    const resumeAudit = () =>
+      w.all(
+        "SELECT action, install_id, job_id, outcome, code, detail FROM admin_audit WHERE action = 'resume.clear_suspended'",
+      );
+
+    it("calls oa:resume while HOSTS is still paused, and records ok", async () => {
+      const s = await active({ slug: "resnew" });
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.slice(n)).toEqual([
+        {
+          script: expect.stringMatching(new RegExp(`${s.installId}$`)),
+          cron: "oa:resume",
+          hosts: [`paused:${s.installId}`, `paused:${s.installId}`],
+        },
+      ]);
+      expect(w.hosts("resnew")).toEqual([s.installId, s.installId]);
+      expect(resumeAudit()).toEqual([
+        {
+          action: "resume.clear_suspended",
+          install_id: s.installId,
+          job_id: r.id,
+          outcome: "ok",
+          code: "ok",
+          detail: "attempts=1",
+        },
+      ]);
+    });
+
+    it("a call that throws 3 times: the resume still completes, audit code throw", async () => {
+      const s = await active({ slug: "resthrow" });
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      const n = w.fake.scheduledCalls.length;
+      w.fake.onScheduled = () => Promise.reject(new Error("unknown job"));
+      const r = await manage("resume", s.installId);
+      expect(r.error).toBeNull();
+      expect(w.fake.scheduledCalls.length - n).toBe(3);
+      expect(w.hosts("resthrow")).toEqual([s.installId, s.installId]);
+      expect(w.status(s.installId)?.state).toBe("active");
+      expect(resumeAudit()).toMatchObject([
+        { outcome: "error", code: "throw", detail: "attempts=3", job_id: r.id },
+      ]);
+    });
+  });
+
+  it("suspend retries a failing close-sockets up to 3 times, then still completes", async () => {
+    const s = await active({ slug: "retryco" });
+    const before = w.fake.scheduledCalls.length;
+    w.fake.onScheduled = () => Promise.reject(new Error("nope"));
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(3);
+    expect(w.status(s.installId)?.state).toBe("suspended");
+    expect(closeAudit()).toMatchObject([{ outcome: "error", code: "throw" }]);
+  });
+
+  it("suspend stops retrying close-sockets at the first ok", async () => {
+    const s = await active({ slug: "retryok" });
+    const before = w.fake.scheduledCalls.length;
+    let n = 0;
+    w.fake.onScheduled = () =>
+      ++n < 2 ? Promise.reject(new Error("once")) : Promise.resolve(undefined);
+    const r = await manage("suspend", s.installId, {
+      args: { reason: "billing" },
+    });
+    expect(r.error).toBeNull();
+    expect(w.fake.scheduledCalls.length - before).toBe(2);
+    expect(closeAudit()).toMatchObject([{ outcome: "ok", code: "ok" }]);
   });
 
   it("delete closes and starts the grace; restore reopens (paused if it was suspended)", async () => {
