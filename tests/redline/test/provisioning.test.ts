@@ -267,7 +267,7 @@ describe("the probes on a conforming staging fake", () => {
       level: "unproven-live",
       reason: P29_UNPROVEN,
     });
-    // P29 is on the list for M1 only (#1046 takes it off).
+    // P29 stays on the list: a run can't purge, and the free-on-purge test is #1046's.
     expect(
       ACCEPTED_UNPROVEN.find((e) => e.name.startsWith("provisioning > P29: "))
         ?.evidence,

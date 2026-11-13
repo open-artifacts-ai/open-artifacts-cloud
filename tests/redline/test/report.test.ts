@@ -229,7 +229,7 @@ describe("gate", () => {
   });
 
   // The unproven-live cases a non-live in-repo test covers, frozen by exact
-  // name and reason (P29 for M1 only, until #1046).
+  // name and reason.
   describe("accepted unproven-live", () => {
     const NOT_CONFIGURED =
       "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)";
@@ -242,7 +242,7 @@ describe("gate", () => {
       "provisioner > a signup for a taken slug fails cleanly",
     ];
     const REASONS = [
-      "self-serve purge doesn't free signup_accounts (#1046); signups off on prod",
+      "a run can't purge a self-serve install, which is what frees its claim (#1046: freeing proven live on staging 2026-11-10)",
       "5 forged callbacks refused; the alert is not readable by O (R27 and other actors' R17 rows are 403)",
       NEEDS_CAPTURE,
       NEEDS_CAPTURE,
