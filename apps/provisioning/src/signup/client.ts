@@ -93,7 +93,7 @@ export const CLIENT_JS = String.raw`(function () {
         h("header", { class: "top" }, [
           h("div", { class: "brand" }, [brandMark(), "Open Artifacts"]),
           h("div", { class: "pitchtext" }, [
-            h("p", { class: "pt" }, ["Where any AI agent publishes for your team."]),
+            h("p", { class: "pt" }, ["Where humans and agents get their best work done."]),
             h("p", { class: "ps" }, ["Pages, docs, code and PDFs, private by default and shared when you choose."])
           ]),
           links
