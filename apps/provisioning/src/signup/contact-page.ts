@@ -75,9 +75,9 @@ export const CONTACT_JS = `(function () {
     return s;
   }
 
-  var HOME = "https://open-artifacts.com";
-  var PLANS = HOME + "/pricing";
-  var PRIVACY = HOME + "/privacy";
+  var HOME = "https://open-artifacts.com/";
+  var PLANS = HOME + "#pricing";
+  var PRIVACY = HOME + "privacy/";
   var ADDS = [
     ["Google group sync", "People join and leave with your Google groups.", false],
     ["Outside-sharing controls", "Decide who may share pages outside the company.", false],
