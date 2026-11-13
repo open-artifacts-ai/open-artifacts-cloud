@@ -9,6 +9,13 @@ export const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
  */
 export const REVOKE_MIN_VERSION = "0.57.1";
 
+/**
+ * The first release whose `oa:resume` job clears the bus suspend marker
+ * (open-artifacts #2387, first shipped in 0.171.0); below it the job is
+ * unknown and a resume can't tell that from a failure.
+ */
+export const RESUME_JOB_MIN_VERSION = "0.171.0";
+
 /** Semver order (prerelease below its release); throws on a non-semver string. */
 export function compareVersions(a: string, b: string): number {
   const pa = SEMVER.exec(String(a));
