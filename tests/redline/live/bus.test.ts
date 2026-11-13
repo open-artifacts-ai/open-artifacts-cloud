@@ -1,6 +1,5 @@
 import { afterAll, describe, it } from "vitest";
 import {
-  BreachFail,
   BUS_CASE_TIMEOUT_MS,
   BUS_CLEANUP_TIMEOUT_MS,
   CASE_JOB_WITHIN_MS,
@@ -16,7 +15,7 @@ import {
   requireBusOn,
   suspendCase,
 } from "../src/hosted-bus.ts";
-import { HOSTED_BUS_NOT_GATING, label, proof } from "../src/report.ts";
+import { label, proof } from "../src/report.ts";
 import type { Held } from "../src/ws.ts";
 
 // open-artifacts#1954 (cloud #202): the hosted bus's two cases, on red-line's
@@ -28,9 +27,7 @@ import type { Held } from "../src/ws.ts";
 // sockets and keep refusing them until the resume, and touch no other
 // install's.
 //
-// Not gating for one release: a case that fails reports unproven-live with
-// HOSTED_BUS_NOT_GATING (an accepted entry in src/report.ts) and puts what
-// failed in its label. A pass is a pass.
+// Both cases gate like any other: a failure fails the case.
 
 const env = process.env;
 let live: Promise<LivePair> | undefined;
@@ -50,11 +47,10 @@ const pair = (): Promise<LivePair> | null => {
 
 type Ctx = Parameters<typeof proof>[0];
 /**
- * Runs a case; a failure is reported, not gated (one release, cloud #202).
- * Its own deadline, a minute inside vitest's, so a slow case reports too
- * instead of timing out red.
+ * Runs a case with its own deadline, a minute inside vitest's, so a slow
+ * case fails with a reason instead of timing out bare.
  */
-async function notGating(
+async function runCase(
   ctx: Ctx,
   timeoutMs: number,
   body: (l: LivePair) => Promise<string>,
@@ -80,14 +76,6 @@ async function notGating(
   });
   try {
     label(ctx, await Promise.race([p.then(body), late]));
-  } catch (e) {
-    // OA Bus M1: a breach gates the run even while the cases don't.
-    if (e instanceof BreachFail) throw e;
-    label(
-      ctx,
-      `would fail: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500),
-    );
-    proof(ctx, "unproven-live", HOSTED_BUS_NOT_GATING);
   } finally {
     clearTimeout(timer);
   }
@@ -114,7 +102,7 @@ describe("bus", () => {
   it(
     "rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
     (ctx) =>
-      notGating(ctx, CROSS_CASE_TIMEOUT_MS, async (l) => {
+      runCase(ctx, CROSS_CASE_TIMEOUT_MS, async (l) => {
         await crossInstallCase(liveCrossIo(l.busa, l.busb, minted), l.pair);
         return `rl-busa ${l.pair.busa.version}, rl-busb ${l.pair.busb.version}`;
       }),
@@ -124,7 +112,7 @@ describe("bus", () => {
   it(
     "suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     (ctx) =>
-      notGating(ctx, BUS_CASE_TIMEOUT_MS, async (l) => {
+      runCase(ctx, BUS_CASE_TIMEOUT_MS, async (l) => {
         const r = await suspendCase(
           liveSuspendIo(l.busb, l.busa, minted, l.run, held),
           l.pair,

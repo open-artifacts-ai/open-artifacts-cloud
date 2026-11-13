@@ -1,5 +1,3 @@
-import { HOSTED_BUS_NOT_GATING } from "../src/report.ts";
-
 // Cases added to live/manifest.json after #1730's base. test/fixtures/main-cases.json
 // and the recording in test/fixtures/run-42402998826.json freeze that base, so a
 // new route is declared here, with its port, and never edited into the
@@ -8,8 +6,8 @@ import { HOSTED_BUS_NOT_GATING } from "../src/report.ts";
 export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
   [
     // #1954 (cloud #202): the hosted bus's two cases on rl-busa and rl-busb
-    // (their bus is on through STAGING_BUS_SLUGS, not the lift). Both are
-    // accepted unproven for one release (ACCEPTED_UNPROVEN_ADDED_SINCE_1730).
+    // (their bus is on through STAGING_BUS_SLUGS, not the lift). Both gate
+    // like any other case (promoted, cloud #202).
     {
       file: "live/bus.test.ts",
       name: "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
@@ -104,16 +102,5 @@ export const ACCEPTED_UNPROVEN_ADDED_SINCE_1730: readonly {
     reason:
       "REDLINE_STG_PROVISIONER is not configured (the provisioner is not deployed)",
     file: "provisioner.test.ts",
-  },
-  // Cloud #202: the hosted bus cases, not gating for one release.
-  {
-    name: "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
-    reason: HOSTED_BUS_NOT_GATING,
-    file: "bus.test.ts",
-  },
-  {
-    name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
-    reason: HOSTED_BUS_NOT_GATING,
-    file: "bus.test.ts",
   },
 ];
