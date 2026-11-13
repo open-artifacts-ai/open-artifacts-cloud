@@ -69,8 +69,9 @@
       "name": "oa-p-billing",
       "main": "src/index.ts",
       // OA_ENV picks the app domain the gate's app host must be on; the
-      // price ids are this env's Stripe test-mode prices (filled at deploy).
-      // STRIPE_SECRET_KEY is a Worker secret, never in this file.
+      // price ids are this env's Stripe live-mode prices (filled at deploy).
+      // STRIPE_SECRET_KEY (a restricted rk_live_ key) is a Worker secret,
+      // never in this file.
       "vars": {
         "OA_ENV": "prod",
         "STRIPE_PRICE_TEAM": "{{STRIPE_PRICE_TEAM_PROD}}",

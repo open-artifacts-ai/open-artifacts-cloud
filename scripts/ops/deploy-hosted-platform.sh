@@ -22,7 +22,7 @@
 #   directory-broker DIRECTORY_REGISTRY_ID GOOGLE_DIRECTORY_CLIENT_ID GOOGLE_DIRECTORY_CLIENT_SECRET
 #   provision-token  SECRETS_STORE_ID (reads only: the user pastes the secret)
 #   provisioner      PLATFORM_DB_ID SECRETS_STORE_ID SIGNUP_DAILY_CAP SIGNUPS_ENABLED WELCOME_FROM
-#   billing          STAGING ONLY. BILLING_DB_ID (D1 oa-s-billing, which must exist)
+#   billing          BILLING_DB_ID (D1 oa-<p>-billing, which must exist)
 #                    BROKER_REGISTRY_ID MAIN_BILLING_MIGRATION_LOCK (main's
 #                    apps/billing/migration-lock.json; migrations,
 #                    scripts/ops/billing-db.ts) the four Stripe price ids
@@ -30,10 +30,11 @@
 #                    _TEAM_YEARLY, _BUSINESS_YEARLY until made)
 #                    and, unless VERIFY_ONLY, STRIPE_SECRET_KEY and
 #                    STRIPE_WEBHOOK_SECRET (the Environment's; a test-mode key
-#                    only, both put on the Worker, a run without them fails
-#                    before anything changes)
+#                    on staging, a restricted rk_live_ key on prod, never
+#                    sk_live_; both put on the Worker, a run without them
+#                    fails before anything changes)
 #   dispatch         HOSTS_KV_ID (both brokers must exist; on staging, when the
-#                    tag declares a BILLING binding, oa-s-billing too, #1568)
+#                    tag declares a BILLING binding, oa-<p>-billing too, #1568)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
 #                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
@@ -61,12 +62,6 @@ case "$env" in
   *) echo "env must be staging or prod" >&2; exit 2 ;;
 esac
 NS="oa-$env"
-# The billing service is staging only (no prod Worker, binding, route or
-# Stripe secret): refused before anything is read or changed.
-if [ "$target" = billing ] && [ "$env" != staging ]; then
-  echo "the billing target is staging only; refusing for $env" >&2
-  exit 2
-fi
 # In CI, prod runs only from main, in the prod deploy Environment.
 if [ "${GITHUB_ACTIONS:-}" = true ] && [ "$env" = prod ]; then
   [ "${GITHUB_REF:-}" = refs/heads/main ] || { echo "prod deploys run only from main (GITHUB_REF is ${GITHUB_REF:-unset})" >&2; exit 2; }
@@ -342,13 +337,13 @@ expect_private() {
   [ "$got" = "$3" ] || { echo "$4: not the expected value" >&2; exit 1; }
 }
 
-# The BILLING service binding (#1568) is staging only, and required only when
+# The BILLING service binding (#1568) is required only when
 # the tag being deployed declares it: main's scripts run against the tag's
 # Workers, so a staging run of an older tag (whose wrangler has none) must not
 # fail for lack of it, and a tag that declares it must not deploy without it.
 # billing_pre <app> <entrypoint>, before deploying: reads the tag's committed
-# env block (wrangler-env.ts billing). Prod refuses a tag that binds BILLING.
-# Staging: a declared binding must be exactly oa-s-billing with this app's
+# env block (wrangler-env.ts billing). A declared binding must be exactly
+# oa-<p>-billing (staging or prod) with this app's
 # entrypoint ("" for the default one, BillingProvisionerRpc for the
 # provisioner), and the Worker must exist (a binding needs its service
 # deployed first); sets BILLING_DECLARED=1. Not declared: BILLING_DECLARED="" and
@@ -360,17 +355,25 @@ billing_pre() {
   c="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/wrangler-env.ts" "$root/apps/$1/wrangler.jsonc" "$env" billing)" ||
     { echo "can't read $1's committed BILLING binding" >&2; exit 1; }
   [ "$c" != null ] || return 0
-  [ "$env" = staging ] || { echo "the tag's $env $1 config binds BILLING; it is staging only; refusing" >&2; exit 1; }
   service="$(jq -r '.service' <<< "$c")"
   entry="$(jq -r '.entrypoint // ""' <<< "$c")"
   [ "$service" = "oa-$P-billing" ] || { echo "the tag's $1 BILLING binding is '$service', want oa-$P-billing; refusing" >&2; exit 1; }
   [ "$entry" = "$2" ] || { echo "the tag's $1 BILLING binding has entrypoint '$entry', want '$2'; refusing" >&2; exit 1; }
   need_workers "oa-$P-billing"
+  # Prod only, before anything is bound or deployed: every active install's
+  # rendered vars must carry a TIER, or the billing gate would read it as Solo
+  # (fail closed; scripts/ops/billing-tier-check.ts prints only a count; the list is read with oa-admin-prod). A verify
+  # only run binds nothing.
+  if [ "$env" = prod ] && [ -z "$VERIFY_ONLY" ]; then
+    need PLATFORM_DB_ID
+    PLATFORM_DB_ID="$PLATFORM_DB_ID" node --experimental-strip-types --no-warnings "$root/scripts/ops/billing-tier-check.ts" prod ||
+      { echo "refusing to bind BILLING on prod to $1; read the list with oa-admin-prod" >&2; exit 1; }
+  fi
   BILLING_DECLARED=1
 }
 # billing_bound <settings json> <app> <entrypoint>, after deploying (or verify
-# only): when the tag declared it, the live binding is a service oa-s-billing
-# with the entrypoint; otherwise (an older tag, or prod) there is none.
+# only): when the tag declared it, the live binding is a service oa-<p>-billing
+# with the entrypoint; otherwise (an older tag) there is none.
 billing_bound() {
   local want=""
   [ -z "$BILLING_DECLARED" ] || want="service oa-$P-billing $3"
@@ -462,7 +465,7 @@ case "$target" in
     welcome_declared provisioner
     [ -z "$WELCOME_DECLARED" ] || need WELCOME_FROM
     signups_committed provisioner
-    # BILLING (#1568, staging only, when the tag declares it): the provisioner
+    # BILLING (#1568, when the tag declares it): the provisioner
     # starts an install's Solo trial through billing's BillingProvisionerRpc.
     # Unbound it would silently skip the free month, so a tag that declares the
     # binding must not deploy without it (read back below).
@@ -556,7 +559,7 @@ case "$target" in
         exit 1
       fi
     fi
-    # BILLING (#66, staging only, when the tag declares it): an operator sets
+    # BILLING (#66, when the tag declares it): an operator sets
     # an install's tier through billing's BillingOperatorRpc. Unbound, the tool
     # answers unavailable, so a tag that declares it must not deploy without it.
     billing_pre provisioning BillingOperatorRpc
@@ -798,7 +801,7 @@ case "$target" in
     [ "$names" = "DIRECTORY_STATE_KEY GOOGLE_DIRECTORY_CLIENT_SECRET " ] || { echo "oa-$P-directory-broker secrets are '$names'" >&2; exit 1; }
     ;;
   billing)
-    # Staging only (checked above). Everything is checked before anything
+    # Staging and prod. Everything is checked before anything
     # changes, so a Worker is never left half configured.
     need BILLING_DB_ID; need BROKER_REGISTRY_ID; need MAIN_BILLING_MIGRATION_LOCK
     for k in STRIPE_PRICE_TEAM STRIPE_PRICE_BUSINESS STRIPE_PRICE_SOLO_MONTHLY STRIPE_PRICE_SOLO_YEARLY; do
@@ -814,11 +817,24 @@ case "$target" in
       { echo "STRIPE_PORTAL_CONFIG is not a Stripe portal configuration id" >&2; exit 2; }
     if [ -z "$VERIFY_ONLY" ]; then
       need STRIPE_SECRET_KEY; need STRIPE_WEBHOOK_SECRET
-      # Test mode only (billing-core refuses a live key too); never printed.
-      [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] ||
-        { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_); a live key is refused" >&2; exit 2; }
+      # Test mode on staging, a restricted live key on prod (billing-core
+      # refuses the other mode's key and sk_live_ too); never printed.
+      if [ "$env" = prod ]; then
+        [[ "$STRIPE_SECRET_KEY" =~ ^rk_live_[A-Za-z0-9]{8,255}$ ]] ||
+          { echo "STRIPE_SECRET_KEY must be a restricted live key (rk_live_) on prod; a test key or sk_live_ is refused" >&2; exit 2; }
+      else
+        [[ "$STRIPE_SECRET_KEY" =~ ^(sk|rk)_test_[A-Za-z0-9]{8,255}$ ]] ||
+          { echo "STRIPE_SECRET_KEY must be a Stripe test-mode key (sk_test_ or rk_test_) on staging; a live key is refused" >&2; exit 2; }
+      fi
       [[ "$STRIPE_WEBHOOK_SECRET" =~ ^whsec_[A-Za-z0-9+/=_-]{8,255}$ ]] ||
         { echo "STRIPE_WEBHOOK_SECRET must be a Stripe signing secret (whsec_...)" >&2; exit 2; }
+      # Prod: every configured price must resolve under the live key with
+      # livemode true (a test key under the live name, or a test-mode price, stops
+      # the deploy here, before anything changes). Fail closed; never prints the key.
+      if [ "$env" = prod ]; then
+        node --experimental-strip-types --no-warnings "$root/scripts/ops/stripe-price-livemode.ts" prod ||
+          { echo "refusing to deploy billing on prod: the Stripe prices are not live mode" >&2; exit 2; }
+      fi
     fi
     # The schema first: the Worker never runs on a stale one. billing-db.ts
     # applies each pinned file once (a frozen lock, main's pins kept) and reads
@@ -856,7 +872,7 @@ case "$target" in
   dispatch)
     need HOSTS_KV_ID
     need_workers oa-$P-auth-broker oa-$P-directory-broker
-    # BILLING (#1568, staging only, when the tag declares it).
+    # BILLING (#1568, when the tag declares it).
     billing_pre dispatch ""
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
@@ -875,7 +891,7 @@ case "$target" in
     # Its Workflows, RPC and producer bindings point at these: deploying first
     # would ship a scheduler bound to nothing.
     need_workers oa-$P-auth-broker oa-$P-directory-broker oa-$P-provisioner
-    # BILLING (#1568, staging only, when the tag declares it).
+    # BILLING (#1568, when the tag declares it).
     billing_pre scheduler ""
     need_queue oa-$P-signups
     # The tag's alert wiring (#915) must be "pinned": every alert var and

@@ -1022,7 +1022,11 @@ describe("the redirect origin comes only from the gate's app host", () => {
   it("prod checks the prod app domain", async () => {
     await seed(A, "cus_existingA");
     const s = fakeStripe();
-    env = { ...baseEnv(), OA_ENV: "prod" };
+    env = {
+      ...baseEnv(),
+      OA_ENV: "prod",
+      STRIPE_SECRET_KEY: "rk_live_FAKEfakeFAKE0123",
+    };
     expect(
       (await call(req("/portal", { install: A }, { appHost: HOST_A }))).status,
     ).toBe(500);
@@ -1033,6 +1037,22 @@ describe("the redirect origin comes only from the gate's app host", () => {
     expect(s.calls[0]?.form.return_url).toBe(
       "https://acme.open-artifacts.app/settings/plan",
     );
+  });
+
+  it("prod refuses a test key and sk_live_; staging refuses a live key: no Stripe call", async () => {
+    await seed(A, "cus_existingA");
+    const s = fakeStripe();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    for (const [OA_ENV, STRIPE_SECRET_KEY, appHost] of [
+      ["prod", "sk_test_FAKEfakeFAKE0123", "acme.open-artifacts.app"],
+      ["prod", "sk_live_FAKEfakeFAKE0123", "acme.open-artifacts.app"],
+      ["staging", "rk_live_FAKEfakeFAKE0123", HOST_A],
+    ] as const) {
+      env = { ...baseEnv(), OA_ENV, STRIPE_SECRET_KEY };
+      const r = await call(req("/portal", { install: A }, { appHost }));
+      expect(r.status, `${OA_ENV} ${STRIPE_SECRET_KEY.slice(0, 7)}`).toBe(500);
+    }
+    expect(s.calls).toEqual([]);
   });
 });
 
