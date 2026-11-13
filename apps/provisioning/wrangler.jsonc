@@ -219,7 +219,10 @@
       "vars": {
         "OA_ENV": "prod",
         "APP_DOMAIN": "open-artifacts.app",
-        "SIGNUPS_ENABLED": "false",
+        // The prod.json value, filled at deploy like staging's: the provisioner and the
+        // scheduler take it from there too, and a literal here left provisioning on
+        // false while they got invite.
+        "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // The sender of the approval email (#2096), the provisioner's value.
