@@ -19,7 +19,7 @@ export interface ApprovalEmail {
 
 export const APPROVAL_SUBJECT = "You're in: Open Artifacts beta";
 
-const esc = (s: string): string =>
+export const esc = (s: string): string =>
   s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -52,7 +52,7 @@ export const signupLink = (appDomain: string): string =>
  * span splits the text node at the "@" (or after "https://"), which defeats
  * the autolinker. The document also sets the format-detection meta.
  */
-const NOLINK = "color:inherit;text-decoration:none;";
+export const NOLINK = "color:inherit;text-decoration:none;";
 const plainAddress = (s: string): string => {
   const at = s.indexOf("@");
   return at < 0
