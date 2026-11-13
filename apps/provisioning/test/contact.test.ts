@@ -272,6 +272,28 @@ describe("POST /api/v1/contact", () => {
     expect(m.sent).toEqual([]);
   });
 
+  it("a Turnstile lookup that throws is 503 unavailable, not a 500, and stores nothing", async () => {
+    const prov = fakeProvisionerRpc({
+      turnstile: () => {
+        throw Object.assign(new Error("turnstile_missing"), {
+          code: "turnstile_missing",
+        });
+      },
+    });
+    const m = mailer();
+    const e = envWith(m, { PROVISIONER: prov });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = await post(e, body({ turnstile: "secret-token" }));
+    expect(r.status).toBe(503);
+    expect(await errCode(r)).toBe("unavailable");
+    expect(await rows()).toEqual([]);
+    expect(m.sent).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(warn.mock.calls)).toContain("turnstile_missing");
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-token");
+    warn.mockRestore();
+  });
+
   it("passes the token, the client address, the signup action and the host to Turnstile", async () => {
     const e = envWith();
     await post(e, body({ turnstile: "tok-1" }));
