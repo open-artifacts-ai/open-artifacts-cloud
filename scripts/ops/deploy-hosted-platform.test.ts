@@ -1349,7 +1349,9 @@ describe("deploy-hosted-platform.sh", () => {
       const next = JSON.parse(live(key));
       if (app === "provisioning")
         next.result.bindings = next.result.bindings.filter(
-          (b: { name: string }) => !b.name.startsWith("WELCOME_"),
+          // v0.154.0 predates WELCOME_* and BUSINESS_REQUESTS_TO (open-artifacts#2404).
+          (b: { name: string }) =>
+            !b.name.startsWith("WELCOME_") && b.name !== "BUSINESS_REQUESTS_TO",
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.

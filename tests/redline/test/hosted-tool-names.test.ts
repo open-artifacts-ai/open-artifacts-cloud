@@ -64,7 +64,11 @@ describe("HOSTED_TOOL_NAMES", () => {
   it("matches the names in apps/provisioning HOSTED_TOOLS", () => {
     const { names, elements } = parseHostedTools(
       src("hosted-tools.ts"),
-      constsFrom(src("routes/set-tier.ts"), src("routes/beta.ts")),
+      constsFrom(
+        src("routes/set-tier.ts"),
+        src("routes/beta.ts"),
+        src("routes/business.ts"),
+      ),
     );
     expect(names.length).toBeGreaterThan(0);
     // Every entry must be named: an unparsed form fails here, not silently.

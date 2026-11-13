@@ -397,6 +397,7 @@ describe("server identity, tools, resources, prompts (9A.5)", () => {
     expect(tools.map((t) => t.name)).toEqual([
       ...ADMIN_TOOL_NAMES,
       "list_waitlist",
+      "list_business_requests",
       "beta_stats",
       "approve_waitlist",
       "allow_signup",
@@ -406,7 +407,7 @@ describe("server identity, tools, resources, prompts (9A.5)", () => {
     for (const t of tools.filter(
       (x) =>
         x.name !== "set_install_tier" &&
-        !x.name.match(/waitlist|allow|beta_stats/),
+        !x.name.match(/waitlist|allow|beta_stats|business_requests/),
     )) {
       const def = toolOf(t.name as AdminToolName);
       expect(t.description).toBe(def.description);

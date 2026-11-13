@@ -14,12 +14,14 @@ async function startMocks() {
     { http, HttpResponse },
     { createMock },
     { createBetaMock },
+    { createBusinessMock },
     { autoAdvance },
   ] = await Promise.all([
     import("msw/browser"),
     import("msw"),
     import("./mocks/handlers"),
     import("./mocks/beta"),
+    import("./mocks/business"),
     import("./mocks/autoAdvance"),
   ]);
   // ?mock=unauth: GET /api/v1/me answers 401.
@@ -159,7 +161,13 @@ async function startMocks() {
     mode: flag === "beta-open" ? "true" : "invite",
     ...(flag === "beta-empty" ? { waitlist: [], allowed: [] } : {}),
   });
-  const worker = setupWorker(...extra, ...beta.handlers, ...mock.handlers);
+  const business = createBusinessMock({ now: Date.now });
+  const worker = setupWorker(
+    ...extra,
+    ...beta.handlers,
+    ...business.handlers,
+    ...mock.handlers,
+  );
   autoAdvance(worker.events, mock, 1500);
   await worker.start({
     onUnhandledRequest: "bypass",

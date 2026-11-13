@@ -31,11 +31,13 @@ import { handleMcp } from "./mcp/index.js";
 import { isRefusal } from "./principal.js";
 import { refuse } from "./refuse.js";
 import { BETA_PATH_RE, betaApi } from "./routes/beta.js";
+import { BUSINESS_PATH_RE, businessApi } from "./routes/business.js";
 import { CLAIM_FREE_PATH, freeClaim } from "./routes/claim-free.js";
 import { bodyKeys, invokeRoute } from "./routes/invoke.js";
 import { SET_TIER_PATH_RE, setTier } from "./routes/set-tier.js";
 import { matchRoute } from "./routes/table.js";
 import { ipKeyOf } from "./services/counters.js";
+import { submitContact } from "./signup/contact.js";
 import {
   SIGNUP_CSP,
   signupConfig,
@@ -145,6 +147,10 @@ async function route(
       if (r) return refuse(env, "auth", r.code, req);
       return guard(() => signupStatus(env, p));
     }
+    if (path === "/api/v1/contact") {
+      if (req.method !== "POST") return methodNotAllowed("POST");
+      return guard(() => submitContact(req, env, clientIp(req), Date.now()));
+    }
     if (path === "/api/v1/signup/waitlist") {
       if (req.method !== "POST") return methodNotAllowed("POST");
       return guard(() => joinWaitlist(req, env, Date.now()));
@@ -159,6 +165,16 @@ async function route(
   const betaPath = host === "admin" ? BETA_PATH_RE.exec(path) : null;
   if (betaPath)
     return betaRoute(req, env, clientIp(req), betaPath[1] ?? "", url);
+  const bizPath = host === "admin" ? BUSINESS_PATH_RE.exec(path) : null;
+  if (bizPath)
+    return betaRoute(
+      req,
+      env,
+      clientIp(req),
+      bizPath[1] ?? "",
+      url,
+      businessApi,
+    );
 
   const tierPath = host === "admin" ? SET_TIER_PATH_RE.exec(path) : null;
   if (tierPath) {
@@ -262,6 +278,7 @@ async function betaRoute(
   ip: string,
   sub: string,
   url: URL,
+  api: typeof betaApi = betaApi,
 ): Promise<Response> {
   const p = await authenticate(req, env, "admin");
   if (isRefusal(p)) return refuse(env, "auth", p.code, req);
@@ -271,7 +288,7 @@ async function betaRoute(
     const read = req.method === "GET";
     const rl = await limit(env, read ? "read" : "write", p.rateKey);
     if (rl) throw new ApiError(rl.code);
-    const r = await betaApi(
+    const r = await api(
       env,
       p,
       { method: req.method, sub, url, body: () => readJsonBody(req) },

@@ -207,6 +207,7 @@ it("real admin: Agent tokens nav, the email search and Create install", async ()
   expect(await navLinks()).toEqual([
     "Installs",
     "Beta",
+    "Business requests",
     "Audit log",
     "Agent tokens",
   ]);
