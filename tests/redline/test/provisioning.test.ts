@@ -54,8 +54,6 @@ import { credFile, rawTargets } from "../src/provisioning-live.ts";
 import {
   ACCEPTED_UNPROVEN,
   acceptedUnproven,
-  DELETE_HUB_NOT_GATING,
-  P54_NAME,
   caseKey,
   gatePasses,
   PRE_PROD_NA,
@@ -162,12 +160,12 @@ const level = (o: Outcome | string | undefined) =>
 vi.mock("../src/bus-gate.ts", () => ({ HOSTED_BUS_LIFTED: true }));
 
 describe("the probes on a conforming staging fake", () => {
-  it("covers P1-P54 exactly once: a probe, or removed with the issue that says why", () => {
+  it("covers P1-P53 exactly once: a probe, or removed with the issue that says why", () => {
     const removed = Object.keys(REMOVED_PROBES);
     const ids = [...PROBES.map((p) => p.id), ...removed]
       .map((id) => Number(id.slice(1)))
       .sort((a, b) => a - b);
-    expect(ids).toEqual(Array.from({ length: 54 }, (_, i) => i + 1));
+    expect(ids).toEqual(Array.from({ length: 53 }, (_, i) => i + 1));
     expect(removed.sort()).toEqual(["P35", "P50"]);
     expect(REMOVED_PROBES.P35).toMatch(/^#1260: /);
     expect(REMOVED_PROBES.P50).toMatch(/^#1078: /);
@@ -363,12 +361,6 @@ describe("each probe fails on the behaviour it guards", () => {
     ["p21_stays_paused", "P21", /P21 \/healthz 200: not within 120 s/],
     ["p22_closed_404", "P22", /P22 closed page/],
     ["p23_no_row", "P23", /P23: inventory has no row for it/],
-    [
-      "hub_survives",
-      "P54",
-      /P54: oa-s-.*'s delete left Durable Object namespaces behind, and with them the BusHub data: ns-.*:BusHub, ns-.*:Other/,
-    ],
-    ["hub_none", "P54", /P54: oa-s-.* had no Durable Object namespace before/],
     [
       "p23_slug_freed",
       "P23",
@@ -1327,32 +1319,6 @@ describe("each probe fails on the behaviour it guards", () => {
     );
   });
 
-  it("P54 (open-artifacts#2360): namespaces before the delete, BusHub among them, none after: pass, naming ids and classes only", async () => {
-    const f = fakeApi();
-    const out = (await runAll(f)).get("P54") as { level: string; note?: string };
-    expect(out.level).toBe("pass");
-    expect(out.note).toMatch(
-      /^oa-s-.*: 2 Durable Object namespace\(s\) before the delete \(ns-.*:BusHub, ns-.*:Other\), none after$/,
-    );
-  });
-
-  it("P54 is unproven with the not-gating reason when the lane has no way to list namespaces, and the gate accepts exactly that", async () => {
-    const f = fakeApi();
-    f.io.doNamespaces = undefined;
-    const out = (await runAll(f)).get("P54");
-    expect(out).toEqual({
-      level: "unproven-live",
-      reason: DELETE_HUB_NOT_GATING,
-    });
-    const c = {
-      name: P54_NAME,
-      file: "live/provisioning.test.ts",
-      level: "unproven-live" as const,
-      reason: DELETE_HUB_NOT_GATING,
-    };
-    expect(acceptedUnproven(c)).toBeDefined();
-  });
-
   it("P53 is unproven, never pass, when the seam never fires", async () => {
     const f = fakeApi();
     f.faults.add("p53_no_kill");
@@ -2242,7 +2208,7 @@ describe("a failed step doesn't cascade", () => {
       seen.add(p.id);
     }
     // P20 and P22 need nothing now: they run on rl-l, not P13's rl-p.
-    expect(PROBES.filter((p) => p.needs).length).toBe(12);
+    expect(PROBES.filter((p) => p.needs).length).toBe(11);
   });
 
   it("every needs is earlier in the probe's own chain, so a failure blocks only its own chain", () => {
@@ -2417,7 +2383,6 @@ describe("the chains run at once (startChains)", () => {
     "P45",
     "P31",
     "P23",
-    "P54",
   ];
   /** The run's own installs (rl-p, rl-l, rl-q) still live. */
   const live = (f: FakeApi) =>

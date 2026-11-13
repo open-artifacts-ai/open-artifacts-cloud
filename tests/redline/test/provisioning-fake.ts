@@ -129,8 +129,6 @@ export type Fault =
   | "p16_late"
   | "p22_closed_404"
   | "p23_no_row"
-  | "hub_survives"
-  | "hub_none"
   | "p23_slug_freed"
   | "p23_cooling"
   | "p44_unlisted_redirect"
@@ -1285,21 +1283,6 @@ export function fakeApi(): FakeApi {
     jwt: async () => API_JWT,
     stgInventoryJwt: async () => INV_JWT,
     schemaOf: async (v) => schemaOf(v),
-    // open-artifacts#2360: an install's script has a BusHub namespace and a
-    // second class; a delete (the row deleting or deleted) removes them,
-    // unless the fault leaves them behind. The fault "hub_none" lists none
-    // before the delete.
-    doNamespaces: async (script) => {
-      const id = script.replace(/^oa-s-/, "");
-      const i = installs.get(id);
-      if (!i || faults.has("hub_none")) return [];
-      const gone = i.state === "deleting" || i.state === "deleted";
-      if (gone && !faults.has("hub_survives")) return [];
-      return [
-        { id: `ns-${id}-hub`, class: "BusHub", script },
-        { id: `ns-${id}-other`, class: "Other", script },
-      ];
-    },
   };
   void panel;
   return {

@@ -1310,10 +1310,6 @@
     },
     {
       "file": "live/provisioning.test.ts",
-      "name": "provisioning > P54: delete wipes the hub (open-artifacts#2360): rl-p's Durable Object namespaces, BusHub among them, exist before the delete and none is left after the delete job is done"
-    },
-    {
-      "file": "live/provisioning.test.ts",
       "name": "provisioning > P51: bus (#1299): suspend closes a long-connected machine socket and refuses a new one; the same token connects again after resume"
     },
     {

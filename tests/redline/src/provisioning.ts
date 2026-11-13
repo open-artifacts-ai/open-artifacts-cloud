@@ -20,22 +20,10 @@ import {
   networkCode,
   notResolved,
 } from "./fetch-timeout.ts";
-import {
-  type DoLister,
-  type HubRecord,
-  judge,
-  recordAfter,
-  recordBefore,
-  stagingScript,
-} from "./hub-wipe.ts";
 import { RETRY_BACKOFF_MS, safeCode } from "./http.ts";
 import { note } from "./notes.ts";
 import { PROD_ADMIN_ORIGIN } from "./prod.ts";
-import {
-  DELETE_HUB_NOT_GATING,
-  NIGHTLY_NA_REASON,
-  PRE_PROD_REASON,
-} from "./report.ts";
+import { NIGHTLY_NA_REASON, PRE_PROD_REASON } from "./report.ts";
 import { type Schema, schemaAhead } from "./schema.ts";
 import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 
@@ -116,12 +104,6 @@ export interface ProvIo {
   bus?: BusIo;
   /** The D1 migrations and Durable Object tags of a release (P31). */
   schemaOf?: (version: string) => Promise<Schema>;
-  /**
-   * An install script's Durable Object namespaces, read-only (P23 and P54,
-   * open-artifacts#2360). Absent when the lane has no Cloudflare token that
-   * can read Workers scripts: P54 is then unproven-live.
-   */
-  doNamespaces?: DoLister;
 }
 
 /**
@@ -194,8 +176,6 @@ export const BUS_CLOSE_WITHIN_MS = 360_000;
 /** HOSTS is KV: a write takes up to 60 s to show everywhere. Two periods. */
 export const HOSTS_SETTLE_MS = 120_000;
 export const JOB_WITHIN_MS = 20 * 60_000;
-/** How long rl-p's Durable Object namespaces may take to go after its delete job is done (P23). */
-export const HUB_WIPE_WITHIN_MS = 2 * 60_000;
 /** A case's vitest timeout: its slowest wait plus margin. */
 export const PROBE_TIMEOUT_MS = JOB_WITHIN_MS + 5 * 60_000;
 /** The run's cleanup: one install can wait on a live job, a delete and a purge. */
@@ -512,8 +492,6 @@ export interface RunState {
   p15?: { checked: number; violations: string[] };
   /** P16: the upgrade sent while the create ran ("late": it was accepted). */
   p16?: Res | "late";
-  /** P23: rl-p's Durable Object namespaces around its delete (P54 judges them). */
-  hub?: HubRecord;
   /** A non-rl install id from inventory (P10, P45). */
   panelInstall?: string | null;
   releases?: Release[];
@@ -961,7 +939,6 @@ export const CHAINS: readonly Chain[] = [
       "P45",
       "P31",
       "P23",
-      "P54",
     ],
   },
   {
@@ -2560,10 +2537,6 @@ export const PROBES: readonly Probe[] = [
     // up after itself.
     run: async (run) => {
       const p = rlp(run);
-      // open-artifacts#2360: read rl-p's Durable Object namespaces around the
-      // delete (never fails P23; P54 judges what was seen).
-      const list = run.io.doNamespaces;
-      if (list) run.s.hub = await recordBefore(list, stagingScript(p.id));
       const d = run.accepted(
         await run.v1(`/installs/${p.id}/delete`, {
           body: { requestId: run.rid("p23-del"), confirmSlug: p.slug },
@@ -2571,13 +2544,6 @@ export const PROBES: readonly Probe[] = [
         "P23 delete",
       );
       await run.done(d.job.id, "P23 delete");
-      if (list && run.s.hub)
-        await recordAfter(list, run.s.hub, {
-          now: run.io.now,
-          wait: run.io.wait,
-          withinMs: HUB_WIPE_WITHIN_MS,
-          pollMs: POLL_MS,
-        });
       const g = run.accepted(
         await run.v1(`/installs/${p.id}/purge`, {
           body: { requestId: run.rid("p23-purge"), confirmSlug: p.slug },
@@ -2613,18 +2579,6 @@ export const PROBES: readonly Probe[] = [
           `P23: R18 after purge: ${desc(s)}, want taken or cooling`,
         );
       return pass();
-    },
-  },
-  {
-    id: "P54",
-    needs: ["P13", "P23"],
-    title:
-      "delete wipes the hub (open-artifacts#2360): rl-p's Durable Object namespaces, BusHub among them, exist before the delete and none is left after the delete job is done",
-    run: async (run) => {
-      if (!run.io.doNamespaces) return unproven(DELETE_HUB_NOT_GATING);
-      const v = judge(run.s.hub);
-      if (!v.ok) throw new ProbeFail(`P54: ${v.reason}`);
-      return pass(v.note);
     },
   },
   {

@@ -41,9 +41,7 @@ import {
   writeBusPair,
   writeBusPairError,
 } from "./hosted-bus.ts";
-import { cfDoLister, type DoLister } from "./hub-wipe.ts";
 import { hookReason } from "./http.ts";
-import { parseProvisionerProbe } from "./provisioner.ts";
 import {
   AUDIENCES,
   type AudienceKey,
@@ -206,32 +204,6 @@ export function liveBusIo(
   };
 }
 
-/**
- * P23/P54's read of an install script's Durable Object namespaces
- * (open-artifacts#2360): GET only, with the staging token the lane already
- * has (REDLINE_STG_PROVISIONER: accountId and tokenFile), which must also be
- * able to read Workers scripts. Undefined when that config is absent, so P54
- * is unproven-live; a token that cannot list them fails P54 (HTTP status and
- * error codes only), which is unproven-live too while it is not gating.
- */
-export function liveDoNamespaces(
-  env: Record<string, string | undefined>,
-): DoLister | undefined {
-  let p: ReturnType<typeof parseProvisionerProbe>;
-  try {
-    p = parseProvisionerProbe(env);
-  } catch {
-    return undefined;
-  }
-  if (!p) return undefined;
-  const { tokenFile } = p;
-  return cfDoLister(
-    p.accountId,
-    () => readSecretFile(tokenFile, "REDLINE_STG_PROVISIONER token"),
-    boundFetch(globalThis.fetch),
-  );
-}
-
 export function liveRun(
   env: Record<string, string | undefined>,
   t: RawTargets,
@@ -252,7 +224,6 @@ export function liveRun(
     stgInventoryJwt: src("stagingInventory"),
     schemaOf: gitSchemaOf,
     bus: liveBusIo(env),
-    doNamespaces: liveDoNamespaces(env),
     rlAPat: existsSync(patFile)
       ? () => readSecretFile(patFile, secretFileName(t.a.name, "PAT"))
       : undefined,

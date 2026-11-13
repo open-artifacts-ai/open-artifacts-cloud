@@ -1,8 +1,4 @@
-import {
-  DELETE_HUB_NOT_GATING,
-  HOSTED_BUS_NOT_GATING,
-  P54_NAME,
-} from "../src/report.ts";
+import { HOSTED_BUS_NOT_GATING } from "../src/report.ts";
 
 // Cases added to live/manifest.json after #1730's base. test/fixtures/main-cases.json
 // and the recording in test/fixtures/run-42402998826.json freeze that base, so a
@@ -38,9 +34,6 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/provisioning.test.ts",
       name: "provisioning > P53: a killed upgrade is retried by its own job (#1501): rl-f-k's first attempt dies after its version write with the row upgrading, the job's retry takes the lease and finishes active on the new version",
     },
-    // open-artifacts#2360: a delete wipes the install's Durable Object
-    // namespaces; accepted unproven for one release.
-    { file: "live/provisioning.test.ts", name: P54_NAME },
     // #1346 role reach, ported with the v0.140.0 pin bump.
     ...[
       "org GET /api/v1/bus/reach [session]",
@@ -122,10 +115,5 @@ export const ACCEPTED_UNPROVEN_ADDED_SINCE_1730: readonly {
     name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     reason: HOSTED_BUS_NOT_GATING,
     file: "bus.test.ts",
-  },
-  {
-    name: P54_NAME,
-    reason: DELETE_HUB_NOT_GATING,
-    file: "provisioning.test.ts",
   },
 ];
