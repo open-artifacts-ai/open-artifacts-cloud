@@ -1,8 +1,15 @@
 // chain-dispatch.ts: the chain's deploy dispatches one run and fails closed
 // unless exactly that run is found and succeeds. gh is a stub with a fake
 // clock; nothing is dispatched.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { dispatchAndWait, type Exec, outputLine } from "./chain-dispatch.ts";
+import {
+  billingConfigured,
+  dispatchAndWait,
+  type Exec,
+  outputLine,
+} from "./chain-dispatch.ts";
 
 const T0 = Date.parse("2026-11-05T12:00:00Z");
 const CHAIN = "c555-1";
@@ -93,6 +100,62 @@ describe("chain-dispatch", () => {
       `chain_id=${CHAIN}`,
     ])
       expect(d).toContain(f);
+  });
+  it("billing (#1568): the deploy targets carry billing before provision-token only when prod's billing is configured; otherwise the default list, so no release breaks", () => {
+    const targets = (billing: boolean | undefined) => {
+      const h = harness({ list: () => [run()] });
+      dispatchAndWait({
+        exec: h.exec,
+        repo: "o/r",
+        tag: "v1.2.3",
+        chainId: CHAIN,
+        ...(billing === undefined ? {} : { billing }),
+        now: () => T0,
+        sleep: () => {},
+      });
+      const d = h.calls[0] as string[];
+      return d.find((x) => x.startsWith("targets=")) as string;
+    };
+    const FULL =
+      "targets=platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+    const WITH =
+      "targets=platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+    expect(targets(undefined)).toBe(FULL);
+    expect(targets(false)).toBe(FULL);
+    expect(targets(true)).toBe(WITH);
+  });
+  it("billingConfigured: the four required prices filled means configured; all empty or absent means skip; partly filled, a malformed id or bad JSON throws", () => {
+    const four = {
+      stripe_price_team: "price_Team1",
+      stripe_price_business: "price_Biz1",
+      stripe_price_solo_monthly: "price_SoloM1",
+      stripe_price_solo_yearly: "price_SoloY1",
+    };
+    const empty = Object.fromEntries(Object.keys(four).map((k) => [k, ""]));
+    expect(billingConfigured(JSON.stringify(four))).toBe(true);
+    expect(
+      billingConfigured(
+        JSON.stringify({ ...four, stripe_price_team_yearly: "" }),
+      ),
+    ).toBe(true);
+    expect(billingConfigured(JSON.stringify(empty))).toBe(false);
+    expect(billingConfigured(JSON.stringify({}))).toBe(false);
+    expect(() =>
+      billingConfigured(JSON.stringify({ ...empty, stripe_price_team: "price_1" })),
+    ).toThrow("partly filled");
+    expect(() =>
+      billingConfigured(JSON.stringify({ ...four, stripe_price_team: "prod_1" })),
+    ).toThrow("not a Stripe price id");
+    expect(() => billingConfigured("{not json")).toThrow();
+  });
+  it("the committed prod.json skips billing until its prices are filled", () => {
+    const prod = readFileSync(
+      join(import.meta.dirname, "../../.github/hosted/prod.json"),
+      "utf8",
+    );
+    expect(billingConfigured(prod)).toBe(
+      /"stripe_price_team":\s*"price_/.test(prod),
+    );
   });
   it("dispatches hosted-publish.yml (#1412) with env, tag and chain id only, and matches its own run title", () => {
     const title = `hosted-publish prod v1.2.3 [${CHAIN}]`;

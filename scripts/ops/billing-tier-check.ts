@@ -6,9 +6,9 @@
 // bindings match, lack a valid TIER. The server reads an install with no TIER
 // and no billing row as Solo (S3), so such an install would lock to Solo the
 // moment dispatch passes it the billing gate. Fail closed: a missing,
-// unreadable or non-JSON vars value refuses too. Prints only the count (the
-// cloud repo's Actions logs are public: no install id, slug or var value); the
-// list is read with oa-admin-prod. Read-only.
+// unreadable or non-JSON vars value refuses too. Prints no number, id, slug
+// or var value (the cloud repo's Actions logs are public); the list is read
+// with oa-admin-prod. Read-only.
 // Usage: CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PLATFORM_DB_ID
 //   node scripts/ops/billing-tier-check.ts prod
 import { realpathSync } from "node:fs";
@@ -68,23 +68,22 @@ if (
     )
   )
     fail("PLATFORM_DB_ID must be a uuid", 2);
+  let bad = false;
   try {
     const rows = await d1({
       token: CLOUDFLARE_API_TOKEN as string,
       accountId: CLOUDFLARE_ACCOUNT_ID as string,
       databaseId: PLATFORM_DB_ID as string,
     }).all("SELECT id, slug, state, vars FROM installs ORDER BY id");
-    const n = tierProblemCount(rows as unknown as InstallRow[]);
-    if (n > 0)
-      fail(
-        `refusing to bind BILLING on prod: ${n} active install(s) have no valid TIER; set TIER (or a billing row) first. Read the list with oa-admin-prod.`,
-      );
-    console.log(
-      `billing bind check: every active prod install (${rows.length} listed) has a TIER`,
-    );
+    bad = tierProblemCount(rows as unknown as InstallRow[]) > 0;
   } catch {
     fail(
       "billing bind check: the installs could not be read; refusing (fail closed)",
     );
   }
+  if (bad)
+    fail(
+      "refusing: an active install has no valid TIER; read the list with oa-admin-prod",
+    );
+  console.log("billing bind check: ok");
 }

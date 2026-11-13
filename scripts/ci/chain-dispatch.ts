@@ -21,7 +21,7 @@
 // run-name builds from its inputs. Zero matches by the
 // find deadline, or more than one, fails.
 import { spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
@@ -38,6 +38,40 @@ const WORKFLOWS: Record<Which, { file: string; name: string }> = {
 const BOT = "github-actions[bot]";
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+/** The full list with billing (#1568), between the directory broker and provision-token. */
+const FULL_BILLING =
+  "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+const PRICE_RE = /^price_[A-Za-z0-9]{1,255}$/;
+const REQUIRED_PRICES = [
+  "stripe_price_team",
+  "stripe_price_business",
+  "stripe_price_solo_monthly",
+  "stripe_price_solo_yearly",
+] as const;
+
+/**
+ * Whether prod's billing is configured: the four required live price ids are
+ * filled in prod.json (each a price id). Empty means not yet, and the chain
+ * skips the billing target cleanly instead of failing every prod release.
+ * Throws on JSON that cannot be read or a filled value that is not a price id
+ * (a broken file fails the chain, never silently skips).
+ */
+export function billingConfigured(prodJson: string): boolean {
+  const j = JSON.parse(prodJson) as Record<string, unknown>;
+  let filled = 0;
+  for (const k of REQUIRED_PRICES) {
+    const v = j[k];
+    if (v === undefined || v === null || v === "") continue;
+    if (typeof v !== "string" || !PRICE_RE.test(v))
+      throw new Error(`prod.json: ${k} is not a Stripe price id`);
+    filled++;
+  }
+  // Partly filled is a broken state: the billing target would refuse for the
+  // missing price, so the chain says so now.
+  if (filled !== 0 && filled !== REQUIRED_PRICES.length)
+    throw new Error("prod.json: the billing prices are only partly filled");
+  return filled === REQUIRED_PRICES.length;
+}
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const CHAIN_RE = /^[A-Za-z0-9-]{1,40}$/;
 
@@ -62,6 +96,8 @@ export interface Opts {
   chainId: string;
   /** Which workflow to dispatch; deploy by default. */
   workflow?: Which;
+  /** Deploy with the billing target (prod's billing is configured). */
+  billing?: boolean;
   now: () => number;
   sleep: (ms: number) => void;
   /** Called as soon as the run is found, before waiting for it. */
@@ -107,7 +143,7 @@ export function dispatchAndWait(o: Opts): Outcome {
     ...(which === "deploy"
       ? [
           "-f",
-          `targets=${FULL}`,
+          `targets=${o.billing ? FULL_BILLING : FULL}`,
           "-f",
           "reason=",
           "-f",
@@ -238,7 +274,19 @@ function main(argv: string[]) {
     if (out) appendFileSync(out, line);
   };
   try {
+    const billing =
+      flag(argv, "workflow") !== "publish" &&
+      billingConfigured(
+        readFileSync(flag(argv, "hosted-file") || ".github/hosted/prod.json", "utf8"),
+      );
+    if (flag(argv, "workflow") !== "publish")
+      console.log(
+        billing
+          ? "chain-dispatch: the billing target is included"
+          : "chain-dispatch: billing skipped (prod's price ids are not filled in prod.json)",
+      );
     const r = dispatchAndWait({
+      billing,
       exec: realExec,
       repo: flag(argv, "repo"),
       tag: flag(argv, "tag"),

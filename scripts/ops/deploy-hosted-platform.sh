@@ -304,7 +304,7 @@ billing_pre() {
   if [ "$env" = prod ] && [ -z "$VERIFY_ONLY" ]; then
     need PLATFORM_DB_ID
     PLATFORM_DB_ID="$PLATFORM_DB_ID" node --experimental-strip-types --no-warnings "$root/scripts/ops/billing-tier-check.ts" prod ||
-      { echo "refusing to bind BILLING on prod to $1: read the installs without a TIER with oa-admin-prod" >&2; exit 1; }
+      { echo "refusing to bind BILLING on prod to $1; read the list with oa-admin-prod" >&2; exit 1; }
   fi
   BILLING_DECLARED=1
 }

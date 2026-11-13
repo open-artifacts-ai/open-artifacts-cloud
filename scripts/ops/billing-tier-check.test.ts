@@ -103,7 +103,7 @@ describe("the script", () => {
     );
     return stub;
   };
-  it("a refusal prints the count and 'oa-admin-prod', never an install id, slug or var value", () => {
+  it("a refusal prints no number, id, slug or var value, only the pointer to oa-admin-prod", () => {
     const stub = withRows([
       row("iSECRETidAAAA", JSON.stringify({ TIER: "trial" })),
       row(
@@ -115,7 +115,10 @@ describe("the script", () => {
     const r = exec("prod", base, ["--import", stub]);
     expect(r.status).toBe(1);
     const all = r.stdout + r.stderr;
-    expect(all).toContain("2 active install(s) have no valid TIER");
+    expect(all).toContain(
+      "refusing: an active install has no valid TIER; read the list with oa-admin-prod",
+    );
+    expect(all).not.toMatch(/\d/);
     expect(all).toContain("oa-admin-prod");
     for (const s of ["iSECRETid", "slug-", "NEVERAPPEARvalue"])
       expect(all).not.toContain(s);
@@ -126,6 +129,7 @@ describe("the script", () => {
     ]);
     const r = exec("prod", base, ["--import", stub]);
     expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("billing bind check: ok");
     expect(r.stdout + r.stderr).not.toContain("iSECRETid");
     expect(r.stdout + r.stderr).not.toContain("slug-");
   });
