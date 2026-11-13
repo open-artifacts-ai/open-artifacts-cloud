@@ -821,12 +821,12 @@ describe("scripts/redline.ts with no targets", () => {
 });
 
 describe("lane output prefixing", () => {
-  it("keeps ::workflow commands:: at line start and prefixes the rest", () => {
+  it("keeps ::add-mask:: at line start and prefixes the rest", () => {
     const from = new PassThrough();
     let out = "";
     prefixed(from, { write: (s) => (out += s) }, "[a] ");
     from.write(
-      "hello\n::add-mask::x\n  ::add-mask::y\r\nplain ::not-cmd::\n::add-mask::tail",
+      "hello\n::add-mask::x\n  ::add-mask::y\r\nplain ::not-cmd::\n::stop-commands::tok\n::add-mask::tail",
     );
     from.end();
     return new Promise<void>((res) =>
@@ -836,6 +836,7 @@ describe("lane output prefixing", () => {
           "::add-mask::x",
           "  ::add-mask::y\r",
           "[a] plain ::not-cmd::",
+          "[a] ::stop-commands::tok",
           "::add-mask::tail",
           "",
         ]);

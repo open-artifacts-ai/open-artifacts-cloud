@@ -1,10 +1,12 @@
 /**
- * Copies `from` to `to` a whole line at a time, each line prefixed. A line that
- * starts with `::` is a GitHub Actions workflow command (`::add-mask::`, ...):
- * the runner parses those only at the start of a line, so they go out bare.
+ * Copies `from` to `to` a whole line at a time, each line prefixed. Only a
+ * `::add-mask::` line goes out bare: the runner parses workflow commands only
+ * at the start of a line, so a prefix would leave the secret unmasked. Every
+ * other `::cmd::` (such as `::stop-commands::`) keeps the prefix, so test
+ * output cannot switch masking off.
  */
 export function prefixLine(p: string, line: string): string {
-  return /^[ \t\r]*::/.test(line) ? `${line}\n` : `${p}${line}\n`;
+  return /^[ \t\r]*::add-mask::/.test(line) ? `${line}\n` : `${p}${line}\n`;
 }
 
 export function prefixed(
