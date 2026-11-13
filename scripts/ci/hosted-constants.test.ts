@@ -175,10 +175,10 @@ describe(".github/hosted/<env>.json", () => {
   // Design 155 and M4: prod stays closed. User decision 2026-11-10 (option
   // A): staging sign-ups are open to anyone, capped at 20 a day, for the M2
   // exit-test walk (it was test-users only, #1012, P29).
-  it("prod signups stay closed with a cap of 20, staging is invite-only (beta proof, #2096) with a cap of 20; the caps and alert addresses are the Manager's", () => {
+  it("prod is invite-only too (the private beta, #2096) with a cap of 20, staging is invite-only (beta proof, #2096) with a cap of 20; the caps and alert addresses are the Manager's", () => {
     expect(read("prod").signup_daily_cap).toBe(20);
     expect(read("staging").signup_daily_cap).toBe(20);
-    expect(read("prod").signups_enabled).toBe("false");
+    expect(read("prod").signups_enabled).toBe("invite");
     expect(read("staging").signups_enabled).toBe("invite");
     // #1084: the alert address is the owner's: never committed, it comes
     // from the OA_OWNER_EMAIL secret (hosted-constants.sh).
@@ -256,7 +256,7 @@ describe("hosted-constants.sh", () => {
         "GOOGLE_CLIENT_ID=206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com",
         "GOOGLE_DIRECTORY_CLIENT_ID=206295999771-6cr3mbfc7g2ejnvdoqhlf2v8v6sdm023.apps.googleusercontent.com",
         "SIGNUP_DAILY_CAP=20",
-        "SIGNUPS_ENABLED=false",
+        "SIGNUPS_ENABLED=invite",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
         ...PROD_PRICE_LINES(),
         "PROD_SIGNUP_DEPLOY=on",
