@@ -37,6 +37,8 @@ scripts/ci/assemble-release.mjs
 scripts/ci/build-hosted-release.ts
 scripts/ci/chain-dispatch.test.ts
 scripts/ci/chain-dispatch.ts
+scripts/ci/check-hosted-owned-vars.test.ts
+scripts/ci/check-hosted-owned-vars.ts
 scripts/ci/check-hosted-release.ts
 scripts/ci/deploy-hosted-platform-workflow.test.ts
 scripts/ci/deploy-token-expiry.sh

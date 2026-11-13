@@ -86,6 +86,9 @@ ALLOW=(
   # The report-only orphaned Durable Object namespaces check (open-artifacts#2360).
   scripts/ci/do-orphans.sh
   scripts/ci/do-orphans.test.ts
+  # The hosted-owned vars check (#262), this repo's own.
+  scripts/ci/check-hosted-owned-vars.ts
+  scripts/ci/check-hosted-owned-vars.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
