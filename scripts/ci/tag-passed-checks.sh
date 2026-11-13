@@ -88,7 +88,7 @@ check_run() {
 
 # check_jobs <workflow-file> <repo-path> <run-id> <required-job>...: each
 # required job completed with success, and no other job in the run failed
-# (NPM_JOBS excepted).
+# (NONBLOCKING_JOBS excepted).
 check_jobs() {
   local wf="$1" r="$2" id="$3" jobs j got bad
   shift 3
@@ -100,7 +100,7 @@ check_jobs() {
     got="$(jq -r --arg n "$j" '[.jobs[] | select(.name == $n)] | if length == 1 then (if .[0].status == "completed" then (.[0].conclusion // "unknown") else "not completed (" + (.[0].status // "unknown") + ")" end) else "missing" end' <<< "$jobs")"
     [ "$got" = success ] || fail "job $j: $got"
   done
-  bad="$(jq -r --argjson npm "$(printf '%s\n' "${NPM_JOBS[@]}" | jq -R . | jq -sc .)" '[.jobs[] | select(.name as $n | $npm | index($n) | not) | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped")) | .name + ": " + (if .status != "completed" then "not completed (" + (.status // "unknown") + ")" else (.conclusion // "unknown") end)] | first // empty' <<< "$jobs")" || fail "$label jobs: unreadable"
+  bad="$(jq -r --argjson npm "$(printf '%s\n' "${NONBLOCKING_JOBS[@]}" | jq -R . | jq -sc .)" '[.jobs[] | select(.name as $n | $npm | index($n) | not) | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped")) | .name + ": " + (if .status != "completed" then "not completed (" + (.status // "unknown") + ")" else (.conclusion // "unknown") end)] | first // empty' <<< "$jobs")" || fail "$label jobs: unreadable"
   [ -z "$bad" ] || fail "job $bad"
 }
 
@@ -117,10 +117,12 @@ check_assets() {
 # staging and prod releases (v0.122.0 was blocked that way). Each listed job
 # must be present exactly once, completed, and concluded success; missing,
 # skipped, cancelled, running or unknown statuses all block. Every other job in
-# the run (deploy-prod, deploy-landing, a job added later) must be completed
-# with success or skipped (deploy-demo is skipped when DEMO_ENABLED is off), so
-# the only jobs allowed to fail are NPM_JOBS.
-NPM_JOBS=(pack-npm publish-npm)
+# the run (deploy-prod, a job added later) must be completed with success or
+# skipped (deploy-demo is skipped when DEMO_ENABLED is off), so the only jobs
+# allowed to fail are NONBLOCKING_JOBS: the npm jobs, and deploy-landing, which
+# goes red on purpose while hosted sign-ups are closed (the public repo's
+# sign-up probe, #2139) and is not a dependency of the hosted deploy.
+NONBLOCKING_JOBS=(pack-npm publish-npm deploy-landing)
 LEGACY_REQUIRED=(
   release-please
   verify-release
