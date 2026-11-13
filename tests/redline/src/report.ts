@@ -561,7 +561,7 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
         'tests/redline/test/hosted-bus.test.ts "case 1: rl-busa\'s machine token at rl-busb"; the live result is in the case label; promotion to gating: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/202',
     },
     {
-      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      name: "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
       reason: HOSTED_BUS_NOT_GATING,
       file: "bus.test.ts",
       evidence:

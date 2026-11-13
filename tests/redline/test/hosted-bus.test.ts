@@ -27,10 +27,12 @@ import {
   crossInstallCase,
   hubView,
   listsName,
+  PAUSE_WINDOW_MS,
   RECONNECT_AT_MS,
   readBusPair,
   type SuspendIo,
   suspendCase,
+  WINDOW_CLOSE_DEADLINE_MS,
   waitBusPair,
   writeBusPair,
 } from "../src/hosted-bus.ts";
@@ -218,6 +220,12 @@ function suspendIo(
     /** The hub after the resume: "same" (default), "changed" or "gone" (ours missing). */
     hubAfter?: "same" | "changed" | "gone";
     daemonClosedEarly?: boolean;
+    /** Reconnects before this (ms after the job's done) get 101 and a held socket (the pause window). */
+    windowUntilMs?: number;
+    /** When the install's later pass closes a window socket (ms after the job's done; null: never) and with what code. */
+    windowCloseAtMs?: number | null;
+    windowCloseCode?: number | null;
+    windowTexts?: string[];
   } = {},
 ): SuspendIo & { log: string[]; reconnectsAt: number[] } {
   const t = { now: 0 };
@@ -231,7 +239,9 @@ function suspendIo(
   });
   const closeAt = o.closeAtMs === undefined ? 5_000 : o.closeAtMs;
   const since = () => (doneAt === null ? -1 : t.now - doneAt);
+  const windowTicks: (() => void)[] = [];
   const tick = () => {
+    for (const w of windowTicks) w();
     if (doneAt !== null && closeAt !== null && closedAt === null)
       if (since() >= closeAt) {
         closedAt = t.now;
@@ -279,8 +289,34 @@ function suspendIo(
       log.push("resume");
       if (o.resumeFails) throw new ProbeFail("rl-busb resume: job failed");
     },
-    reconnect: async () => {
+    reconnectHold: async () => {
       reconnectsAt.push(since());
+      if (o.windowUntilMs !== undefined && since() < o.windowUntilMs) {
+        let open = true;
+        let resolveWin!: () => void;
+        const winClosed = new Promise<void>((r) => {
+          resolveWin = r;
+        });
+        const due =
+          o.windowCloseAtMs === undefined ? 121_000 : o.windowCloseAtMs;
+        windowTicks.push(() => {
+          if (open && due !== null && since() >= due) {
+            open = false;
+            resolveWin();
+          }
+        });
+        return {
+          status: 101,
+          paused: false,
+          sock: {
+            closed: winClosed,
+            isOpen: () => open,
+            closeCode: () =>
+              o.windowCloseCode === undefined ? 4403 : o.windowCloseCode,
+            texts: () => o.windowTexts ?? [],
+          },
+        };
+      }
       if (o.upgradeAtMs !== undefined && since() >= o.upgradeAtMs)
         return { status: 101, paused: false };
       const paused = since() >= (o.pausedFromMs ?? 0);
@@ -308,7 +344,7 @@ function suspendIo(
 }
 
 describe("case 2: suspend rl-busb", () => {
-  it("passes: closes within 30 s with 4403, reconnects at 10, 60 and 125 s are dispatch's paused answer, resumes, reopens with the pending mail, hub intact", async () => {
+  it("passes: closes within 30 s with 4403, reconnects at 10, 60 and 125 s are dispatch's paused answer (no window 101), resumes, reopens with the pending mail, hub intact", async () => {
     const io = suspendIo();
     const r = await suspendCase(io, PAIR);
     // The hub is compared after the resume and BEFORE the reopen (OA Bus M2).
@@ -325,6 +361,79 @@ describe("case 2: suspend rl-busb", () => {
     expect(io.reconnectsAt).toEqual([...RECONNECT_AT_MS]);
     expect(RECONNECT_AT_MS).toEqual([10_000, 60_000, 125_000]);
     expect(r.reconnects).toBe(3);
+    expect(r.windowOpens).toBe(0);
+  });
+
+  describe("the pause window (P20, #228)", () => {
+    it("a 101 at 10 s and 60 s closed with 4403 by the later pass passes, and is recorded", async () => {
+      const io = suspendIo({
+        windowUntilMs: PAUSE_WINDOW_MS,
+        windowCloseAtMs: 121_000,
+      });
+      const r = await suspendCase(io, PAIR);
+      expect(r.windowOpens).toBe(2);
+      expect(r.windowCloseMs).toEqual([121_000, 121_000]);
+      expect(io.log).toContain("resume");
+    });
+
+    it("frames on window sockets are counted by type and a delivery is flagged, never failed on", async () => {
+      const r = await suspendCase(
+        suspendIo({
+          windowUntilMs: PAUSE_WINDOW_MS,
+          windowTexts: [
+            JSON.stringify({ type: "hello_ok" }),
+            JSON.stringify({ type: "deliver" }),
+            "nope",
+          ],
+        }),
+        PAIR,
+      );
+      expect(r.windowFrames).toEqual({ hello_ok: 2, deliver: 2, unparsed: 2 });
+      expect(r.windowDelivery).toBe(true);
+    });
+
+    it("a window socket still open at the deadline is a breach, and still resumes", async () => {
+      const io = suspendIo({
+        windowUntilMs: PAUSE_WINDOW_MS,
+        windowCloseAtMs: null,
+      });
+      const e = await suspendCase(io, PAIR).catch((x) => x);
+      expect(e).toBeInstanceOf(BreachFail);
+      expect((e as Error).message).toMatch(
+        /a socket opened in the pause window was still open 150 s after the suspend/,
+      );
+      expect(io.log).toContain("resume");
+    });
+
+    it("a window socket closed after the deadline is a breach", async () => {
+      await expect(
+        suspendCase(
+          suspendIo({
+            windowUntilMs: PAUSE_WINDOW_MS,
+            windowCloseAtMs: WINDOW_CLOSE_DEADLINE_MS + 1_000,
+          }),
+          PAIR,
+        ),
+      ).rejects.toThrow(/still open 150 s after the suspend/);
+    });
+
+    it("a window socket closed with 1006 is a breach", async () => {
+      const e = await suspendCase(
+        suspendIo({ windowUntilMs: PAUSE_WINDOW_MS, windowCloseCode: 1006 }),
+        PAIR,
+      ).catch((x) => x);
+      expect(e).toBeInstanceOf(BreachFail);
+      expect((e as Error).message).toMatch(/closed with 1006, want 4403/);
+    });
+
+    it("a 101 at 125 s is still a breach, window sockets or not", async () => {
+      const e = await suspendCase(
+        suspendIo({ windowUntilMs: PAUSE_WINDOW_MS, upgradeAtMs: 120_000 }),
+        PAIR,
+      ).catch((x) => x);
+      expect(e).toBeInstanceOf(BreachFail);
+      expect((e as Error).message).toMatch(/upgraded the daemon's token 125 s/);
+    });
   });
 
   it("a close at 30 s passes; at 31 s it fails, though the 120 s pass would come later", async () => {
@@ -375,9 +484,10 @@ describe("case 2: suspend rl-busb", () => {
   });
 
   it("OA Bus M1: a 101 for a suspended install is a breach, never a plain failure", async () => {
-    const e = await suspendCase(suspendIo({ upgradeAtMs: 0 }), PAIR).catch(
-      (x) => x,
-    );
+    const e = await suspendCase(
+      suspendIo({ upgradeAtMs: PAUSE_WINDOW_MS }),
+      PAIR,
+    ).catch((x) => x);
     expect(e).toBeInstanceOf(BreachFail);
     expect((e as Error).message.startsWith(BREACH_MARK)).toBe(true);
   });
