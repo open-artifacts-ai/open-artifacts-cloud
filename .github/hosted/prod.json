@@ -9,7 +9,7 @@
   "google_client_id": "206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com",
   "google_directory_client_id": "206295999771-6cr3mbfc7g2ejnvdoqhlf2v8v6sdm023.apps.googleusercontent.com",
   "signup_daily_cap": 20,
-  "signup_deploy": "off",
+  "signup_deploy": "on",
   "signups_enabled": "false",
   "stripe_price_business": "price_1UbHrCFXnzkboexsnYZYBmo4",
   "stripe_price_business_yearly": "price_1UbHrBFXnzkboexsYtoHtT0U",

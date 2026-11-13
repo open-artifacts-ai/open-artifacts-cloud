@@ -259,7 +259,7 @@ describe("hosted-constants.sh", () => {
         "SIGNUPS_ENABLED=false",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
         ...PROD_PRICE_LINES(),
-        "PROD_SIGNUP_DEPLOY=off",
+        "PROD_SIGNUP_DEPLOY=on",
         "ALERT_TO=me@test.invalid",
         "",
       ].join("\n"),
@@ -376,12 +376,12 @@ describe("hosted-constants.sh", () => {
     expect(bad.ghEnv).toBe("");
   });
 
-  it("prod commits signup_deploy off; it loads as PROD_SIGNUP_DEPLOY, exactly on or off, prod only (#40)", () => {
-    expect(read("prod").signup_deploy).toBe("off");
-    const off = load(PROD());
+  it("prod commits signup_deploy on; it loads as PROD_SIGNUP_DEPLOY, exactly on or off, prod only (#40)", () => {
+    expect(read("prod").signup_deploy).toBe("on");
+    const off = load({ ...PROD(), signup_deploy: "off" });
     expect(off.code, off.err).toBe(0);
     expect(off.ghEnv).toContain("PROD_SIGNUP_DEPLOY=off\n");
-    const on = load({ ...PROD(), signup_deploy: "on" });
+    const on = load(PROD());
     expect(on.code, on.err).toBe(0);
     expect(on.ghEnv).toContain("PROD_SIGNUP_DEPLOY=on\n");
     for (const v of [
