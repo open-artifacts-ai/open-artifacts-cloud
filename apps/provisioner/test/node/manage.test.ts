@@ -9,6 +9,7 @@ import {
   NAMESPACES,
   parseTemplate,
 } from "@oa/provision";
+import { RESUME_JOB_MIN_VERSION } from "@oa/provision/versions";
 import { REDLINE_SCOPE_FIXTURE } from "@oa/provisioning-contract/fixtures";
 import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -860,8 +861,12 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
       ]);
     });
 
-    it("a call that throws 3 times: the resume still completes, audit code throw", async () => {
+    const setVersion = (id: string, v: string) =>
+      w.db.prepare("UPDATE installs SET version = ? WHERE id = ?").run(v, id);
+
+    it("an install below 0.171.0 and a call that throws 3 times: the resume still completes, audit code throw", async () => {
       const s = await active({ slug: "resthrow" });
+      setVersion(s.installId, "0.170.9");
       expect(
         (await manage("suspend", s.installId, { args: { reason: "billing" } }))
           .error,
@@ -876,6 +881,28 @@ describe("suspend, resume, delete, restore (5.5, 5.6)", () => {
       expect(resumeAudit()).toMatchObject([
         { outcome: "error", code: "throw", detail: "attempts=3", job_id: r.id },
       ]);
+    });
+
+    it("an install at 0.171.0 and a call that throws 3 times: the step fails and HOSTS stays paused", async () => {
+      const s = await active({ slug: "resloud" });
+      setVersion(s.installId, RESUME_JOB_MIN_VERSION);
+      expect(
+        (await manage("suspend", s.installId, { args: { reason: "billing" } }))
+          .error,
+      ).toBeNull();
+      w.fake.onScheduled = () => Promise.reject(new Error("marker write"));
+      const r = await manage("resume", s.installId);
+      expect(r.error).not.toBeNull();
+      expect(r.job?.status).not.toBe("done");
+      expect(w.hosts("resloud")).toEqual([
+        `paused:${s.installId}`,
+        `paused:${s.installId}`,
+      ]);
+      expect(resumeAudit()[0]).toMatchObject({
+        outcome: "error",
+        code: "throw",
+        detail: "attempts=3",
+      });
     });
   });
 

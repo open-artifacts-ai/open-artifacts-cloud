@@ -323,7 +323,7 @@ describe("gate", () => {
     it("cloud #202: the hosted bus cases are not accepted: a fail or an infra on either gates, and a breach always does", () => {
       const BUS = [
         "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
-        "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+        "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
       ];
       for (const name of BUS) {
         expect(ACCEPTED_UNPROVEN.some((e) => e.name === name)).toBe(false);

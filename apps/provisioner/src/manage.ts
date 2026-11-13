@@ -53,6 +53,7 @@ import {
   auditResumeClear,
   clearInstallSuspendMarker,
   closeInstallSocketsCounted,
+  installHasResumeJob,
   installRow,
   liveMode,
   modeStatement,
@@ -324,9 +325,11 @@ async function operate(
       );
       await s("unpause", LEASED_STEP, async () => {
         // The install's bus suspend marker goes first: HOSTS is still paused,
-        // so a serving install never refuses bus connects. Retried inside,
-        // never throws, never fails the resume (an older install rejects the
-        // unknown job); the final outcome is audited.
+        // so a serving install never refuses bus connects. Retried inside;
+        // the final outcome is audited. An install on a release with the job
+        // (RESUME_JOB_MIN_VERSION) throws on a non-ok outcome, so the step
+        // retries and the job goes red before HOSTS flips; an older install
+        // rejects the unknown job, so it never fails the resume.
         const clear = await clearInstallSuspendMarker(ctx, job.installId);
         await auditResumeClear(
           ctx,
@@ -335,6 +338,13 @@ async function operate(
           clear.outcome,
           clear.attempts,
         );
+        if (
+          clear.outcome !== "ok" &&
+          (await installHasResumeJob(ctx, job.installId))
+        )
+          throw new Error(
+            `resume: the install's bus suspend marker was not cleared (${clear.outcome} after ${clear.attempts} attempts)`,
+          );
         await (await p(job)).unpause(job.installId, { kind: "resume" });
         await transient(modeStatement(ctx, job.installId, "serving").run());
         return { mode: "serving" };

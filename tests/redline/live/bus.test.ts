@@ -110,17 +110,14 @@ describe("bus", () => {
   );
 
   it(
-    "suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+    "suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
     (ctx) =>
       runCase(ctx, BUS_CASE_TIMEOUT_MS, async (l) => {
         const r = await suspendCase(
           liveSuspendIo(l.busb, l.busa, minted, l.run, held),
           l.pair,
         );
-        const w = r.windowCloseMs
-          .map((m) => (m === null ? "never" : `${Math.round(m / 1000)} s`))
-          .join(", ");
-        return `closed ${Math.round(r.closeMs / 1000)} s after the suspend job; ${r.reconnects} reconnects, ${r.windowOpens} got 101 in the pause window${r.windowOpens ? ` (closed ${w} after the suspend job; frames ${JSON.stringify(r.windowFrames)}${r.windowDelivery ? "; DELIVERY FRAME on a window socket" : ""})` : ""}`;
+        return `closed ${Math.round(r.closeMs / 1000)} s after the suspend job; ${r.reconnects} reconnects got the paused answer`;
       }),
     BUS_CASE_TIMEOUT_MS,
   );

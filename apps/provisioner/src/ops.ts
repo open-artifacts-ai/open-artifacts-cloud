@@ -16,6 +16,11 @@ import {
   WfpProvisioner,
   type WfpStep,
 } from "@oa/provision";
+import {
+  compareVersions,
+  isReleaseVersion,
+  RESUME_JOB_MIN_VERSION,
+} from "@oa/provision/versions";
 import type { ServingMode } from "@oa/provisioning-contract";
 import {
   deployEnv,
@@ -247,10 +252,10 @@ export type ResumeOutcome = SystemJobOutcome;
 
 /**
  * On resume, before the HOSTS flip to serving: asks the install to clear its
- * bus suspend marker, retried up to 3 times. Never throws and never fails the
- * resume: an install on a release without the job rejects it as unknown, and
- * that can't be told from a real failure (the error text isn't read). The
- * final outcome is audited.
+ * bus suspend marker, retried up to 3 times. Never throws: the caller decides
+ * (an install below RESUME_JOB_MIN_VERSION rejects the job as unknown, and
+ * that can't be told from a real failure, so it never fails the resume; at or
+ * above it a non-ok outcome fails the step). The final outcome is audited.
  */
 export async function clearInstallSuspendMarker(
   ctx: OpsCtx,
@@ -258,6 +263,15 @@ export async function clearInstallSuspendMarker(
   timeoutMs = RESUME_TIMEOUT_MS,
 ): Promise<{ outcome: ResumeOutcome; attempts: number }> {
   return callWithRetry(ctx, installId, RESUME_JOB, timeoutMs);
+}
+
+/** True iff the install's release has the oa:resume job (an unknown version: no). */
+export async function installHasResumeJob(
+  ctx: OpsCtx,
+  installId: string,
+): Promise<boolean> {
+  const v = (await installRow(ctx, installId))?.version ?? null;
+  return isReleaseVersion(v) && compareVersions(v, RESUME_JOB_MIN_VERSION) >= 0;
 }
 
 export const CLOSE_AUDIT_FAILED = "suspend close_sockets audit failed";
