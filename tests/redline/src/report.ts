@@ -497,6 +497,17 @@ export const BREACH_MARK = "BREACH:";
  */
 export const HOSTED_BUS_NOT_GATING =
   "not gating for one release (cloud #202): a failure is reported, not gated, until a real gate run passes both";
+/**
+ * open-artifacts#2360: P54 (a delete wipes the install's Durable Object
+ * namespaces, and with them the BusHub data) reports, but doesn't gate, for
+ * one release: a failure, or a lane with no token that can list namespaces,
+ * is this accepted unproven-live.
+ */
+export const DELETE_HUB_NOT_GATING =
+  "not gating for one release (open-artifacts#2360): a failure is reported, not gated, until a real gate run passes it";
+/** P54's case name (src/provisioning.ts holds the title; a test pins them together). */
+export const P54_NAME =
+  "provisioning > P54: delete wipes the hub (open-artifacts#2360): rl-p's Durable Object namespaces, BusHub among them, exist before the delete and none is left after the delete job is done";
 export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
   [
     {
@@ -567,6 +578,15 @@ export const ACCEPTED_UNPROVEN: readonly AcceptedUnproven[] = Object.freeze(
       evidence:
         'tests/redline/test/hosted-bus.test.ts "case 2: suspend rl-busb"; the live result is in the case label; promotion to gating: https://github.com/open-artifacts-ai/open-artifacts-cloud/issues/202',
     },
+    // open-artifacts#2360: a delete wipes the install's Durable Object
+    // namespaces. Not gating for one release.
+    {
+      name: P54_NAME,
+      reason: DELETE_HUB_NOT_GATING,
+      file: "provisioning.test.ts",
+      evidence:
+        'tests/redline/test/hub-wipe.test.ts "judge"; tests/redline/test/provisioning.test.ts "P54"; the live result is in the case label; Cloudflare\'s WfP script delete documents `force` as deleting the namespaces a script implements, not the plain delete: https://github.com/open-artifacts-ai/open-artifacts/issues/2360',
+    },
   ].map((e) => Object.freeze(e)),
 );
 
@@ -634,9 +654,10 @@ export function notGating(c: CaseResult): CaseResult {
   if (c.level !== "fail" && c.level !== "infra") return c;
   // OA Bus M1: a breach (a forbidden 101) gates the run whatever applies.
   if (c.reason?.includes(BREACH_MARK)) return c;
-  const hit = ACCEPTED_UNPROVEN.some(
+  const hit = ACCEPTED_UNPROVEN.find(
     (e) =>
-      e.reason === HOSTED_BUS_NOT_GATING &&
+      (e.reason === HOSTED_BUS_NOT_GATING ||
+        e.reason === DELETE_HUB_NOT_GATING) &&
       e.name === c.name &&
       (c.file === undefined || c.file.endsWith(e.file)),
   );
@@ -644,7 +665,7 @@ export function notGating(c: CaseResult): CaseResult {
   return {
     ...c,
     level: "unproven-live",
-    reason: HOSTED_BUS_NOT_GATING,
+    reason: hit.reason,
     label: `would be ${c.level}: ${c.reason ?? "no reason"}`.slice(0, 500),
   };
 }

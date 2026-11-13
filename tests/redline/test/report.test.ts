@@ -24,7 +24,9 @@ import {
   formatReport,
   gateOn,
   gatePasses,
+  DELETE_HUB_NOT_GATING,
   HOSTED_BUS_NOT_GATING,
+  P54_NAME,
   LEVELS,
   type Level,
   label,
@@ -243,6 +245,7 @@ describe("gate", () => {
       "provisioner > a signup for a taken slug fails cleanly",
       "bus > rl-busa's machine token at rl-busb: /bus/connect is 401 unauthorized, never 101; 101 at rl-busa; rl-busb's machines and roster unchanged; its content host never upgrades it",
       "bus > suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects inside the 120 s pause window are closed with 4403 by the install's later pass, after it never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      P54_NAME,
     ];
     const REASONS = [
       "self-serve purge doesn't free signup_accounts (#1046); signups off on prod",
@@ -253,19 +256,39 @@ describe("gate", () => {
       NOT_CONFIGURED,
       HOSTED_BUS_NOT_GATING,
       HOSTED_BUS_NOT_GATING,
+      DELETE_HUB_NOT_GATING,
     ];
     const listed = () =>
       ACCEPTED_UNPROVEN.map((e) => c(e.name, "unproven-live", e.reason));
     const ok = c("a", "pass");
 
-    it("is exactly the eight, frozen, each citing a test file", () => {
-      expect(ACCEPTED_UNPROVEN).toHaveLength(8);
+    it("is exactly the nine, frozen, each citing a test file", () => {
+      expect(ACCEPTED_UNPROVEN).toHaveLength(9);
       expect(ACCEPTED_UNPROVEN.map((e) => e.name)).toEqual(NAMES);
       expect(ACCEPTED_UNPROVEN.map((e) => e.reason)).toEqual(REASONS);
       expect(Object.isFrozen(ACCEPTED_UNPROVEN)).toBe(true);
       for (const e of ACCEPTED_UNPROVEN) {
         expect(Object.isFrozen(e)).toBe(true);
         expect(e.evidence).toMatch(/test\.ts "[^"]+"/);
+      }
+    });
+
+    it("P54 failing or infra is reported as that accepted unproven-live with what it was in the label, and never reddens the gate (open-artifacts#2360)", () => {
+      for (const level of ["fail", "infra"] as const) {
+        const r = buildReport([
+          ok,
+          {
+            ...c(P54_NAME, level, "P54: oa-s-i1's delete left namespaces behind"),
+            file: "live/provisioning.test.ts",
+          },
+        ]);
+        expect(r.gate.passed).toBe(true);
+        const row = r.cases.find((x) => x.name === P54_NAME);
+        expect(row).toMatchObject({
+          level: "unproven-live",
+          reason: DELETE_HUB_NOT_GATING,
+        });
+        expect(row?.label).toMatch(new RegExp(`^would be ${level}: P54: `));
       }
     });
 
@@ -279,7 +302,7 @@ describe("gate", () => {
       const r = buildReport([ok, ...listed()]);
       expect(r.gate).toEqual({
         passed: true,
-        reason: "every case passed but 8 accepted unproven-live",
+        reason: "every case passed but 9 accepted unproven-live",
       });
       expect(exitCode(r, true)).toBe(0);
     });
@@ -303,6 +326,7 @@ describe("gate", () => {
         "provisioner.test.ts",
         "bus.test.ts",
         "bus.test.ts",
+        "provisioning.test.ts",
       ]);
     });
 
@@ -322,7 +346,7 @@ describe("gate", () => {
         const r = buildReport([ok, ...listed(), bad]);
         expect(r.gate.passed, JSON.stringify(bad)).toBe(false);
         expect(r.gate.reason).toBe(
-          '1 of 10 cases are not "pass"; 8 accepted unproven-live',
+          '1 of 11 cases are not "pass"; 9 accepted unproven-live',
         );
       }
     });
@@ -402,7 +426,7 @@ describe("gate", () => {
         );
       }
       expect(t).toContain(
-        'Gate: FAIL (1 of 10 cases are not "pass"; 8 accepted unproven-live)',
+        'Gate: FAIL (1 of 11 cases are not "pass"; 9 accepted unproven-live)',
       );
     });
   });
