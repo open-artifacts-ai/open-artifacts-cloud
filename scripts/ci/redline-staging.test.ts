@@ -139,6 +139,16 @@ describe("redline-staging.yml", () => {
       },
       run: 'bash scripts/ci/platform-tags.sh staging "$TAG"',
     });
+    // The orphan read is unproven, so its step is continue-on-error: it never
+    // blocks a release gate, whatever the script exits.
+    expect(
+      ps.find((s) => s.name?.startsWith("Durable Object namespaces"))?.[
+        "continue-on-error"
+      ],
+    ).toBe(true);
+    expect(ps.filter((s) => s["continue-on-error"] !== undefined).length).toBe(
+      1,
+    );
     // The tag check and the report-only orphan read (open-artifacts#2360) are
     // the only steps that see the token.
     expect(

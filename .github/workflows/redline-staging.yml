@@ -141,11 +141,14 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash scripts/ci/platform-tags.sh staging "$TAG"
       # open-artifacts#2360, report-only: staging Durable Object namespaces
-      # whose install Worker is gone (does a delete wipe them?). Fails only
-      # when a list call fails or the list does not show namespaced scripts.
+      # whose install Worker is gone (does a delete wipe them?). The script
+      # exits 1 when a list call fails or the list does not show namespaced
+      # scripts, but the step is continue-on-error: an unproven check must not
+      # block a release gate.
       - name: Read the dispatch namespace
         run: echo "DISPATCH_NAMESPACE=$(jq -er '.dispatch_namespace' .github/hosted/staging.json)" >> "$GITHUB_ENV"
       - name: Durable Object namespaces without their install Worker
+        continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash scripts/ci/do-orphans.sh
