@@ -32,25 +32,32 @@ describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
     expect(cfg.env.staging.vars).not.toHaveProperty("PROD_BUS_ALL");
   });
 
-  it("with the merged prod config, a prod install gets no bus", async () => {
-    const o = await provisionerOptions(
-      {
-        ...cfg.env.prod.vars,
-        ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
-        RELEASES: {} as R2Bucket,
-        PROVISION_TOKEN: { get: async () => "t" } as SecretsStoreSecret,
-      },
-      "ss-01JBQ4ZKXW5V9R3M2N8P6T7Y0A",
-      {
-        fetch: (async () => new Response("{}")) as typeof fetch,
-        now: () => 0,
-        sleep: async () => {},
-      },
-      "01JOB0000000000000000000AA",
-    );
+  it('with the merged prod config, a prod install gets no bus until PROD_BUS_ALL flips to "1"', async () => {
+    const opts = (vars: Record<string, string>) =>
+      provisionerOptions(
+        {
+          ...vars,
+          ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+          RELEASES: {} as R2Bucket,
+          PROVISION_TOKEN: { get: async () => "t" } as SecretsStoreSecret,
+        },
+        "ss-01JBQ4ZKXW5V9R3M2N8P6T7Y0A",
+        {
+          fetch: (async () => new Response("{}")) as typeof fetch,
+          now: () => 0,
+          sleep: async () => {},
+        },
+        "01JOB0000000000000000000AA",
+      );
+    const o = await opts(cfg.env.prod.vars);
     expect(o.prodBusAll).toBe(false);
     expect(o.stagingBusAll).toBe(false);
     expect(o.stagingBusSlugs).toEqual([]);
+    // The flip is that one var: the same config with "1" turns prod on, and
+    // nothing else does.
+    const flipped = await opts({ ...cfg.env.prod.vars, PROD_BUS_ALL: "1" });
+    expect(flipped.prodBusAll).toBe(true);
+    expect(flipped.stagingBusAll).toBe(false);
   });
 });
 
