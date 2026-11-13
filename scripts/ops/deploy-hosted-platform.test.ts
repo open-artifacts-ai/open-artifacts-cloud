@@ -808,7 +808,7 @@ describe("deploy-hosted-platform.sh", () => {
       });
     }
     // Prod only: no BILLING is bound while an active install lacks a TIER
-    // (the guard script, stubbed here, exits 1 and names the installs).
+    // (the guard script, stubbed here, exits 1).
     for (const app of [
       "dispatch",
       "scheduler",

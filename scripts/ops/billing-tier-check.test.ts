@@ -1,9 +1,12 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { tierProblems } from "./billing-tier-check.ts";
+import { tierProblemCount } from "./billing-tier-check.ts";
 
 // Prod's BILLING bind guard: every active install's rendered vars need a TIER.
+// The cloud repo's Actions logs are public: only a count is ever printed.
 const root = join(import.meta.dirname, "../..");
 const row = (id: string, vars: unknown, state = "active") => ({
   id,
@@ -12,26 +15,26 @@ const row = (id: string, vars: unknown, state = "active") => ({
   vars,
 });
 
-describe("tierProblems", () => {
-  it("passes installs whose rendered vars carry trial, team or business", () => {
+describe("tierProblemCount", () => {
+  it("counts none for installs whose rendered vars carry trial, team or business", () => {
     expect(
-      tierProblems([
+      tierProblemCount([
         row("ia", JSON.stringify({ TIER: "trial" })),
         row("ib", JSON.stringify({ TIER: "team", OTHER: "x" })),
         row("ic", JSON.stringify({ TIER: "business" })),
       ]),
-    ).toEqual([]);
+    ).toBe(0);
   });
-  it("refuses an active install with no TIER, naming it", () => {
-    const p = tierProblems([
-      row("ia", JSON.stringify({ TIER: "trial" })),
-      row("ib", JSON.stringify({ FEATURES: "a,b" })),
-    ]);
-    expect(p).toEqual([
-      "install ib (slug-ib): its rendered vars have no valid TIER",
-    ]);
+  it("counts an active install with no TIER", () => {
+    expect(
+      tierProblemCount([
+        row("ia", JSON.stringify({ TIER: "trial" })),
+        row("ib", JSON.stringify({ FEATURES: "a,b" })),
+        row("ic", JSON.stringify({})),
+      ]),
+    ).toBe(2);
   });
-  it("fails closed: an empty, unknown or non-string TIER, and missing, null, non-JSON or non-object vars all refuse", () => {
+  it("fails closed: an empty, unknown or non-string TIER, and missing, null, non-JSON or non-object vars all count", () => {
     const bad = [
       JSON.stringify({ TIER: "" }),
       JSON.stringify({ TIER: "free" }),
@@ -44,45 +47,97 @@ describe("tierProblems", () => {
       undefined,
     ];
     for (const [i, vars] of bad.entries())
-      expect(tierProblems([row(`i${i}`, vars)]), String(vars)).toHaveLength(1);
+      expect(tierProblemCount([row(`i${i}`, vars)]), String(vars)).toBe(1);
   });
   it("ignores installs that are not active", () => {
     expect(
-      tierProblems([row("ia", "{}", "deleted"), row("ib", null, "suspended")]),
-    ).toEqual([]);
-  });
-  it("never prints a var value", () => {
-    const p = tierProblems([
-      row("ia", JSON.stringify({ SESSION_SECRET: "NEVERAPPEAR" })),
-    ]);
-    expect(p.join("\n")).not.toContain("NEVERAPPEAR");
+      tierProblemCount([
+        row("ia", "{}", "deleted"),
+        row("ib", null, "suspended"),
+      ]),
+    ).toBe(0);
   });
 });
 
 describe("the script", () => {
+  const exec = (
+    arg: string,
+    env: Record<string, string>,
+    args: string[] = [],
+  ) =>
+    spawnSync(
+      "node",
+      [
+        "--experimental-strip-types",
+        "--no-warnings",
+        ...args,
+        join(root, "scripts/ops/billing-tier-check.ts"),
+        arg,
+      ],
+      { env, encoding: "utf8" },
+    );
+  const base = {
+    PATH: process.env.PATH ?? "",
+    CLOUDFLARE_API_TOKEN: "t",
+    CLOUDFLARE_ACCOUNT_ID: "26ac346086d4405f7a976d48747a2a75",
+    PLATFORM_DB_ID: "6ca9103e-507e-4541-b3bb-2485e699512b",
+  };
+
   it("refuses before any call: not prod, no token, a bad account or database id", () => {
-    const base = {
-      PATH: process.env.PATH ?? "",
-      CLOUDFLARE_API_TOKEN: "t",
-      CLOUDFLARE_ACCOUNT_ID: "26ac346086d4405f7a976d48747a2a75",
-      PLATFORM_DB_ID: "6ca9103e-507e-4541-b3bb-2485e699512b",
-    };
-    const exec = (arg: string, env: Record<string, string>) =>
-      spawnSync(
-        "node",
-        [
-          "--experimental-strip-types",
-          "--no-warnings",
-          join(root, "scripts/ops/billing-tier-check.ts"),
-          arg,
-        ],
-        { env, encoding: "utf8" },
-      );
     expect(exec("staging", base).status).toBe(2);
     expect(exec("prod", { ...base, CLOUDFLARE_API_TOKEN: "" }).status).toBe(2);
     expect(exec("prod", { ...base, CLOUDFLARE_ACCOUNT_ID: "x" }).status).toBe(
       2,
     );
     expect(exec("prod", { ...base, PLATFORM_DB_ID: "x" }).status).toBe(2);
+  });
+
+  // D1 answered by a preloaded fetch stub: the run prints a count and the
+  // pointer to oa-admin-prod, and no install id, slug or var value.
+  const withRows = (rows: unknown[]) => {
+    const dir = mkdtempSync(join(tmpdir(), "tier-check-"));
+    const stub = join(dir, "stub.mjs");
+    writeFileSync(
+      stub,
+      `globalThis.fetch = async () => Response.json({ success: true, result: [{ success: true, results: ${JSON.stringify(rows)} }] });`,
+    );
+    return stub;
+  };
+  it("a refusal prints the count and 'oa-admin-prod', never an install id, slug or var value", () => {
+    const stub = withRows([
+      row("iSECRETidAAAA", JSON.stringify({ TIER: "trial" })),
+      row(
+        "iSECRETidBBBB",
+        JSON.stringify({ SESSION_SECRET: "NEVERAPPEARvalue" }),
+      ),
+      row("iSECRETidCCCC", null),
+    ]);
+    const r = exec("prod", base, ["--import", stub]);
+    expect(r.status).toBe(1);
+    const all = r.stdout + r.stderr;
+    expect(all).toContain("2 active install(s) have no valid TIER");
+    expect(all).toContain("oa-admin-prod");
+    for (const s of ["iSECRETid", "slug-", "NEVERAPPEARvalue"])
+      expect(all).not.toContain(s);
+  });
+  it("passes and prints no names when every active install has a TIER", () => {
+    const stub = withRows([
+      row("iSECRETidAAAA", JSON.stringify({ TIER: "team" })),
+    ]);
+    const r = exec("prod", base, ["--import", stub]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout + r.stderr).not.toContain("iSECRETid");
+    expect(r.stdout + r.stderr).not.toContain("slug-");
+  });
+  it("fails closed when D1 cannot be read", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tier-check-"));
+    const stub = join(dir, "stub.mjs");
+    writeFileSync(
+      stub,
+      `globalThis.fetch = async () => { throw new Error("net"); };`,
+    );
+    const r = exec("prod", base, ["--import", stub]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("fail closed");
   });
 });

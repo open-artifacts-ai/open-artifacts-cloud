@@ -299,12 +299,12 @@ billing_pre() {
   need_workers "oa-$P-billing"
   # Prod only, before anything is bound or deployed: every active install's
   # rendered vars must carry a TIER, or the billing gate would read it as Solo
-  # (fail closed; scripts/ops/billing-tier-check.ts names the installs). A verify
+  # (fail closed; scripts/ops/billing-tier-check.ts prints only a count; the list is read with oa-admin-prod). A verify
   # only run binds nothing.
   if [ "$env" = prod ] && [ -z "$VERIFY_ONLY" ]; then
     need PLATFORM_DB_ID
     PLATFORM_DB_ID="$PLATFORM_DB_ID" node --experimental-strip-types --no-warnings "$root/scripts/ops/billing-tier-check.ts" prod ||
-      { echo "refusing to bind BILLING on prod to $1: see the installs above" >&2; exit 1; }
+      { echo "refusing to bind BILLING on prod to $1: read the installs without a TIER with oa-admin-prod" >&2; exit 1; }
   fi
   BILLING_DECLARED=1
 }
