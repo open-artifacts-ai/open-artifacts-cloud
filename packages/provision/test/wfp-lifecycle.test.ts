@@ -876,7 +876,7 @@ describe("upgrade", () => {
     );
   });
 
-  it("#1427: an install on v3 upgrading to the real template (binds BusHub, adds it at v4) is refused before any write", async () => {
+  it("#1427: an install on v3 upgrading to the real template (binds BusHub and DocRoom, adds them at v4 and v5) is refused before any write", async () => {
     // The real template adds BusHub at v4 and binds BUS_HUB (#1315). An
     // install still on v3 (below 0.109.0) would add and bind it in one upload.
     const bus = (
@@ -897,7 +897,7 @@ describe("upgrade", () => {
     // #1343: the DO rule's refusal is do_step_required.
     expect(e.code).toBe("do_step_required");
     expect(e.message).toMatch(
-      /adds Durable Object class BusHub and binds it.*upgrade first to a release that adds it unbound/,
+      /adds Durable Object class BusHub, DocRoom and binds it.*upgrade first to a release that adds it unbound/,
     );
     expect(uploads(s.fake, from)).toHaveLength(0);
     expect(s.fake.writes().length).toBe(w);

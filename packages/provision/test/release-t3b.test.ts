@@ -796,10 +796,19 @@ describe("C: ustar", () => {
     const tar = packUstar(entries);
     const text = Buffer.from(tar).toString("latin1");
     expect(text).not.toContain("PaxHeader");
-    for (let o = 0; o < tar.length; o += 512)
+    // Walk header to header: a data block can hold any byte at offset 156.
+    for (let o = 0; o < tar.length; ) {
+      const h = tar.subarray(o, o + 512);
+      if (h.every((b) => b === 0)) break;
       expect(["x", "g", "L", "K"]).not.toContain(
-        String.fromCharCode(tar[o + 156] as number),
+        String.fromCharCode(h[156] as number),
       );
+      const size = Number.parseInt(
+        new TextDecoder().decode(h.subarray(124, 135)),
+        8,
+      );
+      o += 512 + Math.ceil(size / 512) * 512;
+    }
     const got = parseUstar(tar);
     expect(got.map((f) => f.path).sort()).toEqual(
       entries.map((e) => e.path).sort(),
