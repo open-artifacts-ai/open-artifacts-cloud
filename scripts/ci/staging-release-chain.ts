@@ -18,7 +18,7 @@
 //     the tag is that job's name;
 //   - after deploy-hosted-platform: the run is one this chain dispatched
 //     (display title `deploy-hosted-platform staging <tag> [sc<run>-<n>]`,
-//     actor github-actions[bot]). A manual deploy, a verify_only run, a
+//     the release App's bot as actor). A manual deploy, a verify_only run, a
 //     partial-target run or a prod run has no `sc` chain id and never starts
 //     the gate; this chain's deploy takes the workflow's default targets;
 //   - the tag is the newest release (releases/latest);
@@ -38,7 +38,8 @@ export type Next = "deploy" | "gate";
 
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const CHAIN_RE = /^sc[0-9]{1,20}-[0-9]{1,4}$/;
-const BOT = "github-actions[bot]";
+/** The release App's public login: the actor of a run dispatched with its token. */
+export const APP_ACTOR = "open-artifacts-release[bot]";
 /** The deploy run-name this chain's dispatch produces (deploy-hosted-platform.yml). */
 export const DEPLOY_TITLE_RE =
   /^deploy-hosted-platform staging (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(sc[0-9]{1,20}-[0-9]{1,4})\]$/;
@@ -145,7 +146,7 @@ export function plan(o: {
     tag = tags[0] as string;
   } else if (o.workflow === "deploy-hosted-platform") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
-    if (o.actor !== BOT) return skip("not dispatched by this chain");
+    if (o.actor !== APP_ACTOR) return skip("not dispatched by this chain");
     const m = DEPLOY_TITLE_RE.exec(o.title);
     if (!m?.[1])
       return skip("not a staging deploy this chain dispatched (no chain id)");

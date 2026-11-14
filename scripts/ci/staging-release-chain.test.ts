@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { FULL_BILLING } from "./chain-dispatch.ts";
 import {
+  APP_ACTOR,
   DEPLOY_TITLE_RE,
   dispatch,
   type Exec,
@@ -29,7 +30,7 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
-const BOT = "github-actions[bot]";
+const BOT = APP_ACTOR;
 
 type World = {
   latest?: string;
@@ -194,6 +195,10 @@ describe("after the staging deploy: the gate", () => {
   });
   it("skips a deploy not dispatched by the bot, or not a dispatch", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
+    skipped(afterDeploy({}, { actor: "other-app[bot]" }));
+    skipped(afterDeploy({}, { actor: "github-actions[bot]" }));
+    skipped(afterDeploy({}, { actor: "open-artifacts-release" }));
+    expect(APP_ACTOR).toBe("open-artifacts-release[bot]");
     skipped(afterDeploy({}, { event: "push" }));
   });
   it("skips a stale tag", () => {
@@ -340,19 +345,38 @@ describe("the workflow", () => {
     expect(text).toContain("github.event.workflow_run.display_title");
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     const step = w.jobs.plan.steps.find((s: any) => s.id === "plan");
+    expect(text).not.toContain("vars.");
     expect(step.env.TITLE).toBe(
       "${{ github.event.workflow_run.display_title }}",
     );
   });
-  it("gives actions: write to the dispatch job alone, behind a per-tag group", () => {
+  it("dispatches with the release App's token (actions: write), never github.token", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+    const steps: any[] = w.jobs.dispatch.steps;
+    const iApp = steps.findIndex((s) => s.id === "app");
+    const iGo = steps.findIndex((s) =>
+      /staging-release-chain\.ts dispatch/.test(s.run ?? ""),
+    );
+    expect(iApp).toBeGreaterThanOrEqual(0);
+    expect(iApp).toBeLessThan(iGo);
+    expect(steps[iApp].uses).toMatch(
+      /^actions\/create-github-app-token@[0-9a-f]{40}$/,
+    );
+    expect(steps[iApp].with).toEqual({
+      "app-id": "${{ secrets.RELEASE_APP_ID }}",
+      "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+      "permission-actions": "write",
+    });
+    expect(steps[iGo].env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    // the default token is never the dispatch token
+    expect(JSON.stringify(steps[iGo])).not.toContain("github.token");
+  });
+  it("gives the dispatch job read-only default permissions, behind a per-tag group", () => {
     expect(w.jobs.plan.permissions).toEqual({
       contents: "read",
       actions: "read",
     });
-    expect(w.jobs.dispatch.permissions).toEqual({
-      contents: "read",
-      actions: "write",
-    });
+    expect(w.jobs.dispatch.permissions).toEqual({ contents: "read" });
     expect(w.jobs.dispatch.needs).toBe("plan");
     expect(w.jobs.dispatch.if).toBe("needs.plan.outputs.go == 'true'");
     expect(w.jobs.dispatch.concurrency.group).toContain(
