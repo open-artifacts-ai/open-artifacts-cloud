@@ -403,6 +403,34 @@ describe("alert conditions", () => {
     for (const k of EXTERNAL) expect(r[k].open, k).toBeNull();
   });
 
+  // The fleet keys skip test-hooks installs in their own queries.
+  for (const k of SQL_ALERT_KEYS)
+    it(`${k}: a red-line (rl-) fixture install never opens it`, async () => {
+      const id = installId();
+      await install(id, { slug: "rl-f-test" });
+      const c = { now: base(k), install: id };
+      const token = await FIXTURES[k].open(c);
+      const r = await evaluate(c.now, token);
+      expect(
+        r[k].rows.filter((row) => row.install_id === id),
+        k,
+      ).toEqual([]);
+    });
+
+  it("upgrade_incomplete: an rl- install opens nothing, a normal one still does", async () => {
+    const now = base("upgrade_incomplete");
+    const rl = installId();
+    await install(rl, { slug: "rl-f-x" });
+    await FIXTURES.upgrade_incomplete.open({ now, install: rl });
+    expect((await evaluate(now)).upgrade_incomplete.open).toBe(false);
+    const real = installId();
+    await install(real, { slug: "acme" });
+    await FIXTURES.upgrade_incomplete.open({ now, install: real });
+    const r = await evaluate(now);
+    expect(r.upgrade_incomplete.open).toBe(true);
+    expect(r.upgrade_incomplete.rows.map((x) => x.install_id)).toEqual([real]);
+  });
+
   for (const k of CONDITION_KEYS)
     it(`${k}: its fixture opens it, a change clears it`, async () => {
       const id = installId();
