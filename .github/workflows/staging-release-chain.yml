@@ -68,9 +68,8 @@ jobs:
           BRANCH: ${{ github.event.workflow_run.head_branch }}
           TITLE: ${{ github.event.workflow_run.display_title }}
           ACTOR: ${{ github.event.workflow_run.actor.login }}
-          APP_SLUG: ${{ vars.RELEASE_APP_SLUG }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --app-slug "$APP_SLUG" --run-id "$RUN_ID"
+        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"
   dispatch:
     needs: plan
     if: needs.plan.outputs.go == 'true'

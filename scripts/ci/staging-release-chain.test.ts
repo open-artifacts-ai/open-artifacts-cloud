@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { FULL_BILLING } from "./chain-dispatch.ts";
 import {
+  APP_ACTOR,
   DEPLOY_TITLE_RE,
   dispatch,
   type Exec,
@@ -29,8 +30,7 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
-const SLUG = "oa-release";
-const BOT = `${SLUG}[bot]`;
+const BOT = APP_ACTOR;
 
 type World = {
   latest?: string;
@@ -85,7 +85,6 @@ const afterPublish = (o: World = {}, over: Record<string, string> = {}) =>
     branch: "main",
     title: "hosted-publish",
     actor: BOT,
-    appSlug: SLUG,
     runId: "123",
     ...over,
   });
@@ -100,7 +99,6 @@ const afterDeploy = (o: World = {}, over: Record<string, string> = {}) =>
     branch: "main",
     title: CHAIN_TITLE,
     actor: BOT,
-    appSlug: SLUG,
     runId: "124",
     ...over,
   });
@@ -163,7 +161,6 @@ describe("after hosted-publish: the staging deploy", () => {
         branch: "main",
         title: "hosted-publish",
         actor: BOT,
-        appSlug: SLUG,
         runId: "123",
       }),
     ).toThrow(/502/);
@@ -200,8 +197,8 @@ describe("after the staging deploy: the gate", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
     skipped(afterDeploy({}, { actor: "other-app[bot]" }));
     skipped(afterDeploy({}, { actor: "github-actions[bot]" }));
-    skipped(afterDeploy({}, { actor: SLUG }));
-    expect(() => afterDeploy({}, { appSlug: "" })).toThrow(/RELEASE_APP_SLUG/);
+    skipped(afterDeploy({}, { actor: "open-artifacts-release" }));
+    expect(APP_ACTOR).toBe("open-artifacts-release[bot]");
     skipped(afterDeploy({}, { event: "push" }));
   });
   it("skips a stale tag", () => {
@@ -348,7 +345,7 @@ describe("the workflow", () => {
     expect(text).toContain("github.event.workflow_run.display_title");
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     const step = w.jobs.plan.steps.find((s: any) => s.id === "plan");
-    expect(step.env.APP_SLUG).toBe("${{ vars.RELEASE_APP_SLUG }}");
+    expect(text).not.toContain("vars.");
     expect(step.env.TITLE).toBe(
       "${{ github.event.workflow_run.display_title }}",
     );
