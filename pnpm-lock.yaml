@@ -608,6 +608,9 @@ importers:
       '@oa/bus-protocol':
         specifier: workspace:*
         version: link:../../packages/bus-protocol
+      '@oa/doc-schema':
+        specifier: workspace:*
+        version: link:../../packages/doc-schema
       '@oa/shared':
         specifier: workspace:*
         version: link:../../packages/shared
