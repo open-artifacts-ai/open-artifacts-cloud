@@ -125,7 +125,10 @@ describe("strictVars: google without a domain", () => {
         ),
       ).toThrow();
   });
-  it("is still refused for an admin create", () => {
-    expect(why(g)).toBe("google needs at least one domain");
+  it("is allowed for an admin create too (owner and invites only, #2520)", () => {
+    const v = strictVars(g, opts);
+    expect(v.AUTH_PROVIDERS).toBe("google");
+    expect(v).not.toHaveProperty("AUTH_DOMAINS");
+    expect(v.AUTH_DOMAIN_JOIN).toBe("invite");
   });
 });

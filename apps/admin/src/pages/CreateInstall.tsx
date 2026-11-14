@@ -152,16 +152,19 @@ export function CreateInstall() {
   const noProvider = providers.length === 0;
   const ownerRefused =
     testAdmin && emailOk && ownerDomain !== STAGING_TEST_DOMAIN;
-  /** Design's Allowed domains rules (option A): any method, owner's domain included. */
+  const googleOn = providers.includes("google");
+  /** Design's Allowed domains rules (option A): any method, owner's domain included; Google may have none. */
   const domainsError =
     domains.length === 0
-      ? domainsText !== null || emailOk
+      ? !googleOn && (domainsText !== null || emailOk)
         ? "Add at least one domain."
         : null
       : ownerDomain && !domains.includes(ownerDomain)
         ? `Include the owner's domain, ${ownerDomain}.`
         : null;
-  const domainsOk = domains.length > 0 && !domainsError && auth.success;
+  // Google with no domain admits the owner and invited people only (#2520).
+  const domainsOk =
+    (domains.length > 0 || googleOn) && !domainsError && auth.success;
   const slugTone =
     check.status === "ok"
       ? "ok"
@@ -333,7 +336,9 @@ export function CreateInstall() {
               className={domainsError ? "oa-help-bad" : undefined}
             >
               {domainsError ??
-                "People with an email at these domains can join. Starts with the owner's domain. Separate with commas."}
+                (domains.length === 0 && googleOn && domainsText !== null
+                  ? "No allowed domain: people sign in with Google only when invited."
+                  : "People with an email at these domains can join. Starts with the owner's domain. Separate with commas.")}
             </small>
           </div>
           <div>

@@ -399,6 +399,9 @@ it("needs at least one allowed domain that includes the owner's, for any sign-in
   owner();
   await screen.findByText(/ is available\./);
   expect(screen.getByLabelText("Allowed domains")).toHaveValue("example.com");
+  // Email only, so a domain is required (Google may have none).
+  fireEvent.click(screen.getByRole("checkbox", { name: "Email" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Google" }));
   domains("");
   expect(screen.getByTestId("domains-help")).toHaveTextContent(
     "Add at least one domain.",
@@ -414,18 +417,48 @@ it("needs at least one allowed domain that includes the owner's, for any sign-in
     "Include the owner's domain, example.com.",
   );
   expect(submit()).toBeDisabled();
-  // Email only: the rule still holds.
-  fireEvent.click(screen.getByRole("checkbox", { name: "Email" }));
-  fireEvent.click(screen.getByRole("checkbox", { name: "Google" }));
-  expect(screen.getByTestId("domains-help")).toHaveTextContent(
-    "Include the owner's domain, example.com.",
-  );
-  expect(submit()).toBeDisabled();
   domains("a.com, Example.com");
   expect(screen.getByTestId("domains-help")).toHaveTextContent(
     /^People with an email/,
   );
   await waitFor(() => expect(submit()).toBeEnabled());
+});
+
+it("lets Google have no allowed domain, with a hint, and submits it", async () => {
+  renderApp("/installs/new");
+  await screen.findByLabelText("Slug");
+  type("fresh-six");
+  owner();
+  await screen.findByText(/ is available\./);
+  domains("");
+  expect(screen.getByTestId("domains-help")).toHaveTextContent(
+    "No allowed domain: people sign in with Google only when invited.",
+  );
+  expect(screen.getByLabelText("Allowed domains")).not.toHaveAttribute(
+    "aria-invalid",
+  );
+  await waitFor(() => expect(submit()).toBeEnabled());
+  fireEvent.click(submit());
+  await waitFor(() => expect(writes().length).toBe(1));
+  expect(writes()[0]?.body).toMatchObject({
+    auth: { providers: ["google"], domains: [] },
+  });
+});
+
+it("needs a domain again once Google is off", async () => {
+  renderApp("/installs/new");
+  await screen.findByLabelText("Slug");
+  type("fresh-seven");
+  owner();
+  await screen.findByText(/ is available\./);
+  domains("");
+  // Google off, email on: a domain is needed again.
+  fireEvent.click(screen.getByRole("checkbox", { name: "Email" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Google" }));
+  expect(screen.getByTestId("domains-help")).toHaveTextContent(
+    "Add at least one domain.",
+  );
+  expect(submit()).toBeDisabled();
 });
 
 it("says to pick at least one sign-in method", async () => {

@@ -398,6 +398,27 @@ describe("R4 auth.domainCodes (#1088)", () => {
     expect(await vars(off.body.job.id)).not.toHaveProperty("EMAIL_CODE_DOMAIN");
   });
 
+  it("google with no domains is accepted: no AUTH_DOMAINS stored (#2520)", async () => {
+    const r = await call(fakeEnv(), ADMIN_P, "R4", {
+      body: leo({ auth: { providers: ["google"], domains: [] } }),
+    });
+    expect(r.status).toBe(202);
+    expect(await vars(r.body.job.id)).toEqual({
+      AUTH_PROVIDERS: "google",
+      AUTH_DOMAINS: "",
+      TIER: "business",
+    });
+  });
+
+  it("email codes with no domain are still refused", async () => {
+    const r = await call(fakeEnv(), ADMIN_P, "R4", {
+      body: leo({
+        auth: { providers: ["email"], domains: [], domainCodes: true },
+      }),
+    });
+    expect(r.status).toBe(400);
+  });
+
   it("with google: invalid_input naming the field", async () => {
     const r = await call(fakeEnv(), ADMIN_P, "R4", {
       body: leo({
