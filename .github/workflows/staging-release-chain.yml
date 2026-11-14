@@ -62,7 +62,8 @@ jobs:
         name: What this event starts
         env:
           GH_TOKEN: ${{ github.token }}
-          WORKFLOW: ${{ github.event.workflow_run.name }}
+          # The file, not the name: a run-name replaces the name (the deploy's is its title).
+          WORKFLOW: ${{ github.event.workflow_run.path }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
