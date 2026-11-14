@@ -297,7 +297,41 @@ describe("R4 create by an admin session", () => {
     expect(r.status).toBe(400);
   });
 
-  it.each(["leo", "rl-a", "rl-b", "demo"])(
+  it("rl- is the red-line fixture prefix: an admin and a token create of rl-acme is slug_reserved (#297)", async () => {
+    const e = fakeEnv();
+    for (const p of [ADMIN_P, WRITE]) {
+      const { sendWelcome: _s, ...body } = leo({ slug: "rl-acme" });
+      const r = await call(e, p, "R4", {
+        body: p === ADMIN_P ? { ...body, sendWelcome: true } : body,
+      });
+      expect(r.code).toBe("slug_reserved");
+      expect(r.status).toBe(400);
+    }
+    expect(
+      (await call(e, ADMIN_P, "R18", { params: { slug: "rl-acme" } })).body
+        .status,
+    ).toBe("reserved");
+  });
+
+  it("the red-line fixture path (OIDC) still creates rl- installs, and R18 says ok", async () => {
+    const e = fakeEnv();
+    const r = await call(e, OIDC_P, "R4", {
+      body: {
+        requestId: requestId(),
+        slug: "rl-a",
+        ownerEmail: "a@oa-redline-a.fyi",
+        tier: "team",
+        auth: { providers: ["email"], domains: [] },
+        testHooks: true,
+      },
+    });
+    expect(r.status).toBe(202);
+    expect(
+      (await call(e, OIDC_P, "R18", { params: { slug: "rl-b" } })).body.status,
+    ).toBe("ok");
+  });
+
+  it.each(["leo", "demo", "url", "rlx"])(
     "existing install name %s is not reserved",
     async (slug) => {
       const e = fakeEnv();
