@@ -125,6 +125,15 @@ describe("strictVars: google without a domain", () => {
         ),
       ).toThrow();
   });
+  it("admin and self-serve render the same auth vars for google,email with no domain (TIER differs by rule, so it is left out)", () => {
+    const admin = { ...strictVars(ss, opts) } as Record<string, string>;
+    const self = { ...strictVars(ss, selfServe) } as Record<string, string>;
+    admin.TIER = self.TIER = "";
+    expect(admin).toEqual(self);
+    expect(admin.AUTH_PROVIDERS).toBe("google,email");
+    expect(admin).not.toHaveProperty("AUTH_DOMAINS");
+    expect(admin.AUTH_DOMAIN_JOIN).toBe("invite");
+  });
   it("is allowed for an admin create too (owner and invites only, #2520)", () => {
     const v = strictVars(g, opts);
     expect(v.AUTH_PROVIDERS).toBe("google");
