@@ -30,6 +30,8 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
+const PUBLISH_PATH = ".github/workflows/hosted-publish.yml";
+const DEPLOY_PATH = ".github/workflows/deploy-hosted-platform.yml";
 const BOT = APP_ACTOR;
 
 type World = {
@@ -79,7 +81,7 @@ const afterPublish = (o: World = {}, over: Record<string, string> = {}) =>
   plan({
     exec: world(o).exec,
     repo: REPO,
-    workflow: "hosted-publish",
+    workflow: PUBLISH_PATH,
     conclusion: "success",
     event: "workflow_run",
     branch: "main",
@@ -93,7 +95,7 @@ const afterDeploy = (o: World = {}, over: Record<string, string> = {}) =>
   plan({
     exec: world(o).exec,
     repo: REPO,
-    workflow: "deploy-hosted-platform",
+    workflow: DEPLOY_PATH,
     conclusion: "success",
     event: "workflow_dispatch",
     branch: "main",
@@ -155,7 +157,7 @@ describe("after hosted-publish: the staging deploy", () => {
       plan({
         exec,
         repo: REPO,
-        workflow: "hosted-publish",
+        workflow: PUBLISH_PATH,
         conclusion: "success",
         event: "workflow_run",
         branch: "main",
@@ -210,8 +212,19 @@ describe("after the staging deploy: the gate", () => {
       true,
     );
   });
+  it("matches the workflow file, not the name (a run-name replaces the name)", () => {
+    // the live event: name is the run's title, path is the file
+    expect(afterDeploy({}, { workflow: DEPLOY_PATH }).go).toBe(true);
+    expect(
+      afterDeploy({}, { workflow: `${DEPLOY_PATH}@refs/heads/main` }).go,
+    ).toBe(true);
+    skipped(afterDeploy({}, { workflow: CHAIN_TITLE }));
+    skipped(afterDeploy({}, { workflow: "deploy-hosted-platform" }));
+    expect(afterPublish({}, { workflow: PUBLISH_PATH }).go).toBe(true);
+    skipped(afterPublish({}, { workflow: "hosted-publish" }));
+  });
   it("ignores other workflows", () => {
-    skipped(afterDeploy({}, { workflow: "ci" }));
+    skipped(afterDeploy({}, { workflow: ".github/workflows/ci.yml" }));
   });
 });
 
@@ -346,6 +359,7 @@ describe("the workflow", () => {
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     const step = w.jobs.plan.steps.find((s: any) => s.id === "plan");
     expect(text).not.toContain("vars.");
+    expect(step.env.WORKFLOW).toBe("${{ github.event.workflow_run.path }}");
     expect(step.env.TITLE).toBe(
       "${{ github.event.workflow_run.display_title }}",
     );

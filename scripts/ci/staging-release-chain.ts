@@ -25,7 +25,7 @@
 //   - never twice: no run of the target workflow for that tag exists, in any
 //     state (a failed one waits for a person), checked in `plan` and again in
 //     `dispatch` under the concurrency group keyed on the tag.
-// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <name> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id>
+// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <path> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id>
 //        node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo o/n --next deploy|gate --tag vX.Y.Z --chain-id <id>
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
@@ -39,6 +39,7 @@ export type Next = "deploy" | "gate";
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const CHAIN_RE = /^sc[0-9]{1,20}-[0-9]{1,4}$/;
 /** The release App's public login: the actor of a run dispatched with its token. */
+const WORKFLOW_DIR = ".github/workflows/";
 export const APP_ACTOR = "open-artifacts-release[bot]";
 /** The deploy run-name this chain's dispatch produces (deploy-hosted-platform.yml). */
 export const DEPLOY_TITLE_RE =
@@ -109,6 +110,7 @@ export type Plan =
 export function plan(o: {
   exec: Exec;
   repo: string;
+  /** The event run's workflow file (workflow_run.path), not its name: a run-name replaces the name. */
   workflow: string;
   conclusion: string;
   event: string;
@@ -123,7 +125,8 @@ export function plan(o: {
   if (o.branch !== "main") return skip("the run is not on main");
   let next: Next;
   let tag: string;
-  if (o.workflow === "hosted-publish") {
+  const file = o.workflow.replace(/@.*$/, "");
+  if (file === WORKFLOW_DIR + "hosted-publish.yml") {
     if (o.event !== "workflow_run")
       return skip("a manual publish does not start the chain");
     if (!/^[1-9][0-9]{0,19}$/.test(o.runId)) throw new Error("bad run id");
@@ -144,7 +147,7 @@ export function plan(o: {
     if (tags.length > 1) throw new Error("the run published several releases");
     next = "deploy";
     tag = tags[0] as string;
-  } else if (o.workflow === "deploy-hosted-platform") {
+  } else if (file === WORKFLOW_DIR + "deploy-hosted-platform.yml") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
     if (o.actor !== APP_ACTOR) return skip("not dispatched by this chain");
     const m = DEPLOY_TITLE_RE.exec(o.title);
