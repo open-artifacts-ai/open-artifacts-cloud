@@ -117,13 +117,8 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   if (!rules) throw new ApiError("forbidden");
   const f = checkCreateFields(body, rules, env.OA_ENV, STAGING_TEST_DOMAIN);
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
-  // Public #1825 lets the contract accept google with no auth.domains (owner
-  // and invites only), but the hosted pipeline does not: the provisioner
-  // refuses it (apps/provisioner/src/recheck.ts, packages/provision/src/wfp.ts),
-  // so it would be accepted here and fail later. Refuse it now, until Gmail
-  // owners (#864/#865).
-  if (body.auth?.providers?.includes("google") && !body.auth.domains?.length)
-    throw new ApiError("invalid_input", "auth.domains: google needs a domain");
+  // Google with no auth.domains is allowed (#2520): the install admits the
+  // owner and invited people only. Email codes still need a domain.
 
   const w = await writeOf(env, p, a.surface, "R4", null, body);
   const prior = await replay(w);
