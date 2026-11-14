@@ -28,7 +28,7 @@ export const isTestUser = (p: Principal, env: { OA_ENV: string }) =>
  * The red-line gate's fixture installs are `rl-*` (cloud #297); hosted code
  * treats them as "not a real install" (no bus, no operator alerts). So a
  * person (admin session, token, self-serve user) may not take one. The gate's
- * own creates may: the OIDC principals (red-line and the test admin) and the
+ * own creates may: the OIDC principal (red-line), the staging test admin (kind "test-admin") and the
  * staging OIDC test users. Existing installs are not rechecked here.
  */
 export const FIXTURE_SLUG_PREFIX = "rl-";
@@ -39,4 +39,5 @@ export const isFixtureSlugRefused = (
 ) =>
   slug.startsWith(FIXTURE_SLUG_PREFIX) &&
   p.kind !== "oidc" &&
+  p.kind !== "test-admin" &&
   !isTestUser(p, env);

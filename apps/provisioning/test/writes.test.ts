@@ -331,6 +331,20 @@ describe("R4 create by an admin session", () => {
     ).toBe("ok");
   });
 
+  it("the staging test admin may still create rl- installs (#1053)", async () => {
+    const e = fakeEnv();
+    expect(
+      (
+        await call(
+          e,
+          { ...OIDC_P, kind: "test-admin", actorKey: "admin:t@test.invalid" },
+          "R18",
+          { params: { slug: "rl-ta" } },
+        )
+      ).body.status,
+    ).toBe("ok");
+  });
+
   it.each(["leo", "demo", "url", "rlx"])(
     "existing install name %s is not reserved",
     async (slug) => {
