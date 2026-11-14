@@ -16,6 +16,7 @@
   "stripe_price_solo_yearly": "price_1UaImwJuK8jgC2cZKiXgN6nX",
   "stripe_price_team": "price_1UYx2vJuK8jgC2cZAcUMAQpw",
   "stripe_price_team_yearly": "price_1UamQGJuK8jgC2cZYOU7jxrn",
+  "stripe_portal_config": "bpc_1UbKyQJuK8jgC2cZNSV0UYXl",
   "welcome_from": "welcome@mail.open-artifacts-staging.app",
   "deploy_token_id": "02543528cc914cbde61db08c45b0b4ee"
 }

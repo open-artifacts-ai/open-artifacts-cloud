@@ -696,6 +696,9 @@ case "$target" in
       expect "$S" '.result.bindings[] | select(.name == "SIGNUPS_ENABLED") | .text | . == "test-users"' false "SIGNUPS_ENABLED (test-users is staging only)"
     fi
     signups_deployed "$S" "$W"
+    # The env's committed value (prod.json, staging.json), as the provisioner and
+    # the scheduler get it: never a literal in the config.
+    expect "$S" '[.result.bindings[] | select(.name == "SIGNUPS_ENABLED") | .text] | join(",")' "$SIGNUPS_ENABLED" "SIGNUPS_ENABLED"
     # MCP_REDIRECT_URIS among them; ADMIN_IDENTITIES is a secret, by name only.
     vars_are "$S" provisioning
     # The settings API's key for query-string redaction is not recorded, so it is not read.

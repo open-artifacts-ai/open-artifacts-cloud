@@ -1,0 +1,114 @@
+# The staging half of the release chain (cloud #264 step 1): no manual
+# dispatch between a published release and the red-line gate.
+#   hosted-release -> hosted-publish (staging) -> THIS: deploy-hosted-platform
+#   (env staging, the workflow's default targets) -> THIS: redline-staging (the
+#   gate) -> prod-release-chain.yml (unchanged).
+# The only triggers are completed hosted-publish and deploy-hosted-platform
+# runs (workflow_run: main's copy of this file runs, and the head branch is
+# main). scripts/ci/staging-release-chain.ts decides, from the event's own
+# fields passed through env: (never into a script), whether to act:
+# success only; a publish started by hosted-release (never a manual or prod
+# publish); a deploy this chain dispatched (its `sc` chain id in the run name,
+# so a manual, verify_only, partial-target or prod deploy never starts the
+# gate); the tag is the newest release; and no run of the target workflow
+# exists for the tag in any state (a failed one waits for a person). The
+# dispatch job re-checks all that under a concurrency group keyed on the tag.
+# The deploy and the gate each hold their own gates (release gate, platform
+# tags, staging's Environment); this file only starts them, and waits for
+# nothing. Dispatches use the release App's installation token (actions:
+# write), never the default token: GitHub raises no workflow_run event for a
+# run the default token started, so this chain's second step and
+# prod-release-chain would never fire. A run dispatched by the App is still
+# a workflow_dispatch run, the event prod-release-chain and
+# staging-first-gate.sh read.
+# The red-line nightly yields to candidates (it skips while any red-line run is
+# going), but a nightly already running holds the `redline` group, so the gate
+# waits for it (up to about 150 min), and a second dispatch replaces a waiting one.
+name: staging-release-chain
+
+on:
+  workflow_run:
+    workflows: [hosted-publish, deploy-hosted-platform]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 10
+    outputs:
+      go: ${{ steps.plan.outputs.go }}
+      next: ${{ steps.plan.outputs.next }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - name: On main
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = refs/heads/main ] || { echo "the chain runs on main only"; exit 1; }'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: plan
+        name: What this event starts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"
+  dispatch:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    # The dispatch uses the release App's installation token (actions: write,
+    # minted below), not the default token: a run the default token starts
+    # raises no workflow_run event, so nothing after the deploy would fire
+    # (neither this chain's gate nor prod-release-chain after it). The job's own
+    # token only reads the checkout.
+    permissions:
+      contents: read
+    # One start per step and tag: a second event for the same tag waits, then
+    # finds the run the first started and skips.
+    concurrency:
+      group: staging-release-chain-${{ needs.plan.outputs.next }}-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            scripts/ci
+            .github/hosted
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: app
+        name: Mint the dispatch token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-actions: write
+      - name: Start the next workflow for the tag
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          NEXT: ${{ needs.plan.outputs.next }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          CHAIN_ID: sc${{ github.run_id }}-${{ github.run_attempt }}
+        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo "$GITHUB_REPOSITORY" --next "$NEXT" --tag "$TAG" --chain-id "$CHAIN_ID"

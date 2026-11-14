@@ -49,11 +49,16 @@ set -uo pipefail
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
 # And the T19 dry-run workflow (#166): a workflow that public never had.
+# And the staging half of the release chain (#264 step 1): a workflow, its
+# script and its test that public never had.
 ALLOW=(
   pnpm-lock.yaml
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/hosted-release-alert.yml
+  .github/workflows/staging-release-chain.yml
+  scripts/ci/staging-release-chain.ts
+  scripts/ci/staging-release-chain.test.ts
   scripts/ci/pin-bump.ts
   scripts/ci/pin-bump.test.ts
   scripts/ci/hosted-release-alert.test.ts
@@ -86,6 +91,9 @@ ALLOW=(
   # The report-only orphaned Durable Object namespaces check (open-artifacts#2360).
   scripts/ci/do-orphans.sh
   scripts/ci/do-orphans.test.ts
+  # The hosted-owned vars check (#262), this repo's own.
+  scripts/ci/check-hosted-owned-vars.ts
+  scripts/ci/check-hosted-owned-vars.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

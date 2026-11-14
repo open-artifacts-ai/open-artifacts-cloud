@@ -150,6 +150,21 @@ describe("provisionerOptions", () => {
     expect(s.stagingBusAll).toBe(false);
   });
 
+  it('OAUTH_BORN_D1: only "1" turns it on, in either env; absent and anything else are off (#1008)', async () => {
+    const o = (e: Record<string, string>) =>
+      provisionerOptions(mkEnv(e), LABEL, io(), JOB);
+    for (const env of ["staging", "prod"]) {
+      expect((await o({ OA_ENV: env, OAUTH_BORN_D1: "1" })).oauthBornD1).toBe(
+        true,
+      );
+      for (const v of ["0", "true", "", " 1", "1 "])
+        expect((await o({ OA_ENV: env, OAUTH_BORN_D1: v })).oauthBornD1).toBe(
+          false,
+        );
+      expect((await o({ OA_ENV: env })).oauthBornD1).toBe(false);
+    }
+  });
+
   it("reads PROVISION_TOKEN once and calls Cloudflare with it on ACCOUNT_ID", async () => {
     const gets: string[] = [];
     const calls: { url: string; auth: string | null }[] = [];

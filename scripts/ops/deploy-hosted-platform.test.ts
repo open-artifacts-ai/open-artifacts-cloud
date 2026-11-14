@@ -1349,12 +1349,16 @@ describe("deploy-hosted-platform.sh", () => {
       const next = JSON.parse(live(key));
       if (app === "provisioning")
         next.result.bindings = next.result.bindings.filter(
-          (b: { name: string }) => !b.name.startsWith("WELCOME_"),
+          // v0.154.0 predates WELCOME_* and BUSINESS_REQUESTS_TO (open-artifacts#2404).
+          (b: { name: string }) =>
+            !b.name.startsWith("WELCOME_") && b.name !== "BUSINESS_REQUESTS_TO",
         );
-      // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325): its provisioner has no such var.
+      // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
+      // (open-artifacts#1008): its provisioner has neither var.
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
-          (b: { name: string }) => b.name !== "PROD_BUS_ALL",
+          (b: { name: string }) =>
+            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
         );
       return JSON.stringify(next);
     };
@@ -2113,16 +2117,10 @@ describe("deploy-hosted-platform.sh", () => {
       readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8");
     /** The prod block's SIGNUPS_ENABLED committed as a literal "true". */
     const literalAs = (app: string, src: string, v: string) => {
-      const out =
-        app === "provisioning"
-          ? src.replace(
-              /("prod"[\s\S]*)"SIGNUPS_ENABLED": "false"/,
-              `$1"SIGNUPS_ENABLED": "${v}"`,
-            )
-          : src.replace(
-              '"SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}"',
-              `"SIGNUPS_ENABLED": "${v}"`,
-            );
+      const out = src.replace(
+        '"SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}"',
+        `"SIGNUPS_ENABLED": "${v}"`,
+      );
       expect(out, app).not.toBe(src);
       return out;
     };
@@ -2186,9 +2184,11 @@ describe("deploy-hosted-platform.sh", () => {
           expect(r.err).toContain("half pins the prod alerts; refusing");
           expect(noDeploy(r.log)).toEqual([]);
         }
-        const yes = app === "scheduler" ? src : literalTrue(app, src);
-        const want: Record<string, string> =
-          app === "scheduler" ? { SIGNUPS_ENABLED: "true" } : {};
+        // Every app's committed gate is {{SIGNUPS_ENABLED_PROD}} (provisioning's
+        // was a literal false until open-artifacts-cloud's fix for prod run
+        // 43467891577): "true" comes from SIGNUPS_ENABLED.
+        const yes = src;
+        const want: Record<string, string> = { SIGNUPS_ENABLED: "true" };
         for (const VERIFY_ONLY of ["", "1"]) {
           const r = go(yes, "true", { ...want, VERIFY_ONLY });
           expect(r.code, `${app} ${VERIFY_ONLY}`).toBe(1);
@@ -2212,16 +2212,14 @@ describe("deploy-hosted-platform.sh", () => {
           `deployed ${W}: SIGNUPS_ENABLED=invite admits the allow list and needs ALLOW_SIGNUPS=1 or ALLOW_INVITE=1; refusing`,
         );
         // The scheduler's committed value comes from SIGNUPS_ENABLED as filled.
-        const as = (v: string): Record<string, string> =>
-          app === "scheduler"
-            ? { SIGNUPS_ENABLED: v, ALLOW_INVITE: "1" }
-            : { ALLOW_INVITE: "1" };
-        const lit = (v: string) =>
-          app === "scheduler" ? src : literalAs(app, src, v);
-        const ok = go(lit("invite"), "invite", as("invite"));
+        const as = (v: string): Record<string, string> => ({
+          SIGNUPS_ENABLED: v,
+          ALLOW_INVITE: "1",
+        });
+        const ok = go(src, "invite", as("invite"));
         expect(ok.code, ok.err).toBe(0);
         for (const v of ["true", "test-users"]) {
-          const no = go(lit(v), v, as(v));
+          const no = go(src, v, as(v));
           expect(no.code, `${app} ${v}`).toBe(1);
         }
       });
@@ -3163,17 +3161,16 @@ describe("deploy-hosted-platform.sh", () => {
         "utf8",
       );
       // Prod's (staging's is test-users since #1012).
-      const at = PV.lastIndexOf('"SIGNUPS_ENABLED": "false",');
+      const PROD_GATE = '"SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}",';
+      const at = PV.lastIndexOf(PROD_GATE);
       expect(at).toBeGreaterThan(PV.indexOf('"prod": {'));
       expect(PV.indexOf('"prod": {')).toBeGreaterThan(0);
       const prodVar = (v: string) =>
-        PV.slice(0, at) +
-        v +
-        PV.slice(at + '"SIGNUPS_ENABLED": "false",'.length);
+        PV.slice(0, at) + v + PV.slice(at + PROD_GATE.length);
       for (const [label, config, msg] of [
         [
           "oidc",
-          prodVar('"SIGNUPS_ENABLED": "false", "OIDC_AUDIENCE": "x",'),
+          prodVar(`${PROD_GATE} "OIDC_AUDIENCE": "x",`),
           "prod provisioning commits OIDC_AUDIENCE",
         ],
         [

@@ -1462,6 +1462,8 @@ describe("WfpProvisioner.create", () => {
       "RL_DIRECTORY",
       // #1315: BusHub (v4, 0.109.0), bound one release after its class tag.
       "BUS_HUB",
+      // DocRoom (v5, 0.172.0), bound one release after its class tag (0.179.0).
+      "DOC_ROOM",
       "RL_ANON",
       "RL_AUTH",
       // public #1937: install-wide per-IP ceiling for anonymous writes. Bound
@@ -3575,6 +3577,39 @@ describe("H-T4b round 1", () => {
   });
 
   describe("F3: the welcome text comes from the release", () => {
+    it("open-artifacts#2422: the self-test deletes the Welcome page after reading it back", async () => {
+      const s = setup();
+      await s.p.create(input());
+      const calls = s.fake.mcpCalls;
+      expect(calls.indexOf("publish_artifact")).toBeGreaterThanOrEqual(0);
+      expect(calls.indexOf("delete_artifact")).toBeGreaterThan(
+        calls.lastIndexOf("get_artifact", calls.indexOf("delete_artifact")),
+      );
+      expect(calls.indexOf("get_artifact")).toBeLessThan(
+        calls.indexOf("delete_artifact"),
+      );
+      // and a get_artifact after the delete checks it is gone
+      expect(calls.slice(calls.indexOf("delete_artifact"))).toEqual([
+        "delete_artifact",
+        "get_artifact",
+      ]);
+      expect([...s.fake.artifacts.values()].every((a) => a.deleted)).toBe(true);
+    });
+
+    it("open-artifacts#2422: a failed delete fails the self-test", async () => {
+      const s = setup();
+      s.fake.failDelete = true;
+      const e = await fails(s.p.create(input()));
+      expect(e.message).toMatch(/delete_artifact failed/);
+    });
+
+    it("open-artifacts#2422: a page still readable after delete fails the self-test", async () => {
+      const s = setup();
+      s.fake.ignoreDelete = true;
+      const e = await fails(s.p.create(input()));
+      expect(e.message).toMatch(/still returns the welcome artifact/);
+    });
+
     it("the published Welcome artifact is the release's text", async () => {
       const s = setup();
       await s.p.create(input());
@@ -4881,16 +4916,53 @@ describe("a job's lease across its attempts (#1326: fenced by attempt)", () => {
   });
 });
 
-describe("#1315: the real template binds BusHub, so only an install already on tag v4 takes it", () => {
-  // BusHub shipped unbound (tag v4) in 0.109.0. An install on v3 (0.99.0,
-  // 0.100.0) would add and bind it in one upgrade, which a rollback could
-  // not undo: refused, naming the step. Create never runs this rule.
-  it("live v3 (pre-0.109.0) is refused, naming BusHub and the step", () => {
-    expect(() => assertDoClassesShipFirst(loadTemplate(), "v3")).toThrow(
-      /adds Durable Object class BusHub and binds it.*upgrade first to a release that adds it unbound/,
+describe("#1315: the real template binds BusHub and DocRoom, so only an install on their class tags takes it", () => {
+  // BusHub shipped unbound (tag v4) in 0.109.0 and DocRoom (tag v5) in
+  // 0.172.0. An install behind a tag would add and bind the class in one
+  // upgrade, which a rollback could not undo: refused, naming the step.
+  // Create never runs this rule.
+  const tpl = loadTemplate();
+  const migs = (tpl.migrations ?? []) as {
+    tag: string;
+    new_sqlite_classes?: string[];
+  }[];
+  const busAt = migs.findIndex((m) => m.new_sqlite_classes?.includes("BusHub"));
+  // The release just before DocRoom (and any later class): binds BusHub only.
+  const docAt = migs.findIndex((m) =>
+    m.new_sqlite_classes?.includes("DocRoom"),
+  );
+  const later = new Set(
+    migs.slice(docAt).flatMap((m) => m.new_sqlite_classes ?? []),
+  );
+  const busOnly = {
+    ...tpl,
+    durable_objects: {
+      bindings: (tpl.durable_objects?.bindings ?? []).filter(
+        (x: { class_name: string }) => !later.has(x.class_name),
+      ),
+    },
+  };
+  it("the tags this models are the ones the template carries", () => {
+    expect(migs[busAt]?.tag).toBe("v4");
+    expect(migs[docAt]?.tag).toBe("v5");
+  });
+  it("live v3 (pre-0.109.0) is refused, naming BusHub, DocRoom and the step", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v3")).toThrow(
+      /adds Durable Object class BusHub, DocRoom and binds it.*upgrade first to a release that adds it unbound/,
     );
   });
-  it("live v4 (0.109.0 or later) passes", () => {
-    expect(() => assertDoClassesShipFirst(loadTemplate(), "v4")).not.toThrow();
+  it("live v4 (0.109.0 to 0.171.x) is refused, naming DocRoom", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v4")).toThrow(
+      /adds Durable Object class DocRoom and binds it.*upgrade first to a release that adds it unbound/,
+    );
+  });
+  it("live v5 (0.172.0 or later) passes", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v5")).not.toThrow();
+  });
+  it("a template binding BusHub only: v3 is refused naming BusHub, v4 passes", () => {
+    expect(() => assertDoClassesShipFirst(busOnly, "v3")).toThrow(
+      /adds Durable Object class BusHub and binds it/,
+    );
+    expect(() => assertDoClassesShipFirst(busOnly, "v4")).not.toThrow();
   });
 });

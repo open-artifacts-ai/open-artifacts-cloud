@@ -2142,6 +2142,52 @@ code.oa-code,
   color: var(--oa-text);
   font: 400 13px / 1.4 var(--oa-font-sans);
 }
+.oa-beta-fs {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.oa-biz-table td,
+.oa-biz-table th {
+  padding-left: 8px;
+  padding-right: 8px;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.oa-biz-table .who,
+.oa-biz-table .nt {
+  min-width: 180px;
+}
+.oa-biz-table .co {
+  min-width: 120px;
+}
+.oa-biz-table .nd {
+  min-width: 130px;
+}
+.oa-biz-table .fr {
+  width: 120px;
+  min-width: 120px;
+}
+.oa-biz-table .st {
+  width: 150px;
+  min-width: 150px;
+}
+.oa-biz-table .st select {
+  width: 150px;
+}
+.oa-biz-table .nm {
+  font-weight: 500;
+}
+.oa-biz-table .eml,
+.oa-biz-table .st .dt {
+  overflow-wrap: anywhere;
+}
+.oa-biz-table .oa-beta-nt {
+  overflow-wrap: normal;
+}
 .oa-beta-card {
   margin-bottom: 0;
 }

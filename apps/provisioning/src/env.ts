@@ -69,6 +69,11 @@ export interface Env {
    */
   WELCOME_EMAIL?: SendEmail;
   WELCOME_FROM?: string;
+  /**
+   * Where a Business contact request is mailed (open-artifacts#2404), through
+   * the same WELCOME_EMAIL binding. Unset, the shared reply address.
+   */
+  BUSINESS_REQUESTS_TO?: string;
   /** Broker redeem only (4.3). */
   AUTH_BROKER: Fetcher;
   /** Self-serve producer (post-M1). */

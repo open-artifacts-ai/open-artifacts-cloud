@@ -235,6 +235,8 @@ export async function world(
     } as unknown as SendEmail,
     WELCOME_FROM: "welcome@staging.open-artifacts.test",
     SELF_SERVE_TIER: "trial",
+    /** #1008: a test sets "1" to have new installs born on d1. */
+    OAUTH_BORN_D1: undefined as string | undefined,
     DISPATCHER: dispatcher as unknown as DispatchNamespace,
     MANAGE_INSTALL: manage as unknown as Workflow<{ jobId: string }>,
   } satisfies WorkflowEnv;

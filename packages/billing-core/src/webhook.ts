@@ -315,6 +315,28 @@ export function intervalOf(
     : null;
 }
 
+/**
+ * A live subscription's cancel date, billing interval and renewal date (#2138,
+ * #2135) as row sets: cancels_at (when a cancel is scheduled, or its resume),
+ * billing_interval (month or year), renews_at (the period's end; none while a
+ * cancel is scheduled).
+ */
+export function renewalSets(o: Record<string, unknown>): Set[] {
+  const sets: Set[] = [];
+  const ends = cancelsAtOf(o);
+  if (ends !== undefined) sets.push({ sql: "cancels_at = ?", args: [ends] });
+  const interval = intervalOf(o);
+  if (interval) sets.push({ sql: "billing_interval = ?", args: [interval] });
+  if (o.cancel_at_period_end === true || toMs(o.cancel_at) !== null)
+    sets.push({ sql: "renews_at = NULL", args: [] });
+  else {
+    const end =
+      periodEndOf(o) ?? (o.status === "trialing" ? toMs(o.trial_end) : null);
+    if (end !== null) sets.push({ sql: "renews_at = ?", args: [end] });
+  }
+  return sets;
+}
+
 /** One column assignment in the row update: SQL and its binds. */
 type Set = { sql: string; args: unknown[] };
 
@@ -335,6 +357,13 @@ export function changeFor(
    * active).
    */
   adopted: "active" | "past_due" = "active",
+  /**
+   * The checkout's live subscription as read from Stripe: its cancel date,
+   * interval and renewal date are recorded with the adoption (the
+   * subscription events that carry them may be older than the checkout, so
+   * stale).
+   */
+  live: Record<string, unknown> | null = null,
 ): Set[] | null {
   const o = ev.object;
   const graceEnd = ev.created * 1000 + GRACE_MS;
@@ -487,6 +516,8 @@ export function changeFor(
           sql: "last_checkout_created = ?",
           args: [ev.created],
         });
+      if (payNow && sub && live && tierFromSubscription(live, prices))
+        sets.push(...renewalSets(live));
       // This checkout's session is no longer open.
       if (typeof o.id === "string" && CHECKOUT_SESSION_ID.test(o.id))
         sets.push({
@@ -617,21 +648,7 @@ export function changeFor(
         tierFromSubscription(o, prices) &&
         (status === "active" || status === "past_due")
       ) {
-        const ends = cancelsAtOf(o);
-        if (ends !== undefined)
-          sets.push({ sql: "cancels_at = ?", args: [ends] });
-        // The renewal (#2135): the period's end, none while a cancel is set.
-        const interval = intervalOf(o);
-        if (interval)
-          sets.push({ sql: "billing_interval = ?", args: [interval] });
-        if (o.cancel_at_period_end === true || toMs(o.cancel_at) !== null)
-          sets.push({ sql: "renews_at = NULL", args: [] });
-        else {
-          const end =
-            periodEndOf(o) ??
-            (o.status === "trialing" ? toMs(o.trial_end) : null);
-          if (end !== null) sets.push({ sql: "renews_at = ?", args: [end] });
-        }
+        sets.push(...renewalSets(o));
       }
       // incomplete (status null) changes nothing, not even the id.
       if (status && subId)
@@ -966,11 +983,7 @@ async function settleCancels(
       current_id: string | null;
     }>();
   if (results.length === 0) return [];
-  const cfg: StripeConfig = {
-    secretKey: env.STRIPE_SECRET_KEY ?? "",
-    ...(env.OA_ENV === "prod" ? { live: true } : {}),
-    ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
-  };
+  const cfg = stripeConfigOf(env);
   const failed: { id: string; event: string | null }[] = [];
   for (const { subscription_id: id, event_id, current_id } of results) {
     // Never the row's own subscription: dropped without a Stripe call (a
@@ -1006,6 +1019,13 @@ async function settleCancels(
 
 const QUEUE_UNADOPTED =
   "INSERT OR IGNORE INTO pending_cancels (subscription_id, customer_id, event_id) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM tiers WHERE stripe_customer_id = ?2 AND stripe_subscription_id IS NOT ?1)";
+
+/** The one Stripe config every read and cancel of the webhook uses. */
+const stripeConfigOf = (env: WebhookEnv): StripeConfig => ({
+  secretKey: env.STRIPE_SECRET_KEY ?? "",
+  ...(env.OA_ENV === "prod" ? { live: true } : {}),
+  ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
+});
 
 /** The Stripe webhook route. Never throws: a D1 error is 500 (Stripe retries). */
 export async function handleStripeWebhook(
@@ -1104,16 +1124,20 @@ export async function handleStripeWebhook(
     // Stripe retries. Not needed for the row's own subscription, or a Solo
     // held by a live Team (it is never adopted).
     let adopted: "active" | "past_due" = "active";
+    let live: Record<string, unknown> | null = null;
     if (paidSub) {
       const cur = await db
         .prepare(
-          "SELECT stripe_subscription_id AS id, tier, status FROM tiers WHERE stripe_customer_id = ?",
+          "SELECT stripe_subscription_id AS id, tier, status, billing_interval, renews_at, cancels_at FROM tiers WHERE stripe_customer_id = ?",
         )
         .bind(customer)
         .first<{
           id: string | null;
           tier: string | null;
           status: string | null;
+          billing_interval: string | null;
+          renews_at: number | null;
+          cancels_at: number | null;
         }>();
       const heldByTeam =
         (cur?.tier === "team" || cur?.tier === "business") &&
@@ -1123,21 +1147,21 @@ export async function handleStripeWebhook(
       const soloPaid =
         isObj(ev.object.metadata) && asTier(ev.object.metadata.tier) === "solo";
       if (cur && cur.id !== paidSub && !(soloPaid && heldByTeam)) {
-        const cfg: StripeConfig = {
-          secretKey: env.STRIPE_SECRET_KEY ?? "",
-          ...(env.OA_ENV === "prod" ? { live: true } : {}),
-          ...(env.stripeFetch ? { fetch: env.stripeFetch } : {}),
-        };
+        const cfg = stripeConfigOf(env);
         let state: string;
         try {
-          state = (await retrieveSubscription({ subscriptionId: paidSub }, cfg))
-            .status;
+          const got = await retrieveSubscription(
+            { subscriptionId: paidSub },
+            cfg,
+          );
+          state = got.status;
+          live = got.subscription ?? null;
         } catch {
           log("subscription_read_failed");
           return json({ error: "unavailable" }, 500);
         }
-        const live = statusFromSubscription(state);
-        if (live !== "active" && live !== "past_due") {
+        const liveState = statusFromSubscription(state);
+        if (liveState !== "active" && liveState !== "past_due") {
           // Not live. Only a TERMINAL state is recorded: canceled and
           // incomplete_expired can never come back, and a 404 is only taken as
           // gone once the event is old (Stripe may not have a just-created
@@ -1165,11 +1189,30 @@ export async function handleStripeWebhook(
           log((r[0]?.meta.changes ?? 0) > 0 ? "not_live" : "replay");
           return json({ received: true });
         }
-        adopted = live;
+        adopted = liveState;
+      } else if (
+        cur &&
+        cur.id === paidSub &&
+        (cur.billing_interval === null ||
+          (cur.renews_at === null && cur.cancels_at === null))
+      ) {
+        // The row's own subscription, whose renewal data its subscription
+        // events never delivered (they were older than this checkout): read
+        // it. Best effort: a failed read leaves it for the next event.
+        try {
+          const got = await retrieveSubscription(
+            { subscriptionId: paidSub },
+            stripeConfigOf(env),
+          );
+          const st = statusFromSubscription(got.status);
+          if (st === "active" || st === "past_due") live = got.subscription ?? null;
+        } catch {
+          log("subscription_read_failed");
+        }
       }
     }
-    if (adopted !== "active")
-      change = changeFor(ev, pricesOf(env), adopted) ?? change;
+    if (adopted !== "active" || live)
+      change = changeFor(ev, pricesOf(env), adopted, live) ?? change;
     const stream = streamOf(ev.type);
     const sets = [
       ...change,

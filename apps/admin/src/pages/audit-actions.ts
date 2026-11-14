@@ -36,6 +36,7 @@ const VERB: Record<string, string> = {
   "beta.allow_add": "allowed an email or domain to sign up",
   "beta.allow_remove": "removed an email or domain from the allow list",
   "beta.email_failed": "couldn't send an approval email",
+  "business_request.status": "changed a Business request's status",
   // The provisioner's step rows (#1136); job.done and job.failed sum them up.
   "create.start": "started creating the install",
   "create.resume": "resumed creating the install",
@@ -62,6 +63,7 @@ const VERB: Record<string, string> = {
   "vars.session_cut": "signed everyone out",
   "vars.session_cut_failed": "couldn't sign everyone out",
   "vars.session_cut_dropped": "skipped a sign-out it no longer needed",
+  "vars.kv_dropped": "removed the old OAuth namespace",
   "verify_clean.refused": "failed the clean check",
   "verify_clean.retry":
     "waited for Cloudflare to show the install's settings, then checked again",

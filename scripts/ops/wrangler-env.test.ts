@@ -38,12 +38,28 @@ describe("wrangler-env.ts", () => {
     // Prod has no OIDC_* and needs only the cap.
     const p = committedVars(cfg("provisioning"), "prod", {
       SIGNUP_DAILY_CAP: "50",
+      SIGNUPS_ENABLED: "invite",
       WELCOME_FROM: "welcome@mail.example.app",
     });
     expect(Object.keys(p).filter((k) => k.startsWith("OIDC_"))).toEqual([]);
+    // Prod's gate is the constant too, not a literal (it was a literal false).
+    expect(p.SIGNUPS_ENABLED).toBe("invite");
+    expect(() =>
+      committedVars(cfg("provisioning"), "prod", {
+        SIGNUP_DAILY_CAP: "50",
+        WELCOME_FROM: "welcome@mail.example.app",
+      }),
+    ).toThrow(/SIGNUPS_ENABLED/);
   });
   it("signups: the committed SIGNUPS_ENABLED, a literal or as filled; null when absent", () => {
-    expect(committedSignups(cfg("provisioning"), "prod", {})).toBe("false");
+    expect(
+      committedSignups(cfg("provisioning"), "prod", {
+        SIGNUPS_ENABLED: "invite",
+      }),
+    ).toBe("invite");
+    expect(() => committedSignups(cfg("provisioning"), "prod", {})).toThrow(
+      "has no value",
+    );
     expect(
       committedSignups(cfg("provisioning"), "staging", {
         SIGNUPS_ENABLED: "true",

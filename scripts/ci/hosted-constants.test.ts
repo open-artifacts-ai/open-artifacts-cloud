@@ -70,7 +70,20 @@ describe(".github/hosted/<env>.json", () => {
       [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS, "signup_deploy"].sort(),
     );
     expect(Object.keys(read("staging")).sort()).toEqual(
-      [...KEYS, ...STRIPE_KEYS, ...STRIPE_YEARLY_KEYS].sort(),
+      [
+        ...KEYS,
+        ...STRIPE_KEYS,
+        ...STRIPE_YEARLY_KEYS,
+        "stripe_portal_config",
+      ].sort(),
+    );
+  });
+
+  // #2208: the staging sandbox's portal configuration (plan changes and
+  // quantities off), made by staging-portal-config portal-ensure on 11-13.
+  it("staging pins its portal configuration, from the staging sandbox", () => {
+    expect(read("staging").stripe_portal_config).toBe(
+      "bpc_1UbKyQJuK8jgC2cZNSV0UYXl",
     );
   });
 
@@ -175,10 +188,10 @@ describe(".github/hosted/<env>.json", () => {
   // Design 155 and M4: prod stays closed. User decision 2026-11-10 (option
   // A): staging sign-ups are open to anyone, capped at 20 a day, for the M2
   // exit-test walk (it was test-users only, #1012, P29).
-  it("prod signups stay closed with a cap of 20, staging is invite-only (beta proof, #2096) with a cap of 20; the caps and alert addresses are the Manager's", () => {
+  it("prod is invite-only too (the private beta, #2096) with a cap of 20, staging is invite-only (beta proof, #2096) with a cap of 20; the caps and alert addresses are the Manager's", () => {
     expect(read("prod").signup_daily_cap).toBe(20);
     expect(read("staging").signup_daily_cap).toBe(20);
-    expect(read("prod").signups_enabled).toBe("false");
+    expect(read("prod").signups_enabled).toBe("invite");
     expect(read("staging").signups_enabled).toBe("invite");
     // #1084: the alert address is the owner's: never committed, it comes
     // from the OA_OWNER_EMAIL secret (hosted-constants.sh).
@@ -256,10 +269,10 @@ describe("hosted-constants.sh", () => {
         "GOOGLE_CLIENT_ID=206295999771-ntbp6nlf5ospa45ovc73aur4f05fpp5s.apps.googleusercontent.com",
         "GOOGLE_DIRECTORY_CLIENT_ID=206295999771-6cr3mbfc7g2ejnvdoqhlf2v8v6sdm023.apps.googleusercontent.com",
         "SIGNUP_DAILY_CAP=20",
-        "SIGNUPS_ENABLED=false",
+        "SIGNUPS_ENABLED=invite",
         "WELCOME_FROM=welcome@mail.open-artifacts.app",
         ...PROD_PRICE_LINES(),
-        "PROD_SIGNUP_DEPLOY=off",
+        "PROD_SIGNUP_DEPLOY=on",
         "ALERT_TO=me@test.invalid",
         "",
       ].join("\n"),
@@ -289,6 +302,8 @@ describe("hosted-constants.sh", () => {
           STRIPE_KEYS.length +
           STRIPE_YEARLY_KEYS.length +
           (env === "prod" ? 1 : 0) +
+          // staging pins its portal configuration (#2208)
+          (env === "staging" ? 1 : 0) +
           1,
       );
     }
@@ -376,12 +391,12 @@ describe("hosted-constants.sh", () => {
     expect(bad.ghEnv).toBe("");
   });
 
-  it("prod commits signup_deploy off; it loads as PROD_SIGNUP_DEPLOY, exactly on or off, prod only (#40)", () => {
-    expect(read("prod").signup_deploy).toBe("off");
-    const off = load(PROD());
+  it("prod commits signup_deploy on; it loads as PROD_SIGNUP_DEPLOY, exactly on or off, prod only (#40)", () => {
+    expect(read("prod").signup_deploy).toBe("on");
+    const off = load({ ...PROD(), signup_deploy: "off" });
     expect(off.code, off.err).toBe(0);
     expect(off.ghEnv).toContain("PROD_SIGNUP_DEPLOY=off\n");
-    const on = load({ ...PROD(), signup_deploy: "on" });
+    const on = load(PROD());
     expect(on.code, on.err).toBe(0);
     expect(on.ghEnv).toContain("PROD_SIGNUP_DEPLOY=on\n");
     for (const v of [
@@ -453,8 +468,13 @@ describe("hosted-constants.sh", () => {
   });
 
   it("stripe_portal_config is optional, validated when present, in both envs", () => {
-    const st = load(read("staging"), "staging");
+    const { stripe_portal_config: _pinned, ...unpinned } = read("staging");
+    const st = load(unpinned, "staging");
+    expect(st.code, st.err).toBe(0);
     expect(st.ghEnv).not.toContain("STRIPE_PORTAL_CONFIG");
+    expect(load(read("staging"), "staging").ghEnv).toContain(
+      "STRIPE_PORTAL_CONFIG=bpc_1UbKyQJuK8jgC2cZNSV0UYXl\n",
+    );
     const ok = load(
       { ...read("staging"), stripe_portal_config: "bpc_1Abc" },
       "staging",

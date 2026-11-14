@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { BARRIERS } from "../src/barrier.ts";
 import {
@@ -25,6 +26,7 @@ import {
   planProblems,
   selectPlan,
 } from "../src/lanes.ts";
+import { prefixed } from "../src/prefixed.ts";
 import {
   buildReport,
   type CaseResult,
@@ -816,4 +818,30 @@ describe("scripts/redline.ts with no targets", () => {
     },
     180_000,
   );
+});
+
+describe("lane output prefixing", () => {
+  it("keeps ::add-mask:: at line start and prefixes the rest", () => {
+    const from = new PassThrough();
+    let out = "";
+    prefixed(from, { write: (s) => (out += s) }, "[a] ");
+    from.write(
+      "hello\n::add-mask::x\n  ::add-mask::y\r\nplain ::not-cmd::\n::stop-commands::tok\n::add-mask::tail",
+    );
+    from.end();
+    return new Promise<void>((res) =>
+      from.on("end", () => {
+        expect(out.split("\n")).toEqual([
+          "[a] hello",
+          "::add-mask::x",
+          "  ::add-mask::y\r",
+          "[a] plain ::not-cmd::",
+          "[a] ::stop-commands::tok",
+          "::add-mask::tail",
+          "",
+        ]);
+        res();
+      }),
+    );
+  });
 });

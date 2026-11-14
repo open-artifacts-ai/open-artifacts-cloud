@@ -541,6 +541,35 @@ describe("R4 self-serve policy (4.2 order)", () => {
     });
   });
 
+  it("Turnstile next: a lookup that throws is 503 unavailable, not a raw 500; ok:false stays turnstile_failed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const e = fakeEnv({
+      SIGNUPS_ENABLED: "true",
+      PROVISIONER: fakeProvisionerRpc({
+        turnstile: () => {
+          throw Object.assign(new Error("cloudflare 403"), {
+            code: "forbidden",
+          });
+        },
+      }),
+    });
+    const r = await call(e, u(), "R4", {
+      body: ss({ turnstile: "secret-token" }),
+    });
+    expect(r.status).toBe(503);
+    expect(r.code).toBe("unavailable");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-token");
+    warn.mockRestore();
+    const refused = fakeEnv({
+      SIGNUPS_ENABLED: "true",
+      PROVISIONER: fakeProvisionerRpc({ turnstile: () => false }),
+    });
+    expect((await call(refused, u(), "R4", { body: ss() })).code).toBe(
+      "turnstile_failed",
+    );
+  });
+
   it("no hd (a personal account) is admitted; a second live install for the account is 409 signup_limit", async () => {
     const e = fakeEnv({ SIGNUPS_ENABLED: "true" });
     expect(

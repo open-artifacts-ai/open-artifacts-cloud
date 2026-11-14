@@ -1,6 +1,7 @@
 import type { Env } from "../env.js";
 import type { Principal } from "../principal.js";
 import { CLIENT_JS } from "./client.js";
+import { CONTACT_HTML, CONTACT_JS } from "./contact-page.js";
 import { gateOf } from "./gate.js";
 import { CSS } from "./style.js";
 
@@ -72,6 +73,9 @@ export function signupStatic(req: Request, path: string): Response | null {
     return asset(CLIENT_JS, "text/javascript", "public, max-age=300");
   if (path === "/favicon.svg")
     return asset(FAVICON, "image/svg+xml", "public, max-age=86400");
+  if (path === "/contact") return asset(CONTACT_HTML, "text/html", "no-store");
+  if (path === "/contact.js")
+    return asset(CONTACT_JS, "text/javascript", "public, max-age=300");
   if (path === "/") return asset(HTML, "text/html", "no-store");
   return null;
 }

@@ -173,6 +173,7 @@ describe("OIDC on staging /mcp (9A.10)", () => {
       ...ADMIN_TOOL_NAMES,
       // Hosted-only (#66); an OIDC caller sees it listed and is forbidden.
       "list_waitlist",
+      "list_business_requests",
       "beta_stats",
       "approve_waitlist",
       "allow_signup",

@@ -13,6 +13,7 @@ import { canCall, useMe } from "./hooks/useEnv";
 import { Shell } from "./layout/Shell";
 import { Audit } from "./pages/Audit";
 import { Beta } from "./pages/Beta";
+import { Business } from "./pages/Business";
 import { CreateInstall } from "./pages/CreateInstall";
 import { InstallDetail } from "./pages/InstallDetail";
 import { Installs, parseStateFilter, type StateFilter } from "./pages/Installs";
@@ -115,6 +116,7 @@ const routeTree = root.addChildren([
       },
     }),
     inShell("/beta", Beta),
+    inShell("/business-requests", Business),
     inShell("/tokens", TokensRoute),
   ]),
 ]);

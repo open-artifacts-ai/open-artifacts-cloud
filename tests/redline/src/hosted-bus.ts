@@ -350,6 +350,10 @@ export interface HeldSock {
   closed: Promise<void>;
   isOpen(): boolean;
   closeCode(): number | null;
+  /** The server's close reason, at most 120 chars. */
+  closeReason?(): string;
+  /** True when the socket errored before it closed. */
+  erroredFirst?(): boolean;
 }
 
 export interface Daemon extends HeldSock {
@@ -410,8 +414,14 @@ export async function suspendCase(
     );
   const out: SuspendResult = { closeMs: 0, reconnects: 0 };
   const stillUp = (when: string) => {
-    if (!bystander.isOpen())
-      throw new ProbeFail(`${Y}'s bus socket closed ${when}`);
+    if (!bystander.isOpen()) {
+      const code = bystander.closeCode();
+      const reason = (bystander.closeReason?.() ?? "").slice(0, 120);
+      const err = bystander.erroredFirst?.() ? ", errored first" : "";
+      throw new ProbeFail(
+        `${Y}'s bus socket closed ${when} (code ${code ?? "none"}, reason '${reason}'${err})`,
+      );
+    }
   };
   let failure: unknown;
   let resumeFailure: unknown;
@@ -780,6 +790,8 @@ const asSock = (h: Held): HeldSock => {
     closed: h.closed,
     isOpen: () => open,
     closeCode: () => h.closeCode(),
+    closeReason: () => h.closeReason?.() ?? "",
+    erroredFirst: () => h.erroredFirst?.() ?? false,
   };
 };
 

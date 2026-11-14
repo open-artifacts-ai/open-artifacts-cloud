@@ -207,8 +207,7 @@ case "$app" in
     fill "PROVISIONING_OAUTH_KV_ID_${up}" "${PROVISIONING_OAUTH_KV_ID:-}" "$hex32"
     # The API's per-day signup cap, the provisioner's value (#893).
     fill "SIGNUP_DAILY_CAP_${up}" "${SIGNUP_DAILY_CAP:-}" "$cap"
-    # Staging's gate is the constant (open for the M2 walk); prod's block pins
-    # a literal false, so this fill only checks the value there.
+    # Both envs' gate is the env's committed constant (prod.json, staging.json).
     fill "SIGNUPS_ENABLED_${up}" "${SIGNUPS_ENABLED:-}" "$onoff"
     # The approval email's sender (#2096), the provisioner's value.
     # Only when this tag's config declares it (an older tag has no approval email).

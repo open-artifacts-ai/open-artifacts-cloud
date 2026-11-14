@@ -285,11 +285,25 @@ describe("upgrade and rollback (5.4)", () => {
     const TARGET = "0.25.0";
     const STEP = "0.24.5";
     const tpl = parseTemplate(new TextDecoder().decode(FIX.TEMPLATE_BYTES));
+    // The step unbinds BusHub and every class a later migration adds (public
+    // v0.179.0 also binds DocRoom, v5), so it stays "the release just before
+    // BusHub" for any future class.
+    const migrations = (tpl.migrations ?? []) as {
+      tag: string;
+      new_sqlite_classes?: string[];
+    }[];
+    const busHubAt = migrations.findIndex((m) =>
+      m.new_sqlite_classes?.includes("BusHub"),
+    );
+    expect(busHubAt).toBeGreaterThanOrEqual(0);
+    const newer = new Set(
+      migrations.slice(busHubAt).flatMap((m) => m.new_sqlite_classes ?? []),
+    );
     const unbound = {
       ...tpl,
       durable_objects: {
         bindings: (tpl.durable_objects?.bindings ?? []).filter(
-          (x: { class_name: string }) => x.class_name !== "BusHub",
+          (x: { class_name: string }) => !newer.has(x.class_name),
         ),
       },
     };
@@ -1066,6 +1080,29 @@ describe("purge and discard (5.6, 2.5 item 4)", () => {
     expect(w.hosts("purgeco")).toEqual([undefined, undefined]);
     expect(w.lifecycle(s.installId)?.serving_mode).toBe("unmapped");
     expect(w.status(s.installId)?.state).toBe("deleted");
+  });
+
+  it("a purge deletes an install's OAuth namespace if it has one, and is not troubled when it has none (#1008)", async () => {
+    const titles = () =>
+      [...w.fake.kv.values()]
+        .map((k) => k.title)
+        .filter((t) => t.endsWith("-oauth"));
+    const withNs = await active({ slug: "withns" });
+    expect(titles()).toHaveLength(1);
+    await manage("delete", withNs.installId);
+    expect((await manage("purge", withNs.installId)).error).toBeNull();
+    expect(w.install(withNs.installId)?.state).toBe("deleted");
+    expect(titles()).toEqual([]);
+
+    w.env.OAUTH_BORN_D1 = "1";
+    const born = await active({ slug: "bornco" });
+    expect(titles()).toEqual([]);
+    expect(w.install(born.installId)?.kv_id).toBeNull();
+    await manage("delete", born.installId);
+    const r = await manage("purge", born.installId);
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done" });
+    expect(w.install(born.installId)?.state).toBe("deleted");
   });
 
   it("the scheduler's purge waits for purge_at", async () => {

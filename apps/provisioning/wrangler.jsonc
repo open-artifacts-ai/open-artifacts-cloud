@@ -57,6 +57,7 @@
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_STAGING}}",
+        "BUSINESS_REQUESTS_TO": "hello@open-artifacts.com",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback",
         "OIDC_AUDIENCE": "https://api.open-artifacts-staging.app",
         "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
@@ -218,11 +219,15 @@
       "vars": {
         "OA_ENV": "prod",
         "APP_DOMAIN": "open-artifacts.app",
-        "SIGNUPS_ENABLED": "false",
+        // The prod.json value, filled at deploy like staging's: the provisioner and the
+        // scheduler take it from there too, and a literal here left provisioning on
+        // false while they got invite.
+        "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}",
         "SELF_SERVE_TIER": "trial",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
+        "BUSINESS_REQUESTS_TO": "hello@open-artifacts.com",
         "MCP_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback"
       },
       "d1_databases": [

@@ -690,9 +690,64 @@ describe("0012_solo_start (self-serve Solo start)", () => {
   });
 });
 
+describe("0015_business_requests (the Business contact form, open-artifacts#2404)", () => {
+  it("follows 0014 and only adds the business_requests table and an index", () => {
+    expect(migrationFiles.slice(14)).toEqual(["0015_business_requests.sql"]);
+    const sql = migrationSql("0015_business_requests.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
+    expect(
+      cols(platformDb(), "business_requests").map((c) => c.replace(/ NN$/, "")),
+    ).toEqual([
+      "id TEXT PK",
+      "created_at INTEGER",
+      "name TEXT",
+      "email TEXT",
+      "company TEXT",
+      "team_size TEXT",
+      "needs TEXT",
+      "note TEXT",
+      "source TEXT",
+      "instance_host TEXT",
+      "status TEXT",
+      "status_changed_at INTEGER",
+      "status_changed_by TEXT",
+    ]);
+  });
+
+  it("defaults status to new and needs to [], and refuses an unknown size, source or status", () => {
+    const db = platformDb();
+    const ins = (o: Record<string, string>) =>
+      db
+        .prepare(
+          "INSERT INTO business_requests (id, created_at, name, email, company, team_size, source, status) VALUES (?, 1, 'n', 'e@x.co', 'c', ?, ?, ?)",
+        )
+        .run(
+          o.id as string,
+          o.size ?? "1-10",
+          o.source ?? "landing",
+          o.status ?? "new",
+        );
+    ins({ id: "a" });
+    expect(
+      db
+        .prepare(
+          "SELECT status, needs, note, instance_host FROM business_requests",
+        )
+        .get(),
+    ).toEqual({ status: "new", needs: "[]", note: null, instance_host: null });
+    expect(() => ins({ id: "b", size: "5" })).toThrow();
+    expect(() => ins({ id: "c", source: "email" })).toThrow();
+    expect(() => ins({ id: "d", status: "open" })).toThrow();
+    expect(() => ins({ id: "a" })).toThrow();
+  });
+});
+
 describe("0014_waitlist_emailed (when the approval email went, #2096)", () => {
   it("follows 0013 and only adds the nullable emailed_at column", () => {
-    expect(migrationFiles.slice(13)).toEqual(["0014_waitlist_emailed.sql"]);
+    expect(migrationFiles.slice(13, 14)).toEqual(["0014_waitlist_emailed.sql"]);
     const sql = migrationSql("0014_waitlist_emailed.sql").replace(
       /--[^\n]*/g,
       "",

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
-import { FileText, KeyRound, Server, Users } from "lucide-react";
+import { Briefcase, FileText, KeyRound, Server, Users } from "lucide-react";
 import { useEffect } from "react";
 import { betaStatsQuery } from "../api/beta";
 import { api } from "../api/client";
@@ -82,6 +82,11 @@ export function Shell() {
                   {beta.data?.waiting}
                 </span>
               )}
+            </Link>
+          )}
+          {mayBeta && (
+            <Link to="/business-requests">
+              <Briefcase size={14} aria-hidden /> Business requests
             </Link>
           )}
           <Link to="/audit">

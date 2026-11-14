@@ -1771,6 +1771,176 @@ describe("the renewal date and interval are recorded (#2135)", () => {
   });
 });
 
+describe("a paid checkout records the subscription's interval and renewal (#2135)", () => {
+  const PERIOD_END = T + 20 * 86_400;
+  const live = (interval: string, o: Record<string, unknown> = {}) => ({
+    id: "sub_Test1",
+    customer: CUS_A,
+    status: "active",
+    current_period_end: PERIOD_END,
+    items: {
+      data: [
+        {
+          price: {
+            id: "price_Team",
+            lookup_key: "team",
+            recurring: { interval },
+          },
+        },
+      ],
+    },
+    ...o,
+  });
+  const stripeOf = (body: Record<string, unknown> | null) => {
+    const f = (async () =>
+      body
+        ? Response.json(body)
+        : Response.json({ error: {} }, { status: 500 })) as unknown as typeof fetch;
+    return { ...env, stripeFetch: f } as WebhookEnv;
+  };
+  const checkout = (created: number, o: Record<string, unknown> = {}) =>
+    event(
+      "checkout.session.completed",
+      {
+        customer: CUS_A,
+        subscription: "sub_Test1",
+        payment_status: "paid",
+        metadata: { tier: "team" },
+        ...o,
+      },
+      { created },
+    );
+  const upd = (o: Record<string, unknown>, created: number) =>
+    event("customer.subscription.updated", o, { created });
+
+  it("a yearly checkout whose subscription events were older (stale) still records year and the period end", async () => {
+    await deliver(checkout(T + 100), { env: stripeOf(live("year")) });
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_Test1",
+      billing_interval: "year",
+      renews_at: PERIOD_END * 1000,
+    });
+    // The older subscription event is stale, and changes nothing.
+    await deliver(upd(sub({ status: "active" }), T + 50), {
+      env: stripeOf(live("month")),
+    });
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("a monthly checkout records month", async () => {
+    await deliver(checkout(T + 100), { env: stripeOf(live("month")) });
+    expect(await row(A)).toMatchObject({
+      billing_interval: "month",
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("a cancel scheduled at checkout time: renews_at stays null, the interval and cancels_at are kept", async () => {
+    await deliver(checkout(T + 100), {
+      env: stripeOf(live("year", { cancel_at_period_end: true })),
+    });
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: null,
+      cancels_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("a failed read of the row's own subscription still applies the checkout; the renewal waits for the next event", async () => {
+    await ownSub(A);
+    expect((await deliver(checkout(T + 100), { env: stripeOf(null) })).status).toBe(
+      200,
+    );
+    expect(await row(A)).toMatchObject({
+      tier: "team",
+      stripe_subscription_id: "sub_Test1",
+      billing_interval: null,
+      renews_at: null,
+    });
+    await deliver(upd(live("year"), T + 200), { env: stripeOf(null) });
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("redelivering the same checkout leaves the row identical and makes no other Stripe write", async () => {
+    const calls: string[] = [];
+    const f = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${new URL(url).pathname}`);
+      return Response.json(live("year"));
+    }) as unknown as typeof fetch;
+    const e = { ...env, stripeFetch: f } as WebhookEnv;
+    const ev = checkout(T + 100);
+    await deliver(ev, { env: e });
+    const first = await row(A);
+    await deliver(ev, { env: e });
+    expect(await row(A)).toEqual(first);
+    expect(calls.every((c) => c.startsWith("GET "))).toBe(true);
+    expect(await pending()).toEqual([]);
+  });
+
+  it("on prod (OA_ENV=prod, an rk_live_ key) the own-subscription read happens and the fields are written", async () => {
+    await ownSub(A);
+    const calls: string[] = [];
+    const f = (async (url: string) => {
+      calls.push(new URL(url).pathname);
+      return Response.json(live("year"));
+    }) as unknown as typeof fetch;
+    const prod = {
+      ...env,
+      OA_ENV: "prod",
+      STRIPE_SECRET_KEY: "rk_live_abcdefgh12345678",
+      stripeFetch: f,
+    } as WebhookEnv;
+    const ev = { ...checkout(T + 100), livemode: true };
+    expect((await deliver(ev, { env: prod })).status).toBe(200);
+    expect(calls).toEqual(["/v1/subscriptions/sub_Test1"]);
+    expect(await row(A)).toMatchObject({
+      billing_interval: "year",
+      renews_at: PERIOD_END * 1000,
+    });
+  });
+
+  it("no extra read for the row's own subscription when a cancel is scheduled", async () => {
+    await ownSub(A);
+    await db
+      .prepare(
+        "UPDATE tiers SET billing_interval = 'year', cancels_at = ?2 WHERE install_id = ?1",
+      )
+      .bind(A, PERIOD_END * 1000)
+      .run();
+    const calls: string[] = [];
+    const f = (async (url: string) => {
+      calls.push(url);
+      return Response.json(live("year"));
+    }) as unknown as typeof fetch;
+    await deliver(checkout(T + 100), {
+      env: { ...env, stripeFetch: f } as WebhookEnv,
+    });
+    expect(calls).toEqual([]);
+    expect((await row(A)).renews_at).toBeNull();
+  });
+
+  it("an unpaid checkout and a subscription that is not live record nothing", async () => {
+    await deliver(checkout(T + 100, { payment_status: "unpaid" }), {
+      env: stripeOf(live("year")),
+    });
+    expect((await row(A)).billing_interval).toBeNull();
+    await deliver(checkout(T + 200), {
+      env: stripeOf(live("year", { status: "incomplete" })),
+    });
+    expect(await row(A)).toMatchObject({
+      billing_interval: null,
+      renews_at: null,
+    });
+  });
+});
+
 describe("pruning stripe_events (#1479)", () => {
   const ids = async () =>
     (
@@ -1931,6 +2101,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     const retry = await deliver(ev, { env: good.e });
     expect(retry.status).toBe(200);
     expect(good.calls).toEqual([
+      "GET /v1/subscriptions/sub_New1",
       "GET /v1/subscriptions/sub_Old1",
       "DELETE /v1/subscriptions/sub_Old1",
     ]);
@@ -1938,7 +2109,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     // A third delivery cancels nothing more.
     const again = stripe();
     expect((await deliver(ev, { env: again.e })).status).toBe(200);
-    expect(again.calls).toEqual([]);
+    expect(again.calls).toEqual(["GET /v1/subscriptions/sub_New1"]);
   });
 
   it("no cancel when the previous subscription is dead or is the same one, and not for an unpaid checkout", async () => {
@@ -1946,7 +2117,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
     await soloLive();
     let s = stripe();
     await deliver(completed("sub_Old1"), { env: s.e });
-    expect(s.calls).toEqual([]);
+    expect(s.calls).toEqual(["GET /v1/subscriptions/sub_Old1"]);
     // Previous lapsed: nothing left to cancel.
     await soloLive();
     await db
@@ -2005,7 +2176,7 @@ describe("Solo to Team or Business through Checkout (#1568)", () => {
       now: later,
       t: Math.floor(later / 1000),
     });
-    expect(again.calls).toEqual([]);
+    expect(again.calls).toEqual(["GET /v1/subscriptions/sub_New1"]);
     expect(await row(A)).toMatchObject({
       tier: "team",
       stripe_subscription_id: "sub_New1",
@@ -2162,7 +2333,7 @@ describe("subscription events apply only to the row's current subscription (#156
     // The checkout for the same subscription then finds nothing to cancel.
     const s = okStripe();
     await deliver(paidCheckout(NEW), { env: s.e });
-    expect(s.calls).toEqual([]);
+    expect(s.calls).toEqual(["GET /v1/subscriptions/sub_New1"]);
     // A comped paid row without a subscription is not lapsed by a stray delete.
     await db
       .prepare(
@@ -3010,7 +3181,7 @@ describe("a Solo Checkout never replaces a live Team or Business subscription (#
       { env: s.e },
     );
     await deliver(checkout("sub_Team1", "team"), { env: s.e });
-    expect(s.calls).toEqual([]);
+    expect(s.calls).toEqual(["GET sub_Team1"]);
     expect(await pending()).toEqual([]);
   });
 
@@ -3579,7 +3750,7 @@ describe("a Checkout adopts a subscription only if Stripe says it is live (#1568
     await deliver(checkout("sub_Unpaid1", { payment_status: "unpaid" }), {
       env: s.e,
     });
-    expect(s.calls).toEqual([]);
+    expect(s.calls).toEqual(["GET sub_Old1"]);
     await db
       .prepare(
         "UPDATE tiers SET tier = 'team', stripe_subscription_id = 'sub_Team1' WHERE install_id = ?",

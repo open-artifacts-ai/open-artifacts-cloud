@@ -1,5 +1,5 @@
 # The public open-artifacts release this repo builds on.
 # overlay.sh refuses a public checkout whose HEAD is not exactly this sha.
 # Bump both lines together, in one PR, with the regenerated pnpm-lock.yaml.
-tag=v0.173.0
-sha=51750ca7472d0837e540ddd305a4d764fe9bb2de
+tag=v0.180.0
+sha=59b9682ac31b5cae9823f7358dc939fa8dbf28d4

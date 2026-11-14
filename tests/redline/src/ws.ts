@@ -155,6 +155,10 @@ export interface Held {
    * null before that, for a close frame with no code, and with nothing open.
    */
   closeCode: () => number | null;
+  /** The server's close reason text, truncated to 120 chars; "" when none came. */
+  closeReason?: () => string;
+  /** True when the socket errored before it ended. */
+  erroredFirst?: () => boolean;
 }
 
 /** One masked client text frame (RFC 6455 5.2), for a short payload. */
@@ -223,8 +227,12 @@ export async function holdSocket(
       texts,
       waitText: async () => false,
       closeCode: () => null,
+      closeReason: () => "",
+      erroredFirst: () => false,
     };
   let ended = false;
+  let reason = "";
+  let errFirst = false;
   const waiters = new Set<() => void>();
   let endNow!: () => void;
   const closed = new Promise<void>((resolve) => {
@@ -236,7 +244,10 @@ export async function holdSocket(
     endNow = end;
     socket.once("close", end);
     socket.once("end", end);
-    socket.once("error", end);
+    socket.once("error", () => {
+      if (!ended) errFirst = true;
+      end();
+    });
   });
   // Writes after the peer is gone may error; closed already settled.
   socket.on("error", () => {});
@@ -263,6 +274,11 @@ export async function holdSocket(
       // A close frame: its first two payload bytes are the code.
       if (op === 8) {
         if (code === null && len >= 2) code = buf.readUInt16BE(off);
+        if (len > 2)
+          reason = buf
+            .subarray(off + 2, off + len)
+            .toString("utf8")
+            .slice(0, 120);
         // Echo the close (the server waits for it, e.g. behind an edge),
         // settle `closed`, then end the socket; destroy if it lingers.
         if (!ended) {
@@ -298,6 +314,8 @@ export async function holdSocket(
       socket.destroy();
     },
     closeCode: () => code,
+    closeReason: () => reason,
+    erroredFirst: () => errFirst,
     waitText: (pred, ms) =>
       new Promise<boolean>((resolve) => {
         const done = (v: boolean) => {
