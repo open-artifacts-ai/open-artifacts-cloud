@@ -142,9 +142,10 @@
         "ACCOUNT_ID": "{{ACCOUNT_ID_PROD}}",
         // The Workflow's env: it refuses any other value.
         "OA_ENV": "prod",
-        // open-artifacts#2325: "1" gives every prod install the bus feature. OFF ("0") until
-        // a reviewed PR flips it, after the hosted isolation red-line cases pass.
-        "PROD_BUS_ALL": "0",
+        // open-artifacts#2325: "1" gives every prod install the bus feature (red-line
+        // fixtures, slugs starting rl-, never). ON: flipped by a reviewed PR after the hosted
+        // isolation red-line cases passed; "0" turns it off again at the next render.
+        "PROD_BUS_ALL": "1",
         // open-artifacts#1008: OFF ("0") in prod: new installs still get the KV namespace until
         // a reviewed PR flips it, after the staging rollout and red-line.
         "OAUTH_BORN_D1": "0",

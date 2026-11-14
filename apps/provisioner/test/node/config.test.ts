@@ -25,14 +25,14 @@ const P = { staging: "s", prod: "p" } as const;
 const ROUTING = ["route", "routes", "custom_domain", "custom_domains"];
 
 describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
-  it('prod has PROD_BUS_ALL "0" and no staging var; staging has no PROD_BUS_ALL', () => {
-    expect(cfg.env.prod.vars.PROD_BUS_ALL).toBe("0");
+  it('prod has PROD_BUS_ALL "1" and no staging var; staging has no PROD_BUS_ALL', () => {
+    expect(cfg.env.prod.vars.PROD_BUS_ALL).toBe("1");
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_ALL");
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
     expect(cfg.env.staging.vars).not.toHaveProperty("PROD_BUS_ALL");
   });
 
-  it('with the merged prod config, a prod install gets no bus until PROD_BUS_ALL flips to "1"', async () => {
+  it('with the merged prod config, a prod install gets bus (prodBusAll only, never the staging flags); "0" turns it off', async () => {
     const opts = (vars: typeof cfg.env.prod.vars) =>
       provisionerOptions(
         {
@@ -50,14 +50,14 @@ describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
         "01JOB0000000000000000000AA",
       );
     const o = await opts(cfg.env.prod.vars);
-    expect(o.prodBusAll).toBe(false);
+    expect(o.prodBusAll).toBe(true);
     expect(o.stagingBusAll).toBe(false);
     expect(o.stagingBusSlugs).toEqual([]);
-    // The flip is that one var: the same config with "1" turns prod on, and
-    // nothing else does.
-    const flipped = await opts({ ...cfg.env.prod.vars, PROD_BUS_ALL: "1" });
-    expect(flipped.prodBusAll).toBe(true);
-    expect(flipped.stagingBusAll).toBe(false);
+    // The switch is that one var: the same config with "0" turns prod off,
+    // and nothing else does.
+    const off = await opts({ ...cfg.env.prod.vars, PROD_BUS_ALL: "0" });
+    expect(off.prodBusAll).toBe(false);
+    expect(off.stagingBusAll).toBe(false);
   });
 });
 
@@ -144,7 +144,7 @@ describe("wrangler.jsonc", () => {
               STAGING_BUS_SLUGS: "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb",
               STAGING_BUS_ALL: "1",
             }
-          : { PROD_BUS_ALL: "0" }),
+          : { PROD_BUS_ALL: "1" }),
         // open-artifacts#1008: born on d1 in staging, off in prod.
         OAUTH_BORN_D1: env === "staging" ? "1" : "0",
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
