@@ -13,6 +13,7 @@ import {
   readZip,
   scrubDirs,
   scrubTraceZip,
+  secretLiterals,
   writeZip,
 } from "../src/t19-trace.ts";
 
@@ -150,6 +151,103 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     expect(text).toContain("application/json");
     expect(text).toContain("locator.fill");
     expect(text).toContain("https://app.example/api/s/[redacted]?code=");
+  });
+
+  it("drops log events and reduces errors; fill values, OAuth params and page text do not survive", () => {
+    const FILL = "hunter2-secret-value";
+    const PAGE = "Welcome back dana@example.com";
+    const t = ndjson(
+      { type: "context-options", version: 8 },
+      { type: "log", callId: "c1", time: 1, message: `fill("${FILL}")` },
+      {
+        type: "log",
+        callId: "c2",
+        time: 2,
+        message:
+          "navigated to https://app.example/cb?code=AUTHCODE123&state=STATE456#oa=FRAGTOKEN789",
+      },
+      {
+        type: "after",
+        callId: "c3",
+        endTime: 3,
+        error: {
+          name: "Error",
+          message: `expect(locator).toHaveText(expected)\nExpected: "ok"\nReceived: "${PAGE}"\nat https://app.example/cb?code=AUTHCODE123&state=STATE456#oa=FRAGTOKEN789`,
+        },
+      },
+      {
+        type: "error",
+        message: `page.goto: Timeout navigating to https://app.example/cb?code=AUTHCODE123&state=STATE456#oa=FRAGTOKEN789 expecting '${FILL}'\nCall log:\n  - Received "${PAGE}"`,
+      },
+    );
+    const out = scrubTraceZip(
+      writeZip([{ name: "trace.trace", data: Buffer.from(t) }]),
+      [],
+    );
+    const text = all(out);
+    expect(text).not.toContain('"type":"log"');
+    for (const bad of [
+      FILL,
+      PAGE,
+      "dana@",
+      "AUTHCODE123",
+      "STATE456",
+      "FRAGTOKEN789",
+      "Received",
+      "Call log",
+    ])
+      expect(text).not.toContain(bad);
+    expect(text).toContain("<redacted>");
+    expect(text).toContain("expect(locator).toHaveText(expected)");
+  });
+
+  it("redacts path segments of 24+ characters, dots and escapes included", () => {
+    const n = ndjson({
+      type: "resource-snapshot",
+      snapshot: {
+        request: {
+          method: "GET",
+          url: "https://a.example/x/abc.def.ghi.jkl.mno.pqrstuv/ok/a%20b%20c%20d%20e%20f%20g%20h%20i%20j",
+        },
+        response: { status: 200 },
+      },
+    });
+    const out = scrubTraceZip(
+      writeZip([
+        {
+          name: "trace.trace",
+          data: Buffer.from('{"type":"context-options"}\n'),
+        },
+        { name: "trace.network", data: Buffer.from(n) },
+      ]),
+      [],
+    );
+    const text = all(out);
+    expect(text).toContain("/x/[redacted]/ok/[redacted]");
+  });
+
+  it("secretLiterals matches each line of a file and the URL-encoded form", () => {
+    writeFileSync(
+      join(dir, "k"),
+      "first-secret-line one\nsecond&secret=line\n",
+    );
+    const l = secretLiterals(dir);
+    expect(l).toContain("second&secret=line");
+    expect(l).toContain(encodeURIComponent("second&secret=line"));
+    expect(l).toContain("first-secret-line one");
+    const z = writeZip([
+      {
+        name: "trace.trace",
+        data: Buffer.from(
+          ndjson({
+            type: "before",
+            callId: "c",
+            apiName: "x second%26secret%3Dline",
+          }),
+        ),
+      },
+    ]);
+    expect(all(scrubTraceZip(z, l))).not.toContain("second%26secret");
   });
 
   it("scrubs the zip files under the directories in place", () => {

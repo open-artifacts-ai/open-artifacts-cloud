@@ -156,8 +156,6 @@ export function redactText(s: string, literals: readonly string[]): string {
   return out;
 }
 
-const SECRET_SEGMENT = /^[A-Za-z0-9_-]{24,}$/;
-
 /** A URL with no credentials, no query values, no fragment, no token-shaped path segment. */
 export function scrubUrl(u: unknown, lit: readonly string[]): string {
   if (typeof u !== "string") return REDACTED;
@@ -171,7 +169,7 @@ export function scrubUrl(u: unknown, lit: readonly string[]): string {
     return `${url.protocol}${REDACTED}`;
   const path = url.pathname
     .split("/")
-    .map((s) => (SECRET_SEGMENT.test(s) ? REDACTED : s))
+    .map((s) => (s.length >= 24 ? REDACTED : s))
     .join("/");
   const keys = [...new Set([...url.searchParams.keys()])];
   const q = keys.length
@@ -223,6 +221,23 @@ function pick(
     else if (typeof v === "string") out[k] = redactText(v, lit);
   }
   return out;
+}
+
+/**
+ * An error message reduced to its first line, every URL through scrubUrl and
+ * every quoted string replaced (a fill value, a "Received" page text).
+ */
+export function scrubError(m: unknown, lit: readonly string[]): string {
+  if (typeof m !== "string") return REDACTED;
+  const first = m.split("\n")[0] ?? "";
+  const noUrls = first.replace(/https?:\/\/[^\s"'`)\]>]+/g, (u) =>
+    scrubUrl(u, lit),
+  );
+  const noQuotes = noUrls
+    .replace(/"[^"]*"/g, '"<redacted>"')
+    .replace(/'[^']*'/g, "'<redacted>'")
+    .replace(/`[^`]*`/g, "`<redacted>`");
+  return redactText(noQuotes, lit);
 }
 
 function scrubSnapshot(s: unknown, lit: readonly string[]): Obj {
@@ -330,11 +345,13 @@ function scrubEvent(e: Obj, lit: readonly string[]): Obj | null {
         ...pick(e, ["callId", "endTime", "pageId"], lit),
         type: "after",
       };
-      if (isObj(e.error)) out.error = pick(e.error, ["name", "message"], lit);
+      if (isObj(e.error))
+        out.error = {
+          ...pick(e.error, ["name"], lit),
+          message: scrubError(e.error.message, lit),
+        };
       return out;
     }
-    case "log":
-      return { ...pick(e, ["callId", "time", "message"], lit), type: "log" };
     case "console":
       return {
         ...pick(e, ["pageId", "time", "messageType"], lit),
@@ -355,7 +372,7 @@ function scrubEvent(e: Obj, lit: readonly string[]): Obj | null {
         params: {},
       };
     case "error":
-      return { ...pick(e, ["message"], lit), type: "error" };
+      return { message: scrubError(e.message, lit), type: "error" };
     case "resource-snapshot":
       return {
         type: "resource-snapshot",
@@ -436,15 +453,21 @@ function* walk(dir: string): Generator<string> {
   }
 }
 
-/** Every file in `dir`, as a secret value (values under 8 bytes are skipped). */
+/** Every file in `dir` as secret values (under 8 bytes skipped), deduplicated. */
 export function secretLiterals(dir: string): string[] {
   if (!existsSync(dir)) return [];
   const out: string[] = [];
   for (const f of walk(dir)) {
-    const v = readFileSync(f, "utf8").trim();
-    if (v.length >= 8) out.push(v);
+    const v = readFileSync(f, "utf8");
+    // The whole value, each line of it, and the URL-encoded form of both.
+    for (const x of [v.trim(), ...v.split("\n").map((l) => l.trim())]) {
+      if (x.length < 8) continue;
+      out.push(x);
+      const enc = encodeURIComponent(x);
+      if (enc !== x) out.push(enc);
+    }
   }
-  return out;
+  return [...new Set(out)];
 }
 
 /** A short, static code for a scrub failure: never any trace content. */
