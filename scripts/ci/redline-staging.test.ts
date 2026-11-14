@@ -1570,11 +1570,21 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     const up = t19Steps.filter((s) => s.with?.name === "t19-report");
     expect(up).toHaveLength(1);
     expect(up[0]?.if).toBe(
-      "always() && steps.scan.outcome == 'success' && steps.t19.outcome != 'skipped'",
+      "always() && steps.scan.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'",
     );
     expect(t19Steps.indexOf(up[0] ?? {})).toBeGreaterThan(
       t19Steps.indexOf(scan),
     );
+    // #281: the scrub step exists, runs after T19 and before the scan, and
+    // T19 keeps a trace on failure for it to scrub.
+    const trace = t19Named("trace");
+    expect(trace.if).toBe("always() && steps.t19.outcome != 'skipped'");
+    expect(trace.run).toContain("t19-trace scrub");
+    expect(t19Steps.indexOf(trace)).toBeGreaterThan(
+      t19Steps.indexOf(t19Named("t19")),
+    );
+    expect(t19Steps.indexOf(trace)).toBeLessThan(t19Steps.indexOf(scan));
+    expect(t19Named("t19").run).toContain("--trace retain-on-failure");
     expect(up[0]?.with.path).toBe("apps/dashboard/playwright-report");
     const tmp = mkdtempSync(join(tmpdir(), "t19-scan-"));
     try {
