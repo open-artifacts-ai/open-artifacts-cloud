@@ -1462,6 +1462,8 @@ describe("WfpProvisioner.create", () => {
       "RL_DIRECTORY",
       // #1315: BusHub (v4, 0.109.0), bound one release after its class tag.
       "BUS_HUB",
+      // DocRoom (v5, 0.172.0), bound one release after its class tag (0.179.0).
+      "DOC_ROOM",
       "RL_ANON",
       "RL_AUTH",
       // public #1937: install-wide per-IP ceiling for anonymous writes. Bound
@@ -4914,16 +4916,53 @@ describe("a job's lease across its attempts (#1326: fenced by attempt)", () => {
   });
 });
 
-describe("#1315: the real template binds BusHub, so only an install already on tag v4 takes it", () => {
-  // BusHub shipped unbound (tag v4) in 0.109.0. An install on v3 (0.99.0,
-  // 0.100.0) would add and bind it in one upgrade, which a rollback could
-  // not undo: refused, naming the step. Create never runs this rule.
-  it("live v3 (pre-0.109.0) is refused, naming BusHub and the step", () => {
-    expect(() => assertDoClassesShipFirst(loadTemplate(), "v3")).toThrow(
-      /adds Durable Object class BusHub and binds it.*upgrade first to a release that adds it unbound/,
+describe("#1315: the real template binds BusHub and DocRoom, so only an install on their class tags takes it", () => {
+  // BusHub shipped unbound (tag v4) in 0.109.0 and DocRoom (tag v5) in
+  // 0.172.0. An install behind a tag would add and bind the class in one
+  // upgrade, which a rollback could not undo: refused, naming the step.
+  // Create never runs this rule.
+  const tpl = loadTemplate();
+  const migs = (tpl.migrations ?? []) as {
+    tag: string;
+    new_sqlite_classes?: string[];
+  }[];
+  const busAt = migs.findIndex((m) => m.new_sqlite_classes?.includes("BusHub"));
+  // The release just before DocRoom (and any later class): binds BusHub only.
+  const docAt = migs.findIndex((m) =>
+    m.new_sqlite_classes?.includes("DocRoom"),
+  );
+  const later = new Set(
+    migs.slice(docAt).flatMap((m) => m.new_sqlite_classes ?? []),
+  );
+  const busOnly = {
+    ...tpl,
+    durable_objects: {
+      bindings: (tpl.durable_objects?.bindings ?? []).filter(
+        (x: { class_name: string }) => !later.has(x.class_name),
+      ),
+    },
+  };
+  it("the tags this models are the ones the template carries", () => {
+    expect(migs[busAt]?.tag).toBe("v4");
+    expect(migs[docAt]?.tag).toBe("v5");
+  });
+  it("live v3 (pre-0.109.0) is refused, naming BusHub, DocRoom and the step", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v3")).toThrow(
+      /adds Durable Object class BusHub, DocRoom and binds it.*upgrade first to a release that adds it unbound/,
     );
   });
-  it("live v4 (0.109.0 or later) passes", () => {
-    expect(() => assertDoClassesShipFirst(loadTemplate(), "v4")).not.toThrow();
+  it("live v4 (0.109.0 to 0.171.x) is refused, naming DocRoom", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v4")).toThrow(
+      /adds Durable Object class DocRoom and binds it.*upgrade first to a release that adds it unbound/,
+    );
+  });
+  it("live v5 (0.172.0 or later) passes", () => {
+    expect(() => assertDoClassesShipFirst(tpl, "v5")).not.toThrow();
+  });
+  it("a template binding BusHub only: v3 is refused naming BusHub, v4 passes", () => {
+    expect(() => assertDoClassesShipFirst(busOnly, "v3")).toThrow(
+      /adds Durable Object class BusHub and binds it/,
+    );
+    expect(() => assertDoClassesShipFirst(busOnly, "v4")).not.toThrow();
   });
 });

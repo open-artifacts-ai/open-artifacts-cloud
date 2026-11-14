@@ -71,6 +71,16 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.179.0: the ask decider route (#1794) and the document websocket (DocRoom).
+    ...[
+      "artifact comments ask decider [session]",
+      "artifact comments ask decider [pat]",
+      "artifact ws doc [session]",
+      "artifact ws doc [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",

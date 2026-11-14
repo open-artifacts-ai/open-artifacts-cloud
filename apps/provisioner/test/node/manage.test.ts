@@ -285,11 +285,25 @@ describe("upgrade and rollback (5.4)", () => {
     const TARGET = "0.25.0";
     const STEP = "0.24.5";
     const tpl = parseTemplate(new TextDecoder().decode(FIX.TEMPLATE_BYTES));
+    // The step unbinds BusHub and every class a later migration adds (public
+    // v0.179.0 also binds DocRoom, v5), so it stays "the release just before
+    // BusHub" for any future class.
+    const migrations = (tpl.migrations ?? []) as {
+      tag: string;
+      new_sqlite_classes?: string[];
+    }[];
+    const busHubAt = migrations.findIndex((m) =>
+      m.new_sqlite_classes?.includes("BusHub"),
+    );
+    expect(busHubAt).toBeGreaterThanOrEqual(0);
+    const newer = new Set(
+      migrations.slice(busHubAt).flatMap((m) => m.new_sqlite_classes ?? []),
+    );
     const unbound = {
       ...tpl,
       durable_objects: {
         bindings: (tpl.durable_objects?.bindings ?? []).filter(
-          (x: { class_name: string }) => x.class_name !== "BusHub",
+          (x: { class_name: string }) => !newer.has(x.class_name),
         ),
       },
     };
