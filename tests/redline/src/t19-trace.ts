@@ -237,7 +237,9 @@ export function scrubError(m: unknown, lit: readonly string[]): string {
     .replace(/"[^"]*"/g, '"<redacted>"')
     .replace(/'[^']*'/g, "'<redacted>'")
     .replace(/`[^`]*`/g, "`<redacted>`");
-  return redactText(noQuotes, lit);
+  // An unmatched quote: nothing after it can be trusted, cut to the line's end.
+  const cut = noQuotes.replace(/(?<!<redacted)["'`].*$/, "<redacted>");
+  return redactText(cut, lit);
 }
 
 function scrubSnapshot(s: unknown, lit: readonly string[]): Obj {

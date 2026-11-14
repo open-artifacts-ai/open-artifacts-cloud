@@ -201,6 +201,22 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     expect(text).toContain("expect(locator).toHaveText(expected)");
   });
 
+  it("an unmatched quote cuts the error to the end of the line", () => {
+    const n = ndjson({
+      type: "error",
+      message: `fill failed: value 'abc-unterminated-secret https://x.example/?code=ZZZ and more`,
+    });
+    const text = all(
+      scrubTraceZip(
+        writeZip([{ name: "trace.trace", data: Buffer.from(n) }]),
+        [],
+      ),
+    );
+    expect(text).not.toContain("unterminated");
+    expect(text).not.toContain("more");
+    expect(text).toContain("fill failed: value");
+  });
+
   it("redacts path segments of 24+ characters, dots and escapes included", () => {
     const n = ndjson({
       type: "resource-snapshot",
