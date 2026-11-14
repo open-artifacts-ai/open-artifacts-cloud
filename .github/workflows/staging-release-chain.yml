@@ -15,9 +15,12 @@
 # dispatch job re-checks all that under a concurrency group keyed on the tag.
 # The deploy and the gate each hold their own gates (release gate, platform
 # tags, staging's Environment); this file only starts them, and waits for
-# nothing. Dispatches use the default token: a run dispatched by it is a
-# workflow_dispatch run by github-actions[bot], the event prod-release-chain
-# and staging-first-gate.sh read.
+# nothing. Dispatches use the release App's installation token (actions:
+# write), never the default token: GitHub raises no workflow_run event for a
+# run the default token started, so this chain's second step and
+# prod-release-chain would never fire. A run dispatched by the App is still
+# a workflow_dispatch run, the event prod-release-chain and
+# staging-first-gate.sh read.
 # The red-line nightly yields to candidates (it skips while any red-line run is
 # going), but a nightly already running holds the `redline` group, so the gate
 # waits for it (up to about 150 min), and a second dispatch replaces a waiting one.
@@ -71,10 +74,13 @@ jobs:
     needs: plan
     if: needs.plan.outputs.go == 'true'
     runs-on: ubuntu-latest
-    # actions: write is this job's alone: it dispatches the workflow.
+    # The dispatch uses the release App's installation token (actions: write,
+    # minted below), not the default token: a run the default token starts
+    # raises no workflow_run event, so nothing after the deploy would fire
+    # (neither this chain's gate nor prod-release-chain after it). The job's own
+    # token only reads the checkout.
     permissions:
       contents: read
-      actions: write
     # One start per step and tag: a second event for the same tag waits, then
     # finds the run the first started and skips.
     concurrency:
@@ -92,9 +98,16 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
+      - id: app
+        name: Mint the dispatch token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-actions: write
       - name: Start the next workflow for the tag
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           NEXT: ${{ needs.plan.outputs.next }}
           TAG: ${{ needs.plan.outputs.tag }}
           CHAIN_ID: sc${{ github.run_id }}-${{ github.run_attempt }}
