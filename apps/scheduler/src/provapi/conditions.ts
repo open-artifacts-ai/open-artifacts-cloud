@@ -42,7 +42,7 @@ export function signupDailyCap(v: string | undefined): number {
  * (the fleet-wide keys) stay.
  */
 export const REDLINE_FILTER = (sql: string) =>
-  `SELECT * FROM (${sql}) alert_rows WHERE install_id IS NULL OR install_id NOT IN (SELECT id FROM installs WHERE slug LIKE 'rl-%')`;
+  `SELECT * FROM (${sql}) alert_rows WHERE install_id IS NULL OR job_kind IN ('purge', 'delete', 'discard') OR install_id NOT IN (SELECT id FROM installs WHERE slug LIKE 'rl-%')`;
 
 export async function sqlConditions(
   db: D1Database,

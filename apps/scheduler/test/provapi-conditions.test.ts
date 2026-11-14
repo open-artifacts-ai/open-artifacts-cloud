@@ -404,7 +404,17 @@ describe("alert conditions", () => {
   });
 
   // The fleet keys skip test-hooks installs in their own queries.
-  for (const k of SQL_ALERT_KEYS)
+  it("purge_stuck: an rl- install that won't purge still opens it", async () => {
+    const id = installId();
+    await install(id, { slug: "rl-f-leak" });
+    const now = base("purge_stuck");
+    await FIXTURES.purge_stuck.open({ now, install: id });
+    const r = await evaluate(now);
+    expect(r.purge_stuck.open).toBe(true);
+    expect(r.purge_stuck.rows.map((x) => x.install_id)).toEqual([id]);
+  });
+
+  for (const k of SQL_ALERT_KEYS.filter((k) => k !== "purge_stuck"))
     it(`${k}: a red-line (rl-) fixture install never opens it`, async () => {
       const id = installId();
       await install(id, { slug: "rl-f-test" });
