@@ -29,7 +29,8 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
-const BOT = "oa-release[bot]";
+const SLUG = "oa-release";
+const BOT = `${SLUG}[bot]`;
 
 type World = {
   latest?: string;
@@ -84,6 +85,7 @@ const afterPublish = (o: World = {}, over: Record<string, string> = {}) =>
     branch: "main",
     title: "hosted-publish",
     actor: BOT,
+    appSlug: SLUG,
     runId: "123",
     ...over,
   });
@@ -98,6 +100,7 @@ const afterDeploy = (o: World = {}, over: Record<string, string> = {}) =>
     branch: "main",
     title: CHAIN_TITLE,
     actor: BOT,
+    appSlug: SLUG,
     runId: "124",
     ...over,
   });
@@ -160,6 +163,7 @@ describe("after hosted-publish: the staging deploy", () => {
         branch: "main",
         title: "hosted-publish",
         actor: BOT,
+        appSlug: SLUG,
         runId: "123",
       }),
     ).toThrow(/502/);
@@ -194,6 +198,10 @@ describe("after the staging deploy: the gate", () => {
   });
   it("skips a deploy not dispatched by the bot, or not a dispatch", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
+    skipped(afterDeploy({}, { actor: "other-app[bot]" }));
+    skipped(afterDeploy({}, { actor: "github-actions[bot]" }));
+    skipped(afterDeploy({}, { actor: SLUG }));
+    expect(() => afterDeploy({}, { appSlug: "" })).toThrow(/RELEASE_APP_SLUG/);
     skipped(afterDeploy({}, { event: "push" }));
   });
   it("skips a stale tag", () => {
@@ -340,6 +348,7 @@ describe("the workflow", () => {
     expect(text).toContain("github.event.workflow_run.display_title");
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     const step = w.jobs.plan.steps.find((s: any) => s.id === "plan");
+    expect(step.env.APP_SLUG).toBe("${{ vars.RELEASE_APP_SLUG }}");
     expect(step.env.TITLE).toBe(
       "${{ github.event.workflow_run.display_title }}",
     );

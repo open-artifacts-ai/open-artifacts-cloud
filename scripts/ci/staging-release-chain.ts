@@ -18,14 +18,14 @@
 //     the tag is that job's name;
 //   - after deploy-hosted-platform: the run is one this chain dispatched
 //     (display title `deploy-hosted-platform staging <tag> [sc<run>-<n>]`,
-//     a bot actor). A manual deploy, a verify_only run, a
+//     the release App's bot as actor). A manual deploy, a verify_only run, a
 //     partial-target run or a prod run has no `sc` chain id and never starts
 //     the gate; this chain's deploy takes the workflow's default targets;
 //   - the tag is the newest release (releases/latest);
 //   - never twice: no run of the target workflow for that tag exists, in any
 //     state (a failed one waits for a person), checked in `plan` and again in
 //     `dispatch` under the concurrency group keyed on the tag.
-// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <name> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id>
+// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <name> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --app-slug <slug> --run-id <id>
 //        node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo o/n --next deploy|gate --tag vX.Y.Z --chain-id <id>
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
@@ -38,8 +38,8 @@ export type Next = "deploy" | "gate";
 
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const CHAIN_RE = /^sc[0-9]{1,20}-[0-9]{1,4}$/;
-/** The chain dispatches with the release App's token: its actor is a bot. */
-const BOT_RE = /^[A-Za-z0-9-]{1,40}\[bot\]$/;
+/** The release App's slug (repo variable RELEASE_APP_SLUG): the chain dispatches with its token. */
+const SLUG_RE = /^[A-Za-z0-9-]{1,40}$/;
 /** The deploy run-name this chain's dispatch produces (deploy-hosted-platform.yml). */
 export const DEPLOY_TITLE_RE =
   /^deploy-hosted-platform staging (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(sc[0-9]{1,20}-[0-9]{1,4})\]$/;
@@ -115,6 +115,8 @@ export function plan(o: {
   branch: string;
   title: string;
   actor: string;
+  /** The release App's slug: the only actor of a deploy this chain dispatched. */
+  appSlug: string;
   runId: string;
 }): Plan {
   const skip = (why: string): Plan => ({ go: false, why });
@@ -146,7 +148,10 @@ export function plan(o: {
     tag = tags[0] as string;
   } else if (o.workflow === "deploy-hosted-platform") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
-    if (!BOT_RE.test(o.actor)) return skip("not dispatched by this chain");
+    if (!SLUG_RE.test(o.appSlug))
+      throw new Error("RELEASE_APP_SLUG is not set");
+    if (o.actor !== `${o.appSlug}[bot]`)
+      return skip("not dispatched by this chain");
     const m = DEPLOY_TITLE_RE.exec(o.title);
     if (!m?.[1])
       return skip("not a staging deploy this chain dispatched (no chain id)");
@@ -250,6 +255,7 @@ function main(argv: string[]) {
       branch: flag(argv, "branch"),
       title: flag(argv, "title"),
       actor: flag(argv, "actor"),
+      appSlug: flag(argv, "app-slug"),
       runId: flag(argv, "run-id"),
     });
     emit("go", String(p.go));
