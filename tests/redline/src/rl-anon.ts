@@ -68,6 +68,7 @@ export const KEY_TABLE: Record<string, KeyRow> = {
   },
   "sub:ip:": { paced: true, why: "anonymous data-subscribe" },
   "ev:ip:": { paced: true, why: "anonymous events" },
+  "doc:ip:": { paced: true, why: "anonymous doc room socket (GET .../doc)" },
   "anonid:ip:": { paced: true, why: "anonymous anon-id mint" },
   "ip:": { paced: true, why: "anonymous data writes" },
   "bus-dev:ip:": { paced: true, why: "POST /bus/device, per IP" },
@@ -123,7 +124,7 @@ export interface ReqLike {
 }
 
 const RUNTIME =
-  /^\/api\/v1\/artifacts\/[^/]+\/(data|data-count|data-subscribe|events|anon-id|storage)(\/|$)/;
+  /^\/api\/v1\/artifacts\/[^/]+\/(data|data-count|data-subscribe|events|anon-id|doc|storage)(\/|$)/;
 
 /** Anonymous: no cookie and no bearer (the embed header makes any call anonymous too). */
 const isAnonymous = (h: Headers) =>
@@ -170,6 +171,7 @@ export function classify(
     const part = RUNTIME.exec(p)?.[1];
     if (part === "data-subscribe") keys.push("sub:ip");
     else if (part === "events") keys.push("ev:ip");
+    else if (part === "doc") keys.push("doc:ip");
     else if (part === "anon-id") keys.push("anonid:ip");
     else if (part === "data" && m !== "GET") keys.push("ip");
   }
