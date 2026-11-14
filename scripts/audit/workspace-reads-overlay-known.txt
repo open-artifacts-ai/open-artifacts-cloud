@@ -13,6 +13,7 @@
 #
 # It only shrinks. A line that matches no current read fails the check as stale.
 apps/admin/vite.config.ts @oa/provisioning # cycle: provisioning declares admin; reads provisioning's dist-assets build output
+apps/dashboard/e2e/md-ref.mjs @oa/render # public package: cloud cannot edit its package.json (public follow-up declares it; remove this line then, or the stale check fails)
 apps/provisioning/test/node/seal-copy.test.ts @oa/provisioner # cycle: provisioner declares provisioning
 apps/scheduler/test/node/config.test.ts @oa/redline # cycle: redline -> provisioner -> scheduler
 packages/bus-adapter-openclaw/test/bus.test.ts @open-artifacts/bus # public package: cloud cannot edit its package.json
