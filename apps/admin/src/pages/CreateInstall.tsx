@@ -337,7 +337,7 @@ export function CreateInstall() {
             >
               {domainsError ??
                 (domains.length === 0 && googleOn && domainsText !== null
-                  ? "No allowed domain: people sign in with Google only when invited."
+                  ? "No domain set: only the owner and people they invite can log in with Google."
                   : "People with an email at these domains can join. Starts with the owner's domain. Separate with commas.")}
             </small>
           </div>

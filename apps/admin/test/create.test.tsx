@@ -432,7 +432,7 @@ it("lets Google have no allowed domain, with a hint, and submits it", async () =
   await screen.findByText(/ is available\./);
   domains("");
   expect(screen.getByTestId("domains-help")).toHaveTextContent(
-    "No allowed domain: people sign in with Google only when invited.",
+    "No domain set: only the owner and people they invite can log in with Google.",
   );
   expect(screen.getByLabelText("Allowed domains")).not.toHaveAttribute(
     "aria-invalid",
