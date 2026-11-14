@@ -156,11 +156,13 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     mkdirSync(join(dir, "data"));
     const f = join(dir, "data", "a.zip");
     writeFileSync(f, fixture());
-    expect(scrubDirs([dir, join(dir, "missing")], [HOOK])).toBe(1);
+    expect(scrubDirs([dir, join(dir, "missing")], [HOOK])).toEqual({
+      scrubbed: 1,
+    });
     expect(all(readFileSync(f))).not.toContain(PAT);
   });
 
-  it("an unparseable line fails closed and deletes every trace zip", () => {
+  it("an unparseable line drops every trace zip and returns a reason code", () => {
     const good = join(dir, "good.zip");
     const bad = join(dir, "bad.zip");
     writeFileSync(good, fixture());
@@ -173,7 +175,10 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
         },
       ]),
     );
-    expect(() => scrubDirs([dir], [])).toThrow(/unparseable/);
+    expect(scrubDirs([dir], [])).toEqual({
+      scrubbed: 0,
+      dropped: "an-unparseable-line",
+    });
     expect(existsSync(good)).toBe(false);
     expect(existsSync(bad)).toBe(false);
   });
@@ -185,7 +190,7 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     ).toThrow(/no trace\.trace/);
     const f = join(dir, "c.zip");
     writeFileSync(f, "garbage");
-    expect(() => scrubDirs([dir], [])).toThrow(/deleted/);
+    expect(scrubDirs([dir], []).dropped).toBeTruthy();
     expect(existsSync(f)).toBe(false);
   });
 });

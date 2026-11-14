@@ -447,14 +447,27 @@ export function secretLiterals(dir: string): string[] {
   return out;
 }
 
+/** A short, static code for a scrub failure: never any trace content. */
+export function reasonCode(e: unknown): string {
+  const m = e instanceof Error ? e.message : "";
+  const code = m
+    .replace(/^trace:\s*/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40);
+  return code || "scrub-error";
+}
+
 /**
- * Scrubs every zip under `dirs` in place. If any one fails, every zip found is
- * deleted and this throws: the caller uploads no trace.
+ * Scrubs every zip under `dirs` in place. If any one fails, every zip found
+ * (the report's data/ copies too) is deleted and the reason code is returned:
+ * the rest of the report can still go up, and no unscrubbed trace can.
  */
 export function scrubDirs(
   dirs: readonly string[],
   literals: readonly string[],
-): number {
+): { scrubbed: number; dropped?: string } {
   const zips: string[] = [];
   for (const d of dirs)
     if (existsSync(d))
@@ -462,11 +475,9 @@ export function scrubDirs(
   try {
     for (const f of zips)
       writeFileSync(f, scrubTraceZip(readFileSync(f), literals));
+    return { scrubbed: zips.length };
   } catch (e) {
     for (const f of zips) rmSync(f, { force: true });
-    throw new Error(
-      `t19 trace scrub failed, ${zips.length} trace zip(s) deleted: ${(e as Error).message}`,
-    );
+    return { scrubbed: 0, dropped: reasonCode(e) };
   }
-  return zips.length;
 }

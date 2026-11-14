@@ -346,7 +346,9 @@ jobs:
       # hook-key headers, bodies, console lines and DOM snapshots, so every
       # trace zip is rebuilt from an allowlist (timings, methods, statuses, URLs
       # without query values, action names) and checked again; any failure
-      # deletes every trace zip and fails this step, which blocks the upload.
+      # deletes every trace zip (data/ copies too) and logs "trace dropped:
+      # <code>", and the rest of the report still goes up. Only a crash of this
+      # step itself blocks the upload.
       - id: trace
         name: Scrub the Playwright traces
         if: always() && steps.t19.outcome != 'skipped'
