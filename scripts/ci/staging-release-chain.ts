@@ -146,10 +146,7 @@ export function plan(o: {
     tag = tags[0] as string;
   } else if (o.workflow === "deploy-hosted-platform") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
-    if (!SLUG_RE.test(o.appSlug))
-      throw new Error("RELEASE_APP_SLUG is not set");
-    if (o.actor !== `${o.appSlug}[bot]`)
-      return skip("not dispatched by this chain");
+    if (o.actor !== APP_ACTOR) return skip("not dispatched by this chain");
     const m = DEPLOY_TITLE_RE.exec(o.title);
     if (!m?.[1])
       return skip("not a staging deploy this chain dispatched (no chain id)");
