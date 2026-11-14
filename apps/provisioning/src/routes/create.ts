@@ -13,6 +13,7 @@ import { ApiError } from "../errors.js";
 import { factsOf, isTestUser, type PrincipalFacts } from "../facts.js";
 import { newInstallId } from "../ids.js";
 import type { Principal } from "../principal.js";
+import { signedUp } from "../services/analytics.js";
 import { chargeSelfServeCreate } from "../services/counters.js";
 import { accept, replay, writeOf } from "../services/jobs.js";
 import { admission } from "../signup/gate.js";
@@ -207,6 +208,10 @@ VALUES (?1, ?2, ?3, ?4, ?1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)`,
     },
     start: ss
       ? async (jobId) => {
+          // #2479: the batch has committed (the install id, signup and claim
+          // exist), and a replay or lost race never reaches start, so this
+          // fires once per self-serve install. Off the response path.
+          signedUp(env, a.ctx, installId, tier);
           // W1's parseSignup takes exactly { signupId }; the signup id is the
           // job id (0007).
           await env.SIGNUPS.send({ signupId: jobId });

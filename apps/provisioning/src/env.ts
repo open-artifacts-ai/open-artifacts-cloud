@@ -105,6 +105,13 @@ export interface Env {
    * create needs a token, 4.2). Unset: the page cannot create and says so.
    */
   TURNSTILE_SITEKEY?: string;
+  /**
+   * PostHog project key for the `signed_up` event (#2479). Optional secret:
+   * unset, no event is sent and no call is made.
+   */
+  POSTHOG_KEY?: string;
+  /** PostHog capture host override (var); default https://us.i.posthog.com. */
+  POSTHOG_HOST?: string;
   OA_ENV: ProvisioningEnv;
   /** Staging only (honoured by adminSessionTtlMs); prod ignores it. */
   ADMIN_SESSION_TTL_HOURS?: string;
