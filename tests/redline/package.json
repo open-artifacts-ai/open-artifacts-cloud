@@ -10,6 +10,7 @@
     "test": "pnpm --filter @oa/provision build && vitest run",
     "live": "node --experimental-strip-types scripts/redline.ts",
     "provisioning": "node --experimental-strip-types --no-warnings scripts/provisioning.ts",
+    "t19-trace": "node --experimental-strip-types --no-warnings scripts/t19-trace.ts",
     "local": "node --experimental-strip-types scripts/local-pair.ts",
     "local:google": "REDLINE_LOCAL_MODE=google node --experimental-strip-types scripts/local-pair.ts",
     "local:t19": "REDLINE_LOCAL_T19=1 node --experimental-strip-types scripts/local-pair.ts",

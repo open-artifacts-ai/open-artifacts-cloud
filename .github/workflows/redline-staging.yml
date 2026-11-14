@@ -339,7 +339,20 @@ jobs:
           T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/t19-sealed/version.txt")"
           if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi
           export T19_EXPECT_VERSION
-          pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts
+          # --trace overrides the config's CI "off": a failed case keeps a trace,
+          # scrubbed by the next step before anything is uploaded (#281).
+          pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure
+      # The report folder is public. A trace holds cookies, Authorization and
+      # hook-key headers, bodies, console lines and DOM snapshots, so every
+      # trace zip is rebuilt from an allowlist (timings, methods, statuses, URLs
+      # without query values, action names) and checked again; any failure
+      # deletes every trace zip and fails this step, which blocks the upload.
+      - id: trace
+        name: Scrub the Playwright traces
+        if: always() && steps.t19.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          pnpm --filter @oa/redline t19-trace scrub --secrets "$RUNNER_TEMP/redline-secrets" "$GITHUB_WORKSPACE/apps/dashboard/playwright-report" "$GITHUB_WORKSPACE/apps/dashboard/test-results"
       # Artifacts are not masked: the hook key in a report stops the upload.
       - id: scan
         name: No secret in the report
@@ -359,7 +372,7 @@ jobs:
             if grep -rqF -f "$f" "${dirs[@]}"; then echo "secret in report: ${f##*/}"; exit 1; fi
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always() && steps.scan.outcome == 'success' && steps.t19.outcome != 'skipped'
+        if: always() && steps.scan.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'
         with:
           name: t19-report
           path: apps/dashboard/playwright-report
