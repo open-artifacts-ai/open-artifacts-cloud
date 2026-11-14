@@ -418,6 +418,14 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comments ask decider [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comments ask decider [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > artifact artifact agents [session]"
     },
     {
@@ -527,6 +535,14 @@
     {
       "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > artifact ws events [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact ws doc [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact ws doc [pat]"
     },
     {
       "file": "live/surfaces.test.ts",
