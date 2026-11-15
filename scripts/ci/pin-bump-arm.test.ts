@@ -475,8 +475,8 @@ const fake = (
     mode?: string;
     annotated?: boolean;
     extraRuns?: boolean;
-    head?: string;
-    lines?: string;
+    /** Any call whose args contain one of these answers 404. */
+    notFound?: string[];
     tagSha?: string;
   } = {},
 ) => {
@@ -486,6 +486,8 @@ const fake = (
     calls.push([cmd, ...args]);
     const a = args.join(" ");
     const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
+    if (o.notFound?.some((n) => a.includes(n)))
+      return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
     if (a.includes("/pulls?state=open"))
       return ok(
         JSON.stringify([
@@ -677,7 +679,7 @@ describe("run", () => {
       ),
     ).toHaveLength(1);
     expect(r.logs.join("\n")).toMatch(
-      /disabled auto-merge: .*commit is by leourbina/,
+      /disabled auto-merge: a commit is not by the bot/,
     );
   });
   it("plan reports write=true for a take-back but changes nothing", () => {
@@ -694,6 +696,61 @@ describe("run", () => {
         fake({ armed: true, autoBy: "leourbina", checks: green.slice(1) }),
       ).disarmed,
     ).toEqual([]);
+  });
+  it("an armed-by-bot PR whose inputs cannot be read is disarmed, whichever read fails", () => {
+    for (const notFound of [
+      [`${PUB}/releases/tags/`],
+      [`${PUB}/git/ref/tags/`],
+      ["contents/PUBLIC_PIN?ref="],
+      ["contents/SYNCED_FROM?ref="],
+      ["/git/trees/"],
+      ["/check-runs"],
+      ["/pulls/7/files"],
+    ]) {
+      const f = fake({ armed: true, notFound });
+      const r = go("arm", f);
+      expect(r.disarmed, notFound.join()).toEqual([7]);
+      expect(r.armed).toEqual([]);
+      expect(
+        f.calls.filter((c) =>
+          c.join(" ").startsWith("gh pr merge 7 --disable-auto --repo"),
+        ),
+      ).toHaveLength(1);
+      expect(r.logs.join("\n")).toMatch(/could not read what it needs/);
+    }
+  });
+  it("an unarmed PR whose inputs cannot be read is left, and the run does not throw", () => {
+    const f = fake({ notFound: [`${PUB}/releases/tags/`] });
+    const r = go("arm", f);
+    expect(r.write).toBe(false);
+    expect(r.merges).toEqual([]);
+  });
+  it("plan reports write=true for a PR it will disarm because a read failed", () => {
+    const r = go(
+      "plan",
+      fake({ armed: true, notFound: [`${PUB}/releases/tags/`] }),
+    );
+    expect(r.write).toBe(true);
+    expect(r.merges).toEqual([]);
+  });
+  it("for an armed-by-bot PR the commits are checked first: a bad one disarms before other reads", () => {
+    const f = fake({ armed: true, commitAuthor: "leourbina" });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+    const reads = f.calls.map((c) => c.join(" "));
+    expect(reads.some((c) => c.includes("/pulls/7/files"))).toBe(false);
+    expect(reads.some((c) => c.includes("/releases/tags/"))).toBe(false);
+    const g = fake({ armed: true, unverified: true });
+    expect(go("arm", g).disarmed).toEqual([7]);
+    expect(g.calls.some((c) => c.join(" ").includes("/pulls/7/files"))).toBe(
+      false,
+    );
+  });
+  it("a state that cannot be read leaves the PR alone", () => {
+    const f = fake({ armed: true, notFound: ["pr view"] });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([]);
+    expect(r.write).toBe(false);
   });
   it("an API error throws, so the run is red", () => {
     const exec: Exec = () => ({ code: 1, stdout: "", stderr: "boom" });
@@ -712,7 +769,7 @@ describe("workflow", () => {
   const wf = parse(text);
   it("triggers on CI completion, bump PRs and a schedule, and never cancels a run", () => {
     expect(Object.keys(wf.on).sort()).toEqual([
-      "pull_request",
+      "pull_request_target",
       "schedule",
       "workflow_run",
     ]);
@@ -739,6 +796,31 @@ describe("workflow", () => {
     expect(app.uses).toMatch(/^actions\/create-github-app-token@[0-9a-f]{40}$/);
     expect(app.with?.["permission-pull-requests"]).toBe("write");
     expect(text).not.toMatch(/github\.head_ref\s*\}\}|head_sha/);
+    // pull_request_target runs with secrets: it may only ever check out main.
+    expect(wf.on.pull_request).toBeUndefined();
+    expect(wf.on.pull_request_target.types).toEqual([
+      "opened",
+      "reopened",
+      "synchronize",
+    ]);
+    const checkouts = steps.filter((s) =>
+      s.uses?.startsWith("actions/checkout@"),
+    );
+    expect(checkouts).toHaveLength(1);
+    expect(checkouts[0]?.with).toMatchObject({
+      ref: "${{ github.event.repository.default_branch }}",
+      "persist-credentials": false,
+    });
+    const runs = JSON.stringify(wf.jobs.arm.steps);
+    expect(runs).not.toMatch(
+      /pull_request\.head|head_ref\}|github\.event\.pull_request|merge_commit/,
+    );
+    expect(
+      wf.jobs.arm.steps.some((s: { uses?: string }) =>
+        /pnpm|install/.test(s.uses ?? ""),
+      ),
+    ).toBe(false);
+    expect(runs).not.toMatch(/pnpm|npm (ci|install)/);
     expect(steps[0]?.with).toMatchObject({
       ref: "${{ github.event.repository.default_branch }}",
     });

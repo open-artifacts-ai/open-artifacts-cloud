@@ -224,141 +224,165 @@ export function peelTag(exec: Exec, publicRepo: string, tag: string): string {
   return obj.type === "commit" ? obj.sha : "";
 }
 
-type Candidate = { number: number; input: Input };
+type Listed = {
+  number: number;
+  user: { login: string };
+  head: { ref: string; sha: string; repo: { full_name: string } | null };
+};
+type View = { oid: string; armed: boolean; autoMergeBy?: string };
 
-/** Reads every open bump PR from the bot into a decision input. Throws on any API error. */
-export function snapshot(
-  exec: Exec,
-  repo: string,
-  publicRepo: string,
-): Candidate[] {
-  const prs = JSON.parse(
-    gh(exec, [
-      "api",
-      "--paginate",
-      "--slurp",
-      `repos/${repo}/pulls?state=open&per_page=100`,
-    ]),
-  ).flat() as {
-    number: number;
-    user: { login: string };
-    head: { ref: string; sha: string; repo: { full_name: string } | null };
-  }[];
-  const out: Candidate[] = [];
-  for (const p of prs) {
-    if (p.user.login !== BOT || !p.head.ref.startsWith(BRANCH_PREFIX)) continue;
-    const oid = p.head.sha;
-    const files = JSON.parse(
+/** Open PRs from the bot on a bump branch. Throws on an API error. */
+function listBumpPrs(exec: Exec, repo: string): Listed[] {
+  return (
+    JSON.parse(
       gh(exec, [
         "api",
         "--paginate",
         "--slurp",
-        `repos/${repo}/pulls/${p.number}/files?per_page=100`,
+        `repos/${repo}/pulls?state=open&per_page=100`,
       ]),
-    ).flat() as PrFile[];
-    // Past GitHub's 3000-file cap or not, a bump with more than 3 files is not pin-only.
-    const commits = (
-      JSON.parse(
-        gh(exec, [
-          "api",
-          "--paginate",
-          "--slurp",
-          `repos/${repo}/pulls/${p.number}/commits?per_page=100`,
-        ]),
-      ).flat() as {
-        author: { login: string } | null;
-        committer: { login: string } | null;
-        commit?: { verification?: { verified?: boolean } };
-      }[]
-    ).map((c) => ({
-      author: c.author?.login ?? "",
-      committer: c.committer?.login ?? "",
-      verified: c.commit?.verification?.verified === true,
-    }));
-    let required: string[] = [];
-    try {
-      required = requiredChecks(
-        gh(exec, ["api", `repos/${repo}/rules/branches/main`]),
-      );
-    } catch {}
-    const pinOnly = files.length <= PIN_FILES.length;
-    const text = (f: string, ref: string) =>
-      pinOnly ? raw(exec, repo, f, ref) : "";
-    const pin = text("PUBLIC_PIN", oid);
-    const tag = field(pin, "tag");
-    let tagSha = "";
-    let released = false;
-    if (/^v\d+\.\d+\.\d+$/.test(tag)) {
-      tagSha = peelTag(exec, publicRepo, tag);
-      const rel = JSON.parse(
-        gh(exec, ["api", `repos/${publicRepo}/releases/tags/${tag}`]),
-      );
-      released = rel.draft === false && rel.prerelease === false;
-    }
-    const tree = (
-      JSON.parse(gh(exec, ["api", `repos/${repo}/git/trees/${oid}`]))
-        .tree as TreeEntry[]
-    ).map((t) => ({ path: t.path, mode: t.mode, type: t.type }));
-    const checks = (
-      JSON.parse(
-        gh(exec, [
-          "api",
-          "--paginate",
-          "--slurp",
-          `repos/${repo}/commits/${oid}/check-runs?filter=latest&per_page=100`,
-        ]),
-      ) as { check_runs: (Check & { app?: { slug?: string } | null })[] }[]
-    )
-      .flatMap((pg) => pg.check_runs)
-      .map((c) => ({
-        name: c.name,
-        status: c.status,
-        conclusion: c.conclusion,
-        app: String(c.app?.slug ?? ""),
-      }));
-    // Re-read the head after the checks: a push in between makes the checks stale.
-    const view = JSON.parse(
-      gh(exec, [
-        "pr",
-        "view",
-        String(p.number),
-        "--repo",
-        repo,
-        "--json",
-        "headRefOid,autoMergeRequest,isInMergeQueue",
-      ]),
-    );
-    out.push({
-      number: p.number,
-      input: {
-        author: p.user.login,
-        headRef: p.head.ref,
-        headRepo: p.head.repo?.full_name ?? "",
-        repo,
-        headOid: String(view.headRefOid),
-        checksOid: oid,
-        files,
-        pin,
-        synced: text("SYNCED_FROM", oid),
-        mainPin: raw(exec, repo, "PUBLIC_PIN", "main"),
-        mainSynced: raw(exec, repo, "SYNCED_FROM", "main"),
-        tagSha,
-        released,
-        tree,
-        checks,
-        commits,
-        required,
-        armed: Boolean(view.autoMergeRequest) || Boolean(view.isInMergeQueue),
-        autoMergeBy:
-          view.autoMergeRequest && !view.isInMergeQueue
-            ? String(view.autoMergeRequest.enabledBy?.login ?? "")
-            : undefined,
-      },
-    });
-  }
-  return out;
+    ).flat() as Listed[]
+  ).filter((p) => p.user.login === BOT && p.head.ref.startsWith(BRANCH_PREFIX));
 }
 
+function readView(exec: Exec, repo: string, n: number): View {
+  const v = JSON.parse(
+    gh(exec, [
+      "pr",
+      "view",
+      String(n),
+      "--repo",
+      repo,
+      "--json",
+      "headRefOid,autoMergeRequest,isInMergeQueue",
+    ]),
+  );
+  return {
+    oid: String(v.headRefOid),
+    armed: Boolean(v.autoMergeRequest) || Boolean(v.isInMergeQueue),
+    autoMergeBy:
+      v.autoMergeRequest && !v.isInMergeQueue
+        ? String(v.autoMergeRequest.enabledBy?.login ?? "")
+        : undefined,
+  };
+}
+
+function readCommits(exec: Exec, repo: string, n: number): Commit[] {
+  return (
+    JSON.parse(
+      gh(exec, [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${repo}/pulls/${n}/commits?per_page=100`,
+      ]),
+    ).flat() as {
+      author: { login: string } | null;
+      committer: { login: string } | null;
+      commit?: { verification?: { verified?: boolean } };
+    }[]
+  ).map((c) => ({
+    author: c.author?.login ?? "",
+    committer: c.committer?.login ?? "",
+    verified: c.commit?.verification?.verified === true,
+  }));
+}
+const botOnly = (cs: Commit[]) =>
+  cs.length > 0 &&
+  cs.every((c) => c.author === BOT && c.committer === BOT && c.verified);
+
+/** Everything else decide needs. Throws on any API error (the caller treats that as "does not qualify"). */
+function gather(
+  exec: Exec,
+  repo: string,
+  publicRepo: string,
+  p: Listed,
+  view: View,
+  commits: Commit[],
+): Input {
+  const oid = p.head.sha;
+  const files = JSON.parse(
+    gh(exec, [
+      "api",
+      "--paginate",
+      "--slurp",
+      `repos/${repo}/pulls/${p.number}/files?per_page=100`,
+    ]),
+  ).flat() as PrFile[];
+  // A bump with more than 3 files is not pin-only; its contents are not read.
+  const pinOnly = files.length <= PIN_FILES.length;
+  const text = (f: string, ref: string) =>
+    pinOnly ? raw(exec, repo, f, ref) : "";
+  const pin = text("PUBLIC_PIN", oid);
+  const synced = text("SYNCED_FROM", oid);
+  const tag = field(pin, "tag");
+  let tagSha = "";
+  let released = false;
+  if (/^v\d+\.\d+\.\d+$/.test(tag)) {
+    tagSha = peelTag(exec, publicRepo, tag);
+    const rel = JSON.parse(
+      gh(exec, ["api", `repos/${publicRepo}/releases/tags/${tag}`]),
+    );
+    released = rel.draft === false && rel.prerelease === false;
+  }
+  const tree = (
+    JSON.parse(gh(exec, ["api", `repos/${repo}/git/trees/${oid}`]))
+      .tree as TreeEntry[]
+  ).map((t) => ({ path: t.path, mode: t.mode, type: t.type }));
+  const checks = (
+    JSON.parse(
+      gh(exec, [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${repo}/commits/${oid}/check-runs?filter=latest&per_page=100`,
+      ]),
+    ) as { check_runs: (Check & { app?: { slug?: string } | null })[] }[]
+  )
+    .flatMap((pg) => pg.check_runs)
+    .map((c) => ({
+      name: c.name,
+      status: c.status,
+      conclusion: c.conclusion,
+      app: String(c.app?.slug ?? ""),
+    }));
+  let required: string[] = [];
+  try {
+    required = requiredChecks(
+      gh(exec, ["api", `repos/${repo}/rules/branches/main`]),
+    );
+  } catch {}
+  return {
+    author: p.user.login,
+    headRef: p.head.ref,
+    headRepo: p.head.repo?.full_name ?? "",
+    repo,
+    headOid: view.oid,
+    checksOid: oid,
+    files,
+    pin,
+    synced,
+    mainPin: raw(exec, repo, "PUBLIC_PIN", "main"),
+    mainSynced: raw(exec, repo, "SYNCED_FROM", "main"),
+    tagSha,
+    released,
+    tree,
+    checks,
+    commits,
+    required,
+    armed: view.armed,
+    autoMergeBy: view.autoMergeBy,
+  };
+}
+
+const msg = (e: unknown) => String(e instanceof Error ? e.message : e);
+
+/**
+ * Fail-safe per PR: any read error means "does not qualify". A PR this bot armed
+ * then gets its auto-merge disabled; an unarmed one is left. A person's own arming
+ * is never touched. The commits are read first for an armed PR, so the cheapest
+ * fact disarms before anything else is read.
+ */
 export function run(o: {
   mode: "plan" | "arm";
   exec: Exec;
@@ -369,45 +393,64 @@ export function run(o: {
   const armed: number[] = [];
   const disarmed: number[] = [];
   let write = false;
-  for (const c of snapshot(o.exec, o.repo, o.publicRepo)) {
-    const d = decide(c.input);
-    o.log(`#${c.number}: ${d.arm ? "arm" : "leave"}: ${d.why}`);
-    if (d.arm) {
+  for (const p of listBumpPrs(o.exec, o.repo)) {
+    let view: View;
+    try {
+      view = readView(o.exec, o.repo, p.number);
+    } catch (e) {
+      o.log(`#${p.number}: leave: cannot read its state: ${msg(e)}`);
+      continue;
+    }
+    const ours = view.armed && view.autoMergeBy === BOT;
+    let input: Input | undefined;
+    let d: Decision;
+    try {
+      const commits = readCommits(o.exec, o.repo, p.number);
+      if (ours && !botOnly(commits))
+        d = no("a commit is not by the bot and verified");
+      else {
+        input = gather(o.exec, o.repo, o.publicRepo, p, view, commits);
+        d = decide(input);
+      }
+    } catch (e) {
+      d = no(`could not read what it needs: ${msg(e)}`);
+    }
+    o.log(`#${p.number}: ${d.arm ? "arm" : "leave"}: ${d.why}`);
+    if (d.arm && input) {
       write = true;
       if (o.mode === "arm") {
         gh(o.exec, [
           "pr",
           "merge",
-          String(c.number),
+          String(p.number),
           "--auto",
           "--squash",
           "--match-head-commit",
-          c.input.headOid,
+          input.headOid,
           "--repo",
           o.repo,
         ]);
-        armed.push(c.number);
+        armed.push(p.number);
       }
       continue;
     }
-    // Armed by this bot, but no longer provably pin-only and green: take the arming back.
-    // A person's own arming is never touched.
-    if (c.input.armed && c.input.autoMergeBy === BOT) {
-      const again = decide({ ...c.input, armed: false });
-      if (again.arm) continue;
-      write = true;
-      if (o.mode === "arm") {
-        gh(o.exec, [
-          "pr",
-          "merge",
-          String(c.number),
-          "--disable-auto",
-          "--repo",
-          o.repo,
-        ]);
-        disarmed.push(c.number);
-        o.log(`#${c.number}: disabled auto-merge: ${again.why}`);
-      }
+    if (!ours) continue;
+    // Armed by this bot but not provably pin-only and green (an armed PR reads
+    // "already armed" in decide, so judge it as if unarmed).
+    const again = input ? decide({ ...input, armed: false }) : d;
+    if (again.arm) continue;
+    write = true;
+    if (o.mode === "arm") {
+      gh(o.exec, [
+        "pr",
+        "merge",
+        String(p.number),
+        "--disable-auto",
+        "--repo",
+        o.repo,
+      ]);
+      disarmed.push(p.number);
+      o.log(`#${p.number}: disabled auto-merge: ${again.why}`);
     }
   }
   return { write, armed, disarmed };
