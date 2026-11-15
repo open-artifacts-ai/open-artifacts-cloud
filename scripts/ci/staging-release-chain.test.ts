@@ -106,6 +106,35 @@ const afterDeploy = (o: World = {}, over: Record<string, string> = {}) =>
   });
 const skipped = (p: { go: boolean }) => expect(p.go).toBe(false);
 
+describe("staging chain read retries", () => {
+  it("one failed read then success still plans the deploy", () => {
+    const inner = world().exec;
+    let failed = false;
+    const sleeps: number[] = [];
+    const exec: Exec = (c, a) => {
+      if (!failed && a.join(" ").includes("/jobs")) {
+        failed = true;
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      return inner(c, a);
+    };
+    const p = plan({
+      exec,
+      sleep: (ms) => sleeps.push(ms),
+      repo: REPO,
+      workflow: PUBLISH_PATH,
+      conclusion: "success",
+      event: "workflow_run",
+      branch: "main",
+      title: "hosted-publish",
+      actor: BOT,
+      runId: "123",
+    });
+    expect(p).toEqual({ go: true, next: "deploy", tag: TAG });
+    expect(sleeps).toEqual([2000]);
+  });
+});
+
 describe("after hosted-publish: the staging deploy", () => {
   it("starts for a release published by hosted-release", () => {
     expect(afterPublish()).toEqual({ go: true, next: "deploy", tag: TAG });
