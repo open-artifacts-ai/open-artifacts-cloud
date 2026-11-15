@@ -394,7 +394,9 @@ describe("fresh: this event is the newest green run for the tag", () => {
       "api",
       "-X",
       "GET",
-      `repos/${REPO}/actions/workflows/redline-staging.yml/runs?branch=main&status=success&event=workflow_dispatch&per_page=100`,
+      "--jq",
+      expect.stringContaining("workflow_runs"),
+      `repos/${REPO}/actions/workflows/redline-staging.yml/runs?branch=main&status=success&event=workflow_dispatch&per_page=30`,
     ]);
   });
 
