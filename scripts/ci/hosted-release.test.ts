@@ -1008,12 +1008,30 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     );
   });
 
+  it("hosted-build builds the server through the bus-pin wrapper, with the release version, before the release files", () => {
+    const st = allSteps("hosted-build");
+    const b = st.findIndex((x) =>
+      (x.run ?? "").includes("build-hosted-release"),
+    );
+    expect(st[b]?.env?.VERSION).toBe(
+      "${{ needs.hosted-guard.outputs.version }}",
+    );
+    const run = st[b]?.run ?? "";
+    expect(run).toContain(
+      'scripts/ci/bus-pin-build.ts "$VERSION" apps/server/src/version.gen.ts -- pnpm --filter @oa/server build',
+    );
+    expect(run.indexOf("bus-pin-build.ts")).toBeLessThan(
+      run.indexOf("build-hosted-release"),
+    );
+    expect(run).not.toMatch(/^\s*pnpm --filter @oa\/server build/m);
+  });
+
   it("hosted-build fails unless the built server reports exactly the release version", () => {
     const st = allSteps("hosted-build");
     const b = st.findIndex((x) =>
       (x.run ?? "").includes("build-hosted-release"),
     );
-    const v = st.findIndex((x) => (x.run ?? "").includes("version.gen.ts"));
+    const v = st.findIndex((x) => (x.run ?? "").includes("grep -Fqx"));
     expect(v).toBeGreaterThan(b);
     expect(st[v]?.env?.VERSION).toBe(
       "${{ needs.hosted-guard.outputs.version }}",

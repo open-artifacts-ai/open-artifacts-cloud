@@ -61,6 +61,8 @@ ALLOW=(
   .github/workflows/staging-release-chain.yml
   scripts/ci/staging-release-chain.ts
   scripts/ci/staging-release-chain.test.ts
+  scripts/ci/bus-pin-build.ts
+  scripts/ci/bus-pin-build.test.ts
   scripts/ci/pin-bump.ts
   scripts/ci/pin-bump.test.ts
   scripts/ci/pin-bump-arm.ts
