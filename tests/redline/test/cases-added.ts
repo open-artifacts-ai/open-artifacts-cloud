@@ -89,6 +89,17 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.189.0: the login settings routes (#2545).
+    ...[
+      "org GET /api/v1/members/reach [session]",
+      "org GET /api/v1/members/reach [pat]",
+      "org GET /api/v1/settings/login [session]",
+      "org GET /api/v1/settings/login [pat]",
+      "org POST /api/v1/settings/login/first-invite-seen [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",

@@ -742,7 +742,19 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/settings/login [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/settings/login [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org GET /api/v1/spaces [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/settings/login/first-invite-seen [session]"
     },
     {
       "file": "live/surfaces.test.ts",
@@ -963,6 +975,14 @@
     {
       "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org GET /api/v1/oauth-clients [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/members/reach [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/members/reach [session]"
     },
     {
       "file": "live/surfaces.test.ts",
