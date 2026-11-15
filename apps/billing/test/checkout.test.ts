@@ -4001,6 +4001,54 @@ describe("per-member seats: POST /seats (#2580)", () => {
     });
   });
 
+  it("checkout numbers: flag off is main's (seats exactly, creators, no members), flag on takes the larger of seats and members", async () => {
+    const qtyOf = async (body: Record<string, unknown>) => {
+      const c = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "team", ...body }),
+      );
+      const q = c.calls.find((x) => x.path === CHECKOUT)?.form[
+        "line_items[0][quantity]"
+      ];
+      c.spy.mockRestore();
+      return [r.status, q];
+    };
+    env = { ...sEnv(), PER_MEMBER_FROM: "" };
+    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([200, "3"]);
+    expect(await qtyOf({ interval: "year", seats: 3 })).toEqual([200, "3"]);
+    expect((await qtyOf({ interval: "year", members: 6 }))[0]).toBe(400);
+    expect((await qtyOf({ interval: "year", seats: 3, creators: 2 }))[0]).toBe(400);
+    expect(
+      (await qtyOf({ interval: "year", seats: 3, creators: 2, members: 5 }))[0],
+    ).toBe(400);
+    expect(await qtyOf({ creators: 3, members: 9 })).toEqual([200, "3"]);
+    expect(await qtyOf({ creators: 0 })).toEqual([200, "1"]);
+    expect(await qtyOf({})).toEqual([200, "1"]);
+    env = sEnv();
+    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([200, "9"]);
+    expect(await qtyOf({ interval: "year", seats: 12, members: 5 })).toEqual([200, "12"]);
+    expect(await qtyOf({ interval: "year", seats: 3, members: 0 })).toEqual([200, "3"]);
+    expect(await qtyOf({ interval: "year", members: 0 })).toEqual([200, "1"]);
+    expect(await qtyOf({ creators: 3, members: 9 })).toEqual([200, "9"]);
+  });
+
+  it("flag off: a failed seat-shaped invoice takes the normal path (the plan goes past_due), nothing is recorded as a seat failure", async () => {
+    env = { ...sEnv(), PER_MEMBER_FROM: "" };
+    await live({ interval: "year" });
+    await db
+      .prepare(
+        "INSERT INTO seats (install_id, members, ts, apply_outcome, updated_at) VALUES (?1, 5, 1, 'not_started', 1)",
+      )
+      .bind(A)
+      .run();
+    const lines = logs();
+    const r = await hook("evt_dark_inv", "invoice.payment_failed", seatInvoice());
+    expect(r.status).toBe(200);
+    expect(await stored()).toMatchObject({ seat_failures: 0, seat_failed_at: null });
+    expect(lines.filter((l) => l.includes("seat_invoice"))).toEqual([]);
+    expect(await rowOf(A)).toMatchObject({ status: "past_due" });
+  });
+
   it("a subscription created before PER_MEMBER_FROM keeps its credit when it ends", async () => {
     await live();
     const s = fakeStripe(async (c) =>

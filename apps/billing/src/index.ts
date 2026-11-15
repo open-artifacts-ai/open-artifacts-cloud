@@ -613,13 +613,15 @@ async function checkout(
   // with year and refused otherwise; a creator count is the monthly plan's.
   const yearly = plan !== "solo" && interval === "year";
   // (Both counts together are fine: the yearly seats are the member count.)
-  if (yearly && creators !== undefined && members === undefined)
+  const perMember = perMemberFrom(env) !== undefined;
+  if (yearly && creators !== undefined && !(perMember && members !== undefined))
     return bad("bad_creators");
   // With members, the seats default to max(1, members) (#2580).
   if (
     yearly
       ? seats === undefined
-        ? typeof members !== "number"
+        ? // Seats are required, as before, unless per-member applies.
+          !perMember || typeof members !== "number"
         : !Number.isInteger(seats) ||
           (seats as number) < 1 ||
           (seats as number) > MAX_CREATORS
@@ -627,15 +629,17 @@ async function checkout(
   )
     return bad("bad_seats");
   const quantity = yearly
-    ? typeof seats === "number"
-      ? seats
-      : Math.max(1, members as number)
+    ? // The given seats, exactly as before; with per-member on, members
+      // count too: the larger of the two.
+      perMember && typeof members === "number"
+      ? Math.max(typeof seats === "number" ? seats : 0, members, 1)
+      : (seats as number)
     : // A new subscription is per member once PER_MEMBER_FROM is set. With it
       // off, the creator count bills as before; a body with members only (an
       // instance that sends no creators) falls back to max(1, members),
       // which is that instance's own count.
       typeof members === "number" &&
-        (perMemberFrom(env) !== undefined || typeof creators !== "number")
+        (perMember || typeof creators !== "number")
       ? Math.max(1, members)
       : typeof creators === "number"
         ? Math.max(1, creators)

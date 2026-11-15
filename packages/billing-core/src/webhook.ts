@@ -843,7 +843,7 @@ async function overagePayment(
 }
 
 const SEAT_OWNER_SQL =
-  "SELECT s.install_id AS install, s.seat_failures AS failures FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.stripe_customer_id = ?1";
+  "SELECT s.install_id AS install, s.seat_failures AS failures FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.stripe_customer_id = ?1 AND s.per_member = 1";
 const SEAT_FAILED_SQL =
   "UPDATE seats SET seat_failed_at = max(coalesce(seat_failed_at, 0), ?2), seat_amount_due = coalesce(?3, seat_amount_due), seat_failures = seat_failures + 1 WHERE changes() = 1 AND install_id = ?4";
 const SEAT_PAID_SQL =
