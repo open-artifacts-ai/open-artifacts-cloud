@@ -28,6 +28,7 @@ jobs:
       (github.event_name == 'pull_request_target' && startsWith(github.head_ref, 'pin-bump/')) ||
       (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/'))
     runs-on: ubuntu-latest
+    environment: release-app
     timeout-minutes: 10
     permissions:
       contents: read

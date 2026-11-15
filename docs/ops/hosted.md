@@ -538,6 +538,10 @@ security find-generic-password -s oa-hosted-prod -a open-artifacts -w |
   gh secret set CLOUDFLARE_API_TOKEN --env hosted-prod-deploy -R open-artifacts-ai/open-artifacts-cloud
 ```
 
+## Release App key environment (#302)
+
+The release App's `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` live in the Environment `release-app`, deployment branches `main` only (a custom branch policy that is exactly `main`). Every job that mints the token (`actions/create-github-app-token`) declares `environment: release-app`, and no other job reads those secrets; `scripts/ci/release-app-environment.test.ts` enforces both. A run from another ref fails at the branch policy before it can reach the key (a `hosted-release` dry run from a non-main ref now fails at `mirror`). Once the Environment holds both secrets, delete the repo-level copies.
+
 ## Cloudflare token naming (#933, #934)
 
 Every Cloudflare token is named `oa-<env>-<job>[-ro] · <where it lives>`:
