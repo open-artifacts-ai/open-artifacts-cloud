@@ -449,4 +449,17 @@ describe("T19 report scan (#294)", () => {
     expect(stripEmbeddedMedia([d]).dropped).toBe(1);
     expect(existsSync(join(d, "index.html"))).toBe(false);
   });
+
+  it("stripEmbeddedMedia replaces inline image and video data URIs", () => {
+    const big = Buffer.alloc(300, 7).toString("base64");
+    writeFileSync(
+      join(d, "index.html"),
+      `<img src="data:image/png;base64,${big}"><video src="data:video/webm;base64,${big}"></video><p>ok</p>`,
+    );
+    expect(stripEmbeddedMedia([d]).stripped).toBe(1);
+    const html = readFileSync(join(d, "index.html"), "latin1");
+    expect(html).toBe(
+      '<img src="data:,"><video src="data:,"></video><p>ok</p>',
+    );
+  });
 });

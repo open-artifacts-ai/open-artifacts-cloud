@@ -561,8 +561,12 @@ export function stripEmbeddedMedia(dirs: readonly string[]): {
     for (const f of walk(d)) {
       if (!f.endsWith(".html")) continue;
       try {
-        const text = readFileSync(f, "latin1");
-        let changed = false;
+        // Inline image and video data URIs become an empty one.
+        const text = readFileSync(f, "latin1").replace(
+          /data:(?:image|video)\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/_=-]*/gi,
+          "data:,",
+        );
+        let changed = text !== readFileSync(f, "latin1");
         const out = text.replace(BLOB_RE, (m) => {
           const b = Buffer.from(m, "base64");
           if (b.length < 4 || b.readUInt32LE(0) !== 0x04034b50) return m;
