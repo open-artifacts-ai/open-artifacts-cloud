@@ -16,6 +16,8 @@
 #      names at the tag's commit (push or merge_group run, that head_sha): the
 #      public Workers cloud CI never tests (auth-broker, directory-broker) and
 #      the public packages the private ones build on.
+# Public CI is judged by its PUBLIC_REQUIRED jobs only: the run's overall
+# conclusion and non-required jobs (public-only) are ignored.
 # "Green" is the latest attempt's: the run completed, and each required job
 # (REQUIRED / PUBLIC_REQUIRED below) completed with success exactly once in it.
 # A missing, red or unreadable run, or any API error, is a refusal, never a pass.
@@ -42,7 +44,7 @@ P="repos/$PUBLIC_REPO"
 # This repo's ci.yml jobs (every one runs on a push to main; none is path-filtered).
 REQUIRED=(scripts overlay overlay-action lint "e2e (provisioning)" "e2e (admin)")
 # Public ci.yml's required checks (its test and e2e jobs aggregate the shards).
-PUBLIC_REQUIRED=(lint typecheck test authz-matrix build no-test-hooks e2e)
+PUBLIC_REQUIRED=(lint typecheck test authz-matrix build no-test-hooks released-migrations-frozen e2e)
 
 POLL="${CI_POLL_SECS:-60}"
 CAP="${CI_WAIT_CAP_SECS:-1500}"
@@ -50,6 +52,7 @@ APPEAR="${CI_APPEAR_SECS:-300}"
 [[ "$POLL" =~ ^[1-9][0-9]*$ && "$CAP" =~ ^[0-9]+$ && "$APPEAR" =~ ^[0-9]+$ ]] || { echo "bad CI_POLL_SECS, CI_WAIT_CAP_SECS or CI_APPEAR_SECS" >&2; exit 2; }
 max_polls=$((CAP / POLL))
 appear_polls=$((APPEAR / POLL))
+judge_run=1 # 1: the run's overall conclusion must be success; 0: only the required jobs
 polls=0 # shared by both repos' waits: the cap is for the whole guard
 
 fail() { echo "CI guard failed: $1" >&2; exit 1; }
@@ -92,7 +95,12 @@ wait_green() {
       [[ "$id" =~ ^[0-9]+$ ]] || fail "$label run: bad id"
       status="$(jq -r '.status' <<< "$run")"
       if [ "$status" = completed ]; then
-        [ "$(jq -r '.conclusion' <<< "$run")" = success ] || fail "$label run $id for $s: $(jq -r '.conclusion' <<< "$run")"
+        # Cloud: every job is required, so the run's overall result counts.
+        # Public: only PUBLIC_REQUIRED jobs count (a non-required job such as
+        # public-only may fail the run without blocking main).
+        if [ "$judge_run" = 1 ]; then
+          [ "$(jq -r '.conclusion' <<< "$run")" = success ] || fail "$label run $id for $s: $(jq -r '.conclusion' <<< "$run")"
+        fi
         st="$(jobs_state "$r" "$id" "$@")"
         [ "$st" = ok ] || fail "$label run $id for $s: $st"
         echo "CI guard: $label run $id is green on $s"
@@ -148,6 +156,7 @@ fi
 pin="$(gh api -X GET -H "Accept: application/vnd.github.raw+json" "$C/contents/PUBLIC_PIN?ref=$sha" 2> /dev/null)" || fail "PUBLIC_PIN at $sha: GitHub API error"
 psha="$(printf '%s\n' "$pin" | sed -n 's/^sha=//p')"
 [[ "$psha" =~ ^[0-9a-f]{40}$ ]] || fail "PUBLIC_PIN at $sha: no sha"
+judge_run=0
 wait_green "public CI" "$P" "$psha" "per_page=100" '["push","merge_group"]' "${PUBLIC_REQUIRED[@]}"
 
 echo "CI guard: $tag ($sha) passed cloud CI and public CI ($psha)"
