@@ -35,6 +35,7 @@ export {
   type StripeConfig,
   StripeConfigError,
   type StripeSession,
+  seatJumpLimit,
   setSeatQuantity,
   setSubscriptionQuantity,
 } from "./sessions.js";

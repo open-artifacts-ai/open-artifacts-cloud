@@ -3387,10 +3387,15 @@ describe("per-member seats: POST /seats (#2580)", () => {
   const SUBS = `/v1/subscriptions/${SUB}`;
   const ITEM = "/v1/subscription_items/si_itemA";
   const DAY = 86_400_000;
-  const yEnv = (): Env => ({
+  const FROM = 1_000_000;
+  const sEnv = (): Env => ({
     ...baseEnv(),
     STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
     STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+    PER_MEMBER_FROM: String(FROM),
+  });
+  beforeEach(() => {
+    env = sEnv();
   });
   async function live(
     o: { tier?: string; interval?: "month" | "year"; renewsAt?: number } = {},
@@ -3404,14 +3409,22 @@ describe("per-member seats: POST /seats (#2580)", () => {
       .run();
   }
   /** Stripe's subscription, holding the quantity last written. */
-  function stripeAt(quantity: number, interval: "month" | "year" = "month") {
+  function stripeAt(
+    quantity: number,
+    interval: "month" | "year" = "month",
+    o: {
+      createdMs?: number;
+      onPost?: (c: StripeCall) => Promise<void>;
+    } = {},
+  ) {
     let held = quantity;
     const posts: StripeCall[] = [];
-    const s = fakeStripe((c) => {
+    const s = fakeStripe(async (c) => {
       if (c.method === "GET" && c.path === SUBS)
         return Response.json({
           id: SUB,
           status: "active",
+          created: Math.floor((o.createdMs ?? 2 * FROM) / 1000),
           items: {
             data: [
               {
@@ -3428,6 +3441,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       if (c.method === "POST" && c.path === ITEM) {
         held = Number(c.form.quantity);
         posts.push(c);
+        await o.onPost?.(c);
         return Response.json({ id: "si_itemA", quantity: held });
       }
       return undefined;
@@ -3438,6 +3452,60 @@ describe("per-member seats: POST /seats (#2580)", () => {
     req("/seats", { install: A, ts, members });
   const stored = () =>
     db.prepare("SELECT * FROM seats WHERE install_id = ?1").bind(A).first();
+  const cron = (at = Date.now()) =>
+    billing.scheduled(
+      { scheduledTime: at, cron: "17 3 * * *", noRetry() {} },
+      env,
+    );
+  const logs = () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    return lines;
+  };
+  const hook = async (
+    id: string,
+    type: string,
+    object: Record<string, unknown>,
+    created = Math.floor(Date.now() / 1000),
+  ) => {
+    const body = JSON.stringify({
+      id,
+      object: "event",
+      type,
+      livemode: false,
+      created,
+      data: { object: { customer: "cus_existingA", ...object } },
+    });
+    return call(
+      new Request(`${ORIGIN}/stripe/webhook`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "stripe-signature": await signStripePayload(
+            body,
+            "whsec_test_seat_0123456789",
+            Math.floor(Date.now() / 1000),
+          ),
+          "cf-connecting-ip": "1.2.3.4",
+        },
+        body,
+      }),
+      { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_seat_0123456789" },
+    );
+  };
+  const seatInvoice = (extra: Record<string, unknown> = {}) => ({
+    id: "in_seat1",
+    object: "invoice",
+    subscription: SUB,
+    billing_reason: "subscription_update",
+    amount_due: 5000,
+    lines: {
+      data: [{ price: { id: "price_teamY1" }, proration: true }],
+    },
+    ...extra,
+  });
 
   it("a trial or solo install stores the count and calls Stripe not at all", async () => {
     await live({ tier: "trial" });
@@ -3452,6 +3520,62 @@ describe("per-member seats: POST /seats (#2580)", () => {
       members: 3,
       apply_outcome: "trial",
     });
+  });
+
+  it("PER_MEMBER_FROM unset: stored only (not_started), no Stripe call, /usage still counts", async () => {
+    await live();
+    env = { ...sEnv(), PER_MEMBER_FROM: "" };
+    const s = stripeAt(2);
+    const r = await call(seatsReq(5));
+    expect(await r.json()).toEqual({ members: 5, applied: "not_started" });
+    expect(s.calls).toEqual([]);
+    const d = new Date();
+    const closed = new Date(
+      Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1),
+    )
+      .toISOString()
+      .slice(0, 7);
+    await call(
+      req("/usage", {
+        install: A,
+        month: closed,
+        creators: ["a", "b", "c"],
+        count: 3,
+      }),
+    );
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["3"]);
+  });
+
+  it("a subscription created before PER_MEMBER_FROM is legacy: stored only, /usage keeps counting", async () => {
+    await live();
+    const s = stripeAt(2, "month", { createdMs: FROM - 1000 });
+    const r = await call(seatsReq(5));
+    expect(await r.json()).toEqual({ members: 5, applied: "legacy" });
+    expect(s.posts).toEqual([]);
+    expect(await stored()).toMatchObject({ per_member: 0 });
+    const d = new Date();
+    const closed = new Date(
+      Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1),
+    )
+      .toISOString()
+      .slice(0, 7);
+    await call(
+      req("/usage", {
+        install: A,
+        month: closed,
+        creators: ["a", "b", "c"],
+        count: 3,
+      }),
+    );
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["3"]);
+  });
+
+  it("a subscription created at or after PER_MEMBER_FROM is per member", async () => {
+    await live();
+    stripeAt(2, "month", { createdMs: FROM });
+    const r = await call(seatsReq(3));
+    expect(await r.json()).toEqual({ members: 3, applied: "updated" });
+    expect(await stored()).toMatchObject({ per_member: 1 });
   });
 
   it("monthly increase: create_prorations, key seats-<install>-<ts>-<quantity>", async () => {
@@ -3489,44 +3613,50 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.posts).toEqual([]);
     const t = stripeAt(4);
     await call(seatsReq(0, Date.now() + 1));
-    expect(
-      t.posts.map((c) => [c.key?.endsWith("-1"), c.form.quantity]),
-    ).toEqual([[true, "1"]]);
+    expect(t.posts.map((c) => c.form.quantity)).toEqual(["1"]);
+  });
+
+  it("a jump past max(current + 10, 2 x current) is held: stored, nothing applied, logged without counts", async () => {
+    await live();
+    const s = stripeAt(3);
+    const lines = logs();
+    const r = await call(seatsReq(14));
+    expect(await r.json()).toEqual({ members: 14, applied: "held" });
+    expect(s.posts).toEqual([]);
+    expect(await stored()).toMatchObject({ members: 14, apply_outcome: "held" });
+    expect(lines).toContain(`billing_seats_held ${A}`);
+    expect(lines.filter((l) => l.includes("held")).join()).not.toMatch(/14/);
+    // At the limit it applies.
+    const ok = await call(seatsReq(13, Date.now() + 1));
+    expect(await ok.json()).toEqual({ members: 13, applied: "updated" });
+    // A held install is left alone by the daily cron.
+    await call(seatsReq(80, Date.now() + 2));
+    await cron();
+    expect(s.held()).toBe(13);
   });
 
   it("yearly increase: always_invoice, charged now", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    env = yEnv();
     const s = stripeAt(3, "year");
-    const r = await call(seatsReq(4), env);
+    const r = await call(seatsReq(4));
     expect(await r.json()).toEqual({ members: 4, applied: "updated" });
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "4", proration_behavior: "always_invoice" },
     ]);
+    expect(await stored()).toMatchObject({ seat_prev_quantity: 3 });
   });
 
-  it("yearly decrease is deferred, then the daily cron applies it within 2 days of renewal, proration none", async () => {
+  it("yearly decrease is deferred, then the cron applies it within 7 days of renewal, nearest first, proration none", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    env = yEnv();
     const s = stripeAt(5, "year");
-    const r = await call(seatsReq(3), env);
+    const r = await call(seatsReq(3));
     expect(await r.json()).toEqual({ members: 3, applied: "deferred" });
     expect(s.posts).toEqual([]);
-    // Far from renewal: the cron leaves it.
-    await billing.scheduled(
-      { scheduledTime: Date.now(), cron: "17 3 * * *", noRetry() {} },
-      env,
-    );
+    await cron();
     expect(s.posts).toEqual([]);
-    // Within 2 days of renewal: applied.
-    await billing.scheduled(
-      {
-        scheduledTime: Date.now() + 99 * DAY,
-        cron: "17 3 * * *",
-        noRetry() {},
-      },
-      env,
-    );
+    await cron(Date.now() + 94 * DAY);
+    expect(s.posts).toEqual([]);
+    await cron(Date.now() + 94.5 * DAY);
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "3", proration_behavior: "none" },
     ]);
@@ -3534,16 +3664,23 @@ describe("per-member seats: POST /seats (#2580)", () => {
       applied_quantity: 3,
       apply_outcome: "updated",
     });
-    // Applied: a second run changes nothing.
-    await billing.scheduled(
-      {
-        scheduledTime: Date.now() + 99 * DAY,
-        cron: "17 3 * * *",
-        noRetry() {},
-      },
-      env,
-    );
+    await cron(Date.now() + 99 * DAY);
     expect(s.posts.length).toBe(1);
+  });
+
+  it("a renewal that passed with a lower stored count is logged and the decrease applied", async () => {
+    await live({ interval: "year", renewsAt: Date.now() - DAY });
+    const s = stripeAt(5, "year");
+    await db
+      .prepare(
+        "INSERT INTO seats (install_id, members, ts, applied_quantity, apply_outcome, per_member, updated_at) VALUES (?1, 3, 1, 5, 'deferred', 1, 1)",
+      )
+      .bind(A)
+      .run();
+    const lines = logs();
+    await cron();
+    expect(lines).toContain(`billing_seats_renewal_missed ${A}`);
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["3"]);
   });
 
   it("an older ts never overwrites a newer report", async () => {
@@ -3555,6 +3692,129 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await r.json()).toEqual({ members: 4, applied: "stale" });
     expect(await stored()).toMatchObject({ members: 4, ts });
     expect(s.posts.length).toBe(1);
+  });
+
+  it("a newer report that lands during the Stripe call is applied too", async () => {
+    await live();
+    const ts = Date.now();
+    let done = false;
+    const s = stripeAt(3, "month", {
+      onPost: async () => {
+        if (done) return;
+        done = true;
+        await db
+          .prepare("UPDATE seats SET members = 7, ts = ?2 WHERE install_id = ?1")
+          .bind(A, ts + 10)
+          .run();
+      },
+    });
+    const r = await call(seatsReq(4, ts));
+    expect(await r.json()).toEqual({ members: 7, applied: "updated" });
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["4", "7"]);
+    expect(await stored()).toMatchObject({ applied_quantity: 7 });
+  });
+
+  it("the daily cron applies a stored count that differs from the applied one, and retries a failed apply", async () => {
+    await live();
+    const s = stripeAt(2);
+    await db
+      .prepare(
+        "INSERT INTO seats (install_id, members, ts, applied_quantity, apply_outcome, per_member, updated_at) VALUES (?1, 4, 1, 2, 'updated', 1, 1)",
+      )
+      .bind(A)
+      .run();
+    await cron();
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["4"]);
+    expect(await stored()).toMatchObject({ applied_quantity: 4 });
+    // Failed: retried although stored equals applied.
+    await db
+      .prepare("UPDATE seats SET apply_outcome = 'failed'")
+      .run();
+    await cron();
+    expect(await stored()).toMatchObject({ apply_outcome: "unchanged" });
+  });
+
+  it("a failed yearly seat invoice is logged once, blocks increases, and a replay counts once", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    const s = stripeAt(3, "year");
+    await call(seatsReq(4));
+    const before = await rowOf(A);
+    const lines = logs();
+    expect((await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status).toBe(200);
+    expect((await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status).toBe(200);
+    expect(lines.filter((l) => l.startsWith("billing_seat_invoice_failed"))).toEqual([
+      `billing_seat_invoice_failed ${A}`,
+    ]);
+    expect(await stored()).toMatchObject({ seat_amount_due: 5000, seat_failures: 1 });
+    expect(await rowOf(A)).toEqual(before);
+    const r = await call(seatsReq(6, Date.now() + 1));
+    expect(await r.json()).toEqual({ members: 6, applied: "unpaid_hold" });
+    expect(s.posts.length).toBe(1);
+    // A later payment ends the hold.
+    await hook("evt_sp1", "invoice.paid", { id: "in_seat1" }, Math.floor(Date.now() / 1000) + 5);
+    const ok = await call(seatsReq(6, Date.now() + 2));
+    expect(await ok.json()).toEqual({ members: 6, applied: "updated" });
+  });
+
+  it("Stripe giving up on a seat invoice rolls the quantity back to the last paid one, proration none", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    const s = stripeAt(3, "year");
+    await call(seatsReq(4));
+    await hook("evt_sf2", "invoice.payment_failed", seatInvoice());
+    await hook("evt_sv2", "invoice.marked_uncollectible", seatInvoice());
+    await cron();
+    expect(s.posts.map((c) => c.form)).toEqual([
+      { quantity: "4", proration_behavior: "always_invoice" },
+      { quantity: "3", proration_behavior: "none" },
+    ]);
+    expect(s.posts[1]?.key).toMatch(new RegExp(`^seats-rollback-${A}-\\d+$`));
+    expect(await stored()).toMatchObject({
+      applied_quantity: 3,
+      apply_outcome: "rolled_back",
+    });
+    // Still unpaid: the cron does not raise it again.
+    await cron();
+    expect(s.held()).toBe(3);
+  });
+
+  it("only a yearly seat proration counts as a seat failure (L1)", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    stripeAt(3, "year");
+    await call(seatsReq(4));
+    for (const [i, o] of [
+      seatInvoice({ billing_reason: "subscription_cycle" }),
+      seatInvoice({ lines: { data: [{ price: { id: "price_teamY1" }, proration: false }] } }),
+      seatInvoice({ lines: { data: [{ price: { id: "price_other" }, proration: true }] } }),
+      seatInvoice({
+        lines: {
+          data: [
+            { price: { id: "price_teamY1" }, proration: true },
+            { price: { id: "price_other" }, proration: true },
+          ],
+        },
+      }),
+    ].entries())
+      await hook(`evt_l1_${i}`, "invoice.payment_failed", o);
+    expect(await stored()).toMatchObject({ seat_failures: 0, seat_failed_at: null });
+  });
+
+  it("a completed checkout applies the stored count (L3)", async () => {
+    await seed(A, "cus_existingA", "trial");
+    await db
+      .prepare(
+        "INSERT INTO seats (install_id, members, ts, apply_outcome, updated_at) VALUES (?1, 5, 1, 'trial', 1)",
+      )
+      .bind(A)
+      .run();
+    const s = stripeAt(2);
+    const r = await hook("evt_co1", "checkout.session.completed", {
+      subscription: SUB,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+    });
+    expect(r.status).toBe(200);
+    expect(s.posts.map((c) => c.form.quantity)).toEqual(["5"]);
+    expect(await stored()).toMatchObject({ applied_quantity: 5, per_member: 1 });
   });
 
   it("bad members and extra keys are refused", async () => {
@@ -3569,7 +3829,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await stored()).toBeNull();
   });
 
-  it("once seats exist /usage is stored but no longer sets the quantity or bills overage", async () => {
+  it("once a per-member subscription reports seats /usage is stored but sets no quantity and bills no overage", async () => {
     await live();
     const s = stripeAt(2);
     await call(seatsReq(2));
@@ -3598,55 +3858,6 @@ describe("per-member seats: POST /seats (#2580)", () => {
     ).toEqual({ count: 5, apply_outcome: "per_member" });
   });
 
-  it("a failed mid-term yearly seat invoice is recorded on the seats row and never moves the plan; a replay counts once", async () => {
-    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    env = yEnv();
-    stripeAt(3, "year");
-    await call(seatsReq(4), env);
-    const before = await rowOf(A);
-    const body = JSON.stringify({
-      id: "evt_seat_fail_1",
-      object: "event",
-      type: "invoice.payment_failed",
-      livemode: false,
-      created: Math.floor(Date.now() / 1000),
-      data: {
-        object: {
-          id: "in_seat1",
-          object: "invoice",
-          customer: "cus_existingA",
-          subscription: SUB,
-          billing_reason: "subscription_update",
-          amount_due: 5000,
-        },
-      },
-    });
-    const deliver = async () =>
-      call(
-        new Request(`${ORIGIN}/stripe/webhook`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "stripe-signature": await signStripePayload(
-              body,
-              "whsec_test_seat_0123456789",
-              Math.floor(Date.now() / 1000),
-            ),
-            "cf-connecting-ip": "1.2.3.4",
-          },
-          body,
-        }),
-        { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_seat_0123456789" },
-      );
-    expect((await deliver()).status).toBe(200);
-    expect((await deliver()).status).toBe(200);
-    expect(await stored()).toMatchObject({
-      seat_amount_due: 5000,
-      seat_failures: 1,
-    });
-    expect(await rowOf(A)).toEqual(before);
-  });
-
   it("/checkout takes members for monthly Team (at least 1) and defaults yearly seats from it", async () => {
     for (const [body, qty] of [
       [{ members: 4 }, "4"],
@@ -3656,11 +3867,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
       [{ interval: "year", members: 0 }, "1"],
       [{ interval: "year", members: 6, seats: 8 }, "8"],
     ] as const) {
-      env = yEnv();
       const s = fakeStripe();
       const r = await call(
         req("/checkout", { install: A, plan: "team", ...body }),
-        env,
       );
       expect(r.status, JSON.stringify(body)).toBe(200);
       const c = s.calls.find((x) => x.path === CHECKOUT);

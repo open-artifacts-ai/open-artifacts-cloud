@@ -634,7 +634,13 @@ export type SeatOutcome =
   /** Canceled, incomplete, gone (404): left alone. */
   | "not_live"
   /** Not one item at the tier's monthly or yearly price: left alone. */
-  | "unknown_price";
+  | "unknown_price"
+  /** Created before perMemberFrom: it keeps the old counting, nothing written. */
+  | "legacy"
+  /** An increase past max(current + 10, 2 x current): not applied. */
+  | "held"
+  /** An increase while a yearly seat invoice is unpaid: not applied. */
+  | "unpaid_hold";
 
 export interface SeatInput {
   subscriptionId: string;
@@ -647,7 +653,17 @@ export interface SeatInput {
   idempotencyKey: string;
   /** A yearly decrease is not written now (the daily cron applies it). */
   deferYearlyDecrease?: boolean;
+  /** ms: a subscription created before this is "legacy" and left alone. */
+  perMemberFrom?: number;
+  /** Refuse any increase (a yearly seat invoice is unpaid). */
+  blockIncrease?: boolean;
+  /** Write this proration regardless (a rollback to the last paid quantity). */
+  forceNone?: boolean;
 }
+
+/** An increase past this is held for a person to look at (#2580). */
+export const seatJumpLimit = (current: number): number =>
+  Math.max(current + 10, 2 * current);
 
 /**
  * Proration for a seat change: monthly up create_prorations (charged on the
@@ -677,6 +693,8 @@ export async function setSeatQuantity(
   previous?: number;
   interval?: "month" | "year";
   proration?: "create_prorations" | "none" | "always_invoice";
+  /** The subscription's creation time (ms), when Stripe gave one. */
+  created?: number;
 }> {
   const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
   const quantity = input.quantity;
@@ -728,12 +746,27 @@ export async function setSeatQuantity(
   if (!interval) return { outcome: "unknown_price" };
   const previous =
     typeof item.quantity === "number" ? item.quantity : undefined;
+  const created =
+    typeof out.created === "number" ? out.created * 1000 : undefined;
   const seen = {
     interval,
     ...(previous === undefined ? {} : { previous }),
+    ...(created === undefined ? {} : { created }),
   } as const;
+  if (
+    input.perMemberFrom !== undefined &&
+    (created === undefined || created < input.perMemberFrom)
+  )
+    return { outcome: "legacy", ...seen };
   if (previous === quantity) return { outcome: "unchanged", ...seen };
-  const proration = seatProration(interval, previous ?? 0, quantity);
+  if (previous !== undefined && quantity > previous) {
+    if (input.blockIncrease) return { outcome: "unpaid_hold", ...seen };
+    if (quantity > seatJumpLimit(previous))
+      return { outcome: "held", ...seen };
+  }
+  const proration = input.forceNone
+    ? "none"
+    : seatProration(interval, previous ?? 0, quantity);
   if (
     interval === "year" &&
     input.deferYearlyDecrease &&

@@ -123,6 +123,12 @@ export interface Env {
    * with a test key.
    */
   STAGING_TEST_CLOCK_INSTALLS?: string;
+  /**
+   * Per-member billing start (#2580), epoch ms. Only subscriptions created at
+   * or after it bill per member; older ones keep /usage counting. Empty or
+   * unset: off, and /seats is stored only.
+   */
+  PER_MEMBER_FROM?: string;
 }
 
 /** The Stripe config for this env: prod is live mode (rk_live_ only), the rest test mode. */
@@ -1501,7 +1507,7 @@ async function applyQuantity(
   // that and no overage is billed; /usage is still stored.
   if (
     await db
-      .prepare("SELECT 1 AS x FROM seats WHERE install_id = ?1")
+      .prepare("SELECT 1 AS x FROM seats WHERE install_id = ?1 AND per_member = 1")
       .bind(install)
       .first()
   )
@@ -1678,20 +1684,31 @@ async function usage(
 const SEATS_SQL =
   "INSERT INTO seats (install_id, members, ts, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id) DO UPDATE SET members = excluded.members, ts = excluded.ts, updated_at = excluded.updated_at WHERE excluded.ts >= seats.ts RETURNING 1 AS ok";
 const SEATS_READ_SQL =
-  "SELECT members, ts, applied_quantity FROM seats WHERE install_id = ?1";
+  "SELECT members, ts, seat_failed_at, seat_paid_at FROM seats WHERE install_id = ?1";
 const SEATS_APPLIED_SQL =
-  "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5 WHERE install_id = ?1 AND ts = ?2";
+  "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5, per_member = coalesce(?6, per_member) WHERE install_id = ?1 AND ts = ?2";
 const SEATS_TIER_SQL =
   "SELECT tier, status, stripe_subscription_id FROM tiers WHERE install_id = ?1";
 
 /**
+ * PER_MEMBER_FROM (ms): subscriptions created at or after it bill per
+ * member. Empty or unset: per-member is off and /seats is stored only.
+ */
+const perMemberFrom = (env: Env): number | undefined => {
+  const n = Number(env.PER_MEMBER_FROM);
+  return env.PER_MEMBER_FROM && Number.isFinite(n) && n > 0 ? n : undefined;
+};
+
+/**
  * Writes the stored member count to the install's Team or Business
- * subscription (monthly or yearly) and answers the outcome string. A
- * Stripe failure the install should retry (network, 5xx, 401, 403, 409,
- * 429, config) is the refusal; any other failure is recorded as failed.
- * The yearly decrease is deferred (outcome "deferred") unless `cron`, which
- * applies it just before renewal. No subscription (trial, solo, free):
- * stored only.
+ * subscription (monthly or yearly) and answers the outcome string:
+ * not_started (PER_MEMBER_FROM unset), legacy (the subscription predates
+ * it), held (a jump past max(current + 10, 2 x current)), unpaid_hold (an
+ * increase while a yearly seat invoice is unpaid), deferred (a yearly
+ * decrease, applied by the cron within 7 days before renewal), or what
+ * Stripe did. A Stripe failure the install should retry (network, 5xx, 401,
+ * 403, 409, 429, config) is the refusal; any other failure is recorded as
+ * failed. No subscription (trial, solo, free): stored only.
  */
 async function applySeats(
   env: Env,
@@ -1703,14 +1720,20 @@ async function applySeats(
 ): Promise<{ outcome: string; refused?: Response }> {
   const db = env.BILLING_DB;
   const quantity = Math.max(1, members);
-  const done = async (o: string, applied: number | null = null) => {
+  const done = async (
+    o: string,
+    applied: number | null = null,
+    perMember: number | null = null,
+  ) => {
     await db
       .prepare(SEATS_APPLIED_SQL)
-      .bind(install, ts, applied, now, o)
+      .bind(install, ts, applied, now, o, perMember)
       .run();
     console.log("billing seats", o, install);
     return { outcome: o };
   };
+  const from = perMemberFrom(env);
+  if (from === undefined) return done("not_started");
   const row = await db.prepare(SEATS_TIER_SQL).bind(install).first<{
     tier: string | null;
     status: string | null;
@@ -1727,6 +1750,13 @@ async function applySeats(
     row.tier === "team"
       ? env.STRIPE_PRICE_TEAM_YEARLY
       : env.STRIPE_PRICE_BUSINESS_YEARLY;
+  const state = await db.prepare(SEATS_READ_SQL).bind(install).first<{
+    seat_failed_at: number | null;
+    seat_paid_at: number | null;
+  }>();
+  const unpaid =
+    state?.seat_failed_at != null &&
+    state.seat_failed_at > (state.seat_paid_at ?? 0);
   try {
     const r = await stripe(install, () =>
       setSeatQuantity(
@@ -1737,18 +1767,33 @@ async function applySeats(
           yearlyPriceIds: yearly ? [yearly] : [],
           idempotencyKey: `seats-${install}-${ts}-${quantity}`,
           deferYearlyDecrease: !cron,
+          perMemberFrom: from,
+          blockIncrease: unpaid,
         },
         stripeConfig(env),
       ),
     );
+    if (r.outcome === "legacy") return done("legacy", null, 0);
+    if (r.outcome === "held") console.log("billing_seats_held", install);
+    if (r.outcome === "updated" && r.proration === "always_invoice")
+      await db
+        .prepare(
+          "UPDATE seats SET seat_prev_quantity = ?2 WHERE install_id = ?1",
+        )
+        .bind(install, r.previous ?? null)
+        .run();
     if (r.outcome === "updated" || r.outcome === "unchanged")
-      return done(r.outcome, quantity);
-    return done(r.outcome);
+      return done(r.outcome, quantity, 1);
+    return done(
+      r.outcome,
+      null,
+      r.outcome === "not_live" || r.outcome === "unknown_price" ? null : 1,
+    );
   } catch (e) {
     if (!(e instanceof StripeFailure)) throw e;
     await db
       .prepare(SEATS_APPLIED_SQL)
-      .bind(install, ts, null, now, "failed")
+      .bind(install, ts, null, now, "failed", null)
       .run();
     console.error("billing seats failed", install);
     return { outcome: "failed", refused: usageRefusal(e) ?? undefined };
@@ -1787,34 +1832,131 @@ async function seats(
     });
   }
   console.log("billing seats", install);
-  const r = await applySeats(env, install, members as number, ts, now);
+  let cur = { members: members as number, ts };
+  let r = await applySeats(env, install, cur.members, cur.ts, now);
+  // A newer report landed while the Stripe call ran: apply it too.
+  for (let i = 0; i < 3 && !r.refused; i++) {
+    const latest = await db
+      .prepare(SEATS_READ_SQL)
+      .bind(install)
+      .first<{ members: number; ts: number }>();
+    if (!latest || latest.ts === cur.ts) break;
+    cur = latest;
+    r = await applySeats(env, install, cur.members, cur.ts, now);
+  }
   if (r.refused) return r.refused;
-  return Response.json({ members, applied: r.outcome });
+  return Response.json({ members: cur.members, applied: r.outcome });
 }
 
-const DEFER_WINDOW_MS = 2 * 86_400_000;
-const SEATS_DUE_SQL =
-  "SELECT s.install_id, s.members, s.ts FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.billing_interval = 'year' AND t.tier IN ('team', 'business') AND t.status IN ('active', 'past_due') AND t.stripe_subscription_id IS NOT NULL AND t.renews_at IS NOT NULL AND t.renews_at > ?1 AND t.renews_at <= ?2 AND coalesce(s.applied_quantity, 0) != max(1, s.members) ORDER BY s.install_id LIMIT ?3";
+/** A yearly decrease is applied this long before renews_at (and after). */
+export const DEFER_WINDOW_MS = 7 * 86_400_000;
+const SEATS_BACKLOG_SQL =
+  "SELECT s.install_id, s.members, s.ts, s.applied_quantity, t.billing_interval, t.renews_at FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.tier IN ('team', 'business') AND t.status IN ('active', 'past_due') AND t.stripe_subscription_id IS NOT NULL AND coalesce(s.apply_outcome, '') NOT IN ('legacy', 'held') AND (coalesce(s.applied_quantity, 0) != max(1, s.members) OR s.apply_outcome = 'failed') AND (t.billing_interval IS NOT 'year' OR max(1, s.members) >= coalesce(s.applied_quantity, 0) OR (t.renews_at IS NOT NULL AND t.renews_at <= ?1)) ORDER BY t.renews_at IS NULL, t.renews_at, s.install_id LIMIT ?2";
+const SEATS_ROLLBACK_SQL =
+  "SELECT s.install_id, s.seat_prev_quantity AS prev, s.seat_closed_at AS closed, t.tier, t.stripe_subscription_id AS sub FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE s.seat_closed_at IS NOT NULL AND s.seat_closed_at > coalesce(s.seat_rollback_at, 0) AND s.seat_closed_at > coalesce(s.seat_paid_at, 0) AND s.seat_prev_quantity IS NOT NULL AND t.stripe_subscription_id IS NOT NULL AND t.tier IN ('team', 'business') ORDER BY s.install_id LIMIT ?1";
 
 /**
- * Yearly decreases wait for the renewal: within 2 days before renews_at the
- * stored count is written with proration_behavior none, so the next yearly
- * invoice bills it. Each failure is logged and the next daily run retries.
+ * The daily seats work. First, a yearly seat invoice Stripe gave up on
+ * (voided or uncollectible) rolls the quantity back to the last paid one,
+ * proration none. Then every install whose stored count differs from what
+ * was applied, or whose last apply failed, is applied again (a yearly
+ * decrease only within 7 days before renews_at, nearest renewal first, and
+ * after it). A renewal that passed with a lower stored count is logged. Each
+ * failure is logged and the next run retries.
  */
-export async function applyYearlyDecreases(
-  env: Env,
-  now: number,
-): Promise<void> {
-  const due = await env.BILLING_DB.prepare(SEATS_DUE_SQL)
-    .bind(now, now + DEFER_WINDOW_MS, RETRY_BATCH)
-    .all<{ install_id: string; members: number; ts: number }>();
+export async function applySeatBacklog(env: Env, now: number): Promise<void> {
+  const from = perMemberFrom(env);
+  if (from === undefined) return;
+  const db = env.BILLING_DB;
+  const back = await db
+    .prepare(SEATS_ROLLBACK_SQL)
+    .bind(RETRY_BATCH)
+    .all<{
+      install_id: string;
+      prev: number;
+      closed: number;
+      tier: string;
+      sub: string;
+    }>();
+  for (const r of back.results) {
+    try {
+      const monthly =
+        r.tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
+      const yearly =
+        r.tier === "team"
+          ? env.STRIPE_PRICE_TEAM_YEARLY
+          : env.STRIPE_PRICE_BUSINESS_YEARLY;
+      const out = await stripe(r.install_id, () =>
+        setSeatQuantity(
+          {
+            subscriptionId: r.sub,
+            quantity: Math.max(1, r.prev),
+            monthlyPriceIds: monthly ? [monthly] : [],
+            yearlyPriceIds: yearly ? [yearly] : [],
+            idempotencyKey: `seats-rollback-${r.install_id}-${r.closed}`,
+            forceNone: true,
+          },
+          stripeConfig(env),
+        ),
+      );
+      if (out.outcome === "updated" || out.outcome === "unchanged") {
+        await db
+          .prepare(
+            "UPDATE seats SET applied_quantity = ?2, applied_at = ?3, apply_outcome = 'rolled_back', seat_rollback_at = ?3 WHERE install_id = ?1",
+          )
+          .bind(r.install_id, Math.max(1, r.prev), now)
+          .run();
+        console.log("billing seats rolled_back", r.install_id);
+      }
+    } catch {
+      console.error("billing seats rollback error", r.install_id);
+    }
+  }
+  const due = await db
+    .prepare(SEATS_BACKLOG_SQL)
+    .bind(now + DEFER_WINDOW_MS, RETRY_BATCH)
+    .all<{
+      install_id: string;
+      members: number;
+      ts: number;
+      applied_quantity: number | null;
+      billing_interval: string | null;
+      renews_at: number | null;
+    }>();
   for (const r of due.results) {
     try {
-      await applySeats(env, r.install_id, r.members, r.ts, now, true);
+      const year = r.billing_interval === "year" && r.renews_at !== null;
+      const window = year && (r.renews_at as number) <= now + DEFER_WINDOW_MS;
+      if (
+        year &&
+        (r.renews_at as number) <= now &&
+        Math.max(1, r.members) < (r.applied_quantity ?? 0)
+      )
+        console.log("billing_seats_renewal_missed", r.install_id);
+      await applySeats(env, r.install_id, r.members, r.ts, now, window);
     } catch {
       console.error("billing seats cron error", r.install_id);
     }
   }
+}
+
+const SEATS_CUSTOMER_SQL =
+  "SELECT s.install_id, s.members, s.ts FROM tiers t JOIN seats s ON s.install_id = t.install_id WHERE t.stripe_customer_id = ?1";
+
+/**
+ * A subscription that just went live (its checkout completed): apply the
+ * stored member count by the normal rules (the checkout priced the count
+ * at checkout time, which may have moved since).
+ */
+async function applySeatsOnCheckout(
+  env: Env,
+  customer: string,
+  now: number,
+): Promise<void> {
+  const r = await env.BILLING_DB.prepare(SEATS_CUSTOMER_SQL)
+    .bind(customer)
+    .first<{ install_id: string; members: number; ts: number }>();
+  if (r) await applySeats(env, r.install_id, r.members, r.ts, now);
 }
 
 /** Closed months the daily cron re-tries per run (oldest last try first). */
@@ -1995,7 +2137,11 @@ export default {
         console.error("billing webhook config");
         return bad("config", 500);
       }
-      return handleStripeWebhook(
+      // The body is read again after the webhook, only to learn that a
+      // checkout completed (#2580): the stored member count is then applied.
+      const declared = Number(req.headers.get("content-length") ?? 0);
+      const copy = declared <= MAX_BODY ? req.clone() : null;
+      const res = await handleStripeWebhook(
         req,
         {
           BILLING_DB: env.BILLING_DB,
@@ -2011,6 +2157,25 @@ export default {
         },
         Date.now(),
       );
+      if (res.ok && copy) {
+        try {
+          const ev = JSON.parse(await copy.text()) as {
+            type?: unknown;
+            data?: { object?: { customer?: unknown } };
+          };
+          const customer = ev.data?.object?.customer;
+          if (
+            (ev.type === "checkout.session.completed" ||
+              ev.type === "checkout.session.async_payment_succeeded") &&
+            typeof customer === "string"
+          )
+            await applySeatsOnCheckout(env, customer, Date.now());
+        } catch (e) {
+          if (e instanceof StripeFailure) console.error("billing seats checkout");
+          else console.error("billing seats checkout db_error");
+        }
+      }
+      return res;
     }
     // Gate routes only over a binding: an internet request always carries
     // cf-connecting-ip.
@@ -2080,7 +2245,7 @@ export default {
       console.error("billing retry db_error");
     }
     try {
-      await applyYearlyDecreases(env, controller.scheduledTime);
+      await applySeatBacklog(env, controller.scheduledTime);
     } catch {
       console.error("billing seats db_error");
     }
