@@ -100,6 +100,15 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.190.1: the doc ops route (#2542) and the edit_doc MCP tool.
+    ...[
+      "artifact rest doc ops [session]",
+      "artifact rest doc ops [pat]",
+      "artifact mcp edit_doc [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",
