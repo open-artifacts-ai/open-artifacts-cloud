@@ -113,6 +113,8 @@ describe("refusals before any call", () => {
     [["publish-floor", "--env", "staging"]],
     [["publish-release", "--env", "staging", "--tag", "main"]],
     [["status", "--env", "staging", "--install", "../etc"]],
+    [[...STATUS("iaaaaaaaaaaa"), "--stage-only"]],
+    [["publish-floor", "--env", "staging", "--floor", "f", "--stage-only"]],
   ])("bad flags exit 1 before any call: %j", async (argv) => {
     const w = world();
     expect(await main(argv, w.deps)).toBe(1);
@@ -435,6 +437,35 @@ describe("commands", () => {
       ),
     ).toEqual([]);
     expect(removed).toBe(dir);
+  });
+
+  it("publish-release --stage-only is accepted and reaches the same verification (a bad .sig.json is refused before any upload)", async () => {
+    const w = world();
+    const exec = w.deps.execFile;
+    w.deps.execFile = async (f, a) => {
+      if (f !== "gh") return exec(f, a);
+      const dir = a[a.indexOf("--dir") + 1] as string;
+      writeFileSync(join(dir, "oa-release-prod-release-0.30.0.tar"), "x");
+      writeFileSync(join(dir, "oa-release-prod-release-0.30.0.sig.json"), "{}");
+      return "";
+    };
+    w.deps.readFile = (p) => new Uint8Array(readFileSync(p));
+    expect(
+      await main(
+        [
+          "publish-release",
+          "--env",
+          "staging",
+          "--tag",
+          "v0.30.0",
+          "--stage-only",
+        ],
+        w.deps,
+      ),
+    ).toBe(1);
+    expect(
+      w.parsed().find((l) => l.step === "publish-release")?.message,
+    ).toMatch(/\.sig\.json|tar/);
   });
 
   it("publish-floor reads the floor file and hands it to publishFloor", async () => {
