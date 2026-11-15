@@ -98,6 +98,8 @@ ALLOW=(
   # The hosted-owned vars check (#262), this repo's own.
   scripts/ci/check-hosted-owned-vars.ts
   scripts/ci/check-hosted-owned-vars.test.ts
+  # The release App environment check (#302), this repo's own.
+  scripts/ci/release-app-environment.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
