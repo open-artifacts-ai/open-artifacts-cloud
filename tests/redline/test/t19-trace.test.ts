@@ -10,10 +10,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  dropErrorContext,
+  dropMedia,
   readZip,
+  scanDirs,
   scrubDirs,
   scrubTraceZip,
   secretLiterals,
+  stripEmbeddedMedia,
   writeZip,
 } from "../src/t19-trace.ts";
 
@@ -306,5 +310,156 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     writeFileSync(f, "garbage");
     expect(scrubDirs([dir], []).dropped).toBeTruthy();
     expect(existsSync(f)).toBe(false);
+  });
+});
+
+describe("T19 report scan (#294)", () => {
+  let d: string;
+  beforeEach(() => {
+    d = mkdtempSync(join(tmpdir(), "t19-scan-"));
+  });
+  afterEach(() => rmSync(d, { recursive: true, force: true }));
+  const KEY = "hk_s3cret_value_0123456789";
+  const b64 = (b: Buffer) => b.toString("base64");
+
+  it("a clean report passes", () => {
+    const blob = b64(writeZip([{ name: "r.json", data: Buffer.from("{}") }]));
+    writeFileSync(
+      join(d, "index.html"),
+      `<script>data:application/zip;base64,${blob}</script>`,
+    );
+    writeFileSync(
+      join(d, "a.zip"),
+      writeZip([{ name: "x", data: Buffer.from("ok") }]),
+    );
+    const r = scanDirs([d], [KEY]);
+    expect(r.hits).toEqual([]);
+    expect(r.dropped).toEqual([]);
+  });
+
+  it("catches a token inside the HTML reporter's embedded base64 zip", () => {
+    const blob = b64(
+      writeZip([{ name: "r.json", data: Buffer.from(`err ${KEY} end`) }]),
+    );
+    writeFileSync(
+      join(d, "index.html"),
+      `<script id="playwrightReportBase64">data:application/zip;base64,${blob}</script>`,
+    );
+    expect(scanDirs([d], [KEY]).hits).toHaveLength(1);
+  });
+
+  it("catches a token inside a nested zip, and a token shape", () => {
+    const inner = writeZip([{ name: "i", data: Buffer.from(`${KEY}`) }]);
+    writeFileSync(
+      join(d, "a.zip"),
+      writeZip([{ name: "in.zip", data: inner }]),
+    );
+    const shape = writeZip([{ name: "i", data: Buffer.from(PAT) }]);
+    writeFileSync(join(d, "b.zip"), shape);
+    expect(
+      scanDirs([d], [KEY])
+        .hits.map((f) => f.slice(-5))
+        .sort(),
+    ).toEqual(["a.zip", "b.zip"]);
+  });
+
+  it("drops a zip it cannot read, including a bad embedded one", () => {
+    writeFileSync(join(d, "bad.zip"), Buffer.from("PK\x03\x04 garbage"));
+    writeFileSync(
+      join(d, "index.html"),
+      `x ${b64(Buffer.from("PK\x03\x04 garbage garbage garbage garbage garbage garbage garbage garbage"))}`,
+    );
+    const r = scanDirs([d], [KEY]);
+    expect(r.dropped).toHaveLength(2);
+    expect(existsSync(join(d, "bad.zip"))).toBe(false);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
+  });
+
+  it("dropErrorContext removes error-context.md files, wherever they sit", () => {
+    mkdirSync(join(d, "data", "x"), { recursive: true });
+    writeFileSync(join(d, "data", "x", "error-context.md"), `snapshot ${KEY}`);
+    writeFileSync(join(d, "keep.md"), "ok");
+    expect(dropErrorContext([d])).toBe(1);
+    expect(existsSync(join(d, "data", "x", "error-context.md"))).toBe(false);
+    expect(existsSync(join(d, "keep.md"))).toBe(true);
+  });
+
+  it("dropMedia removes images and videos anywhere", () => {
+    mkdirSync(join(d, "data"), { recursive: true });
+    for (const n of [
+      "a.png",
+      "data/b.JPG",
+      "c.jpeg",
+      "d.webp",
+      "e.gif",
+      "data/f.webm",
+      "g.mp4",
+    ])
+      writeFileSync(join(d, n), "x");
+    writeFileSync(join(d, "index.html"), "ok");
+    expect(dropMedia([d])).toBe(7);
+    expect(existsSync(join(d, "index.html"))).toBe(true);
+    expect(existsSync(join(d, "a.png"))).toBe(false);
+  });
+
+  it("an image inside a zip or the embedded report fails closed (the file is dropped)", () => {
+    const z = writeZip([{ name: "data/s.png", data: Buffer.from("\x89PNG") }]);
+    writeFileSync(join(d, "a.zip"), z);
+    writeFileSync(join(d, "index.html"), `x ${b64(z)}`);
+    const r = scanDirs([d], [KEY]);
+    expect(r.dropped).toHaveLength(2);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
+  });
+
+  it("base64 split across lines is not reassembled", () => {
+    const blob = b64(
+      Buffer.from(`pad ${KEY} pad pad pad pad pad pad pad pad pad pad pad`),
+    );
+    const split = `${blob.slice(0, 40)}\n${blob.slice(40)}`;
+    writeFileSync(join(d, "index.html"), split);
+    expect(scanDirs([d], [KEY]).hits).toEqual([]);
+  });
+
+  it("stripEmbeddedMedia keeps index.html, its zip loses the media, and the scan passes", () => {
+    const z = writeZip([
+      { name: "report.json", data: Buffer.from("{}") },
+      { name: "data/s.png", data: Buffer.from("\x89PNG screenshot") },
+      { name: "data/v.webm", data: Buffer.from("video") },
+    ]);
+    writeFileSync(
+      join(d, "index.html"),
+      `<script>data:application/zip;base64,${b64(z)}</script>`,
+    );
+    expect(stripEmbeddedMedia([d])).toEqual({ stripped: 1, dropped: 0 });
+    const html = readFileSync(join(d, "index.html"), "latin1");
+    const blob = /[A-Za-z0-9+/]{64,}={0,2}/.exec(html)?.[0] ?? "";
+    expect(readZip(Buffer.from(blob, "base64")).map((e) => e.name)).toEqual([
+      "report.json",
+    ]);
+    const r = scanDirs([d], [KEY]);
+    expect(r).toMatchObject({ dropped: [], hits: [] });
+  });
+
+  it("a corrupt embedded zip drops index.html", () => {
+    const z = writeZip([{ name: "report.json", data: Buffer.from("{}") }]);
+    writeFileSync(
+      join(d, "index.html"),
+      `x ${b64(z.subarray(0, z.length - 30))}`,
+    );
+    expect(stripEmbeddedMedia([d]).dropped).toBe(1);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
+  });
+
+  it("stripEmbeddedMedia replaces inline image and video data URIs", () => {
+    const big = Buffer.alloc(300, 7).toString("base64");
+    writeFileSync(
+      join(d, "index.html"),
+      `<img src="data:image/png;base64,${big}"><video src="data:video/webm;base64,${big}"></video><p>ok</p>`,
+    );
+    expect(stripEmbeddedMedia([d]).stripped).toBe(1);
+    const html = readFileSync(join(d, "index.html"), "latin1");
+    expect(html).toBe(
+      '<img src="data:,"><video src="data:,"></video><p>ok</p>',
+    );
   });
 });

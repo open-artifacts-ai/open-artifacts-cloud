@@ -1570,7 +1570,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     const up = t19Steps.filter((s) => s.with?.name === "t19-report");
     expect(up).toHaveLength(1);
     expect(up[0]?.if).toBe(
-      "always() && steps.scan.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'",
+      "always() && steps.scan.outcome == 'success' && steps.deep.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'",
     );
     expect(t19Steps.indexOf(up[0] ?? {})).toBeGreaterThan(
       t19Steps.indexOf(scan),
@@ -1585,6 +1585,11 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     );
     expect(t19Steps.indexOf(trace)).toBeLessThan(t19Steps.indexOf(scan));
     expect(t19Named("t19").run).toContain("--trace retain-on-failure");
+    // #294: the deep scan runs after the text scan, before the upload.
+    const deep = t19Named("deep");
+    expect(deep.run).toContain("t19-trace scan");
+    expect(t19Steps.indexOf(deep)).toBeGreaterThan(t19Steps.indexOf(scan));
+    expect(t19Steps.indexOf(deep)).toBeLessThan(t19Steps.indexOf(up[0] ?? {}));
     expect(up[0]?.with.path).toBe("apps/dashboard/playwright-report");
     const tmp = mkdtempSync(join(tmpdir(), "t19-scan-"));
     try {
