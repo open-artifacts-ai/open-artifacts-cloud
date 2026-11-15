@@ -1197,6 +1197,26 @@ describe("deploy-hosted-platform.yml", () => {
     expect(failing.stdout).toContain("::group::prod inventory (wave 2)");
     expect(failing.stdout).toContain("wave 2 failed: billing");
     expect(failing.stdout).not.toContain("provisioner");
+    // L2: killed mid-wave, the buffered logs still print, each under its group.
+    const slow = spawnSync(
+      "bash",
+      [
+        "-c",
+        loop.replace(
+          'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
+          `bash -c 'echo "started $0"; if [ "$0" = billing ]; then kill -TERM $PPID; fi; sleep 5' "$t"`,
+        ),
+      ],
+      {
+        env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS: FULLB },
+        encoding: "utf8",
+        timeout: 20000,
+      },
+    );
+    expect(slow.status).not.toBe(0);
+    expect(slow.stdout).toContain("::group::prod billing (unfinished)");
+    expect(slow.stdout).toContain("started billing");
+    expect(slow.stdout).toContain("started inventory");
   });
 
   it("require_newer (the chain's): the tag must be newer than prod's scheduler, before anything deploys", () => {

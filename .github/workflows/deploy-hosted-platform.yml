@@ -390,6 +390,22 @@ jobs:
           # the run (its wave-mates still finish: they were already deploying).
           plan="$(bash scripts/ops/deploy-waves.sh "$TARGETS")"
           logs="$(mktemp -d)"
+          # A cancel or timeout mid-wave still shows each running target's
+          # buffered log (under its own group), whatever the exit.
+          dump_logs() {
+            local f t
+            for f in "$logs"/*.log; do
+              [ -e "$f" ] || continue
+              t="$(basename "$f" .log)"
+              [ -e "$logs/$t.shown" ] && continue
+              touch "$logs/$t.shown"
+              echo "::group::$DEPLOY_ENV $t (unfinished)"
+              cat "$f"
+              echo "::endgroup::"
+            done
+          }
+          trap dump_logs EXIT
+          trap 'exit 143' TERM INT
           n=0
           while IFS= read -r wave; do
             n=$((n + 1))
@@ -408,6 +424,7 @@ jobs:
             for ((i = 0; i < count; i++)); do
               rc=0
               wait "${pids[$i]}" || rc=$?
+              touch "$logs/${ts[$i]}.shown"
               echo "::group::$DEPLOY_ENV ${ts[$i]} (wave $n)"
               cat "$logs/${ts[$i]}.log"
               echo "::endgroup::"
