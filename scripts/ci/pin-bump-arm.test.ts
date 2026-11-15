@@ -8,6 +8,7 @@ import { parse } from "yaml";
 import {
   BOT,
   type Check,
+  commitOk,
   decide,
   type Exec,
   GATE_WORKFLOWS,
@@ -310,10 +311,53 @@ describe("decide", () => {
       { commits: [{ author: BOT, committer: "leourbina", verified: true }] },
       /committed by leourbina/,
     );
+  });
+  it("accepts web-flow as committer only for a verified commit authored by the bot", () => {
+    const wf = (author: string, verified: boolean) => ({
+      commits: [{ author, committer: "web-flow", verified }],
+    });
+    expect(decide(base(wf(BOT, true))).arm).toBe(true);
     left(
-      { commits: [{ author: BOT, committer: "web-flow", verified: true }] },
-      /committed by web-flow/,
+      wf("leourbina", true),
+      /commit is by leourbina, committed by web-flow/,
     );
+    left(wf(BOT, false), /unverified/);
+    left(wf("", true), /committed by web-flow/);
+    left(wf("web-flow", true), /commit is by web-flow/);
+    left(wf(`x${BOT}`, true), /commit is by/);
+    // One bad commit among good ones still refuses.
+    left(
+      {
+        commits: [
+          { author: BOT, committer: "web-flow", verified: true },
+          { author: "leourbina", committer: "web-flow", verified: true },
+        ],
+      },
+      /leourbina/,
+    );
+    // Other committers stay refused, even for the bot's own commit.
+    left(
+      { commits: [{ author: BOT, committer: "github", verified: true }] },
+      /committed by github/,
+    );
+    expect(
+      commitOk({ author: BOT, committer: "web-flow", verified: true }),
+    ).toBe(true);
+    expect(commitOk({ author: BOT, committer: BOT, verified: true })).toBe(
+      true,
+    );
+  });
+  it("takes back the bot's arming over a human web-flow commit, keeps it for the bot's", () => {
+    expect(
+      go(
+        "arm",
+        fake({ armed: true, commitAuthor: "leourbina", committer: "web-flow" }),
+      ).disarmed,
+    ).toEqual([7]);
+    expect(
+      go("arm", fake({ armed: true, committer: "web-flow" })).disarmed,
+    ).toEqual([]);
+    expect(go("arm", fake({ committer: "web-flow" })).armed).toEqual([7]);
   });
   it("leaves a commit GitHub could not attribute, or a PR with no commits", () => {
     left(
@@ -472,6 +516,7 @@ const fake = (
     armed?: boolean;
     author?: string;
     commitAuthor?: string;
+    committer?: string;
     rulesFail?: boolean;
     unverified?: boolean;
     released?: boolean;
@@ -572,7 +617,7 @@ const fake = (
           [
             {
               author: { login: o.commitAuthor ?? BOT },
-              committer: { login: BOT },
+              committer: { login: o.committer ?? BOT },
               commit: { verification: { verified: !o.unverified } },
             },
           ],
