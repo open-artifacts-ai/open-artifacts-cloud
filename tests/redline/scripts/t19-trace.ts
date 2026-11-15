@@ -3,6 +3,7 @@
 // On a scrub failure: deletes every trace zip found, logs "trace dropped: <code>", exits 0.
 import {
   dropErrorContext,
+  dropMedia,
   scanDirs,
   scrubDirs,
   secretLiterals,
@@ -33,6 +34,8 @@ try {
   }
   const ec = dropErrorContext(dirs);
   if (ec) console.log(`dropped error-context: ${ec} file(s)`);
+  const md = dropMedia(dirs);
+  if (md) console.log(`dropped ${md} screenshots/videos`);
   const r = scrubDirs(dirs, lit);
   if (r.dropped) console.log(`trace dropped: ${r.dropped}`);
   else console.log(`t19 trace: ${r.scrubbed} trace zip(s) scrubbed`);

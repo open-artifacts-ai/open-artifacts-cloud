@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   dropErrorContext,
+  dropMedia,
   readZip,
   scanDirs,
   scrubDirs,
@@ -380,5 +381,41 @@ describe("T19 report scan (#294)", () => {
     expect(dropErrorContext([d])).toBe(1);
     expect(existsSync(join(d, "data", "x", "error-context.md"))).toBe(false);
     expect(existsSync(join(d, "keep.md"))).toBe(true);
+  });
+
+  it("dropMedia removes images and videos anywhere", () => {
+    mkdirSync(join(d, "data"), { recursive: true });
+    for (const n of [
+      "a.png",
+      "data/b.JPG",
+      "c.jpeg",
+      "d.webp",
+      "e.gif",
+      "data/f.webm",
+      "g.mp4",
+    ])
+      writeFileSync(join(d, n), "x");
+    writeFileSync(join(d, "index.html"), "ok");
+    expect(dropMedia([d])).toBe(7);
+    expect(existsSync(join(d, "index.html"))).toBe(true);
+    expect(existsSync(join(d, "a.png"))).toBe(false);
+  });
+
+  it("an image inside a zip or the embedded report fails closed (the file is dropped)", () => {
+    const z = writeZip([{ name: "data/s.png", data: Buffer.from("\x89PNG") }]);
+    writeFileSync(join(d, "a.zip"), z);
+    writeFileSync(join(d, "index.html"), `x ${b64(z)}`);
+    const r = scanDirs([d], [KEY]);
+    expect(r.dropped).toHaveLength(2);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
+  });
+
+  it("base64 split across lines is not reassembled", () => {
+    const blob = b64(
+      Buffer.from(`pad ${KEY} pad pad pad pad pad pad pad pad pad pad pad`),
+    );
+    const split = `${blob.slice(0, 40)}\n${blob.slice(40)}`;
+    writeFileSync(join(d, "index.html"), split);
+    expect(scanDirs([d], [KEY]).hits).toEqual([]);
   });
 });

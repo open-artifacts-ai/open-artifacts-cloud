@@ -528,7 +528,24 @@ export function dropErrorContext(dirs: readonly string[]): number {
   return n;
 }
 
+const MEDIA = /\.(?:png|jpe?g|webp|gif|webm|mp4)$/i;
+
+/** Drops every screenshot and video under `dirs` (a picture can show any on-screen value); returns how many. */
+export function dropMedia(dirs: readonly string[]): number {
+  let n = 0;
+  for (const d of dirs)
+    if (existsSync(d))
+      for (const f of walk(d))
+        if (MEDIA.test(f)) {
+          rmSync(f, { force: true });
+          n++;
+        }
+  return n;
+}
+
 const SECRET_SHAPE = /oa_(?:pat|mac)_/;
+// Base64 split across lines is not reassembled (Playwright writes the embedded
+// zip on one line today); a split blob is scanned only in pieces.
 const BLOB = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
 const MAX_DEPTH = 6;
 
@@ -538,7 +555,12 @@ function scanBytes(b: Buffer, lit: readonly string[], depth: number): void {
   if (depth > MAX_DEPTH) throw new Error("scan: nested too deep");
   if (b.length >= 4 && b.readUInt32LE(0) === 0x04034b50) {
     // A zip: every entry, which may itself be a zip or hold base64.
-    for (const e of readZip(b)) scanBytes(e.data, lit, depth + 1);
+    // An image or video inside a zip can't be inspected for on-screen values:
+    // fail closed (the file holding the zip is dropped).
+    for (const e of readZip(b)) {
+      if (MEDIA.test(e.name)) throw new Error("scan: media inside a zip");
+      scanBytes(e.data, lit, depth + 1);
+    }
     return;
   }
   for (const l of lit) if (l && b.includes(l)) throw new Hit("hit");
