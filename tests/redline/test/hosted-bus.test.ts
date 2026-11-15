@@ -215,6 +215,10 @@ function suspendIo(
     suspendFails?: boolean;
     resumeFails?: boolean;
     reopenStatus?: number;
+    /** The reopen answers 503 until this many ms after the resume (then reopenStatus or 101). */
+    reopen503UntilMs?: number;
+    reopenBody?: string;
+    reopenRetryAfter?: string;
     redelivered?: boolean;
     /** The hub after the resume: "same" (default), "changed" or "gone" (ours missing). */
     hubAfter?: "same" | "changed" | "gone";
@@ -225,6 +229,7 @@ function suspendIo(
   const log: string[] = [];
   const reconnectsAt: number[] = [];
   let doneAt: number | null = null;
+  let resumedAt: number | null = null;
   let closedAt: number | null = null;
   let resolveClosed!: () => void;
   const closed = new Promise<void>((r) => {
@@ -281,6 +286,7 @@ function suspendIo(
     resume: async () => {
       log.push("resume");
       if (o.resumeFails) throw new ProbeFail("rl-busb resume: job failed");
+      resumedAt = t.now;
     },
     reconnect: async () => {
       reconnectsAt.push(since());
@@ -291,9 +297,21 @@ function suspendIo(
     },
     reopen: async (id) => {
       log.push(`reopen ${id}`);
+      if (
+        o.reopen503UntilMs !== undefined &&
+        resumedAt !== null &&
+        t.now - resumedAt < o.reopen503UntilMs
+      )
+        return {
+          status: 503,
+          redelivered: false,
+          body: o.reopenBody ?? '{"error":"unavailable"}',
+          retryAfter: o.reopenRetryAfter ?? null,
+        };
       return {
         status: o.reopenStatus ?? 101,
         redelivered: o.redelivered ?? true,
+        body: o.reopenBody,
       };
     },
     hub: async () => {
@@ -422,6 +440,49 @@ describe("case 2: suspend rl-busb", () => {
     await expect(
       suspendCase(suspendIo({ resumeFails: true }), PAIR),
     ).rejects.toThrow(/resume: job failed/);
+  });
+
+  it("retries a 503 after the resume and passes on the 101, noting each answer", async () => {
+    const io = suspendIo({
+      reopen503UntilMs: 2_500,
+      reopenBody: "x".repeat(300),
+      reopenRetryAfter: "2",
+    });
+    const r = await suspendCase(io, PAIR);
+    expect(io.log.filter((l) => l.startsWith("reopen"))).toHaveLength(3);
+    expect(r.resumeNotes).toEqual([
+      `503 0 ms after the resume, Retry-After 2, body '${"x".repeat(200)}'`,
+      `503 2000 ms after the resume, Retry-After 2, body '${"x".repeat(200)}'`,
+      "101 4000 ms after the resume",
+    ]);
+  });
+
+  it("caps one wait at 10 s and waits 1 s without Retry-After", async () => {
+    const io = suspendIo({ reopen503UntilMs: 3_000, reopenRetryAfter: "99" });
+    expect((await suspendCase(io, PAIR)).resumeNotes).toEqual([
+      '503 0 ms after the resume, Retry-After 99, body \'{"error":"unavailable"}\'',
+      "101 10000 ms after the resume",
+    ]);
+    const r = await suspendCase(suspendIo({ reopen503UntilMs: 2_500 }), PAIR);
+    expect(r.resumeNotes.at(-1)).toBe("101 3000 ms after the resume");
+  });
+
+  it("fails when the 503 lasts 61 s, naming the body", async () => {
+    const io = suspendIo({
+      reopen503UntilMs: 61_000,
+      reopenBody: '{"error":"workspace_waking"}',
+    });
+    await expect(suspendCase(io, PAIR)).rejects.toThrow(
+      /503 for 60 s, want 101.*body '\{"error":"workspace_waking"\}'/,
+    );
+  });
+
+  it("fails at once on a 500 after the resume", async () => {
+    const io = suspendIo({ reopenStatus: 500, reopenBody: "boom" });
+    await expect(suspendCase(io, PAIR)).rejects.toThrow(
+      /with 500, want 101.*body 'boom'/,
+    );
+    expect(io.log.filter((l) => l.startsWith("reopen"))).toHaveLength(1);
   });
 
   it.each<[string, Parameters<typeof suspendIo>[0], RegExp]>([
