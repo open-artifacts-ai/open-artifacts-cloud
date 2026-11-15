@@ -13,6 +13,7 @@ import {
   GATE_WORKFLOWS,
   gateRefusal,
   type Input,
+  isChainProdDeploy,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -483,6 +484,8 @@ const fake = (
     busyStatus?: string;
     prodDone?: boolean;
     junkCount?: boolean;
+    deployTitles?: string[];
+    deepDeploy?: boolean;
     tagSha?: string;
   } = {},
 ) => {
@@ -496,17 +499,32 @@ const fake = (
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
     const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
     if (wr) {
-      expect(a).toMatch(/per_page=(1|20)\b/);
-      expect(a).toContain("--jq");
-      if (wr[1] === "deploy-hosted-platform.yml" && wr[2] === "success")
-        return ok(
-          JSON.stringify([
-            "deploy-hosted-platform staging v0.182.0",
-            ...(o.prodDone === false
-              ? []
-              : ["deploy-hosted-platform prod v0.181.0"]),
-          ]),
-        );
+      if (wr[2] !== "success") {
+        expect(a).toMatch(/per_page=1\b/);
+        expect(a).toContain("--jq");
+      }
+      if (wr[1] === "deploy-hosted-platform.yml" && wr[2] === "success") {
+        const page = Number(/&page=(\d+)/.exec(a)?.[1]);
+        expect(a).toMatch(/per_page=100\b/);
+        expect(a).toContain("--jq");
+        if (o.junkCount) return ok("oops");
+        const t = o.deployTitles ?? [
+          "deploy-hosted-platform prod v0.181.0 [c43692402507-1]",
+        ];
+        if (o.prodDone === false)
+          return ok(
+            JSON.stringify({
+              n: 3,
+              t: ["deploy-hosted-platform prod v0.180.0 [c1-1]"],
+            }),
+          );
+        // A long history: the pin's deploy sits on page 3.
+        if (o.deepDeploy)
+          return ok(
+            JSON.stringify(page === 3 ? { n: 100, t } : { n: 100, t: [] }),
+          );
+        return ok(JSON.stringify({ n: 5, t }));
+      }
       if (o.junkCount) return ok("oops");
       return ok(
         o.busy === wr[1] && (o.busyStatus ?? "in_progress") === wr[2]
@@ -803,7 +821,97 @@ describe("gateRefusal", () => {
   });
 });
 
+describe("isChainProdDeploy", () => {
+  it("counts the chain's run of exactly that tag", () => {
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.183.0 [c43692402507-1]",
+        "v0.183.0",
+      ),
+    ).toBe(true);
+  });
+  it("never matches a bare prefix of a longer tag", () => {
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.184.0 [c43692402507-1]",
+        "v0.18.0",
+      ),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.18.0 [c1-1]",
+        "v0.18.0",
+      ),
+    ).toBe(true);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.18.04 [c1-1]",
+        "v0.18.0",
+      ),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.1840.0 [c1-1]",
+        "v0.184.0",
+      ),
+    ).toBe(false);
+  });
+  it("does not count a run without a chain id (manual or partial), or another env", () => {
+    expect(
+      isChainProdDeploy("deploy-hosted-platform prod v0.183.0", "v0.183.0"),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.183.0 [manual]",
+        "v0.183.0",
+      ),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.183.0 [c1-1] extra",
+        "v0.183.0",
+      ),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform staging v0.183.0 [c1-1]",
+        "v0.183.0",
+      ),
+    ).toBe(false);
+    expect(
+      isChainProdDeploy(
+        "deploy-hosted-platform prod v0.183.0 [c1-1",
+        "v0.183.0",
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("the release gate in run", () => {
+  it("finds the pin's deploy on a later page, and fails closed past the cap", () => {
+    expect(go("arm", fake({ deepDeploy: true })).armed).toEqual([7]);
+    const none = go(
+      "arm",
+      fake({
+        deepDeploy: true,
+        deployTitles: [
+          "deploy-hosted-platform prod v0.181.0 [c1-1]".replace(
+            "v0.181.0",
+            "v0.1.0",
+          ),
+        ],
+      }),
+    );
+    expect(none.armed).toEqual([]);
+    expect(none.logs.join("\n")).toMatch(/no successful prod deploy/);
+  });
+  it("a manual prod deploy of the pin without a chain id does not count", () => {
+    const r = go(
+      "arm",
+      fake({ deployTitles: ["deploy-hosted-platform prod v0.181.0"] }),
+    );
+    expect(r.armed).toEqual([]);
+  });
   it("names the five workflows", () => {
     expect(GATE_WORKFLOWS).toEqual([
       "hosted-publish.yml",
@@ -854,9 +962,10 @@ describe("the release gate in run", () => {
       .map((c) => c.join(" "))
       .filter((c) => c.includes("/actions/workflows/"));
     expect(reads.length).toBe(GATE_WORKFLOWS.length * 2 + 1);
+    expect(reads.filter((c) => c.includes("per_page=100")).length).toBe(1);
     for (const c of reads) {
       expect(c).toContain("--jq");
-      expect(Number(/per_page=(\d+)/.exec(c)?.[1])).toBeLessThanOrEqual(20);
+      expect(Number(/per_page=(\d+)/.exec(c)?.[1])).toBeLessThanOrEqual(100);
     }
   });
   it("the real exec has room for 16 MiB of output", () => {

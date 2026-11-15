@@ -199,10 +199,26 @@ export const GATE_WORKFLOWS = [
   "prod-release-chain.yml",
 ];
 export const PROD_DEPLOY_WORKFLOW = "deploy-hosted-platform.yml";
+export const PROD_TITLE = "deploy-hosted-platform prod ";
+/** Pages of 100 successful dispatched deploy runs to look through for the pin's prod deploy. */
+export const DEPLOY_PAGES = 5;
+/**
+ * A full prod deploy of `tag`: the chain's run (prod-release-chain dispatches the
+ * full target list, verify_only false, and puts its id in the run-name):
+ * `deploy-hosted-platform prod vX.Y.Z [c<digits>-<n>]`. A title without the chain id
+ * (a manual or partial run) never counts, and the tag must match whole: v0.18.0 is
+ * not v0.18.0x, and a prefix of a longer tag never matches.
+ */
+export function isChainProdDeploy(title: string, tag: string): boolean {
+  const head = `${PROD_TITLE}${tag} [`;
+  return (
+    title.startsWith(head) && /^c\d+-\d+\]$/.test(title.slice(head.length))
+  );
+}
 export type Gate = {
   /** Gate workflows with a queued or in_progress run. */
   busy: string[];
-  /** A successful prod deploy-hosted-platform run exists for main's current pin tag. */
+  /** A successful full prod deploy (the chain's run) exists for main's current pin tag. */
   prodDeployed: boolean;
   /** main's current PUBLIC_PIN tag. */
   mainTag: string;
@@ -420,18 +436,28 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
       if (!Number.isInteger(n)) throw new Error(`no count for ${wf} ${status}`);
       if (n > 0 && !busy.includes(wf)) busy.push(wf);
     }
-  const titles = JSON.parse(
-    gh(exec, [
-      "api",
-      `repos/${repo}/actions/workflows/${PROD_DEPLOY_WORKFLOW}/runs?status=success&per_page=20`,
-      "--jq",
-      "[.workflow_runs[].display_title]",
-    ]),
-  ) as string[];
+  // The API cannot filter by title, so page through the successful dispatched runs
+  // (--jq keeps each page small) until main's pin tag shows up, up to a cap. Not
+  // found within the cap means not deployed (fail closed).
+  let prodDeployed = false;
+  for (let page = 1; page <= DEPLOY_PAGES && !prodDeployed; page++) {
+    const r = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/workflows/${PROD_DEPLOY_WORKFLOW}/runs?status=success&event=workflow_dispatch&per_page=100&page=${page}`,
+        "--jq",
+        `{n: (.workflow_runs | length), t: [.workflow_runs[].display_title | select(startswith("${PROD_TITLE}"))]}`,
+      ]),
+    ) as { n: number; t: string[] };
+    if (!Array.isArray(r.t) || !Number.isInteger(r.n))
+      throw new Error("unreadable deploy runs");
+    prodDeployed = r.t.some((t) => isChainProdDeploy(t, mainTag));
+    if (r.n < 100) break;
+  }
   return {
     busy,
     mainTag,
-    prodDeployed: titles.includes(`deploy-hosted-platform prod ${mainTag}`),
+    prodDeployed,
   };
 }
 
@@ -505,6 +531,9 @@ export function run(o: {
       continue;
     }
     if (!ours) continue;
+    // A busy pipeline never lands here: an already-armed bump is not disarmed
+    // when the pipeline turns busy (arming queues it at once; the gate only
+    // holds back arming).
     // Armed by this bot but not provably pin-only and green (an armed PR reads
     // "already armed" in decide, so judge it as if unarmed).
     const again = input ? decide({ ...input, armed: false }) : d;
