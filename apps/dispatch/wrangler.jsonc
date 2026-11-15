@@ -36,7 +36,15 @@
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-s-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
-        { "binding": "BILLING", "service": "oa-s-billing" }
+        { "binding": "BILLING", "service": "oa-s-billing" },
+        // A login-domain change through LoginGate on LOGIN (#2520): STAGING
+        // ONLY, provisioning's LoginChangeGate entrypoint (not its internet
+        // fetch). oa-s-provisioning must be deployed first.
+        {
+          "binding": "LOGIN",
+          "service": "oa-s-provisioning",
+          "entrypoint": "LoginChangeGate"
+        }
       ],
       "observability": {
         "enabled": true,

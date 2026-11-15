@@ -5,6 +5,7 @@ export * from "./direct-fetch.js";
 export * from "./gate.js";
 export * from "./metadata.js";
 export * from "./names.js";
+export * from "./owner-vars.js";
 export * from "./platform.js";
 export * from "./publish.js";
 export * from "./r2s3.js";

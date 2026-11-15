@@ -689,7 +689,14 @@ case "$target" in
     got="$(jq -c '[.result.bindings[] | select(.type == "ratelimit") | {name, namespace_id: (.namespace_id | tostring), limit: .simple.limit, period: .simple.period}] | sort_by(.name)' <<< "$S")"
     [ "$got" = "$want" ] || { echo "rate limits: got $got, want $want" >&2; exit 1; }
     billing_bound "$S" provisioning BillingOperatorRpc
-    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end)) | sort | join(",")' <<< "$want")"
+    # The install registry (#2520), read-only: required only when the tag's
+    # env block declares it (an older tag has none).
+    REG_DECLARED=""
+    if grep -q "{{BROKER_REGISTRY_ID_$(tr a-z A-Z <<< "$env")}}" "$root/apps/provisioning/wrangler.jsonc"; then
+      REG_DECLARED=1
+      expect "$S" '.result.bindings[] | select(.name == "BROKER_REGISTRY") | .namespace_id' "$BROKER_REGISTRY_ID" "BROKER_REGISTRY"
+    fi
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" --arg r "${REG_DECLARED:+BROKER_REGISTRY}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end) + (if $r == "" then [] else [$r] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }

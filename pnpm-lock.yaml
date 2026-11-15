@@ -501,6 +501,9 @@ importers:
       '@oa/auth-core':
         specifier: workspace:*
         version: link:../../packages/auth-core
+      '@oa/broker-core':
+        specifier: workspace:*
+        version: link:../../packages/broker-core
       '@oa/gh-oidc':
         specifier: workspace:*
         version: link:../../packages/gh-oidc

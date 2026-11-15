@@ -15,15 +15,25 @@ import {
   type Env as OaEnv,
   parseHostsValue,
 } from "@oa/provision/names";
+import {
+  type LoginGateEnv,
+  type LoginGateProps,
+  loginProps,
+} from "./login-gate.js";
 import { unavailable } from "./unavailable.js";
 
 // And its only path to the tier store (see @oa/broker-core/billing-gate).
 export { BillingGate } from "@oa/broker-core/billing-gate";
 // The install's only path to the brokers (see @oa/broker-core/gate).
 export { BrokerGate } from "@oa/broker-core/gate";
+// And its only path to a login-domain change (see ./login-gate).
+export { LoginGate } from "./login-gate.js";
 export { CLOSED_COPY, PAUSED_COPY } from "./unavailable.js";
 
-export interface Env extends BrokerGateEnv, Partial<BillingGateEnv> {
+export interface Env
+  extends BrokerGateEnv,
+    Partial<BillingGateEnv>,
+    Partial<LoginGateEnv> {
   DISPATCHER: DispatchNamespace;
   /**
    * host -> HOSTS value (`<id>`, `paused:<id>` or `closed:<id>`), written by
@@ -82,6 +92,7 @@ const category = (e: unknown) =>
 interface GateExports {
   BrokerGate: (o: { props: BrokerGateProps }) => Fetcher;
   BillingGate: (o: { props: BillingGateProps }) => Fetcher;
+  LoginGate: (o: { props: LoginGateProps }) => Fetcher;
 }
 
 export default {
@@ -114,6 +125,7 @@ export default {
       const props = {
         ...brokerProps(gates, id),
         ...billingProps(gates, id, appHost, env),
+        ...loginProps(gates, id, env),
       };
       return await env.DISPATCHER.get(names(id, env.OA_ENV).script, {
         props,

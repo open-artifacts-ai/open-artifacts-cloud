@@ -41,6 +41,7 @@ import {
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
 import { codeOf } from "./errors.js";
+import { checkLoginJob, isLoginJob, loginRedeploy } from "./login-change.js";
 import {
   dropCopyKeySettled,
   leftKeyOpen,
@@ -136,6 +137,8 @@ export type ManageJob = {
   };
   /** update: R29's mode or R30's copy (#1008). */
   oauth?: OAuthJob;
+  /** update: an instance's login-domain change (#2520), the platform's own job. */
+  login?: boolean;
   /** upgrade, rollback: the install is already on `to`; nothing to do. */
   already?: boolean;
   /** purge: the skip reason for the directory revoke, if any. */
@@ -443,7 +446,11 @@ async function operate(
       await redlineCreds(ctx, step, jobId, job);
       break;
     case "update":
-      if (job.oauth?.op === "set")
+      if (job.login)
+        await s("redeploy", MANAGE_UPLOAD_STEP, () =>
+          loginRedeploy(ctx, job, labelOf(job)),
+        );
+      else if (job.oauth?.op === "set")
         await setOAuthStore(ctx, step, job, labelOf(job), job.oauth.mode);
       else await oauthCopy(ctx, step, job, labelOf(job));
       break;
@@ -830,6 +837,13 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       out.args = redlineCredsJobArgs(redlineArgs(job));
       break;
     case "update": {
+      // #2520: an instance's login change is the platform's own job, with
+      // exactly { login: true } and vars that still pass the login schema.
+      if (job.actor_kind === "system" && isLoginJob(args)) {
+        await checkLoginJob(ctx, job, job.install_id, st.source, out.testHooks);
+        out.login = true;
+        break;
+      }
       // Admin MCP only (AUTHZ R29, R30): the row's token is an OAuth grant.
       if (!(await oauthGrant(ctx, job)))
         throw refused("update needs an OAuth grant");
@@ -878,6 +892,15 @@ async function checkKind(
     )
       return;
   }
+  // #2520: the platform's own login change is an `update` from active, as the
+  // system actor (TRANSITIONS lists T only, and is public).
+  if (
+    kind === "update" &&
+    job.actor_kind === "system" &&
+    st.state === "active" &&
+    isLoginJob(argsOf(job))
+  )
+    return;
   checkTransition(st.state, kind, job);
 }
 

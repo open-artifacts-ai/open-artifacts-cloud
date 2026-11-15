@@ -5,14 +5,17 @@
 // and for a create parses signups.vars with a strict schema. Any mismatch is
 // `invalid_state`, terminal.
 import type { NonRetryableError } from "cloudflare:workflows";
-import { type Env as DeployEnv, STAGING_TEST_DOMAIN } from "@oa/provision";
+import {
+  type Env as DeployEnv,
+  OwnerVarsRefusal,
+  ownerVars,
+} from "@oa/provision";
 import {
   canTransition,
   type InstallState,
   type JobKind,
   slugError,
   TEST_MEMBER,
-  TierSchema,
   type TransitionActor,
   type TransitionFrom,
   testMemberOwns,
@@ -126,18 +129,10 @@ export function checkJob(
   return job;
 }
 
-const PROVIDERS = new Set(["google", "email"]);
-const DOMAIN = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/;
-
 /**
- * signups.vars under the strict schema (2.5 item 3): exactly AUTH_PROVIDERS,
- * AUTH_DOMAINS, TIER, TEST_DOMAIN (equal to STAGING_TEST_DOMAIN) only on a
- * staging test-hook row, and EMAIL_CODE_DOMAIN=on only on an admin create with
- * email, no google and a domain (#1088). Self-serve also needs TIER = SELF_SERVE_TIER,
- * providers exactly google, or google and email (guest codes), and at most one domain (with google, at most
- * one: a personal Google account has none). Google with no domain is fine for
- * either source (#2520): owner and invites only. Returns the vars create renders: AUTH_DOMAIN_JOIN=invite forced,
- * an empty AUTH_DOMAINS dropped.
+ * signups.vars under the strict schema (2.5 item 3), @oa/provision's
+ * ownerVars: its refusals become the step's. `login` is a login change's
+ * resulting vars (#2520); a create never passes it.
  */
 export function strictVars(
   raw: string,
@@ -146,73 +141,18 @@ export function strictVars(
     selfServeTier: string;
     testHooks: boolean;
     env: DeployEnv;
+    login?: boolean;
   },
 ): Record<string, string> {
-  let v: unknown;
   try {
-    v = JSON.parse(raw);
-  } catch {
-    throw refused("vars are not JSON");
+    return ownerVars(raw, o);
+  } catch (e) {
+    if (e instanceof OwnerVarsRefusal)
+      throw e.code === "domain_codes_refused"
+        ? new StepRefusal("domain_codes_refused", e.why)
+        : refused(e.why);
+    throw e;
   }
-  if (!v || typeof v !== "object" || Array.isArray(v))
-    throw refused("vars are not an object");
-  const vars = v as Record<string, unknown>;
-  const allowed = ["AUTH_PROVIDERS", "AUTH_DOMAINS", "TIER"];
-  if (o.testHooks) allowed.push("TEST_DOMAIN");
-  for (const k of Object.keys(vars))
-    if (!allowed.includes(k) && k !== "EMAIL_CODE_DOMAIN")
-      throw refused(`var ${k.slice(0, 40)} is not allowed`);
-  for (const k of allowed)
-    if (typeof vars[k] !== "string") throw refused(`var ${k} is missing`);
-  const providers = (vars.AUTH_PROVIDERS as string).split(",");
-  if (
-    providers.length === 0 ||
-    providers.length > 2 ||
-    new Set(providers).size !== providers.length ||
-    !providers.every((p) => PROVIDERS.has(p))
-  )
-    throw refused("AUTH_PROVIDERS is not a provider list");
-  const domains =
-    vars.AUTH_DOMAINS === "" ? [] : (vars.AUTH_DOMAINS as string).split(",");
-  if (domains.length > 50 || !domains.every((d) => DOMAIN.test(d)))
-    throw refused("AUTH_DOMAINS is not a domain list");
-  const codes = vars.EMAIL_CODE_DOMAIN;
-  if (codes !== undefined && (codes !== "on" || o.source !== "admin"))
-    throw refused("EMAIL_CODE_DOMAIN is not allowed here");
-  if (
-    codes !== undefined &&
-    (!providers.includes("email") ||
-      providers.includes("google") ||
-      domains.length === 0)
-  )
-    throw new StepRefusal(
-      "domain_codes_refused",
-      "EMAIL_CODE_DOMAIN=on needs email, no google and a domain",
-    );
-  const tier = TierSchema.safeParse(vars.TIER);
-  if (!tier.success) throw refused("TIER is not a tier");
-  if (o.testHooks) {
-    if (o.env !== "staging") throw refused("test hooks are staging only");
-    if (vars.TEST_DOMAIN !== STAGING_TEST_DOMAIN)
-      throw refused("TEST_DOMAIN is not the staging test domain");
-  }
-  if (o.source === "self-serve") {
-    if (tier.data !== o.selfServeTier)
-      throw refused("a self-serve TIER must be SELF_SERVE_TIER");
-    // google only (rows queued before guest codes) or google and email.
-    const set = [...providers].sort().join(",");
-    if (set !== "google" && set !== "email,google")
-      throw refused("self-serve providers must be google, or google and email");
-    if (domains.length > 1) throw refused("self-serve has at most one domain");
-  }
-  return {
-    AUTH_PROVIDERS: providers.join(","),
-    ...(domains.length > 0 ? { AUTH_DOMAINS: domains.join(",") } : {}),
-    AUTH_DOMAIN_JOIN: "invite",
-    TIER: tier.data,
-    ...(codes === undefined ? {} : { EMAIL_CODE_DOMAIN: "on" }),
-    ...(o.testHooks ? { TEST_DOMAIN: STAGING_TEST_DOMAIN } : {}),
-  };
 }
 
 /** A stored slug is still a valid, unreserved one. */

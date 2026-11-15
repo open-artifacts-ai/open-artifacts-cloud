@@ -54,6 +54,9 @@
         "APP_DOMAIN": "open-artifacts-staging.app",
         "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_STAGING}}",
         "SELF_SERVE_TIER": "trial",
+        // An instance's login-domain change (#2520): "1" on, anything else
+        // its plain 404. Staging only for now.
+        "LOGIN_CHANGE": "1",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_STAGING}}",
@@ -194,6 +197,12 @@
         {
           "binding": "OAUTH_KV",
           "id": "{{PROVISIONING_OAUTH_KV_ID_STAGING}}"
+        },
+        // The install registry, read-only: the keys a login change's signature
+        // is checked against (#2520). STAGING ONLY; prod has none yet.
+        {
+          "binding": "BROKER_REGISTRY",
+          "id": "{{BROKER_REGISTRY_ID_STAGING}}"
         }
       ]
     },
@@ -224,6 +233,9 @@
         // false while they got invite.
         "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_PROD}}",
         "SELF_SERVE_TIER": "trial",
+        // An instance's login-domain change (#2520): off on prod until its
+        // red-line case has passed on staging.
+        "LOGIN_CHANGE": "0",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
