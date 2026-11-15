@@ -1099,19 +1099,28 @@ describe("workflow", () => {
     expect(wf.concurrency["cancel-in-progress"]).toBe(false);
     expect(wf.permissions).toEqual({});
   });
-  it("mints the App token only after the plan, only for the arm step, and never runs the PR's code", () => {
-    const steps = wf.jobs.arm.steps as {
+  it("plans read-only with no environment, then mints the App token only in the arm job, and never runs the PR's code", () => {
+    type Step = {
       id?: string;
       name?: string;
       if?: string;
       uses?: string;
       with?: Record<string, string>;
-    }[];
+    };
+    const planJob = wf.jobs.plan;
+    const armJob = wf.jobs.arm;
+    expect(planJob.environment).toBeUndefined();
+    expect(planJob.outputs.write).toBe("${{ steps.plan.outputs.write }}");
+    expect(JSON.stringify(planJob)).not.toMatch(
+      /create-github-app-token|RELEASE_APP/,
+    );
+    expect(armJob.needs).toBe("plan");
+    expect(armJob.if).toContain("needs.plan.outputs.write == 'true'");
+    expect(armJob.environment).toBe("release-app");
+    const steps = armJob.steps as Step[];
     const ids = steps.map((s) => s.id ?? s.name);
-    expect(ids.indexOf("plan")).toBeLessThan(ids.indexOf("app"));
     expect(ids.indexOf("app")).toBeLessThan(ids.indexOf("Arm"));
     const app = steps.find((s) => s.id === "app")!;
-    expect(app.if).toContain("steps.plan.outputs.write == 'true'");
     expect(app.uses).toMatch(/^actions\/create-github-app-token@[0-9a-f]{40}$/);
     expect(app.with?.["permission-pull-requests"]).toBe("write");
     expect(text).not.toMatch(/github\.head_ref\s*\}\}|head_sha/);
@@ -1122,27 +1131,26 @@ describe("workflow", () => {
       "reopened",
       "synchronize",
     ]);
-    const checkouts = steps.filter((s) =>
-      s.uses?.startsWith("actions/checkout@"),
-    );
-    expect(checkouts).toHaveLength(1);
-    expect(checkouts[0]?.with).toMatchObject({
-      ref: "${{ github.event.repository.default_branch }}",
-      "persist-credentials": false,
-    });
-    const runs = JSON.stringify(wf.jobs.arm.steps);
-    expect(runs).not.toMatch(
-      /pull_request\.head|head_ref\}|github\.event\.pull_request|merge_commit/,
-    );
-    expect(
-      wf.jobs.arm.steps.some((s: { uses?: string }) =>
-        /pnpm|install/.test(s.uses ?? ""),
-      ),
-    ).toBe(false);
-    expect(runs).not.toMatch(/pnpm|npm (ci|install)/);
-    expect(steps[0]?.with).toMatchObject({
-      ref: "${{ github.event.repository.default_branch }}",
-    });
-    expect(wf.jobs.arm.permissions["pull-requests"]).toBe("read");
+    for (const job of [planJob, armJob]) {
+      const js = job.steps as Step[];
+      const checkouts = js.filter((s) =>
+        s.uses?.startsWith("actions/checkout@"),
+      );
+      expect(checkouts).toHaveLength(1);
+      expect(checkouts[0]?.with).toMatchObject({
+        ref: "${{ github.event.repository.default_branch }}",
+        "persist-credentials": false,
+      });
+      expect(js[0]?.with).toMatchObject({
+        ref: "${{ github.event.repository.default_branch }}",
+      });
+      const runs = JSON.stringify(js);
+      expect(runs).not.toMatch(
+        /pull_request\.head|head_ref\}|github\.event\.pull_request|merge_commit/,
+      );
+      expect(runs).not.toMatch(/pnpm|npm (ci|install)/);
+      expect(js.some((s) => /pnpm|install/.test(s.uses ?? ""))).toBe(false);
+    }
+    expect(planJob.permissions["pull-requests"]).toBe("read");
   });
 });
