@@ -113,8 +113,12 @@ const edit = (f: (s: any) => void) => {
 };
 const sleeps = (r: { calls: string[] }) =>
   r.calls.filter((c) => c === "sleep 60").length;
-const running = (sha: string, status: string, conclusion: string | null = null, extra = {}) =>
-  runOf(77, sha, { status, conclusion, ...extra });
+const running = (
+  sha: string,
+  status: string,
+  conclusion: string | null = null,
+  extra = {},
+) => runOf(77, sha, { status, conclusion, ...extra });
 
 describe("tag-ci-green.sh", () => {
   it("proceeds when cloud CI and public CI are green, reading only", () => {
@@ -122,7 +126,9 @@ describe("tag-ci-green.sh", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("passed cloud CI and public CI");
     expect(
-      r.calls.every((c) => c.startsWith("gh api -X GET") || c.startsWith("sleep")),
+      r.calls.every(
+        (c) => c.startsWith("gh api -X GET") || c.startsWith("sleep"),
+      ),
     ).toBe(true);
   });
 
@@ -136,7 +142,9 @@ describe("tag-ci-green.sh", () => {
     });
     expect(run(annotated).code).toBe(0);
     const calls = run(annotated).calls;
-    expect(calls.some((c) => c.includes(`git/tags/${"9".repeat(40)}`))).toBe(true);
+    expect(calls.some((c) => c.includes(`git/tags/${"9".repeat(40)}`))).toBe(
+      true,
+    );
     // A ref that is not a commit (a tag of a tree) or does not resolve: refuse.
     for (const bad of [
       { object: { type: "tree", sha: SHA } },
@@ -144,14 +152,22 @@ describe("tag-ci-green.sh", () => {
       "not json",
       undefined,
     ]) {
-      const r2 = run(edit((s) => { s.ref = bad; }));
+      const r2 = run(
+        edit((s) => {
+          s.ref = bad;
+        }),
+      );
       expect(r2.code, JSON.stringify(bad)).toBe(1);
     }
   });
 
   it("refuses at once a cloud run that completed red or cancelled, without waiting", () => {
     for (const conclusion of ["failure", "cancelled", "timed_out"]) {
-      const r = run(edit((s) => { s.runs = running(SHA, "completed", conclusion); }));
+      const r = run(
+        edit((s) => {
+          s.runs = running(SHA, "completed", conclusion);
+        }),
+      );
       expect(r.code, conclusion).toBe(1);
       expect(r.err).toContain(`cloud CI run 77 for ${SHA}: ${conclusion}`);
       expect(sleeps(r)).toBe(0);
@@ -185,7 +201,9 @@ describe("tag-ci-green.sh", () => {
     late["runs-2"] = { workflow_runs: [] };
     late["runs-3"] = runOf(77, SHA);
     expect(run(late).code).toBe(0);
-    const never = edit((s) => { s.runs = { workflow_runs: [] }; });
+    const never = edit((s) => {
+      s.runs = { workflow_runs: [] };
+    });
     const r = run(never);
     expect(r.code).toBe(1);
     expect(r.err).toContain("no cloud CI push/merge-queue run");
@@ -193,7 +211,11 @@ describe("tag-ci-green.sh", () => {
   });
 
   it("refuses when the run is still going at the cap", () => {
-    const r = run(edit((s) => { s.runs = running(SHA, "in_progress"); }));
+    const r = run(
+      edit((s) => {
+        s.runs = running(SHA, "in_progress");
+      }),
+    );
     expect(r.code).toBe(1);
     expect(r.err).toContain("still in_progress after 180s");
     expect(sleeps(r)).toBe(3);
@@ -209,42 +231,79 @@ describe("tag-ci-green.sh", () => {
   it("refuses when a required job is red, missing, skipped or duplicated", () => {
     for (const name of JOBS) {
       for (const conclusion of ["failure", "skipped"]) {
-        const r = run(edit((s) => {
-          s.jobs.jobs.find((j: { name: string }) => j.name === name).conclusion = conclusion;
-        }));
+        const r = run(
+          edit((s) => {
+            s.jobs.jobs.find(
+              (j: { name: string }) => j.name === name,
+            ).conclusion = conclusion;
+          }),
+        );
         expect(r.code, `${name} ${conclusion}`).toBe(1);
         expect(r.err).toContain(`job ${name}: ${conclusion}`);
       }
-      const gone = run(edit((s) => {
-        s.jobs.jobs = s.jobs.jobs.filter((j: { name: string }) => j.name !== name);
-        s.jobs.total_count = JOBS.length - 1;
-      }));
+      const gone = run(
+        edit((s) => {
+          s.jobs.jobs = s.jobs.jobs.filter(
+            (j: { name: string }) => j.name !== name,
+          );
+          s.jobs.total_count = JOBS.length - 1;
+        }),
+      );
       expect(gone.code, `${name} missing`).toBe(1);
       expect(gone.err).toContain(`job ${name}: missing`);
     }
-    const dup = run(edit((s) => {
-      s.jobs.jobs.push({ name: "lint", status: "completed", conclusion: "success" });
-      s.jobs.total_count = JOBS.length + 1;
-    }));
+    const dup = run(
+      edit((s) => {
+        s.jobs.jobs.push({
+          name: "lint",
+          status: "completed",
+          conclusion: "success",
+        });
+        s.jobs.total_count = JOBS.length + 1;
+      }),
+    );
     expect(dup.code).toBe(1);
     expect(dup.err).toContain("job lint: missing");
   });
 
   it("refuses a commit that is not on main", () => {
-    const r = run(edit((s) => { s.compare.status = "diverged"; }));
+    const r = run(
+      edit((s) => {
+        s.compare.status = "diverged";
+      }),
+    );
     expect(r.code).toBe(1);
     expect(r.err).toContain("is not on main");
   });
 
   it("fails closed on an unreadable or unparsable answer, whichever call it is", () => {
-    for (const k of ["ref", "compare", "runs", "jobs", "pub-runs", "pub-jobs"]) {
-      const gone = run(edit((s) => { s[k] = undefined; }));
+    for (const k of [
+      "ref",
+      "compare",
+      "runs",
+      "jobs",
+      "pub-runs",
+      "pub-jobs",
+    ]) {
+      const gone = run(
+        edit((s) => {
+          s[k] = undefined;
+        }),
+      );
       expect(gone.code, `${k} missing`).toBe(1);
       expect(gone.err).toContain("CI guard failed");
-      const junk = run(edit((s) => { s[k] = "not json"; }));
+      const junk = run(
+        edit((s) => {
+          s[k] = "not json";
+        }),
+      );
       expect(junk.code, `${k} junk`).toBe(1);
     }
-    const paged = run(edit((s) => { s.jobs.total_count = 150; }));
+    const paged = run(
+      edit((s) => {
+        s.jobs.total_count = 150;
+      }),
+    );
     expect(paged.code).toBe(1);
     expect(paged.err).toContain("more than one page");
   });
@@ -258,14 +317,22 @@ describe("tag-ci-green.sh", () => {
   describe("merge-queue tree match", () => {
     const MG_HEAD = "a".repeat(40);
     const TREE = "b".repeat(40);
-    const mg = (over: { tree?: string; conclusion?: string; jobRed?: boolean } = {}) => {
+    const mg = (
+      over: { tree?: string; conclusion?: string; jobRed?: boolean } = {},
+    ) => {
       const s = good();
       s.runs = running(SHA, "in_progress"); // the push run is still going
       s.gitcommit = { tree: { sha: TREE } };
       s[`gitcommit-${MG_HEAD}`] = { tree: { sha: over.tree ?? TREE } };
       s.mgruns = {
         workflow_runs: [
-          { id: 88, head_sha: MG_HEAD, event: "merge_group", status: "completed", conclusion: over.conclusion ?? "success" },
+          {
+            id: 88,
+            head_sha: MG_HEAD,
+            event: "merge_group",
+            status: "completed",
+            conclusion: over.conclusion ?? "success",
+          },
         ],
       };
       const j = jobsOf(JOBS);
@@ -312,39 +379,75 @@ describe("tag-ci-green.sh", () => {
   describe("M1: public CI on the exact PUBLIC_PIN sha", () => {
     it("reads the pin at the tag's commit and checks that sha in the public repo", () => {
       const r = run(good());
-      expect(r.calls.some((c) => c.includes(`contents/PUBLIC_PIN?ref=${SHA}`))).toBe(true);
-      expect(r.calls.some((c) => c.includes(`repos/${PUB}/actions/workflows/ci.yml/runs`) && c.includes(`head_sha=${PSHA}`))).toBe(true);
+      expect(
+        r.calls.some((c) => c.includes(`contents/PUBLIC_PIN?ref=${SHA}`)),
+      ).toBe(true);
+      expect(
+        r.calls.some(
+          (c) =>
+            c.includes(`repos/${PUB}/actions/workflows/ci.yml/runs`) &&
+            c.includes(`head_sha=${PSHA}`),
+        ),
+      ).toBe(true);
     });
 
     it("accepts a push or a merge_group run, refuses a run at another sha or another event", () => {
-      expect(run(edit((s) => { s["pub-runs"] = runOf(55, PSHA, { event: "push" }); })).code).toBe(0);
+      expect(
+        run(
+          edit((s) => {
+            s["pub-runs"] = runOf(55, PSHA, { event: "push" });
+          }),
+        ).code,
+      ).toBe(0);
       for (const bad of [
         runOf(55, "e".repeat(40), { event: "merge_group" }),
         runOf(55, PSHA, { event: "pull_request" }),
       ]) {
-        const r = run(edit((s) => { s["pub-runs"] = bad; }));
+        const r = run(
+          edit((s) => {
+            s["pub-runs"] = bad;
+          }),
+        );
         expect(r.code).toBe(1);
         expect(r.err).toContain("no public CI push/merge-queue run");
       }
     });
 
     it("refuses a red public run, a red or missing public job", () => {
-      expect(run(edit((s) => { s["pub-runs"] = running(PSHA, "completed", "failure"); })).err).toContain("public CI run 77");
+      expect(
+        run(
+          edit((s) => {
+            s["pub-runs"] = running(PSHA, "completed", "failure");
+          }),
+        ).err,
+      ).toContain("public CI run 77");
       for (const name of PJOBS) {
-        const red = run(edit((s) => { s["pub-jobs"].jobs.find((j: { name: string }) => j.name === name).conclusion = "failure"; }));
+        const red = run(
+          edit((s) => {
+            s["pub-jobs"].jobs.find(
+              (j: { name: string }) => j.name === name,
+            ).conclusion = "failure";
+          }),
+        );
         expect(red.code, name).toBe(1);
         expect(red.err).toContain(`job ${name}: failure`);
-        const gone = run(edit((s) => {
-          s["pub-jobs"].jobs = s["pub-jobs"].jobs.filter((j: { name: string }) => j.name !== name);
-          s["pub-jobs"].total_count = PJOBS.length - 1;
-        }));
+        const gone = run(
+          edit((s) => {
+            s["pub-jobs"].jobs = s["pub-jobs"].jobs.filter(
+              (j: { name: string }) => j.name !== name,
+            );
+            s["pub-jobs"].total_count = PJOBS.length - 1;
+          }),
+        );
         expect(gone.err, `${name} missing`).toContain(`job ${name}: missing`);
       }
     });
 
     it("waits for a running public run, sharing one cap with the cloud wait", () => {
       const s = good();
-      s["pub-runs-1"] = running(PSHA, "in_progress", null, { event: "merge_group" });
+      s["pub-runs-1"] = running(PSHA, "in_progress", null, {
+        event: "merge_group",
+      });
       s["pub-runs-2"] = runOf(55, PSHA, { event: "merge_group" });
       const r = run(s);
       expect(r.code).toBe(0);
@@ -354,7 +457,9 @@ describe("tag-ci-green.sh", () => {
       slow["runs-1"] = running(SHA, "in_progress");
       slow["runs-2"] = running(SHA, "in_progress");
       slow["runs-3"] = runOf(77, SHA);
-      slow["pub-runs"] = running(PSHA, "in_progress", null, { event: "merge_group" });
+      slow["pub-runs"] = running(PSHA, "in_progress", null, {
+        event: "merge_group",
+      });
       const r2 = run(slow);
       expect(r2.code).toBe(1);
       expect(r2.err).toContain("public CI run 77");
