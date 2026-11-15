@@ -432,6 +432,42 @@ describe("pin-bump.yml", () => {
     expect(JSON.stringify(jobs.report)).not.toContain("secrets.");
   });
 
+  it("commits through the git-data API with the App token, not local git", () => {
+    const c = stepsOf("open").find((s) =>
+      s.name?.startsWith("Commit and push"),
+    );
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(c.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(c.env.BASE).toBe("${{ github.sha }}");
+    for (const call of [
+      "git/blobs",
+      "git/trees",
+      "git/commits",
+      "git/refs/heads/$BRANCH",
+      "git/refs",
+    ])
+      expect(c.run).toContain(call);
+    // Only the three pin files, as regular files, on top of the main sha the job checked out.
+    expect(c.run).toContain("for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml");
+    expect(c.run).toContain('mode: "100644"');
+    expect(c.run).toContain("parents: [$p]");
+    // No author or committer is set, so GitHub records the App and signs it.
+    expect(c.run).not.toMatch(/author|committer/);
+    // An existing branch is moved with force; a new one is created.
+    expect(c.run).toContain("-F force=true");
+    expect(c.run).toContain("-X POST");
+    expect(c.run).not.toMatch(/\bgit (commit|push|config|switch|add)\b/);
+    expect(text).not.toMatch(/github-actions\[bot\]|x-access-token/);
+    const names = stepsOf("open").map((s) => s.name ?? s.id);
+    expect(names.indexOf(c.name)).toBeGreaterThan(
+      names.indexOf("Take the lockfile as data"),
+    );
+    expect(names.indexOf(c.name)).toBeLessThan(
+      names.indexOf("Open the PR (never armed)"),
+    );
+  });
+
   it("never arms or merges", () => {
     expect(text).not.toMatch(
       /gh pr merge|--auto(?![-\w])|--admin|auto-merge|enablePullRequestAutoMerge/,

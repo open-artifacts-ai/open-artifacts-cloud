@@ -154,23 +154,38 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
+      # The commit is made through the git-data API with the App token, never with
+      # local git: GitHub then records the App's bot as author and committer and
+      # signs it (verified), and the push needs only the App's contents write.
       - if: steps.plan.outputs.bump == 'true'
-        name: Commit and push the branch
+        name: Commit and push the branch (App-signed, through the API)
         env:
-          TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
           BRANCH: ${{ steps.plan.outputs.branch }}
           REPO: ${{ github.repository }}
+          BASE: ${{ github.sha }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
-          git add PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml
-          git commit -m "chore(pin): bump PUBLIC_PIN to $TAG"
+          entries='[]'
+          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml; do
+            base64 < "$f" | tr -d '\n' | jq -Rs '{content: ., encoding: "base64"}' > "$RUNNER_TEMP/blob.json"
+            blob=$(gh api "repos/$REPO/git/blobs" --input "$RUNNER_TEMP/blob.json" --jq .sha)
+            entries=$(jq -c --arg p "$f" --arg s "$blob" '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<< "$entries")
+          done
+          base_tree=$(gh api "repos/$REPO/git/commits/$BASE" --jq .tree.sha)
+          jq -n --arg b "$base_tree" --argjson e "$entries" '{base_tree: $b, tree: $e}' > "$RUNNER_TEMP/tree.json"
+          tree=$(gh api "repos/$REPO/git/trees" --input "$RUNNER_TEMP/tree.json" --jq .sha)
+          jq -n --arg m "chore(pin): bump PUBLIC_PIN to $TAG" --arg t "$tree" --arg p "$BASE" '{message: $m, tree: $t, parents: [$p]}' > "$RUNNER_TEMP/commit.json"
+          commit=$(gh api "repos/$REPO/git/commits" --input "$RUNNER_TEMP/commit.json" --jq .sha)
           # plan found no PR, open or closed, for this branch, so a leftover
           # branch from a run that died before opening one is safe to replace.
-          git push --force "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/$BRANCH"
+          if gh api "repos/$REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$commit" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" > /dev/null
+          fi
+          echo "pushed $BRANCH at $commit"
       - if: steps.plan.outputs.bump == 'true'
         name: Open the PR (never armed)
         env:
