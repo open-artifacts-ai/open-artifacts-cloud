@@ -1198,17 +1198,25 @@ describe("deploy-hosted-platform.yml", () => {
     expect(failing.stdout).toContain("wave 2 failed: billing");
     expect(failing.stdout).not.toContain("provisioner");
     // L2: killed mid-wave, the buffered logs still print, each under its group.
+    // Billing cancels the run only once its wave-mates have all signalled that
+    // they started (a file each), so the test does not race the wave's start.
+    const startedDir = mkdtempSync(join(tmpdir(), "wave-started-"));
     const slow = spawnSync(
       "bash",
       [
         "-c",
         loop.replace(
           'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
-          `bash -c 'echo "started $0"; if [ "$0" = billing ]; then kill -TERM $PPID; fi; sleep 5' "$t"`,
+          `bash -c 'echo "started $0"; touch "$STARTED/$0"; if [ "$0" = billing ]; then for i in $(seq 400); do n=0; for w in auth-broker directory-broker provision-token inventory; do [ -e "$STARTED/$w" ] && n=$((n+1)); done; [ "$n" = 4 ] && break; sleep 0.05; done; kill -TERM $PPID; fi; sleep 5' "$t"`,
         ),
       ],
       {
-        env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS: FULLB },
+        env: {
+          PATH: process.env.PATH,
+          DEPLOY_ENV: "prod",
+          TARGETS: FULLB,
+          STARTED: startedDir,
+        },
         encoding: "utf8",
         timeout: 20000,
       },
