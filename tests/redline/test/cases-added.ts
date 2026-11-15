@@ -81,6 +81,14 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.184.0: the inbox route (#2525).
+    ...[
+      "org GET /api/v1/me/inbox [session]",
+      "org GET /api/v1/me/inbox [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",
