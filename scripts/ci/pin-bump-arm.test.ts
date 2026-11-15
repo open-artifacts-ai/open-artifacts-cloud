@@ -10,6 +10,8 @@ import {
   type Check,
   decide,
   type Exec,
+  GATE_WORKFLOWS,
+  gateRefusal,
   type Input,
   requiredChecks,
   run,
@@ -477,6 +479,10 @@ const fake = (
     extraRuns?: boolean;
     /** Any call whose args contain one of these answers 404. */
     notFound?: string[];
+    busy?: string;
+    busyStatus?: string;
+    prodDone?: boolean;
+    junkCount?: boolean;
     tagSha?: string;
   } = {},
 ) => {
@@ -488,6 +494,26 @@ const fake = (
     const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
     if (o.notFound?.some((n) => a.includes(n)))
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+    const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
+    if (wr) {
+      expect(a).toMatch(/per_page=(1|20)\b/);
+      expect(a).toContain("--jq");
+      if (wr[1] === "deploy-hosted-platform.yml" && wr[2] === "success")
+        return ok(
+          JSON.stringify([
+            "deploy-hosted-platform staging v0.182.0",
+            ...(o.prodDone === false
+              ? []
+              : ["deploy-hosted-platform prod v0.181.0"]),
+          ]),
+        );
+      if (o.junkCount) return ok("oops");
+      return ok(
+        o.busy === wr[1] && (o.busyStatus ?? "in_progress") === wr[2]
+          ? "1"
+          : "0",
+      );
+    }
     if (a.includes("/pulls?state=open"))
       return ok(
         JSON.stringify([
@@ -757,6 +783,89 @@ describe("run", () => {
     expect(() =>
       run({ mode: "plan", exec, repo: REPO, publicRepo: PUB, log: () => {} }),
     ).toThrow(/boom/);
+  });
+});
+
+describe("gateRefusal", () => {
+  const idle = { busy: [], prodDeployed: true, mainTag: "v0.181.0" };
+  it("lets an idle pipeline with main's pin deployed to prod through", () => {
+    expect(gateRefusal(idle)).toBeUndefined();
+  });
+  it("refuses while a gate workflow runs", () => {
+    expect(gateRefusal({ ...idle, busy: ["hosted-publish.yml"] })).toMatch(
+      /candidate open: hosted-publish.yml/,
+    );
+  });
+  it("refuses while main's pin has no prod deploy", () => {
+    expect(gateRefusal({ ...idle, prodDeployed: false })).toMatch(
+      /v0.181.0 has no successful prod deploy/,
+    );
+  });
+});
+
+describe("the release gate in run", () => {
+  it("names the five workflows", () => {
+    expect(GATE_WORKFLOWS).toEqual([
+      "hosted-publish.yml",
+      "staging-release-chain.yml",
+      "deploy-hosted-platform.yml",
+      "redline-staging.yml",
+      "prod-release-chain.yml",
+    ]);
+  });
+  it("refuses while any gate workflow is queued or in progress", () => {
+    for (const busy of GATE_WORKFLOWS)
+      for (const busyStatus of ["queued", "in_progress"]) {
+        const r = go("arm", fake({ busy, busyStatus }));
+        expect(r.armed, `${busy} ${busyStatus}`).toEqual([]);
+        expect(r.write).toBe(false);
+        expect(r.logs.join("\n")).toMatch(
+          new RegExp(`candidate open: ${busy.replace(".", "\\.")}`),
+        );
+      }
+  });
+  it("refuses while main's pin has no successful prod deploy", () => {
+    const r = go("arm", fake({ prodDone: false }));
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+  });
+  it("arms when every gate workflow is idle and prod has the current pin", () => {
+    expect(go("arm", fake()).armed).toEqual([7]);
+  });
+  it("does not arm when a read fails or answers junk", () => {
+    for (const nf of [
+      "actions/workflows/redline-staging.yml",
+      "status=success",
+    ]) {
+      const r = go("arm", fake({ notFound: [nf] }));
+      expect(r.armed, nf).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(/cannot read the release pipeline/);
+    }
+    expect(go("arm", fake({ junkCount: true })).armed).toEqual([]);
+  });
+  it("a busy pipeline never disarms a PR the bot already armed", () => {
+    const r = go("arm", fake({ armed: true, busy: "hosted-publish.yml" }));
+    expect(r.disarmed).toEqual([]);
+  });
+  it("reads the runs lists small: per_page at most 20 and a --jq", () => {
+    const f = fake();
+    go("arm", f);
+    const reads = f.calls
+      .map((c) => c.join(" "))
+      .filter((c) => c.includes("/actions/workflows/"));
+    expect(reads.length).toBe(GATE_WORKFLOWS.length * 2 + 1);
+    for (const c of reads) {
+      expect(c).toContain("--jq");
+      expect(Number(/per_page=(\d+)/.exec(c)?.[1])).toBeLessThanOrEqual(20);
+    }
+  });
+  it("the real exec has room for 16 MiB of output", () => {
+    expect(
+      readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "pin-bump-arm.ts"),
+        "utf8",
+      ),
+    ).toContain("maxBuffer: 16 * 1024 * 1024");
   });
 });
 

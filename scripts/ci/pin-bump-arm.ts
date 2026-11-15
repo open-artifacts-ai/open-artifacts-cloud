@@ -190,6 +190,32 @@ export function decide(i: Input): Decision {
   };
 }
 
+/** Workflows that must be idle before a bump is armed (#309). */
+export const GATE_WORKFLOWS = [
+  "hosted-publish.yml",
+  "staging-release-chain.yml",
+  "deploy-hosted-platform.yml",
+  "redline-staging.yml",
+  "prod-release-chain.yml",
+];
+export const PROD_DEPLOY_WORKFLOW = "deploy-hosted-platform.yml";
+export type Gate = {
+  /** Gate workflows with a queued or in_progress run. */
+  busy: string[];
+  /** A successful prod deploy-hosted-platform run exists for main's current pin tag. */
+  prodDeployed: boolean;
+  /** main's current PUBLIC_PIN tag. */
+  mainTag: string;
+};
+/** Pure: why a qualifying bump must wait (candidate open), or undefined. */
+export function gateRefusal(g: Gate): string | undefined {
+  if (g.busy.length > 0)
+    return `candidate open: ${g.busy.join(", ")} queued or in progress`;
+  if (!g.prodDeployed)
+    return `candidate open: main's pin ${g.mainTag} has no successful prod deploy yet`;
+  return undefined;
+}
+
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
 
@@ -375,6 +401,40 @@ function gather(
   };
 }
 
+/** Small reads only: one count per workflow and status, one short title list. Throws on any error. */
+export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
+  const mainTag = field(mainPin, "tag");
+  if (!/^v\d+\.\d+\.\d+$/.test(mainTag))
+    throw new Error("main's PUBLIC_PIN has no valid tag=");
+  const busy: string[] = [];
+  for (const wf of GATE_WORKFLOWS)
+    for (const status of ["queued", "in_progress"]) {
+      const n = Number(
+        gh(exec, [
+          "api",
+          `repos/${repo}/actions/workflows/${wf}/runs?status=${status}&per_page=1`,
+          "--jq",
+          ".total_count",
+        ]).trim(),
+      );
+      if (!Number.isInteger(n)) throw new Error(`no count for ${wf} ${status}`);
+      if (n > 0 && !busy.includes(wf)) busy.push(wf);
+    }
+  const titles = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/workflows/${PROD_DEPLOY_WORKFLOW}/runs?status=success&per_page=20`,
+      "--jq",
+      "[.workflow_runs[].display_title]",
+    ]),
+  ) as string[];
+  return {
+    busy,
+    mainTag,
+    prodDeployed: titles.includes(`deploy-hosted-platform prod ${mainTag}`),
+  };
+}
+
 const msg = (e: unknown) => String(e instanceof Error ? e.message : e);
 
 /**
@@ -417,6 +477,16 @@ export function run(o: {
     }
     o.log(`#${p.number}: ${d.arm ? "arm" : "leave"}: ${d.why}`);
     if (d.arm && input) {
+      let wait: string | undefined;
+      try {
+        wait = gateRefusal(readGate(o.exec, o.repo, input.mainPin));
+      } catch (e) {
+        wait = `cannot read the release pipeline, not arming: ${msg(e)}`;
+      }
+      if (wait) {
+        o.log(`#${p.number}: leave: ${wait}`);
+        continue;
+      }
       write = true;
       if (o.mode === "arm") {
         gh(o.exec, [
@@ -457,7 +527,10 @@ export function run(o: {
 }
 
 const realExec: Exec = (cmd, args) => {
-  const r = spawnSync(cmd, args, { encoding: "utf8" });
+  const r = spawnSync(cmd, args, {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
   return {
     code: r.status ?? 1,
     stdout: r.stdout ?? "",
