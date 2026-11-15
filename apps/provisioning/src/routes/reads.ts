@@ -15,7 +15,7 @@ import { z } from "zod";
 import { billingTiersOf } from "../billing-tiers.js";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
-import { factsOf } from "../facts.js";
+import { factsOf, isFixtureSlugRefused } from "../facts.js";
 import { limit as rateLimit } from "../limits.js";
 import {
   CreatedCursor,
@@ -260,7 +260,11 @@ export async function checkSlug(a: HandlerArgs): Promise<RouteResult> {
     );
     if (r) throw new ApiError(r.code);
   }
-  const rule = slugRule(slug);
+  const base = slugRule(slug);
+  const rule =
+    base === "ok" && isFixtureSlugRefused(factsOf(a.principal), a.env, slug)
+      ? "reserved"
+      : base;
   // "cooling" is wider than the public contract's SlugCheck status enum; the
   // contract is public, so it widens there on its next release (cloud #108).
   let status: SlugCheck["status"] | "cooling" = rule;
