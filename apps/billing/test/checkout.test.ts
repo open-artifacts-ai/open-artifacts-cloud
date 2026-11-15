@@ -4014,10 +4014,15 @@ describe("per-member seats: POST /seats (#2580)", () => {
       return [r.status, q];
     };
     env = { ...sEnv(), PER_MEMBER_FROM: "" };
-    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([200, "3"]);
+    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([
+      200,
+      "3",
+    ]);
     expect(await qtyOf({ interval: "year", seats: 3 })).toEqual([200, "3"]);
     expect((await qtyOf({ interval: "year", members: 6 }))[0]).toBe(400);
-    expect((await qtyOf({ interval: "year", seats: 3, creators: 2 }))[0]).toBe(400);
+    expect((await qtyOf({ interval: "year", seats: 3, creators: 2 }))[0]).toBe(
+      400,
+    );
     expect(
       (await qtyOf({ interval: "year", seats: 3, creators: 2, members: 5 }))[0],
     ).toBe(400);
@@ -4025,9 +4030,18 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await qtyOf({ creators: 0 })).toEqual([200, "1"]);
     expect(await qtyOf({})).toEqual([200, "1"]);
     env = sEnv();
-    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([200, "9"]);
-    expect(await qtyOf({ interval: "year", seats: 12, members: 5 })).toEqual([200, "12"]);
-    expect(await qtyOf({ interval: "year", seats: 3, members: 0 })).toEqual([200, "3"]);
+    expect(await qtyOf({ interval: "year", seats: 3, members: 9 })).toEqual([
+      200,
+      "9",
+    ]);
+    expect(await qtyOf({ interval: "year", seats: 12, members: 5 })).toEqual([
+      200,
+      "12",
+    ]);
+    expect(await qtyOf({ interval: "year", seats: 3, members: 0 })).toEqual([
+      200,
+      "3",
+    ]);
     expect(await qtyOf({ interval: "year", members: 0 })).toEqual([200, "1"]);
     expect(await qtyOf({ creators: 3, members: 9 })).toEqual([200, "9"]);
   });
@@ -4042,9 +4056,16 @@ describe("per-member seats: POST /seats (#2580)", () => {
       .bind(A)
       .run();
     const lines = logs();
-    const r = await hook("evt_dark_inv", "invoice.payment_failed", seatInvoice());
+    const r = await hook(
+      "evt_dark_inv",
+      "invoice.payment_failed",
+      seatInvoice(),
+    );
     expect(r.status).toBe(200);
-    expect(await stored()).toMatchObject({ seat_failures: 0, seat_failed_at: null });
+    expect(await stored()).toMatchObject({
+      seat_failures: 0,
+      seat_failed_at: null,
+    });
     expect(lines.filter((l) => l.includes("seat_invoice"))).toEqual([]);
     expect(await rowOf(A)).toMatchObject({ status: "past_due" });
   });

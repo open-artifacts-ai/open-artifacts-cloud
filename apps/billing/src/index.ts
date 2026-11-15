@@ -638,8 +638,7 @@ async function checkout(
       // off, the creator count bills as before; a body with members only (an
       // instance that sends no creators) falls back to max(1, members),
       // which is that instance's own count.
-      typeof members === "number" &&
-        (perMember || typeof creators !== "number")
+      typeof members === "number" && (perMember || typeof creators !== "number")
       ? Math.max(1, members)
       : typeof creators === "number"
         ? Math.max(1, creators)
