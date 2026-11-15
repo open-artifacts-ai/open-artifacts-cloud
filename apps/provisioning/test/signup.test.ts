@@ -472,6 +472,18 @@ describe("create from the sign-up host (R4, self-serve policy)", () => {
     expect(e.queued).toHaveLength(1);
   });
 
+  it("a self-serve create of rl-acme is slug_reserved, nothing queued (#297)", async () => {
+    const e = env({ SIGNUPS_ENABLED: "true" });
+    const { sid } = await signIn(e);
+    const r = await create(e, sid, {}, { slug: "rl-acme" });
+    expect(r.status).toBe(400);
+    expect(((await r.json()) as { error: { code: string } }).error.code).toBe(
+      "slug_reserved",
+    );
+    expect(await db.prepare("SELECT 1 FROM signups").first()).toBeNull();
+    expect(e.queued).toHaveLength(0);
+  });
+
   it("CSRF: wrong Origin, no token, a token from the admin derivation are all 403", async () => {
     const e = env({ SIGNUPS_ENABLED: "true" });
     const { sid } = await signIn(e);
@@ -585,6 +597,7 @@ describe("GET /api/v1/slugs/:slug and /api/v1/signup", () => {
     expect(await status("acme")).toBe("ok");
     expect(await status("Bad_Slug")).toBe("invalid");
     expect(await status("admin")).toBe("reserved");
+    expect(await status("rl-acme")).toBe("reserved");
     await insert("signups", {
       signup_id: jobId(),
       source: "admin",

@@ -10,7 +10,12 @@ import {
 import type { z } from "zod";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
-import { factsOf, isTestUser, type PrincipalFacts } from "../facts.js";
+import {
+  factsOf,
+  isFixtureSlugRefused,
+  isTestUser,
+  type PrincipalFacts,
+} from "../facts.js";
 import { newInstallId } from "../ids.js";
 import type { Principal } from "../principal.js";
 import { signedUp } from "../services/analytics.js";
@@ -57,9 +62,10 @@ export const liveClaim = async (env: Env, sub: string) =>
     .bind(sub)
     .first()) !== null;
 
-function slugRule(slug: string) {
+function slugRule(slug: string, p: Principal & PrincipalFacts, env: Env) {
   const e = slugError(slug);
   if (e) throw new ApiError(e);
+  if (isFixtureSlugRefused(p, env, slug)) throw new ApiError("slug_reserved");
 }
 
 const GMAIL_DOMAINS = ["gmail.com", "googlemail.com"];
@@ -126,7 +132,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
 
   const user = p.kind === "user";
   const ss = user ? await selfServePolicy(a, p, body) : null;
-  slugRule(body.slug);
+  slugRule(body.slug, p, env);
   const testHooks = body.testHooks === true;
   // Pinned here, so the provisioner never picks the newest by itself.
   const version = await resolveRelease(

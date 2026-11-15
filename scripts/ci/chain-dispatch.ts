@@ -117,6 +117,28 @@ const gh = (exec: Exec, args: string[]): string => {
   return r.stdout;
 };
 
+/** Backoff before retries 2 and 3 of a read-only gh call. */
+const READ_BACKOFF_MS = [2_000, 5_000, 10_000];
+
+/**
+ * A read-only gh call, tried up to 3 times with backoff so one transient
+ * failure does not fail the chain while the deploy it started keeps running.
+ * Never use this for a write (the dispatch, the cancel).
+ */
+export const ghRead = (
+  o: Pick<Opts, "exec" | "sleep">,
+  args: string[],
+): string => {
+  for (let i = 0; ; i++) {
+    try {
+      return gh(o.exec, args);
+    } catch (e) {
+      if (i >= 2) throw e;
+      o.sleep(READ_BACKOFF_MS[i] ?? 10_000);
+    }
+  }
+};
+
 export function dispatchAndWait(o: Opts): Outcome {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
   if (!CHAIN_RE.test(o.chainId)) throw new Error("bad chain id");
@@ -162,7 +184,7 @@ export function dispatchAndWait(o: Opts): Outcome {
   const title = `${WORKFLOWS[which].name} prod ${o.tag} [${o.chainId}]`;
   const matches = (): WorkflowRun[] => {
     const out = JSON.parse(
-      gh(o.exec, [
+      ghRead(o, [
         "api",
         `repos/${o.repo}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&branch=main&per_page=100`,
       ]),
@@ -196,7 +218,7 @@ export function dispatchAndWait(o: Opts): Outcome {
   const start = o.now();
   for (;;) {
     const r = JSON.parse(
-      gh(o.exec, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
+      ghRead(o, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
     ) as WorkflowRun;
     if (r.status === "completed") {
       if (r.conclusion !== "success")
@@ -223,7 +245,7 @@ export function dispatchAndWait(o: Opts): Outcome {
       }
       try {
         const last = JSON.parse(
-          gh(o.exec, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
+          ghRead(o, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
         ) as WorkflowRun;
         if (last.status === "completed" && last.conclusion === "success")
           return { runId: found.id, url, conclusion: "success" };

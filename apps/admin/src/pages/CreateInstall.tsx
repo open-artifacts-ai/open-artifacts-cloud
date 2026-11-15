@@ -67,7 +67,11 @@ export const appDomainFor = (env: "prod" | "staging", host: string) =>
 
 /** Slug rules on the client, then (after a pause) the live check. */
 function useSlugStatus(slug: string, domain: string, testAdmin: boolean) {
-  const local = slug ? slugRule(slug) : null;
+  const base = slug ? slugRule(slug) : null;
+  // `rl-` is the red-line gate's fixture prefix (cloud #297); only the test
+  // admin may take it.
+  const local =
+    base === "ok" && !testAdmin && slug.startsWith("rl-") ? "reserved" : base;
   const refused =
     testAdmin && local === "ok" && !slug.startsWith(OIDC_LIMITS.slugPrefix);
   const [settled, setSettled] = useState("");

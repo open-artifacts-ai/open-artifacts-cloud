@@ -35,6 +35,15 @@ export function signupDailyCap(v: string | undefined): number {
   return Number.isSafeInteger(n) && n > 0 ? n : 0;
 }
 
+/**
+ * The red-line gate's own fixture installs (slug `rl-...`) end upgrades in
+ * upgrade_incomplete and the like on purpose, then get purged. They never
+ * open an operator alert: rows naming one are dropped. Rows with no install
+ * (the fleet-wide keys) stay.
+ */
+export const REDLINE_FILTER = (sql: string) =>
+  `SELECT * FROM (${sql}) alert_rows WHERE install_id IS NULL OR job_kind IN ('purge', 'delete', 'discard') OR install_id NOT IN (SELECT id FROM installs WHERE slug LIKE 'rl-%')`;
+
 export async function sqlConditions(
   db: D1Database,
   input: { now: number; signupDailyCap: number },
@@ -43,7 +52,7 @@ export async function sqlConditions(
   for (const k of SQL_ALERT_KEYS) {
     try {
       const { results } = await db
-        .prepare(ALERT_CONDITIONS[k].sql)
+        .prepare(REDLINE_FILTER(ALERT_CONDITIONS[k].sql))
         .bind(...alertParams(k, input))
         .all<AlertRow>();
       out[k] = { open: results.length > 0, rows: results };
