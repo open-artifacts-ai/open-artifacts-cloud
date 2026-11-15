@@ -665,18 +665,31 @@ export interface SeatInput {
 export const seatJumpLimit = (current: number): number =>
   Math.max(current + 10, 2 * current);
 
+type Proration = "create_prorations" | "none" | "always_invoice";
+
 /**
- * Proration for a seat change: monthly up create_prorations (charged on the
- * next invoice), monthly down none (no credit), yearly up always_invoice
- * (charged now), yearly down none (applied just before renewal).
+ * The one place the seat proration rule lives (#2580), per interval:
+ * what an increase and a decrease are written with, and whether a decrease
+ * waits for the renewal (the daily cron then writes it).
  */
+export const SEAT_PRORATION: Readonly<
+  Record<
+    "month" | "year",
+    { up: Proration; down: Proration; deferDown: boolean }
+  >
+> = {
+  month: { up: "create_prorations", down: "none", deferDown: false },
+  year: { up: "always_invoice", down: "none", deferDown: true },
+};
+
+/** Proration for a seat change, from SEAT_PRORATION. */
 export function seatProration(
   interval: "month" | "year",
   previous: number,
   quantity: number,
-): "create_prorations" | "none" | "always_invoice" {
-  if (quantity <= previous) return "none";
-  return interval === "year" ? "always_invoice" : "create_prorations";
+): Proration {
+  const r = SEAT_PRORATION[interval];
+  return quantity <= previous ? r.down : r.up;
 }
 
 /**
@@ -767,7 +780,7 @@ export async function setSeatQuantity(
     ? "none"
     : seatProration(interval, previous ?? 0, quantity);
   if (
-    interval === "year" &&
+    SEAT_PRORATION[interval].deferDown &&
     input.deferYearlyDecrease &&
     previous !== undefined &&
     quantity < previous

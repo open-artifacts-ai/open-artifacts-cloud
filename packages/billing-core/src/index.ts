@@ -28,6 +28,7 @@ export {
   retrieveCustomerPaymentMethod,
   retrieveInvoiceStatus,
   retrieveSubscription,
+  SEAT_PRORATION,
   SOLO_TRIAL_DAYS,
   type SoloTrialInput,
   STRIPE_API,

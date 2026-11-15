@@ -1802,6 +1802,9 @@ async function applySeats(
   }
 }
 
+/** Outcomes after which the instance should resend soon (#2580). */
+const SEATS_RETRY = new Set(["held", "failed"]);
+
 async function seats(
   env: Env,
   install: string,
@@ -1831,6 +1834,7 @@ async function seats(
     return Response.json({
       members: kept?.members ?? members,
       applied: "stale",
+      retry: false,
     });
   }
   console.log("billing seats", install);
@@ -1847,7 +1851,11 @@ async function seats(
     r = await applySeats(env, install, cur.members, cur.ts, now);
   }
   if (r.refused) return r.refused;
-  return Response.json({ members: cur.members, applied: r.outcome });
+  return Response.json({
+    members: cur.members,
+    applied: r.outcome,
+    retry: SEATS_RETRY.has(r.outcome),
+  });
 }
 
 /** A yearly decrease is applied this long before renews_at (and after). */

@@ -3513,7 +3513,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     const r = await call(seatsReq(3));
     expect([r.status, await r.json()]).toEqual([
       200,
-      { members: 3, applied: "trial" },
+      { members: 3, applied: "trial", retry: false },
     ]);
     expect(s.calls).toEqual([]);
     expect(await stored()).toMatchObject({
@@ -3527,7 +3527,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     env = { ...sEnv(), PER_MEMBER_FROM: "" };
     const s = stripeAt(2);
     const r = await call(seatsReq(5));
-    expect(await r.json()).toEqual({ members: 5, applied: "not_started" });
+    expect(await r.json()).toEqual({
+      members: 5,
+      applied: "not_started",
+      retry: false,
+    });
     expect(s.calls).toEqual([]);
     const d = new Date();
     const closed = new Date(
@@ -3550,7 +3554,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live();
     const s = stripeAt(2, "month", { createdMs: FROM - 1000 });
     const r = await call(seatsReq(5));
-    expect(await r.json()).toEqual({ members: 5, applied: "legacy" });
+    expect(await r.json()).toEqual({
+      members: 5,
+      applied: "legacy",
+      retry: false,
+    });
     expect(s.posts).toEqual([]);
     expect(await stored()).toMatchObject({ per_member: 0 });
     const d = new Date();
@@ -3574,7 +3582,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live();
     stripeAt(2, "month", { createdMs: FROM });
     const r = await call(seatsReq(3));
-    expect(await r.json()).toEqual({ members: 3, applied: "updated" });
+    expect(await r.json()).toEqual({
+      members: 3,
+      applied: "updated",
+      retry: false,
+    });
     expect(await stored()).toMatchObject({ per_member: 1 });
   });
 
@@ -3585,7 +3597,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     const r = await call(seatsReq(5, ts));
     expect([r.status, await r.json()]).toEqual([
       200,
-      { members: 5, applied: "updated" },
+      { members: 5, applied: "updated", retry: false },
     ]);
     expect(s.posts.map((c) => [c.key, c.form])).toEqual([
       [
@@ -3609,7 +3621,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live();
     const s = stripeAt(1);
     const r = await call(seatsReq(0));
-    expect(await r.json()).toEqual({ members: 0, applied: "unchanged" });
+    expect(await r.json()).toEqual({
+      members: 0,
+      applied: "unchanged",
+      retry: false,
+    });
     expect(s.posts).toEqual([]);
     const t = stripeAt(4);
     await call(seatsReq(0, Date.now() + 1));
@@ -3621,7 +3637,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     const s = stripeAt(3);
     const lines = logs();
     const r = await call(seatsReq(14));
-    expect(await r.json()).toEqual({ members: 14, applied: "held" });
+    expect(await r.json()).toEqual({
+      members: 14,
+      applied: "held",
+      retry: true,
+    });
     expect(s.posts).toEqual([]);
     expect(await stored()).toMatchObject({
       members: 14,
@@ -3631,7 +3651,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(lines.filter((l) => l.includes("held")).join()).not.toMatch(/14/);
     // At the limit it applies.
     const ok = await call(seatsReq(13, Date.now() + 1));
-    expect(await ok.json()).toEqual({ members: 13, applied: "updated" });
+    expect(await ok.json()).toEqual({
+      members: 13,
+      applied: "updated",
+      retry: false,
+    });
     // A held install is left alone by the daily cron.
     await call(seatsReq(80, Date.now() + 2));
     await cron();
@@ -3642,7 +3666,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     const s = stripeAt(3, "year");
     const r = await call(seatsReq(4));
-    expect(await r.json()).toEqual({ members: 4, applied: "updated" });
+    expect(await r.json()).toEqual({
+      members: 4,
+      applied: "updated",
+      retry: false,
+    });
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "4", proration_behavior: "always_invoice" },
     ]);
@@ -3653,7 +3681,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     const s = stripeAt(5, "year");
     const r = await call(seatsReq(3));
-    expect(await r.json()).toEqual({ members: 3, applied: "deferred" });
+    expect(await r.json()).toEqual({
+      members: 3,
+      applied: "deferred",
+      retry: false,
+    });
     expect(s.posts).toEqual([]);
     await cron();
     expect(s.posts).toEqual([]);
@@ -3692,7 +3724,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     const ts = Date.now();
     await call(seatsReq(4, ts));
     const r = await call(seatsReq(9, ts - 1000));
-    expect(await r.json()).toEqual({ members: 4, applied: "stale" });
+    expect(await r.json()).toEqual({
+      members: 4,
+      applied: "stale",
+      retry: false,
+    });
     expect(await stored()).toMatchObject({ members: 4, ts });
     expect(s.posts.length).toBe(1);
   });
@@ -3714,7 +3750,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
       },
     });
     const r = await call(seatsReq(4, ts));
-    expect(await r.json()).toEqual({ members: 7, applied: "updated" });
+    expect(await r.json()).toEqual({
+      members: 7,
+      applied: "updated",
+      retry: false,
+    });
     expect(s.posts.map((c) => c.form.quantity)).toEqual(["4", "7"]);
     expect(await stored()).toMatchObject({ applied_quantity: 7 });
   });
@@ -3758,7 +3798,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
     });
     expect(await rowOf(A)).toEqual(before);
     const r = await call(seatsReq(6, Date.now() + 1));
-    expect(await r.json()).toEqual({ members: 6, applied: "unpaid_hold" });
+    expect(await r.json()).toEqual({
+      members: 6,
+      applied: "unpaid_hold",
+      retry: false,
+    });
     expect(s.posts.length).toBe(1);
     // A later payment ends the hold.
     await hook(
@@ -3768,7 +3812,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
       Math.floor(Date.now() / 1000) + 5,
     );
     const ok = await call(seatsReq(6, Date.now() + 2));
-    expect(await ok.json()).toEqual({ members: 6, applied: "updated" });
+    expect(await ok.json()).toEqual({
+      members: 6,
+      applied: "updated",
+      retry: false,
+    });
   });
 
   it("Stripe giving up on a seat invoice rolls the quantity back to the last paid one, proration none", async () => {
@@ -3841,6 +3889,37 @@ describe("per-member seats: POST /seats (#2580)", () => {
       applied_quantity: 5,
       per_member: 1,
     });
+  });
+
+  it("retry is true only for held and failed (a permanent Stripe 4xx)", async () => {
+    await live();
+    const failedStripe = fakeStripe(async (c) => {
+      if (c.method === "GET" && c.path === SUBS)
+        return Response.json({
+          id: SUB,
+          status: "active",
+          created: 2 * FROM,
+          items: {
+            data: [
+              {
+                id: "si_itemA",
+                quantity: 2,
+                price: { id: "price_team1", recurring: { interval: "month" } },
+              },
+            ],
+          },
+        });
+      if (c.method === "POST")
+        return Response.json({ error: { message: "no" } }, { status: 400 });
+      return undefined;
+    });
+    const r = await call(seatsReq(3));
+    expect(await r.json()).toEqual({
+      members: 3,
+      applied: "failed",
+      retry: true,
+    });
+    failedStripe.spy.mockRestore();
   });
 
   it("bad members and extra keys are refused", async () => {

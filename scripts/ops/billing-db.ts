@@ -37,7 +37,7 @@ export { Refused };
 const TRACKER_SQL =
   "CREATE TABLE IF NOT EXISTS billing_migrations (name TEXT PRIMARY KEY, sha256 TEXT NOT NULL, applied_at INTEGER NOT NULL)";
 /** What the pinned files build (read back). */
-const TABLES = ["tiers", "stripe_events", "usage", "pending_cancels"];
+const TABLES = ["tiers", "stripe_events", "usage", "pending_cancels", "seats"];
 const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 export async function run(o: {
