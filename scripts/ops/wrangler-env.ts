@@ -156,6 +156,25 @@ export function committedBilling(
 }
 
 /**
+ * The env block's LOGIN service binding (#2520: dispatch's login gate on
+ * provisioning's LoginChangeGate), or null when it has none.
+ */
+export function committedLogin(
+  src: string,
+  env: Env,
+): { service: string; entrypoint: string | null } | null {
+  const b = (block(src, env).services ?? []).filter(
+    (x) => x.binding === "LOGIN",
+  );
+  if (b.length === 0) return null;
+  if (b.length > 1) throw new Error("more than one LOGIN binding");
+  return {
+    service: String(b[0]?.service ?? ""),
+    entrypoint: b[0]?.entrypoint === undefined ? null : String(b[0].entrypoint),
+  };
+}
+
+/**
  * Whether the env block wires the scheduler's alerts at all: true when any
  * alert var or ALERT_EMAIL's destination_address is present.
  */
@@ -201,7 +220,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|observability",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|observability",
     );
     process.exit(2);
   }
@@ -213,6 +232,7 @@ if (
     else if (what === "signups") out = committedSignups(src, env, process.env);
     else if (what === "observability") out = committedObservability(src, env);
     else if (what === "billing") out = committedBilling(src, env);
+    else if (what === "login") out = committedLogin(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";
       else {

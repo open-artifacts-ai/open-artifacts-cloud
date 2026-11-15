@@ -297,6 +297,12 @@ const NEXT: Record<string, string> = {
       service: "oa-s-directory-broker",
     },
     { type: "service", name: "BILLING", service: "oa-s-billing" },
+    {
+      type: "service",
+      name: "LOGIN",
+      service: "oa-s-provisioning",
+      entrypoint: "LoginChangeGate",
+    },
     { type: "plain_text", name: "OA_ENV", text: "staging" },
   ]),
   "oa-p-inventory": settings([
@@ -372,6 +378,10 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   // #1176: the platform's own release tag (apps/provisioning/wrangler.jsonc).
   { type: "version_metadata", name: "CF_VERSION_METADATA" },
   { type: "kv_namespace", name: "OAUTH_KV", namespace_id: OAUTH },
+  // The install registry, read-only (#2520): staging's tag declares it.
+  ...(env === "staging"
+    ? [{ type: "kv_namespace", name: "BROKER_REGISTRY", namespace_id: REG }]
+    : []),
   {
     type: "service",
     name: "PROVISIONER",
@@ -530,6 +540,8 @@ const setup = (
     exists?: readonly string[];
     /** Prod's oa-p-billing does not exist (it does by default: prod's tag declares BILLING). */
     noBilling?: boolean;
+    /** Staging's oa-s-provisioning does not exist (it does by default: staging dispatch's LOGIN binds it, #2520). */
+    noProvisioning?: boolean;
     secrets?: Record<string, string[]>;
     next?: Record<string, string>;
     failSecrets?: boolean;
@@ -589,6 +601,9 @@ const setup = (
     ...(opts.noBilling || opts.exists?.includes("oa-p-billing")
       ? []
       : ["oa-p-billing"]),
+    ...(opts.noProvisioning || opts.exists?.includes("oa-s-provisioning")
+      ? []
+      : ["oa-s-provisioning"]),
   ]) {
     writeFileSync(join(state, `${w}.exists`), "");
     if (NEXT[w])
@@ -862,6 +877,33 @@ describe("deploy-hosted-platform.sh", () => {
         }
       });
     }
+    it("staging dispatch, a tag that declares LOGIN: refuses until oa-s-provisioning exists, before any deploy; prod declares none and needs no provisioning (#2520)", () => {
+      const deps = [
+        "oa-s-auth-broker",
+        "oa-s-directory-broker",
+        "oa-s-billing",
+      ];
+      const none = setup({ exists: deps, noProvisioning: true }).run(
+        "dispatch",
+        {},
+        "staging",
+      );
+      expect(none.code).toBe(1);
+      expect(none.err).toContain(
+        "oa-s-provisioning does not exist: deploy it first",
+      );
+      expect(none.log.some((l) => l.startsWith("wrapper"))).toBe(false);
+      const ok = setup({ exists: deps }).run("dispatch", {}, "staging");
+      expect(ok.err).toBe("");
+      expect(ok.code).toBe(0);
+      const prod = setup({ exists: SCHED_DEPS("p"), noProvisioning: true }).run(
+        "dispatch",
+        {},
+        "prod",
+      );
+      expect(prod.err).toBe("");
+      expect(prod.code).toBe(0);
+    });
     it("staging never runs the TIER guard", () => {
       const stg = setup({
         exists: ["oa-s-auth-broker", "oa-s-directory-broker", "oa-s-billing"],
@@ -1349,9 +1391,12 @@ describe("deploy-hosted-platform.sh", () => {
       const next = JSON.parse(live(key));
       if (app === "provisioning")
         next.result.bindings = next.result.bindings.filter(
-          // v0.154.0 predates WELCOME_* and BUSINESS_REQUESTS_TO (open-artifacts#2404).
+          // v0.154.0 predates WELCOME_*, BUSINESS_REQUESTS_TO (open-artifacts#2404)
+          // and LOGIN_CHANGE (#2520).
           (b: { name: string }) =>
-            !b.name.startsWith("WELCOME_") && b.name !== "BUSINESS_REQUESTS_TO",
+            !b.name.startsWith("WELCOME_") &&
+            b.name !== "BUSINESS_REQUESTS_TO" &&
+            b.name !== "LOGIN_CHANGE",
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.
