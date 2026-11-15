@@ -3670,9 +3670,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
       applied: "updated",
       retry: false,
     });
-    expect(
-      await (await call(seatsReq(2, Date.now() + 1))).json(),
-    ).toEqual({ members: 2, applied: "updated", retry: false });
+    expect(await (await call(seatsReq(2, Date.now() + 1))).json()).toEqual({
+      members: 2,
+      applied: "updated",
+      retry: false,
+    });
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "4", proration_behavior: "create_prorations" },
       { quantity: "2", proration_behavior: "create_prorations" },
@@ -3744,8 +3746,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await call(seatsReq(4));
     const before = await rowOf(A);
     const lines = logs();
-    const fail = () =>
-      hook("evt_sf1", "invoice.payment_failed", seatInvoice());
+    const fail = () => hook("evt_sf1", "invoice.payment_failed", seatInvoice());
     expect((await fail()).status).toBe(200);
     expect((await fail()).status).toBe(200);
     expect(
@@ -3764,9 +3765,13 @@ describe("per-member seats: POST /seats (#2580)", () => {
     });
     expect(s.posts.length).toBe(1);
     // A decrease is still applied.
-    expect((await (await call(seatsReq(2, Date.now() + 2))).json()).applied).toBe(
-      "updated",
-    );
+    expect(
+      (
+        (await (await call(seatsReq(2, Date.now() + 2))).json()) as {
+          applied: string;
+        }
+      ).applied,
+    ).toBe("updated");
     // A later payment ends the hold.
     await hook(
       "evt_sp1",
@@ -3775,7 +3780,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       Math.floor(Date.now() / 1000) + 5,
     );
     const ok = await call(seatsReq(6, Date.now() + 3));
-    expect((await ok.json()).applied).toBe("updated");
+    expect(((await ok.json()) as { applied: string }).applied).toBe("updated");
   });
 
   it("only a pure seat-proration invoice counts as a seat failure (L1)", async () => {
@@ -3828,22 +3833,36 @@ describe("per-member seats: POST /seats (#2580)", () => {
     ] as const) {
       const s = fakeStripe(async (c) => {
         if (c.method === "GET" && c.path === "/v1/customers/cus_existingA")
-          return Response.json({ id: "cus_existingA", balance, currency: "usd" });
+          return Response.json({
+            id: "cus_existingA",
+            balance,
+            currency: "usd",
+          });
         if (c.path === "/v1/customers/cus_existingA/balance_transactions")
           return Response.json({ id: "cbtxn_1" });
         return undefined;
       });
-      const r = await hook(`evt_del_${balance}`, "customer.subscription.deleted", {
-        ...sub,
-        status: "canceled",
-      });
+      const r = await hook(
+        `evt_del_${posts}${balance > 0 ? "p" : "n"}${Math.abs(balance)}`,
+        "customer.subscription.deleted",
+        {
+          ...sub,
+          status: "canceled",
+        },
+      );
       expect(r.status).toBe(200);
-      const bt = s.calls.filter((c) => c.path.endsWith("/balance_transactions"));
+      const bt = s.calls.filter((c) =>
+        c.path.endsWith("/balance_transactions"),
+      );
       expect(bt.length).toBe(posts);
       if (posts)
         expect([bt[0]?.key, bt[0]?.form]).toEqual([
           `credit-end-${SUB}`,
-          { amount: "700", currency: "usd", description: "Credit ends with the plan" },
+          {
+            amount: "700",
+            currency: "usd",
+            description: "Credit ends with the plan",
+          },
         ]);
       s.spy.mockRestore();
     }
@@ -3859,11 +3878,22 @@ describe("per-member seats: POST /seats (#2580)", () => {
   it("a yearly Team checkout bills pending items monthly; monthly and Solo do not", async () => {
     env = sEnv();
     const s = fakeStripe();
-    await call(req("/checkout", { install: A, plan: "team", interval: "year", members: 3 }));
-    await call(req("/checkout", { install: A, plan: "team", members: 3 }, { }));
+    await call(
+      req("/checkout", {
+        install: A,
+        plan: "team",
+        interval: "year",
+        members: 3,
+      }),
+    );
+    await call(req("/checkout", { install: A, plan: "team", members: 3 }, {}));
     const forms = s.calls.filter((c) => c.path === CHECKOUT).map((c) => c.form);
-    expect(forms[0]?.["subscription_data[pending_invoice_item_interval][interval]"]).toBe("month");
-    expect(forms[1]).not.toHaveProperty("subscription_data[pending_invoice_item_interval][interval]");
+    expect(
+      forms[0]?.["subscription_data[pending_invoice_item_interval][interval]"],
+    ).toBe("month");
+    expect(forms[1]).not.toHaveProperty(
+      "subscription_data[pending_invoice_item_interval][interval]",
+    );
   });
 
   it("a completed checkout applies the stored count (L3)", async () => {

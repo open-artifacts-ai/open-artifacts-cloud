@@ -671,7 +671,6 @@ export interface SeatInput {
 export const seatJumpLimit = (current: number): number =>
   Math.max(current + 10, 2 * current);
 
-
 type Proration = "create_prorations" | "none";
 
 /**
@@ -687,8 +686,16 @@ export const SEAT_PRORATION: Readonly<
     { up: Proration; down: Proration; deferDown: boolean }
   >
 > = {
-  month: { up: "create_prorations", down: "create_prorations", deferDown: false },
-  year: { up: "create_prorations", down: "create_prorations", deferDown: false },
+  month: {
+    up: "create_prorations",
+    down: "create_prorations",
+    deferDown: false,
+  },
+  year: {
+    up: "create_prorations",
+    down: "create_prorations",
+    deferDown: false,
+  },
 };
 
 /** Proration for a seat change, from SEAT_PRORATION. */

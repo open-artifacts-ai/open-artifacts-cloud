@@ -859,7 +859,10 @@ export function isSeatInvoice(
   o: Record<string, unknown>,
   prices: readonly (string | undefined)[],
 ): boolean {
-  if (o.billing_reason !== "subscription_cycle" && o.billing_reason !== "manual")
+  if (
+    o.billing_reason !== "subscription_cycle" &&
+    o.billing_reason !== "manual"
+  )
     return false;
   const lines = isObj(o.lines) ? o.lines.data : null;
   if (!Array.isArray(lines) || lines.length === 0) return false;
@@ -872,7 +875,8 @@ export function isSeatInvoice(
         ? l.pricing.price_details.price
         : undefined;
     const d = isObj(l.parent) ? l.parent.subscription_item_details : null;
-    const proration = l.proration === true || (isObj(d) && d.proration === true);
+    const proration =
+      l.proration === true || (isObj(d) && d.proration === true);
     return typeof price === "string" && ids.includes(price) && proration;
   });
 }
@@ -894,7 +898,10 @@ async function seatInvoiceEvent(
   now: number,
 ): Promise<Response | null> {
   if (ev.type === "invoice.paid") {
-    await db.prepare(SEAT_PAID_SQL).bind(ev.created * 1000, customer).run();
+    await db
+      .prepare(SEAT_PAID_SQL)
+      .bind(ev.created * 1000, customer)
+      .run();
     return null;
   }
   if (ev.type !== "invoice.payment_failed") return null;
