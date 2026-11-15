@@ -44,6 +44,17 @@ export type PrFile = {
   status: string;
   previous_filename?: string;
 };
+/** The committer GitHub records for a commit made through the API with an App token. */
+export const WEB_FLOW = "web-flow";
+/**
+ * Pure: a commit the bot made and GitHub verified. The committer is the bot, or
+ * web-flow (what GitHub records for an API-made App commit), but web-flow is
+ * accepted only for a verified commit authored by exactly the bot.
+ */
+export const commitOk = (c: Commit) =>
+  c.verified &&
+  c.author === BOT &&
+  (c.committer === BOT || c.committer === WEB_FLOW);
 export type Commit = { author: string; committer: string; verified: boolean };
 /** A root tree entry at the PR head. */
 export type TreeEntry = { path: string; mode: string; type: string };
@@ -107,9 +118,7 @@ export function decide(i: Input): Decision {
   if (i.armed) return no("already armed or queued");
 
   if (i.commits.length === 0) return no("the PR has no commits to check");
-  const human = i.commits.find(
-    (c) => c.author !== BOT || c.committer !== BOT || !c.verified,
-  );
+  const human = i.commits.find((c) => !commitOk(c));
   if (human)
     return no(
       `not pin-only: a commit is by ${human.author || "unknown"}, committed by ${human.committer || "unknown"}${human.verified ? "" : ", unverified"}`,
@@ -362,9 +371,7 @@ function readCommits(exec: Exec, repo: string, n: number): Commit[] {
     verified: c.commit?.verification?.verified === true,
   }));
 }
-const botOnly = (cs: Commit[]) =>
-  cs.length > 0 &&
-  cs.every((c) => c.author === BOT && c.committer === BOT && c.verified);
+const botOnly = (cs: Commit[]) => cs.length > 0 && cs.every(commitOk);
 
 /** Everything else decide needs. Throws on any API error (the caller treats that as "does not qualify"). */
 function gather(
