@@ -44,7 +44,7 @@ P="repos/$PUBLIC_REPO"
 # This repo's ci.yml jobs (every one runs on a push to main; none is path-filtered).
 REQUIRED=(scripts overlay overlay-action lint "e2e (provisioning)" "e2e (admin)")
 # Public ci.yml's required checks (its test and e2e jobs aggregate the shards).
-PUBLIC_REQUIRED=(lint typecheck test authz-matrix build no-test-hooks e2e)
+PUBLIC_REQUIRED=(lint typecheck test authz-matrix build no-test-hooks released-migrations-frozen e2e)
 
 POLL="${CI_POLL_SECS:-60}"
 CAP="${CI_WAIT_CAP_SECS:-1500}"

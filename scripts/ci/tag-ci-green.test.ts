@@ -27,6 +27,7 @@ const PJOBS = [
   "authz-matrix",
   "build",
   "no-test-hooks",
+  "released-migrations-frozen",
   "e2e",
 ];
 
