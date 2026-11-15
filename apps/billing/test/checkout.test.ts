@@ -3913,6 +3913,88 @@ describe("per-member seats: POST /seats (#2580)", () => {
     }
   });
 
+  describe("PER_MEMBER_FROM unset: the seat code makes no Stripe call", () => {
+    beforeEach(() => {
+      env = { ...sEnv(), PER_MEMBER_FROM: "" };
+    });
+    const writes = (calls: StripeCall[]) =>
+      calls.filter((c) => c.method !== "GET").map((c) => c.path);
+
+    for (const interval of ["month", "year"] as const)
+      it(`checkout.session.completed (${interval}): no write, no balance call, no interval change`, async () => {
+        await seed(A, "cus_existingA", "trial");
+        await db
+          .prepare(
+            "INSERT INTO seats (install_id, members, ts, apply_outcome, updated_at) VALUES (?1, 5, 1, 'not_started', 1)",
+          )
+          .bind(A)
+          .run();
+        const s = stripeAt(3, interval);
+        const r = await hook(`evt_dark_${interval}`, "checkout.session.completed", {
+          subscription: SUB,
+          payment_status: "paid",
+          metadata: { tier: "team" },
+        });
+        expect(r.status).toBe(200);
+        expect(writes(s.calls)).toEqual([]);
+        expect(s.calls.map((c) => c.path).filter((p) => p.includes("balance"))).toEqual([]);
+        expect(s.held()).toBe(3);
+      });
+
+    it("customer.subscription.deleted: no balance read or write", async () => {
+      await live();
+      const s = fakeStripe();
+      const r = await hook("evt_dark_del", "customer.subscription.deleted", {
+        id: SUB,
+        created: 2000,
+        items: { data: [{ price: { id: "price_team1" } }] },
+      });
+      expect(r.status).toBe(200);
+      expect(s.calls.filter((c) => c.path.includes("customers"))).toEqual([]);
+    });
+
+    it("/seats: stored only, not_started, zero Stripe calls", async () => {
+      await live();
+      const s = stripeAt(2);
+      const r = await call(seatsReq(5));
+      expect(await r.json()).toEqual({
+        members: 5,
+        applied: "not_started",
+        retry: false,
+      });
+      expect(s.calls).toEqual([]);
+      await cron();
+      expect(s.calls).toEqual([]);
+    });
+
+    it("/usage: sets the quantity with no proration, exactly as before, even after a /seats report", async () => {
+      await live();
+      const s = stripeAt(2);
+      await call(seatsReq(9));
+      const d = new Date();
+      const closed = new Date(
+        Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1),
+      )
+        .toISOString()
+        .slice(0, 7);
+      const r = await call(
+        req("/usage", {
+          install: A,
+          month: closed,
+          creators: ["a", "b", "c"],
+          count: 3,
+        }),
+      );
+      expect(r.status).toBe(200);
+      expect(s.posts.map((c) => [c.key, c.form])).toEqual([
+        [
+          expect.stringMatching(new RegExp(`^qty-${A}-${closed}-3-\\d+$`)),
+          { quantity: "3", proration_behavior: "none" },
+        ],
+      ]);
+    });
+  });
+
   it("a subscription created before PER_MEMBER_FROM keeps its credit when it ends", async () => {
     await live();
     const s = fakeStripe(async (c) =>
