@@ -40,6 +40,7 @@ beforeEach(async () => {
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
     db.prepare("DELETE FROM overage"),
+    db.prepare("DELETE FROM seats"),
     db.prepare("DELETE FROM stripe_events"),
   ]);
   clearRegistryCache();
@@ -1069,7 +1070,11 @@ describe("scheduled: prune stripe_events (#1479)", () => {
       },
     } as unknown as Env;
     await expect(run(NOW, broken)).resolves.toBeUndefined();
-    expect(lines).toEqual(["billing retry db_error", "billing prune db_error"]);
+    expect(lines).toEqual([
+      "billing retry db_error",
+      "billing seats db_error",
+      "billing prune db_error",
+    ]);
   });
 });
 

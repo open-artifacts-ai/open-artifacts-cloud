@@ -623,6 +623,133 @@ export async function setSubscriptionQuantity(
   };
 }
 
+// ------------------------------------------- per-member seats (#2580)
+
+/** What setSeatQuantity did. */
+export type SeatOutcome =
+  | "updated"
+  | "unchanged"
+  /** A yearly decrease with deferYearlyDecrease: nothing written now. */
+  | "deferred"
+  /** Canceled, incomplete, gone (404): left alone. */
+  | "not_live"
+  /** Not one item at the tier's monthly or yearly price: left alone. */
+  | "unknown_price";
+
+export interface SeatInput {
+  subscriptionId: string;
+  /** The member count to bill (1..10000). */
+  quantity: number;
+  /** The tier's monthly and yearly prices (an unset yearly one is omitted). */
+  monthlyPriceIds: readonly string[];
+  yearlyPriceIds: readonly string[];
+  /** Billing's key: seats-<install>-<ts>-<quantity>. */
+  idempotencyKey: string;
+  /** A yearly decrease is not written now (the daily cron applies it). */
+  deferYearlyDecrease?: boolean;
+}
+
+/**
+ * Proration for a seat change: monthly up create_prorations (charged on the
+ * next invoice), monthly down none (no credit), yearly up always_invoice
+ * (charged now), yearly down none (applied just before renewal).
+ */
+export function seatProration(
+  interval: "month" | "year",
+  previous: number,
+  quantity: number,
+): "create_prorations" | "none" | "always_invoice" {
+  if (quantity <= previous) return "none";
+  return interval === "year" ? "always_invoice" : "create_prorations";
+}
+
+/**
+ * Sets a live Team or Business subscription's item quantity to the member
+ * count with the proration seatProration names. Writes nothing unless the
+ * subscription is live (active or past_due) with exactly one item at one of
+ * the tier's prices; an item already at `quantity` is not written.
+ */
+export async function setSeatQuantity(
+  input: SeatInput,
+  cfg: StripeConfig,
+): Promise<{
+  outcome: SeatOutcome;
+  previous?: number;
+  interval?: "month" | "year";
+  proration?: "create_prorations" | "none" | "always_invoice";
+}> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const quantity = input.quantity;
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
+    throw new StripeConfigError("quantity");
+  for (const p of [...input.monthlyPriceIds, ...input.yearlyPriceIds])
+    check(PRICE, "priceIds", p);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  let status: number;
+  let out: Record<string, unknown> | null;
+  try {
+    ({ status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/subscriptions/${id}`,
+      null,
+      null,
+    ));
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404)
+      return { outcome: "not_live" };
+    throw e;
+  }
+  if (typeof out?.status !== "string")
+    throw new StripeApiError(status, "bad_answer");
+  if (!QUANTITY_LIVE.has(out.status)) return { outcome: "not_live" };
+  const items = (out.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  if (items.length !== 1) return { outcome: "unknown_price" };
+  const item = items[0] as {
+    id?: unknown;
+    quantity?: unknown;
+    price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+  };
+  if (typeof item?.id !== "string" || !SUBSCRIPTION_ITEM.test(item.id))
+    throw new StripeApiError(status, "bad_answer");
+  const priceId = item.price?.id;
+  const rec = item.price?.recurring?.interval;
+  const interval =
+    typeof priceId === "string" &&
+    rec === "month" &&
+    input.monthlyPriceIds.includes(priceId)
+      ? "month"
+      : typeof priceId === "string" &&
+          rec === "year" &&
+          input.yearlyPriceIds.includes(priceId)
+        ? "year"
+        : null;
+  if (!interval) return { outcome: "unknown_price" };
+  const previous =
+    typeof item.quantity === "number" ? item.quantity : undefined;
+  const seen = {
+    interval,
+    ...(previous === undefined ? {} : { previous }),
+  } as const;
+  if (previous === quantity) return { outcome: "unchanged", ...seen };
+  const proration = seatProration(interval, previous ?? 0, quantity);
+  if (
+    interval === "year" &&
+    input.deferYearlyDecrease &&
+    previous !== undefined &&
+    quantity < previous
+  )
+    return { outcome: "deferred", ...seen };
+  await post(
+    cfg,
+    `/v1/subscription_items/${item.id}`,
+    { quantity: String(quantity), proration_behavior: proration },
+    input.idempotencyKey,
+  );
+  return { outcome: "updated", proration, ...seen };
+}
+
 // ------------------------------------------------- yearly overage (#2235)
 
 const INVOICE_ITEM = /^ii_[A-Za-z0-9_]{1,255}$/;

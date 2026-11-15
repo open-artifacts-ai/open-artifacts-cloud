@@ -842,6 +842,46 @@ async function overagePayment(
   return json({ received: true });
 }
 
+const SEAT_OWNER_SQL =
+  "SELECT EXISTS (SELECT 1 FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.stripe_customer_id = ?1 AND t.billing_interval = 'year') AS yes";
+const SEAT_FAILED_SQL =
+  "UPDATE seats SET seat_failed_at = max(coalesce(seat_failed_at, 0), ?2), seat_amount_due = coalesce(?3, seat_amount_due), seat_failures = seat_failures + 1 WHERE changes() = 1 AND install_id = (SELECT install_id FROM tiers WHERE stripe_customer_id = ?1 AND billing_interval = 'year')";
+
+/**
+ * A failed payment of a mid-term yearly seat invoice (#2580: a quantity
+ * increase billed at once, billing_reason subscription_update) on an install
+ * that reports /seats: recorded on its seats row only. Like the overage
+ * invoice it never moves tier, status or grace. Any other failed invoice, and
+ * installs without a seats row, take the normal path (null here).
+ */
+async function seatInvoiceFailed(
+  db: D1Database,
+  ev: StripeEvent,
+  customer: string,
+  now: number,
+): Promise<Response | null> {
+  if (
+    ev.type !== "invoice.payment_failed" ||
+    ev.object.billing_reason !== "subscription_update"
+  )
+    return null;
+  const mine = (
+    await db.prepare(SEAT_OWNER_SQL).bind(customer).first<{ yes: number }>()
+  )?.yes;
+  if (!mine) return null;
+  const due = ev.object.amount_due;
+  const amount =
+    typeof due === "number" && Number.isSafeInteger(due) && due >= 0
+      ? due
+      : null;
+  const res = await db.batch([
+    db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
+    db.prepare(SEAT_FAILED_SQL).bind(customer, ev.created * 1000, amount),
+  ]);
+  log((res[0]?.meta.changes ?? 0) === 0 ? "replay" : "seat_invoice_failed");
+  return json({ received: true });
+}
+
 /** One fixed-category line, the install id only (never a Stripe id). */
 const log = (category: string, install?: string | null) =>
   console.log("billing webhook", category, ...(install ? [install] : []));
@@ -1082,6 +1122,10 @@ export async function handleStripeWebhook(
       isOverage(ev.object)
     )
       return await overagePayment(db, ev, customer, now);
+    if (customer) {
+      const seat = await seatInvoiceFailed(db, ev, customer, now);
+      if (seat) return seat;
+    }
     if (!change || !customer) {
       const res = await db.batch([db.prepare(INSERT_EVENT).bind(ev.id, now)]);
       const fresh = (res[0]?.meta.changes ?? 0) > 0;
@@ -1205,7 +1249,8 @@ export async function handleStripeWebhook(
             stripeConfigOf(env),
           );
           const st = statusFromSubscription(got.status);
-          if (st === "active" || st === "past_due") live = got.subscription ?? null;
+          if (st === "active" || st === "past_due")
+            live = got.subscription ?? null;
         } catch {
           log("subscription_read_failed");
         }

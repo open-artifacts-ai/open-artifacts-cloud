@@ -232,6 +232,7 @@ beforeEach(async () => {
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
     db.prepare("DELETE FROM overage"),
+    db.prepare("DELETE FROM seats"),
   ]);
   clearRegistryCache();
   await register();
@@ -3378,5 +3379,306 @@ describe("two plans sharing a price id fail closed (#2235)", () => {
     );
     expect(w.status).toBe(500);
     expect(s.calls).toEqual([]);
+  });
+});
+
+describe("per-member seats: POST /seats (#2580)", () => {
+  const SUB = "sub_seatsA";
+  const SUBS = `/v1/subscriptions/${SUB}`;
+  const ITEM = "/v1/subscription_items/si_itemA";
+  const DAY = 86_400_000;
+  const yEnv = (): Env => ({
+    ...baseEnv(),
+    STRIPE_PRICE_TEAM_YEARLY: "price_teamY1",
+    STRIPE_PRICE_BUSINESS_YEARLY: "price_businessY1",
+  });
+  async function live(
+    o: { tier?: string; interval?: "month" | "year"; renewsAt?: number } = {},
+  ) {
+    await seed(A, "cus_existingA", o.tier ?? "team");
+    await db
+      .prepare(
+        "UPDATE tiers SET stripe_subscription_id = ?1, billing_interval = ?2, renews_at = ?3 WHERE install_id = ?4",
+      )
+      .bind(SUB, o.interval ?? "month", o.renewsAt ?? null, A)
+      .run();
+  }
+  /** Stripe's subscription, holding the quantity last written. */
+  function stripeAt(quantity: number, interval: "month" | "year" = "month") {
+    let held = quantity;
+    const posts: StripeCall[] = [];
+    const s = fakeStripe((c) => {
+      if (c.method === "GET" && c.path === SUBS)
+        return Response.json({
+          id: SUB,
+          status: "active",
+          items: {
+            data: [
+              {
+                id: "si_itemA",
+                quantity: held,
+                price: {
+                  id: interval === "year" ? "price_teamY1" : "price_team1",
+                  recurring: { interval },
+                },
+              },
+            ],
+          },
+        });
+      if (c.method === "POST" && c.path === ITEM) {
+        held = Number(c.form.quantity);
+        posts.push(c);
+        return Response.json({ id: "si_itemA", quantity: held });
+      }
+      return undefined;
+    });
+    return { ...s, posts, held: () => held };
+  }
+  const seatsReq = (members: number, ts = Date.now()) =>
+    req("/seats", { install: A, ts, members });
+  const stored = () =>
+    db.prepare("SELECT * FROM seats WHERE install_id = ?1").bind(A).first();
+
+  it("a trial or solo install stores the count and calls Stripe not at all", async () => {
+    await live({ tier: "trial" });
+    const s = fakeStripe();
+    const r = await call(seatsReq(3));
+    expect([r.status, await r.json()]).toEqual([
+      200,
+      { members: 3, applied: "trial" },
+    ]);
+    expect(s.calls).toEqual([]);
+    expect(await stored()).toMatchObject({
+      members: 3,
+      apply_outcome: "trial",
+    });
+  });
+
+  it("monthly increase: create_prorations, key seats-<install>-<ts>-<quantity>", async () => {
+    await live();
+    const s = stripeAt(2);
+    const ts = Date.now();
+    const r = await call(seatsReq(5, ts));
+    expect([r.status, await r.json()]).toEqual([
+      200,
+      { members: 5, applied: "updated" },
+    ]);
+    expect(s.posts.map((c) => [c.key, c.form])).toEqual([
+      [
+        `seats-${A}-${ts}-5`,
+        { quantity: "5", proration_behavior: "create_prorations" },
+      ],
+    ]);
+    expect(await stored()).toMatchObject({ applied_quantity: 5 });
+  });
+
+  it("monthly decrease: proration none", async () => {
+    await live();
+    const s = stripeAt(5);
+    await call(seatsReq(3));
+    expect(s.posts.map((c) => c.form)).toEqual([
+      { quantity: "3", proration_behavior: "none" },
+    ]);
+  });
+
+  it("zero members is billed as 1; an unchanged quantity writes nothing", async () => {
+    await live();
+    const s = stripeAt(1);
+    const r = await call(seatsReq(0));
+    expect(await r.json()).toEqual({ members: 0, applied: "unchanged" });
+    expect(s.posts).toEqual([]);
+    const t = stripeAt(4);
+    await call(seatsReq(0, Date.now() + 1));
+    expect(
+      t.posts.map((c) => [c.key?.endsWith("-1"), c.form.quantity]),
+    ).toEqual([[true, "1"]]);
+  });
+
+  it("yearly increase: always_invoice, charged now", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    env = yEnv();
+    const s = stripeAt(3, "year");
+    const r = await call(seatsReq(4), env);
+    expect(await r.json()).toEqual({ members: 4, applied: "updated" });
+    expect(s.posts.map((c) => c.form)).toEqual([
+      { quantity: "4", proration_behavior: "always_invoice" },
+    ]);
+  });
+
+  it("yearly decrease is deferred, then the daily cron applies it within 2 days of renewal, proration none", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    env = yEnv();
+    const s = stripeAt(5, "year");
+    const r = await call(seatsReq(3), env);
+    expect(await r.json()).toEqual({ members: 3, applied: "deferred" });
+    expect(s.posts).toEqual([]);
+    // Far from renewal: the cron leaves it.
+    await billing.scheduled(
+      { scheduledTime: Date.now(), cron: "17 3 * * *", noRetry() {} },
+      env,
+    );
+    expect(s.posts).toEqual([]);
+    // Within 2 days of renewal: applied.
+    await billing.scheduled(
+      {
+        scheduledTime: Date.now() + 99 * DAY,
+        cron: "17 3 * * *",
+        noRetry() {},
+      },
+      env,
+    );
+    expect(s.posts.map((c) => c.form)).toEqual([
+      { quantity: "3", proration_behavior: "none" },
+    ]);
+    expect(await stored()).toMatchObject({
+      applied_quantity: 3,
+      apply_outcome: "updated",
+    });
+    // Applied: a second run changes nothing.
+    await billing.scheduled(
+      {
+        scheduledTime: Date.now() + 99 * DAY,
+        cron: "17 3 * * *",
+        noRetry() {},
+      },
+      env,
+    );
+    expect(s.posts.length).toBe(1);
+  });
+
+  it("an older ts never overwrites a newer report", async () => {
+    await live();
+    const s = stripeAt(2);
+    const ts = Date.now();
+    await call(seatsReq(4, ts));
+    const r = await call(seatsReq(9, ts - 1000));
+    expect(await r.json()).toEqual({ members: 4, applied: "stale" });
+    expect(await stored()).toMatchObject({ members: 4, ts });
+    expect(s.posts.length).toBe(1);
+  });
+
+  it("bad members and extra keys are refused", async () => {
+    for (const members of [-1, 1.5, "3", MAX_CREATORS + 1]) {
+      const r = await call(req("/seats", { install: A, members }));
+      expect(r.status).toBe(400);
+    }
+    expect(
+      (await call(req("/seats", { install: A, members: 1, creators: [] })))
+        .status,
+    ).toBe(400);
+    expect(await stored()).toBeNull();
+  });
+
+  it("once seats exist /usage is stored but no longer sets the quantity or bills overage", async () => {
+    await live();
+    const s = stripeAt(2);
+    await call(seatsReq(2));
+    s.calls.length = 0;
+    const d = new Date();
+    const closed = new Date(
+      Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1),
+    )
+      .toISOString()
+      .slice(0, 7);
+    const r = await call(
+      req("/usage", {
+        install: A,
+        month: closed,
+        creators: ["a", "b", "c", "d", "e"],
+        count: 5,
+      }),
+    );
+    expect(r.status).toBe(200);
+    expect(s.calls).toEqual([]);
+    expect(
+      await db
+        .prepare("SELECT count, apply_outcome FROM usage WHERE install_id = ?1")
+        .bind(A)
+        .first(),
+    ).toEqual({ count: 5, apply_outcome: "per_member" });
+  });
+
+  it("a failed mid-term yearly seat invoice is recorded on the seats row and never moves the plan; a replay counts once", async () => {
+    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
+    env = yEnv();
+    stripeAt(3, "year");
+    await call(seatsReq(4), env);
+    const before = await rowOf(A);
+    const body = JSON.stringify({
+      id: "evt_seat_fail_1",
+      object: "event",
+      type: "invoice.payment_failed",
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: "in_seat1",
+          object: "invoice",
+          customer: "cus_existingA",
+          subscription: SUB,
+          billing_reason: "subscription_update",
+          amount_due: 5000,
+        },
+      },
+    });
+    const deliver = async () =>
+      call(
+        new Request(`${ORIGIN}/stripe/webhook`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "stripe-signature": await signStripePayload(
+              body,
+              "whsec_test_seat_0123456789",
+              Math.floor(Date.now() / 1000),
+            ),
+            "cf-connecting-ip": "1.2.3.4",
+          },
+          body,
+        }),
+        { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_seat_0123456789" },
+      );
+    expect((await deliver()).status).toBe(200);
+    expect((await deliver()).status).toBe(200);
+    expect(await stored()).toMatchObject({
+      seat_amount_due: 5000,
+      seat_failures: 1,
+    });
+    expect(await rowOf(A)).toEqual(before);
+  });
+
+  it("/checkout takes members for monthly Team (at least 1) and defaults yearly seats from it", async () => {
+    for (const [body, qty] of [
+      [{ members: 4 }, "4"],
+      [{ members: 0 }, "1"],
+      [{ creators: 3 }, "3"],
+      [{ interval: "year", members: 6 }, "6"],
+      [{ interval: "year", members: 0 }, "1"],
+      [{ interval: "year", members: 6, seats: 8 }, "8"],
+    ] as const) {
+      env = yEnv();
+      const s = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "team", ...body }),
+        env,
+      );
+      expect(r.status, JSON.stringify(body)).toBe(200);
+      const c = s.calls.find((x) => x.path === CHECKOUT);
+      expect(c?.form["line_items[0][quantity]"], JSON.stringify(body)).toBe(
+        qty,
+      );
+      s.spy.mockRestore();
+    }
+    fakeStripe();
+    for (const body of [
+      { members: -1 },
+      { members: 2, creators: 2 },
+      { plan: "solo", interval: "month", members: 2 },
+    ]) {
+      const r = await call(
+        req("/checkout", { install: A, plan: "team", ...body }),
+      );
+      expect(r.status, JSON.stringify(body)).toBe(400);
+    }
   });
 });

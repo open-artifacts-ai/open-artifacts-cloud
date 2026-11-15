@@ -72,6 +72,7 @@ import {
   type StripeConfig,
   StripeConfigError,
   SUBSCRIPTION_LIVE_SQL,
+  setSeatQuantity,
   setSubscriptionQuantity,
   TIERS_OF_MAX,
   type TierOfView,
@@ -384,10 +385,19 @@ const mismatched = (body: Record<string, unknown>, install: string) =>
 
 /** Each signed POST's allowed body keys; any other field is 400 bad_body. */
 const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
-  "/checkout": ["install", "ts", "plan", "interval", "creators", "seats"],
+  "/checkout": [
+    "install",
+    "ts",
+    "plan",
+    "interval",
+    "creators",
+    "members",
+    "seats",
+  ],
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
+  "/seats": ["install", "ts", "members"],
 };
 /** Only a Stripe-hosted page is ever passed back. */
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
@@ -557,7 +567,7 @@ async function checkout(
   appHost: string,
   body: Record<string, unknown>,
 ) {
-  const { plan, interval, creators, seats } = body;
+  const { plan, interval, creators, members, seats } = body;
   if (plan !== "solo" && plan !== "team" && plan !== "business")
     return bad("bad_plan");
   // #2404: Business has no self-serve checkout; nothing is created for it.
@@ -573,6 +583,17 @@ async function checkout(
       (creators as number) > MAX_CREATORS)
   )
     return bad("bad_creators");
+  // Per member (#2580): the instance's member count (0..MAX_CREATORS), billed
+  // as at least 1. A body names members or creators, not both.
+  if (
+    members !== undefined &&
+    (plan === "solo" ||
+      creators !== undefined ||
+      !Number.isInteger(members) ||
+      (members as number) < 0 ||
+      (members as number) > MAX_CREATORS)
+  )
+    return bad("bad_members");
   // Solo names its billing interval; Team and Business take month (the
   // default) or year (#2136, prepaid seats).
   if (
@@ -585,19 +606,26 @@ async function checkout(
   // with year and refused otherwise; a creator count is the monthly plan's.
   const yearly = plan !== "solo" && interval === "year";
   if (yearly && creators !== undefined) return bad("bad_creators");
+  // With members, the seats default to max(1, members) (#2580).
   if (
     yearly
-      ? !Number.isInteger(seats) ||
-        (seats as number) < 1 ||
-        (seats as number) > MAX_CREATORS
+      ? seats === undefined
+        ? typeof members !== "number"
+        : !Number.isInteger(seats) ||
+          (seats as number) < 1 ||
+          (seats as number) > MAX_CREATORS
       : seats !== undefined
   )
     return bad("bad_seats");
   const quantity = yearly
-    ? (seats as number)
-    : typeof creators === "number"
-      ? Math.max(1, creators)
-      : undefined;
+    ? typeof seats === "number"
+      ? seats
+      : Math.max(1, members as number)
+    : typeof members === "number"
+      ? Math.max(1, members)
+      : typeof creators === "number"
+        ? Math.max(1, creators)
+        : undefined;
   const tier: CheckoutTier = plan;
   const priceId =
     plan === "solo"
@@ -1469,6 +1497,15 @@ async function applyQuantity(
     console.log("billing usage quantity", o, install);
     return null;
   };
+  // Per member (#2580): once an install reports /seats, its quantity follows
+  // that and no overage is billed; /usage is still stored.
+  if (
+    await db
+      .prepare("SELECT 1 AS x FROM seats WHERE install_id = ?1")
+      .bind(install)
+      .first()
+  )
+    return outcome("per_member");
   const state = await db.prepare(USAGE_STATE_SQL).bind(install, month).first<{
     applied_quantity: number | null;
     apply_outcome: string | null;
@@ -1636,6 +1673,150 @@ async function usage(
   return Response.json({ ok: true, month, count });
 }
 
+// ------------------------------------------------- per-member seats (#2580)
+
+const SEATS_SQL =
+  "INSERT INTO seats (install_id, members, ts, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id) DO UPDATE SET members = excluded.members, ts = excluded.ts, updated_at = excluded.updated_at WHERE excluded.ts >= seats.ts RETURNING 1 AS ok";
+const SEATS_READ_SQL =
+  "SELECT members, ts, applied_quantity FROM seats WHERE install_id = ?1";
+const SEATS_APPLIED_SQL =
+  "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5 WHERE install_id = ?1 AND ts = ?2";
+const SEATS_TIER_SQL =
+  "SELECT tier, status, stripe_subscription_id FROM tiers WHERE install_id = ?1";
+
+/**
+ * Writes the stored member count to the install's Team or Business
+ * subscription (monthly or yearly) and answers the outcome string. A
+ * Stripe failure the install should retry (network, 5xx, 401, 403, 409,
+ * 429, config) is the refusal; any other failure is recorded as failed.
+ * The yearly decrease is deferred (outcome "deferred") unless `cron`, which
+ * applies it just before renewal. No subscription (trial, solo, free):
+ * stored only.
+ */
+async function applySeats(
+  env: Env,
+  install: string,
+  members: number,
+  ts: number,
+  now: number,
+  cron = false,
+): Promise<{ outcome: string; refused?: Response }> {
+  const db = env.BILLING_DB;
+  const quantity = Math.max(1, members);
+  const done = async (o: string, applied: number | null = null) => {
+    await db
+      .prepare(SEATS_APPLIED_SQL)
+      .bind(install, ts, applied, now, o)
+      .run();
+    console.log("billing seats", o, install);
+    return { outcome: o };
+  };
+  const row = await db.prepare(SEATS_TIER_SQL).bind(install).first<{
+    tier: string | null;
+    status: string | null;
+    stripe_subscription_id: string | null;
+  }>();
+  if (!row?.stripe_subscription_id) return done("no_subscription");
+  if (row.tier !== "team" && row.tier !== "business")
+    return done(row.tier === "trial" ? "trial" : "solo");
+  if (row.status !== "active" && row.status !== "past_due")
+    return done(row.status === "suspended" ? "suspended" : "lapsed");
+  const monthly =
+    row.tier === "team" ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_BUSINESS;
+  const yearly =
+    row.tier === "team"
+      ? env.STRIPE_PRICE_TEAM_YEARLY
+      : env.STRIPE_PRICE_BUSINESS_YEARLY;
+  try {
+    const r = await stripe(install, () =>
+      setSeatQuantity(
+        {
+          subscriptionId: row.stripe_subscription_id as string,
+          quantity,
+          monthlyPriceIds: monthly ? [monthly] : [],
+          yearlyPriceIds: yearly ? [yearly] : [],
+          idempotencyKey: `seats-${install}-${ts}-${quantity}`,
+          deferYearlyDecrease: !cron,
+        },
+        stripeConfig(env),
+      ),
+    );
+    if (r.outcome === "updated" || r.outcome === "unchanged")
+      return done(r.outcome, quantity);
+    return done(r.outcome);
+  } catch (e) {
+    if (!(e instanceof StripeFailure)) throw e;
+    await db
+      .prepare(SEATS_APPLIED_SQL)
+      .bind(install, ts, null, now, "failed")
+      .run();
+    console.error("billing seats failed", install);
+    return { outcome: "failed", refused: usageRefusal(e) ?? undefined };
+  }
+}
+
+async function seats(
+  env: Env,
+  install: string,
+  body: Record<string, unknown>,
+  now: number,
+) {
+  const db = env.BILLING_DB;
+  if (mismatched(body, install)) return bad("install_mismatch", 403);
+  const { ts, members } = body as { ts: number; members: unknown };
+  if (
+    !Number.isInteger(members) ||
+    (members as number) < 0 ||
+    (members as number) > MAX_CREATORS
+  )
+    return bad("bad_members");
+  const written = await db
+    .prepare(SEATS_SQL)
+    .bind(install, members, ts, now)
+    .first();
+  if (!written) {
+    // An older report never overwrites a newer one.
+    const kept = await db
+      .prepare(SEATS_READ_SQL)
+      .bind(install)
+      .first<{ members: number }>();
+    console.log("billing seats stale", install);
+    return Response.json({
+      members: kept?.members ?? members,
+      applied: "stale",
+    });
+  }
+  console.log("billing seats", install);
+  const r = await applySeats(env, install, members as number, ts, now);
+  if (r.refused) return r.refused;
+  return Response.json({ members, applied: r.outcome });
+}
+
+const DEFER_WINDOW_MS = 2 * 86_400_000;
+const SEATS_DUE_SQL =
+  "SELECT s.install_id, s.members, s.ts FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.billing_interval = 'year' AND t.tier IN ('team', 'business') AND t.status IN ('active', 'past_due') AND t.stripe_subscription_id IS NOT NULL AND t.renews_at IS NOT NULL AND t.renews_at > ?1 AND t.renews_at <= ?2 AND coalesce(s.applied_quantity, 0) != max(1, s.members) ORDER BY s.install_id LIMIT ?3";
+
+/**
+ * Yearly decreases wait for the renewal: within 2 days before renews_at the
+ * stored count is written with proration_behavior none, so the next yearly
+ * invoice bills it. Each failure is logged and the next daily run retries.
+ */
+export async function applyYearlyDecreases(
+  env: Env,
+  now: number,
+): Promise<void> {
+  const due = await env.BILLING_DB.prepare(SEATS_DUE_SQL)
+    .bind(now, now + DEFER_WINDOW_MS, RETRY_BATCH)
+    .all<{ install_id: string; members: number; ts: number }>();
+  for (const r of due.results) {
+    try {
+      await applySeats(env, r.install_id, r.members, r.ts, now, true);
+    } catch {
+      console.error("billing seats cron error", r.install_id);
+    }
+  }
+}
+
 /** Closed months the daily cron re-tries per run (oldest last try first). */
 export const RETRY_BATCH = 50;
 /** Only months in the last 90 days are scanned. */
@@ -1761,6 +1942,7 @@ const GATE = new Set([
   "GET /solo/trial-ending",
   "POST /trial/start",
   "POST /usage",
+  "POST /seats",
   "POST /checkout",
   "POST /portal",
 ]);
@@ -1881,6 +2063,7 @@ export default {
       if (!strictBody(body, url.pathname)) return bad("bad_body");
       if (route === "POST /trial/start")
         return await trialStart(env, install, body, now);
+      if (route === "POST /seats") return await seats(env, install, body, now);
       return await usage(env, install, body, now);
     } catch {
       // Never the error text: it can carry a D1 message.
@@ -1895,6 +2078,11 @@ export default {
       await retryUnapplied(env, controller.scheduledTime);
     } catch {
       console.error("billing retry db_error");
+    }
+    try {
+      await applyYearlyDecreases(env, controller.scheduledTime);
+    } catch {
+      console.error("billing seats db_error");
     }
     try {
       const n = await pruneStripeEvents(
