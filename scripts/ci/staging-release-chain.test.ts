@@ -44,7 +44,7 @@ const world = (o: World = {}) => {
   const calls: string[][] = [];
   const exec: Exec = (_c, args) => {
     calls.push(args);
-    const path = args[1] === "-X" ? (args[3] ?? "") : (args[1] ?? "");
+    const path = args.find((a) => a.startsWith("repos/")) ?? "";
     const json = (v: unknown) => ({
       code: 0,
       stdout: JSON.stringify(v),
@@ -433,4 +433,22 @@ describe("the workflow", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));
     expect(p.on.workflow_run.workflows).toEqual(["redline-staging"]);
   });
+});
+
+describe("runs-list reads stay under spawnSync's 1 MiB buffer", () => {
+  for (const f of [
+    "chain-dispatch",
+    "staging-release-chain",
+    "prod-release-chain",
+  ]) {
+    it(`${f}: small page, --jq, maxBuffer backstop`, () => {
+      const src = read(`scripts/ci/${f}.ts`);
+      const lists = src.match(/actions\/workflows\/[^`]*\/runs\?[^`]*`/g) ?? [];
+      expect(lists.length).toBeGreaterThan(0);
+      for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
+      expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      expect(src).toMatch(/MAX_BUFFER = 16 \* 1024 \* 1024/);
+      expect(src).toMatch(/maxBuffer: MAX_BUFFER/);
+    });
+  }
 });

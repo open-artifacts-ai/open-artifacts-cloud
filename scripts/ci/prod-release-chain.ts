@@ -91,7 +91,9 @@ export function fresh(o: {
       "api",
       "-X",
       "GET",
-      `repos/${o.repo}/actions/workflows/redline-staging.yml/runs?branch=main&status=success&event=workflow_dispatch&per_page=100`,
+      "--jq",
+      "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
+      `repos/${o.repo}/actions/workflows/redline-staging.yml/runs?branch=main&status=success&event=workflow_dispatch&per_page=30`,
     ]),
   ) as { workflow_runs?: Run[] };
   if (!Array.isArray(body.workflow_runs))
@@ -131,7 +133,9 @@ export function published(o: {
       "api",
       "-X",
       "GET",
-      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed&per_page=100`,
+      "--jq",
+      "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
+      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed&per_page=30`,
     ]),
   ) as { workflow_runs?: Run[] };
   if (!Array.isArray(body.workflow_runs))
@@ -287,12 +291,20 @@ export function report(o: {
   return { action: "opened" };
 }
 
+const MAX_BUFFER = 16 * 1024 * 1024;
 const realExec: Exec = (cmd, args) => {
-  const r = spawnSync(cmd, args, { encoding: "utf8" });
+  // A runs list can pass spawnSync's 1 MiB default; the reads also ask gh for
+  // a small --jq body, this is the backstop.
+  const r = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER });
+  const code = r.status ?? 1;
   return {
-    code: r.status ?? 1,
+    code,
     stdout: r.stdout ?? "",
-    stderr: r.stderr ?? "",
+    stderr:
+      (r.stderr ?? "") +
+      (r.status === null
+        ? ` [${(r.error as NodeJS.ErrnoException | undefined)?.code ?? "killed"}: gh output over ${MAX_BUFFER} bytes or killed]`
+        : ""),
   };
 };
 
