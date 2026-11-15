@@ -3824,6 +3824,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await live();
     const sub = {
       id: SUB,
+      created: 2000,
       items: { data: [{ price: { id: "price_team1" } }] },
     };
     for (const [balance, posts] of [
@@ -3873,6 +3874,56 @@ describe("per-member seats: POST /seats (#2580)", () => {
       items: { data: [{ price: { id: "price_soloM1" } }] },
     });
     expect(s.calls.filter((c) => c.path.includes("balance"))).toEqual([]);
+  });
+
+  it("with PER_MEMBER_FROM off: no interval call, no credit clear, and checkout bills creators when both are sent", async () => {
+    env = { ...sEnv(), PER_MEMBER_FROM: "" };
+    await live({ interval: "year" });
+    const s = stripeAt(3, "year");
+    await hook("evt_off1", "checkout.session.completed", {
+      subscription: SUB,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+    });
+    expect(s.calls.filter((c) => c.method === "POST")).toEqual([]);
+    const d = fakeStripe();
+    await hook("evt_off2", "customer.subscription.deleted", {
+      id: SUB,
+      created: 2000,
+      items: { data: [{ price: { id: "price_team1" } }] },
+    });
+    expect(d.calls.filter((c) => c.path.includes("balance"))).toEqual([]);
+    d.spy.mockRestore();
+    for (const [body, qty] of [
+      [{ members: 4, creators: 2 }, "2"],
+      [{ members: 4 }, "4"],
+      [{ creators: 3 }, "3"],
+    ] as const) {
+      const c = fakeStripe();
+      const r = await call(
+        req("/checkout", { install: A, plan: "team", ...body }),
+      );
+      expect(r.status).toBe(200);
+      expect(
+        c.calls.find((x) => x.path === CHECKOUT)?.form["line_items[0][quantity]"],
+      ).toBe(qty);
+      c.spy.mockRestore();
+    }
+  });
+
+  it("a subscription created before PER_MEMBER_FROM keeps its credit when it ends", async () => {
+    await live();
+    const s = fakeStripe(async (c) =>
+      c.path === "/v1/customers/cus_existingA"
+        ? Response.json({ balance: -700, currency: "usd" })
+        : undefined,
+    );
+    await hook("evt_old1", "customer.subscription.deleted", {
+      id: SUB,
+      created: 1,
+      items: { data: [{ price: { id: "price_team1" } }] },
+    });
+    expect(s.calls.filter((c) => c.path.includes("balance_transactions"))).toEqual([]);
   });
 
   it("a completed yearly Team checkout sets the monthly pending-invoice interval first (key piii-<sub>), then applies the stored count; monthly does not", async () => {
@@ -4018,6 +4069,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       [{ members: 4 }, "4"],
       [{ members: 0 }, "1"],
       [{ creators: 3 }, "3"],
+      [{ members: 4, creators: 2 }, "4"],
       [{ interval: "year", members: 6 }, "6"],
       [{ interval: "year", members: 0 }, "1"],
       [{ interval: "year", members: 6, seats: 8 }, "8"],
@@ -4036,7 +4088,6 @@ describe("per-member seats: POST /seats (#2580)", () => {
     fakeStripe();
     for (const body of [
       { members: -1 },
-      { members: 2, creators: 2 },
       { plan: "solo", interval: "month", members: 2 },
     ]) {
       const r = await call(

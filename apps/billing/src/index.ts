@@ -592,11 +592,10 @@ async function checkout(
   )
     return bad("bad_creators");
   // Per member (#2580): the instance's member count (0..MAX_CREATORS), billed
-  // as at least 1. A body names members or creators, not both.
+  // as at least 1. An instance sends both members and creators.
   if (
     members !== undefined &&
     (plan === "solo" ||
-      creators !== undefined ||
       !Number.isInteger(members) ||
       (members as number) < 0 ||
       (members as number) > MAX_CREATORS)
@@ -613,7 +612,9 @@ async function checkout(
   // Yearly Team and Business sell prepaid seats (1..MAX_CREATORS), required
   // with year and refused otherwise; a creator count is the monthly plan's.
   const yearly = plan !== "solo" && interval === "year";
-  if (yearly && creators !== undefined) return bad("bad_creators");
+  // (Both counts together are fine: the yearly seats are the member count.)
+  if (yearly && creators !== undefined && members === undefined)
+    return bad("bad_creators");
   // With members, the seats default to max(1, members) (#2580).
   if (
     yearly
@@ -629,7 +630,12 @@ async function checkout(
     ? typeof seats === "number"
       ? seats
       : Math.max(1, members as number)
-    : typeof members === "number"
+    : // A new subscription is per member once PER_MEMBER_FROM is set. With it
+      // off, the creator count bills as before; a body with members only (an
+      // instance that sends no creators) falls back to max(1, members),
+      // which is that instance's own count.
+      typeof members === "number" &&
+        (perMemberFrom(env) !== undefined || typeof creators !== "number")
       ? Math.max(1, members)
       : typeof creators === "number"
         ? Math.max(1, creators)
@@ -2114,6 +2120,7 @@ export default {
             data?: {
               object?: {
                 id?: unknown;
+                created?: unknown;
                 customer?: unknown;
                 subscription?: unknown;
                 items?: { data?: unknown };
@@ -2138,11 +2145,16 @@ export default {
                 env.STRIPE_PRICE_TEAM_YEARLY,
                 env.STRIPE_PRICE_BUSINESS_YEARLY,
               ].filter((v) => typeof v === "string" && v !== "");
+              const from = perMemberFrom(env);
               try {
-                if (yearly.length > 0)
+                if (yearly.length > 0 && from !== undefined)
                   await stripe("-", () =>
                     ensureMonthlyPendingInvoices(
-                      { subscriptionId: sub, yearlyPriceIds: yearly },
+                      {
+                        subscriptionId: sub,
+                        yearlyPriceIds: yearly,
+                        createdFrom: from,
+                      },
                       stripeConfig(env),
                     ),
                   );
@@ -2157,6 +2169,9 @@ export default {
           if (
             ev.type === "customer.subscription.deleted" &&
             ev.livemode === (env.OA_ENV === "prod") &&
+            perMemberFrom(env) !== undefined &&
+            typeof obj?.created === "number" &&
+            obj.created * 1000 >= (perMemberFrom(env) as number) &&
             typeof customer === "string" &&
             typeof obj?.id === "string" &&
             isTeamBusinessItems(env, obj.items?.data)

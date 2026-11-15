@@ -798,9 +798,14 @@ export async function setSeatQuantity(
  * `yearlyPriceIds` recurring yearly is changed; one already on month is left.
  */
 export async function ensureMonthlyPendingInvoices(
-  input: { subscriptionId: string; yearlyPriceIds: readonly string[] },
+  input: {
+    subscriptionId: string;
+    yearlyPriceIds: readonly string[];
+    /** ms: a subscription created before this is left alone ("legacy"). */
+    createdFrom?: number;
+  },
   cfg: StripeConfig,
-): Promise<{ outcome: "set" | "unchanged" | "not_yearly" }> {
+): Promise<{ outcome: "set" | "unchanged" | "not_yearly" | "legacy" }> {
   const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
   for (const p of input.yearlyPriceIds) check(PRICE, "yearlyPriceIds", p);
   const { status, out } = await send(
@@ -825,6 +830,11 @@ export async function ensureMonthlyPendingInvoices(
     );
   });
   if (!yearly) return { outcome: "not_yearly" };
+  if (
+    input.createdFrom !== undefined &&
+    !(typeof out?.created === "number" && out.created * 1000 >= input.createdFrom)
+  )
+    return { outcome: "legacy" };
   const pending = out?.pending_invoice_item_interval as
     | { interval?: unknown }
     | null
