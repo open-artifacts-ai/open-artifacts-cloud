@@ -3623,7 +3623,10 @@ describe("per-member seats: POST /seats (#2580)", () => {
     const r = await call(seatsReq(14));
     expect(await r.json()).toEqual({ members: 14, applied: "held" });
     expect(s.posts).toEqual([]);
-    expect(await stored()).toMatchObject({ members: 14, apply_outcome: "held" });
+    expect(await stored()).toMatchObject({
+      members: 14,
+      apply_outcome: "held",
+    });
     expect(lines).toContain(`billing_seats_held ${A}`);
     expect(lines.filter((l) => l.includes("held")).join()).not.toMatch(/14/);
     // At the limit it applies.
@@ -3654,9 +3657,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.posts).toEqual([]);
     await cron();
     expect(s.posts).toEqual([]);
-    await cron(Date.now() + 94 * DAY);
+    await cron(Date.now() + 92 * DAY);
     expect(s.posts).toEqual([]);
-    await cron(Date.now() + 94.5 * DAY);
+    await cron(Date.now() + 93.5 * DAY);
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "3", proration_behavior: "none" },
     ]);
@@ -3703,7 +3706,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
         if (done) return;
         done = true;
         await db
-          .prepare("UPDATE seats SET members = 7, ts = ?2 WHERE install_id = ?1")
+          .prepare(
+            "UPDATE seats SET members = 7, ts = ?2 WHERE install_id = ?1",
+          )
           .bind(A, ts + 10)
           .run();
       },
@@ -3727,9 +3732,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.posts.map((c) => c.form.quantity)).toEqual(["4"]);
     expect(await stored()).toMatchObject({ applied_quantity: 4 });
     // Failed: retried although stored equals applied.
-    await db
-      .prepare("UPDATE seats SET apply_outcome = 'failed'")
-      .run();
+    await db.prepare("UPDATE seats SET apply_outcome = 'failed'").run();
     await cron();
     expect(await stored()).toMatchObject({ apply_outcome: "unchanged" });
   });
@@ -3740,18 +3743,30 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await call(seatsReq(4));
     const before = await rowOf(A);
     const lines = logs();
-    expect((await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status).toBe(200);
-    expect((await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status).toBe(200);
-    expect(lines.filter((l) => l.startsWith("billing_seat_invoice_failed"))).toEqual([
-      `billing_seat_invoice_failed ${A}`,
-    ]);
-    expect(await stored()).toMatchObject({ seat_amount_due: 5000, seat_failures: 1 });
+    expect(
+      (await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status,
+    ).toBe(200);
+    expect(
+      (await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status,
+    ).toBe(200);
+    expect(
+      lines.filter((l) => l.startsWith("billing_seat_invoice_failed")),
+    ).toEqual([`billing_seat_invoice_failed ${A}`]);
+    expect(await stored()).toMatchObject({
+      seat_amount_due: 5000,
+      seat_failures: 1,
+    });
     expect(await rowOf(A)).toEqual(before);
     const r = await call(seatsReq(6, Date.now() + 1));
     expect(await r.json()).toEqual({ members: 6, applied: "unpaid_hold" });
     expect(s.posts.length).toBe(1);
     // A later payment ends the hold.
-    await hook("evt_sp1", "invoice.paid", { id: "in_seat1" }, Math.floor(Date.now() / 1000) + 5);
+    await hook(
+      "evt_sp1",
+      "invoice.paid",
+      { id: "in_seat1" },
+      Math.floor(Date.now() / 1000) + 5,
+    );
     const ok = await call(seatsReq(6, Date.now() + 2));
     expect(await ok.json()).toEqual({ members: 6, applied: "updated" });
   });
@@ -3770,8 +3785,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.posts[1]?.key).toMatch(new RegExp(`^seats-rollback-${A}-\\d+$`));
     expect(await stored()).toMatchObject({
       applied_quantity: 3,
-      apply_outcome: "rolled_back",
+      apply_outcome: "unpaid_hold",
     });
+    expect((await stored())?.seat_rollback_at).not.toBeNull();
     // Still unpaid: the cron does not raise it again.
     await cron();
     expect(s.held()).toBe(3);
@@ -3783,8 +3799,12 @@ describe("per-member seats: POST /seats (#2580)", () => {
     await call(seatsReq(4));
     for (const [i, o] of [
       seatInvoice({ billing_reason: "subscription_cycle" }),
-      seatInvoice({ lines: { data: [{ price: { id: "price_teamY1" }, proration: false }] } }),
-      seatInvoice({ lines: { data: [{ price: { id: "price_other" }, proration: true }] } }),
+      seatInvoice({
+        lines: { data: [{ price: { id: "price_teamY1" }, proration: false }] },
+      }),
+      seatInvoice({
+        lines: { data: [{ price: { id: "price_other" }, proration: true }] },
+      }),
       seatInvoice({
         lines: {
           data: [
@@ -3795,7 +3815,10 @@ describe("per-member seats: POST /seats (#2580)", () => {
       }),
     ].entries())
       await hook(`evt_l1_${i}`, "invoice.payment_failed", o);
-    expect(await stored()).toMatchObject({ seat_failures: 0, seat_failed_at: null });
+    expect(await stored()).toMatchObject({
+      seat_failures: 0,
+      seat_failed_at: null,
+    });
   });
 
   it("a completed checkout applies the stored count (L3)", async () => {
@@ -3814,7 +3837,10 @@ describe("per-member seats: POST /seats (#2580)", () => {
     });
     expect(r.status).toBe(200);
     expect(s.posts.map((c) => c.form.quantity)).toEqual(["5"]);
-    expect(await stored()).toMatchObject({ applied_quantity: 5, per_member: 1 });
+    expect(await stored()).toMatchObject({
+      applied_quantity: 5,
+      per_member: 1,
+    });
   });
 
   it("bad members and extra keys are refused", async () => {

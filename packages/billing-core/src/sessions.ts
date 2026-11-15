@@ -761,8 +761,7 @@ export async function setSeatQuantity(
   if (previous === quantity) return { outcome: "unchanged", ...seen };
   if (previous !== undefined && quantity > previous) {
     if (input.blockIncrease) return { outcome: "unpaid_hold", ...seen };
-    if (quantity > seatJumpLimit(previous))
-      return { outcome: "held", ...seen };
+    if (quantity > seatJumpLimit(previous)) return { outcome: "held", ...seen };
   }
   const proration = input.forceNone
     ? "none"

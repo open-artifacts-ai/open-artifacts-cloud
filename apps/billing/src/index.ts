@@ -1507,7 +1507,9 @@ async function applyQuantity(
   // that and no overage is billed; /usage is still stored.
   if (
     await db
-      .prepare("SELECT 1 AS x FROM seats WHERE install_id = ?1 AND per_member = 1")
+      .prepare(
+        "SELECT 1 AS x FROM seats WHERE install_id = ?1 AND per_member = 1",
+      )
       .bind(install)
       .first()
   )
@@ -1868,16 +1870,13 @@ export async function applySeatBacklog(env: Env, now: number): Promise<void> {
   const from = perMemberFrom(env);
   if (from === undefined) return;
   const db = env.BILLING_DB;
-  const back = await db
-    .prepare(SEATS_ROLLBACK_SQL)
-    .bind(RETRY_BATCH)
-    .all<{
-      install_id: string;
-      prev: number;
-      closed: number;
-      tier: string;
-      sub: string;
-    }>();
+  const back = await db.prepare(SEATS_ROLLBACK_SQL).bind(RETRY_BATCH).all<{
+    install_id: string;
+    prev: number;
+    closed: number;
+    tier: string;
+    sub: string;
+  }>();
   for (const r of back.results) {
     try {
       const monthly =
@@ -2171,7 +2170,8 @@ export default {
           )
             await applySeatsOnCheckout(env, customer, Date.now());
         } catch (e) {
-          if (e instanceof StripeFailure) console.error("billing seats checkout");
+          if (e instanceof StripeFailure)
+            console.error("billing seats checkout");
           else console.error("billing seats checkout db_error");
         }
       }
