@@ -15,6 +15,7 @@ import {
   requireBusOn,
   suspendCase,
 } from "../src/hosted-bus.ts";
+import { note } from "../src/notes.ts";
 import { label, proof } from "../src/report.ts";
 import type { Held } from "../src/ws.ts";
 
@@ -117,6 +118,7 @@ describe("bus", () => {
           liveSuspendIo(l.busb, l.busa, minted, l.run, held),
           l.pair,
         );
+        for (const n of r.resumeNotes) note(`bus resume: ${n}`);
         return `closed ${Math.round(r.closeMs / 1000)} s after the suspend job; ${r.reconnects} reconnects got the paused answer`;
       }),
     BUS_CASE_TIMEOUT_MS,

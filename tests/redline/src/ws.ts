@@ -140,6 +140,9 @@ function upgrade(req: Request): Promise<Response> {
 export interface Held {
   /** The handshake's status: 101 when the server upgraded. */
   status: number;
+  /** The refusal's body and Retry-After header when the server did not upgrade. */
+  body?: string;
+  retryAfter?: string | null;
   /** Resolves when the connection ends, whoever ended it. Never rejects. */
   closed: Promise<void>;
   /** Writes one masked text frame (a client frame must be masked). */
@@ -221,6 +224,8 @@ export async function holdSocket(
   if (!socket)
     return {
       status: res.status,
+      body: await res.text().catch(() => ""),
+      retryAfter: res.headers.get("retry-after"),
       closed: Promise.resolve(),
       send: () => {},
       destroy: () => {},
