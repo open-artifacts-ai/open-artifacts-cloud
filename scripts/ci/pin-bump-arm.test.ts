@@ -14,6 +14,7 @@ import {
   gateRefusal,
   type Input,
   isChainProdDeploy,
+  parseView,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -616,16 +617,30 @@ const fake = (
       return ok(
         JSON.stringify({ draft: false, prerelease: o.released === false }),
       );
-    if (a.startsWith("pr view"))
+    if (a.startsWith("api graphql")) {
+      expect(a).toContain("pullRequest(number: $n)");
+      expect(a).toContain("isInMergeQueue");
       return ok(
         JSON.stringify({
-          headRefOid: o.headNow ?? HEAD,
-          autoMergeRequest: o.armed
-            ? { enabledBy: { login: o.autoBy ?? BOT } }
-            : null,
-          isInMergeQueue: false,
+          data: {
+            repository: {
+              pullRequest: {
+                headRefOid: o.headNow ?? HEAD,
+                isInMergeQueue: false,
+                autoMergeRequest: o.armed
+                  ? {
+                      enabledBy: {
+                        __typename: o.autoBy ? "User" : "Bot",
+                        login: o.autoBy ?? "open-artifacts-release",
+                      },
+                    }
+                  : null,
+              },
+            },
+          },
         }),
       );
+    }
     if (a.startsWith("pr merge")) return ok("");
     return { code: 1, stdout: "", stderr: `unexpected ${cmd} ${a}` };
   };
@@ -791,7 +806,7 @@ describe("run", () => {
     );
   });
   it("a state that cannot be read leaves the PR alone", () => {
-    const f = fake({ armed: true, notFound: ["pr view"] });
+    const f = fake({ armed: true, notFound: ["api graphql"] });
     const r = go("arm", f);
     expect(r.disarmed).toEqual([]);
     expect(r.write).toBe(false);
@@ -818,6 +833,92 @@ describe("gateRefusal", () => {
     expect(gateRefusal({ ...idle, prodDeployed: false })).toMatch(
       /v0.181.0 has no successful prod deploy/,
     );
+  });
+});
+
+describe("parseView", () => {
+  const gql = (pr: unknown) =>
+    JSON.stringify({ data: { repository: { pullRequest: pr } } });
+  it("reads an arming by the release bot, whose GraphQL login has no [bot]", () => {
+    expect(
+      parseView(
+        gql({
+          headRefOid: HEAD,
+          isInMergeQueue: false,
+          autoMergeRequest: {
+            enabledBy: { __typename: "Bot", login: "open-artifacts-release" },
+          },
+        }),
+      ),
+    ).toEqual({ oid: HEAD, armed: true, autoMergeBy: BOT });
+  });
+  it("reads an arming by a person as theirs, never the bot's", () => {
+    const v = parseView(
+      gql({
+        headRefOid: HEAD,
+        isInMergeQueue: false,
+        autoMergeRequest: {
+          enabledBy: { __typename: "User", login: "leourbina" },
+        },
+      }),
+    );
+    expect(v).toEqual({ oid: HEAD, armed: true, autoMergeBy: "leourbina" });
+    // A user named like the bot is still not the bot.
+    expect(
+      parseView(
+        gql({
+          headRefOid: HEAD,
+          isInMergeQueue: false,
+          autoMergeRequest: {
+            enabledBy: { __typename: "User", login: "open-artifacts-release" },
+          },
+        }),
+      ).autoMergeBy,
+    ).not.toBe(BOT);
+  });
+  it("reads a queued PR as armed with no auto-merge owner", () => {
+    expect(
+      parseView(
+        gql({ headRefOid: HEAD, isInMergeQueue: true, autoMergeRequest: null }),
+      ),
+    ).toEqual({ oid: HEAD, armed: true, autoMergeBy: undefined });
+    expect(
+      parseView(
+        gql({
+          headRefOid: HEAD,
+          isInMergeQueue: true,
+          autoMergeRequest: {
+            enabledBy: { __typename: "Bot", login: "open-artifacts-release" },
+          },
+        }),
+      ).autoMergeBy,
+    ).toBeUndefined();
+  });
+  it("reads an unarmed PR", () => {
+    expect(
+      parseView(
+        gql({
+          headRefOid: HEAD,
+          isInMergeQueue: false,
+          autoMergeRequest: null,
+        }),
+      ),
+    ).toEqual({ oid: HEAD, armed: false, autoMergeBy: undefined });
+  });
+  it("throws on an error, a missing PR, junk, or a bad head sha (fail closed)", () => {
+    expect(() =>
+      parseView(JSON.stringify({ errors: [{ message: "x" }] })),
+    ).toThrow();
+    expect(() => parseView(gql(null))).toThrow();
+    expect(() => parseView("not json")).toThrow();
+    expect(() =>
+      parseView(gql({ headRefOid: "abc", isInMergeQueue: false })),
+    ).toThrow();
+  });
+  it("never asks gh pr view for JSON fields", () => {
+    const f = fake();
+    go("arm", f);
+    expect(f.calls.some((c) => c[1] === "pr" && c[2] === "view")).toBe(false);
   });
 });
 

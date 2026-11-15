@@ -287,26 +287,59 @@ function listBumpPrs(exec: Exec, repo: string): Listed[] {
   ).filter((p) => p.user.login === BOT && p.head.ref.startsWith(BRANCH_PREFIX));
 }
 
-function readView(exec: Exec, repo: string, n: number): View {
-  const v = JSON.parse(
-    gh(exec, [
-      "pr",
-      "view",
-      String(n),
-      "--repo",
-      repo,
-      "--json",
-      "headRefOid,autoMergeRequest,isInMergeQueue",
-    ]),
-  );
+const VIEW_QUERY = `query($owner: String!, $name: String!, $n: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $n) {
+      headRefOid
+      isInMergeQueue
+      autoMergeRequest { enabledBy { __typename login } }
+    }
+  }
+}`;
+
+/**
+ * Pure: the PR state from the GraphQL answer. Throws on anything unexpected, so the
+ * caller fails closed. GraphQL names a bot without "[bot]", so a Bot actor's login
+ * gets it back and compares equal to BOT.
+ */
+export function parseView(json: string): View {
+  const pr = JSON.parse(json)?.data?.repository?.pullRequest;
+  if (!pr || !SHA.test(String(pr.headRefOid ?? "")))
+    throw new Error("unreadable pull request state");
+  const queued = pr.isInMergeQueue === true;
+  const auto = pr.autoMergeRequest;
+  const by = auto?.enabledBy;
+  const login = String(by?.login ?? "");
   return {
-    oid: String(v.headRefOid),
-    armed: Boolean(v.autoMergeRequest) || Boolean(v.isInMergeQueue),
+    oid: pr.headRefOid,
+    armed: queued || Boolean(auto),
     autoMergeBy:
-      v.autoMergeRequest && !v.isInMergeQueue
-        ? String(v.autoMergeRequest.enabledBy?.login ?? "")
+      auto && !queued
+        ? by?.__typename === "Bot" && !login.endsWith("[bot]")
+          ? `${login}[bot]`
+          : login
         : undefined,
   };
+}
+
+// `gh pr view --json` lacks some fields on older gh (isInMergeQueue), so the
+// state is read through GraphQL, which the runner's gh always has.
+function readView(exec: Exec, repo: string, n: number): View {
+  const [owner, name] = repo.split("/");
+  return parseView(
+    gh(exec, [
+      "api",
+      "graphql",
+      "-f",
+      `query=${VIEW_QUERY}`,
+      "-f",
+      `owner=${owner}`,
+      "-f",
+      `name=${name}`,
+      "-F",
+      `n=${n}`,
+    ]),
+  );
 }
 
 function readCommits(exec: Exec, repo: string, n: number): Commit[] {
