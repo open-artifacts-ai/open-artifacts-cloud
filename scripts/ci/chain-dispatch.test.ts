@@ -117,9 +117,9 @@ describe("chain-dispatch", () => {
       return d.find((x) => x.startsWith("targets=")) as string;
     };
     const FULL =
-      "targets=platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+      "targets=platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
     const WITH =
-      "targets=platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+      "targets=platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
     expect(targets(undefined)).toBe(FULL);
     expect(targets(false)).toBe(FULL);
     expect(targets(true)).toBe(WITH);

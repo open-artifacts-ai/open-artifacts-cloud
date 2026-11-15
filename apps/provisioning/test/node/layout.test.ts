@@ -192,9 +192,28 @@ describe("the API never writes provision's tables (W4 static SQL test)", () => {
   const re =
     /\b(?:insert\s+(?:or\s+\w+\s+)?into|replace\s+into|update|delete\s+from)\s+["`]?(installs|hosts|hosted_audit|release_floor|platform_state)\b/i;
 
+  const LOGIN_CHANGE = "src/routes/login-change.ts";
+  it("login-change writes only installs.vars and one hosted_audit row, never hosts, release_floor or platform_state", () => {
+    const text = readFileSync(join(app, LOGIN_CHANGE), "utf8");
+    const writes = [...text.matchAll(new RegExp(re.source, "gi"))].map((m) =>
+      m[0].replace(/\s+/g, " ").toLowerCase(),
+    );
+    expect(writes.sort()).toEqual([
+      "insert into hosted_audit",
+      "update installs",
+    ]);
+    expect(text).toMatch(
+      /UPDATE installs SET vars = \?3, updated_at = \?4 WHERE id = \?1 AND row_version = \?2/,
+    );
+  });
+
   it("no src module writes installs, hosts, hosted_audit, release_floor or platform_state", () => {
     expect(src.length).toBeGreaterThan(10);
+    // The one exception (#2520): the instance's login-domain change writes its
+    // own install's vars and audit row in one CAS batch (design approved by
+    // the security reviewer); the test below pins what it may touch.
     const hits = src.flatMap((f) => {
+      if (rel(f) === LOGIN_CHANGE) return [];
       const m = re.exec(readFileSync(f, "utf8"));
       return m ? [`${rel(f)}: ${m[0]}`] : [];
     });

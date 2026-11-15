@@ -286,6 +286,22 @@ describe("body", () => {
       (b: Record<string, unknown>) => (b.autoJoin = "yes"),
     ],
     ["non-string domains", (b: Record<string, unknown>) => (b.domains = [1])],
+    [
+      "an hd that is not a hostname",
+      (b: Record<string, unknown>) => (b.hd = "Acme.TEST; DROP"),
+    ],
+    [
+      "an ownerUserId with odd characters",
+      (b: Record<string, unknown>) => (b.ownerUserId = "u 1<script>"),
+    ],
+    [
+      "an empty ownerUserId",
+      (b: Record<string, unknown>) => (b.ownerUserId = ""),
+    ],
+    [
+      "an ownerUserId over 64 characters",
+      (b: Record<string, unknown>) => (b.ownerUserId = "u".repeat(65)),
+    ],
     ["a short nonce", (b: Record<string, unknown>) => (b.nonce = "abc")],
   ])("refuses %s", async (_n, mutate) => {
     const { env } = await world();
@@ -303,6 +319,30 @@ describe("body", () => {
     expect((await call(await req("[]", { install: id }), env)).status).toBe(
       400,
     );
+  });
+});
+
+describe("hd", () => {
+  it("an empty hd (a Gmail owner) clears the list but proves no domain", async () => {
+    const { env } = await world({
+      vars: { ...BASE, AUTH_DOMAINS: "ops.test" },
+    });
+    const clear = await call(
+      await req(body({ hd: "", domains: [] }), { install: id }),
+      env,
+    );
+    expect(clear.status).toBe(202);
+    // An empty list with autoJoin false clears operator-set domains.
+    expect((await vars(id)).vars.AUTH_DOMAINS).toBeUndefined();
+  });
+
+  it("an empty hd cannot prove a domain", async () => {
+    const { env } = await world();
+    const r = await call(
+      await req(body({ hd: "", domains: ["acme.test"] }), { install: id }),
+      env,
+    );
+    expect(await err(r)).toEqual({ status: 403, error: "domain_unproven" });
   });
 });
 
@@ -532,7 +572,7 @@ describe("refusals", () => {
     ["a name with a path", "acme.test/x"],
     ["a trailing dot", "acme.test."],
   ])("refuses %s", async (_n, d) => {
-    await expectRefused({}, body({ domains: [d], hd: d }), {
+    await expectRefused({}, body({ domains: [d] }), {
       status: 422,
       error: "bad_domain",
     });

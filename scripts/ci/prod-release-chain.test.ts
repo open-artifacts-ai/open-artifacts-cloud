@@ -39,7 +39,7 @@ const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
 const SHA = "a".repeat(40);
 const FULL =
-  "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+  "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 const ON =
   "${{ vars.PROD_RELEASE_CHAIN == 'on' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}";
 
@@ -281,7 +281,7 @@ describe("prod-release-chain.yml", () => {
     expect(sh).toContain('"env=prod"');
     expect(sh).toContain('"require_newer=true"');
     expect(sh).toContain(
-      `"platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler"`,
+      `"platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler"`,
     );
     // The full list is the deploy's own: its read-back and no-break-glass
     // `if:`s compare against it.

@@ -47,14 +47,25 @@ describe("ALLOW_SIGNUPS", () => {
 });
 
 const FULL =
-  "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+  "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 // The gate on billing's Stripe secrets: the billing target, on either env (#1568).
 const HOLD = "contains(format(',{0},', inputs.targets), ',billing,') &&";
 // The full list with billing (staging and prod, #1568).
 const FULLB =
-  "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+  "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 
 describe("deploy-hosted-platform.yml", () => {
+  it("provisioning deploys before dispatch (dispatch binds its LoginChangeGate, #2520)", () => {
+    for (const list of [FULL, FULLB]) {
+      const t = list.split(",");
+      expect(t.indexOf("provisioning")).toBeGreaterThan(-1);
+      expect(t.indexOf("provisioning")).toBeLessThan(t.indexOf("dispatch"));
+    }
+    expect(text).toContain(
+      'order="platform-db auth-broker directory-broker billing provision-token provisioner provisioning dispatch inventory zones scheduler"',
+    );
+  });
+
   it("one version (#1040): the default is every target, in order; required", () => {
     const t = w.on.workflow_dispatch.inputs.targets;
     expect(t.default).toBe(FULL);
@@ -546,7 +557,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(
       go(
         "v0.74.1",
-        "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler",
+        "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler",
       ),
     ).toBe(0);
     expect(go("v0.74.1", "provisioning,provisioner")).toBe(1);
@@ -699,9 +710,10 @@ describe("deploy-hosted-platform.yml", () => {
       "billing",
       "provision-token",
       "provisioner",
+      // Before dispatch: dispatch's LOGIN binds its LoginChangeGate (#2520).
+      "provisioning",
       "dispatch",
       "inventory",
-      "provisioning",
       "zones",
       "scheduler",
     ]);
@@ -1160,7 +1172,7 @@ describe("deploy-hosted-platform.yml", () => {
         .join(",");
     };
     expect(ran(FULL)).toBe(
-      "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning",
+      "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory",
     );
     expect(ran("scheduler")).toBe("");
   });

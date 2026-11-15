@@ -45,6 +45,7 @@ const DAY_MS = 86_400_000;
 const NONCE_KEEP_MS = 10 * 60_000;
 const MAX_BODY = 8192;
 const INSTALL_ID = /^i[a-z0-9]{11}$/;
+const OWNER_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const NONCE = /^[A-Za-z0-9_-]{16,64}$/;
 const FIELDS = ["autoJoin", "domains", "hd", "nonce", "ownerUserId", "ts"];
 const DOMAIN =
@@ -192,10 +193,11 @@ function parseBody(text: string): Body | null {
     typeof b.nonce !== "string" ||
     !NONCE.test(b.nonce) ||
     typeof b.ownerUserId !== "string" ||
-    b.ownerUserId.length < 1 ||
-    b.ownerUserId.length > 128 ||
+    !OWNER_ID.test(b.ownerUserId) ||
+    // hd reaches the audit row: a lowercase hostname, or empty (a Gmail
+    // owner), and an empty one proves no domain (checked with the list).
     typeof b.hd !== "string" ||
-    b.hd.length > 253 ||
+    (b.hd !== "" && !DOMAIN.test(b.hd)) ||
     !Array.isArray(b.domains) ||
     !b.domains.every((d) => typeof d === "string") ||
     typeof b.autoJoin !== "boolean"

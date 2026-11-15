@@ -45,6 +45,16 @@ describe("wrangler.jsonc", () => {
           service: platformNames(env).directoryBroker,
         },
         { binding: "BILLING", service: platformNames(env).billing },
+        // #2520: provisioning's LoginChangeGate entrypoint, staging only.
+        ...(env === "staging"
+          ? [
+              {
+                binding: "LOGIN",
+                service: "oa-s-provisioning",
+                entrypoint: "LoginChangeGate",
+              },
+            ]
+          : []),
       ]);
       expect(e.dispatch_namespaces).toEqual([
         { binding: "DISPATCHER", namespace: NAMESPACES[env] },

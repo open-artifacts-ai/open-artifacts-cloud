@@ -884,6 +884,9 @@ case "$target" in
     need_workers oa-$P-auth-broker oa-$P-directory-broker
     # BILLING (#1568, when the tag declares it).
     billing_pre dispatch ""
+    # LOGIN (#2520, when the tag declares it): provisioning's LoginChangeGate
+    # entrypoint, so provisioning deploys before dispatch in the target order.
+    if grep -q LoginChangeGate "$root/apps/dispatch/wrangler.jsonc"; then need_workers oa-$P-provisioning; fi
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
     expect "$S" '.result.bindings[] | select(.name == "HOSTS") | .namespace_id' "$HOSTS_KV_ID" "HOSTS"
