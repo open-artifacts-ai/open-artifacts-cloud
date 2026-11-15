@@ -10,7 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  dropErrorContext,
   readZip,
+  scanDirs,
   scrubDirs,
   scrubTraceZip,
   secretLiterals,
@@ -306,5 +308,77 @@ describe("T19 trace scrub (src/t19-trace.ts)", () => {
     writeFileSync(f, "garbage");
     expect(scrubDirs([dir], []).dropped).toBeTruthy();
     expect(existsSync(f)).toBe(false);
+  });
+});
+
+describe("T19 report scan (#294)", () => {
+  let d: string;
+  beforeEach(() => {
+    d = mkdtempSync(join(tmpdir(), "t19-scan-"));
+  });
+  afterEach(() => rmSync(d, { recursive: true, force: true }));
+  const KEY = "hk_s3cret_value_0123456789";
+  const b64 = (b: Buffer) => b.toString("base64");
+
+  it("a clean report passes", () => {
+    const blob = b64(writeZip([{ name: "r.json", data: Buffer.from("{}") }]));
+    writeFileSync(
+      join(d, "index.html"),
+      `<script>data:application/zip;base64,${blob}</script>`,
+    );
+    writeFileSync(
+      join(d, "a.zip"),
+      writeZip([{ name: "x", data: Buffer.from("ok") }]),
+    );
+    const r = scanDirs([d], [KEY]);
+    expect(r.hits).toEqual([]);
+    expect(r.dropped).toEqual([]);
+  });
+
+  it("catches a token inside the HTML reporter's embedded base64 zip", () => {
+    const blob = b64(
+      writeZip([{ name: "r.json", data: Buffer.from(`err ${KEY} end`) }]),
+    );
+    writeFileSync(
+      join(d, "index.html"),
+      `<script id="playwrightReportBase64">data:application/zip;base64,${blob}</script>`,
+    );
+    expect(scanDirs([d], [KEY]).hits).toHaveLength(1);
+  });
+
+  it("catches a token inside a nested zip, and a token shape", () => {
+    const inner = writeZip([{ name: "i", data: Buffer.from(`${KEY}`) }]);
+    writeFileSync(
+      join(d, "a.zip"),
+      writeZip([{ name: "in.zip", data: inner }]),
+    );
+    const shape = writeZip([{ name: "i", data: Buffer.from(PAT) }]);
+    writeFileSync(join(d, "b.zip"), shape);
+    expect(
+      scanDirs([d], [KEY])
+        .hits.map((f) => f.slice(-5))
+        .sort(),
+    ).toEqual(["a.zip", "b.zip"]);
+  });
+
+  it("drops a zip it cannot read, including a bad embedded one", () => {
+    writeFileSync(join(d, "bad.zip"), Buffer.from("PK\x03\x04 garbage"));
+    writeFileSync(
+      join(d, "index.html"),
+      `x ${b64(Buffer.from("PK\x03\x04 garbage garbage garbage garbage garbage garbage garbage garbage"))}`,
+    );
+    const r = scanDirs([d], [KEY]);
+    expect(r.dropped).toHaveLength(2);
+    expect(existsSync(join(d, "bad.zip"))).toBe(false);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
+  });
+
+  it("dropErrorContext removes error-context.md files, wherever they sit", () => {
+    mkdirSync(join(d, "data", "x"), { recursive: true });
+    writeFileSync(join(d, "data", "x", "error-context.md"), `snapshot ${KEY}`);
+    writeFileSync(join(d, "keep.md"), "ok");
+    expect(dropErrorContext([d])).toBe(1);
+    expect(existsSync(join(d, "data", "x", "error-context.md"))).toBe(false);
+    expect(existsSync(join(d, "keep.md"))).toBe(true);
   });
 });

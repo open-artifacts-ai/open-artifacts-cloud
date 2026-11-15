@@ -506,3 +506,74 @@ export function scrubDirs(
     return { scrubbed: 0, dropped: reasonCode(e) };
   }
 }
+
+// ---- the report scan (#294) -------------------------------------------------
+// The report folder is public. A text grep can't see inside a zip (trace
+// copies, nested zips) or inside the base64 zip the Playwright HTML reporter
+// embeds in index.html, and error-context.md (a page snapshot on failure) can
+// hold any on-screen value. Both are handled here and fail closed.
+// The HTML report is kept (it is the report people open); the config that
+// picks the reporter lives in the public repo, so we scan it instead.
+
+/** Drops every error-context.md under `dirs`; returns how many. */
+export function dropErrorContext(dirs: readonly string[]): number {
+  let n = 0;
+  for (const d of dirs)
+    if (existsSync(d))
+      for (const f of walk(d))
+        if (f.endsWith("error-context.md")) {
+          rmSync(f, { force: true });
+          n++;
+        }
+  return n;
+}
+
+const SECRET_SHAPE = /oa_(?:pat|mac)_/;
+const BLOB = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
+const MAX_DEPTH = 6;
+
+class Hit extends Error {}
+
+function scanBytes(b: Buffer, lit: readonly string[], depth: number): void {
+  if (depth > MAX_DEPTH) throw new Error("scan: nested too deep");
+  if (b.length >= 4 && b.readUInt32LE(0) === 0x04034b50) {
+    // A zip: every entry, which may itself be a zip or hold base64.
+    for (const e of readZip(b)) scanBytes(e.data, lit, depth + 1);
+    return;
+  }
+  for (const l of lit) if (l && b.includes(l)) throw new Hit("hit");
+  const text = b.toString("latin1");
+  if (SECRET_SHAPE.test(text)) throw new Hit("hit");
+  for (const m of text.matchAll(BLOB))
+    scanBytes(Buffer.from(m[0], "base64"), lit, depth + 1);
+}
+
+/**
+ * Scans every file under `dirs`: its bytes, every zip inside (nested too) and
+ * every base64 blob (the HTML reporter's embedded zip). A file that can't be
+ * read as a whole is deleted (never uploaded); a hit is listed, never shown.
+ */
+export function scanDirs(
+  dirs: readonly string[],
+  literals: readonly string[],
+): { scanned: number; dropped: string[]; hits: string[] } {
+  const dropped: string[] = [];
+  const hits: string[] = [];
+  let scanned = 0;
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    for (const f of walk(d)) {
+      scanned++;
+      try {
+        scanBytes(readFileSync(f), literals, 0);
+      } catch (e) {
+        if (e instanceof Hit) hits.push(f);
+        else {
+          rmSync(f, { force: true });
+          dropped.push(f);
+        }
+      }
+    }
+  }
+  return { scanned, dropped, hits };
+}

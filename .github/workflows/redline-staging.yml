@@ -355,6 +355,16 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --filter @oa/redline t19-trace scrub --secrets "$RUNNER_TEMP/redline-secrets" "$GITHUB_WORKSPACE/apps/dashboard/playwright-report" "$GITHUB_WORKSPACE/apps/dashboard/test-results"
+      # The text scan above can't see inside zips or the HTML reporter's
+      # embedded base64 zip (#294). This one opens every file, every zip (nested
+      # too) and every base64 blob; an unreadable file is deleted, a hit stops
+      # the upload. error-context.md files were dropped by the step before.
+      - id: deep
+        name: No secret inside the report's zips
+        if: always() && steps.t19.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          pnpm --filter @oa/redline t19-trace scan --secrets "$RUNNER_TEMP/redline-secrets" "$GITHUB_WORKSPACE/apps/dashboard/playwright-report" "$GITHUB_WORKSPACE/apps/dashboard/test-results"
       # Artifacts are not masked: the hook key in a report stops the upload.
       - id: scan
         name: No secret in the report
@@ -374,7 +384,7 @@ jobs:
             if grep -rqF -f "$f" "${dirs[@]}"; then echo "secret in report: ${f##*/}"; exit 1; fi
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always() && steps.scan.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'
+        if: always() && steps.scan.outcome == 'success' && steps.deep.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'
         with:
           name: t19-report
           path: apps/dashboard/playwright-report
