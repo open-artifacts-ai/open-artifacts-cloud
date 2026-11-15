@@ -1097,7 +1097,9 @@ describe("workflow", () => {
     // A push to main and a manual run re-evaluate open bumps; neither takes inputs.
     expect(wf.on.push).toEqual({ branches: ["main"] });
     expect(wf.on.workflow_dispatch ?? null).toBeNull();
-    const cond = String(wf.jobs.arm.if);
+    // The event filter lives on the plan job; arm only follows a plan that says write.
+    expect(wf.jobs.arm.needs).toBe("plan");
+    const cond = String(wf.jobs.plan.if);
     for (const ev of ["schedule", "push", "workflow_dispatch"])
       expect(cond).toContain(`github.event_name == '${ev}'`);
     expect(wf.on.workflow_run).toEqual({
