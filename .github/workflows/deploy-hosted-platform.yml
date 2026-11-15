@@ -203,6 +203,10 @@ jobs:
         run: |
           set -euo pipefail
           bash .release-gate/scripts/ci/tag-passed-checks.sh "$DEPLOY_ENV" "$TAG"
+          # The deploy does not re-run the Workers' package tests: CI did, on
+          # this exact commit. No green CI push run on main for the tag's
+          # commit, no deploy (unreadable counts as no).
+          bash .release-gate/scripts/ci/tag-ci-green.sh "$TAG"
           rm -rf .release-gate
       - name: Prod runs only from main
         if: ${{ inputs.env == 'prod' }}
@@ -255,7 +259,7 @@ jobs:
       - name: Use main's deploy scripts
         run: |
           set -euo pipefail
-          for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do
+          for f in deploy-hosted-platform.sh deploy-waves.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do
             cp ".deploy-logic/scripts/ops/$f" "scripts/ops/$f"
           done
           cp .deploy-logic/packages/provision/src/wfp.ts "$RUNNER_TEMP/main-wfp.ts"
@@ -296,16 +300,11 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
-      - name: Build and test the Workers being deployed
-        env:
-          DEPLOY_ENV: ${{ inputs.env }}
-          TARGETS: ${{ inputs.targets }}
-        run: |
-          set -euo pipefail
-          pnpm --filter @oa/provision build
-          pnpm --filter @oa/auth-broker --filter @oa/directory-broker --filter @oa/dispatch --filter @oa/scheduler --filter @oa/inventory --filter @oa/provisioner --filter @oa/provisioning --filter @oa/admin test
-          # The billing service and its Stripe core (#1568): tested when the run deploys it.
-          case ",$TARGETS," in *,billing,*) pnpm --filter @oa/billing --filter @oa/billing-core test ;; esac
+      # Build only: the package tests are CI's (tag-ci-green.sh above refuses a
+      # tag whose commit has no green CI run). The provisioning target builds
+      # its own assets.
+      - name: Build the Workers being deployed
+        run: pnpm --filter @oa/provision build
       # main's committed constants (account id, email, Google client ids),
       # and the alert address from the OA_OWNER_EMAIL secret (#1084: never
       # committed, masked in the log).
@@ -383,15 +382,42 @@ jobs:
           STRIPE_WEBHOOK_SECRET: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
         run: |
           set -euo pipefail
-          IFS=, read -ra list <<< "$TARGETS"
-          for t in "${list[@]}"; do
-            # Zones and the scheduler have steps of their own, after this one.
-            [ "$t" = zones ] && continue
-            [ "$t" = scheduler ] && continue
-            echo "::group::$DEPLOY_ENV $t"
-            bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"
-            echo "::endgroup::"
-          done
+          # In waves (scripts/ops/deploy-waves.sh holds the dependencies): the
+          # targets of one wave do not need each other and deploy at once, each
+          # with its own log, shown under its own group once the wave is done.
+          # Every target keeps its read-back and verify steps; a wave starts
+          # only after the one before succeeded, and any failed target fails
+          # the run (its wave-mates still finish: they were already deploying).
+          plan="$(bash scripts/ops/deploy-waves.sh "$TARGETS")"
+          logs="$(mktemp -d)"
+          n=0
+          while IFS= read -r wave; do
+            n=$((n + 1))
+            pids=()
+            ts=()
+            for t in $wave; do
+              # Zones and the scheduler have steps of their own, after this one.
+              [ "$t" = zones ] && continue
+              [ "$t" = scheduler ] && continue
+              bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t" > "$logs/$t.log" 2>&1 &
+              pids+=("$!")
+              ts+=("$t")
+            done
+            failed=""
+            count="${#ts[@]}"
+            for ((i = 0; i < count; i++)); do
+              rc=0
+              wait "${pids[$i]}" || rc=$?
+              echo "::group::$DEPLOY_ENV ${ts[$i]} (wave $n)"
+              cat "$logs/${ts[$i]}.log"
+              echo "::endgroup::"
+              if [ "$rc" -ne 0 ]; then
+                echo "::error::$DEPLOY_ENV ${ts[$i]} failed (exit $rc)"
+                failed="$failed ${ts[$i]}"
+              fi
+            done
+            [ -z "$failed" ] || { echo "wave $n failed:$failed"; exit 1; }
+          done <<< "$plan"
       # Plan, then apply (hosted-zones.sh refuses anything outside its fixed
       # set and reads every change back);
       # verify_only stays plan only. Both go to the job summary.
