@@ -3499,7 +3499,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     id: "in_seat1",
     object: "invoice",
     subscription: SUB,
-    billing_reason: "subscription_update",
+    billing_reason: "subscription_cycle",
     amount_due: 5000,
     lines: {
       data: [{ price: { id: "price_teamY1" }, proration: true }],
@@ -3608,12 +3608,12 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await stored()).toMatchObject({ applied_quantity: 5 });
   });
 
-  it("monthly decrease: proration none", async () => {
+  it("monthly decrease: create_prorations (a credit on the next invoice)", async () => {
     await live();
     const s = stripeAt(5);
     await call(seatsReq(3));
     expect(s.posts.map((c) => c.form)).toEqual([
-      { quantity: "3", proration_behavior: "none" },
+      { quantity: "3", proration_behavior: "create_prorations" },
     ]);
   });
 
@@ -3662,60 +3662,21 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.held()).toBe(13);
   });
 
-  it("yearly increase: always_invoice, charged now", async () => {
+  it("yearly increase and decrease: create_prorations, applied at once", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     const s = stripeAt(3, "year");
-    const r = await call(seatsReq(4));
-    expect(await r.json()).toEqual({
+    expect(await (await call(seatsReq(4))).json()).toEqual({
       members: 4,
       applied: "updated",
       retry: false,
     });
+    expect(
+      await (await call(seatsReq(2, Date.now() + 1))).json(),
+    ).toEqual({ members: 2, applied: "updated", retry: false });
     expect(s.posts.map((c) => c.form)).toEqual([
-      { quantity: "4", proration_behavior: "always_invoice" },
+      { quantity: "4", proration_behavior: "create_prorations" },
+      { quantity: "2", proration_behavior: "create_prorations" },
     ]);
-    expect(await stored()).toMatchObject({ seat_prev_quantity: 3 });
-  });
-
-  it("yearly decrease is deferred, then the cron applies it within 7 days of renewal, nearest first, proration none", async () => {
-    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    const s = stripeAt(5, "year");
-    const r = await call(seatsReq(3));
-    expect(await r.json()).toEqual({
-      members: 3,
-      applied: "deferred",
-      retry: false,
-    });
-    expect(s.posts).toEqual([]);
-    await cron();
-    expect(s.posts).toEqual([]);
-    await cron(Date.now() + 92 * DAY);
-    expect(s.posts).toEqual([]);
-    await cron(Date.now() + 93.5 * DAY);
-    expect(s.posts.map((c) => c.form)).toEqual([
-      { quantity: "3", proration_behavior: "none" },
-    ]);
-    expect(await stored()).toMatchObject({
-      applied_quantity: 3,
-      apply_outcome: "updated",
-    });
-    await cron(Date.now() + 99 * DAY);
-    expect(s.posts.length).toBe(1);
-  });
-
-  it("a renewal that passed with a lower stored count is logged and the decrease applied", async () => {
-    await live({ interval: "year", renewsAt: Date.now() - DAY });
-    const s = stripeAt(5, "year");
-    await db
-      .prepare(
-        "INSERT INTO seats (install_id, members, ts, applied_quantity, apply_outcome, per_member, updated_at) VALUES (?1, 3, 1, 5, 'deferred', 1, 1)",
-      )
-      .bind(A)
-      .run();
-    const lines = logs();
-    await cron();
-    expect(lines).toContain(`billing_seats_renewal_missed ${A}`);
-    expect(s.posts.map((c) => c.form.quantity)).toEqual(["3"]);
   });
 
   it("an older ts never overwrites a newer report", async () => {
@@ -3777,18 +3738,16 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await stored()).toMatchObject({ apply_outcome: "unchanged" });
   });
 
-  it("a failed yearly seat invoice is logged once, blocks increases, and a replay counts once", async () => {
+  it("a failed seat-proration invoice is logged once, blocks increases, and a replay counts once", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     const s = stripeAt(3, "year");
     await call(seatsReq(4));
     const before = await rowOf(A);
     const lines = logs();
-    expect(
-      (await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status,
-    ).toBe(200);
-    expect(
-      (await hook("evt_sf1", "invoice.payment_failed", seatInvoice())).status,
-    ).toBe(200);
+    const fail = () =>
+      hook("evt_sf1", "invoice.payment_failed", seatInvoice());
+    expect((await fail()).status).toBe(200);
+    expect((await fail()).status).toBe(200);
     expect(
       lines.filter((l) => l.startsWith("billing_seat_invoice_failed")),
     ).toEqual([`billing_seat_invoice_failed ${A}`]);
@@ -3804,6 +3763,10 @@ describe("per-member seats: POST /seats (#2580)", () => {
       retry: false,
     });
     expect(s.posts.length).toBe(1);
+    // A decrease is still applied.
+    expect((await (await call(seatsReq(2, Date.now() + 2))).json()).applied).toBe(
+      "updated",
+    );
     // A later payment ends the hold.
     await hook(
       "evt_sp1",
@@ -3811,62 +3774,96 @@ describe("per-member seats: POST /seats (#2580)", () => {
       { id: "in_seat1" },
       Math.floor(Date.now() / 1000) + 5,
     );
-    const ok = await call(seatsReq(6, Date.now() + 2));
-    expect(await ok.json()).toEqual({
-      members: 6,
-      applied: "updated",
-      retry: false,
-    });
+    const ok = await call(seatsReq(6, Date.now() + 3));
+    expect((await ok.json()).applied).toBe("updated");
   });
 
-  it("Stripe giving up on a seat invoice rolls the quantity back to the last paid one, proration none", async () => {
-    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    const s = stripeAt(3, "year");
-    await call(seatsReq(4));
-    await hook("evt_sf2", "invoice.payment_failed", seatInvoice());
-    await hook("evt_sv2", "invoice.marked_uncollectible", seatInvoice());
-    await cron();
-    expect(s.posts.map((c) => c.form)).toEqual([
-      { quantity: "4", proration_behavior: "always_invoice" },
-      { quantity: "3", proration_behavior: "none" },
-    ]);
-    expect(s.posts[1]?.key).toMatch(new RegExp(`^seats-rollback-${A}-\\d+$`));
-    expect(await stored()).toMatchObject({
-      applied_quantity: 3,
-      apply_outcome: "unpaid_hold",
-    });
-    expect((await stored())?.seat_rollback_at).not.toBeNull();
-    // Still unpaid: the cron does not raise it again.
-    await cron();
-    expect(s.held()).toBe(3);
-  });
-
-  it("only a yearly seat proration counts as a seat failure (L1)", async () => {
+  it("only a pure seat-proration invoice counts as a seat failure (L1)", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     stripeAt(3, "year");
     await call(seatsReq(4));
+    const line = (price: string, proration: boolean) => ({
+      price: { id: price },
+      proration,
+    });
     for (const [i, o] of [
-      seatInvoice({ billing_reason: "subscription_cycle" }),
-      seatInvoice({
-        lines: { data: [{ price: { id: "price_teamY1" }, proration: false }] },
-      }),
-      seatInvoice({
-        lines: { data: [{ price: { id: "price_other" }, proration: true }] },
-      }),
+      seatInvoice({ billing_reason: "subscription_update" }),
+      seatInvoice({ billing_reason: "subscription_create" }),
+      seatInvoice({ lines: { data: [line("price_teamY1", false)] } }),
+      seatInvoice({ lines: { data: [line("price_other", true)] } }),
       seatInvoice({
         lines: {
-          data: [
-            { price: { id: "price_teamY1" }, proration: true },
-            { price: { id: "price_other" }, proration: true },
-          ],
+          data: [line("price_teamY1", true), line("price_teamY1", false)],
         },
       }),
+      seatInvoice({ lines: { data: [] } }),
     ].entries())
       await hook(`evt_l1_${i}`, "invoice.payment_failed", o);
     expect(await stored()).toMatchObject({
       seat_failures: 0,
       seat_failed_at: null,
     });
+    // manual counts, and a monthly price too.
+    await hook(
+      "evt_l1_ok",
+      "invoice.payment_failed",
+      seatInvoice({
+        billing_reason: "manual",
+        lines: { data: [line("price_team1", true)] },
+      }),
+    );
+    expect(await stored()).toMatchObject({ seat_failures: 1 });
+  });
+
+  it("Team or Business ending zeroes a credit balance (credit-end-<sub>), only when the balance is below zero", async () => {
+    await live();
+    const sub = {
+      id: SUB,
+      items: { data: [{ price: { id: "price_team1" } }] },
+    };
+    for (const [balance, posts] of [
+      [-700, 1],
+      [0, 0],
+      [300, 0],
+    ] as const) {
+      const s = fakeStripe(async (c) => {
+        if (c.method === "GET" && c.path === "/v1/customers/cus_existingA")
+          return Response.json({ id: "cus_existingA", balance, currency: "usd" });
+        if (c.path === "/v1/customers/cus_existingA/balance_transactions")
+          return Response.json({ id: "cbtxn_1" });
+        return undefined;
+      });
+      const r = await hook(`evt_del_${balance}`, "customer.subscription.deleted", {
+        ...sub,
+        status: "canceled",
+      });
+      expect(r.status).toBe(200);
+      const bt = s.calls.filter((c) => c.path.endsWith("/balance_transactions"));
+      expect(bt.length).toBe(posts);
+      if (posts)
+        expect([bt[0]?.key, bt[0]?.form]).toEqual([
+          `credit-end-${SUB}`,
+          { amount: "700", currency: "usd", description: "Credit ends with the plan" },
+        ]);
+      s.spy.mockRestore();
+    }
+    // A Solo subscription ending is left alone.
+    const s = fakeStripe();
+    await hook("evt_del_solo", "customer.subscription.deleted", {
+      id: "sub_soloZ",
+      items: { data: [{ price: { id: "price_soloM1" } }] },
+    });
+    expect(s.calls.filter((c) => c.path.includes("balance"))).toEqual([]);
+  });
+
+  it("a yearly Team checkout bills pending items monthly; monthly and Solo do not", async () => {
+    env = sEnv();
+    const s = fakeStripe();
+    await call(req("/checkout", { install: A, plan: "team", interval: "year", members: 3 }));
+    await call(req("/checkout", { install: A, plan: "team", members: 3 }, { }));
+    const forms = s.calls.filter((c) => c.path === CHECKOUT).map((c) => c.form);
+    expect(forms[0]?.["subscription_data[pending_invoice_item_interval][interval]"]).toBe("month");
+    expect(forms[1]).not.toHaveProperty("subscription_data[pending_invoice_item_interval][interval]");
   });
 
   it("a completed checkout applies the stored count (L3)", async () => {

@@ -9,6 +9,7 @@ export {
   type CheckoutTier,
   type CustomerInput,
   cancelSubscription,
+  clearCustomerCredit,
   createCheckoutSession,
   createCustomer,
   createOverageInvoice,

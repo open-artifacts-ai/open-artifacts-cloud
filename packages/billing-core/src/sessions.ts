@@ -49,6 +49,12 @@ export interface CheckoutInput {
    * needs it at least 48 hours ahead: the caller checks.
    */
   trialEnd?: number;
+  /**
+   * Bill pending invoice items (seat prorations, #2580) once a month, on one
+   * month-end invoice: subscription_data[pending_invoice_item_interval]
+   * [interval]=month. For the yearly Team and Business checkout.
+   */
+  pendingInvoiceMonthly?: boolean;
 }
 
 export interface PortalInput {
@@ -229,6 +235,12 @@ export function createCheckoutSession(
         ...(input.trialEnd === undefined
           ? {}
           : { "subscription_data[trial_end]": String(input.trialEnd) }),
+        ...(input.pendingInvoiceMonthly
+          ? {
+              "subscription_data[pending_invoice_item_interval][interval]":
+                "month",
+            }
+          : {}),
       },
       input.idempotencyKey,
     ),
@@ -629,8 +641,6 @@ export async function setSubscriptionQuantity(
 export type SeatOutcome =
   | "updated"
   | "unchanged"
-  /** A yearly decrease with deferYearlyDecrease: nothing written now. */
-  | "deferred"
   /** Canceled, incomplete, gone (404): left alone. */
   | "not_live"
   /** Not one item at the tier's monthly or yearly price: left alone. */
@@ -651,26 +661,25 @@ export interface SeatInput {
   yearlyPriceIds: readonly string[];
   /** Billing's key: seats-<install>-<ts>-<quantity>. */
   idempotencyKey: string;
-  /** A yearly decrease is not written now (the daily cron applies it). */
-  deferYearlyDecrease?: boolean;
   /** ms: a subscription created before this is "legacy" and left alone. */
   perMemberFrom?: number;
   /** Refuse any increase (a yearly seat invoice is unpaid). */
   blockIncrease?: boolean;
-  /** Write this proration regardless (a rollback to the last paid quantity). */
-  forceNone?: boolean;
 }
 
 /** An increase past this is held for a person to look at (#2580). */
 export const seatJumpLimit = (current: number): number =>
   Math.max(current + 10, 2 * current);
 
-type Proration = "create_prorations" | "none" | "always_invoice";
+
+type Proration = "create_prorations" | "none";
 
 /**
- * The one place the seat proration rule lives (#2580), per interval:
- * what an increase and a decrease are written with, and whether a decrease
- * waits for the renewal (the daily cron then writes it).
+ * The one place the seat proration rule lives (#2580), per interval: what an
+ * increase and a decrease are written with. Both create prorations (a
+ * removal is a credit on the next invoice, like Slack); change a value here
+ * to change the rule. deferDown true would hold a decrease for the daily
+ * cron (unused today).
  */
 export const SEAT_PRORATION: Readonly<
   Record<
@@ -678,8 +687,8 @@ export const SEAT_PRORATION: Readonly<
     { up: Proration; down: Proration; deferDown: boolean }
   >
 > = {
-  month: { up: "create_prorations", down: "none", deferDown: false },
-  year: { up: "always_invoice", down: "none", deferDown: true },
+  month: { up: "create_prorations", down: "create_prorations", deferDown: false },
+  year: { up: "create_prorations", down: "create_prorations", deferDown: false },
 };
 
 /** Proration for a seat change, from SEAT_PRORATION. */
@@ -705,7 +714,7 @@ export async function setSeatQuantity(
   outcome: SeatOutcome;
   previous?: number;
   interval?: "month" | "year";
-  proration?: "create_prorations" | "none" | "always_invoice";
+  proration?: Proration;
   /** The subscription's creation time (ms), when Stripe gave one. */
   created?: number;
 }> {
@@ -776,16 +785,7 @@ export async function setSeatQuantity(
     if (input.blockIncrease) return { outcome: "unpaid_hold", ...seen };
     if (quantity > seatJumpLimit(previous)) return { outcome: "held", ...seen };
   }
-  const proration = input.forceNone
-    ? "none"
-    : seatProration(interval, previous ?? 0, quantity);
-  if (
-    SEAT_PRORATION[interval].deferDown &&
-    input.deferYearlyDecrease &&
-    previous !== undefined &&
-    quantity < previous
-  )
-    return { outcome: "deferred", ...seen };
+  const proration = seatProration(interval, previous ?? 0, quantity);
   await post(
     cfg,
     `/v1/subscription_items/${item.id}`,
@@ -793,6 +793,47 @@ export async function setSeatQuantity(
     input.idempotencyKey,
   );
   return { outcome: "updated", proration, ...seen };
+}
+
+/**
+ * Zeroes a customer's credit balance when a Team or Business plan ends
+ * (#2580: the credit from seat removals ends with the plan). In Stripe a
+ * credit is a negative customer.balance; it is cleared with a balance
+ * transaction of the opposite sign, only when the balance is below zero.
+ * The key is credit-end-<subscription>, so a retry is one write.
+ */
+export async function clearCustomerCredit(
+  input: { customerId: string; subscriptionId: string },
+  cfg: StripeConfig,
+): Promise<{ outcome: "cleared" | "none"; amount?: number }> {
+  const id = check(CUSTOMER, "customerId", input.customerId);
+  const sub = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/customers/${id}`,
+    null,
+    null,
+  );
+  const balance = out?.balance;
+  if (typeof balance !== "number" || !Number.isSafeInteger(balance))
+    throw new StripeApiError(status, "bad_answer");
+  if (balance >= 0) return { outcome: "none" };
+  const currency =
+    typeof out?.currency === "string" && /^[a-z]{3}$/.test(out.currency)
+      ? out.currency
+      : "usd";
+  await post(
+    cfg,
+    `/v1/customers/${id}/balance_transactions`,
+    {
+      amount: String(-balance),
+      currency,
+      description: "Credit ends with the plan",
+    },
+    `credit-end-${sub}`,
+  );
+  return { outcome: "cleared", amount: -balance };
 }
 
 // ------------------------------------------------- yearly overage (#2235)
