@@ -832,7 +832,10 @@ export async function ensureMonthlyPendingInvoices(
   if (!yearly) return { outcome: "not_yearly" };
   if (
     input.createdFrom !== undefined &&
-    !(typeof out?.created === "number" && out.created * 1000 >= input.createdFrom)
+    !(
+      typeof out?.created === "number" &&
+      out.created * 1000 >= input.createdFrom
+    )
   )
     return { outcome: "legacy" };
   const pending = out?.pending_invoice_item_interval as

@@ -3905,7 +3905,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
       );
       expect(r.status).toBe(200);
       expect(
-        c.calls.find((x) => x.path === CHECKOUT)?.form["line_items[0][quantity]"],
+        c.calls.find((x) => x.path === CHECKOUT)?.form[
+          "line_items[0][quantity]"
+        ],
       ).toBe(qty);
       c.spy.mockRestore();
     }
@@ -3923,7 +3925,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
       created: 1,
       items: { data: [{ price: { id: "price_team1" } }] },
     });
-    expect(s.calls.filter((c) => c.path.includes("balance_transactions"))).toEqual([]);
+    expect(
+      s.calls.filter((c) => c.path.includes("balance_transactions")),
+    ).toEqual([]);
   });
 
   it("a completed yearly Team checkout sets the monthly pending-invoice interval first (key piii-<sub>), then applies the stored count; monthly does not", async () => {
