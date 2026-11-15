@@ -371,6 +371,12 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
   "POST /api/v1/passkeys/settings/challenge":
     "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  // #2545: the login settings. The owner rule is the PUT's, and the first
+  // visit flag is a write the red-line installs have no throwaway for.
+  "POST /api/v1/settings/login/first-invite-seen":
+    "real-only: it sets the caller's own first-invite flag, with no row to make on the red-line installs; A at B is deny-only",
+  "PUT /api/v1/settings/login":
+    "owner-only (the login settings): no admin success leg",
   // Self-serve billing (hosted only): an allowed caller's request reaches
   // billing (a Stripe session or a usage report), so no success leg runs
   // live. A at B is deny-only.
@@ -809,6 +815,29 @@ export const DROPPED: Readonly<
   "org POST /api/v1/passkeys/settings/challenge": {
     why: "interactive-only",
     coveredBy: [INSTANCE, ...PASSKEY_TESTS],
+  },
+  // #2545: the login settings (public login-api.2520.test.ts).
+  "org POST /api/v1/settings/login/first-invite-seen": {
+    why: "real-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/login-api.2520.test.ts",
+        describe: "login settings",
+        test: "first-invite-seen is 204, per person, and sets the flag",
+      },
+    ],
+  },
+  "org PUT /api/v1/settings/login": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/login-api.2520.test.ts",
+        describe: "PUT login settings",
+        test: "no fresh login: 401 reauth_required",
+      },
+    ],
   },
   "org DELETE /api/v1/spaces/:id/mappings/:groupId": {
     why: "real-only",
