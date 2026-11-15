@@ -3930,14 +3930,20 @@ describe("per-member seats: POST /seats (#2580)", () => {
           .bind(A)
           .run();
         const s = stripeAt(3, interval);
-        const r = await hook(`evt_dark_${interval}`, "checkout.session.completed", {
-          subscription: SUB,
-          payment_status: "paid",
-          metadata: { tier: "team" },
-        });
+        const r = await hook(
+          `evt_dark_${interval}`,
+          "checkout.session.completed",
+          {
+            subscription: SUB,
+            payment_status: "paid",
+            metadata: { tier: "team" },
+          },
+        );
         expect(r.status).toBe(200);
         expect(writes(s.calls)).toEqual([]);
-        expect(s.calls.map((c) => c.path).filter((p) => p.includes("balance"))).toEqual([]);
+        expect(
+          s.calls.map((c) => c.path).filter((p) => p.includes("balance")),
+        ).toEqual([]);
         expect(s.held()).toBe(3);
       });
 
