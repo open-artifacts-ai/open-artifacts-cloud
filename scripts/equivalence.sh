@@ -52,14 +52,8 @@ set -uo pipefail
 # And the T19 dry-run workflow (#166): a workflow that public never had.
 # And the staging half of the release chain (#264 step 1): a workflow, its
 # script and its test that public never had.
-# And the deploy's CI guard and wave plan (#264 step 3): two scripts with their
-# tests that public never had.
 ALLOW=(
   pnpm-lock.yaml
-  scripts/ci/tag-ci-green.sh
-  scripts/ci/tag-ci-green.test.ts
-  scripts/ops/deploy-waves.sh
-  scripts/ops/deploy-waves.test.ts
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/pin-bump-arm.yml
