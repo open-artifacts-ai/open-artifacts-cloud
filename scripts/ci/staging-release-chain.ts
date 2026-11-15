@@ -30,7 +30,7 @@
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { billingConfigured, FULL_BILLING } from "./chain-dispatch.ts";
+import { billingConfigured, FULL_BILLING, ghRead } from "./chain-dispatch.ts";
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
@@ -56,6 +56,10 @@ const TARGET: Record<Next, { file: string; title: (tag: string) => string }> = {
 
 type Run = { id: number; display_title?: string };
 
+type Sleep = (ms: number) => void;
+const realSleep: Sleep = (ms) =>
+  void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
 function gh(exec: Exec, args: string[]): string {
   const r = exec("gh", args);
   if (r.code !== 0)
@@ -65,9 +69,15 @@ function gh(exec: Exec, args: string[]): string {
   return r.stdout;
 }
 
-export function latestRelease(exec: Exec, repo: string): string {
+export function latestRelease(
+  exec: Exec,
+  repo: string,
+  sleep: Sleep = realSleep,
+): string {
   const tag = (
-    JSON.parse(gh(exec, ["api", `repos/${repo}/releases/latest`])) as {
+    JSON.parse(
+      ghRead({ exec, sleep }, ["api", `repos/${repo}/releases/latest`]),
+    ) as {
       tag_name?: string;
     }
   ).tag_name;
@@ -79,13 +89,14 @@ export function latestRelease(exec: Exec, repo: string): string {
 /** Runs of `next`'s workflow for `tag`, in any state (this chain's carry ` [id]`). */
 export function existingRuns(o: {
   exec: Exec;
+  sleep?: Sleep;
   repo: string;
   next: Next;
   tag: string;
 }): number[] {
   const t = TARGET[o.next];
   const body = JSON.parse(
-    gh(o.exec, [
+    ghRead({ exec: o.exec, sleep: o.sleep ?? realSleep }, [
       "api",
       "-X",
       "GET",
@@ -109,6 +120,7 @@ export type Plan =
 
 export function plan(o: {
   exec: Exec;
+  sleep?: Sleep;
   repo: string;
   /** The event run's workflow file (workflow_run.path), not its name: a run-name replaces the name. */
   workflow: string;
@@ -131,7 +143,7 @@ export function plan(o: {
       return skip("a manual publish does not start the chain");
     if (!/^[1-9][0-9]{0,19}$/.test(o.runId)) throw new Error("bad run id");
     const jobs = JSON.parse(
-      gh(o.exec, [
+      ghRead({ exec: o.exec, sleep: o.sleep ?? realSleep }, [
         "api",
         "-X",
         "GET",
@@ -158,10 +170,16 @@ export function plan(o: {
   } else {
     return skip(`unexpected workflow ${o.workflow}`);
   }
-  const latest = latestRelease(o.exec, o.repo);
+  const latest = latestRelease(o.exec, o.repo, o.sleep);
   if (latest !== tag)
     return skip(`${tag} is not the newest release (${latest})`);
-  const have = existingRuns({ exec: o.exec, repo: o.repo, next, tag });
+  const have = existingRuns({
+    exec: o.exec,
+    sleep: o.sleep,
+    repo: o.repo,
+    next,
+    tag,
+  });
   if (have.length > 0)
     return skip(`a ${TARGET[next].file} run for ${tag} already exists`);
   return { go: true, next, tag };
@@ -170,6 +188,7 @@ export function plan(o: {
 /** Starts the next workflow; false (nothing started) if the tag's run exists or the tag went stale. */
 export function dispatch(o: {
   exec: Exec;
+  sleep?: Sleep;
   repo: string;
   next: Next;
   tag: string;
@@ -179,11 +198,16 @@ export function dispatch(o: {
 }): { started: boolean; why?: string } {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
   if (!CHAIN_RE.test(o.chainId)) throw new Error("bad chain id");
-  if (latestRelease(o.exec, o.repo) !== o.tag)
+  if (latestRelease(o.exec, o.repo, o.sleep) !== o.tag)
     return { started: false, why: `${o.tag} is no longer the newest release` };
   if (
-    existingRuns({ exec: o.exec, repo: o.repo, next: o.next, tag: o.tag })
-      .length > 0
+    existingRuns({
+      exec: o.exec,
+      sleep: o.sleep,
+      repo: o.repo,
+      next: o.next,
+      tag: o.tag,
+    }).length > 0
   )
     return { started: false, why: `a run for ${o.tag} already exists` };
   // Deploy: env, tag and the chain id, so every other input keeps the

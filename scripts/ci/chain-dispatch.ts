@@ -125,7 +125,10 @@ const READ_BACKOFF_MS = [2_000, 5_000, 10_000];
  * failure does not fail the chain while the deploy it started keeps running.
  * Never use this for a write (the dispatch, the cancel).
  */
-const ghRead = (o: Pick<Opts, "exec" | "sleep">, args: string[]): string => {
+export const ghRead = (
+  o: Pick<Opts, "exec" | "sleep">,
+  args: string[],
+): string => {
   for (let i = 0; ; i++) {
     try {
       return gh(o.exec, args);
