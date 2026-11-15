@@ -30,7 +30,7 @@ function jobs(text: string): Map<string, string> {
 describe("release App key environment", () => {
   // Public-repo workflows present in the overlay; they belong to the public
   // repo's own secrets, not this one.
-  const PUBLIC_ONLY = ["release-cadence.yml"];
+  const PUBLIC_ONLY = ["release-cadence.yml", "release-please.yml"];
   const files = readdirSync(dir).filter(
     (f) => /\.ya?ml$/.test(f) && !PUBLIC_ONLY.includes(f),
   );
