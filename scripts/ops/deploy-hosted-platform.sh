@@ -689,7 +689,14 @@ case "$target" in
     got="$(jq -c '[.result.bindings[] | select(.type == "ratelimit") | {name, namespace_id: (.namespace_id | tostring), limit: .simple.limit, period: .simple.period}] | sort_by(.name)' <<< "$S")"
     [ "$got" = "$want" ] || { echo "rate limits: got $got, want $want" >&2; exit 1; }
     billing_bound "$S" provisioning BillingOperatorRpc
-    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end)) | sort | join(",")' <<< "$want")"
+    # The install registry (#2520), read-only: required only when the tag's
+    # env block declares it (an older tag has none).
+    REG_DECLARED=""
+    if grep -q "{{BROKER_REGISTRY_ID_$(tr a-z A-Z <<< "$env")}}" "$root/apps/provisioning/wrangler.jsonc"; then
+      REG_DECLARED=1
+      expect "$S" '.result.bindings[] | select(.name == "BROKER_REGISTRY") | .namespace_id' "$BROKER_REGISTRY_ID" "BROKER_REGISTRY"
+    fi
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" --arg r "${REG_DECLARED:+BROKER_REGISTRY}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end) + (if $r == "" then [] else [$r] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }
@@ -877,6 +884,16 @@ case "$target" in
     need_workers oa-$P-auth-broker oa-$P-directory-broker
     # BILLING (#1568, when the tag declares it).
     billing_pre dispatch ""
+    # LOGIN (#2520, when the tag declares it for this env): provisioning's
+    # LoginChangeGate entrypoint, so provisioning deploys before dispatch in
+    # the target order and must exist before dispatch is bound to it.
+    login="$(node --experimental-strip-types --no-warnings "$root/scripts/ops/wrangler-env.ts" "$root/apps/dispatch/wrangler.jsonc" "$env" login)" ||
+      { echo "can't read dispatch's committed LOGIN binding" >&2; exit 1; }
+    if [ -n "$login" ] && [ "$login" != null ]; then
+      [ "$(jq -r '.service' <<< "$login")" = "oa-$P-provisioning" ] ||
+        { echo "the tag's dispatch LOGIN binding is not oa-$P-provisioning; refusing" >&2; exit 1; }
+      need_workers oa-$P-provisioning
+    fi
     HOSTS_KV_ID="$HOSTS_KV_ID" deploy dispatch
     S="$(settings oa-$P-dispatch)"
     expect "$S" '.result.bindings[] | select(.name == "HOSTS") | .namespace_id' "$HOSTS_KV_ID" "HOSTS"
@@ -884,6 +901,9 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "AUTH_BROKER") | .service' oa-$P-auth-broker "AUTH_BROKER"
     expect "$S" '.result.bindings[] | select(.name == "DIRECTORY_BROKER") | .service' oa-$P-directory-broker "DIRECTORY_BROKER"
     billing_bound "$S" dispatch ""
+    if [ -n "$login" ] && [ "$login" != null ]; then
+      expect "$S" '[.result.bindings[] | select(.name == "LOGIN") | "\(.type) \(.service) \(.entrypoint // "")"] | join(",")' "service oa-$P-provisioning LoginChangeGate" "dispatch LOGIN binding"
+    fi
     expect "$S" '.result.bindings[] | select(.name == "OA_ENV") | .text' "$env" "OA_ENV"
     observability_is "$S" dispatch
     ;;

@@ -620,24 +620,74 @@ describe("round 1", () => {
   });
 
   // Manager ruling 2026-10-24 (#572): hosted AUTH_DOMAINS isn't verified as
-  // owned, so a hosted install never admits by domain until it is.
-  it("always renders AUTH_DOMAIN_JOIN=invite", () => {
+  // owned, so a hosted install admits by domain only when its owner proved the
+  // domain (#2520): `member` needs the platform's marker and one domain.
+  it("renders AUTH_DOMAIN_JOIN=invite unless the owner's change says member", () => {
     const cases: Record<string, string>[] = [
       {},
       { AUTH_DOMAIN_JOIN: "invite" },
+      { AUTH_DOMAINS: "a.test,b.test" },
     ];
     for (const vars of cases) {
       const m = userWorkerMetadata(inst({ vars }), res());
       expect(text(m.bindings, "AUTH_DOMAIN_JOIN")).toBe("invite");
+      expect(
+        m.bindings.find(
+          (b: { name: string }) => b.name === "AUTH_DOMAIN_JOIN_SOURCE",
+        ),
+      ).toBeUndefined();
     }
   });
 
-  it.each(["member", "Member", "", " invite"])(
+  it("renders member with the owner marker and exactly one domain", () => {
+    const m = userWorkerMetadata(
+      inst({
+        vars: {
+          AUTH_DOMAINS: "acme.test",
+          AUTH_DOMAIN_JOIN: "member",
+          AUTH_DOMAIN_JOIN_SOURCE: "owner",
+        },
+      }),
+      res(),
+    );
+    expect(text(m.bindings, "AUTH_DOMAIN_JOIN")).toBe("member");
+    expect(text(m.bindings, "AUTH_DOMAIN_JOIN_SOURCE")).toBe("owner");
+  });
+
+  it.each([
+    [
+      "member without the marker",
+      { AUTH_DOMAINS: "a.test", AUTH_DOMAIN_JOIN: "member" },
+    ],
+    [
+      "the marker without member",
+      { AUTH_DOMAINS: "a.test", AUTH_DOMAIN_JOIN_SOURCE: "owner" },
+    ],
+    [
+      "member over two domains",
+      {
+        AUTH_DOMAINS: "a.test,b.test",
+        AUTH_DOMAIN_JOIN: "member",
+        AUTH_DOMAIN_JOIN_SOURCE: "owner",
+      },
+    ],
+    [
+      "member over no domain",
+      { AUTH_DOMAIN_JOIN: "member", AUTH_DOMAIN_JOIN_SOURCE: "owner" },
+    ],
+    ["a marker that is not owner", { AUTH_DOMAIN_JOIN_SOURCE: "operator" }],
+  ])("refuses %s", (_n, vars) => {
+    expect(() => userWorkerMetadata(inst({ vars }), res())).toThrow(
+      /AUTH_DOMAIN_JOIN/,
+    );
+  });
+
+  it.each(["Member", "", " invite", "everyone"])(
     "refuses AUTH_DOMAIN_JOIN=%j",
     (v) => {
       expect(() =>
         userWorkerMetadata(inst({ vars: { AUTH_DOMAIN_JOIN: v } }), res()),
-      ).toThrow(/AUTH_DOMAIN_JOIN.*invite/);
+      ).toThrow(/AUTH_DOMAIN_JOIN/);
     },
   );
 

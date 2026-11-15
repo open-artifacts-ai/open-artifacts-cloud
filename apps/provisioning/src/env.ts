@@ -76,6 +76,14 @@ export interface Env {
   BUSINESS_REQUESTS_TO?: string;
   /** Broker redeem only (4.3). */
   AUTH_BROKER: Fetcher;
+  /**
+   * The install registry (the auth broker's namespace), read-only: the keys
+   * a login change's signature is checked against (#2520). Unbound, the
+   * route answers 503 unavailable.
+   */
+  BROKER_REGISTRY?: KVNamespace;
+  /** "1" turns the instance's login-domain change route on (#2520); else its plain 404. */
+  LOGIN_CHANGE?: string;
   /** Self-serve producer (post-M1). */
   SIGNUPS: Queue;
   /** The admin SPA (single-page-application, Worker first). */

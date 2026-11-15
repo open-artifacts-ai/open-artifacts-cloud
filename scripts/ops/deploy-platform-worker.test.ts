@@ -786,6 +786,8 @@ describe("deploy-platform-worker.sh", () => {
     const OK = {
       PLATFORM_DB_ID: DB,
       PROVISIONING_OAUTH_KV_ID: KV,
+      // The install registry (#2520), read-only: staging declares it.
+      BROKER_REGISTRY_ID: REG,
       GITHUB_REPOSITORY_ID: "1012345678",
       SIGNUP_DAILY_CAP: "20",
       SIGNUPS_ENABLED: "false",
@@ -831,9 +833,11 @@ describe("deploy-platform-worker.sh", () => {
           '"WELCOME_FROM": "welcome@mail.open-artifacts.app"',
         );
         expect(snap).not.toMatch(new RegExp(`\\{\\{[A-Z0-9_]*_${up}\\}\\}`));
-        if (env === "staging")
+        if (env === "staging") {
           expect(snap).toContain('"OIDC_REPOSITORY_ID": "1012345678"');
-        else expect(snap).toContain("{{GITHUB_REPOSITORY_ID_STAGING}}");
+          // The registry binding is filled where declared (#2520).
+          expect(snap).toContain(`"id": "${REG}"`);
+        } else expect(snap).toContain("{{GITHUB_REPOSITORY_ID_STAGING}}");
         expect(r.out + r.err).not.toContain(KV);
       });
 

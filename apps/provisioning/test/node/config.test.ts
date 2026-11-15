@@ -155,6 +155,15 @@ describe("wrangler.jsonc", () => {
             binding: "OAUTH_KV",
             id: `{{PROVISIONING_OAUTH_KV_ID_${env.toUpperCase()}}}`,
           },
+          // The install registry, read-only (#2520): staging only.
+          ...(env === "staging"
+            ? [
+                {
+                  binding: "BROKER_REGISTRY",
+                  id: "{{BROKER_REGISTRY_ID_STAGING}}",
+                },
+              ]
+            : []),
         ]);
       });
 

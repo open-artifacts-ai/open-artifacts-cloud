@@ -53,6 +53,7 @@ export const HOSTED_ADDED = [
   "AUTH_PROVIDERS",
   "AUTH_DOMAINS",
   "AUTH_DOMAIN_JOIN",
+  "AUTH_DOMAIN_JOIN_SOURCE",
   "AUTH_BROKER_URL",
   "DIRECTORY_BROKER_URL",
   "GOOGLE_CLIENT_ID",
@@ -88,12 +89,16 @@ export const HOSTED_VARS: Record<string, (v: string) => string | undefined> = {
   CODE_EMAILS_PER_DAY: posInt,
   AUTH_PROVIDERS: list(/^[a-z][a-z0-9_-]*$/),
   AUTH_DOMAINS: list(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/i),
-  // Hosted AUTH_DOMAINS isn't verified as owned, so a hosted install never
-  // admits by domain: always "invite" until ownership is proven (#572).
+  // Hosted AUTH_DOMAINS isn't verified as owned, so a hosted install admits by
+  // domain only when its owner proved the domain (#2520): `member` needs the
+  // platform-only marker AUTH_DOMAIN_JOIN_SOURCE=owner and exactly one domain
+  // (checked with the other vars in userWorkerMetadata). Otherwise "invite".
   AUTH_DOMAIN_JOIN: (v) =>
-    v === "invite"
+    v === "invite" || v === "member"
       ? undefined
-      : 'hosted installs must use "invite" until domain ownership is proven (#572)',
+      : 'expected "invite" or "member"',
+  AUTH_DOMAIN_JOIN_SOURCE: (v) =>
+    v === "owner" ? undefined : 'expected "owner"',
   // The OAuth store (#1008): set by the provisioner's update job, on the
   // install's vars, so upgrades and rollbacks keep it.
   OAUTH_STORE: (v) =>
@@ -400,6 +405,20 @@ export function userWorkerMetadata(
     const why = hostedVarProblem(k, v);
     if (why) throw new Error(why);
   }
+  // #2520: `member` only with the owner's marker and one domain, and the
+  // marker only with `member`: an operator-typed domain never auto-joins.
+  const member = i.vars.AUTH_DOMAIN_JOIN === "member";
+  if (member !== (i.vars.AUTH_DOMAIN_JOIN_SOURCE === "owner"))
+    throw new Error(
+      'AUTH_DOMAIN_JOIN must be "invite" unless the owner\'s change set "member" with AUTH_DOMAIN_JOIN_SOURCE "owner" (#2520)',
+    );
+  if (
+    member &&
+    (i.vars.AUTH_DOMAINS ?? "").split(",").filter(Boolean).length !== 1
+  )
+    throw new Error(
+      'AUTH_DOMAIN_JOIN "member" needs exactly one domain (#2520)',
+    );
   if (i.vars.TEST_DOMAIN !== undefined && (!i.testHooks || r.env === "prod"))
     throw new Error(
       "TEST_DOMAIN is only allowed on test-hook installs outside prod",
@@ -487,6 +506,11 @@ export function userWorkerMetadata(
   for (const k of PASSTHROUGH) {
     const v = i.vars[k];
     if (v !== undefined) plain[k] = v;
+  }
+  // #2520: the owner's own domain join, with the marker the server reads.
+  if (member) {
+    plain.AUTH_DOMAIN_JOIN = "member";
+    plain.AUTH_DOMAIN_JOIN_SOURCE = "owner";
   }
   // "off" is the same as absent: nothing is uploaded.
   if (i.vars.EMAIL_CODE_DOMAIN === "on") plain.EMAIL_CODE_DOMAIN = "on";

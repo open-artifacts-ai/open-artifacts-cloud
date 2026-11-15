@@ -574,43 +574,44 @@ describe("platform-db.ts", () => {
         aheadOnMain: [],
       });
     });
+    // The newest pins of the real lock, so a new migration never shifts these.
+    const NEWEST = Object.keys(JSON.parse(readFileSync(LOCK, "utf8")).pins)
+      .sort()
+      .slice(-2) as [string, string];
     it("passes and reports one or two additive pins main has ahead of the tag", () => {
       const one = tagTree((_, pins) => {
-        delete pins["0015_business_requests.sql"];
+        delete pins[NEWEST[1]];
       });
       expect(pinDrift(LOCK, one.lock)).toEqual({
         problems: [],
-        aheadOnMain: ["0015_business_requests.sql"],
+        aheadOnMain: [NEWEST[1]],
       });
       const two = tagTree((_, pins) => {
-        delete pins["0014_waitlist_emailed.sql"];
-        delete pins["0015_business_requests.sql"];
+        delete pins[NEWEST[0]];
+        delete pins[NEWEST[1]];
       });
       expect(pinDrift(LOCK, two.lock)).toEqual({
         problems: [],
-        aheadOnMain: [
-          "0014_waitlist_emailed.sql",
-          "0015_business_requests.sql",
-        ],
+        aheadOnMain: [NEWEST[0], NEWEST[1]],
       });
     });
     it("still refuses an edited pin while main is ahead", () => {
       const t = tagTree((_, pins) => {
-        delete pins["0015_business_requests.sql"];
+        delete pins[NEWEST[1]];
         pins["0007_signups.sql"] = "0".repeat(64);
       });
       expect(pinDrift(LOCK, t.lock)).toEqual({
         problems: [
           "0007_signups.sql's pin differs from main's (an edited migration)",
         ],
-        aheadOnMain: ["0015_business_requests.sql"],
+        aheadOnMain: [NEWEST[1]],
       });
     });
     it("accepts a new migration the tag pins", () => {
       const t = tagTree((dir, pins) => {
         const sql = "CREATE TABLE IF NOT EXISTS x (id TEXT PRIMARY KEY);\n";
-        writeFileSync(join(dir, "0016_x.sql"), sql);
-        pins["0016_x.sql"] = sha(sql);
+        writeFileSync(join(dir, "9999_x.sql"), sql);
+        pins["9999_x.sql"] = sha(sql);
       });
       expect(() => loadMigrations(t.dir, t.lock)).not.toThrow();
       expect(pinDrift(LOCK, t.lock)).toEqual({

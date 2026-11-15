@@ -217,6 +217,11 @@ case "$app" in
     # Only staging has the OIDC principal (4.4); prod's block names no
     # repository, but the value is checked either way.
     fill "GITHUB_REPOSITORY_ID_${up}" "${GITHUB_REPOSITORY_ID:-}" "$repo_id"
+    # The install registry, read-only (#2520): only when this env's block
+    # declares it (staging first; an older tag has none).
+    if grep -q "{{BROKER_REGISTRY_ID_${up}}}" wrangler.jsonc; then
+      fill "BROKER_REGISTRY_ID_${up}" "${BROKER_REGISTRY_ID:-}" "$hex32"
+    fi
     ;;
 esac
 

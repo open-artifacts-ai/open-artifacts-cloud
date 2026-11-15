@@ -37,10 +37,10 @@ const WORKFLOWS: Record<Which, { file: string; name: string }> = {
 };
 const BOT = "github-actions[bot]";
 export const FULL =
-  "platform-db,auth-broker,directory-broker,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+  "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 /** The full list with billing (#1568), between the directory broker and provision-token. */
 export const FULL_BILLING =
-  "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,dispatch,inventory,provisioning,zones,scheduler";
+  "platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 const PRICE_RE = /^price_[A-Za-z0-9]{1,255}$/;
 const REQUIRED_PRICES = [
   "stripe_price_team",
