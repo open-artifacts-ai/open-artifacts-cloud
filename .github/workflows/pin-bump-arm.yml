@@ -16,6 +16,13 @@ on:
   # script; it must never check out or run the PR's code.
   pull_request_target:
     types: [opened, reopened, synchronize]
+  # The schedule is best-effort and may never fire, and CI on main is filtered
+  # out below, so a push to main (which changes what an open bump is judged
+  # against) and a manual run also re-evaluate every open bump. Every trigger
+  # checks out main and runs main's script; the plan is read-only.
+  push:
+    branches: [main]
+  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
 permissions: {}
@@ -27,6 +34,8 @@ jobs:
     # Cheap exits: a PR event for another branch, or a CI run for another branch.
     if: >-
       github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && startsWith(github.head_ref, 'pin-bump/')) ||
       (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/'))
     runs-on: ubuntu-latest

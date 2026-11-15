@@ -1089,9 +1089,17 @@ describe("workflow", () => {
   it("triggers on CI completion, bump PRs and a schedule, and never cancels a run", () => {
     expect(Object.keys(wf.on).sort()).toEqual([
       "pull_request_target",
+      "push",
       "schedule",
+      "workflow_dispatch",
       "workflow_run",
     ]);
+    // A push to main and a manual run re-evaluate open bumps; neither takes inputs.
+    expect(wf.on.push).toEqual({ branches: ["main"] });
+    expect(wf.on.workflow_dispatch ?? null).toBeNull();
+    const cond = String(wf.jobs.arm.if);
+    for (const ev of ["schedule", "push", "workflow_dispatch"])
+      expect(cond).toContain(`github.event_name == '${ev}'`);
     expect(wf.on.workflow_run).toEqual({
       workflows: ["CI"],
       types: ["completed"],
