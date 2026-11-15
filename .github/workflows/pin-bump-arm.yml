@@ -1,0 +1,60 @@
+# Arms a pin-only bump (cloud #264). When the release bot's pin-bump/* PR changes
+# only PUBLIC_PIN, SYNCED_FROM and pnpm-lock.yaml, the tag and sha agree with the
+# public repo's tag, the tag is newer than main's pin, and every required check is
+# green on the PR's current head, it enables auto-merge (the merge queue does the
+# rest). Anything else is left for a person. The rule is scripts/ci/pin-bump-arm.ts.
+# Always runs main's script (never the PR's), read-only until a PR qualifies; the
+# App token exists only right before the arm step.
+name: pin-bump-arm
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: "*/15 * * * *"
+permissions: {}
+concurrency:
+  group: pin-bump-arm
+  cancel-in-progress: false
+jobs:
+  arm:
+    # Cheap exits: a PR event for another branch, or a CI run for another branch.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'pin-bump/')) ||
+      (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: plan
+        name: Plan (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --experimental-strip-types scripts/ci/pin-bump-arm.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+      - id: app
+        if: ${{ steps.plan.outputs.write == 'true' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-contents: write
+      - name: Arm
+        if: ${{ steps.plan.outputs.write == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: node --experimental-strip-types scripts/ci/pin-bump-arm.ts arm --repo "$GITHUB_REPOSITORY"
