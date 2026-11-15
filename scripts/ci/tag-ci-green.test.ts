@@ -372,7 +372,8 @@ describe("tag-ci-green.sh", () => {
 
     it("still needs public CI green", () => {
       const s = mg();
-      s["pub-jobs"].jobs[0].conclusion = "failure";
+      (s["pub-jobs"] as { jobs: { conclusion: string }[] }).jobs[0].conclusion =
+        "failure";
       expect(run(s).code).toBe(1);
     });
   });
