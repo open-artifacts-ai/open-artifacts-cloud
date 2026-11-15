@@ -371,7 +371,7 @@ describe("tag-ci-green.sh", () => {
 
     it("still needs public CI green", () => {
       const s = mg();
-      s["pub-runs"] = running(PSHA, "completed", "failure");
+      s["pub-jobs"].jobs[0].conclusion = "failure";
       expect(run(s).code).toBe(1);
     });
   });
@@ -413,14 +413,22 @@ describe("tag-ci-green.sh", () => {
       }
     });
 
-    it("refuses a red public run, a red or missing public job", () => {
-      expect(
-        run(
-          edit((s) => {
-            s["pub-runs"] = running(PSHA, "completed", "failure");
-          }),
-        ).err,
-      ).toContain("public CI run 77");
+    it("passes when the public run failed only through a non-required job", () => {
+      const r = run(
+        edit((s) => {
+          s["pub-runs"] = running(PSHA, "completed", "failure");
+          s["pub-jobs"].jobs.push({
+            name: "public-only",
+            status: "completed",
+            conclusion: "failure",
+          });
+          s["pub-jobs"].total_count = PJOBS.length + 1;
+        }),
+      );
+      expect(r.code, r.err).toBe(0);
+    });
+
+    it("refuses a red or missing public job", () => {
       for (const name of PJOBS) {
         const red = run(
           edit((s) => {
