@@ -543,6 +543,50 @@ export function dropMedia(dirs: readonly string[]): number {
   return n;
 }
 
+const BLOB_RE = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
+
+/**
+ * Rebuilds each embedded base64 zip in the .html files under `dirs` without its
+ * media entries, in place, so a red run keeps its report. Any failure to read
+ * or rebuild deletes that html file (fail closed). Returns {stripped, dropped}.
+ */
+export function stripEmbeddedMedia(dirs: readonly string[]): {
+  stripped: number;
+  dropped: number;
+} {
+  let stripped = 0;
+  let dropped = 0;
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    for (const f of walk(d)) {
+      if (!f.endsWith(".html")) continue;
+      try {
+        const text = readFileSync(f, "latin1");
+        let changed = false;
+        const out = text.replace(BLOB_RE, (m) => {
+          const b = Buffer.from(m, "base64");
+          if (b.length < 4 || b.readUInt32LE(0) !== 0x04034b50) return m;
+          const entries = readZip(b);
+          if (!entries.some((e) => MEDIA.test(e.name))) return m;
+          changed = true;
+          const kept = entries.filter((e) => !MEDIA.test(e.name));
+          const nz = writeZip(kept);
+          readZip(nz); // read the rebuilt zip back
+          return nz.toString("base64");
+        });
+        if (changed) {
+          writeFileSync(f, out, "latin1");
+          stripped++;
+        }
+      } catch {
+        rmSync(f, { force: true });
+        dropped++;
+      }
+    }
+  }
+  return { stripped, dropped };
+}
+
 const SECRET_SHAPE = /oa_(?:pat|mac)_/;
 // Base64 split across lines is not reassembled (Playwright writes the embedded
 // zip on one line today); a split blob is scanned only in pieces.

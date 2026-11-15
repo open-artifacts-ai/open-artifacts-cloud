@@ -7,6 +7,7 @@ import {
   scanDirs,
   scrubDirs,
   secretLiterals,
+  stripEmbeddedMedia,
 } from "../src/t19-trace.ts";
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -36,6 +37,11 @@ try {
   if (ec) console.log(`dropped error-context: ${ec} file(s)`);
   const md = dropMedia(dirs);
   if (md) console.log(`dropped ${md} screenshots/videos`);
+  const se = stripEmbeddedMedia(dirs);
+  if (se.stripped || se.dropped)
+    console.log(
+      `embedded report: media stripped from ${se.stripped} file(s), ${se.dropped} dropped`,
+    );
   const r = scrubDirs(dirs, lit);
   if (r.dropped) console.log(`trace dropped: ${r.dropped}`);
   else console.log(`t19 trace: ${r.scrubbed} trace zip(s) scrubbed`);

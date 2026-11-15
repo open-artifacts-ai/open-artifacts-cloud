@@ -17,6 +17,7 @@ import {
   scrubDirs,
   scrubTraceZip,
   secretLiterals,
+  stripEmbeddedMedia,
   writeZip,
 } from "../src/t19-trace.ts";
 
@@ -417,5 +418,35 @@ describe("T19 report scan (#294)", () => {
     const split = `${blob.slice(0, 40)}\n${blob.slice(40)}`;
     writeFileSync(join(d, "index.html"), split);
     expect(scanDirs([d], [KEY]).hits).toEqual([]);
+  });
+
+  it("stripEmbeddedMedia keeps index.html, its zip loses the media, and the scan passes", () => {
+    const z = writeZip([
+      { name: "report.json", data: Buffer.from("{}") },
+      { name: "data/s.png", data: Buffer.from("\x89PNG screenshot") },
+      { name: "data/v.webm", data: Buffer.from("video") },
+    ]);
+    writeFileSync(
+      join(d, "index.html"),
+      `<script>data:application/zip;base64,${b64(z)}</script>`,
+    );
+    expect(stripEmbeddedMedia([d])).toEqual({ stripped: 1, dropped: 0 });
+    const html = readFileSync(join(d, "index.html"), "latin1");
+    const blob = /[A-Za-z0-9+/]{64,}={0,2}/.exec(html)?.[0] ?? "";
+    expect(readZip(Buffer.from(blob, "base64")).map((e) => e.name)).toEqual([
+      "report.json",
+    ]);
+    const r = scanDirs([d], [KEY]);
+    expect(r).toMatchObject({ dropped: [], hits: [] });
+  });
+
+  it("a corrupt embedded zip drops index.html", () => {
+    const z = writeZip([{ name: "report.json", data: Buffer.from("{}") }]);
+    writeFileSync(
+      join(d, "index.html"),
+      `x ${b64(z.subarray(0, z.length - 30))}`,
+    );
+    expect(stripEmbeddedMedia([d]).dropped).toBe(1);
+    expect(existsSync(join(d, "index.html"))).toBe(false);
   });
 });
