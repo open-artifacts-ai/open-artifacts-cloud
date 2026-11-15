@@ -459,6 +459,69 @@ describe("chain-dispatch", () => {
   });
 });
 
+describe("chain-dispatch read retries", () => {
+  const ok = { code: 0, stdout: "", stderr: "" };
+  function retryHarness(listFailures: number, dispatchFails = false) {
+    const sleeps: number[] = [];
+    let listCalls = 0;
+    let dispatches = 0;
+    const exec: Exec = (_c, a) => {
+      if (a[0] === "workflow") {
+        dispatches++;
+        return dispatchFails ? { code: 1, stdout: "", stderr: "HTTP 403" } : ok;
+      }
+      if (a[1]?.includes("/workflows/")) {
+        if (listCalls++ < listFailures)
+          return { code: 1, stdout: "", stderr: "" };
+        return {
+          code: 0,
+          stdout: JSON.stringify({ workflow_runs: [run()] }),
+          stderr: "",
+        };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify(
+          run({ status: "completed", conclusion: "success" }),
+        ),
+        stderr: "",
+      };
+    };
+    const go = () =>
+      dispatchAndWait({
+        exec,
+        repo: "o/r",
+        tag: "v1.2.3",
+        chainId: CHAIN,
+        now: () => T0,
+        sleep: (ms) => {
+          sleeps.push(ms);
+        },
+      });
+    return { go, sleeps, dispatches: () => dispatches, lists: () => listCalls };
+  }
+
+  it("one failed run-list read then success passes", () => {
+    const h = retryHarness(1);
+    expect(h.go().conclusion).toBe("success");
+    expect(h.sleeps).toEqual([2000]);
+  });
+
+  it("three failed reads fail with the gh error", () => {
+    const h = retryHarness(3);
+    expect(() => h.go()).toThrow(/gh api .*: exit 1/);
+    expect(h.lists()).toBe(3);
+    expect(h.sleeps).toEqual([2000, 5000]);
+  });
+
+  it("a failed dispatch is not retried", () => {
+    const h = retryHarness(0, true);
+    expect(() => h.go()).toThrow(/HTTP 403/);
+    expect(h.dispatches()).toBe(1);
+    expect(h.sleeps).toEqual([]);
+  });
+});
+
 describe("outputLine", () => {
   it("is one line: a multi-line error cannot add a deploy_run= line", () => {
     const evil =
