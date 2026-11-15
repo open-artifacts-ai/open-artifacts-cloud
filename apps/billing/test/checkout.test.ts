@@ -3875,25 +3875,42 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(s.calls.filter((c) => c.path.includes("balance"))).toEqual([]);
   });
 
-  it("a yearly Team checkout bills pending items monthly; monthly and Solo do not", async () => {
-    env = sEnv();
-    const s = fakeStripe();
-    await call(
-      req("/checkout", {
-        install: A,
-        plan: "team",
-        interval: "year",
-        members: 3,
-      }),
-    );
-    await call(req("/checkout", { install: A, plan: "team", members: 3 }, {}));
-    const forms = s.calls.filter((c) => c.path === CHECKOUT).map((c) => c.form);
-    expect(
-      forms[0]?.["subscription_data[pending_invoice_item_interval][interval]"],
-    ).toBe("month");
-    expect(forms[1]).not.toHaveProperty(
-      "subscription_data[pending_invoice_item_interval][interval]",
-    );
+  it("a completed yearly Team checkout sets the monthly pending-invoice interval first (key piii-<sub>), then applies the stored count; monthly does not", async () => {
+    await seed(A, "cus_existingA", "trial");
+    await db
+      .prepare(
+        "INSERT INTO seats (install_id, members, ts, apply_outcome, updated_at) VALUES (?1, 5, 1, 'trial', 1)",
+      )
+      .bind(A)
+      .run();
+    const s = stripeAt(3, "year");
+    const r = await hook("evt_pi1", "checkout.session.completed", {
+      subscription: SUB,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+    });
+    expect(r.status).toBe(200);
+    const order = s.calls
+      .filter((c) => c.method === "POST")
+      .map((c) => [c.path, c.key, c.form]);
+    expect(order).toEqual([
+      [
+        SUBS,
+        `piii-${SUB}`,
+        { "pending_invoice_item_interval[interval]": "month" },
+      ],
+      [ITEM, expect.stringMatching(/^seats-/), expect.objectContaining({ quantity: "5" })],
+    ]);
+    // Monthly: no interval change.
+    await db.prepare("DELETE FROM seats").run();
+    await db.prepare("DELETE FROM stripe_events").run();
+    const m = stripeAt(3, "month");
+    await hook("evt_pi2", "checkout.session.completed", {
+      subscription: SUB,
+      payment_status: "paid",
+      metadata: { tier: "team" },
+    });
+    expect(m.calls.filter((c) => c.path === SUBS && c.method === "POST")).toEqual([]);
   });
 
   it("a completed checkout applies the stored count (L3)", async () => {

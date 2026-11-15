@@ -49,12 +49,6 @@ export interface CheckoutInput {
    * needs it at least 48 hours ahead: the caller checks.
    */
   trialEnd?: number;
-  /**
-   * Bill pending invoice items (seat prorations, #2580) once a month, on one
-   * month-end invoice: subscription_data[pending_invoice_item_interval]
-   * [interval]=month. For the yearly Team and Business checkout.
-   */
-  pendingInvoiceMonthly?: boolean;
 }
 
 export interface PortalInput {
@@ -235,12 +229,6 @@ export function createCheckoutSession(
         ...(input.trialEnd === undefined
           ? {}
           : { "subscription_data[trial_end]": String(input.trialEnd) }),
-        ...(input.pendingInvoiceMonthly
-          ? {
-              "subscription_data[pending_invoice_item_interval][interval]":
-                "month",
-            }
-          : {}),
       },
       input.idempotencyKey,
     ),
@@ -800,6 +788,55 @@ export async function setSeatQuantity(
     input.idempotencyKey,
   );
   return { outcome: "updated", proration, ...seen };
+}
+
+/**
+ * A yearly Team or Business subscription bills its pending invoice items
+ * (seat prorations, #2580) once a month, on one month-end invoice:
+ * subscriptions.update pending_invoice_item_interval[interval]=month, key
+ * piii-<subscription>. Only a live subscription with an item at one of
+ * `yearlyPriceIds` recurring yearly is changed; one already on month is left.
+ */
+export async function ensureMonthlyPendingInvoices(
+  input: { subscriptionId: string; yearlyPriceIds: readonly string[] },
+  cfg: StripeConfig,
+): Promise<{ outcome: "set" | "unchanged" | "not_yearly" }> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  for (const p of input.yearlyPriceIds) check(PRICE, "yearlyPriceIds", p);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/subscriptions/${id}`,
+    null,
+    null,
+  );
+  const items = (out?.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  const yearly = items.some((i) => {
+    const price = (
+      i as {
+        price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+      } | null
+    )?.price;
+    return (
+      typeof price?.id === "string" &&
+      input.yearlyPriceIds.includes(price.id) &&
+      price.recurring?.interval === "year"
+    );
+  });
+  if (!yearly) return { outcome: "not_yearly" };
+  const pending = out?.pending_invoice_item_interval as
+    | { interval?: unknown }
+    | null
+    | undefined;
+  if (pending?.interval === "month") return { outcome: "unchanged" };
+  await post(
+    cfg,
+    `/v1/subscriptions/${id}`,
+    { "pending_invoice_item_interval[interval]": "month" },
+    `piii-${id}`,
+  );
+  return { outcome: "set" };
 }
 
 /**

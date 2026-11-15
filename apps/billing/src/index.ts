@@ -44,6 +44,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   type CheckoutTier,
   clearCustomerCredit,
+  ensureMonthlyPendingInvoices,
   createCheckoutSession,
   createCustomer,
   createOverageInvoice,
@@ -766,7 +767,6 @@ async function checkout(
         tier,
         ...(quantity === undefined ? {} : { quantity }),
         ...(trialEnd === undefined ? {} : { trialEnd }),
-        ...(yearly ? { pendingInvoiceMonthly: true } : {}),
         successUrl: `${base}?checkout=done`,
         cancelUrl: `${base}?checkout=cancel`,
         idempotencyKey,
@@ -2115,6 +2115,7 @@ export default {
               object?: {
                 id?: unknown;
                 customer?: unknown;
+                subscription?: unknown;
                 items?: { data?: unknown };
               };
             };
@@ -2124,8 +2125,31 @@ export default {
             (ev.type === "checkout.session.completed" ||
               ev.type === "checkout.session.async_payment_succeeded") &&
             typeof customer === "string"
-          )
+          ) {
+            // A yearly plan's seat prorations bill monthly: set that first,
+            // then apply the stored count. A Stripe failure here asks Stripe
+            // to resend the event.
+            const sub = ev.data?.object?.subscription;
+            if (typeof sub === "string" && /^sub_[A-Za-z0-9]{1,255}$/.test(sub)) {
+              const yearly = [
+                env.STRIPE_PRICE_TEAM_YEARLY,
+                env.STRIPE_PRICE_BUSINESS_YEARLY,
+              ].filter((v) => typeof v === "string" && v !== "");
+              try {
+                if (yearly.length > 0)
+                  await stripe("-", () =>
+                    ensureMonthlyPendingInvoices(
+                      { subscriptionId: sub, yearlyPriceIds: yearly },
+                      stripeConfig(env),
+                    ),
+                  );
+              } catch {
+                console.error("billing seats pending_interval failed");
+                return bad("unavailable", 503);
+              }
+            }
             await applySeatsOnCheckout(env, customer, Date.now());
+          }
           const obj = ev.data?.object;
           if (
             ev.type === "customer.subscription.deleted" &&

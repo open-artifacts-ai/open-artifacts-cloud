@@ -10,6 +10,7 @@ export {
   type CustomerInput,
   cancelSubscription,
   clearCustomerCredit,
+  ensureMonthlyPendingInvoices,
   createCheckoutSession,
   createCustomer,
   createOverageInvoice,
