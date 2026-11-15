@@ -44,7 +44,6 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   type CheckoutTier,
   clearCustomerCredit,
-  ensureMonthlyPendingInvoices,
   createCheckoutSession,
   createCustomer,
   createOverageInvoice,
@@ -53,6 +52,7 @@ import {
   createSoloTrialSubscription,
   createTestClock,
   deletePendingOverageItems,
+  ensureMonthlyPendingInvoices,
   expireCheckoutSession,
   finalizeInvoice,
   findOverageInvoice,
@@ -2130,7 +2130,10 @@ export default {
             // then apply the stored count. A Stripe failure here asks Stripe
             // to resend the event.
             const sub = ev.data?.object?.subscription;
-            if (typeof sub === "string" && /^sub_[A-Za-z0-9]{1,255}$/.test(sub)) {
+            if (
+              typeof sub === "string" &&
+              /^sub_[A-Za-z0-9]{1,255}$/.test(sub)
+            ) {
               const yearly = [
                 env.STRIPE_PRICE_TEAM_YEARLY,
                 env.STRIPE_PRICE_BUSINESS_YEARLY,

@@ -3899,7 +3899,11 @@ describe("per-member seats: POST /seats (#2580)", () => {
         `piii-${SUB}`,
         { "pending_invoice_item_interval[interval]": "month" },
       ],
-      [ITEM, expect.stringMatching(/^seats-/), expect.objectContaining({ quantity: "5" })],
+      [
+        ITEM,
+        expect.stringMatching(/^seats-/),
+        expect.objectContaining({ quantity: "5" }),
+      ],
     ]);
     // Monthly: no interval change.
     await db.prepare("DELETE FROM seats").run();
@@ -3910,7 +3914,9 @@ describe("per-member seats: POST /seats (#2580)", () => {
       payment_status: "paid",
       metadata: { tier: "team" },
     });
-    expect(m.calls.filter((c) => c.path === SUBS && c.method === "POST")).toEqual([]);
+    expect(
+      m.calls.filter((c) => c.path === SUBS && c.method === "POST"),
+    ).toEqual([]);
   });
 
   it("a completed checkout applies the stored count (L3)", async () => {
