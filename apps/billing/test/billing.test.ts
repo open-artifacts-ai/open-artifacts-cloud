@@ -40,6 +40,7 @@ beforeEach(async () => {
     db.prepare("DELETE FROM tiers"),
     db.prepare("DELETE FROM usage"),
     db.prepare("DELETE FROM overage"),
+    db.prepare("DELETE FROM seats"),
     db.prepare("DELETE FROM stripe_events"),
   ]);
   clearRegistryCache();

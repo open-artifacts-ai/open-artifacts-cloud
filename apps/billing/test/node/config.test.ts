@@ -72,6 +72,7 @@ describe("wrangler.jsonc", () => {
         STRIPE_PRICE_TEAM_YEARLY: `{{STRIPE_PRICE_TEAM_YEARLY_${up}}}`,
         STRIPE_PRICE_BUSINESS_YEARLY: `{{STRIPE_PRICE_BUSINESS_YEARLY_${up}}}`,
         STRIPE_PORTAL_CONFIG: `{{STRIPE_PORTAL_CONFIG_${up}}}`,
+        PER_MEMBER_FROM: "",
       });
       for (const k of [
         "services",
@@ -109,7 +110,7 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage, 0007_retry and 0008_cancels_at are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage, 0007_retry, 0008_cancels_at and 0009_seats are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
@@ -120,6 +121,7 @@ describe("migrations", () => {
       "0006_overage.sql",
       "0007_retry.sql",
       "0008_cancels_at.sql",
+      "0009_seats.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -177,6 +179,22 @@ describe("migrations", () => {
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
     );
+  });
+
+  it("0009 creates the seats table keyed by install (#2580)", () => {
+    const sql = readFileSync(join(app, "migrations/0009_seats.sql"), "utf8");
+    expect(sql).toMatch(
+      /CREATE TABLE seats \(\n {2}install_id TEXT PRIMARY KEY,/,
+    );
+    for (const c of [
+      "members",
+      "ts",
+      "applied_quantity",
+      "applied_at",
+      "apply_outcome",
+      "updated_at",
+    ])
+      expect(sql).toMatch(new RegExp(`\\n {2}${c} `));
   });
 
   it("0008 adds cancels_at, renews_at and billing_interval to tiers (#2138, #2135)", () => {
@@ -279,7 +297,7 @@ describe("bundle", () => {
     ).toThrow(/entry-point/);
   });
 
-  it("wrangler deploy --dry-run is under 104 KB per env", () => {
+  it("wrangler deploy --dry-run is under 128 KB per env", () => {
     for (const env of ENVS) {
       const out = mkdtempSync(join(tmpdir(), "oa-billing-"));
       wrangler(["--env", env, "--outdir", out]);
@@ -291,8 +309,9 @@ describe("bundle", () => {
       // 64 KB until the staging test clocks (the clock call and its gate);
       // 72 KB until per-creator quantity (#2123: the usage apply path);
       // 80 KB until the yearly overage invoice (#2235);
+      // 128 KB with per-member seats (#2580);
       // 96 KB until the cron retry and overage payment state (#2210, #2246).
-      expect(bytes).toBeLessThan(104 * 1024);
+      expect(bytes).toBeLessThan(128 * 1024);
     }
   });
 });

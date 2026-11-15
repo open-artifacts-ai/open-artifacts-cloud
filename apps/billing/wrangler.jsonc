@@ -40,6 +40,9 @@
         "STRIPE_PRICE_BUSINESS_YEARLY": "{{STRIPE_PRICE_BUSINESS_YEARLY_STAGING}}",
         // Customer Portal configuration (bpc_...): seats and plan changes off. Empty: Stripe's default.
         "STRIPE_PORTAL_CONFIG": "{{STRIPE_PORTAL_CONFIG_STAGING}}",
+        // Per-member billing start (#2580), epoch ms; empty = off. Only
+        // subscriptions created at or after it bill per member.
+        "PER_MEMBER_FROM": "",
         // Exact install ids whose customer is made on a Stripe test clock
         // (M2 step 8; test-clock.ts), by install id or slug. Staging only.
         "STAGING_TEST_CLOCK_INSTALLS": "m2-walk"
@@ -82,7 +85,9 @@
         "STRIPE_PRICE_TEAM_YEARLY": "{{STRIPE_PRICE_TEAM_YEARLY_PROD}}",
         "STRIPE_PRICE_BUSINESS_YEARLY": "{{STRIPE_PRICE_BUSINESS_YEARLY_PROD}}",
         // Customer Portal configuration (bpc_...): seats and plan changes off. Empty: Stripe's default.
-        "STRIPE_PORTAL_CONFIG": "{{STRIPE_PORTAL_CONFIG_PROD}}"
+        "STRIPE_PORTAL_CONFIG": "{{STRIPE_PORTAL_CONFIG_PROD}}",
+        // Per-member billing start (#2580), epoch ms; empty = off.
+        "PER_MEMBER_FROM": ""
       },
       "workers_dev": false,
       "preview_urls": false,

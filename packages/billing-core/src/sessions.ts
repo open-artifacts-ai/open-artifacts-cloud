@@ -623,6 +623,276 @@ export async function setSubscriptionQuantity(
   };
 }
 
+// ------------------------------------------- per-member seats (#2580)
+
+/** What setSeatQuantity did. */
+export type SeatOutcome =
+  | "updated"
+  | "unchanged"
+  /** Canceled, incomplete, gone (404): left alone. */
+  | "not_live"
+  /** Not one item at the tier's monthly or yearly price: left alone. */
+  | "unknown_price"
+  /** Created before perMemberFrom: it keeps the old counting, nothing written. */
+  | "legacy"
+  /** An increase past max(current + 10, 2 x current): not applied. */
+  | "held"
+  /** An increase while a yearly seat invoice is unpaid: not applied. */
+  | "unpaid_hold";
+
+export interface SeatInput {
+  subscriptionId: string;
+  /** The member count to bill (1..10000). */
+  quantity: number;
+  /** The tier's monthly and yearly prices (an unset yearly one is omitted). */
+  monthlyPriceIds: readonly string[];
+  yearlyPriceIds: readonly string[];
+  /** Billing's key: seats-<install>-<ts>-<quantity>. */
+  idempotencyKey: string;
+  /** ms: a subscription created before this is "legacy" and left alone. */
+  perMemberFrom?: number;
+  /** Refuse any increase (a yearly seat invoice is unpaid). */
+  blockIncrease?: boolean;
+}
+
+/** An increase past this is held for a person to look at (#2580). */
+export const seatJumpLimit = (current: number): number =>
+  Math.max(current + 10, 2 * current);
+
+type Proration = "create_prorations" | "none";
+
+/**
+ * The one place the seat proration rule lives (#2580), per interval: what an
+ * increase and a decrease are written with. Both create prorations (a
+ * removal is a credit on the next invoice, like Slack); change a value here
+ * to change the rule. deferDown true would hold a decrease for the daily
+ * cron (unused today).
+ */
+export const SEAT_PRORATION: Readonly<
+  Record<
+    "month" | "year",
+    { up: Proration; down: Proration; deferDown: boolean }
+  >
+> = {
+  month: {
+    up: "create_prorations",
+    down: "create_prorations",
+    deferDown: false,
+  },
+  year: {
+    up: "create_prorations",
+    down: "create_prorations",
+    deferDown: false,
+  },
+};
+
+/** Proration for a seat change, from SEAT_PRORATION. */
+export function seatProration(
+  interval: "month" | "year",
+  previous: number,
+  quantity: number,
+): Proration {
+  const r = SEAT_PRORATION[interval];
+  return quantity <= previous ? r.down : r.up;
+}
+
+/**
+ * Sets a live Team or Business subscription's item quantity to the member
+ * count with the proration seatProration names. Writes nothing unless the
+ * subscription is live (active or past_due) with exactly one item at one of
+ * the tier's prices; an item already at `quantity` is not written.
+ */
+export async function setSeatQuantity(
+  input: SeatInput,
+  cfg: StripeConfig,
+): Promise<{
+  outcome: SeatOutcome;
+  previous?: number;
+  interval?: "month" | "year";
+  proration?: Proration;
+  /** The subscription's creation time (ms), when Stripe gave one. */
+  created?: number;
+}> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const quantity = input.quantity;
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
+    throw new StripeConfigError("quantity");
+  for (const p of [...input.monthlyPriceIds, ...input.yearlyPriceIds])
+    check(PRICE, "priceIds", p);
+  check(IDEMPOTENCY, "idempotencyKey", input.idempotencyKey);
+  let status: number;
+  let out: Record<string, unknown> | null;
+  try {
+    ({ status, out } = await send(
+      cfg,
+      "GET",
+      `/v1/subscriptions/${id}`,
+      null,
+      null,
+    ));
+  } catch (e) {
+    if (e instanceof StripeApiError && e.status === 404)
+      return { outcome: "not_live" };
+    throw e;
+  }
+  if (typeof out?.status !== "string")
+    throw new StripeApiError(status, "bad_answer");
+  if (!QUANTITY_LIVE.has(out.status)) return { outcome: "not_live" };
+  const items = (out.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  if (items.length !== 1) return { outcome: "unknown_price" };
+  const item = items[0] as {
+    id?: unknown;
+    quantity?: unknown;
+    price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+  };
+  if (typeof item?.id !== "string" || !SUBSCRIPTION_ITEM.test(item.id))
+    throw new StripeApiError(status, "bad_answer");
+  const priceId = item.price?.id;
+  const rec = item.price?.recurring?.interval;
+  const interval =
+    typeof priceId === "string" &&
+    rec === "month" &&
+    input.monthlyPriceIds.includes(priceId)
+      ? "month"
+      : typeof priceId === "string" &&
+          rec === "year" &&
+          input.yearlyPriceIds.includes(priceId)
+        ? "year"
+        : null;
+  if (!interval) return { outcome: "unknown_price" };
+  const previous =
+    typeof item.quantity === "number" ? item.quantity : undefined;
+  const created =
+    typeof out.created === "number" ? out.created * 1000 : undefined;
+  const seen = {
+    interval,
+    ...(previous === undefined ? {} : { previous }),
+    ...(created === undefined ? {} : { created }),
+  } as const;
+  if (
+    input.perMemberFrom !== undefined &&
+    (created === undefined || created < input.perMemberFrom)
+  )
+    return { outcome: "legacy", ...seen };
+  if (previous === quantity) return { outcome: "unchanged", ...seen };
+  if (previous !== undefined && quantity > previous) {
+    if (input.blockIncrease) return { outcome: "unpaid_hold", ...seen };
+    if (quantity > seatJumpLimit(previous)) return { outcome: "held", ...seen };
+  }
+  const proration = seatProration(interval, previous ?? 0, quantity);
+  await post(
+    cfg,
+    `/v1/subscription_items/${item.id}`,
+    { quantity: String(quantity), proration_behavior: proration },
+    input.idempotencyKey,
+  );
+  return { outcome: "updated", proration, ...seen };
+}
+
+/**
+ * A yearly Team or Business subscription bills its pending invoice items
+ * (seat prorations, #2580) once a month, on one month-end invoice:
+ * subscriptions.update pending_invoice_item_interval[interval]=month, key
+ * piii-<subscription>. Only a live subscription with an item at one of
+ * `yearlyPriceIds` recurring yearly is changed; one already on month is left.
+ */
+export async function ensureMonthlyPendingInvoices(
+  input: {
+    subscriptionId: string;
+    yearlyPriceIds: readonly string[];
+    /** ms: a subscription created before this is left alone ("legacy"). */
+    createdFrom?: number;
+  },
+  cfg: StripeConfig,
+): Promise<{ outcome: "set" | "unchanged" | "not_yearly" | "legacy" }> {
+  const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  for (const p of input.yearlyPriceIds) check(PRICE, "yearlyPriceIds", p);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/subscriptions/${id}`,
+    null,
+    null,
+  );
+  const items = (out?.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) throw new StripeApiError(status, "bad_answer");
+  const yearly = items.some((i) => {
+    const price = (
+      i as {
+        price?: { id?: unknown; recurring?: { interval?: unknown } | null };
+      } | null
+    )?.price;
+    return (
+      typeof price?.id === "string" &&
+      input.yearlyPriceIds.includes(price.id) &&
+      price.recurring?.interval === "year"
+    );
+  });
+  if (!yearly) return { outcome: "not_yearly" };
+  if (
+    input.createdFrom !== undefined &&
+    !(
+      typeof out?.created === "number" &&
+      out.created * 1000 >= input.createdFrom
+    )
+  )
+    return { outcome: "legacy" };
+  const pending = out?.pending_invoice_item_interval as
+    | { interval?: unknown }
+    | null
+    | undefined;
+  if (pending?.interval === "month") return { outcome: "unchanged" };
+  await post(
+    cfg,
+    `/v1/subscriptions/${id}`,
+    { "pending_invoice_item_interval[interval]": "month" },
+    `piii-${id}`,
+  );
+  return { outcome: "set" };
+}
+
+/**
+ * Zeroes a customer's credit balance when a Team or Business plan ends
+ * (#2580: the credit from seat removals ends with the plan). In Stripe a
+ * credit is a negative customer.balance; it is cleared with a balance
+ * transaction of the opposite sign, only when the balance is below zero.
+ * The key is credit-end-<subscription>, so a retry is one write.
+ */
+export async function clearCustomerCredit(
+  input: { customerId: string; subscriptionId: string },
+  cfg: StripeConfig,
+): Promise<{ outcome: "cleared" | "none"; amount?: number }> {
+  const id = check(CUSTOMER, "customerId", input.customerId);
+  const sub = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
+  const { status, out } = await send(
+    cfg,
+    "GET",
+    `/v1/customers/${id}`,
+    null,
+    null,
+  );
+  const balance = out?.balance;
+  if (typeof balance !== "number" || !Number.isSafeInteger(balance))
+    throw new StripeApiError(status, "bad_answer");
+  if (balance >= 0) return { outcome: "none" };
+  const currency =
+    typeof out?.currency === "string" && /^[a-z]{3}$/.test(out.currency)
+      ? out.currency
+      : "usd";
+  await post(
+    cfg,
+    `/v1/customers/${id}/balance_transactions`,
+    {
+      amount: String(-balance),
+      currency,
+      description: "Credit ends with the plan",
+    },
+    `credit-end-${sub}`,
+  );
+  return { outcome: "cleared", amount: -balance };
+}
+
 // ------------------------------------------------- yearly overage (#2235)
 
 const INVOICE_ITEM = /^ii_[A-Za-z0-9_]{1,255}$/;

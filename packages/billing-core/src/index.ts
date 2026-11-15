@@ -9,6 +9,7 @@ export {
   type CheckoutTier,
   type CustomerInput,
   cancelSubscription,
+  clearCustomerCredit,
   createCheckoutSession,
   createCustomer,
   createOverageInvoice,
@@ -17,6 +18,7 @@ export {
   createSoloTrialSubscription,
   createTestClock,
   deletePendingOverageItems,
+  ensureMonthlyPendingInvoices,
   expireCheckoutSession,
   finalizeInvoice,
   findOverageInvoice,
@@ -28,6 +30,7 @@ export {
   retrieveCustomerPaymentMethod,
   retrieveInvoiceStatus,
   retrieveSubscription,
+  SEAT_PRORATION,
   SOLO_TRIAL_DAYS,
   type SoloTrialInput,
   STRIPE_API,
@@ -35,6 +38,8 @@ export {
   type StripeConfig,
   StripeConfigError,
   type StripeSession,
+  seatJumpLimit,
+  setSeatQuantity,
   setSubscriptionQuantity,
 } from "./sessions.js";
 export {
