@@ -410,7 +410,7 @@ export function userWorkerMetadata(
   const member = i.vars.AUTH_DOMAIN_JOIN === "member";
   if (member !== (i.vars.AUTH_DOMAIN_JOIN_SOURCE === "owner"))
     throw new Error(
-      'AUTH_DOMAIN_JOIN "member" and AUTH_DOMAIN_JOIN_SOURCE "owner" go together (#2520)',
+      'AUTH_DOMAIN_JOIN must be "invite" unless the owner\'s change set "member" with AUTH_DOMAIN_JOIN_SOURCE "owner" (#2520)',
     );
   if (
     member &&

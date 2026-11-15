@@ -692,7 +692,9 @@ describe("0012_solo_start (self-serve Solo start)", () => {
 
 describe("0015_business_requests (the Business contact form, open-artifacts#2404)", () => {
   it("follows 0014 and only adds the business_requests table and an index", () => {
-    expect(migrationFiles.slice(14)).toEqual(["0015_business_requests.sql"]);
+    expect(migrationFiles.slice(14, 15)).toEqual([
+      "0015_business_requests.sql",
+    ]);
     const sql = migrationSql("0015_business_requests.sql").replace(
       /--[^\n]*/g,
       "",
@@ -824,5 +826,21 @@ describe("0013_signup_beta_gate (allow list and waitlist, #2096)", () => {
         )
         .run(),
     ).toThrow();
+  });
+});
+
+describe("0016_login_change_nonces (an instance's login-domain change, open-artifacts#2520)", () => {
+  it("follows 0015 and only adds the login_change_nonces table and an index", () => {
+    expect(migrationFiles.slice(15)).toEqual(["0016_login_change_nonces.sql"]);
+    const sql = migrationSql("0016_login_change_nonces.sql").replace(
+      /--[^\n]*/g,
+      "",
+    );
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
+    expect(
+      cols(platformDb(), "login_change_nonces").map((c) =>
+        c.replace(/ NN/, ""),
+      ),
+    ).toEqual(["install_id TEXT PK", "nonce TEXT PK", "at INTEGER"]);
   });
 });
