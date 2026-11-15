@@ -237,7 +237,8 @@ describe("deploy-hosted-platform.yml", () => {
       group: "hosted-platform-${{ inputs.env }}",
       "cancel-in-progress": false,
     });
-    expect(job["timeout-minutes"]).toBeLessThanOrEqual(30);
+    // 25 min of it may be the CI guard waiting for main's push CI (tag-ci-green.sh).
+    expect(job["timeout-minutes"]).toBeLessThanOrEqual(40);
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {

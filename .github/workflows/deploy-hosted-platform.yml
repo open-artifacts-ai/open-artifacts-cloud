@@ -111,7 +111,7 @@ jobs:
       # nothing more open: ALLOW_INVITE admits invite only, never true or
       # test-users. The committed prod.json stays false until it is flipped.
       ALLOW_INVITE: ${{ inputs.env == 'prod' && '1' || '' }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check the inputs
         env:

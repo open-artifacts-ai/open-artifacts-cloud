@@ -24,7 +24,10 @@ p="\${@: -1}"; p="\${p#repos/$REPO/}"
 case "$p" in
   commits/*) k=commit ;;
   compare/*) k=compare ;;
-  actions/workflows/ci.yml/runs\\?*) k=runs ;;
+  actions/workflows/ci.yml/runs\\?*)
+    n=$(( $(cat "$STATE/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$STATE/n"
+    k=runs; i=$n
+    while [ $i -ge 1 ]; do [ -f "$STATE/runs-$i.json" ] && { k="runs-$i"; break; }; i=$((i-1)); done ;;
   actions/runs/*/jobs\\?*) k=jobs ;;
   *) exit 1 ;;
 esac
@@ -58,7 +61,7 @@ const good = (): State => ({
 });
 
 const run = (state: State, tag = TAG) => {
-  const sb = sandbox({ gh });
+  const sb = sandbox({ gh, sleep: "true" });
   const dir = join(sb.dir, "state");
   mkdirSync(dir);
   for (const [k, v] of Object.entries(state))
@@ -69,6 +72,9 @@ const run = (state: State, tag = TAG) => {
       );
   const r = sb.run(["bash", SCRIPT, tag], {
     env: {
+      CI_POLL_SECS: "60",
+      CI_WAIT_CAP_SECS: "180",
+      CI_APPEAR_SECS: "120",
       STATE: dir,
       REPO,
       GH_TOKEN: "gh-token-SHOULD-NEVER-APPEAR",
@@ -90,7 +96,11 @@ describe("tag-ci-green.sh", () => {
     const r = run(good());
     expect(r.code).toBe(0);
     expect(r.out).toContain("passed CI on main");
-    expect(r.calls.every((c) => c.startsWith("gh api -X GET"))).toBe(true);
+    expect(
+      r.calls.every(
+        (c) => c.startsWith("gh api -X GET") || c.startsWith("sleep"),
+      ),
+    ).toBe(true);
   });
 
   it("refuses when there is no CI push run for the commit", () => {
@@ -111,21 +121,82 @@ describe("tag-ci-green.sh", () => {
     }
   });
 
-  it("refuses a run that is red, cancelled or still running", () => {
-    for (const [status, conclusion] of [
-      ["completed", "failure"],
-      ["completed", "cancelled"],
-      ["in_progress", null],
-      ["queued", null],
-    ]) {
+  it("refuses at once a run that completed red or cancelled, without waiting", () => {
+    for (const conclusion of ["failure", "cancelled", "timed_out"]) {
       const r = run(
         edit((s) => {
-          Object.assign(s.runs.workflow_runs[0], { status, conclusion });
+          s.runs.workflow_runs[0].conclusion = conclusion;
         }),
       );
-      expect(r.code, `${status}/${conclusion}`).toBe(1);
-      expect(r.err).toContain("CI run 77");
+      expect(r.code, conclusion).toBe(1);
+      expect(r.err).toContain(`CI run 77 for ${SHA}: ${conclusion}`);
+      expect(r.calls.some((c) => c.startsWith("sleep"))).toBe(false);
     }
+  });
+
+  const running = (status: string, conclusion: string | null = null) =>
+    // biome-ignore lint/suspicious/noExplicitAny: test fixtures
+    edit((s: any) => {
+      s.runs.workflow_runs[0] = {
+        ...s.runs.workflow_runs[0],
+        status,
+        conclusion,
+      };
+    }).runs;
+
+  it("waits while the run is queued or in progress, then proceeds when it completes green", () => {
+    const s = good();
+    s["runs-1"] = running("queued");
+    s["runs-2"] = running("in_progress");
+    s["runs-3"] = good().runs;
+    const r = run(s);
+    expect(r.code).toBe(0);
+    expect(r.calls.filter((c) => c === "sleep 60")).toHaveLength(2);
+    expect(r.out).toContain("waiting 60s");
+  });
+
+  it("waits, then refuses at once when the run completes red", () => {
+    const s = good();
+    s["runs-1"] = running("in_progress");
+    s["runs-2"] = running("completed", "failure");
+    const r = run(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("CI run 77");
+    expect(r.err).toContain("failure");
+    expect(r.calls.filter((c) => c === "sleep 60")).toHaveLength(1);
+  });
+
+  it("waits for a run that appears late, and refuses one that never appears", () => {
+    const late = good();
+    late["runs-1"] = { workflow_runs: [] };
+    late["runs-2"] = { workflow_runs: [] };
+    late["runs-3"] = good().runs;
+    expect(run(late).code).toBe(0);
+    const never = good();
+    never.runs = { workflow_runs: [] };
+    const r = run(never);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("no CI push run");
+    // The 120 s appear window at a 60 s poll: two sleeps, then refuse.
+    expect(r.calls.filter((c) => c === "sleep 60")).toHaveLength(2);
+  });
+
+  it("refuses when the run is still going at the cap", () => {
+    const s = good();
+    s.runs = running("in_progress");
+    const r = run(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("still in_progress after 180s");
+    expect(r.calls.filter((c) => c === "sleep 60")).toHaveLength(3);
+  });
+
+  it("counts a successful re-run: the latest attempt's status and jobs decide", () => {
+    const s = good();
+    // biome-ignore lint/suspicious/noExplicitAny: test fixtures
+    (s.runs as any).workflow_runs[0].run_attempt = 2;
+    s["runs-1"] = running("in_progress");
+    s["runs-2"] = good().runs;
+    expect(run(s).code).toBe(0);
   });
 
   it("refuses when a required job is red, missing, skipped or duplicated", () => {
