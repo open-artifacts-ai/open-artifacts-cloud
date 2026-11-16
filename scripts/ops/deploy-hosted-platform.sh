@@ -312,6 +312,16 @@ signups_committed() {
 signups_deployed() {
   signups_ok "$(jq -r '[.result.bindings[] | select(.name == "SIGNUPS_ENABLED") | .text // ""] | join(",")' <<< "$1")" "deployed $2"
 }
+# optout_declared <app>: 0 when the tag's committed config for this env turns
+# the hosted opt-out list on (OPTOUT_LIST "1", open-artifacts#2652). Only then
+# are the opt-out keys generated and read back; a tag without the var, or with
+# "0", wants none of them.
+optout_declared() {
+  local v
+  v="$(ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" committed "$1" vars)" ||
+    { echo "can't read $1's committed vars" >&2; exit 1; }
+  [ "$(jq -r '.OPTOUT_LIST // ""' <<< "$v")" = 1 ]
+}
 # names_are <settings json> <want>: the non-var, non-secret binding names, sorted, comma-joined.
 names_are() {
   local got
@@ -489,6 +499,22 @@ case "$target" in
     fi
     PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
       SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
+    # The opt-out root key (open-artifacts#2652), when the tag turns the list
+    # on: the one platform secret the provisioner derives every hosted
+    # install's OPTOUT_HASH_KEY from (HKDF, info oa-optout-v1). Made only when
+    # truly absent, never overwritten, never printed. Without it the tag wants
+    # no secret at all.
+    PROVISIONER_SECRET=""
+    if optout_declared provisioner; then
+      PROVISIONER_SECRET="OPTOUT_ROOT_KEY"
+      have="$(secret_names "oa-$P-provisioner")"
+      if ! grep -qx OPTOUT_ROOT_KEY <<< "$have" && secret_absent "oa-$P-provisioner" OPTOUT_ROOT_KEY; then
+        openssl rand -base64 32 | put_secret "oa-$P-provisioner" provisioner OPTOUT_ROOT_KEY
+        # Again after the secret: the serving version carries the tag (#1040).
+        PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
+          SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
+      fi
+    fi
     S="$(settings oa-$P-provisioner)"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
@@ -506,9 +532,10 @@ case "$target" in
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
     observability_is "$S" provisioner
-    no_secret_bindings "$S" oa-$P-provisioner
+    got="$(jq -r '[.result.bindings[] | select(.type == "secret_text") | .name] | join(",")' <<< "$S")"
+    [ "$got" = "$PROVISIONER_SECRET" ] || { echo "oa-$P-provisioner has secret bindings ($got); want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
     names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
-    [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
+    [ "$names" = "${PROVISIONER_SECRET:+$PROVISIONER_SECRET }" ] || { echo "oa-$P-provisioner has secrets '$names'; want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
     ;;
   provisioning)
     need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
@@ -596,6 +623,18 @@ case "$target" in
     have="$(secret_names "$W")"
     if ! grep -qx ADMIN_SESSION_KEY <<< "$have" && secret_absent "$W" ADMIN_SESSION_KEY; then
       openssl rand -base64 32 | put_secret "$W" provisioning ADMIN_SESSION_KEY
+    fi
+    # The hosted opt-out list's two keys (open-artifacts#2652), when the tag
+    # turns it on: made like ADMIN_SESSION_KEY (only when truly absent, never
+    # overwritten, never printed).
+    OPTOUT_KEYS_WANTED=""
+    if optout_declared provisioning; then
+      OPTOUT_KEYS_WANTED="OPTOUT_STORE_KEY OPTOUT_TOKEN_KEY"
+      for k in $OPTOUT_KEYS_WANTED; do
+        if ! grep -qx "$k" <<< "$have" && secret_absent "$W" "$k"; then
+          openssl rand -base64 32 | put_secret "$W" provisioning "$k"
+        fi
+      done
     fi
     # The admin's registry entry (4.3) carries the public half of
     # ADMIN_BROKER_KEY: a new key when either is missing, entry first (4.6).
@@ -713,7 +752,7 @@ case "$target" in
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"
-    want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
+    want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${OPTOUT_KEYS_WANTED:+$OPTOUT_KEYS_WANTED }${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
     [ "$names" = "$want_names" ] || { echo "$W secrets are '$names'" >&2; exit 1; }
     if [ -n "$SIGNUP_KEY_WANTED" ]; then
       rc=0

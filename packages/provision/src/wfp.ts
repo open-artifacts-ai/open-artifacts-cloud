@@ -233,6 +233,13 @@ export interface WfpOptions {
    */
   oauthBornD1?: boolean;
   /**
+   * open-artifacts#2652: the hosted-wide opt-out purpose key. Set (by the
+   * provisioner Worker, only when its OPTOUT_LIST is "1"), every render, create
+   * and update, binds it as the install's OPTOUT_HASH_KEY secret_text; unset,
+   * no install gets it. Never logged.
+   */
+  optoutHashKey?: string;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -391,12 +398,15 @@ export function expectedSecretNames(o: {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the install carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
 }): string[] {
   return [
     ...CREATE_SECRETS,
     ...(o.broker ? ["BROKER_SIGNING_KEY"] : []),
     ...(o.codes ? ["TURNSTILE_SECRET"] : []),
     ...(o.testHooks ? ["TEST_HOOK_KEY"] : []),
+    ...(o.optout ? ["OPTOUT_HASH_KEY"] : []),
   ].sort();
 }
 
@@ -428,6 +438,8 @@ export interface VerifyCleanInput {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the render carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
   /** The template's last Durable Object migration tag (null: none). */
   lastTag: string | null;
   /** The tag the script runs: the upload's, or the row's when none ran. */
@@ -2435,6 +2447,25 @@ export class WfpProvisioner {
       if (v !== undefined)
         meta.bindings.push({ type: "secret_text", name: k, text: v });
     }
+    // open-artifacts#2652: the hosted-wide opt-out key, on every render.
+    if (this.o.optoutHashKey !== undefined) {
+      this.sensitive.add(this.o.optoutHashKey);
+      meta.bindings.push({
+        type: "secret_text",
+        name: "OPTOUT_HASH_KEY",
+        text: this.o.optoutHashKey,
+      });
+      // Its plain vars (public #2665): where the unsubscribe link lands, and
+      // that the platform list is on. Hosted renders only, with the key.
+      meta.bindings.push(
+        {
+          type: "plain_text",
+          name: "OPTOUT_UNSUBSCRIBE_URL",
+          text: `https://signup.${this.o.domains.app}/unsubscribe`,
+        },
+        { type: "plain_text", name: "OPTOUT_PLATFORM", text: "on" },
+      );
+    }
     // An update never drops the secrets already on the script.
     if (r.mode === "update") meta.keep_bindings = ["secret_text", "secret_key"];
     if (
@@ -2605,6 +2636,7 @@ export class WfpProvisioner {
         rec,
         broker: this.o.brokerEnabled === true,
         codes: m.sitekey !== null,
+        optout: this.o.optoutHashKey !== undefined,
         testHooks,
         lastTag: latest,
         tag,
@@ -3975,6 +4007,7 @@ export class WfpProvisioner {
             rec: rel.rec,
             broker: row.broker_kid !== null,
             codes: m.sitekey !== null,
+            optout: this.o.optoutHashKey !== undefined,
             testHooks: m.testHooks,
             lastTag: tagsOf(rel.template).at(-1) ?? null,
             tag: reached,
@@ -4344,6 +4377,7 @@ export class WfpProvisioner {
           rec: rel.rec,
           broker: row.broker_kid !== null,
           codes: p.m.sitekey !== null,
+          optout: this.o.optoutHashKey !== undefined,
           testHooks: p.m.testHooks,
           lastTag: tagsOf(rel.template).at(-1) ?? null,
           tag: row.do_migration_tag,

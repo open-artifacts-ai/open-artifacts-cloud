@@ -17,6 +17,7 @@ import {
   type WfpOptions,
   WfpProvisioner,
 } from "@oa/provision";
+import { deriveOptoutHashKey } from "./optout-key.js";
 
 export interface ProvisionerEnv {
   PROVISION_TOKEN: SecretsStoreSecret;
@@ -36,6 +37,14 @@ export interface ProvisionerEnv {
    * else is off. "1" in staging, "0" in prod. Existing installs are unchanged.
    */
   OAUTH_BORN_D1?: string;
+  /**
+   * open-artifacts#2652, per environment: "1" gives every hosted install
+   * OPTOUT_HASH_KEY, derived from OPTOUT_ROOT_KEY; anything else is off.
+   * "1" in staging, "0" in prod.
+   */
+  OPTOUT_LIST?: string;
+  /** Secret: the platform root of OPTOUT_HASH_KEY (HKDF, info oa-optout-v1). Required when OPTOUT_LIST is "1". */
+  OPTOUT_ROOT_KEY?: string;
 }
 
 /** The runtime's network and clock; the tests' run on fakes. */
@@ -80,6 +89,13 @@ export async function provisionerOptions(
 ): Promise<WfpOptions> {
   const e = deployEnv(env.OA_ENV);
   const token = await transient(env.PROVISION_TOKEN.get());
+  // open-artifacts#2652: on, a missing root is terminal (an install without
+  // the key could never honour an opt-out); off, the key is never derived.
+  let optoutHashKey: string | undefined;
+  if (env.OPTOUT_LIST === "1") {
+    if (!env.OPTOUT_ROOT_KEY) throw new NonRetryableError("internal");
+    optoutHashKey = await deriveOptoutHashKey(env.OPTOUT_ROOT_KEY);
+  }
   return {
     cf: cfClient({
       accountId: env.ACCOUNT_ID,
@@ -93,6 +109,7 @@ export async function provisionerOptions(
     stagingBusAll: e === "staging" && env.STAGING_BUS_ALL === "1",
     prodBusAll: e === "prod" && env.PROD_BUS_ALL === "1",
     oauthBornD1: env.OAUTH_BORN_D1 === "1",
+    ...(optoutHashKey !== undefined ? { optoutHashKey } : {}),
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),
