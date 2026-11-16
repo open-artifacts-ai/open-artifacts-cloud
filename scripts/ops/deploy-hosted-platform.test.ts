@@ -1416,7 +1416,9 @@ describe("deploy-hosted-platform.sh", () => {
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) =>
-            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
+            b.name !== "PROD_BUS_ALL" &&
+            b.name !== "OAUTH_BORN_D1" &&
+            b.name !== "EMAIL_EVENTS",
         );
       return JSON.stringify(next);
     };
