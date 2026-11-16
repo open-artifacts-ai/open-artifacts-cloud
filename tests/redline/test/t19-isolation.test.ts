@@ -12,6 +12,9 @@ import { KEY_TABLE, WAIT_BUDGET_MS } from "../src/rl-anon.ts";
 // surfaces beside it, so neither may read or write that state: T19 stays on
 // rl-a, and surfaces' org-level read cases judge a status, never a list body.
 const root = join(import.meta.dirname, "../../..");
+// Allows only the error code public v0.197.0 added to the GET branch (its comment
+// and r.code === "members_only"). Any other "members" is a list-body read.
+const BODY_READ = /JSON\.parse|\.body\b|members(?!_only\b)/;
 const read = (f: string) => readFileSync(join(root, f), "utf8");
 
 describe("T19 targets only rl-a", () => {
@@ -65,7 +68,13 @@ describe("surfaces' org-level read cases check a status, never a list body", () 
     );
     expect(get).toMatch(/classify\(route, r,/);
     expect(get).toMatch(/status\(\.\.\.okStatus\)/);
-    expect(get).not.toMatch(/JSON\.parse|\.body\b|members/);
+    expect(get).not.toMatch(BODY_READ);
+  });
+
+  it("the body-read guard still matches member reads, not the members_only code", () => {
+    expect(BODY_READ.test("r.members")).toBe(true);
+    expect(BODY_READ.test("body.members")).toBe(true);
+    expect(BODY_READ.test('r.code === "members_only"')).toBe(false);
   });
 
   it("the member-list compare stays in credentials, under the exclusive lock", () => {
