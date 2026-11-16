@@ -12,6 +12,7 @@ import {
   probeCases,
   probeCred,
   readRepoFile,
+  hiddenToolGate,
   runRead,
   seedWorld,
   settle,
@@ -116,6 +117,9 @@ describe("surface probes (cross-install)", () => {
           credA: probeCred(A, c.variant),
           credB: probeCred(B, c.variant),
         };
+        // edit_doc is offered only with docs on: hidden, every caller must
+        // get unknown_tool and the case's legs do not run (#2630).
+        if (await hiddenToolGate(c, pair)) return;
         if (c.write) {
           const { fresh, run } = c.write;
           await crossWrite(

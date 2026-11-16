@@ -16,7 +16,9 @@ import {
 import {
   CONTENT_PUBLIC,
   contentUnlisted,
+  hiddenToolAnswer,
   needsCookie,
+  offeredTools,
   ORG_SURFACES,
   type OrgTarget,
   PROBE_SHARE_EMAIL,
@@ -132,6 +134,12 @@ export interface ProbeCase {
    * installs with no success leg. The route stays a recorded drop.
    */
   denyOnly?: true;
+  /**
+   * An MCP tool the install offers only conditionally (edit_doc, with docs
+   * on; #2630). Where tools/list does not show it, hiddenToolGate runs in
+   * place of the case's legs.
+   */
+  offeredTool?: string;
   /** This case's own timeout, when its waits exceed the suite's budget. */
   timeout?: number;
   /** Read-only: runs on the seeded world. */
@@ -917,6 +925,64 @@ export const SMOKES: Readonly<Record<Variant, string>> = {
   oauth: "artifact mcp get_artifact [oauth]",
 };
 
+/** What hiddenToolGate reads and asks; the live run uses the real ones. */
+export interface HiddenToolDeps {
+  offered: (t: Target, cred: ProbeCred) => Promise<Set<string> | null>;
+  answer: (
+    t: Target,
+    cred: ProbeCred,
+    name: string,
+  ) => Promise<"unknown_tool" | "callable">;
+}
+
+const liveHidden: HiddenToolDeps = {
+  offered: (t, cred) => offeredTools({ fetch: viaTarget(t, fetch) }, t.app, cred),
+  answer: (t, cred, name) =>
+    hiddenToolAnswer({ fetch: viaTarget(t, fetch) }, t.app, cred, name),
+};
+
+/**
+ * Conditionally offered tools (#2630, as scripts/authz-probe.ts): where an
+ * install's /mcp tools/list does not offer the case's tool, every caller (B's
+ * own at B, and for a cross case A's at A and A's at B) must get
+ * "unknown_tool"; "callable" throws. Returns true when the tool is hidden and
+ * every answer passed (the case's legs are skipped); false when the tool is
+ * offered, the case names none, or a list can't be read (run the normal legs).
+ * A tool offered on one install and hidden on the other runs the hidden check
+ * only on the hidden one, then the normal legs.
+ */
+export async function hiddenToolGate(
+  c: Pick<ProbeCase, "name" | "offeredTool" | "legs">,
+  p: { a: Target; b: Target; credA: ProbeCred; credB: ProbeCred },
+  deps: HiddenToolDeps = liveHidden,
+): Promise<boolean> {
+  const tool = c.offeredTool;
+  if (!tool) return false;
+  const own = c.legs === "own";
+  const hosts = own
+    ? [{ t: p.b, own: p.credB, others: [] as ProbeCred[] }]
+    : [
+        { t: p.a, own: p.credA, others: [p.credB] },
+        { t: p.b, own: p.credB, others: [p.credA] },
+      ];
+  let hiddenAll = true;
+  const bad: string[] = [];
+  for (const h of hosts) {
+    const offered = await deps.offered(h.t, h.own);
+    if (!offered || offered.has(tool)) {
+      hiddenAll = false;
+      continue;
+    }
+    for (const cred of [h.own, ...h.others]) {
+      const got = await deps.answer(h.t, cred, tool);
+      if (got !== "unknown_tool")
+        bad.push(`${c.name}: ${h.t.name} hides ${tool}, a caller got ${got}`);
+    }
+  }
+  if (bad.length) throw new Error(bad.join("; "));
+  return hiddenAll;
+}
+
 /** The SURFACES entry the OAuth smoke runs (no per-route OAuth case exists). */
 const OAUTH_SMOKE = "mcp get_artifact";
 
@@ -1114,6 +1180,7 @@ export function derive(): Derived {
         name: `${name} [${v}]`,
         routes: s.routes,
         variant: v,
+        ...(s.offeredTool ? { offeredTool: s.offeredTool } : {}),
         ...(s.mutates
           ? {
               write: {
