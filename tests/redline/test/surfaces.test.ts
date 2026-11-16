@@ -46,8 +46,10 @@ import {
   GRANT_CASE_TIMEOUT_MS,
   GRANT_LIST_MS,
   groupSeed,
+  type HiddenToolDeps,
   HOOK_SPACE_ID,
   HOSTED_FEATURES,
+  hiddenToolGate,
   INTERACTIVE_ONLY,
   inShard,
   MATRIX_AT_B,
@@ -1273,5 +1275,117 @@ describe("pickOwnGrant: the grant fallback", () => {
         before,
       ),
     ).toThrow(/2 grants for one client/);
+  });
+});
+
+// ------------------------------------------------- hidden tools (#2630)
+
+describe("hiddenToolGate", () => {
+  const T = (name: string) => ({ name, app: `http://${name}.test` }) as Target;
+  const p = {
+    a: T("rl-a"),
+    b: T("rl-b"),
+    credA: { token: "ta" },
+    credB: { token: "tb" },
+  };
+  const c = (legs: "own" | "cross" = "own") => ({
+    name: "artifact mcp edit_doc [pat]",
+    offeredTool: "edit_doc",
+    legs,
+  });
+  const deps = (
+    offered: Set<string> | null,
+    answer:
+      | "unknown_tool"
+      | "callable"
+      | ((cred: string) => string) = "unknown_tool",
+  ) => {
+    const asked: string[] = [];
+    const d: HiddenToolDeps = {
+      offered: async () => offered,
+      answer: async (t, cred) => {
+        asked.push(`${t.name}:${cred.token}`);
+        return (
+          typeof answer === "function" ? answer(cred.token ?? "") : answer
+        ) as "unknown_tool" | "callable";
+      },
+    };
+    return { d, asked };
+  };
+
+  it("offered: runs the normal legs", async () => {
+    const { d, asked } = deps(new Set(["edit_doc", "list_artifacts"]));
+    expect(await hiddenToolGate(c(), p, d)).toBe(false);
+    expect(asked).toEqual([]);
+  });
+
+  it("a case without an offeredTool runs the normal legs", async () => {
+    const { d } = deps(new Set());
+    expect(await hiddenToolGate({ name: "x", legs: "own" }, p, d)).toBe(false);
+  });
+
+  it("hidden and unknown_tool for every caller: passes, legs skipped", async () => {
+    const { d, asked } = deps(new Set(["list_artifacts"]));
+    expect(await hiddenToolGate(c("cross"), p, d)).toBe(true);
+    expect(asked.sort()).toEqual(["rl-a:ta", "rl-a:tb", "rl-b:ta", "rl-b:tb"]);
+  });
+
+  it("an own case asks B's own credential at B only", async () => {
+    const { d, asked } = deps(new Set());
+    expect(await hiddenToolGate(c("own"), p, d)).toBe(true);
+    expect(asked).toEqual(["rl-b:tb"]);
+  });
+
+  it("hidden but callable for any caller: fails", async () => {
+    const { d } = deps(new Set(), (cred) =>
+      cred === "ta" ? "callable" : "unknown_tool",
+    );
+    await expect(hiddenToolGate(c("cross"), p, d)).rejects.toThrow(
+      /rl-[ab] hides edit_doc, a caller got callable/,
+    );
+  });
+
+  it("an unreadable tools/list: runs the normal legs", async () => {
+    const { d, asked } = deps(null, "callable");
+    expect(await hiddenToolGate(c("cross"), p, d)).toBe(false);
+    expect(asked).toEqual([]);
+  });
+
+  it("offered on one install, hidden on the other: checks the hidden one, then runs the legs", async () => {
+    const { asked } = deps(null);
+    const d: HiddenToolDeps = {
+      offered: async (t) =>
+        t.name === "rl-a" ? new Set(["edit_doc"]) : new Set(),
+      answer: async (t, cred) => {
+        asked.push(`${t.name}:${cred.token}`);
+        return "unknown_tool";
+      },
+    };
+    expect(await hiddenToolGate(c("cross"), p, d)).toBe(false);
+    expect(asked.sort()).toEqual(["rl-b:ta", "rl-b:tb"]);
+  });
+
+  it("reads tools/list and calls the tool over /mcp (default wiring)", async () => {
+    const seen: string[] = [];
+    const f = await fake((_req, res, body) => {
+      const m = JSON.parse(body) as { method: string };
+      seen.push(m.method);
+      if (m.method === "tools/list")
+        return json(res, 200, {
+          jsonrpc: "2.0",
+          id: 1,
+          result: { tools: [{ name: "list_artifacts" }] },
+        });
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32601, message: "Method not found" },
+      });
+    });
+    const t = { name: "rl-b", app: f.origin, content: f.origin } as Target;
+    const w = { token: "tb" };
+    const r = await hiddenToolGate(c(), { a: t, b: t, credA: w, credB: w });
+    expect(r).toBe(true);
+    expect(seen).toContain("tools/list");
   });
 });

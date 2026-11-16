@@ -109,6 +109,20 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.195.0: doc versions (#1100), withdraw_ask and edit_comment (#2511).
+    ...[
+      "artifact comments ask withdraw [session]",
+      "artifact comments ask withdraw [pat]",
+      "artifact mcp withdraw_ask [pat]",
+      "artifact mcp edit_comment [pat]",
+      "artifact rest doc save version [session]",
+      "artifact rest doc save version [pat]",
+      "artifact rest doc restore [session]",
+      "artifact rest doc restore [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",
