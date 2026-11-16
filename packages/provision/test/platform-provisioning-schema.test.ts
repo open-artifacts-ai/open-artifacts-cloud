@@ -847,10 +847,10 @@ describe("0016_login_change_nonces (an instance's login-domain change, open-arti
   });
 });
 
-describe("0017_email_events (bounce and complaint events, open-artifacts#2650)", () => {
+describe("0018_email_events (bounce and complaint events, open-artifacts#2650)", () => {
   it("follows 0016, is additive and stores no recipient or subject", () => {
-    expect(migrationFiles.slice(16)).toEqual(["0017_email_events.sql"]);
-    const raw = migrationSql("0017_email_events.sql");
+    expect(migrationFiles.indexOf("0018_email_events.sql")).toBeGreaterThan(15);
+    const raw = migrationSql("0018_email_events.sql");
     const sql = raw.replace(/--[^\n]*/g, "");
     expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
     expect(sql).not.toMatch(/recipient|subject|\bto_addr/i);

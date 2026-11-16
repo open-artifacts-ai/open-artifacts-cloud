@@ -540,8 +540,17 @@ export function userWorkerMetadata(
   // sends) rather than the docs page's "browser_rendering" for account and
   // dispatch scripts.
   if (t.browser) bindings.push({ type: "browser", name: t.browser.binding });
+  // With emailEvents (#2650) each send binding may send only from this
+  // install's own plus-address, so a compromised install can't send as
+  // another (wrangler uploads the same metadata field, allowed_sender_addresses).
   for (const e of (t.send_email ?? []) as { name: string }[])
-    bindings.push({ type: "send_email", name: e.name });
+    bindings.push({
+      type: "send_email",
+      name: e.name,
+      ...(r.emailEvents === true
+        ? { allowed_sender_addresses: [emailFrom] }
+        : {}),
+    });
   if (t.assets) bindings.push({ type: "assets", name: t.assets.binding });
   for (const e of (t.d1_databases ?? []) as { binding: string }[])
     bindings.push({ type: "d1", name: e.binding, id: r.d1Id });
