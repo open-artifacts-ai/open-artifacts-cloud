@@ -5,8 +5,9 @@
 // a stub of this class in ctx.props.LOGIN, valid for that one request.
 //
 // The gate is the identity: it sets x-oa-gate-install to its own install; the
-// body names no install. It forwards one fixed route, POST /login-domains, and
-// only the content type and the install's Ed25519 assertion headers.
+// body names no install. It forwards three fixed routes, POST /login-domains and
+// POST /email-events/{pull,ack} (#2650), and only the content type and the
+// install's Ed25519 assertion headers.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   boundedText,
@@ -27,6 +28,15 @@ export interface LoginGateEnv {
 /** The platform side has no public origin for this route (binding only). */
 export const LOGIN_ORIGIN = "https://login.oa.internal";
 export const LOGIN_GATE_PATH = "/login-domains";
+/** An install pulls and acks its Email Service bounce and complaint events (#2650). */
+export const EMAIL_EVENTS_PULL_PATH = "/email-events/pull";
+export const EMAIL_EVENTS_ACK_PATH = "/email-events/ack";
+/** The gate's fixed route set; anything else is the gate's 404. */
+export const LOGIN_GATE_PATHS: ReadonlySet<string> = new Set([
+  LOGIN_GATE_PATH,
+  EMAIL_EVENTS_PULL_PATH,
+  EMAIL_EVENTS_ACK_PATH,
+]);
 
 const FORWARD = ["content-type", "x-oa-kid", "x-oa-sig"] as const;
 const INSTALL_ID = /^i[a-z0-9]{11}$/;
@@ -60,7 +70,7 @@ export async function passLoginGate(
   if (
     req.method !== "POST" ||
     url.search !== "" ||
-    url.pathname !== LOGIN_GATE_PATH
+    !LOGIN_GATE_PATHS.has(url.pathname)
   ) {
     await req.body?.cancel();
     return refuse(404, "not_found");
@@ -94,7 +104,7 @@ export async function passLoginGate(
   // The platform's only source of the install id: this gate's, never a caller's.
   headers.set(GATE_INSTALL_HEADER, props.installId);
   return env.LOGIN.fetch(
-    new Request(`${LOGIN_ORIGIN}${LOGIN_GATE_PATH}`, {
+    new Request(`${LOGIN_ORIGIN}${url.pathname}`, {
       method: "POST",
       headers,
       body: text,

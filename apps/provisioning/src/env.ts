@@ -84,6 +84,11 @@ export interface Env {
   BROKER_REGISTRY?: KVNamespace;
   /** "1" turns the instance's login-domain change route on (#2520); else its plain 404. */
   LOGIN_CHANGE?: string;
+  /**
+   * "1" turns on the Email Service bounce/complaint routing (open-artifacts#2650):
+   * the queue consumer and the gate's /email-events routes; else off (404, events dropped).
+   */
+  EMAIL_EVENTS?: string;
   /** Self-serve producer (post-M1). */
   SIGNUPS: Queue;
   /** The admin SPA (single-page-application, Worker first). */

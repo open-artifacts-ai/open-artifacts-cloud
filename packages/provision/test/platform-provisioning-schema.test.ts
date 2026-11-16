@@ -831,7 +831,9 @@ describe("0013_signup_beta_gate (allow list and waitlist, #2096)", () => {
 
 describe("0016_login_change_nonces (an instance's login-domain change, open-artifacts#2520)", () => {
   it("follows 0015 and only adds the login_change_nonces table and an index", () => {
-    expect(migrationFiles.slice(15)).toEqual(["0016_login_change_nonces.sql"]);
+    expect(migrationFiles.slice(15, 16)).toEqual([
+      "0016_login_change_nonces.sql",
+    ]);
     const sql = migrationSql("0016_login_change_nonces.sql").replace(
       /--[^\n]*/g,
       "",
@@ -842,5 +844,26 @@ describe("0016_login_change_nonces (an instance's login-domain change, open-arti
         c.replace(/ NN/, ""),
       ),
     ).toEqual(["install_id TEXT PK", "nonce TEXT PK", "at INTEGER"]);
+  });
+});
+
+describe("0017_email_events (bounce and complaint events, open-artifacts#2650)", () => {
+  it("follows 0016, is additive and stores no recipient or subject", () => {
+    expect(migrationFiles.slice(16)).toEqual(["0017_email_events.sql"]);
+    const raw = migrationSql("0017_email_events.sql");
+    const sql = raw.replace(/--[^\n]*/g, "");
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
+    expect(sql).not.toMatch(/recipient|subject|\bto_addr/i);
+    expect(
+      cols(platformDb(), "email_events").map((c) => c.replace(/ NN/, "")),
+    ).toEqual([
+      "seq INTEGER PK",
+      "install_id TEXT",
+      "message_id TEXT",
+      "kind TEXT",
+      "bounce_type TEXT",
+      "event_id TEXT",
+      "at INTEGER",
+    ]);
   });
 });

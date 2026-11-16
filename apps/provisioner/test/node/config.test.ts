@@ -147,6 +147,8 @@ describe("wrangler.jsonc", () => {
           : { PROD_BUS_ALL: "1" }),
         // open-artifacts#1008: born on d1 in staging, off in prod.
         OAUTH_BORN_D1: env === "staging" ? "1" : "0",
+        // open-artifacts#2650: on in staging, off in prod.
+        EMAIL_EVENTS: env === "staging" ? "1" : "0",
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
@@ -257,5 +259,26 @@ describe("bundle", () => {
         .reduce((n, f) => n + statSync(join(out, f)).size, 0);
       expect(bytes).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("EMAIL_EVENTS flag parity (open-artifacts#2650)", () => {
+  it("the provisioner renders the sender and provisioning routes events under one value per env: on in staging, off in prod", () => {
+    expect(cfg.env.staging.vars.EMAIL_EVENTS).toBe("1");
+    expect(cfg.env.prod.vars.EMAIL_EVENTS).toBe("0");
+    for (const env of ENVS)
+      expect(api.env[env].vars.EMAIL_EVENTS).toBe(
+        cfg.env[env].vars.EMAIL_EVENTS,
+      );
+  });
+  it("only staging has the queue consumer, with a dead-letter queue; prod has no email-events queue", () => {
+    expect(api.env.staging.queues.consumers).toEqual([
+      expect.objectContaining({
+        queue: "oa-s-email-events",
+        dead_letter_queue: "oa-s-email-events-dlq",
+      }),
+    ]);
+    expect(api.env.prod.queues).not.toHaveProperty("consumers");
+    expect(JSON.stringify(api.env.prod)).not.toMatch(/email-events/);
   });
 });

@@ -150,6 +150,21 @@ describe("provisionerOptions", () => {
     expect(s.stagingBusAll).toBe(false);
   });
 
+  it('EMAIL_EVENTS: only "1" turns the plus-addressed sender on, in either env (#2650)', async () => {
+    const o = (e: Record<string, string>) =>
+      provisionerOptions(mkEnv(e), LABEL, io(), JOB);
+    for (const env of ["staging", "prod"]) {
+      expect((await o({ OA_ENV: env, EMAIL_EVENTS: "1" })).emailEvents).toBe(
+        true,
+      );
+      for (const v of ["0", "true", "", " 1", "1 "])
+        expect((await o({ OA_ENV: env, EMAIL_EVENTS: v })).emailEvents).toBe(
+          false,
+        );
+      expect((await o({ OA_ENV: env })).emailEvents).toBe(false);
+    }
+  });
+
   it('OAUTH_BORN_D1: only "1" turns it on, in either env; absent and anything else are off (#1008)', async () => {
     const o = (e: Record<string, string>) =>
       provisionerOptions(mkEnv(e), LABEL, io(), JOB);
