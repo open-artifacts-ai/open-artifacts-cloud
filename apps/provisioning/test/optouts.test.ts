@@ -2,7 +2,9 @@ import { keyId, publicFromPkcs8, signRequest } from "@oa/auth-core";
 import { clearRegistryCache } from "@oa/broker-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  ADDS_PER_DAY,
   ADDS_PER_HOUR,
+  CHECKS_PER_DAY,
   CHECKS_PER_MIN,
   mintToken,
   OPTOUT_ADD_ACTION,
@@ -280,21 +282,53 @@ describe("rate limits and the spike hook", () => {
     expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(429);
   });
 
-  it("counts checks per install per day and logs optout_check_spike at the threshold", async () => {
-    const e = await world({ OPTOUT_CHECK_SPIKE: "2" });
+  const seedCount = (key: string, ms: number, count: number) =>
+    db
+      .prepare(
+        "INSERT INTO rate_counters (key, window_start, count) VALUES (?1, ?2, ?3)",
+      )
+      .bind(key, NOW - (NOW % ms), count)
+      .run();
+  const warns = async (f: () => Promise<unknown>) => {
     const logs: unknown[][] = [];
     const orig = console.warn;
     console.warn = (...a: unknown[]) => void logs.push(a);
     try {
-      for (let i = 0; i < 3; i++) await post("/optouts/check", e, { h1: H1 });
+      await f();
     } finally {
       console.warn = orig;
     }
+    return logs;
+  };
+
+  it("checks: warn line at the threshold, hard daily cap of 1000 (429)", async () => {
+    const e = await world({ OPTOUT_CHECK_SPIKE: "2" });
+    const logs = await warns(async () => {
+      for (let i = 0; i < 3; i++) await post("/optouts/check", e, { h1: H1 });
+    });
     expect(logs).toEqual([["optout_check_spike", id, 2]]);
-    const day = await db
-      .prepare("SELECT count FROM rate_counters WHERE key = ?1")
-      .bind(`optout:checkday:${id}`)
-      .first<number>("count");
-    expect(day).toBe(3);
+    await seedCount(`optout:checkday:${id}`, 86_400_000, CHECKS_PER_DAY).catch(
+      () =>
+        db
+          .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
+          .bind(`optout:checkday:${id}`, CHECKS_PER_DAY)
+          .run(),
+    );
+    expect((await post("/optouts/check", e, { h1: H1 })).status).toBe(429);
+  });
+
+  it("adds: warn line at the threshold, hard daily cap of 200 (429)", async () => {
+    const e = await world({ OPTOUT_ADD_SPIKE: "2" });
+    const token = await mintToken(TOKEN_KEY, id, H1, NOW);
+    const logs = await warns(async () => {
+      for (let i = 0; i < 3; i++)
+        await post("/optouts/add", e, { h1: H1, token });
+    });
+    expect(logs).toEqual([["optout_add_spike", id, 2]]);
+    await db
+      .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
+      .bind(`optout:addday:${id}`, ADDS_PER_DAY)
+      .run();
+    expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(429);
   });
 });

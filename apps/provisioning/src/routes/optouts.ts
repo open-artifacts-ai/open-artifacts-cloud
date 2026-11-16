@@ -26,8 +26,12 @@ import type { Env } from "../env.js";
 //   POST /optouts/add   {ts, nonce, h1, token}   -> 204       (idempotent)
 //
 // An add needs a valid, unexpired token this platform minted for that same
-// install and h1 (HMAC with OPTOUT_TOKEN_KEY): a compromised install cannot
-// opt out an address it was never given to mint. There is no removal route;
+// install and h1 (HMAC with OPTOUT_TOKEN_KEY). This does NOT stop a
+// compromised install from opting out addresses it chooses: it can mint a
+// token for any h1 it computes. Only the per-install rate limits, the daily
+// caps and the audit row bound that. (The stronger form, where the platform
+// mints at send time and redeems that token, is not built.) The nonce table
+// (login_change_nonces) is shared with login changes. There is no removal route;
 // operators remove a row by hand (docs/ops/hosted.md).
 
 export const OPTOUT_PATHS: ReadonlySet<string> = new Set([
@@ -38,10 +42,13 @@ export const OPTOUT_PATHS: ReadonlySet<string> = new Set([
 export const OPTOUT_ADD_ACTION = "optout.add";
 export const OPTOUT_ACTOR = "system:optout";
 export const TOKEN_TTL_MS = 30 * 86_400_000;
-export const CHECKS_PER_MIN = 600;
-export const MINTS_PER_HOUR = 600;
+export const CHECKS_PER_MIN = 60;
+export const CHECKS_PER_DAY = 1000;
+export const MINTS_PER_HOUR = 200;
 export const ADDS_PER_HOUR = 60;
-export const DEFAULT_CHECK_SPIKE = 5000;
+export const ADDS_PER_DAY = 200;
+export const DEFAULT_CHECK_SPIKE = 800;
+export const DEFAULT_ADD_SPIKE = 150;
 const DAY_MS = 86_400_000;
 const MIN_MS = 60_000;
 const NONCE_KEEP_MS = 10 * 60_000;
@@ -238,18 +245,25 @@ export async function optout(
     now,
   );
   if (count > limit.n) return reply(429, "rate_limited");
-
-  if (kind === "check") {
-    // The per-install daily count; a spike is a log line the alert reads
-    // (optout_check_spike), once when the day's count crosses the threshold.
+  if (kind !== "mint") {
+    // The per-install daily count: a warn line at the threshold (the alert
+    // reads optout_check_spike / optout_add_spike), a hard cap past it.
+    const cap = kind === "check" ? CHECKS_PER_DAY : ADDS_PER_DAY;
     const day = await bump(
       env.PLATFORM_DB,
-      `optout:checkday:${install}`,
+      `optout:${kind}day:${install}`,
       DAY_MS,
       now,
     );
-    const spike = Number(env.OPTOUT_CHECK_SPIKE) || DEFAULT_CHECK_SPIKE;
-    if (day === spike) console.warn("optout_check_spike", install, day);
+    const spike =
+      Number(
+        kind === "check" ? env.OPTOUT_CHECK_SPIKE : env.OPTOUT_ADD_SPIKE,
+      ) || (kind === "check" ? DEFAULT_CHECK_SPIKE : DEFAULT_ADD_SPIKE);
+    if (day === spike) console.warn(`optout_${kind}_spike`, install, day);
+    if (day > cap) return reply(429, "daily_cap");
+  }
+
+  if (kind === "check") {
     const h2 = await storedHash(env.OPTOUT_STORE_KEY, body.h1);
     const row = await env.PLATFORM_DB.prepare(
       "SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1",
