@@ -147,6 +147,7 @@ describe("wrangler.jsonc", () => {
           : { PROD_BUS_ALL: "1" }),
         // open-artifacts#1008: born on d1 in staging, off in prod.
         OAUTH_BORN_D1: env === "staging" ? "1" : "0",
+        OPTOUT_LIST: env === "staging" ? "1" : "0",
         // Literal: the recheck's tier for self-serve rows (2.5), the API's.
         SELF_SERVE_TIER: "trial",
       });
@@ -258,4 +259,13 @@ describe("bundle", () => {
       expect(bytes).toBeGreaterThan(0);
     }
   });
+});
+
+describe("OPTOUT_LIST (open-artifacts#2652)", () => {
+  for (const e of ENVS)
+    it(`${e}: the provisioner's and the provisioning Worker's values match, and are "0" or "1"`, () => {
+      const a = cfg.env[e].vars.OPTOUT_LIST;
+      expect(["0", "1"]).toContain(a);
+      expect(api.env[e].vars.OPTOUT_LIST).toBe(a);
+    });
 });

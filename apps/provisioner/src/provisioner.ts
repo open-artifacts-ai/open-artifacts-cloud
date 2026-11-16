@@ -89,11 +89,11 @@ export async function provisionerOptions(
 ): Promise<WfpOptions> {
   const e = deployEnv(env.OA_ENV);
   const token = await transient(env.PROVISION_TOKEN.get());
-  // open-artifacts#2652: on, a missing root is terminal (an install without
+  // open-artifacts#2652: on, a missing root is retried, as `internal` (an install without
   // the key could never honour an opt-out); off, the key is never derived.
   let optoutHashKey: string | undefined;
   if (env.OPTOUT_LIST === "1") {
-    if (!env.OPTOUT_ROOT_KEY) throw new NonRetryableError("internal");
+    if (!env.OPTOUT_ROOT_KEY) throw new Transient("internal");
     optoutHashKey = await deriveOptoutHashKey(env.OPTOUT_ROOT_KEY);
   }
   return {

@@ -3558,7 +3558,7 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.code, r.err).toBe(0);
       for (const k of KEYS) expect(puts(r.log)).not.toContain(k);
     });
-    it("provisioner staging: OPTOUT_ROOT_KEY is made once, then the Worker deploys again; absent from prod", () => {
+    it("provisioner staging: OPTOUT_ROOT_KEY is made once, before the one deploy; absent from prod", () => {
       const r = setup({ exists: ["oa-s-billing"] }).run(
         "provisioner",
         {},
@@ -3566,8 +3566,16 @@ describe("deploy-hosted-platform.sh", () => {
       );
       expect(r.code, r.err).toBe(0);
       expect(puts(r.log)).toEqual(["OPTOUT_ROOT_KEY"]);
-      const w = r.log.flatMap((l, i) => (l.startsWith("wrapper") ? [i] : []));
-      expect(w).toHaveLength(2);
+      // Put before the one deploy: the Worker never serves without it.
+      const w = r.log.flatMap((l, i) =>
+        l.startsWith("wrapper provisioner") ? [i] : [],
+      );
+      expect(w).toHaveLength(1);
+      const put = r.log.findIndex((l) =>
+        l.startsWith("stdin-len OPTOUT_ROOT_KEY"),
+      );
+      expect(put).toBeGreaterThanOrEqual(0);
+      expect(put).toBeLessThan(w[0] as number);
       clean(r);
       const kept = setup({
         exists: ["oa-s-billing", "oa-s-provisioner"],

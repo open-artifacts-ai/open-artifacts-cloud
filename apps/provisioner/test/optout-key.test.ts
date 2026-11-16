@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { deriveOptoutHashKey } from "../src/optout-key.js";
-import { provisionerOptions } from "../src/provisioner.js";
+import { provisionerOptions, Transient } from "../src/provisioner.js";
 
 const ROOT = "r".repeat(44);
 const io = {
@@ -44,9 +44,9 @@ describe("OPTOUT_HASH_KEY derivation", () => {
       expect(o.optoutHashKey).toBeUndefined();
     }
   });
-  it("on without the root is a terminal failure that does not say the root", async () => {
+  it("on without the root is a retryable failure (Transient), so a late secret still lets the job run", async () => {
     await expect(
       provisionerOptions(env({ OPTOUT_LIST: "1" }), "l", io, "j4"),
-    ).rejects.toThrow();
+    ).rejects.toBeInstanceOf(Transient);
   });
 });

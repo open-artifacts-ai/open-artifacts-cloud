@@ -497,24 +497,22 @@ case "$target" in
       cf_send POST /r2/buckets "$(jq -nc --arg n "$bucket" '{name: $n}')" | must "create R2 bucket $bucket" > /dev/null
       echo "R2 bucket $bucket created"
     fi
-    PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
-      SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
     # The opt-out root key (open-artifacts#2652), when the tag turns the list
     # on: the one platform secret the provisioner derives every hosted
-    # install's OPTOUT_HASH_KEY from (HKDF, info oa-optout-v1). Made only when
-    # truly absent, never overwritten, never printed. Without it the tag wants
-    # no secret at all.
+    # install's OPTOUT_HASH_KEY from (HKDF, info oa-optout-v1). Put BEFORE the
+    # deploy, so the one deploy carries the tag and the Worker never serves
+    # without it. Made only when truly absent (a direct read, the Worker may
+    # not exist yet), never overwritten, never printed. Without it the tag
+    # wants no secret at all.
     PROVISIONER_SECRET=""
     if optout_declared provisioner; then
       PROVISIONER_SECRET="OPTOUT_ROOT_KEY"
-      have="$(secret_names "oa-$P-provisioner")"
-      if ! grep -qx OPTOUT_ROOT_KEY <<< "$have" && secret_absent "oa-$P-provisioner" OPTOUT_ROOT_KEY; then
+      if secret_absent "oa-$P-provisioner" OPTOUT_ROOT_KEY; then
         openssl rand -base64 32 | put_secret "oa-$P-provisioner" provisioner OPTOUT_ROOT_KEY
-        # Again after the secret: the serving version carries the tag (#1040).
-        PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
-          SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
       fi
     fi
+    PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
+      SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
     S="$(settings oa-$P-provisioner)"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"
