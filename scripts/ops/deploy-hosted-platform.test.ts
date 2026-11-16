@@ -57,6 +57,15 @@ case "$*" in
     touch "$STATE/$w.exists"
     [ -f "$STATE/$w.next.json" ] && cp "$STATE/$w.next.json" "$STATE/$w.settings.json"
     ;;
+  "exec wrangler queues subscription list"*)
+    [ -f "$STATE/fail-subs" ] && exit 1
+    echo "wrangler-list" >> "$STUB_LOG"
+    cat "$STATE/subs.json" 2>/dev/null || echo '[]'
+    ;;
+  "exec wrangler queues subscription create"*)
+    echo "WRITE wrangler $*" >> "$STUB_LOG"
+    jq -nc --arg a "$*" '[{name: "oa-s-email-events", enabled: true, source: {type: "email.sending", domain: ($a | capture("--domain (?<d>[^ ]+)").d)}, events: ($a | capture("--events (?<e>[^ ]+)").e | split(","))}]' > "$STATE/subs.json"
+    ;;
   "exec wrangler secret put"*)
     v="$(cat)"
     echo "stdin-len $5 \${#v}" >> "$STUB_LOG"
@@ -95,10 +104,6 @@ case "$path" in
   queues)
     jq -c --argjson b "$body" 'if type == "object" then .result += [{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}] else . + [{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}] end' "$STATE/queues.json" 2>/dev/null > "$STATE/q.new" || jq -nc --argjson b "$body" '[{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}]' > "$STATE/q.new"
     mv "$STATE/q.new" "$STATE/queues.json"; ok '{}'; exit 0 ;;
-  event_subscriptions/subscriptions\\?*) [ -f "$STATE/fail-subs" ] && { bad; exit 0; }; ok "$(cat "$STATE/subs.json" 2>/dev/null || echo '[]')"; exit 0 ;;
-  event_subscriptions/subscriptions)
-    jq -c --argjson b "$body" '. + [$b]' "$STATE/subs.json" 2>/dev/null > "$STATE/s.new" || jq -nc --argjson b "$body" '[$b]' > "$STATE/s.new"
-    mv "$STATE/s.new" "$STATE/subs.json"; ok '{}'; exit 0 ;;
   r2/buckets/*) n="\${path#r2/buckets/}"
     if [ -f "$STATE/fail-r2" ]; then bad; elif [ -f "$STATE/r2-$n" ]; then ok '{}'; else echo '{"success":false,"errors":[{"code":10006}]}'; fi; exit 0 ;;
   r2/buckets) touch "$STATE/r2-$(jq -r .name <<< "$body")"; ok '{}'; exit 0 ;;
@@ -3450,7 +3455,9 @@ describe("deploy-hosted-platform.sh", () => {
           },
         ]);
       const subWrites = (r: { writes: string[] }) =>
-        r.writes.filter((w) => w.includes("event_subscriptions"));
+        r.writes.filter((w) =>
+          w.startsWith("WRITE wrangler exec wrangler queues subscription"),
+        );
       it("staging creates both queues and the subscription for mail.<zone> when absent, then reads it back", () => {
         const r = stagingSetup().run(
           "provisioning",
@@ -3464,21 +3471,9 @@ describe("deploy-hosted-platform.sh", () => {
           q.map((w) => JSON.parse(w.split(" ").slice(3).join(" ")).queue_name),
         ).toEqual(["oa-s-email-events", "oa-s-email-events-dlq"]);
         const w = subWrites(r);
-        expect(w).toHaveLength(1);
-        const body = JSON.parse(w[0]?.split(" ").slice(3).join(" ") ?? "");
-        expect(body).toMatchObject({
-          enabled: true,
-          source: {
-            type: "email.sending",
-            zone_id: ZONE,
-            domain: "mail.open-artifacts-staging.app",
-          },
-          destination: {
-            type: "queues.queue",
-            queue_id: "q-oa-s-email-events",
-          },
-          events: ["message.bounced", "message.complained"],
-        });
+        expect(w).toEqual([
+          `WRITE wrangler exec wrangler queues subscription create oa-s-email-events --source email.sending --zone-id ${ZONE} --domain mail.open-artifacts-staging.app --events message.bounced,message.complained --name oa-s-email-events`,
+        ]);
         clean(r);
       });
       it("creates nothing when the queues and the subscription exist", () => {
@@ -3539,7 +3534,7 @@ describe("deploy-hosted-platform.sh", () => {
           exists: ["oa-p-provisioner", "oa-p-auth-broker"],
         }).run("provisioning");
         expect(
-          r.writes.filter((w) => /email-events|event_subscriptions/.test(w)),
+          r.writes.filter((w) => /email-events|queues subscription/.test(w)),
         ).toEqual([]);
       });
     });

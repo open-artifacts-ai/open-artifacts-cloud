@@ -116,7 +116,7 @@ email_events_setup() {
   grep -q '"oa-s-email-events"' "$root/apps/provisioning/wrangler.jsonc" || return 0
   need EMAIL_ZONE_TAGS
   [[ "$EMAIL_ZONE_TAGS" =~ ^[0-9a-f]{32}$ ]] || { echo "EMAIL_ZONE_TAGS is not a 32-hex zone id" >&2; exit 1; }
-  local q listing qid domain="mail.$ZONE" subs want
+  local q listing domain="mail.$ZONE" subs
   listing="$(list_all "/queues?" "list queues")"
   for q in oa-s-email-events oa-s-email-events-dlq; do
     jq -e --arg q "$q" 'any(.[]; .queue_name == $q)' <<< "$listing" > /dev/null && continue
@@ -124,20 +124,24 @@ email_events_setup() {
     cf_send POST /queues "$(jq -nc --arg n "$q" '{queue_name: $n}')" | must "create queue $q" > /dev/null
     echo "queue $q created"
   done
-  qid="$(list_all "/queues?" "list queues" | jq -r '[.[] | select(.queue_name == "oa-s-email-events") | .queue_id] | join(" ")')"
-  [ -n "$qid" ] && [[ "$qid" != *" "* ]] || { echo "oa-s-email-events: want exactly one queue id" >&2; exit 1; }
-  want='[.[] | select(.source.type == "email.sending" and .source.domain == $d and .destination.queue_id == $q)]'
-  subs="$(list_all "/event_subscriptions/subscriptions?" "list event subscriptions")"
-  if [ "$(jq --arg d "$domain" --arg q "$qid" "$want | length" <<< "$subs")" = 0 ]; then
+  # The subscription goes through wrangler (documented: `wrangler queues
+  # subscription create|list`), from the provisioning app dir, with the same
+  # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in the environment.
+  local wr=(pnpm exec wrangler queues subscription) norm
+  norm='if type == "array" then . else (.result // .subscriptions // []) end
+    | [.[] | select(.name == "oa-s-email-events" and (tojson | contains($d)))]'
+  subs="$(cd "$root/apps/provisioning" && "${wr[@]}" list oa-s-email-events --json)" || { echo "list event subscriptions failed" >&2; exit 1; }
+  jq -e . <<< "$subs" > /dev/null 2>&1 || { echo "list event subscriptions: unparsable answer" >&2; exit 1; }
+  if [ "$(jq --arg d "$domain" "$norm | length" <<< "$subs")" = 0 ]; then
     [ -z "$VERIFY_ONLY" ] || { echo "the Email Sending event subscription for $domain does not exist" >&2; exit 1; }
-    cf_send POST /event_subscriptions/subscriptions "$(jq -nc --arg d "$domain" --arg q "$qid" --arg z "$EMAIL_ZONE_TAGS" \
-      '{name: "oa-s-email-events", enabled: true, source: {type: "email.sending", zone_id: $z, domain: $d}, destination: {type: "queues.queue", queue_id: $q}, events: ["message.bounced", "message.complained"]}')" |
-      must "create the Email Sending event subscription" > /dev/null
+    (cd "$root/apps/provisioning" && "${wr[@]}" create oa-s-email-events --source email.sending --zone-id "$EMAIL_ZONE_TAGS" \
+      --domain "$domain" --events message.bounced,message.complained --name oa-s-email-events > /dev/null) ||
+      { echo "create the Email Sending event subscription failed" >&2; exit 1; }
     echo "event subscription for $domain created"
   fi
-  # Read back: exactly one, enabled, for these two events only.
-  subs="$(list_all "/event_subscriptions/subscriptions?" "list event subscriptions")"
-  jq -e --arg d "$domain" --arg q "$qid" '[.[] | select(.source.type == "email.sending" and .source.domain == $d and .destination.queue_id == $q)]
+  # Read back: exactly one, not disabled, for these two events only.
+  subs="$(cd "$root/apps/provisioning" && "${wr[@]}" list oa-s-email-events --json)" || { echo "list event subscriptions failed" >&2; exit 1; }
+  jq -e --arg d "$domain" "$norm"'
     | length == 1 and (.[0].enabled != false) and ((.[0].events | map(sub("^.*message[.]"; "message.")) | sort) == ["message.bounced", "message.complained"])' <<< "$subs" > /dev/null ||
     { echo "the event subscription for $domain is not one enabled subscription for bounced and complained" >&2; exit 1; }
 }
