@@ -1066,21 +1066,66 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
 
   it("a version with files but no record is staged: skipped and listed, the rest still checked", async () => {
     const w = many(12);
-    w.objects?.delete("releases/1.0.7/release/record.sig.json");
+    w.objects?.delete("releases/1.0.11/release/record.sig.json");
     const { fetch } = await serve(w);
     const r = await prodClean(probe(), { fetch, pubkey: PUB, ...bearerOf({}) });
     expect(r).toEqual({
       level: "pass",
       releases: 11,
       installs: 1,
-      staged: ["1.0.7"],
+      staged: ["1.0.11"],
     });
+  });
+
+  it("a staged version older than a recorded one fails", async () => {
+    const w = many(12);
+    w.objects?.delete("releases/1.0.7/release/record.sig.json");
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a staged version with hook SQL fails", async () => {
+    const w = many(2);
+    publish(w, { version: "1.0.9", js: HOOK_SQL_MARKERS[0] });
+    w.objects?.delete("releases/1.0.9/release/record.sig.json");
+    await expect(check(w)).rejects.toThrow(/holds hook SQL/);
+  });
+
+  it("a staged version plus a bad record on another version fails", async () => {
+    const w = many(2);
+    publish(w, { version: "1.0.9" });
+    w.objects?.delete("releases/1.0.9/release/record.sig.json");
+    publish(w, {
+      version: "1.0.1",
+      key: generateKeyPairSync("ed25519").privateKey,
+    });
+    await expect(check(w)).rejects.toThrow(/does not verify/);
+  });
+
+  it("six staged versions fail; five pass", async () => {
+    const w = many(1);
+    for (let i = 1; i <= 5; i++) {
+      publish(w, { version: `2.0.${i}` });
+      w.objects?.delete(`releases/2.0.${i}/release/record.sig.json`);
+    }
+    const { fetch } = await serve(w);
+    const r = await prodClean(probe(), { fetch, pubkey: PUB, ...bearerOf({}) });
+    expect(r.staged).toHaveLength(5);
+    publish(w, { version: "2.0.6" });
+    w.objects?.delete("releases/2.0.6/release/record.sig.json");
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a redline-variant version without a record fails", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0", variant: "redline" });
+    w.objects?.delete("releases/2.0.0/redline/record.sig.json");
+    await expect(check(w)).rejects.toThrow(/variant redline in prod/);
   });
 
   it("a recorded version is still fully checked beside a staged one (a bad file fails)", async () => {
     const w = many(3);
-    w.objects?.delete("releases/1.0.1/release/record.sig.json");
-    publish(w, { version: "1.0.2", js: HOOK_SQL_MARKERS[0] });
+    w.objects?.delete("releases/1.0.2/release/record.sig.json");
+    publish(w, { version: "1.0.1", js: HOOK_SQL_MARKERS[0] });
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
   });
 
