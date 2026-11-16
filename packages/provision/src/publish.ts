@@ -149,6 +149,38 @@ const is412 = (e: unknown) => e instanceof CfError && e.status === 412;
 const same = (a: Uint8Array, b: Uint8Array) =>
   Buffer.from(a).equals(Buffer.from(b));
 
+/** How many objects publishRelease uploads or reads back at once. */
+export const PUBLISH_CONCURRENCY = 8;
+
+/**
+ * Runs `fn` over `items`, at most `limit` at a time. After the first failure
+ * nothing new starts; the calls already running finish, then the first error
+ * is thrown. So a caller that awaits this and then writes a record knows
+ * every item succeeded.
+ */
+async function pool<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failed: { error: unknown } | undefined;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const item = items[next++] as T;
+      try {
+        await fn(item);
+      } catch (error) {
+        failed ??= { error };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  if (failed) throw failed.error;
+}
+
 /** One page of a listing: the objects under `prefix` from `cursor` on. */
 type ListPage = (
   prefix: string,
@@ -287,6 +319,14 @@ async function checkFloor(
  * now holds exactly the tar's bytes; otherwise it refuses. Writes and the
  * reads they rest on go through `r2` (S3); `cf` only lists. Needs
  * probeR2Conditionals(r2, env) first.
+ *
+ * Files upload and read back PUBLISH_CONCURRENCY at a time. The record is
+ * written only after every file's upload (or byte-identical read-back)
+ * finished: one failure stops new uploads and the record is never written.
+ * `stageOnly` writes the files and stops before the record (status "staged"):
+ * with no record nothing can install the version, so a release can be staged
+ * ahead of its gate; a later call without it finds the files present and
+ * byte-identical, and writes only the record.
  */
 export async function publishRelease(o: {
   cf: Cf;
@@ -294,11 +334,16 @@ export async function publishRelease(o: {
   env: Env;
   version: string;
   files: { tar: Uint8Array; sig: Uint8Array };
+  /** Write the files but not the record (see above). */
+  stageOnly?: boolean;
 }): Promise<{
   variant: BundleVariant;
   keys: string[];
-  /** "already-published": the identical release was there; nothing written. */
-  status?: "published" | "already-published";
+  /**
+   * "already-published": the identical release was there; nothing written.
+   * "staged": stageOnly wrote the files; keys has no record.
+   */
+  status?: "published" | "already-published" | "staged";
 }> {
   const { cf, env, version } = o;
   const bucket = bucketOf(env);
@@ -420,17 +465,18 @@ export async function publishRelease(o: {
     );
     want.set(RECORD_FILE, o.files.sig);
     let identical = present.length === want.size;
-    for (const x of present) {
-      if (!identical) break;
-      const b = want.get(x.name);
-      if (!b || x.size !== b.length) {
-        identical = false;
-        break;
-      }
-      // null is not-found (differs); any other error (transient, auth) throws.
-      const cur = await r2.get(x.key, { maxBytes: b.length });
-      if (!cur || !same(cur.bytes, b)) identical = false;
-    }
+    if (identical)
+      await pool(present, PUBLISH_CONCURRENCY, async (x) => {
+        if (!identical) return;
+        const b = want.get(x.name);
+        if (!b || x.size !== b.length) {
+          identical = false;
+          return;
+        }
+        // null is not-found (differs); any other error (transient, auth) throws.
+        const cur = await r2.get(x.key, { maxBytes: b.length });
+        if (!cur || !same(cur.bytes, b)) identical = false;
+      });
     if (!identical)
       throw new PublishRefused(
         `release ${version} (${variant}) is already published to ${bucket} and differs from this tar; a version is never overwritten`,
@@ -444,11 +490,13 @@ export async function publishRelease(o: {
   const byName = new Map(files.map((f) => [f.path, f]));
   const done = new Set<string>();
   for (const x of present) {
-    const f = byName.get(x.name);
-    if (!f)
+    if (!byName.has(x.name))
       throw new PublishRefused(
         `release ${version} (${variant}): ${x.key} is in ${bucket} but not in the tar; refusing to resume`,
       );
+  }
+  await pool(present, PUBLISH_CONCURRENCY, async (x) => {
+    const f = byName.get(x.name) as ReleaseAsset;
     let cur: { bytes: Uint8Array } | null = null;
     if (x.size === f.bytes.length)
       cur = await r2.get(x.key, { maxBytes: f.bytes.length }).catch(() => null);
@@ -457,7 +505,7 @@ export async function publishRelease(o: {
         `release ${version} (${variant}): ${x.key} differs from the tar; refusing to resume`,
       );
     done.add(f.path);
-  }
+  });
   /** Create-once; a 412 is "already exists": byte-identical resumes, else refuse. */
   const createOnce = async (key: string, bytes: Uint8Array, what: string) => {
     try {
@@ -473,12 +521,16 @@ export async function publishRelease(o: {
       );
     }
   };
-  const keys: string[] = [];
-  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : 1))) {
-    if (!done.has(f.path))
-      await createOnce(prefix + f.path, f.bytes, "and differs from the tar");
-    keys.push(prefix + f.path);
-  }
+  const sorted = [...files].sort((a, b) => (a.path < b.path ? -1 : 1));
+  const keys = sorted.map((f) => prefix + f.path);
+  // Every file first, in parallel; pool throws on the first failure after the
+  // running uploads settle, so the record below is never reached then.
+  await pool(
+    sorted.filter((f) => !done.has(f.path)),
+    PUBLISH_CONCURRENCY,
+    (f) => createOnce(prefix + f.path, f.bytes, "and differs from the tar"),
+  );
+  if (o.stageOnly) return { variant, keys, status: "staged" };
   // The record last: a reader that finds it finds every file.
   await createOnce(
     prefix + RECORD_FILE,

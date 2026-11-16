@@ -30,6 +30,7 @@ import { platformNames } from "../src/names.js";
 import { canonicalJson } from "../src/platform.js";
 import {
   FLOOR_KEY,
+  PUBLISH_CONCURRENCY,
   PublishRefused,
   probeR2Conditionals,
   publishFloor,
@@ -964,6 +965,167 @@ describe("D: publishRelease", () => {
       s.fake.r2Object(s.bucket, "releases/0.34.0/release/record.sig.json")
         ?.bytes,
     ).toEqual(files.sig);
+  });
+
+  describe("parallel uploads keep the record last", () => {
+    /** Wraps the client's put: counts the calls in flight, optionally fails one key. */
+    const watch = (
+      r2: ReturnType<typeof setup>["r2"]["staging"],
+      failKey?: (key: string) => boolean,
+    ) => {
+      const orig = r2.put.bind(r2);
+      const seen = { inFlight: 0, max: 0, order: [] as string[] };
+      (r2 as { put: typeof r2.put }).put = async (key, bytes, cond) => {
+        seen.inFlight++;
+        seen.max = Math.max(seen.max, seen.inFlight);
+        try {
+          await new Promise((r) => setTimeout(r, 5));
+          if (failKey?.(key)) throw new Error("boom: put failed");
+          const out = await orig(key, bytes, cond);
+          seen.order.push(key);
+          return out;
+        } finally {
+          seen.inFlight--;
+        }
+      };
+      return seen;
+    };
+    const recordKey = releaseKey("0.34.0", "release", "record.sig.json");
+
+    it("uploads files in parallel (bounded) and the record after every file", async () => {
+      const s = await probed(setup());
+      seedFloor(s);
+      const seen = watch(s.r2.staging);
+      await publishRelease({
+        cf: s.cf,
+        r2: s.r2.staging,
+        env: "staging",
+        version: "0.34.0",
+        files: good(),
+      });
+      expect(seen.max).toBeGreaterThan(1);
+      expect(seen.max).toBeLessThanOrEqual(PUBLISH_CONCURRENCY);
+      expect(seen.order).toHaveLength(tarEntries().length + 1);
+      expect(seen.order.at(-1)).toBe(recordKey);
+      expect(seen.order.filter((k) => k === recordKey)).toHaveLength(1);
+    });
+
+    it("one failed file upload: no record is written, nothing new starts after it", async () => {
+      const s = await probed(setup());
+      seedFloor(s);
+      const bad = "releases/0.34.0/release/welcome/welcome.md";
+      const seen = watch(s.r2.staging, (k) => k === bad);
+      const e = await fails(
+        publishRelease({
+          cf: s.cf,
+          r2: s.r2.staging,
+          env: "staging",
+          version: "0.34.0",
+          files: good(),
+        }),
+      );
+      expect(e.message).toMatch(/boom/);
+      expect(seen.order).not.toContain(recordKey);
+      expect(s.fake.r2Object(s.bucket, recordKey)).toBeUndefined();
+      expect(seen.inFlight).toBe(0);
+    });
+
+    it("stageOnly writes every file and no record; the next publish writes only the record", async () => {
+      const s = await probed(setup());
+      seedFloor(s, signFloor(floorOf({ env: "prod" })), "prod");
+      const files = good("release", "prod");
+      const staged = await publishRelease({
+        cf: s.cf,
+        r2: s.r2.prod,
+        env: "prod",
+        version: "0.34.0",
+        files,
+        stageOnly: true,
+      });
+      expect(staged.status).toBe("staged");
+      expect(staged.keys).toHaveLength(tarEntries().length);
+      expect(staged.keys).not.toContain(recordKey);
+      const bucket = platformNames("prod").releases;
+      expect(s.fake.r2Object(bucket, recordKey)).toBeUndefined();
+      for (const e of tarEntries())
+        expect(
+          s.fake.r2Object(bucket, `releases/0.34.0/release/${e.path}`)?.bytes,
+        ).toEqual(e.bytes);
+      // Staging again is a no-op: the files are there, byte-identical.
+      const before = r2Writes(s.fake).length;
+      await publishRelease({
+        cf: s.cf,
+        r2: s.r2.prod,
+        env: "prod",
+        version: "0.34.0",
+        files,
+        stageOnly: true,
+      });
+      expect(r2Writes(s.fake).length).toBe(before);
+      // After the gate: only the record is written.
+      const done = await publishRelease({
+        cf: s.cf,
+        r2: s.r2.prod,
+        env: "prod",
+        version: "0.34.0",
+        files,
+      });
+      expect(done.status).toBe("published");
+      const puts = r2Writes(s.fake).slice(before);
+      expect(puts).toHaveLength(1);
+      expect(puts[0]?.path).toContain("record.sig.json");
+      expect(s.fake.r2Object(bucket, recordKey)?.bytes).toEqual(files.sig);
+    });
+
+    it("a failed gate writes no record: the staged files alone are not a release", async () => {
+      const s = await probed(setup());
+      seedFloor(s, signFloor(floorOf({ env: "prod" })), "prod");
+      await publishRelease({
+        cf: s.cf,
+        r2: s.r2.prod,
+        env: "prod",
+        version: "0.34.0",
+        files: good("release", "prod"),
+        stageOnly: true,
+      });
+      // The gate fails: the chain never calls publish without stageOnly.
+      const bucket = platformNames("prod").releases;
+      expect(s.fake.r2Object(bucket, recordKey)).toBeUndefined();
+      const reader = r2ReleaseReader(s.cf, "prod");
+      await expect(reader.record("0.34.0", "release")).resolves.toBeNull();
+    });
+
+    it("a staged object that differs from the tar is refused, with no record", async () => {
+      const s = await probed(setup());
+      seedFloor(s, signFloor(floorOf({ env: "prod" })), "prod");
+      const files = good("release", "prod");
+      await publishRelease({
+        cf: s.cf,
+        r2: s.r2.prod,
+        env: "prod",
+        version: "0.34.0",
+        files,
+        stageOnly: true,
+      });
+      const bucket = platformNames("prod").releases;
+      s.fake.r2Seed(
+        bucket,
+        "releases/0.34.0/release/welcome/welcome.md",
+        enc("evil"),
+      );
+      const e = await fails(
+        publishRelease({
+          cf: s.cf,
+          r2: s.r2.prod,
+          env: "prod",
+          version: "0.34.0",
+          files,
+        }),
+      );
+      expect(e).toBeInstanceOf(PublishRefused);
+      expect(e.message).toMatch(/differs from the tar/);
+      expect(s.fake.r2Object(bucket, recordKey)).toBeUndefined();
+    });
   });
 
   it("a second publish of the identical release is a no-op success with zero writes", async () => {
