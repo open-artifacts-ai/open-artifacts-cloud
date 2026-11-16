@@ -212,6 +212,13 @@ function suspendIo(
     upgradeAtMs?: number;
     bystanderClosesAtMs?: number;
     bystanderClose?: { code: number | null; reason: string; errored?: boolean };
+    /** The reopened bystander: its upgrade answer, hello and roster, and when it resets again. */
+    bystanderReopen?: {
+      status?: number;
+      helloOk?: boolean;
+      rosterOk?: boolean;
+      resetsAtMs?: number;
+    };
     suspendFails?: boolean;
     resumeFails?: boolean;
     reopenStatus?: number;
@@ -266,6 +273,22 @@ function suspendIo(
         closeCode: () => o.bystanderClose?.code ?? null,
         closeReason: () => o.bystanderClose?.reason ?? "",
         erroredFirst: () => o.bystanderClose?.errored ?? false,
+      };
+    },
+    reopenBystander: async () => {
+      log.push("bystander reopen");
+      const b = o.bystanderReopen ?? {};
+      return {
+        status: b.status ?? 101,
+        helloOk: b.helloOk ?? true,
+        rosterOk: b.rosterOk ?? true,
+        sock: {
+          closed: new Promise(() => {}),
+          isOpen: () => b.resetsAtMs === undefined || since() < b.resetsAtMs,
+          closeCode: () => null,
+          closeReason: () => "",
+          erroredFirst: () => true,
+        },
       };
     },
     openDaemon: async () => {
@@ -356,6 +379,77 @@ describe("case 2: suspend rl-busb", () => {
     await expect(suspendCase(io, PAIR)).rejects.toThrow(
       /bus socket closed while the other install was suspended \(code 1006, reason 'gone', errored first\)/,
     );
+  });
+
+  describe("a transport reset on the bystander (no close code, errored first)", () => {
+    const reset = { code: null, reason: "", errored: true };
+
+    it("is reopened with the same token and passes with a note", async () => {
+      const io = suspendIo({
+        bystanderClosesAtMs: 50_000,
+        bystanderClose: reset,
+      });
+      const r = await suspendCase(io, PAIR);
+      expect(io.log.filter((l) => l === "bystander reopen")).toHaveLength(1);
+      expect(r.resumeNotes[0]).toMatch(
+        /^rl-busa transport reset at \d+ ms since suspend; reopened 101$/,
+      );
+      expect(r.resumeNotes.at(-1)).toMatch(/^101 /);
+    });
+
+    it.each([
+      [
+        "refuses the reopen",
+        { status: 503 },
+        /reset .*reopen failed \(503, want 101\)/,
+      ],
+      ["gets no hello_ok", { helloOk: false }, /no hello_ok/],
+      [
+        "finds the roster changed",
+        { rosterOk: false },
+        /roster no longer lists the case's machine/,
+      ],
+    ])("fails when the reopen %s, and still resumes", async (_, reopen, re) => {
+      const io = suspendIo({
+        bystanderClosesAtMs: 50_000,
+        bystanderClose: reset,
+        bystanderReopen: reopen,
+      });
+      await expect(suspendCase(io, PAIR)).rejects.toThrow(re);
+      expect(io.log).toContain("resume");
+    });
+
+    it("fails on a second reset, with one reopen only", async () => {
+      const io = suspendIo({
+        bystanderClosesAtMs: 50_000,
+        bystanderClose: reset,
+        bystanderReopen: { resetsAtMs: 70_000 },
+      });
+      await expect(suspendCase(io, PAIR)).rejects.toThrow(
+        /bus socket closed .*\(code none, reason '', errored first\)/,
+      );
+      expect(io.log.filter((l) => l === "bystander reopen")).toHaveLength(1);
+    });
+
+    it.each([4403, 1000, 1001])(
+      "a close with code %i fails at once, no reopen",
+      async (code) => {
+        const io = suspendIo({
+          bystanderClosesAtMs: 50_000,
+          bystanderClose: { code, reason: "x", errored: true },
+        });
+        await expect(suspendCase(io, PAIR)).rejects.toThrow(
+          new RegExp(`code ${code}`),
+        );
+        expect(io.log).not.toContain("bystander reopen");
+      },
+    );
+
+    it("a close with no code and no error first fails at once", async () => {
+      const io = suspendIo({ bystanderClosesAtMs: 50_000 });
+      await expect(suspendCase(io, PAIR)).rejects.toThrow(/closed while/);
+      expect(io.log).not.toContain("bystander reopen");
+    });
   });
 
   it("a close at 30 s passes; at 31 s it fails, though the 120 s pass would come later", async () => {

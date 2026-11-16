@@ -367,6 +367,17 @@ export interface SuspendIo {
   wait(ms: number): Promise<void>;
   /** On rl-busa: a bus socket with hello_ok. */
   openBystander(): Promise<HeldSock>;
+  /**
+   * After a transport reset on the bystander: a new socket on rl-busa with the same token. Its
+   * upgrade status, whether hello_ok came, and whether rl-busa's roster still lists the case's
+   * machine live. `sock` is set when the upgrade was 101.
+   */
+  reopenBystander(): Promise<{
+    status: number;
+    helloOk: boolean;
+    rosterOk: boolean;
+    sock?: HeldSock;
+  }>;
   /** On the suspended install: a daemon socket, two agents up, one message delivered, not acked. */
   openDaemon(): Promise<Daemon>;
   /** R7 on the suspended install, to done. */
@@ -421,7 +432,10 @@ export async function suspendCase(
 ): Promise<SuspendResult> {
   const X = p.busb.name;
   const Y = p.busa.name;
-  const bystander = await io.openBystander();
+  let bystander = await io.openBystander();
+  // A transport reset (no close code, errored first) is reopened once; any close with a code fails.
+  let reopened = false;
+  let tSuspend = 0;
   const d = await io.openDaemon();
   // The hub as the daemon left it: compared after the resume, before the
   // reopen (M2), so the reopen's own agent_up can't stand in for it.
@@ -431,15 +445,34 @@ export async function suspendCase(
       `${X}'s roster does not list the case's machine and receiver before the suspend`,
     );
   const out: SuspendResult = { closeMs: 0, reconnects: 0, resumeNotes: [] };
-  const stillUp = (when: string) => {
-    if (!bystander.isOpen()) {
-      const code = bystander.closeCode();
-      const reason = (bystander.closeReason?.() ?? "").slice(0, 120);
-      const err = bystander.erroredFirst?.() ? ", errored first" : "";
-      throw new ProbeFail(
+  const stillUp = async (when: string) => {
+    if (bystander.isOpen()) return;
+    const code = bystander.closeCode();
+    const reason = (bystander.closeReason?.() ?? "").slice(0, 120);
+    const errored = bystander.erroredFirst?.() === true;
+    const err = errored ? ", errored first" : "";
+    const fail = () =>
+      new ProbeFail(
         `${Y}'s bus socket closed ${when} (code ${code ?? "none"}, reason '${reason}'${err})`,
       );
-    }
+    if (code !== null || !errored || reopened) throw fail();
+    reopened = true;
+    const since = Math.round(io.now() - tSuspend);
+    const r = await io.reopenBystander();
+    if (r.status !== 101 || !r.helloOk || !r.rosterOk || !r.sock)
+      throw new ProbeFail(
+        `${Y}'s bus socket was reset ${when} and the reopen failed (${
+          r.status !== 101
+            ? `${r.status}, want 101`
+            : !r.helloOk
+              ? "no hello_ok"
+              : "the roster no longer lists the case's machine"
+        })`,
+      );
+    bystander = r.sock;
+    out.resumeNotes.push(
+      `${Y} transport reset at ${since} ms since suspend; reopened 101`,
+    );
   };
   let failure: unknown;
   let resumeFailure: unknown;
@@ -452,6 +485,7 @@ export async function suspendCase(
     suspended = true;
     await io.suspend();
     const t0 = io.now();
+    tSuspend = t0;
     let closedAt: number | null = null;
     void d.closed.then(() => {
       closedAt ??= io.now();
@@ -479,7 +513,7 @@ export async function suspendCase(
       if (!closeChecked.done && CLOSE_WITHIN_MS <= at) await checkClose();
       const left = t0 + at - io.now();
       if (left > 0) await io.wait(left);
-      stillUp("while the other install was suspended");
+      await stillUp("while the other install was suspended");
       const r = await io.reconnect();
       out.reconnects++;
       const s = Math.round((io.now() - t0) / 1000);
@@ -505,7 +539,7 @@ export async function suspendCase(
     }
   if (failure) throw failure;
   if (resumeFailure) throw resumeFailure;
-  stillUp("by the resume");
+  await stillUp("by the resume");
   const hubAfter = await io.hub();
   if (!hubAfter.ours || hubAfter.view !== hubBefore.view)
     throw new ProbeFail(
@@ -544,7 +578,7 @@ export async function suspendCase(
     throw new ProbeFail(
       `after the resume the pending mail did not come again on ${X} within ${FRAME_WAIT_MS / 1000} s`,
     );
-  stillUp("at the end");
+  await stillUp("at the end");
   return out;
 }
 
@@ -866,6 +900,26 @@ export function liveSuspendIo(
         );
       await hello(h, y.side.name);
       return asSock(h);
+    },
+    async reopenBystander() {
+      const t = await minted.token(y);
+      const h = await holdSocket(connectRequest(y.side.app, t));
+      held.push(h);
+      if (h.status !== 101)
+        return { status: h.status, helloOk: false, rosterOk: false };
+      let helloOk = true;
+      try {
+        await hello(h, y.side.name);
+      } catch {
+        helloOk = false;
+      }
+      const ms = await getText(y, "/api/v1/bus/machines");
+      const rosterOk =
+        ms.status === 200 &&
+        idsWith(JSON.parse(ms.text), "label").some((m) =>
+          m.endsWith(`|${minted.label}|live`),
+        );
+      return { status: 101, helloOk, rosterOk, sock: asSock(h) };
     },
     async openDaemon() {
       const t = await minted.token(x);
