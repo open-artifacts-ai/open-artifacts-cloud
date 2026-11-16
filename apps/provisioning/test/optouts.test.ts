@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { keyId, publicFromPkcs8, signRequest } from "@oa/auth-core";
 import { clearRegistryCache } from "@oa/broker-core";
 import { beforeEach, describe, expect, it } from "vitest";
+import { handle } from "../src/app.js";
 import {
   ADDS_PER_DAY,
-  ADDS_PER_HOUR,
   CHECKS_PER_DAY,
   CHECKS_PER_MIN,
   mintToken,
@@ -11,8 +12,20 @@ import {
   optout,
   storedHash,
   TOKEN_TTL_MS,
+  UNSUB_CSP,
+  UNSUB_PER_IP_HOUR,
+  UNSUB_STYLE,
+  UNSUB_STYLE_HASH,
 } from "../src/routes/optouts.js";
-import { db, fakeEnv, pkcs8, resetDb, seedInstall } from "./fakes.js";
+import {
+  ctx,
+  db,
+  fakeEnv,
+  pkcs8,
+  resetDb,
+  SIGNUP,
+  seedInstall,
+} from "./fakes.js";
 
 // Open-artifacts#2652: the hosted opt-out list, platform side. Requests are
 // what dispatch's LoginGate forwards (install in x-oa-gate-install, body
@@ -109,20 +122,46 @@ beforeEach(async () => {
   clearRegistryCache();
 });
 
-describe("check, mint and add", () => {
-  it("checks one h1 to one bit, and add (with a minted token) flips it", async () => {
+const unsub = (
+  e: Awaited<ReturnType<typeof world>>,
+  token: string,
+  o: { method?: string; form?: boolean; ip?: string; now?: number } = {},
+) => {
+  const method = o.method ?? "POST";
+  const url = `${SIGNUP}/unsubscribe${o.form ? "" : `?t=${token}`}`;
+  return handle(
+    new Request(url, {
+      method,
+      headers: {
+        "cf-connecting-ip": o.ip ?? "203.0.113.7",
+        ...(o.form
+          ? { "content-type": "application/x-www-form-urlencoded" }
+          : {}),
+      },
+      body:
+        method === "POST"
+          ? o.form
+            ? `t=${token}`
+            : "List-Unsubscribe=One-Click"
+          : undefined,
+    }),
+    e,
+    ctx(),
+  );
+};
+
+describe("check, mint and the public unsubscribe", () => {
+  it("check is one h1, one bit; a one-click POST with the token only flips it for every install", async () => {
     const e = await world();
-    const c1 = await post("/optouts/check", e, { h1: H1 });
-    expect(await c1.json()).toEqual({ optedOut: false });
-    const token = await mint(e);
-    expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(204);
+    expect(await (await post("/optouts/check", e, { h1: H1 })).json()).toEqual({
+      optedOut: false,
+    });
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    const r = await unsub(e, token);
+    expect(r.status).toBe(200);
     expect(await (await post("/optouts/check", e, { h1: H1 })).json()).toEqual({
       optedOut: true,
     });
-    expect(await (await post("/optouts/check", e, { h1: H1B })).json()).toEqual(
-      { optedOut: false },
-    );
-    // Another install sees the same hosted-wide list.
     expect(
       await (
         await post(
@@ -133,42 +172,63 @@ describe("check, mint and add", () => {
         )
       ).json(),
     ).toEqual({ optedOut: true });
+    expect(await (await post("/optouts/check", e, { h1: H1B })).json()).toEqual(
+      { optedOut: false },
+    );
   });
 
-  it("add is idempotent: first writer wins, one audit row, install id and hash prefix only", async () => {
+  it("mint returns a token that redeems; a form-body POST works too", async () => {
     const e = await world();
     const token = await mint(e);
-    expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(204);
-    const tokenB = await mintToken(TOKEN_KEY, otherId, H1, NOW);
-    expect(
-      (
-        await post(
-          "/optouts/add",
-          e,
-          { h1: H1, token: tokenB },
-          { install: otherId, key: OTHER_KEY },
-        )
-      ).status,
-    ).toBe(204);
+    expect(token).toBeTruthy();
+    const mintedNow = Date.now();
+    void mintedNow;
+    expect((await unsub(e, token, { form: true })).status).toBe(200);
+    expect(await rows()).toHaveLength(1);
+  });
+
+  it("GET changes nothing, shows the confirm button, and sends the headers", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    const r = await unsub(e, token, { method: "GET" });
+    expect(r.status).toBe(200);
+    expect(await r.text()).toContain("Stop emails from all of Open Artifacts");
+    expect(await rows()).toHaveLength(0);
+    expect(r.headers.get("cache-control")).toBe("no-store");
+    expect(r.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(r.headers.get("content-security-policy")).toBe(UNSUB_CSP);
+    expect(r.headers.get("set-cookie")).toBeNull();
+    expect(UNSUB_STYLE_HASH).toBe(
+      `sha256-${createHash("sha256").update(UNSUB_STYLE).digest("base64")}`,
+    );
+  });
+
+  it("a repeat POST answers the same page, adds nothing, one audit row with the minting install and an h2 prefix only", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    const first = await unsub(e, token);
+    const again = await unsub(e, token);
+    expect(await again.text()).toBe(await first.text());
+    expect(again.headers.get("cache-control")).toBe("no-store");
     const r = await rows();
     expect(r).toHaveLength(1);
     expect(r[0]?.first_install).toBe(id);
     expect(r[0]?.source).toBe("recipient");
     const audit = await db
       .prepare(
-        "SELECT * FROM hosted_audit WHERE action = ?1 AND install_id IN (?2, ?3)",
+        "SELECT * FROM hosted_audit WHERE action = ?1 AND install_id = ?2",
       )
-      .bind(OPTOUT_ADD_ACTION, id, otherId)
-      .all<{ install_id: string; detail: string }>();
+      .bind(OPTOUT_ADD_ACTION, id)
+      .all<{ detail: string }>();
     expect(audit.results).toHaveLength(1);
-    expect(audit.results[0]?.install_id).toBe(id);
-    expect(audit.results[0]?.detail).not.toContain(H1);
+    expect(audit.results[0]?.detail).toBe(
+      JSON.stringify({ hash: (await storedHash(STORE, H1)).slice(0, 8) }),
+    );
   });
 
   it("stores h2 = HMAC(store key, h1): never the address, never h1", async () => {
     const e = await world();
-    const token = await mint(e);
-    await post("/optouts/add", e, { h1: H1, token });
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
     const r = await rows();
     expect(r[0]?.addr_hash).toBe(await storedHash(STORE, H1));
     expect(r[0]?.addr_hash).not.toBe(H1);
@@ -178,23 +238,88 @@ describe("check, mint and add", () => {
     expect(all).not.toContain(H1);
     expect(JSON.stringify(r)).not.toContain(H1);
   });
-});
 
-describe("the token", () => {
-  it("refuses a forged, other-h1, other-install, expired or malformed token", async () => {
+  it("is a plain 400 with no detail for a forged, expired, malformed or missing token", async () => {
     const e = await world();
-    const forged = await mintToken("x".repeat(32), id, H1, NOW);
-    const otherH1 = await mintToken(TOKEN_KEY, id, H1B, NOW);
-    const otherInstall = await mintToken(TOKEN_KEY, otherId, H1, NOW);
-    const expired = await mintToken(TOKEN_KEY, id, H1, NOW - TOKEN_TTL_MS - 1);
-    for (const token of [forged, otherH1, otherInstall, expired]) {
-      const r = await post("/optouts/add", e, { h1: H1, token });
-      expect(r.status).toBe(403);
+    const now = Date.now();
+    const forged = await mintToken("x".repeat(32), id, H1, now);
+    const expired = await mintToken(
+      TOKEN_KEY,
+      id,
+      H1,
+      now - TOKEN_TTL_MS - 1000,
+    );
+    for (const token of [forged, expired, "garbage", ""]) {
+      for (const method of ["GET", "POST"]) {
+        const r = await unsub(e, token, { method });
+        expect(r.status).toBe(400);
+        expect(await r.text()).toBe("Bad request");
+      }
     }
-    expect(
-      (await post("/optouts/add", e, { h1: H1, token: "garbage" })).status,
-    ).toBe(400);
     expect(await rows()).toHaveLength(0);
+  });
+
+  it("the token lives a year", () => {
+    expect(TOKEN_TTL_MS).toBe(365 * 86_400_000);
+  });
+
+  it("per minting install: a warn line at the threshold, past 200 the same page and no add", async () => {
+    const e = await world({ OPTOUT_ADD_SPIKE: "2" });
+    const logs: unknown[][] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void logs.push(a);
+    try {
+      for (let i = 0; i < 2; i++)
+        await unsub(
+          e,
+          await mintToken(TOKEN_KEY, id, i ? H1B : H1, Date.now()),
+        );
+      expect(logs).toEqual([["optout_add_spike", id, 2]]);
+      expect(await rows()).toHaveLength(2);
+      await db
+        .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
+        .bind(`optout:addday:${id}`, ADDS_PER_DAY)
+        .run();
+      const h3 = "c".repeat(64);
+      const r = await unsub(e, await mintToken(TOKEN_KEY, id, h3, Date.now()));
+      expect(r.status).toBe(200);
+      expect(await rows()).toHaveLength(2);
+      expect(logs.at(-1)).toEqual(["optout_add_capped", id, ADDS_PER_DAY + 1]);
+      // Another minting install is unaffected.
+      await unsub(e, await mintToken(TOKEN_KEY, otherId, h3, Date.now()));
+      expect(await rows()).toHaveLength(3);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it("rate limits unsubscribes per IP (429)", async () => {
+    const e = await world();
+    let last = 200;
+    for (let i = 0; i <= UNSUB_PER_IP_HOUR; i++)
+      last = (await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now())))
+        .status;
+    expect(last).toBe(429);
+    expect(
+      (
+        await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()), {
+          ip: "198.51.100.9",
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("is the plain 404 when OPTOUT_LIST is off, and add is gone from the gate", async () => {
+    const off = await world({ OPTOUT_LIST: "0" });
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    expect((await unsub(off, token)).status).toBe(404);
+    const e = await world();
+    const add = await req(
+      "/optouts/add",
+      { ts: NOW, nonce: nonce(), h1: H1, token },
+      { install: id },
+    );
+    expect((await call(add, e)).status).toBe(404);
   });
 });
 
@@ -212,6 +337,9 @@ describe("strict bodies and trust path", () => {
     expect(
       (await post("/optouts/mint", e, { h1: H1, token: "x" })).status,
     ).toBe(400);
+    expect((await post("/optouts/check", e, { h1: [H1, H1B] })).status).toBe(
+      400,
+    );
     expect(await rows()).toHaveLength(0);
   });
 
@@ -252,7 +380,7 @@ describe("strict bodies and trust path", () => {
 });
 
 describe("rate limits and the spike hook", () => {
-  it("limits checks per install per minute and adds per hour", async () => {
+  it("limits checks per install per minute", async () => {
     const e = await world();
     await db
       .prepare(
@@ -261,7 +389,6 @@ describe("rate limits and the spike hook", () => {
       .bind(`optout:check:${id}`, NOW - (NOW % 60_000), CHECKS_PER_MIN)
       .run();
     expect((await post("/optouts/check", e, { h1: H1 })).status).toBe(429);
-    // Another install is unaffected.
     expect(
       (
         await post(
@@ -272,14 +399,6 @@ describe("rate limits and the spike hook", () => {
         )
       ).status,
     ).toBe(200);
-    await db
-      .prepare(
-        "INSERT INTO rate_counters (key, window_start, count) VALUES (?1, ?2, ?3)",
-      )
-      .bind(`optout:add:${id}`, NOW - (NOW % 3_600_000), ADDS_PER_HOUR)
-      .run();
-    const token = await mintToken(TOKEN_KEY, id, H1, NOW);
-    expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(429);
   });
 
   const seedCount = (key: string, ms: number, count: number) =>
@@ -315,20 +434,5 @@ describe("rate limits and the spike hook", () => {
           .run(),
     );
     expect((await post("/optouts/check", e, { h1: H1 })).status).toBe(429);
-  });
-
-  it("adds: warn line at the threshold, hard daily cap of 200 (429)", async () => {
-    const e = await world({ OPTOUT_ADD_SPIKE: "2" });
-    const token = await mintToken(TOKEN_KEY, id, H1, NOW);
-    const logs = await warns(async () => {
-      for (let i = 0; i < 3; i++)
-        await post("/optouts/add", e, { h1: H1, token });
-    });
-    expect(logs).toEqual([["optout_add_spike", id, 2]]);
-    await db
-      .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
-      .bind(`optout:addday:${id}`, ADDS_PER_DAY)
-      .run();
-    expect((await post("/optouts/add", e, { h1: H1, token })).status).toBe(429);
   });
 });

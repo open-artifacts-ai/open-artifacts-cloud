@@ -5,7 +5,7 @@
 // a stub of this class in ctx.props.LOGIN, valid for that one request.
 //
 // The gate is the identity: it sets x-oa-gate-install to its own install; the
-// body names no install. It forwards fixed routes (POST /login-domains and the /optouts/* three), and
+// body names no install. It forwards fixed routes (POST /login-domains and the two /optouts/* ones), and
 // only the content type and the install's Ed25519 assertion headers.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
@@ -29,13 +29,9 @@ export const LOGIN_ORIGIN = "https://login.oa.internal";
 export const LOGIN_GATE_PATH = "/login-domains";
 /**
  * The hosted-wide email opt-out list (open-artifacts#2652) rides the same
- * gate: three more fixed routes, forwarded verbatim, never a caller's path.
+ * gate: two more fixed routes (an opt-out is redeemed on a public page, never through the gate), forwarded verbatim, never a caller's path.
  */
-export const OPTOUT_GATE_PATHS = [
-  "/optouts/check",
-  "/optouts/mint",
-  "/optouts/add",
-] as const;
+export const OPTOUT_GATE_PATHS = ["/optouts/check", "/optouts/mint"] as const;
 const GATE_PATHS: ReadonlySet<string> = new Set([
   LOGIN_GATE_PATH,
   ...OPTOUT_GATE_PATHS,

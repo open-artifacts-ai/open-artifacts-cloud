@@ -4,49 +4,53 @@ import {
   verifyAssertion,
 } from "@oa/broker-core";
 import { GATE_INSTALL_HEADER } from "@oa/broker-core/gate-header";
+import { hmac16 } from "../audit.js";
 import { bump, HOUR_MS } from "../auth/counters.js";
 import type { Env } from "../env.js";
 
-// The hosted-wide email opt-out list (open-artifacts#2652). Same trust path as
-// login-change.ts: the instance reaches it only through dispatch's LoginGate
-// (LOGIN binding, LoginChangeGate entrypoint), the install id is the gate's
-// x-oa-gate-install, the body is signed with one of that install's registry
-// keys (x-oa-kid, x-oa-sig over path, kid and exact body text, ts within
-// ASSERTION_SKEW_MS), the nonce is stored per install (a replay is a 409), and
-// a request with cf-connecting-ip (the internet) is the plain 404. OPTOUT_LIST
-// must be "1"; off, every route is the plain 404.
+// The hosted-wide email opt-out list (open-artifacts#2652).
+//
+// Gate routes (check, mint): same trust path as login-change.ts. The instance
+// reaches them only through dispatch's LoginGate (LOGIN binding,
+// LoginChangeGate entrypoint); the install id is the gate's x-oa-gate-install;
+// the body is signed with one of that install's registry keys (x-oa-kid,
+// x-oa-sig over path, kid and exact body text, ts within ASSERTION_SKEW_MS);
+// the nonce is stored per install (a replay is a 409; the nonce table,
+// login_change_nonces, is shared with login changes); a request with
+// cf-connecting-ip is the plain 404. OPTOUT_LIST must be "1"; off, every route
+// is the plain 404.
 //
 // The platform never receives an address. The install sends h1 =
 // HMAC-SHA256(OPTOUT_HASH_KEY, normalized address); OPTOUT_HASH_KEY is held by
-// hosted installs only (the provisioner sets it at render), never by the
-// platform. The list stores h2 = HMAC-SHA256(OPTOUT_STORE_KEY, h1), never h1.
+// hosted installs only, never by the platform. The list stores h2 =
+// HMAC-SHA256(OPTOUT_STORE_KEY, h1), never h1.
 //
-//   POST /optouts/check {ts, nonce, h1}          -> {optedOut: boolean}
-//   POST /optouts/mint  {ts, nonce, h1}          -> {token}   (for the unsubscribe link)
-//   POST /optouts/add   {ts, nonce, h1, token}   -> 204       (idempotent)
+//   POST /optouts/check {ts, nonce, h1} -> {optedOut: boolean}  (gate)
+//   POST /optouts/mint  {ts, nonce, h1} -> {token}              (gate)
+//   GET|POST signup.<app>/unsubscribe?t=<token>                 (public, below)
 //
-// An add needs a valid, unexpired token this platform minted for that same
-// install and h1 (HMAC with OPTOUT_TOKEN_KEY). This does NOT stop a
-// compromised install from opting out addresses it chooses: it can mint a
-// token for any h1 it computes. Only the per-install rate limits, the daily
-// caps and the audit row bound that. (The stronger form, where the platform
-// mints at send time and redeems that token, is not built.) The nonce table
-// (login_change_nonces) is shared with login changes. There is no removal route;
-// operators remove a row by hand (docs/ops/hosted.md).
+// A token (HMAC with OPTOUT_TOKEN_KEY) names the minting install and h1 and
+// lasts a year. It does NOT stop a compromised install from redeeming its own
+// links: it can mint a token for any h1 it computes. Only the mint rate limit,
+// the per-install daily redemption cap and the audit row bound that. There is
+// no add route on the gate and no removal route; operators remove a row by
+// hand (docs/ops/hosted.md).
 
 export const OPTOUT_PATHS: ReadonlySet<string> = new Set([
   "/optouts/check",
   "/optouts/mint",
-  "/optouts/add",
 ]);
+export const UNSUBSCRIBE_PATH = "/unsubscribe";
 export const OPTOUT_ADD_ACTION = "optout.add";
 export const OPTOUT_ACTOR = "system:optout";
-export const TOKEN_TTL_MS = 30 * 86_400_000;
+export const TOKEN_TTL_MS = 365 * 86_400_000;
 export const CHECKS_PER_MIN = 60;
 export const CHECKS_PER_DAY = 1000;
 export const MINTS_PER_HOUR = 200;
-export const ADDS_PER_HOUR = 60;
+/** Redemptions per minting install per day: a warn line at 150, a hard cap of 200. */
 export const ADDS_PER_DAY = 200;
+/** Unsubscribe POSTs per client IP per hour. */
+export const UNSUB_PER_IP_HOUR = 30;
 export const DEFAULT_CHECK_SPIKE = 800;
 export const DEFAULT_ADD_SPIKE = 150;
 const DAY_MS = 86_400_000;
@@ -60,7 +64,6 @@ const TOKEN = /^[A-Za-z0-9_-]{1,512}\.[A-Za-z0-9_-]{43}$/;
 const FIELDS: Record<string, string[]> = {
   "/optouts/check": ["h1", "nonce", "ts"],
   "/optouts/mint": ["h1", "nonce", "ts"],
-  "/optouts/add": ["h1", "nonce", "token", "ts"],
 };
 
 const noStore = { "cache-control": "no-store" };
@@ -69,7 +72,7 @@ const notFound = () =>
 const reply = (status: number, error: string) =>
   Response.json({ error }, { status, headers: noStore });
 
-type Body = { ts: number; nonce: string; h1: string; token?: string };
+type Body = { ts: number; nonce: string; h1: string };
 
 function parseBody(path: string, text: string): Body | null {
   let v: unknown;
@@ -158,33 +161,37 @@ export async function mintToken(
   return `${payload}.${b64u(await hmacBytes(key, `optout-token:${payload}`))}`;
 }
 
-/** True when `token` was minted by this platform for exactly this install and h1, and hasn't expired. */
-export async function tokenValid(
+/** The {h1, install} a valid, unexpired token this platform minted names, else null. */
+export async function readToken(
   key: string,
   token: string,
-  install: string,
-  h1: string,
   now: number,
-): Promise<boolean> {
+): Promise<{ h1: string; install: string } | null> {
+  if (!TOKEN.test(token)) return null;
   const [payload, mac] = token.split(".");
-  if (!payload || !mac) return false;
+  if (!payload || !mac) return null;
   const want = b64u(await hmacBytes(key, `optout-token:${payload}`));
   let diff = want.length ^ mac.length;
   for (let i = 0; i < want.length; i++)
     diff |= want.charCodeAt(i) ^ (mac.charCodeAt(i) || 0);
-  if (diff !== 0) return false;
+  if (diff !== 0) return null;
   try {
     const p = JSON.parse(new TextDecoder().decode(fromB64u(payload))) as {
       h1?: unknown;
       i?: unknown;
       exp?: unknown;
     };
-    return (
-      p.h1 === h1 && p.i === install && typeof p.exp === "number" && p.exp > now
-    );
-  } catch {
-    return false;
-  }
+    if (
+      typeof p.h1 === "string" &&
+      H1.test(p.h1) &&
+      typeof p.i === "string" &&
+      INSTALL_ID.test(p.i) &&
+      typeof p.exp === "number" &&
+      p.exp > now
+    )
+      return { h1: p.h1, install: p.i };
+  } catch {}
+  return null;
 }
 
 /** One opt-out list request; every answer is a fixed code. */
@@ -235,9 +242,7 @@ export async function optout(
   const limit =
     kind === "check"
       ? { n: CHECKS_PER_MIN, ms: MIN_MS }
-      : kind === "mint"
-        ? { n: MINTS_PER_HOUR, ms: HOUR_MS }
-        : { n: ADDS_PER_HOUR, ms: HOUR_MS };
+      : { n: MINTS_PER_HOUR, ms: HOUR_MS };
   const count = await bump(
     env.PLATFORM_DB,
     `optout:${kind}:${install}`,
@@ -245,25 +250,18 @@ export async function optout(
     now,
   );
   if (count > limit.n) return reply(429, "rate_limited");
-  if (kind !== "mint") {
-    // The per-install daily count: a warn line at the threshold (the alert
-    // reads optout_check_spike / optout_add_spike), a hard cap past it.
-    const cap = kind === "check" ? CHECKS_PER_DAY : ADDS_PER_DAY;
+  if (kind === "check") {
+    // The per-install daily count: a warn line at the threshold
+    // (optout_check_spike), a hard cap past it.
     const day = await bump(
       env.PLATFORM_DB,
-      `optout:${kind}day:${install}`,
+      `optout:checkday:${install}`,
       DAY_MS,
       now,
     );
-    const spike =
-      Number(
-        kind === "check" ? env.OPTOUT_CHECK_SPIKE : env.OPTOUT_ADD_SPIKE,
-      ) || (kind === "check" ? DEFAULT_CHECK_SPIKE : DEFAULT_ADD_SPIKE);
-    if (day === spike) console.warn(`optout_${kind}_spike`, install, day);
-    if (day > cap) return reply(429, "daily_cap");
-  }
-
-  if (kind === "check") {
+    const spike = Number(env.OPTOUT_CHECK_SPIKE) || DEFAULT_CHECK_SPIKE;
+    if (day === spike) console.warn("optout_check_spike", install, day);
+    if (day > CHECKS_PER_DAY) return reply(429, "daily_cap");
     const h2 = await storedHash(env.OPTOUT_STORE_KEY, body.h1);
     const row = await env.PLATFORM_DB.prepare(
       "SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1",
@@ -272,28 +270,124 @@ export async function optout(
       .first();
     return Response.json({ optedOut: row !== null }, { headers: noStore });
   }
-  if (kind === "mint")
-    return Response.json(
-      { token: await mintToken(env.OPTOUT_TOKEN_KEY, install, body.h1, now) },
-      { headers: noStore },
-    );
+  return Response.json(
+    { token: await mintToken(env.OPTOUT_TOKEN_KEY, install, body.h1, now) },
+    { headers: noStore },
+  );
+}
 
-  if (
-    !(await tokenValid(
-      env.OPTOUT_TOKEN_KEY,
-      body.token as string,
-      install,
-      body.h1,
-      now,
-    ))
-  )
-    return reply(403, "bad_token");
-  const h2 = await storedHash(env.OPTOUT_STORE_KEY, body.h1);
-  // First writer wins; the audit row is written only for a new row.
+// The public unsubscribe page (signup.<app>/unsubscribe, no gate). A recipient
+// (or a mail client's RFC 8058 one-click POST, `List-Unsubscribe=One-Click`)
+// holds only the token. GET changes nothing; POST takes only the token (query
+// or form field `t`), adds the opt-out and answers the same page whether the
+// address was new or already listed. No Turnstile, no cookies read or set.
+
+const STYLE =
+  "body{font:16px system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}button{font:inherit;padding:.6rem 1rem;cursor:pointer}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}}";
+/** The CSP sha256 of STYLE (a test recomputes it). */
+export const UNSUB_STYLE_HASH =
+  "sha256-Zo+JMTX83jHilR5wlehyj4yHgg1XfdIBiVLnfoWhHac=";
+export const UNSUB_CSP = `default-src 'none'; style-src '${UNSUB_STYLE_HASH}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`;
+export const UNSUB_STYLE = STYLE;
+const UNSUB_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "cache-control": "no-store",
+  "content-security-policy": UNSUB_CSP,
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+};
+const page = (title: string, inner: string) =>
+  new Response(
+    `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title><style>${STYLE}</style><body>${inner}</body></html>`,
+    { headers: UNSUB_HEADERS },
+  );
+const confirmPage = (token: string) =>
+  page(
+    "Unsubscribe",
+    `<h1>Unsubscribe</h1><p>Stop emails from all of Open Artifacts to this address.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Stop emails from all of Open Artifacts</button></form>`,
+  );
+const donePage = () =>
+  page(
+    "Unsubscribed",
+    "<h1>You are unsubscribed</h1><p>You will not get share emails from Open Artifacts at this address.</p>",
+  );
+const bad = () =>
+  new Response("Bad request", {
+    status: 400,
+    headers: { "cache-control": "no-store", "referrer-policy": "no-referrer" },
+  });
+
+async function tokenOf(req: Request, url: URL): Promise<string | null> {
+  const q = url.searchParams.get("t");
+  if (q !== null) {
+    await req.body?.cancel();
+    return q;
+  }
+  if (req.method !== "POST") return null;
+  const type = req.headers.get("content-type") ?? "";
+  if (!/^application\/x-www-form-urlencoded(\s*;|$)/i.test(type)) return null;
+  try {
+    const buf = await req.arrayBuffer();
+    if (buf.byteLength > 2048) return null;
+    return new URLSearchParams(new TextDecoder().decode(buf)).get("t");
+  } catch {
+    return null;
+  }
+}
+
+/** GET (the confirm page, no change) and POST (the opt-out) of /unsubscribe. */
+export async function unsubscribe(
+  req: Request,
+  env: Env,
+  ipKey: string,
+  now: number = Date.now(),
+): Promise<Response> {
+  if (env.OPTOUT_LIST !== "1") return notFound();
+  if (req.method !== "GET" && req.method !== "POST")
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: { allow: "GET, POST", "cache-control": "no-store" },
+    });
+  if (!env.OPTOUT_STORE_KEY || !env.OPTOUT_TOKEN_KEY)
+    return new Response("Unavailable", { status: 503, headers: noStore });
+  const url = new URL(req.url);
+  const token = await tokenOf(req, url);
+  const named = token
+    ? await readToken(env.OPTOUT_TOKEN_KEY, token, now)
+    : null;
+  if (!token || !named) return bad();
+  if (req.method === "GET") return confirmPage(token);
+
+  const ip = await bump(
+    env.PLATFORM_DB,
+    `optout:unsub:${await hmac16(env, ipKey)}`,
+    HOUR_MS,
+    now,
+  );
+  if (ip > UNSUB_PER_IP_HOUR)
+    return new Response("Too many requests", {
+      status: 429,
+      headers: noStore,
+    });
+  // Per minting install: a warn line at 150, a hard cap of 200 past which the
+  // same page answers but nothing is added.
+  const day = await bump(
+    env.PLATFORM_DB,
+    `optout:addday:${named.install}`,
+    DAY_MS,
+    now,
+  );
+  const spike = Number(env.OPTOUT_ADD_SPIKE) || DEFAULT_ADD_SPIKE;
+  if (day === spike) console.warn("optout_add_spike", named.install, day);
+  if (day > ADDS_PER_DAY) {
+    console.warn("optout_add_capped", named.install, day);
+    return donePage();
+  }
+  const h2 = await storedHash(env.OPTOUT_STORE_KEY, named.h1);
   const ins = await env.PLATFORM_DB.prepare(
     "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) VALUES (?1, 'recipient', ?2, ?3)",
   )
-    .bind(h2, install, now)
+    .bind(h2, named.install, now)
     .run();
   if ((ins.meta.changes ?? 0) > 0)
     await env.PLATFORM_DB.prepare(
@@ -302,10 +396,10 @@ export async function optout(
       .bind(
         now,
         OPTOUT_ACTOR,
-        install,
+        named.install,
         OPTOUT_ADD_ACTION,
-        JSON.stringify({ hash: h2.slice(0, 8), kid }),
+        JSON.stringify({ hash: h2.slice(0, 8) }),
       )
       .run();
-  return new Response(null, { status: 204, headers: noStore });
+  return donePage();
 }
