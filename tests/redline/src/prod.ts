@@ -197,7 +197,13 @@ export const prodCleanLine = (failCode?: string) =>
 export const PROD_CLEAN_LINE_RE =
   /^prod-clean: (pass|fail \([a-z][a-z0-9_]{0,39}\))$/;
 
-export type ProdResult = { level: "pass"; releases: number; installs: number };
+export type ProdResult = {
+  level: "pass";
+  releases: number;
+  installs: number;
+  /** Versions with files but no record: staged before the gate (cloud #329), skipped. */
+  staged?: string[];
+};
 
 /** A 429 is retried this many times per request (Retry-After honoured). */
 export const CF_429_RETRIES = 3;
@@ -620,8 +626,22 @@ async function scan(
           "release_dirty",
           `release ${version.slice(0, 40)}: variant ${v.slice(0, 20)} in prod`,
         );
+  // A version with files but no record is staged (stage-prod uploads before
+  // the gate; the record is written after it): skipped and listed. A record
+  // without its files, or any other odd shape, still fails in checkRelease.
+  const recorded = new Set(keys);
+  const staged = [...releases.keys()].filter(
+    (v) => !recorded.has(`releases/${v}/release/${RECORD_FILE}`),
+  );
+  if (staged.length)
+    console.log(
+      `prodClean: staged (no record): ${staged
+        .map((v) => v.slice(0, 40))
+        .sort()
+        .join(", ")}`,
+    );
   await forEachLimit(
-    [...releases.keys()],
+    [...releases.keys()].filter((v) => !staged.includes(v)),
     PROD_CLEAN_CONCURRENCY,
     (version) => checkRelease(r2, version, pubkey),
     isDirty,
@@ -713,7 +733,14 @@ async function scan(
   };
   await forEachLimit(rows, PROD_CLEAN_CONCURRENCY, checkInstall, isDirty);
 
-  return { level: "pass", releases: releases.size, installs: rows.length };
+  return {
+    level: "pass",
+    releases: releases.size - staged.length,
+    installs: rows.length,
+    ...(staged.length
+      ? { staged: staged.map((v) => v.slice(0, 40)).sort() }
+      : {}),
+  };
 }
 
 /** The prod admin origin, as the provisioning probes read it (REDLINE_PROD_PROV_ADMIN). */

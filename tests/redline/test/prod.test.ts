@@ -1064,10 +1064,42 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
   });
 
-  it("a release with no record, among clean ones, fails", async () => {
+  it("a version with files but no record is staged: skipped and listed, the rest still checked", async () => {
     const w = many(12);
     w.objects?.delete("releases/1.0.7/release/record.sig.json");
+    const { fetch } = await serve(w);
+    const r = await prodClean(probe(), { fetch, pubkey: PUB, ...bearerOf({}) });
+    expect(r).toEqual({
+      level: "pass",
+      releases: 11,
+      installs: 1,
+      staged: ["1.0.7"],
+    });
+  });
+
+  it("a recorded version is still fully checked beside a staged one (a bad file fails)", async () => {
+    const w = many(3);
+    w.objects?.delete("releases/1.0.1/release/record.sig.json");
+    publish(w, { version: "1.0.2", js: HOOK_SQL_MARKERS[0] });
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a record without its files still fails", async () => {
+    const w = many(3);
+    w.objects?.delete("releases/1.0.1/release/modules/index.js");
+    await expect(check(w)).rejects.toThrow();
+  });
+
+  it("a listing error fails", async () => {
+    const w = many(2);
+    const { fetch } = await serve(w);
+    const bad: typeof fetch = async (i, init) =>
+      String(i instanceof Request ? i.url : i).includes("prefix=")
+        ? new Response("{}", { status: 500 })
+        : fetch(i, init);
+    await expect(
+      prodClean(probe(), { fetch: bad, pubkey: PUB, ...bearerOf({}) }),
+    ).rejects.toThrow();
   });
 
   it("an unreadable install (its script's secret list answers 404 on a serving row) fails, among clean ones", async () => {
