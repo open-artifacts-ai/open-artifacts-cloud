@@ -312,21 +312,34 @@ const page = (title: string, inner: string) =>
     `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title><style>${STYLE}</style><body>${inner}</body></html>`,
     { headers: UNSUB_HEADERS },
   );
+const BRAND = "<p><strong>Open Artifacts</strong></p>";
 const confirmPage = (token: string) =>
   page(
-    "Unsubscribe",
-    `<h1>Unsubscribe</h1><p>Stop emails from all of Open Artifacts to this address.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Stop emails from all of Open Artifacts</button></form>`,
+    "Stop these emails?",
+    `${BRAND}<h1>Stop these emails?</h1><p>We won't email you again when someone shares a page with you, from any team on Open Artifacts.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Don't email me again</button></form>`,
   );
-const donePage = () =>
-  page(
-    "Unsubscribed",
-    "<h1>You are unsubscribed</h1><p>You will not get share emails from Open Artifacts at this address.</p>",
-  );
+const donePage = (scopedToTeam: boolean) =>
+  scopedToTeam
+    ? page(
+        "You won't get emails from this team again.",
+        `${BRAND}<h1>You won't get emails from this team again.</h1><p>We've stopped emails to you about pages shared from this team. Other teams on Open Artifacts can still email you for now; we're reviewing that. Pages shared with you still open when you log in.</p>`,
+      )
+    : page(
+        "You won't get these emails again.",
+        `${BRAND}<h1>You won't get these emails again.</h1><p>Pages shared with you still open when you log in. We just won't email you about them.</p>`,
+      );
 const bad = () =>
-  new Response("Bad request", {
-    status: 400,
-    headers: { "cache-control": "no-store", "referrer-policy": "no-referrer" },
-  });
+  new Response(
+    "This link doesn't work. Open the most recent email from us and use the link there.",
+    {
+      status: 400,
+      headers: {
+        "cache-control": "no-store",
+        "referrer-policy": "no-referrer",
+        "content-type": "text/plain; charset=utf-8",
+      },
+    },
+  );
 
 async function tokenOf(req: Request, url: URL): Promise<string | null> {
   const q = url.searchParams.get("t");
@@ -433,5 +446,11 @@ export async function unsubscribe(
         JSON.stringify({ hash: h2.slice(0, 8), scope }),
       )
       .run();
-  return donePage();
+  // Whichever is true now: the platform-wide row exists, or only this team's.
+  const all = await env.PLATFORM_DB.prepare(
+    "SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1",
+  )
+    .bind(h2)
+    .first();
+  return donePage(all === null);
 }
