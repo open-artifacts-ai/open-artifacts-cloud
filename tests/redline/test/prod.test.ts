@@ -9,7 +9,7 @@ import {
   platformNames,
   TEST_HOOKS_DEFINE,
 } from "@oa/provision";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
@@ -1113,6 +1113,34 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
     publish(w, { version: "2.0.6" });
     w.objects?.delete("releases/2.0.6/release/record.sig.json");
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a staged version whose files are half uploaded passes and is listed incomplete", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0" });
+    w.objects?.delete("releases/2.0.0/release/record.sig.json");
+    w.objects?.delete("releases/2.0.0/release/modules/index.js");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { fetch } = await serve(w);
+      const r = await prodClean(probe(), {
+        fetch,
+        pubkey: PUB,
+        ...bearerOf({}),
+      });
+      expect(r.staged).toEqual(["2.0.0"]);
+      expect(log).toHaveBeenCalledWith("prodClean: staged, incomplete: 2.0.0");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("a record-less version with release plus another variant fails", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0" });
+    w.objects?.delete("releases/2.0.0/release/record.sig.json");
+    publish(w, { version: "2.0.0", variant: "redline" });
+    await expect(check(w)).rejects.toThrow(ProdDirty);
   });
 
   it("a redline-variant version without a record fails", async () => {

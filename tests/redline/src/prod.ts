@@ -446,12 +446,19 @@ function versionCmp(a: string, b: string): number {
   return 0;
 }
 
-async function checkStaged(cf: Cf, version: string): Promise<void> {
-  const what = `release ${version.slice(0, 40)} (staged)`;
-  scanModules(
-    await r2ReleaseReader(cf, "prod").modules(version, "release"),
-    what,
-  );
+/** True when the staged version's files could not all be read yet (stage-prod may still be uploading). */
+async function checkStaged(cf: Cf, version: string): Promise<boolean> {
+  let bundle: Awaited<
+    ReturnType<ReturnType<typeof r2ReleaseReader>["modules"]>
+  >;
+  try {
+    bundle = await r2ReleaseReader(cf, "prod").modules(version, "release");
+  } catch {
+    return true;
+  }
+  // Scan what was read; a missing main module means the upload is unfinished.
+  scanModules(bundle, `release ${version.slice(0, 40)} (staged)`);
+  return !bundle.modules.some((m) => m.name === bundle.mainModule);
 }
 
 /**
@@ -667,18 +674,36 @@ async function scan(
       "release_dirty",
       `releases bucket: ${staged.length} staged versions (max ${MAX_STAGED})`,
     );
+  for (const v of staged) {
+    const vs = releases.get(v);
+    if (!vs || vs.size !== 1 || !vs.has("release"))
+      throw new ProdDirty(
+        "release_dirty",
+        `release ${v.slice(0, 40)}: a staged version holds only the release variant`,
+      );
+  }
   for (const v of staged)
     if (recordedVs.some((r) => versionCmp(v, r) <= 0))
       throw new ProdDirty(
         "release_dirty",
         `release ${v.slice(0, 40)}: no ${RECORD_FILE} and not newer than every recorded version`,
       );
+  const incomplete: string[] = [];
   await forEachLimit(
     staged,
     PROD_CLEAN_CONCURRENCY,
-    (v) => checkStaged(r2, v),
+    async (v) => {
+      if (await checkStaged(r2, v)) incomplete.push(v);
+    },
     isDirty,
   );
+  if (incomplete.length)
+    console.log(
+      `prodClean: staged, incomplete: ${incomplete
+        .map((v) => v.slice(0, 40))
+        .sort()
+        .join(", ")}`,
+    );
   if (staged.length)
     console.log(
       `prodClean: staged (no record): ${staged
