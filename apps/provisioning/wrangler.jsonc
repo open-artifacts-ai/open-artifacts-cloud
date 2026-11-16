@@ -57,6 +57,8 @@
         // An instance's login-domain change (#2520): "1" on, anything else
         // its plain 404. Staging only for now.
         "LOGIN_CHANGE": "1",
+        // The hosted email opt-out list (#2652): "1" on, else its plain 404.
+        "OPTOUT_LIST": "1",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_STAGING}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_STAGING}}",
@@ -236,6 +238,8 @@
         // An instance's login-domain change (#2520): off on prod until its
         // red-line case has passed on staging.
         "LOGIN_CHANGE": "0",
+        // The hosted email opt-out list (#2652): off on prod.
+        "OPTOUT_LIST": "0",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
