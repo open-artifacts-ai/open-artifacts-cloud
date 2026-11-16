@@ -226,6 +226,12 @@ export interface WfpOptions {
    */
   prodBusAll?: boolean;
   /**
+   * open-artifacts#2650 (the provisioner's EMAIL_EVENTS, "1" is on): each
+   * install's sender is noreply+<installId>@mail.<app zone> (metadata's
+   * emailEvents).
+   */
+  emailEvents?: boolean;
+  /**
    * open-artifacts#1008, per environment (the provisioner's OAUTH_BORN_D1,
    * "1" is on): a new install is born on d1 (OAUTH_STORE=d1 in its stored
    * vars, no OAUTH_KV binding, no <id>-oauth namespace). Existing installs
@@ -2416,6 +2422,7 @@ export class WfpProvisioner {
         busSlugs: this.o.stagingBusSlugs,
         busAll: this.o.stagingBusAll,
         busAllProd: this.o.prodBusAll,
+        emailEvents: this.o.emailEvents,
         target: this.target.kind,
         mode: r.mode,
         secrets: known,

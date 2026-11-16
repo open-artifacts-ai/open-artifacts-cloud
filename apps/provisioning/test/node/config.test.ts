@@ -121,10 +121,28 @@ describe("wrangler.jsonc", () => {
         ]);
       });
 
-      it("produces to oa-<p>-signups and consumes nothing", () => {
-        expect(e.queues).toEqual({
+      it("produces to oa-<p>-signups; consumes nothing but, on staging, the email-events queue (#2650)", () => {
+        const { consumers, ...rest } = e.queues;
+        expect(rest).toEqual({
           producers: [{ binding: "SIGNUPS", queue: `${p}signups` }],
         });
+        expect(consumers).toEqual(
+          env === "staging"
+            ? [
+                {
+                  queue: "oa-s-email-events",
+                  max_batch_size: 25,
+                  max_batch_timeout: 5,
+                  max_retries: 5,
+                  dead_letter_queue: "oa-s-email-events-dlq",
+                },
+              ]
+            : undefined,
+        );
+      });
+
+      it('EMAIL_EVENTS is "1" on staging and "0" on prod (#2650)', () => {
+        expect(e.vars.EMAIL_EVENTS).toBe(env === "staging" ? "1" : "0");
       });
 
       it("serves the SPA with the Worker first", () => {

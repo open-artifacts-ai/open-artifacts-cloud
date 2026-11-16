@@ -57,6 +57,15 @@ case "$*" in
     touch "$STATE/$w.exists"
     [ -f "$STATE/$w.next.json" ] && cp "$STATE/$w.next.json" "$STATE/$w.settings.json"
     ;;
+  "exec wrangler queues subscription list"*)
+    [ -f "$STATE/fail-subs" ] && exit 1
+    echo "wrangler-list" >> "$STUB_LOG"
+    cat "$STATE/subs.json" 2>/dev/null || echo '[]'
+    ;;
+  "exec wrangler queues subscription create"*)
+    echo "WRITE wrangler $*" >> "$STUB_LOG"
+    jq -nc --arg a "$*" '[{name: "oa-s-email-events", enabled: true, source: {type: "email.sending", domain: ($a | capture("--domain (?<d>[^ ]+)").d)}, events: ($a | capture("--events (?<e>[^ ]+)").e | split(","))}]' > "$STATE/subs.json"
+    ;;
   "exec wrangler secret put"*)
     v="$(cat)"
     echo "stdin-len $5 \${#v}" >> "$STUB_LOG"
@@ -93,7 +102,7 @@ case "$path" in
     else ok "$(cat "$STATE/queues.json")"; fi
     exit 0 ;;
   queues)
-    jq -c --argjson b "$body" 'if type == "object" then .result += [{queue_name: $b.queue_name}] else . + [{queue_name: $b.queue_name}] end' "$STATE/queues.json" 2>/dev/null > "$STATE/q.new" || jq -nc --argjson b "$body" '[{queue_name: $b.queue_name}]' > "$STATE/q.new"
+    jq -c --argjson b "$body" 'if type == "object" then .result += [{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}] else . + [{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}] end' "$STATE/queues.json" 2>/dev/null > "$STATE/q.new" || jq -nc --argjson b "$body" '[{queue_name: $b.queue_name, queue_id: ("q-" + $b.queue_name)}]' > "$STATE/q.new"
     mv "$STATE/q.new" "$STATE/queues.json"; ok '{}'; exit 0 ;;
   r2/buckets/*) n="\${path#r2/buckets/}"
     if [ -f "$STATE/fail-r2" ]; then bad; elif [ -f "$STATE/r2-$n" ]; then ok '{}'; else echo '{"success":false,"errors":[{"code":10006}]}'; fi; exit 0 ;;
@@ -247,7 +256,10 @@ function schedulerBindings(
 const queueList = (names: string[], total = names.length, pages = 1) =>
   JSON.stringify({
     success: true,
-    result: names.map((queue_name) => ({ queue_name })),
+    result: names.map((queue_name) => ({
+      queue_name,
+      queue_id: `q-${queue_name}`,
+    })),
     result_info: {
       page: 1,
       per_page: 100,
@@ -1396,14 +1408,17 @@ describe("deploy-hosted-platform.sh", () => {
           (b: { name: string }) =>
             !b.name.startsWith("WELCOME_") &&
             b.name !== "BUSINESS_REQUESTS_TO" &&
-            b.name !== "LOGIN_CHANGE",
+            b.name !== "LOGIN_CHANGE" &&
+            b.name !== "EMAIL_EVENTS",
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) =>
-            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
+            b.name !== "PROD_BUS_ALL" &&
+            b.name !== "OAUTH_BORN_D1" &&
+            b.name !== "EMAIL_EVENTS",
         );
       return JSON.stringify(next);
     };
@@ -3412,6 +3427,118 @@ describe("deploy-hosted-platform.sh", () => {
       expect(put).toContain(
         '"origin":"https://admin.open-artifacts-staging.app"',
       );
+    });
+    describe("Email Service events (open-artifacts#2650)", () => {
+      const stagingSetup = (files: Record<string, string> = {}) =>
+        setup({
+          exists: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
+          files: {
+            "widgets.json": JSON.stringify([
+              { name: "oa-s-turnstile", sitekey: "0x4AAAAAAAtest_key-1" },
+            ]),
+            ...files,
+          },
+          next: {
+            "oa-s-provisioning": settings(provisioningBindings("s", "staging")),
+          },
+        });
+      const sub = (over: Record<string, unknown> = {}) =>
+        JSON.stringify([
+          {
+            name: "oa-s-email-events",
+            enabled: true,
+            source: {
+              type: "email.sending",
+              domain: "mail.open-artifacts-staging.app",
+            },
+            destination: { queue_id: "q-oa-s-email-events" },
+            events: ["message.bounced", "message.complained"],
+            ...over,
+          },
+        ]);
+      const subWrites = (r: { writes: string[] }) =>
+        r.writes.filter((w) =>
+          w.startsWith("WRITE wrangler exec wrangler queues subscription"),
+        );
+      it("staging creates both queues and the subscription for mail.<zone> when absent, then reads it back", () => {
+        const r = stagingSetup().run(
+          "provisioning",
+          { NEW_KV: OAUTH },
+          "staging",
+        );
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        const q = r.writes.filter((w) => w.startsWith("WRITE POST /queues "));
+        expect(
+          q.map((w) => JSON.parse(w.split(" ").slice(3).join(" ")).queue_name),
+        ).toEqual(["oa-s-email-events", "oa-s-email-events-dlq"]);
+        const w = subWrites(r);
+        expect(w).toEqual([
+          `WRITE wrangler exec wrangler queues subscription create oa-s-email-events --source email.sending --zone-id ${ZONE} --domain mail.open-artifacts-staging.app --events message.bounced,message.complained --name oa-s-email-events`,
+        ]);
+        clean(r);
+      });
+      it("creates nothing when the queues and the subscription exist", () => {
+        const r = stagingSetup({
+          "queues.json": queueList([
+            "oa-s-signups",
+            "oa-s-signups-dlq",
+            "oa-s-email-events",
+            "oa-s-email-events-dlq",
+          ]),
+          "subs.json": sub(),
+        }).run("provisioning", { NEW_KV: OAUTH }, "staging");
+        expect(r.err).toBe("");
+        expect(r.code).toBe(0);
+        expect(subWrites(r)).toEqual([]);
+        expect(r.writes.filter((w) => w.includes("email-events"))).toEqual([]);
+      });
+      it("refuses a subscription that is disabled or has other events", () => {
+        for (const over of [
+          { enabled: false },
+          { events: ["message.delivered"] },
+        ]) {
+          const r = stagingSetup({
+            "queues.json": queueList([
+              "oa-s-signups",
+              "oa-s-signups-dlq",
+              "oa-s-email-events",
+              "oa-s-email-events-dlq",
+            ]),
+            "subs.json": sub(over),
+          }).run("provisioning", { NEW_KV: OAUTH }, "staging");
+          expect(r.code).toBe(1);
+          expect(r.err).toContain(
+            "not one enabled subscription for bounced and complained",
+          );
+        }
+      });
+      it("verify only creates nothing and refuses when the subscription is absent", () => {
+        const r = stagingSetup({
+          "kvns.json": JSON.stringify([
+            { id: OAUTH, title: "oa-s-provisioning-oauth" },
+          ]),
+          "queues.json": queueList([
+            "oa-s-signups",
+            "oa-s-signups-dlq",
+            "oa-s-email-events",
+            "oa-s-email-events-dlq",
+          ]),
+        }).run("provisioning", { NEW_KV: OAUTH, VERIFY_ONLY: "1" }, "staging");
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(
+          "event subscription for mail.open-artifacts-staging.app does not exist",
+        );
+        expect(subWrites(r)).toEqual([]);
+      });
+      it("prod never creates the queue or the subscription (the flag is off there)", () => {
+        const r = setup({
+          exists: ["oa-p-provisioner", "oa-p-auth-broker"],
+        }).run("provisioning");
+        expect(
+          r.writes.filter((w) => /email-events|queues subscription/.test(w)),
+        ).toEqual([]);
+      });
     });
     it("staging also makes the sign-up host's key and entry and puts the env's one Turnstile widget's sitekey; prod gets neither (#40)", () => {
       const exists = ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"];

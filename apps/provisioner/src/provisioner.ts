@@ -31,6 +31,12 @@ export interface ProvisionerEnv {
   /** Prod only (open-artifacts#2325): "1" gives every install `bus`; anything else is off. Set to "0" until flipped. */
   PROD_BUS_ALL?: string;
   /**
+   * open-artifacts#2650, per environment: "1" renders each install's EMAIL_FROM
+   * as noreply+<installId>@mail.<app zone>; anything else is the plain sender.
+   * "1" in staging, "0" in prod. Must match provisioning's EMAIL_EVENTS.
+   */
+  EMAIL_EVENTS?: string;
+  /**
    * open-artifacts#1008, per environment: "1" makes a new install born on d1
    * (OAUTH_STORE=d1, no OAUTH_KV binding, no <id>-oauth namespace); anything
    * else is off. "1" in staging, "0" in prod. Existing installs are unchanged.
@@ -93,6 +99,7 @@ export async function provisionerOptions(
     stagingBusAll: e === "staging" && env.STAGING_BUS_ALL === "1",
     prodBusAll: e === "prod" && env.PROD_BUS_ALL === "1",
     oauthBornD1: env.OAUTH_BORN_D1 === "1",
+    emailEvents: env.EMAIL_EVENTS === "1",
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),

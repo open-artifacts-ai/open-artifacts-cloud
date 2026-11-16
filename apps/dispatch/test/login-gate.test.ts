@@ -86,8 +86,25 @@ describe("LoginGate", () => {
     expect(JSON.parse(got[0]?.body ?? "")).toEqual(b);
   });
 
+  it.each(["/email-events/pull", "/email-events/ack"])(
+    "forwards %s to the same platform path, install from props (#2650)",
+    async (path) => {
+      const { env, got } = world();
+      const r = await passLoginGate(
+        post(path, { ts: 1 }, { "x-oa-gate-install": B }),
+        props,
+        env,
+      );
+      expect(r.status).toBe(202);
+      expect(got[0]?.url).toBe(`${LOGIN_ORIGIN}${path}`);
+      expect(got[0]?.headers["x-oa-gate-install"]).toBe(A);
+    },
+  );
+
   it.each([
     ["another route", () => post("/tier", {})],
+    ["an email-events sibling", () => post("/email-events/list", {})],
+    ["an email-events trailing slash", () => post("/email-events/pull/", {})],
     ["a query string", () => post(`${LOGIN_GATE_PATH}?install=${B}`, {})],
     ["GET", () => new Request(`https://x.example${LOGIN_GATE_PATH}`)],
     ["a trailing slash", () => post(`${LOGIN_GATE_PATH}/`, {})],

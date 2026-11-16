@@ -42,7 +42,8 @@
 #                    smoke's secrets: put on this Worker only, when given)
 #   inventory        PLATFORM_DB_ID HOSTS_KV_ID GITHUB_REPOSITORY_ID GITHUB_REPOSITORY
 #                    (owner/repo: the OIDC principal, design v7 6.3)
-#   provisioning     PLATFORM_DB_ID BROKER_REGISTRY_ID DIRECTORY_REGISTRY_ID SIGNUPS_ENABLED
+#   provisioning     [EMAIL_ZONE_TAGS: staging, when the tag declares oa-s-email-events, #2650]
+#                    PLATFORM_DB_ID BROKER_REGISTRY_ID DIRECTORY_REGISTRY_ID SIGNUPS_ENABLED
 #                    GITHUB_REPOSITORY_ID SIGNUP_DAILY_CAP ADMIN_IDENTITIES (the
 #                    Environment secret `email:sub,...`, #1007; the provisioner
 #                    and auth broker must exist)
@@ -101,6 +102,48 @@ must() {
     exit 1
   fi
   printf '%s' "$body"
+}
+# Email Service bounce and complaint events (open-artifacts#2650), STAGING
+# ONLY: the platform's queue oa-s-email-events (with its dead-letter queue) and
+# the Email Sending event subscription (message.bounced, message.complained)
+# for the hosted sending domain mail.<zone>. Declared only when the tag's
+# provisioning config names the queue; each piece is created only when absent
+# and read back. Needs EMAIL_ZONE_TAGS (the sending zone id the CI lookup exports).
+# Prod has neither the queue nor the subscription until its switch-on
+# (docs/ops/hosted.md, Bounce and complaint events).
+email_events_setup() {
+  [ "$env" = staging ] || return 0
+  grep -q '"oa-s-email-events"' "$root/apps/provisioning/wrangler.jsonc" || return 0
+  need EMAIL_ZONE_TAGS
+  [[ "$EMAIL_ZONE_TAGS" =~ ^[0-9a-f]{32}$ ]] || { echo "EMAIL_ZONE_TAGS is not a 32-hex zone id" >&2; exit 1; }
+  local q listing domain="mail.$ZONE" subs
+  listing="$(list_all "/queues?" "list queues")"
+  for q in oa-s-email-events oa-s-email-events-dlq; do
+    jq -e --arg q "$q" 'any(.[]; .queue_name == $q)' <<< "$listing" > /dev/null && continue
+    [ -z "$VERIFY_ONLY" ] || { echo "queue $q does not exist" >&2; exit 1; }
+    cf_send POST /queues "$(jq -nc --arg n "$q" '{queue_name: $n}')" | must "create queue $q" > /dev/null
+    echo "queue $q created"
+  done
+  # The subscription goes through wrangler (documented: `wrangler queues
+  # subscription create|list`), from the provisioning app dir, with the same
+  # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in the environment.
+  local wr=(pnpm exec wrangler queues subscription) norm
+  norm='if type == "array" then . else (.result // .subscriptions // []) end
+    | [.[] | select(.name == "oa-s-email-events" and (tojson | contains($d)))]'
+  subs="$(cd "$root/apps/provisioning" && "${wr[@]}" list oa-s-email-events --json)" || { echo "list event subscriptions failed" >&2; exit 1; }
+  jq -e . <<< "$subs" > /dev/null 2>&1 || { echo "list event subscriptions: unparsable answer" >&2; exit 1; }
+  if [ "$(jq --arg d "$domain" "$norm | length" <<< "$subs")" = 0 ]; then
+    [ -z "$VERIFY_ONLY" ] || { echo "the Email Sending event subscription for $domain does not exist" >&2; exit 1; }
+    (cd "$root/apps/provisioning" && "${wr[@]}" create oa-s-email-events --source email.sending --zone-id "$EMAIL_ZONE_TAGS" \
+      --domain "$domain" --events message.bounced,message.complained --name oa-s-email-events > /dev/null) ||
+      { echo "create the Email Sending event subscription failed" >&2; exit 1; }
+    echo "event subscription for $domain created"
+  fi
+  # Read back: exactly one, not disabled, for these two events only.
+  subs="$(cd "$root/apps/provisioning" && "${wr[@]}" list oa-s-email-events --json)" || { echo "list event subscriptions failed" >&2; exit 1; }
+  jq -e --arg d "$domain" "$norm"'
+    | length == 1 and (.[0].enabled != false) and ((.[0].events | map(sub("^.*message[.]"; "message.")) | sort) == ["message.bounced", "message.complained"])' <<< "$subs" > /dev/null ||
+    { echo "the event subscription for $domain is not one enabled subscription for bounced and complained" >&2; exit 1; }
 }
 worker_exists() { [ "$(cf_get "/workers/scripts/$1/settings" | jq -r '.success' 2> /dev/null)" = true ]; }
 need_workers() {
@@ -590,6 +633,7 @@ case "$target" in
     fi
     [[ "$found" =~ ^[0-9a-f]{32}$ ]] || { echo "KV namespace $ns: want exactly one, with a 32 hex id" >&2; exit 1; }
     OAUTH_KV_ID="$found"
+    email_events_setup
     PLATFORM_DB_ID="$PLATFORM_DB_ID" PROVISIONING_OAUTH_KV_ID="$OAUTH_KV_ID" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
       SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioning
     W="oa-$P-provisioning"

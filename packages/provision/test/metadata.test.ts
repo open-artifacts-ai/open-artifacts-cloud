@@ -583,6 +583,68 @@ describe("round 1", () => {
     );
   });
 
+  it("emailEvents renders EMAIL_FROM as noreply+<installId>@mail.<app-zone>; off, the plain sender (#2650)", () => {
+    const a = inst();
+    expect(
+      text(
+        userWorkerMetadata(a, { ...res(), emailEvents: true }).bindings,
+        "EMAIL_FROM",
+      ),
+    ).toBe(`noreply+${a.id}@mail.app.test`);
+    for (const off of [{}, { emailEvents: false }])
+      expect(
+        text(
+          userWorkerMetadata(a, { ...res(), ...off }).bindings,
+          "EMAIL_FROM",
+        ),
+      ).toBe("noreply@mail.app.test");
+    // Only the local part changes; the domain is still the one hosted zone.
+    const b = inst({
+      id: "izzz999yyy88",
+      appHost: "b.app.test",
+      contentHost: "b.page.test",
+    });
+    expect(
+      text(
+        userWorkerMetadata(b, { ...res(), emailEvents: true }).bindings,
+        "EMAIL_FROM",
+      ),
+    ).toBe("noreply+izzz999yyy88@mail.app.test");
+    // A stored EMAIL_FROM must match what the flag renders.
+    expect(() =>
+      userWorkerMetadata(
+        inst({ vars: { EMAIL_FROM: "noreply@mail.app.test" } }),
+        { ...res(), emailEvents: true },
+      ),
+    ).toThrow(/EMAIL_FROM must be noreply\+/);
+  });
+
+  it("emailEvents locks each send_email binding to this install's sender; off, no lock (#2650)", () => {
+    const sends = (m: { bindings: { type: string; name: string }[] }) =>
+      m.bindings.filter((b) => b.type === "send_email");
+    const a = inst();
+    const on = sends(userWorkerMetadata(a, { ...res(), emailEvents: true }));
+    expect(on.length).toBeGreaterThan(0);
+    for (const b of on)
+      expect(b).toMatchObject({
+        allowed_sender_addresses: [`noreply+${a.id}@mail.app.test`],
+      });
+    for (const off of [{}, { emailEvents: false }])
+      for (const b of sends(userWorkerMetadata(a, { ...res(), ...off })))
+        expect(b).not.toHaveProperty("allowed_sender_addresses");
+    const other = inst({
+      id: "izzz999yyy88",
+      appHost: "b.app.test",
+      contentHost: "b.page.test",
+    });
+    for (const b of sends(
+      userWorkerMetadata(other, { ...res(), emailEvents: true }),
+    ))
+      expect(b).toMatchObject({
+        allowed_sender_addresses: ["noreply+izzz999yyy88@mail.app.test"],
+      });
+  });
+
   it("EMAIL_FROM is the env's one sender, noreply@mail.<app-zone>, for every install", () => {
     // Cloudflare Email Sending onboards each (sub)domain separately and allows
     // 30 per zone, so a per-install sender subdomain can't scale.

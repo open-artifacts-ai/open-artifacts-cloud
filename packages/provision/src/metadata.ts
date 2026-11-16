@@ -268,6 +268,13 @@ export interface ResourceMetaInput {
    * env is staging; the staging flags are never read when env is prod.
    */
   busAllProd?: boolean;
+  /**
+   * open-artifacts#2650 (the provisioner's EMAIL_EVENTS "1"): the install's
+   * sender is noreply+<installId>@mail.<app zone>, so the platform can route
+   * Email Service bounce and complaint events to it. Off: the plain
+   * noreply@mail.<app zone>.
+   */
+  emailEvents?: boolean;
 }
 
 /** One install slug as STAGING_BUS_SLUGS lists it: lowercase, no "--". */
@@ -398,7 +405,8 @@ export function userWorkerMetadata(
   // EMAIL_FROM is the env's one sender, noreply@mail.<app-domain>, for every
   // install: Email Sending onboards each (sub)domain by hand and allows 30
   // per zone. The server names each install in the From display name.
-  const emailFrom = `noreply@mail.${i.appHost.slice(i.appHost.indexOf(".") + 1)}`;
+  // With emailEvents (#2650) only the local part changes, to noreply+<id>.
+  const emailFrom = `noreply${r.emailEvents === true ? `+${i.id}` : ""}@mail.${i.appHost.slice(i.appHost.indexOf(".") + 1)}`;
 
   // vars: allowlist first
   for (const [k, v] of Object.entries(i.vars)) {
@@ -532,8 +540,17 @@ export function userWorkerMetadata(
   // sends) rather than the docs page's "browser_rendering" for account and
   // dispatch scripts.
   if (t.browser) bindings.push({ type: "browser", name: t.browser.binding });
+  // With emailEvents (#2650) each send binding may send only from this
+  // install's own plus-address, so a compromised install can't send as
+  // another (wrangler uploads the same metadata field, allowed_sender_addresses).
   for (const e of (t.send_email ?? []) as { name: string }[])
-    bindings.push({ type: "send_email", name: e.name });
+    bindings.push({
+      type: "send_email",
+      name: e.name,
+      ...(r.emailEvents === true
+        ? { allowed_sender_addresses: [emailFrom] }
+        : {}),
+    });
   if (t.assets) bindings.push({ type: "assets", name: t.assets.binding });
   for (const e of (t.d1_databases ?? []) as { binding: string }[])
     bindings.push({ type: "d1", name: e.binding, id: r.d1Id });
