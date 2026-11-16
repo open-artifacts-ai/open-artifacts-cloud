@@ -263,7 +263,7 @@ describe("check, mint and the public unsubscribe", () => {
     expect(TOKEN_TTL_MS).toBe(365 * 86_400_000);
   });
 
-  it("per minting install: a warn line at the threshold, past 200 the same page and no add", async () => {
+  it("per minting install: a warn line at the threshold; past 200 the opt-out is still stored and that install's mint answers 429", async () => {
     const e = await world({ OPTOUT_ADD_SPIKE: "2" });
     const logs: unknown[][] = [];
     const orig = console.warn;
@@ -280,33 +280,62 @@ describe("check, mint and the public unsubscribe", () => {
         .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
         .bind(`optout:addday:${id}`, ADDS_PER_DAY)
         .run();
+      // At the cap, mint still works; one more redemption goes past it.
+      const real = { now: Date.now() };
+      expect((await post("/optouts/mint", e, { h1: H1 }, real)).status).toBe(
+        200,
+      );
       const h3 = "c".repeat(64);
       const r = await unsub(e, await mintToken(TOKEN_KEY, id, h3, Date.now()));
       expect(r.status).toBe(200);
-      expect(await rows()).toHaveLength(2);
-      expect(logs.at(-1)).toEqual(["optout_add_capped", id, ADDS_PER_DAY + 1]);
-      // Another minting install is unaffected.
-      await unsub(e, await mintToken(TOKEN_KEY, otherId, h3, Date.now()));
       expect(await rows()).toHaveLength(3);
+      const blocked = await post("/optouts/mint", e, { h1: H1 }, real);
+      expect(await blocked.json()).toEqual({ error: "mint_blocked" });
+      expect(blocked.status).toBe(429);
+      expect(logs.at(-1)).toEqual([
+        "optout_mint_blocked",
+        id,
+        ADDS_PER_DAY + 1,
+      ]);
+      // Another install still mints.
+      expect(
+        (
+          await post(
+            "/optouts/mint",
+            e,
+            { h1: H1 },
+            { install: otherId, key: OTHER_KEY, ...real },
+          )
+        ).status,
+      ).toBe(200);
     } finally {
       console.warn = orig;
     }
   });
 
-  it("rate limits unsubscribes per IP (429)", async () => {
+  it("valid tokens from one IP beyond the per-IP limit are all stored; invalid ones are IP-limited", async () => {
     const e = await world();
-    let last = 200;
+    const hs = Array.from({ length: UNSUB_PER_IP_HOUR + 5 }, (_, i) =>
+      i.toString(16).padStart(64, "0"),
+    );
+    for (const h of hs) {
+      const r = await unsub(e, await mintToken(TOKEN_KEY, id, h, Date.now()));
+      expect(r.status).toBe(200);
+    }
+    expect(await rows()).toHaveLength(hs.length);
+    // (Same install: under its cap of 200.)
+    let last = 0;
     for (let i = 0; i <= UNSUB_PER_IP_HOUR; i++)
-      last = (await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now())))
-        .status;
+      last = (await unsub(e, "garbage")).status;
     expect(last).toBe(429);
+    // A valid token from that IP is still answered.
     expect(
-      (
-        await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()), {
-          ip: "198.51.100.9",
-        })
-      ).status,
+      (await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()))).status,
     ).toBe(200);
+    // Another IP's invalid token is a plain 400.
+    expect((await unsub(e, "garbage", { ip: "198.51.100.9" })).status).toBe(
+      400,
+    );
   });
 
   it("is the plain 404 when OPTOUT_LIST is off, and add is gone from the gate", async () => {

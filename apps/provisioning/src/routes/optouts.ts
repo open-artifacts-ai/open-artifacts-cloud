@@ -5,7 +5,7 @@ import {
 } from "@oa/broker-core";
 import { GATE_INSTALL_HEADER } from "@oa/broker-core/gate-header";
 import { hmac16 } from "../audit.js";
-import { bump, HOUR_MS } from "../auth/counters.js";
+import { bump, HOUR_MS, peek } from "../auth/counters.js";
 import type { Env } from "../env.js";
 
 // The hosted-wide email opt-out list (open-artifacts#2652).
@@ -47,9 +47,9 @@ export const TOKEN_TTL_MS = 365 * 86_400_000;
 export const CHECKS_PER_MIN = 60;
 export const CHECKS_PER_DAY = 1000;
 export const MINTS_PER_HOUR = 200;
-/** Redemptions per minting install per day: a warn line at 150, a hard cap of 200. */
+/** Redemptions per minting install per day: a warn line at 150; past 200 that install's mint answers 429 (redemptions are still stored). */
 export const ADDS_PER_DAY = 200;
-/** Unsubscribe POSTs per client IP per hour. */
+/** Requests with a token that does not verify, per client IP per hour. */
 export const UNSUB_PER_IP_HOUR = 30;
 export const DEFAULT_CHECK_SPIKE = 800;
 export const DEFAULT_ADD_SPIKE = 150;
@@ -94,11 +94,6 @@ function parseBody(path: string, text: string): Body | null {
     !NONCE.test(b.nonce) ||
     typeof b.h1 !== "string" ||
     !H1.test(b.h1)
-  )
-    return null;
-  if (
-    path === "/optouts/add" &&
-    (typeof b.token !== "string" || !TOKEN.test(b.token))
   )
     return null;
   return b as unknown as Body;
@@ -270,6 +265,18 @@ export async function optout(
       .first();
     return Response.json({ optedOut: row !== null }, { headers: noStore });
   }
+  // An install past its daily redemption cap mints no more until someone
+  // looks (an opt-out is never dropped; this is what the cap does instead).
+  const redeemed = await peek(
+    env.PLATFORM_DB,
+    `optout:addday:${install}`,
+    DAY_MS,
+    now,
+  );
+  if (redeemed > ADDS_PER_DAY) {
+    console.warn("optout_mint_blocked", install, redeemed);
+    return reply(429, "mint_blocked");
+  }
   return Response.json(
     { token: await mintToken(env.OPTOUT_TOKEN_KEY, install, body.h1, now) },
     { headers: noStore },
@@ -355,22 +362,27 @@ export async function unsubscribe(
   const named = token
     ? await readToken(env.OPTOUT_TOKEN_KEY, token, now)
     : null;
-  if (!token || !named) return bad();
+  if (!token || !named) {
+    // Only a request whose token does not verify is limited per IP; a valid
+    // token never is.
+    const ip = await bump(
+      env.PLATFORM_DB,
+      `optout:unsub:${await hmac16(env, ipKey)}`,
+      HOUR_MS,
+      now,
+    );
+    if (ip > UNSUB_PER_IP_HOUR)
+      return new Response("Too many requests", {
+        status: 429,
+        headers: noStore,
+      });
+    return bad();
+  }
   if (req.method === "GET") return confirmPage(token);
 
-  const ip = await bump(
-    env.PLATFORM_DB,
-    `optout:unsub:${await hmac16(env, ipKey)}`,
-    HOUR_MS,
-    now,
-  );
-  if (ip > UNSUB_PER_IP_HOUR)
-    return new Response("Too many requests", {
-      status: 429,
-      headers: noStore,
-    });
-  // Per minting install: a warn line at 150, a hard cap of 200 past which the
-  // same page answers but nothing is added.
+  // Per minting install: a warn line at 150. Past 200 the opt-out is still
+  // stored (never dropped); that install's mint answers 429 for the rest of
+  // the day instead.
   const day = await bump(
     env.PLATFORM_DB,
     `optout:addday:${named.install}`,
@@ -379,10 +391,6 @@ export async function unsubscribe(
   );
   const spike = Number(env.OPTOUT_ADD_SPIKE) || DEFAULT_ADD_SPIKE;
   if (day === spike) console.warn("optout_add_spike", named.install, day);
-  if (day > ADDS_PER_DAY) {
-    console.warn("optout_add_capped", named.install, day);
-    return donePage();
-  }
   const h2 = await storedHash(env.OPTOUT_STORE_KEY, named.h1);
   const ins = await env.PLATFORM_DB.prepare(
     "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) VALUES (?1, 'recipient', ?2, ?3)",
