@@ -123,6 +123,15 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.197.0: the onboarding routes (#2632), probed now, no longer dropped.
+    ...[
+      "org GET /api/v1/onboarding [session]",
+      "org GET /api/v1/onboarding [pat]",
+      "org PUT /api/v1/onboarding [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",
