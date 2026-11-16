@@ -18,9 +18,9 @@ import {
   contentUnlisted,
   hiddenToolAnswer,
   needsCookie,
-  offeredTools,
   ORG_SURFACES,
   type OrgTarget,
+  offeredTools,
   PROBE_SHARE_EMAIL,
   type Cred as ProbeCred,
   PUBLIC_ROUTES,
@@ -936,7 +936,8 @@ export interface HiddenToolDeps {
 }
 
 const liveHidden: HiddenToolDeps = {
-  offered: (t, cred) => offeredTools({ fetch: viaTarget(t, fetch) }, t.app, cred),
+  offered: (t, cred) =>
+    offeredTools({ fetch: viaTarget(t, fetch) }, t.app, cred),
   answer: (t, cred, name) =>
     hiddenToolAnswer({ fetch: viaTarget(t, fetch) }, t.app, cred, name),
 };
