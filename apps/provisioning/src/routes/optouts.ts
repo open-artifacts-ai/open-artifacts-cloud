@@ -46,7 +46,8 @@ export const OPTOUT_ACTOR = "system:optout";
 export const TOKEN_TTL_MS = 365 * 86_400_000;
 export const CHECKS_PER_MIN = 60;
 export const CHECKS_PER_DAY = 1000;
-export const MINTS_PER_HOUR = 200;
+/** Mints per install per day: about what an install really sends. */
+export const MINTS_PER_DAY = 150;
 /** Redemptions per minting install per day: a warn line at 150; past 200 that install's mint answers 429 (redemptions are still stored). */
 export const ADDS_PER_DAY = 200;
 /** Requests with a token that does not verify, per client IP per hour. */
@@ -237,7 +238,7 @@ export async function optout(
   const limit =
     kind === "check"
       ? { n: CHECKS_PER_MIN, ms: MIN_MS }
-      : { n: MINTS_PER_HOUR, ms: HOUR_MS };
+      : { n: MINTS_PER_DAY, ms: DAY_MS };
   const count = await bump(
     env.PLATFORM_DB,
     `optout:${kind}:${install}`,
@@ -258,10 +259,13 @@ export async function optout(
     if (day === spike) console.warn("optout_check_spike", install, day);
     if (day > CHECKS_PER_DAY) return reply(429, "daily_cap");
     const h2 = await storedHash(env.OPTOUT_STORE_KEY, body.h1);
+    // An 'all' row counts for everyone; an install-scoped row only for the
+    // caller that holds it (the gate's install, never a body value).
     const row = await env.PLATFORM_DB.prepare(
-      "SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1",
+      `SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1
+UNION ALL SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND install_id = ?2 LIMIT 1`,
     )
-      .bind(h2)
+      .bind(h2, install)
       .first();
     return Response.json({ optedOut: row !== null }, { headers: noStore });
   }
@@ -380,8 +384,8 @@ export async function unsubscribe(
   }
   if (req.method === "GET") return confirmPage(token);
 
-  // Per minting install: a warn line at 150. Past 200 the opt-out is still
-  // stored (never dropped); that install's mint answers 429 for the rest of
+  // Per minting install: a warn line at 150. Past 200 the opt-out is stored
+  // install-scoped (never dropped); that install's mint answers 429 for the rest of
   // the day instead.
   const day = await bump(
     env.PLATFORM_DB,
@@ -391,12 +395,32 @@ export async function unsubscribe(
   );
   const spike = Number(env.OPTOUT_ADD_SPIKE) || DEFAULT_ADD_SPIKE;
   if (day === spike) console.warn("optout_add_spike", named.install, day);
+  // Past the cap the opt-out is still stored, scoped to the minting install
+  // (check honours it for that install only until an operator widens it), so
+  // a stockpile of tokens redeemed at once cannot opt out the whole list. An
+  // under-cap add always creates or keeps the 'all' row and never narrows one.
+  const scope = day > ADDS_PER_DAY ? "install" : "all";
+  if (scope === "install") console.warn("optout_scoped", named.install, day);
   const h2 = await storedHash(env.OPTOUT_STORE_KEY, named.h1);
-  const ins = await env.PLATFORM_DB.prepare(
-    "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) VALUES (?1, 'recipient', ?2, ?3)",
-  )
-    .bind(h2, named.install, now)
-    .run();
+  const ins =
+    scope === "all"
+      ? await env.PLATFORM_DB.prepare(
+          "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) VALUES (?1, 'recipient', ?2, ?3)",
+        )
+          .bind(h2, named.install, now)
+          .run()
+      : await env.PLATFORM_DB.prepare(
+          "INSERT OR IGNORE INTO email_optouts_install (addr_hash, install_id, created_at) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1)",
+        )
+          .bind(h2, named.install, now)
+          .run();
+  if (scope === "all")
+    // Widened: the install-scoped rows for this address are now redundant.
+    await env.PLATFORM_DB.prepare(
+      "DELETE FROM email_optouts_install WHERE addr_hash = ?1",
+    )
+      .bind(h2)
+      .run();
   if ((ins.meta.changes ?? 0) > 0)
     await env.PLATFORM_DB.prepare(
       "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -406,7 +430,7 @@ export async function unsubscribe(
         OPTOUT_ACTOR,
         named.install,
         OPTOUT_ADD_ACTION,
-        JSON.stringify({ hash: h2.slice(0, 8) }),
+        JSON.stringify({ hash: h2.slice(0, 8), scope }),
       )
       .run();
   return donePage();

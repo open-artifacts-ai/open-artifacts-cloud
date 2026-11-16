@@ -7,6 +7,7 @@ import {
   ADDS_PER_DAY,
   CHECKS_PER_DAY,
   CHECKS_PER_MIN,
+  MINTS_PER_DAY,
   mintToken,
   OPTOUT_ADD_ACTION,
   optout,
@@ -222,7 +223,10 @@ describe("check, mint and the public unsubscribe", () => {
       .all<{ detail: string }>();
     expect(audit.results).toHaveLength(1);
     expect(audit.results[0]?.detail).toBe(
-      JSON.stringify({ hash: (await storedHash(STORE, H1)).slice(0, 8) }),
+      JSON.stringify({
+        hash: (await storedHash(STORE, H1)).slice(0, 8),
+        scope: "all",
+      }),
     );
   });
 
@@ -288,7 +292,48 @@ describe("check, mint and the public unsubscribe", () => {
       const h3 = "c".repeat(64);
       const r = await unsub(e, await mintToken(TOKEN_KEY, id, h3, Date.now()));
       expect(r.status).toBe(200);
-      expect(await rows()).toHaveLength(3);
+      expect(await rows()).toHaveLength(2);
+      // The over-cap one is install-scoped: true for the minting install, false for another.
+      const h3h2 = await storedHash(STORE, h3);
+      expect(
+        await db
+          .prepare(
+            "SELECT install_id FROM email_optouts_install WHERE addr_hash = ?1",
+          )
+          .bind(h3h2)
+          .all(),
+      ).toMatchObject({ results: [{ install_id: id }] });
+      expect(
+        await db
+          .prepare("SELECT 1 FROM email_optouts WHERE addr_hash = ?1")
+          .bind(h3h2)
+          .first(),
+      ).toBeNull();
+      expect(
+        await (await post("/optouts/check", e, { h1: h3 }, real)).json(),
+      ).toEqual({ optedOut: true });
+      expect(
+        await (
+          await post(
+            "/optouts/check",
+            e,
+            { h1: h3 },
+            { ...real, install: otherId, key: OTHER_KEY },
+          )
+        ).json(),
+      ).toEqual({ optedOut: false });
+      // Under-cap ones are 'all': true for everyone.
+      expect(
+        await (
+          await post(
+            "/optouts/check",
+            e,
+            { h1: H1 },
+            { ...real, install: otherId, key: OTHER_KEY },
+          )
+        ).json(),
+      ).toEqual({ optedOut: true });
+      expect(logs).toContainEqual(["optout_scoped", id, ADDS_PER_DAY + 1]);
       const blocked = await post("/optouts/mint", e, { h1: H1 }, real);
       expect(await blocked.json()).toEqual({ error: "mint_blocked" });
       expect(blocked.status).toBe(429);
@@ -336,6 +381,105 @@ describe("check, mint and the public unsubscribe", () => {
     expect((await unsub(e, "garbage", { ip: "198.51.100.9" })).status).toBe(
       400,
     );
+  });
+
+  const overCap = async (e: Awaited<ReturnType<typeof world>>, who: string) => {
+    await db
+      .prepare(
+        "INSERT INTO rate_counters (key, window_start, count) VALUES (?1, ?2, ?3) ON CONFLICT (key, window_start) DO UPDATE SET count = ?3",
+      )
+      .bind(
+        `optout:addday:${who}`,
+        Date.now() - (Date.now() % 86_400_000),
+        ADDS_PER_DAY,
+      )
+      .run();
+    return who;
+  };
+  const scoped = (h2: string) =>
+    db
+      .prepare(
+        "SELECT install_id FROM email_optouts_install WHERE addr_hash = ?1 ORDER BY install_id",
+      )
+      .bind(h2)
+      .all<{ install_id: string }>()
+      .then((r) => r.results.map((x) => x.install_id));
+  const real = () => ({ now: Date.now() });
+
+  it("two installs' install-scoped rows for one address coexist; a body-supplied install id is ignored", async () => {
+    const e = await world();
+    await overCap(e, id);
+    await overCap(e, otherId);
+    const h2 = await storedHash(STORE, H1);
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()));
+    expect(await scoped(h2)).toEqual([id, otherId].sort());
+    expect(await rows()).toHaveLength(0);
+    // check is by the gate's install; a body naming another install is a strict-body 400.
+    const bodyId = await post(
+      "/optouts/check",
+      e,
+      { h1: H1, install: otherId },
+      real(),
+    );
+    expect(bodyId.status).toBe(400);
+  });
+
+  it("a later under-cap add widens to all, and all is never narrowed", async () => {
+    const e = await world();
+    const h2 = await storedHash(STORE, H1);
+    await overCap(e, id);
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    expect(await scoped(h2)).toEqual([id]);
+    // Another install, under its cap, redeems the same address: widened.
+    await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()));
+    expect(await rows()).toHaveLength(1);
+    expect(await scoped(h2)).toEqual([]);
+    expect(
+      await (
+        await post(
+          "/optouts/check",
+          e,
+          { h1: H1 },
+          { ...real(), install: otherId, key: OTHER_KEY },
+        )
+      ).json(),
+    ).toEqual({ optedOut: true });
+    // The first install, now over its cap again, never narrows the all row.
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    expect(await rows()).toHaveLength(1);
+    expect(await scoped(h2)).toEqual([]);
+  });
+
+  it("the documented operator clear widens a batch to all", async () => {
+    const e = await world();
+    await overCap(e, id);
+    const h2 = await storedHash(STORE, H1);
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    expect(await rows()).toHaveLength(0);
+    // The operator SQL from docs/ops/hosted.md.
+    await db.batch([
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) SELECT addr_hash, 'recipient', install_id, created_at FROM email_optouts_install WHERE install_id = ?1",
+        )
+        .bind(id),
+      db
+        .prepare("DELETE FROM email_optouts_install WHERE install_id = ?1")
+        .bind(id),
+    ]);
+    expect(await rows()).toHaveLength(1);
+    expect(
+      await (
+        await post(
+          "/optouts/check",
+          e,
+          { h1: H1 },
+          { ...real(), install: otherId, key: OTHER_KEY },
+        )
+      ).json(),
+    ).toEqual({ optedOut: true });
+    void h2;
   });
 
   it("is the plain 404 when OPTOUT_LIST is off, and add is gone from the gate", async () => {
@@ -409,6 +553,28 @@ describe("strict bodies and trust path", () => {
 });
 
 describe("rate limits and the spike hook", () => {
+  it("mint is capped at 150 per install per day", async () => {
+    const e = await world();
+    await db
+      .prepare(
+        "INSERT INTO rate_counters (key, window_start, count) VALUES (?1, ?2, ?3)",
+      )
+      .bind(`optout:mint:${id}`, NOW - (NOW % 86_400_000), MINTS_PER_DAY)
+      .run();
+    const r = await post("/optouts/mint", e, { h1: H1 });
+    expect(r.status).toBe(429);
+    expect(
+      (
+        await post(
+          "/optouts/mint",
+          e,
+          { h1: H1 },
+          { install: otherId, key: OTHER_KEY },
+        )
+      ).status,
+    ).toBe(200);
+  });
+
   it("limits checks per install per minute", async () => {
     const e = await world();
     await db

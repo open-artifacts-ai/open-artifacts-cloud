@@ -8,3 +8,14 @@ CREATE TABLE IF NOT EXISTS email_optouts (
   first_install TEXT,
   created_at INTEGER NOT NULL
 );
+
+-- A redemption past its minting install's daily cap is still stored, but
+-- scoped to that install: check honours it only for that install until an
+-- operator widens the batch into email_optouts. Two installs may each hold
+-- their own row for one address.
+CREATE TABLE IF NOT EXISTS email_optouts_install (
+  addr_hash TEXT NOT NULL,
+  install_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (addr_hash, install_id)
+);

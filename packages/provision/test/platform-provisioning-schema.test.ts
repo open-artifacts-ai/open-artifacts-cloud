@@ -860,6 +860,15 @@ describe("0017_email_optouts (the hosted email opt-out list, open-artifacts#2652
       "first_install TEXT",
       "created_at INTEGER",
     ]);
+    expect(
+      cols(platformDb(), "email_optouts_install").map((c) =>
+        c.replace(/ NN/, ""),
+      ),
+    ).toEqual([
+      "addr_hash TEXT PK",
+      "install_id TEXT PK",
+      "created_at INTEGER",
+    ]);
     expect(() =>
       platformDb()
         .prepare(

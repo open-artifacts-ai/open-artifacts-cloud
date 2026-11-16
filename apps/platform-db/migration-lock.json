@@ -18,6 +18,6 @@
     "0014_waitlist_emailed.sql": "51c049ff8398dc8bea071d3e9f1d1cb30e0f1a920394a0781c519e6ff30edce6",
     "0015_business_requests.sql": "e0829c51f8836bcf376a1857494e226aafe93c76adf63f2db1174fe99489729a",
     "0016_login_change_nonces.sql": "c969f83cf265128f5b85d32f8684b48d90cac623c22bcf817640eaf71e07d514",
-    "0017_email_optouts.sql": "513a25ef1912c7a34a60465502ed88510b69ea9d5ae73afb90036b1624710d7e"
+    "0017_email_optouts.sql": "c97c4dab96da5806de89f2bf116f37a736017705cc5ccc8b3fe2e6f67b3a5153"
   }
 }
