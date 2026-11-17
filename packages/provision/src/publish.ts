@@ -541,6 +541,97 @@ export async function publishRelease(o: {
   return { variant, keys, status: "published" };
 }
 
+/** Most objects pruneStaged lists under releases/ (prodClean's MAX_KEYS). */
+export const PRUNE_LIST_MAX = 200_000;
+
+/**
+ * After `published` has its record: deletes every staged version older than
+ * it. A staged version is one with files under releases/<v>/release/ and no
+ * record (publishRelease stageOnly, the stage-prod job). Once an older one is
+ * passed by a recorded release it can never be published cleanly, and
+ * prodClean reads it as release_dirty. Only a plain X.Y.Z version strictly
+ * below `published` whose only variant is release and that has no record is
+ * deleted; anything else (a record, another variant, a prerelease, an odd
+ * key) is kept and reported. Each version is listed again right before its
+ * deletes, and kept if a record or another object shape has appeared. Deletes
+ * go through r2.deleteStaged, which refuses the record and the floor.
+ *
+ * The second listing narrows, but does not close, the gap before the deletes:
+ * a stage-prod upload of the same version could still land in between. What
+ * closes it is that prod's publishes run one at a time (hosted-publish.yml's
+ * hosted-publish-prod concurrency group) and that only a version below the one
+ * just published is pruned, which no later stage-prod run uploads again.
+ */
+export async function pruneStaged(o: {
+  cf: Cf;
+  r2: R2Releases;
+  env: Env;
+  published: string;
+}): Promise<{ pruned: string[]; kept: { version: string; why: string }[] }> {
+  const { cf, env, published } = o;
+  const r2 = assertProbed(o.r2, env);
+  if (!isReleaseVersion(published))
+    throw new PublishRefused(`version ${published} is not a release version`);
+  const bucket = bucketOf(env);
+  const ownRecord = await listAll(
+    cf,
+    bucket,
+    releaseKey(published, "release", RECORD_FILE),
+    10,
+  );
+  if (!ownRecord.some((x) => x.name === ""))
+    throw new PublishRefused(
+      `release ${published} has no record in ${bucket}; nothing is pruned`,
+    );
+  const byVersion = new Map<string, string[]>();
+  for (const x of await listAll(cf, bucket, "releases/", PRUNE_LIST_MAX)) {
+    if (x.key === FLOOR_KEY) continue;
+    const v = x.name.split("/")[0] ?? "";
+    byVersion.set(v, [...(byVersion.get(v) ?? []), x.name]);
+  }
+  const pruned: string[] = [];
+  const kept: { version: string; why: string }[] = [];
+  /** Why `v` must stay, from its names under releases/; undefined: prune it. */
+  const keepWhy = (names: string[]): string | undefined => {
+    for (const n of names) {
+      const [, variant, ...rest] = n.split("/");
+      if (variant !== "release" || rest.length === 0)
+        return `holds ${n.slice(0, 80)}`;
+      if (rest.join("/") === RECORD_FILE) return "has a record";
+    }
+    return undefined;
+  };
+  for (const [v, names] of [...byVersion].sort((a, b) =>
+    a[0] < b[0] ? -1 : 1,
+  )) {
+    if (v === published) continue;
+    if (!/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(v)) {
+      kept.push({
+        version: v.slice(0, 40),
+        why: "not a plain release version",
+      });
+      continue;
+    }
+    if (compareVersions(v, published) >= 0) continue;
+    const why = keepWhy(names);
+    if (why) {
+      if (why !== "has a record") kept.push({ version: v, why });
+      continue;
+    }
+    // Again, right before deleting: a record written meanwhile keeps it.
+    const prefix = `releases/${v}/`;
+    const now = await listAll(cf, bucket, prefix, ASSET_LIMITS.files + 2000);
+    const again = keepWhy(now.map((x) => `${v}/${x.name}`));
+    if (again) {
+      kept.push({ version: v, why: `${again} (seen just before deleting)` });
+      continue;
+    }
+    await pool(now, PUBLISH_CONCURRENCY, (x) => r2.deleteStaged(x.key));
+    pruned.push(v);
+  }
+  return { pruned, kept };
+}
+
 /**
  * Replaces releases/floor.json with a new signed floor (create-only when
  * there is none, else If-Match on the current etag). The new floor must
