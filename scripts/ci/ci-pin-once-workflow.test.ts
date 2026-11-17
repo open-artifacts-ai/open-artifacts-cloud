@@ -70,12 +70,19 @@ describe("ci.yml pin-only gating", () => {
   });
   for (const [job, dir] of Object.entries(GATED)) {
     describe(job, () => {
-      it("decides in the job, right after its first checkout, with the full history", () => {
+      it("decides in the job, after its first checkout and a pinned setup-node, with the full history", () => {
         const s = steps(job);
         const at = s.findIndex((x) => x.id === "ro");
-        expect(at).toBe(1);
+        expect(at).toBe(2);
         expect(s[0]?.uses).toMatch(/^actions\/checkout@/);
         expect(s[0]?.with["fetch-depth"]).toBe(0);
+        // Node 22.6+ is needed for --experimental-strip-types: a pinned setup-node,
+        // from this repo's own .nvmrc, with no pnpm cache, comes first.
+        expect(s[1]?.uses).toBe(
+          "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+        );
+        expect(s[1]?.with).toEqual({ "node-version-file": `${dir}/.nvmrc` });
+        expect(s[1]?.if).toBeUndefined();
         expect(s[0]?.with["persist-credentials"]).toBe(false);
         expect(roOf(job)["working-directory"]).toBe(dir);
         expect(roOf(job)["continue-on-error"]).toBe(true);
@@ -238,14 +245,18 @@ describe("the decision step, run as written", () => {
       },
     });
     expect(r.status).toBe(0);
+    log = r.stdout + r.stderr;
     return readFileSync(out, "utf8").trim();
   };
+  let log = "";
   const PINS = ["PUBLIC_PIN", "SYNCED_FROM", "pnpm-lock.yaml"];
 
   it("says pin_only=true for the bot's bump of the pin files", () => {
     const { dir, base } = mk("ok", true);
     const head = bump(dir, PINS);
     expect(decide(dir, base, head)).toBe("pin_only=true");
+    expect(log).toContain("pin-only: yes");
+    expect(log).not.toContain("full run");
   });
   it("says false on every event but pull_request", () => {
     const { dir, base } = mk("events", true);
@@ -259,6 +270,9 @@ describe("the decision step, run as written", () => {
     const { dir, base } = mk("no", true);
     const head = bump(dir, PINS);
     expect(decide(dir, base, head, { AUTHOR: "leo" })).toBe("pin_only=false");
+    // A silent fallback is visible: the script's own reason is in the log.
+    expect(log).toContain("pin-only: no: author is leo");
+    expect(log).toContain("full run: the decision did not answer pin-only");
     expect(decide(dir, base, head, { HEAD_REF: "feature/x" })).toBe(
       "pin_only=false",
     );
@@ -269,6 +283,9 @@ describe("the decision step, run as written", () => {
     const { dir, base } = mk("noscript", false);
     const head = bump(dir, PINS);
     expect(decide(dir, base, head)).toBe("pin_only=false");
+    expect(log).toContain(
+      "full run: the base commit has no scripts/ci/pin-only.ts",
+    );
   });
   it("says false when the base sha is missing or unknown", () => {
     const { dir, base } = mk("nobase", true);

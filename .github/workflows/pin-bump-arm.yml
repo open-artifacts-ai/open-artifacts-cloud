@@ -10,6 +10,9 @@
 # still green, so the rule also refuses a head whose merge queue run failed (it finds
 # the run by its pr-<number> branch and its date after the head commit). The PR then
 # stays un-armed until a new commit or a person acts; it is never armed again in a loop.
+# That refusal leaves one PR comment per head sha (with the failed run's link), posted
+# with the App token the Arm step already has (pull-requests: write); the plan step
+# reports write=true while the comment is missing. No new permission is used.
 # Always runs main's script (never the PR's), read-only until a PR qualifies; the
 # App token exists only right before the arm step.
 name: pin-bump-arm

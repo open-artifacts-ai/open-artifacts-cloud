@@ -68,6 +68,8 @@ export type Check = {
 };
 /** A merge-queue (merge_group) CI run for one PR: when it was created and how it ended. */
 export type QueueRun = {
+  /** The run's page, https://github.com/<repo>/actions/runs/<id>; "" if unknown. */
+  url?: string;
   createdAt: string;
   status: string;
   conclusion: string | null;
@@ -144,6 +146,36 @@ export function queueFailure(
   if (!last || last.status !== "completed") return undefined;
   if (last.conclusion === "success") return undefined;
   return `its merge queue run on this head ended ${last.conclusion ?? "unknown"}; a new commit or a person must act`;
+}
+
+/** The hidden marker of the one comment per head sha that says a queue run failed. */
+export const queueMarker = (head: string) =>
+  `<!-- pin-bump-arm: merge queue failed head=${head} -->`;
+/** The newest queue run after the head commit, the one queueFailure judged. */
+function newestRun(headAt: string, runs: QueueRun[]): QueueRun | undefined {
+  const t = Date.parse(headAt);
+  let last: QueueRun | undefined;
+  for (const r of runs)
+    if (
+      Date.parse(r.createdAt) >= t &&
+      (!last || Date.parse(r.createdAt) > Date.parse(last.createdAt))
+    )
+      last = r;
+  return last;
+}
+/** Pure: the PR comment for a failed queue run. Only a github.com run page is linked. */
+export function queueNotice(i: Input, repo: string): string {
+  const run = newestRun(i.headAt, i.queueRuns);
+  const url =
+    run?.url && run.url.startsWith(`https://github.com/${repo}/actions/runs/`)
+      ? run.url
+      : "";
+  return [
+    queueMarker(i.headOid),
+    `The merge queue run for this pin bump (head ${i.headOid.slice(0, 12)}) ended ${run?.conclusion ?? "unknown"}${url ? `: ${url}` : "."}`,
+    "",
+    "The checks on this PR were skipped on purpose (the suite runs once, in the merge queue), so it still looks green. pin-bump-arm will not arm this head again. A port or fix is needed. A new commit on this branch, or arming the PR by hand once the cause is fixed, is the way forward.",
+  ].join("\n");
 }
 
 /** Pure: should this PR be armed? Every rule must hold; the first that fails is the reason. */
@@ -479,7 +511,7 @@ function gather(
       "api",
       `repos/${repo}/actions/workflows/ci.yml/runs?event=merge_group&per_page=100`,
       "--jq",
-      `[.workflow_runs[] | select(.head_branch | startswith("gh-readonly-queue/main/pr-${p.number}-")) | {createdAt: .created_at, status: .status, conclusion: .conclusion}]`,
+      `[.workflow_runs[] | select(.head_branch | startswith("gh-readonly-queue/main/pr-${p.number}-")) | {url: .html_url, createdAt: .created_at, status: .status, conclusion: .conclusion}]`,
     ]),
   ) as QueueRun[];
   let required: string[] = [];
@@ -511,6 +543,26 @@ function gather(
     queueRuns,
     autoMergeBy: view.autoMergeBy,
   };
+}
+
+/** True when the bot already left the failed-queue comment for this head. Throws on an API error. */
+function hasQueueNotice(
+  exec: Exec,
+  repo: string,
+  n: number,
+  head: string,
+): boolean {
+  const marker = queueMarker(head);
+  return (
+    JSON.parse(
+      gh(exec, [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${repo}/issues/${n}/comments?per_page=100`,
+      ]),
+    ).flat() as { user?: { login?: string } | null; body?: string }[]
+  ).some((c) => c.user?.login === BOT && (c.body ?? "").includes(marker));
 }
 
 /** Small reads only: one count per workflow and status, one short title list. Throws on any error. */
@@ -571,9 +623,16 @@ export function run(o: {
   repo: string;
   publicRepo: string;
   log: (line: string) => void;
-}): { write: boolean; armed: number[]; disarmed: number[] } {
+}): {
+  write: boolean;
+  armed: number[];
+  disarmed: number[];
+  noticed: number[];
+} {
   const armed: number[] = [];
   const disarmed: number[] = [];
+  const noticed: number[] = [];
+  let noticeError: unknown;
   let write = false;
   for (const p of listBumpPrs(o.exec, o.repo)) {
     let view: View;
@@ -598,6 +657,40 @@ export function run(o: {
       d = no(`could not read what it needs: ${msg(e)}`);
     }
     o.log(`#${p.number}: ${d.arm ? "arm" : "leave"}: ${d.why}`);
+    // One visible trace per head when a failed queue run is the only thing holding
+    // the PR back (a PR the bump otherwise qualifies for): a comment, once per head
+    // sha. The App token (pull-requests: write) posts it, so plan reports write.
+    if (
+      input &&
+      (!input.armed || ours) &&
+      queueFailure(input.headAt, input.queueRuns) &&
+      decide({ ...input, armed: false, queueRuns: [] }).arm
+    ) {
+      try {
+        if (!hasQueueNotice(o.exec, o.repo, p.number, input.headOid)) {
+          write = true;
+          if (o.mode === "arm") {
+            gh(o.exec, [
+              "api",
+              "-X",
+              "POST",
+              `repos/${o.repo}/issues/${p.number}/comments`,
+              "-f",
+              `body=${queueNotice(input, o.repo)}`,
+            ]);
+            noticed.push(p.number);
+            o.log(`#${p.number}: commented that its merge queue run failed`);
+          }
+        }
+      } catch (e) {
+        // Logged now, thrown after the other PRs are judged: a notice that cannot
+        // be left turns the run red, so it is not lost quietly.
+        o.log(
+          `#${p.number}: could not leave the queue failure notice: ${msg(e)}`,
+        );
+        noticeError ??= e;
+      }
+    }
     if (d.arm && input) {
       let wait: string | undefined;
       try {
@@ -648,7 +741,8 @@ export function run(o: {
       o.log(`#${p.number}: disabled auto-merge: ${again.why}`);
     }
   }
-  return { write, armed, disarmed };
+  if (noticeError) throw noticeError;
+  return { write, armed, disarmed, noticed };
 }
 
 const realExec: Exec = (cmd, args) => {

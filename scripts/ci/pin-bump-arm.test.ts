@@ -18,6 +18,8 @@ import {
   parseView,
   type QueueRun,
   queueFailure,
+  queueMarker,
+  queueNotice,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -534,7 +536,12 @@ describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
     expect(queueFailure(HEAD_AT, [])).toBeUndefined();
   });
   it("run: a failed queue run keeps the PR un-armed on every pass, until a new head", () => {
-    const f = fake({ queue: [FAIL] });
+    // The first pass leaves its one comment (see the next describe); with the
+    // marker there, every later pass writes nothing at all.
+    const f = fake({
+      queue: [FAIL],
+      comments: [{ user: { login: BOT }, body: queueMarker(HEAD) }],
+    });
     for (let n = 0; n < 3; n++) {
       const r = go("arm", f);
       expect(r.armed).toEqual([]);
@@ -560,6 +567,113 @@ describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
     const f = fake({ armed: true, queue: [FAIL] });
     const r = go("arm", f);
     expect(r.disarmed).toEqual([7]);
+  });
+});
+
+describe("the failed queue run leaves one visible trace per head", () => {
+  const RUN_URL = `https://github.com/${REPO}/actions/runs/123456`;
+  const FAIL: QueueRun = {
+    ...qrun("2026-11-17T10:30:00Z", "failure"),
+    url: RUN_URL,
+  };
+  const posts = (f: ReturnType<typeof fake>) =>
+    f.calls.filter((c) => c.join(" ").includes("-X POST"));
+  const mine = (head = HEAD) => ({
+    user: { login: BOT },
+    body: `${queueMarker(head)}\nold`,
+  });
+  it("plan reports write=true, and posts nothing", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("plan", f);
+    expect(r.write).toBe(true);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([]);
+  });
+  it("arm posts one comment with the marker and the run link, and never arms", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    expect(r.armed).toEqual([]);
+    expect(r.merges).toEqual([]);
+    expect(posts(f)).toHaveLength(1);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toContain(`repos/${REPO}/issues/7/comments`);
+    expect(call).toContain(queueMarker(HEAD));
+    expect(call).toContain(RUN_URL);
+    expect(call).toMatch(/port or fix is needed/);
+    expect(call).toMatch(/new commit/);
+    expect(call).toMatch(/by hand/);
+    expect(call).not.toContain("\u2014");
+  });
+  it("posts nothing more once its own marker for this head is there", () => {
+    const f = fake({ queue: [FAIL], comments: [mine()] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.noticed).toEqual([]);
+    expect(r.write).toBe(false);
+    expect(go("plan", fake({ queue: [FAIL], comments: [mine()] })).write).toBe(
+      false,
+    );
+  });
+  it("counts only the bot's marker, and only for this head", () => {
+    const stranger = { user: { login: "someone" }, body: queueMarker(HEAD) };
+    expect(posts(fake({ queue: [FAIL], comments: [stranger] }))).toEqual([]);
+    for (const comments of [[stranger], [mine("9".repeat(40))]]) {
+      const f = fake({ queue: [FAIL], comments });
+      go("arm", f);
+      expect(posts(f)).toHaveLength(1);
+    }
+  });
+  it("says nothing when the PR is held back for another reason, or the queue run is fine", () => {
+    for (const o of [
+      { checks: green.slice(1) },
+      { commitAuthor: "leourbina" },
+      { released: false },
+    ]) {
+      const f = fake({ queue: [FAIL], ...o });
+      go("arm", f);
+      expect(posts(f)).toEqual([]);
+    }
+    const ok = fake({ queue: [qrun("2026-11-17T10:30:00Z", "success")] });
+    go("arm", ok);
+    expect(posts(ok)).toEqual([]);
+    const g = fake({ queue: [FAIL], armed: true, autoBy: "leourbina" });
+    go("arm", g);
+    expect(posts(g)).toEqual([]);
+  });
+  it("a new head after the failure is judged afresh and gets no comment", () => {
+    const f = fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
+  });
+  it("takes back the bot's own arming over a failed queue run, and says so once", () => {
+    const f = fake({ queue: [FAIL], armed: true });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+    expect(posts(f)).toHaveLength(1);
+  });
+  it("turns the run red when the comment cannot be read or posted", () => {
+    expect(() => go("arm", fake({ queue: [FAIL], postFails: true }))).toThrow(
+      /403/,
+    );
+    expect(() =>
+      go("arm", fake({ queue: [FAIL], notFound: ["/issues/7/comments"] })),
+    ).toThrow(/Not Found/);
+  });
+  it("links only this repository's run pages", () => {
+    const i = base({ queueRuns: [{ ...FAIL, url: "https://evil.example/x" }] });
+    expect(queueNotice(i, REPO)).not.toContain("evil.example");
+    expect(queueNotice(i, REPO)).toContain(queueMarker(HEAD));
+    expect(queueNotice(base({ queueRuns: [FAIL] }), REPO)).toContain(RUN_URL);
+  });
+  it("reads the run url in the gh query", () => {
+    const f = fake({ queue: [FAIL] });
+    go("arm", f);
+    const q = f.calls
+      .map((c) => c.join(" "))
+      .find((c) => c.includes("event=merge_group"));
+    expect(q).toContain("url: .html_url");
   });
 });
 
@@ -620,6 +734,8 @@ const fake = (
     tagSha?: string;
     queue?: QueueRun[];
     headAt?: string;
+    comments?: { user: { login: string }; body: string }[];
+    postFails?: boolean;
   } = {},
 ) => {
   const calls: Call[] = [];
@@ -779,6 +895,13 @@ const fake = (
           },
         }),
       );
+    }
+    if (a.includes("/issues/7/comments")) {
+      if (a.includes("-X POST"))
+        return o.postFails
+          ? { code: 1, stdout: "", stderr: "HTTP 403" }
+          : ok("{}");
+      return ok(JSON.stringify([o.comments ?? []]));
     }
     if (a.startsWith("pr merge")) return ok("");
     return { code: 1, stdout: "", stderr: `unexpected ${cmd} ${a}` };

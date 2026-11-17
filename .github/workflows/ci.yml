@@ -48,6 +48,11 @@ jobs:
           path: private
           persist-credentials: false
           fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: private/.nvmrc
       # Run once for the release bot's pin bumps: decided inside each job (a skipped
       # or missing job would count as passing a required check). The script comes
       # from the BASE commit, never from the code under test, and any error or any
@@ -74,10 +79,16 @@ jobs:
             for f in pin-only pin-bump-arm pin-bump; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
-            if [ "$ok" = true ] \
-              && out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts") \
-              && [ "$out" = "pin-only" ]; then
-              pin_only=true
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
             fi
           fi
           echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
@@ -324,6 +335,11 @@ jobs:
           path: _cloud
           persist-credentials: false
           fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: _cloud/.nvmrc
       # Run once for the release bot's pin bumps: decided inside each job (a skipped
       # or missing job would count as passing a required check). The script comes
       # from the BASE commit, never from the code under test, and any error or any
@@ -350,10 +366,16 @@ jobs:
             for f in pin-only pin-bump-arm pin-bump; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
-            if [ "$ok" = true ] \
-              && out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts") \
-              && [ "$out" = "pin-only" ]; then
-              pin_only=true
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
             fi
           fi
           echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
@@ -423,6 +445,11 @@ jobs:
           path: _cloud
           persist-credentials: false
           fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: _cloud/.nvmrc
       # Run once for the release bot's pin bumps: decided inside each job (a skipped
       # or missing job would count as passing a required check). The script comes
       # from the BASE commit, never from the code under test, and any error or any
@@ -449,10 +476,16 @@ jobs:
             for f in pin-only pin-bump-arm pin-bump; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
-            if [ "$ok" = true ] \
-              && out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts") \
-              && [ "$out" = "pin-only" ]; then
-              pin_only=true
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
             fi
           fi
           echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
