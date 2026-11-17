@@ -124,6 +124,20 @@ describe("billingTier", () => {
     });
   });
 
+  it("no billing row on an install created Trial: billing's Solo stands", async () => {
+    const t = await seedInstall({ slug: "bt-t", lifecycle: { tier: "trial" } });
+    const m = billing(() => ({
+      ok: true,
+      tiers: { [t.id]: { tier: "solo", status: "active", noRow: true } },
+    }));
+    const byId = Object.fromEntries((await list(m.rpc)).map((i) => [i.id, i]));
+    expect(byId[t.id]).toMatchObject({
+      tier: "trial",
+      billingTier: "solo",
+      billingStatus: "active",
+    });
+  });
+
   it("unbound: null, the request succeeds", async () => {
     await seedTwo();
     for (const i of await list()) expect(i.billingTier).toBeNull();

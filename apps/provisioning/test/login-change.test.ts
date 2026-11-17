@@ -556,6 +556,14 @@ describe("refusals", () => {
     expect(r.status).toBe(202);
   });
 
+  it("a real Solo row on an install created Team is still refused", async () => {
+    // billing("solo") has no noRow: the owner's own Solo, not the default.
+    await expectRefused({ bill: billing("solo") }, body(), {
+      status: 403,
+      error: "plan_required",
+    });
+  });
+
   it("answers 503 when billing can't say", async () => {
     await expectRefused({ bill: undefined }, body(), {
       status: 503,
