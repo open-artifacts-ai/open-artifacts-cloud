@@ -35,7 +35,10 @@ export type BillingSetTierResult =
 export type BillingTiersOfResult =
   | {
       ok: true;
-      tiers: Record<string, { tier: string | null; status: string | null }>;
+      tiers: Record<
+        string,
+        { tier: string | null; status: string | null; noRow?: boolean }
+      >;
     }
   | { ok: false; error: "bad_installs" | "unavailable" };
 export interface BillingOperatorRpc {

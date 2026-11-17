@@ -539,6 +539,23 @@ describe("refusals", () => {
     });
   });
 
+  it("an install created Team with no billing row passes as Team", async () => {
+    const noRow: BillingOperatorRpc = {
+      setTier: async () => {
+        throw new Error("not used");
+      },
+      tiersOf: async (ids) => ({
+        ok: true,
+        tiers: Object.fromEntries(
+          ids.map((i) => [i, { tier: "solo", status: "active", noRow: true }]),
+        ),
+      }),
+    };
+    const { env } = await world({ bill: noRow });
+    const r = await call(await req(body(), { install: id }), env);
+    expect(r.status).toBe(202);
+  });
+
   it("answers 503 when billing can't say", async () => {
     await expectRefused({ bill: undefined }, body(), {
       status: 503,

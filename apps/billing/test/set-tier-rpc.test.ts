@@ -278,14 +278,14 @@ const tiersOf = (installs: unknown, e: Env = baseEnv()) =>
   );
 
 describe("tiersOf (#2058)", () => {
-  it("answers tier and status per install, solo/active for no row, and writes nothing", async () => {
+  it("answers tier and status per install, solo/active marked noRow for no row, and writes nothing", async () => {
     await seed({ tier: "team", status: "past_due" });
     const before = await rowOf();
     expect(await tiersOf([A, B, A])).toEqual({
       ok: true,
       tiers: {
         [A]: { tier: "team", status: "past_due" },
-        [B]: { tier: "solo", status: "active" },
+        [B]: { tier: "solo", status: "active", noRow: true },
       },
     });
     expect(await rowOf()).toEqual(before);

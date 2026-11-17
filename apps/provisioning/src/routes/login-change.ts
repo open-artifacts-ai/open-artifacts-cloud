@@ -234,12 +234,13 @@ type Row = {
   row_version: number;
   test_hooks: number;
   source: "admin" | "self-serve";
+  tier: string | null;
   serving_mode: string | null;
   suspended_at: number | null;
   deleted_at: number | null;
 };
 
-const ROW_SQL = `SELECT i.id, i.state, i.vars, i.row_version, i.test_hooks, l.source, l.serving_mode, l.suspended_at, l.deleted_at
+const ROW_SQL = `SELECT i.id, i.state, i.vars, i.row_version, i.test_hooks, l.source, l.tier, l.serving_mode, l.suspended_at, l.deleted_at
 FROM installs i JOIN install_lifecycle l ON l.install_id = i.id WHERE i.id = ?1`;
 
 const isConstraint = (e: unknown) =>
@@ -319,7 +320,9 @@ export async function loginChange(
   )
     return reply(403, "install_not_serving");
 
-  const plan = (await billingTiersOf(env, [install])).get(install);
+  const plan = (
+    await billingTiersOf(env, [install], new Map([[install, row.tier]]))
+  ).get(install);
   if (!plan) return reply(503, "unavailable");
   if (
     (plan.billingTier !== "team" && plan.billingTier !== "business") ||

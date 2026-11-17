@@ -98,6 +98,32 @@ describe("billingTier", () => {
     expect(r.body.tier).toBe("team");
   });
 
+  it("no billing row: an install created Team stays Team, not billing's default Solo", async () => {
+    const { a, b } = await seedTwo();
+    const m = billing(() => ({
+      ok: true,
+      tiers: {
+        [a]: { tier: "solo", status: "active", noRow: true },
+        // A real Solo row (the owner chose Solo): shown as is.
+        [b]: { tier: "solo", status: "active" },
+      },
+    }));
+    const byId = Object.fromEntries((await list(m.rpc)).map((i) => [i.id, i]));
+    expect(byId[a]).toMatchObject({
+      tier: "team",
+      billingTier: "team",
+      billingStatus: "active",
+    });
+    expect(byId[b]).toMatchObject({ billingTier: "solo" });
+    const d = await call(fakeEnv({ BILLING: m.rpc }), ADMIN_P, "R3", {
+      params: { id: a },
+    });
+    expect(d.body).toMatchObject({
+      billingTier: "team",
+      billingStatus: "active",
+    });
+  });
+
   it("unbound: null, the request succeeds", async () => {
     await seedTwo();
     for (const i of await list()) expect(i.billingTier).toBeNull();
