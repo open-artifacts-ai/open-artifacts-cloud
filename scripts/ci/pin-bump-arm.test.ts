@@ -20,6 +20,7 @@ import {
   queueFailure,
   queueMarker,
   queueNotice,
+  queueVerdict,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -492,18 +493,86 @@ const RULES = JSON.stringify([
 ]);
 describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
   const FAIL = qrun("2026-11-17T10:30:00Z", "failure");
-  it("leaves a head whose merge queue run failed, for any non-success end", () => {
+  it("leaves a head whose merge queue run failed, timed out or never started", () => {
+    for (const c of ["failure", "timed_out", "startup_failure"])
+      left(
+        { queueRuns: [qrun(FAIL.createdAt, c)] },
+        new RegExp(`merge queue run on this head ended ${c}`),
+      );
+  });
+  it("does not hold a head for one cancelled, skipped or neutral run (no verdict)", () => {
     for (const c of [
-      "failure",
-      "timed_out",
       "cancelled",
-      "startup_failure",
+      "skipped",
+      "neutral",
+      "action_required",
       null,
-    ]) {
-      const r =
-        c === null ? { ...FAIL, conclusion: null } : qrun(FAIL.createdAt, c);
-      left({ queueRuns: [r] }, /merge queue run on this head ended/);
-    }
+    ])
+      expect(
+        decide(base({ queueRuns: [qrun(FAIL.createdAt, c)] })).arm,
+        String(c),
+      ).toBe(true);
+  });
+  it("a cancelled run newer than a failure does not clear the failure; a success does", () => {
+    const cancelled = qrun("2026-11-17T11:00:00Z", "cancelled");
+    expect(decide(base({ queueRuns: [FAIL, cancelled] })).arm).toBe(false);
+    const ok = qrun("2026-11-17T12:00:00Z", "success");
+    expect(decide(base({ queueRuns: [FAIL, cancelled, ok] })).arm).toBe(true);
+  });
+  it("holds a head whose newest three queue runs were all cancelled", () => {
+    const c = (at: string) => qrun(at, "cancelled");
+    const three = [
+      c("2026-11-17T10:10:00Z"),
+      c("2026-11-17T10:20:00Z"),
+      c("2026-11-17T10:30:00Z"),
+    ];
+    left({ queueRuns: three }, /last 3 merge queue runs.*all cancelled/);
+    left({ queueRuns: [...three].reverse() }, /all cancelled/);
+    // Two are not enough, a success or a still-running newest run breaks the streak,
+    // and cancels made before the head commit are another head's.
+    expect(decide(base({ queueRuns: three.slice(1) })).arm).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [...three, qrun("2026-11-17T10:40:00Z", "success")],
+        }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({ queueRuns: [...three, qrun("2026-11-17T10:40:00Z", null)] }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [
+            c("2026-11-17T09:00:00Z"),
+            c("2026-11-17T09:10:00Z"),
+            c("2026-11-17T10:10:00Z"),
+          ],
+        }),
+      ).arm,
+    ).toBe(true);
+    // The newest three decide: an older failure under three newer cancels holds as cancels.
+    expect(
+      queueVerdict(HEAD_AT, [
+        FAIL,
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
+    expect(
+      queueVerdict(HEAD_AT, [
+        qrun("2026-11-17T10:05:00Z", "success"),
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
   });
   it("arms a head whose queue run is still going, or ended green", () => {
     expect(
@@ -660,6 +729,25 @@ describe("the failed queue run leaves one visible trace per head", () => {
     expect(() =>
       go("arm", fake({ queue: [FAIL], notFound: ["/issues/7/comments"] })),
     ).toThrow(/Not Found/);
+  });
+  it("says so when the hold is three cancels in a row", () => {
+    const runs = [1, 2, 3].map((n) => ({
+      ...qrun(`2026-11-17T10:${n}0:00Z`, "cancelled"),
+      url: `https://github.com/${REPO}/actions/runs/${n}`,
+    }));
+    const f = fake({ queue: runs });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toMatch(/cancelled 3 times in a row/);
+    expect(call).toContain("/actions/runs/3");
+    expect(r.armed).toEqual([]);
+  });
+  it("a cancelled run alone leaves no comment, and the PR is armed", () => {
+    const f = fake({ queue: [qrun("2026-11-17T10:30:00Z", "cancelled")] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
   });
   it("links only this repository's run pages", () => {
     const i = base({ queueRuns: [{ ...FAIL, url: "https://evil.example/x" }] });

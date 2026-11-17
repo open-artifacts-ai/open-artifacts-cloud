@@ -121,58 +121,89 @@ const field = (text: string, key: "tag" | "sha") => {
   }
 };
 
+/** Conclusions that hold a PR: the run itself failed. cancelled, skipped and neutral are no verdict. */
+export const HOLDING = ["failure", "timed_out", "startup_failure"];
+/** This many newest queue runs in a row, all cancelled, hold the PR (a cancel loop). */
+export const CANCEL_LIMIT = 3;
+export type QueueVerdict = {
+  why: string;
+  /** The run that decided, for the comment; absent for an unreadable date. */
+  run?: QueueRun;
+  /** Held by a run of cancelled queue runs, not by a failure. */
+  cancels?: boolean;
+};
+
 /**
- * Pure: why a PR whose merge-queue run already failed must not be armed again, or
+ * Pure: whether a PR's merge-queue history after its head commit holds it, or
  * undefined. Pin bumps run the whole suite only in the merge queue, so a failure
  * there drops the PR from the queue with every required check still green on the PR
- * head; arming it again would loop on the same head. The newest queue run made after
- * the head commit decides: anything but success (in progress counts as success here,
- * a PR in the queue reads armed first) holds the PR until a new commit or a person
- * acts. An unreadable date or run fails closed.
+ * head; arming it again would loop on the same head. Looking at the runs made after
+ * the head commit, newest first: a newest run still going lets the PR through (a PR
+ * in the queue reads armed first). Otherwise the newest run that ended failure,
+ * timed_out or startup_failure holds it, unless a success is newer. cancelled,
+ * skipped and neutral give no verdict: GitHub cancels a queued PR's run when a PR
+ * ahead fails or the group is rebuilt, which is not this PR's fault. The one
+ * exception is a loop: the newest CANCEL_LIMIT runs all cancelled also hold it. An
+ * unreadable date fails closed.
  */
-export function queueFailure(
+export function queueVerdict(
   headAt: string,
   runs: QueueRun[],
-): string | undefined {
+): QueueVerdict | undefined {
   const t = Date.parse(headAt);
-  if (Number.isNaN(t)) return "the head commit's date is unreadable";
-  let last: QueueRun | undefined;
+  if (Number.isNaN(t)) return { why: "the head commit's date is unreadable" };
+  const after: { r: QueueRun; at: number }[] = [];
   for (const r of runs) {
     const at = Date.parse(r.createdAt);
-    if (Number.isNaN(at)) return "a merge queue run has no readable date";
-    if (at < t) continue;
-    if (!last || at > Date.parse(last.createdAt)) last = r;
+    if (Number.isNaN(at))
+      return { why: "a merge queue run has no readable date" };
+    if (at >= t) after.push({ r, at });
   }
-  if (!last || last.status !== "completed") return undefined;
-  if (last.conclusion === "success") return undefined;
-  return `its merge queue run on this head ended ${last.conclusion ?? "unknown"}; a new commit or a person must act`;
+  const newest = after.sort((a, b) => b.at - a.at).map((x) => x.r);
+  const first = newest[0];
+  if (!first || first.status !== "completed") return undefined;
+  const top = newest.slice(0, CANCEL_LIMIT);
+  if (
+    top.length === CANCEL_LIMIT &&
+    top.every((r) => r.status === "completed" && r.conclusion === "cancelled")
+  )
+    return {
+      why: `its last ${CANCEL_LIMIT} merge queue runs on this head were all cancelled; a new commit or a person must act`,
+      run: first,
+      cancels: true,
+    };
+  const decisive = newest.find(
+    (r) =>
+      r.status === "completed" &&
+      (r.conclusion === "success" || HOLDING.includes(r.conclusion ?? "")),
+  );
+  if (!decisive || decisive.conclusion === "success") return undefined;
+  return {
+    why: `its merge queue run on this head ended ${decisive.conclusion}; a new commit or a person must act`,
+    run: decisive,
+  };
 }
+/** Pure: the reason a queue run holds the PR, or undefined. */
+export const queueFailure = (headAt: string, runs: QueueRun[]) =>
+  queueVerdict(headAt, runs)?.why;
 
 /** The hidden marker of the one comment per head sha that says a queue run failed. */
 export const queueMarker = (head: string) =>
   `<!-- pin-bump-arm: merge queue failed head=${head} -->`;
-/** The newest queue run after the head commit, the one queueFailure judged. */
-function newestRun(headAt: string, runs: QueueRun[]): QueueRun | undefined {
-  const t = Date.parse(headAt);
-  let last: QueueRun | undefined;
-  for (const r of runs)
-    if (
-      Date.parse(r.createdAt) >= t &&
-      (!last || Date.parse(r.createdAt) > Date.parse(last.createdAt))
-    )
-      last = r;
-  return last;
-}
 /** Pure: the PR comment for a failed queue run. Only a github.com run page is linked. */
 export function queueNotice(i: Input, repo: string): string {
-  const run = newestRun(i.headAt, i.queueRuns);
+  const v = queueVerdict(i.headAt, i.queueRuns);
+  const run = v?.run;
   const url =
     run?.url && run.url.startsWith(`https://github.com/${repo}/actions/runs/`)
       ? run.url
       : "";
+  const what = v?.cancels
+    ? `was cancelled ${CANCEL_LIMIT} times in a row (GitHub cancels a run when a PR ahead fails or the group is rebuilt, so a loop of them needs a person)`
+    : `ended ${run?.conclusion ?? "unknown"}`;
   return [
     queueMarker(i.headOid),
-    `The merge queue run for this pin bump (head ${i.headOid.slice(0, 12)}) ended ${run?.conclusion ?? "unknown"}${url ? `: ${url}` : "."}`,
+    `The merge queue run for this pin bump (head ${i.headOid.slice(0, 12)}) ${what}${url ? `: ${url}` : "."}`,
     "",
     "The checks on this PR were skipped on purpose (the suite runs once, in the merge queue), so it still looks green. pin-bump-arm will not arm this head again. A port or fix is needed. A new commit on this branch, or arming the PR by hand once the cause is fixed, is the way forward.",
   ].join("\n");
