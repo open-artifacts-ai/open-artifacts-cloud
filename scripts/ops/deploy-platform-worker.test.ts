@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { root, sandbox, write } from "../ci/stubs.ts";
-import { alertPinProblems } from "./wrangler-env.ts";
+import { alertPinProblems, stripJsonc } from "./wrangler-env.ts";
 
 // The platform Worker deploy wrapper: an allowlisted app and one env, always from the app's dir,
 // this env's placeholders filled into a copy that is removed on exit, and
@@ -215,6 +215,70 @@ describe("deploy-platform-worker.sh", () => {
     });
     expect(r.code, r.out + r.err).toBe(1);
     expect(r.log).toEqual([]);
+  });
+
+  // open-artifacts#2641: DOCS_PREVIEW opens doc creation on an install and is
+  // staging only. A prod deploy refuses a config that mentions it, before
+  // anything is filled or deployed.
+  describe("DOCS_PREVIEW is staging only", () => {
+    const AB = readFileSync(join(APP, "wrangler.jsonc"), "utf8");
+    const prodEnv = { BROKER_REGISTRY_ID: REG, GOOGLE_CLIENT_ID_PROD: CLIENT };
+    const tree = (config: string, hosted?: string) => {
+      const t = mkdtempSync(join(tmpdir(), "oa-deploy-tree-"));
+      for (const f of ["deploy-platform-worker.sh", "wrangler-env.ts"])
+        write(
+          join(t, "scripts/ops", f),
+          readFileSync(join(root, "scripts/ops", f), "utf8"),
+        );
+      write(join(t, "apps/auth-broker/wrangler.jsonc"), config);
+      if (hosted !== undefined)
+        write(join(t, ".github/hosted/prod.json"), hosted);
+      return join(t, "scripts/ops/deploy-platform-worker.sh");
+    };
+    const withVar = (block: "prod" | "staging" | "top") => {
+      const c = JSON.parse(stripJsonc(AB));
+      if (block === "top") c.vars = { ...c.vars, DOCS_PREVIEW: "1" };
+      else c.env[block].vars = { ...c.env[block].vars, DOCS_PREVIEW: "1" };
+      return JSON.stringify(c, null, 2);
+    };
+    const refused = (r: {
+      code: number | null;
+      out: string;
+      err: string;
+      log: string[];
+    }) => {
+      expectCode(r, 1);
+      expect(r.log).toEqual([]);
+      expect(r.err).toContain("DOCS_PREVIEW");
+      expect(r.err).toContain("staging only");
+    };
+    it("the repo's own config deploys to prod", () => {
+      expectCode(run(["auth-broker", "prod"], prodEnv), 0);
+    });
+    it("prod refuses a config whose prod block or top level sets it", () => {
+      refused(run(["auth-broker", "prod"], prodEnv, tree(withVar("prod"))));
+      refused(run(["auth-broker", "prod"], prodEnv, tree(withVar("top"))));
+    });
+    it("prod refuses a prod constants file that mentions it", () => {
+      refused(
+        run(
+          ["auth-broker", "prod"],
+          prodEnv,
+          tree(AB, '{ "docs_preview": 1, "DOCS_PREVIEW": "1" }'),
+        ),
+      );
+    });
+    it("prod refuses a config it cannot parse", () => {
+      expectCode(run(["auth-broker", "prod"], prodEnv, tree("{ not json")), 1);
+    });
+    it("a staging block that sets it deploys to staging, and does not stop prod", () => {
+      const script = tree(withVar("staging"), '{ "app_zone": "x" }');
+      expectCode(
+        run(["auth-broker", "staging"], { BROKER_REGISTRY_ID: REG }, script),
+        0,
+      );
+      expectCode(run(["auth-broker", "prod"], prodEnv, script), 0);
+    });
   });
 
   describe("dispatch and scheduler", () => {
@@ -841,6 +905,10 @@ describe("deploy-platform-worker.sh", () => {
         join(t, "scripts/ops/deploy-platform-worker.sh"),
         readFileSync(SCRIPT, "utf8"),
       );
+      write(
+        join(t, "scripts/ops/wrangler-env.ts"),
+        readFileSync(join(root, "scripts/ops/wrangler-env.ts"), "utf8"),
+      );
       write(join(t, "apps/provisioning/wrangler.jsonc"), config);
       if (assets)
         write(
@@ -1020,6 +1088,10 @@ describe("deploy-platform-worker.sh", () => {
       write(
         join(t, "scripts/ops/deploy-platform-worker.sh"),
         readFileSync(SCRIPT, "utf8"),
+      );
+      write(
+        join(t, "scripts/ops/wrangler-env.ts"),
+        readFileSync(join(root, "scripts/ops/wrangler-env.ts"), "utf8"),
       );
       write(join(t, "apps/inventory/wrangler.jsonc"), config);
       return join(t, "scripts/ops/deploy-platform-worker.sh");

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { brokerKey } from "./broker-key.ts";
@@ -9,6 +9,7 @@ import {
   committedRateLimits,
   committedSignups,
   committedVars,
+  docsPreviewInProd,
   stripJsonc,
 } from "./wrangler-env.ts";
 
@@ -246,5 +247,50 @@ describe("committedBilling", () => {
           `${app} ${env}`,
         ).toBe(entry[app]);
     }
+  });
+});
+
+// open-artifacts#2641: DOCS_PREVIEW opens doc creation and is staging only.
+describe("docsPreviewInProd", () => {
+  const mk = (top: object, env: object) =>
+    JSON.stringify({ name: "x", ...top, env });
+  it("is true when the prod block or the top level names it, in vars or anywhere else", () => {
+    expect(
+      docsPreviewInProd(mk({}, { prod: { vars: { DOCS_PREVIEW: "1" } } })),
+    ).toBe(true);
+    expect(
+      docsPreviewInProd(mk({ vars: { DOCS_PREVIEW: "1" } }, { prod: {} })),
+    ).toBe(true);
+    expect(
+      docsPreviewInProd(mk({}, { prod: { vars: { A: "DOCS_PREVIEW" } } })),
+    ).toBe(true);
+    expect(
+      docsPreviewInProd(
+        `{ // c\n "env": { "prod": { "vars": { "DOCS_PREVIEW": "0", }, }, }, }`,
+      ),
+    ).toBe(true);
+  });
+  it("is false for a staging-only mention or none, and a config with no prod block", () => {
+    expect(
+      docsPreviewInProd(mk({}, { staging: { vars: { DOCS_PREVIEW: "1" } } })),
+    ).toBe(false);
+    expect(docsPreviewInProd(mk({ vars: { A: "1" } }, { prod: {} }))).toBe(
+      false,
+    );
+    expect(docsPreviewInProd(JSON.stringify({ name: "x" }))).toBe(false);
+  });
+  it("refuses a config it cannot parse", () => {
+    expect(() => docsPreviewInProd("{ not json")).toThrow();
+  });
+  it("no committed platform Worker config or prod constants file mentions it for prod", () => {
+    for (const app of readdirSync(join(root, "apps")))
+      for (const f of ["wrangler.jsonc", "wrangler.test.jsonc"]) {
+        const p = join(root, "apps", app, f);
+        if (existsSync(p))
+          expect(docsPreviewInProd(readFileSync(p, "utf8")), p).toBe(false);
+      }
+    expect(
+      readFileSync(join(root, ".github/hosted/prod.json"), "utf8"),
+    ).not.toContain("DOCS_PREVIEW");
   });
 });
