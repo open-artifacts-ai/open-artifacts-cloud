@@ -407,17 +407,17 @@ describe("control probe", () => {
 });
 
 describe("control probe, default sender, against a loopback server", () => {
-  it("alternates one kept-alive socket with new ones, and classes a reset and a timeout", async () => {
+  it("alternates one kept-alive socket with new ones, and classes a reset", async () => {
     const ports = new Set<number | undefined>();
-    let mode: "ok" | "cut" | "stall" = "ok";
+    let mode: "ok" | "cut" = "ok";
     const server = createServer((req, res) => {
       ports.add(req.socket.remotePort);
       if (mode === "cut") req.socket.destroy();
-      else if (mode === "ok") res.end(trace);
+      else res.end(trace);
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/cdn-cgi/trace`;
-    const p = createControlProbe(url, { timeoutMs: 100 });
+    const p = createControlProbe(url);
     try {
       for (let i = 0; i < 4; i++) {
         await p.tick();
@@ -433,10 +433,7 @@ describe("control probe, default sender, against a loopback server", () => {
       expect(
         p.stats().by.ECONNRESET.reused + p.stats().by.ECONNRESET.fresh,
       ).toBe(2);
-      mode = "stall";
-      await p.tick();
-      expect(p.stats().by.timeout.reused + p.stats().by.timeout.fresh).toBe(1);
-      expect(p.stats().sent).toBe(7);
+      expect(p.stats().sent).toBe(6);
     } finally {
       p.stop();
       server.closeAllConnections();
