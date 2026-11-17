@@ -41,7 +41,7 @@ describe("reset evidence", () => {
     expect(notes).toHaveLength(1);
     const [n = ""] = notes;
     expect(n).toMatch(
-      /^reset: \S+ GET \/cut\/v1\/x host [0-9a-f]{8}, reused socket, idle \d+ ms, request 2 on it$/,
+      /^reset: \S+ GET \/cut\/v1\/x host [0-9a-f]{8}, reused socket, idle \d+ ms, request 2 on it; no ray seen$/,
     );
     expect(Number(/idle (\d+) ms/.exec(n)?.[1])).toBeGreaterThanOrEqual(100);
     expect(n).not.toMatch(/secret|token|127\.0\.0\.1/);
@@ -50,7 +50,7 @@ describe("reset evidence", () => {
   it("names a new socket as new", async () => {
     server.closeAllConnections();
     await expect(get("/cut")).rejects.toThrow("fetch failed");
-    expect(takeFileNotes()[0]).toMatch(/, new socket$/);
+    expect(takeFileNotes()[0]).toMatch(/, new socket; no ray seen$/);
   });
 
   it("an answer isn't a reset, a 500 included", async () => {
