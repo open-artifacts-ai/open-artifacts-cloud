@@ -1,3 +1,9 @@
+import {
+  type ControlStats,
+  controlSummary,
+  EDGE_PREFIX,
+  nearSummary,
+} from "./edge-probe.ts";
 // Proof levels and the gate rule (the Manager's): every case reports exactly
 // one level, and the gate passes only when EVERY case is "pass". staging-only,
 // not-applicable, unproven-live and infra never count as a pass, and neither
@@ -170,6 +176,8 @@ export interface Report {
   combined?: { runNonce: string; verdictsFinishedAt: number };
   /** Notes recorded outside any test (beforeAll), by file. */
   fileNotes?: { file: string; note: string }[];
+  /** Evidence only, never a verdict: what the orchestrator's edge control probe saw (src/edge-probe.ts). */
+  edge?: { control?: ControlStats };
 }
 
 export interface RunBinding {
@@ -229,6 +237,27 @@ export function resetSummary(notes: readonly string[]): string | undefined {
   const retried = notes.filter((n) => n.startsWith(RETRIED_REQUEST_PREFIX));
   const recovered = retried.filter((n) => n.endsWith(RECOVERED_SUFFIX)).length;
   return `Resets: ${resets.length} (${reused} on reused sockets), of ${requests} requests (${fresh} on new sockets); retried ${retried.length}, recovered ${recovered}`;
+}
+
+/** `Edge: IAD 2310, EWR 150`: the edge locations the responses came from, from every file's edge note. */
+export function edgeSummary(notes: readonly string[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const n of notes) {
+    if (!n.startsWith(EDGE_PREFIX)) continue;
+    for (const part of n.slice(EDGE_PREFIX.length).split(", ")) {
+      const m = /^([A-Z]{3}) (\d+)$/.exec(part);
+      if (m)
+        counts.set(
+          m[1] as string,
+          (counts.get(m[1] as string) ?? 0) + Number(m[2]),
+        );
+    }
+  }
+  if (!counts.size) return undefined;
+  return `Edge: ${[...counts]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([c, k]) => `${c} ${k}`)
+    .join(", ")}`;
 }
 
 /** A request retried once on a new socket (src/transport.ts). */
@@ -708,6 +737,17 @@ export function formatReport(r: Report): string {
     ...noted.flatMap((c) => c.notes ?? []),
   ]);
   if (resets) lines.push(resets);
+  const allNotes = [
+    ...(r.fileNotes ?? []).map((n) => n.note),
+    ...noted.flatMap((c) => c.notes ?? []),
+  ];
+  // Evidence lines (src/resets.ts, src/edge-probe.ts): never part of a verdict.
+  const edge = edgeSummary(allNotes);
+  if (edge) lines.push(edge);
+  const control = r.edge?.control;
+  if (control && control.sent > 0) lines.push(controlSummary(control));
+  const near = nearSummary(allNotes, control);
+  if (near) lines.push(near);
   const retried = r.cases.filter((c) =>
     c.notes?.some((n) => n.startsWith("case retried")),
   ).length;

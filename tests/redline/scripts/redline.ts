@@ -23,6 +23,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { BARRIER_DIR_ENV, barrierDirOf, laneExitFile } from "../src/barrier.ts";
+import { type ControlStats, controlProbeFor } from "../src/edge-probe.ts";
 import {
   type Lane,
   type LaneResult,
@@ -37,6 +38,8 @@ import { exitCode, formatReport, gateOn, type Report } from "../src/report.ts";
 import { finalReport, type LanePart, writeReport } from "../src/reporter.ts";
 
 const pkg = join(import.meta.dirname, "..");
+// When this run began: the lanes (env below) and the control probe share it.
+const suiteStart = Date.now();
 const gate = gateOn(process.argv.slice(2), process.env);
 const reportFile =
   process.env.REDLINE_REPORT ||
@@ -75,6 +78,7 @@ mkdirSync(lockDir, { recursive: true, mode: 0o700 });
 
 const vitest = join(pkg, "node_modules", ".bin", "vitest");
 const live = new Set<ChildProcess>();
+let control: ControlStats | undefined;
 const forward = (sig: NodeJS.Signals) => () => {
   for (const c of live) c.kill(sig);
 };
@@ -97,6 +101,7 @@ function runLane(lane: Lane, prefix: boolean): Promise<LaneResult> {
         ...process.env,
         ...lane.env,
         REDLINE_LANE: name,
+        REDLINE_SUITE_START_MS: String(suiteStart),
         [BARRIER_DIR_ENV]: barrierDir,
         [LOCK_DIR_ENV]: lockDir,
         REDLINE_REPORT: reportFile,
@@ -130,19 +135,33 @@ function runLane(lane: Lane, prefix: boolean): Promise<LaneResult> {
 }
 
 const results: LaneResult[] = [];
-for (const [i, phase] of PLAN.entries()) {
-  console.log(
-    `redline: phase ${i + 1} of ${PLAN.length}: ${phase.map((l) => `${l.name}: ${l.files.join(", ")}`).join(" | ")}`,
-  );
-  results.push(
-    ...(await Promise.all(phase.map((l) => runLane(l, phase.length > 1)))),
-  );
+// Evidence only (src/edge-probe.ts): one control request a second to the edge
+// while the lanes run, once for the whole run. It never changes a verdict, and
+// is always stopped, however the lanes end. Lanes read the start time to say
+// when a reset happened (src/resets.ts).
+const probe = controlProbeFor(process.env, { startMs: suiteStart });
+process.once("exit", () => {
+  probe?.stop();
+});
+try {
+  probe?.start();
+  for (const [i, phase] of PLAN.entries()) {
+    console.log(
+      `redline: phase ${i + 1} of ${PLAN.length}: ${phase.map((l) => `${l.name}: ${l.files.join(", ")}`).join(" | ")}`,
+    );
+    results.push(
+      ...(await Promise.all(phase.map((l) => runLane(l, phase.length > 1)))),
+    );
+  }
+} finally {
+  control = probe?.stop();
 }
 
 const merged = mergeLanes(results);
 let report: Report | null = null;
 try {
   report = await finalReport(merged.cases, merged.fileNotes);
+  if (control && control.sent > 0) report = { ...report, edge: { control } };
   process.stdout.write(`\n${writeReport(report, reportFile)}`);
 } catch (e) {
   console.error(`redline: no report was written (${(e as Error).message})`);
