@@ -628,6 +628,10 @@ export function userWorkerMetadata(
   if (migrations) meta.migrations = migrations;
   if (missing.length > 0) meta.keep_bindings = ["secret_text", "secret_key"];
   assertUniqueBindings(meta.bindings);
+  // open-artifacts#2641: also on what is rendered, so a release template's
+  // vars can't bind DOCS_PREVIEW on prod either.
+  if (r.env === "prod" && meta.bindings.some((b) => b.name === "DOCS_PREVIEW"))
+    throw new Error("DOCS_PREVIEW is staging only; prod refuses it");
   return meta;
 }
 

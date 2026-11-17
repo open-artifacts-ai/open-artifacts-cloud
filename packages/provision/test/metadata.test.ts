@@ -974,6 +974,12 @@ describe("DOCS_PREVIEW var (staging only)", () => {
     for (const v of ["0", "true", "", "11"])
       expect(() => meta(v, "staging")).toThrow(/invalid var DOCS_PREVIEW/);
   });
+  it("prod refuses it from the release template's vars too", () => {
+    const t = { ...tpl, vars: { ...tpl.vars, DOCS_PREVIEW: "1" } };
+    expect(() =>
+      userWorkerMetadata(inst(), res({ env: "prod", template: t })),
+    ).toThrow(/DOCS_PREVIEW is staging only/);
+  });
   it("an install without it has no DOCS_PREVIEW binding, on either env", () => {
     for (const env of ["staging", "prod"] as const)
       expect(
