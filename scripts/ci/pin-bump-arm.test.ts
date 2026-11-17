@@ -16,6 +16,8 @@ import {
   type Input,
   isChainProdDeploy,
   parseView,
+  type QueueRun,
+  queueFailure,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -28,6 +30,12 @@ const HEAD = "c".repeat(40);
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
+const HEAD_AT = "2026-11-17T10:00:00Z";
+const qrun = (createdAt: string, conclusion: string | null): QueueRun => ({
+  createdAt,
+  status: conclusion === null ? "in_progress" : "completed",
+  conclusion,
+});
 const REQUIRED_CHECKS = [
   "scripts",
   "overlay",
@@ -67,6 +75,8 @@ const base = (o: Partial<Input> = {}): Input => ({
   commits: [{ author: BOT, committer: BOT, verified: true }],
   required: REQUIRED_CHECKS,
   armed: false,
+  headAt: HEAD_AT,
+  queueRuns: [],
   ...o,
 });
 const left = (o: Partial<Input>, why: RegExp) => {
@@ -478,6 +488,81 @@ const RULES = JSON.stringify([
   },
   { type: "merge_queue", parameters: {} },
 ]);
+describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
+  const FAIL = qrun("2026-11-17T10:30:00Z", "failure");
+  it("leaves a head whose merge queue run failed, for any non-success end", () => {
+    for (const c of [
+      "failure",
+      "timed_out",
+      "cancelled",
+      "startup_failure",
+      null,
+    ]) {
+      const r =
+        c === null ? { ...FAIL, conclusion: null } : qrun(FAIL.createdAt, c);
+      left({ queueRuns: [r] }, /merge queue run on this head ended/);
+    }
+  });
+  it("arms a head whose queue run is still going, or ended green", () => {
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", null)] })).arm,
+    ).toBe(true);
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", "success")] }))
+        .arm,
+    ).toBe(true);
+  });
+  it("ignores a failed run made before this head commit (an older head)", () => {
+    const old = qrun("2026-11-17T09:59:59Z", "failure");
+    expect(decide(base({ queueRuns: [old] })).arm).toBe(true);
+  });
+  it("judges by the newest run after the head, whatever the order", () => {
+    const bad = qrun("2026-11-17T10:30:00Z", "failure");
+    const good = qrun("2026-11-17T11:00:00Z", "success");
+    expect(decide(base({ queueRuns: [bad, good] })).arm).toBe(true);
+    expect(decide(base({ queueRuns: [good, bad] })).arm).toBe(true);
+    const late = qrun("2026-11-17T12:00:00Z", "failure");
+    expect(decide(base({ queueRuns: [good, bad, late] })).arm).toBe(false);
+    expect(decide(base({ queueRuns: [late, good, bad] })).arm).toBe(false);
+  });
+  it("fails closed on an unreadable head date or run date", () => {
+    left({ headAt: "" }, /date is unreadable/);
+    left({ headAt: "soon" }, /date is unreadable/);
+    left({ queueRuns: [qrun("", "success")] }, /no readable date/);
+  });
+  it("queueFailure says nothing without runs", () => {
+    expect(queueFailure(HEAD_AT, [])).toBeUndefined();
+  });
+  it("run: a failed queue run keeps the PR un-armed on every pass, until a new head", () => {
+    const f = fake({ queue: [FAIL] });
+    for (let n = 0; n < 3; n++) {
+      const r = go("arm", f);
+      expect(r.armed).toEqual([]);
+      expect(r.write).toBe(false);
+      expect(r.merges).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(
+        /#7: leave: its merge queue run on this head ended failure/,
+      );
+    }
+    // A new head commit made after the failed run is judged afresh.
+    expect(
+      go("arm", fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" })).armed,
+    ).toEqual([7]);
+  });
+  it("run: a queue run in the API that cannot be read leaves the PR", () => {
+    const r = go("arm", fake({ notFound: ["event=merge_group"] }));
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/could not read what it needs/);
+    const g = go("arm", fake({ notFound: ["/git/commits/"] }));
+    expect(g.armed).toEqual([]);
+  });
+  it("run: a bot-armed PR with a failed queue run is disarmed", () => {
+    const f = fake({ armed: true, queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+  });
+});
+
 describe("requiredChecks", () => {
   it("reads the contexts of the required_status_checks rule", () => {
     expect(requiredChecks(RULES)).toEqual(REQUIRED_CHECKS);
@@ -533,6 +618,8 @@ const fake = (
     deployTitles?: string[];
     deepDeploy?: boolean;
     tagSha?: string;
+    queue?: QueueRun[];
+    headAt?: string;
   } = {},
 ) => {
   const calls: Call[] = [];
@@ -577,6 +664,13 @@ const fake = (
           ? "1"
           : "0",
       );
+    }
+    if (a.includes("/git/commits/"))
+      return ok(JSON.stringify({ committer: { date: o.headAt ?? HEAD_AT } }));
+    if (a.includes("actions/workflows/ci.yml/runs?event=merge_group")) {
+      expect(a).toContain("per_page=100");
+      expect(a).toContain("gh-readonly-queue/main/pr-7-");
+      return ok(JSON.stringify(o.queue ?? []));
     }
     if (a.includes("/pulls?state=open"))
       return ok(
@@ -1106,7 +1200,10 @@ describe("the release gate in run", () => {
     go("arm", f);
     const reads = f.calls
       .map((c) => c.join(" "))
-      .filter((c) => c.includes("/actions/workflows/"));
+      .filter(
+        (c) =>
+          c.includes("/actions/workflows/") && !c.includes("workflows/ci.yml/"),
+      );
     expect(reads.length).toBe(GATE_WORKFLOWS.length * 2 + 1);
     expect(reads.filter((c) => c.includes("per_page=100")).length).toBe(1);
     for (const c of reads) {

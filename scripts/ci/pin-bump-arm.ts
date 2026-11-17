@@ -35,7 +35,8 @@ export function requiredChecks(json: string): string[] {
     return [];
   }
 }
-const BRANCH = /^pin-bump\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
+/** A bump branch: pin-bump/vX.Y.Z. */
+export const BRANCH = /^pin-bump\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
 const SHA = /^[0-9a-f]{40}$/;
 
 export type PrFile = {
@@ -64,6 +65,12 @@ export type Check = {
   status: string;
   conclusion: string | null;
   app?: string;
+};
+/** A merge-queue (merge_group) CI run for one PR: when it was created and how it ended. */
+export type QueueRun = {
+  createdAt: string;
+  status: string;
+  conclusion: string | null;
 };
 export type Input = {
   author: string;
@@ -94,6 +101,10 @@ export type Input = {
   required: string[];
   /** Auto-merge is enabled or the PR is queued. */
   armed: boolean;
+  /** When the PR's head commit was made (ISO 8601); a queue run older than that is another head's. */
+  headAt: string;
+  /** The merge-queue CI runs for this PR, any head. */
+  queueRuns: QueueRun[];
   /** Auto-merge was enabled (not queued), and by whom. */
   autoMergeBy?: string;
 };
@@ -108,6 +119,33 @@ const field = (text: string, key: "tag" | "sha") => {
   }
 };
 
+/**
+ * Pure: why a PR whose merge-queue run already failed must not be armed again, or
+ * undefined. Pin bumps run the whole suite only in the merge queue, so a failure
+ * there drops the PR from the queue with every required check still green on the PR
+ * head; arming it again would loop on the same head. The newest queue run made after
+ * the head commit decides: anything but success (in progress counts as success here,
+ * a PR in the queue reads armed first) holds the PR until a new commit or a person
+ * acts. An unreadable date or run fails closed.
+ */
+export function queueFailure(
+  headAt: string,
+  runs: QueueRun[],
+): string | undefined {
+  const t = Date.parse(headAt);
+  if (Number.isNaN(t)) return "the head commit's date is unreadable";
+  let last: QueueRun | undefined;
+  for (const r of runs) {
+    const at = Date.parse(r.createdAt);
+    if (Number.isNaN(at)) return "a merge queue run has no readable date";
+    if (at < t) continue;
+    if (!last || at > Date.parse(last.createdAt)) last = r;
+  }
+  if (!last || last.status !== "completed") return undefined;
+  if (last.conclusion === "success") return undefined;
+  return `its merge queue run on this head ended ${last.conclusion ?? "unknown"}; a new commit or a person must act`;
+}
+
 /** Pure: should this PR be armed? Every rule must hold; the first that fails is the reason. */
 export function decide(i: Input): Decision {
   if (i.author !== BOT) return no(`author is ${i.author}, not ${BOT}`);
@@ -116,6 +154,8 @@ export function decide(i: Input): Decision {
   if (i.headRepo !== i.repo)
     return no(`head is in ${i.headRepo}, not ${i.repo}`);
   if (i.armed) return no("already armed or queued");
+  const failed = queueFailure(i.headAt, i.queueRuns);
+  if (failed) return no(failed);
 
   if (i.commits.length === 0) return no("the PR has no commits to check");
   const human = i.commits.find((c) => !commitOk(c));
@@ -428,6 +468,20 @@ function gather(
       conclusion: c.conclusion,
       app: String(c.app?.slug ?? ""),
     }));
+  const headAt = String(
+    JSON.parse(gh(exec, ["api", `repos/${repo}/git/commits/${oid}`])).committer
+      ?.date ?? "",
+  );
+  // Merge-queue runs are named gh-readonly-queue/<base>/pr-<n>-<base sha>; --jq keeps
+  // the page small. The newest 100 are enough: arming makes a new run every time.
+  const queueRuns = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/workflows/ci.yml/runs?event=merge_group&per_page=100`,
+      "--jq",
+      `[.workflow_runs[] | select(.head_branch | startswith("gh-readonly-queue/main/pr-${p.number}-")) | {createdAt: .created_at, status: .status, conclusion: .conclusion}]`,
+    ]),
+  ) as QueueRun[];
   let required: string[] = [];
   try {
     required = requiredChecks(
@@ -453,6 +507,8 @@ function gather(
     commits,
     required,
     armed: view.armed,
+    headAt,
+    queueRuns,
     autoMergeBy: view.autoMergeBy,
   };
 }

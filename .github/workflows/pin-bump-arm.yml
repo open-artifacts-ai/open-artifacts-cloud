@@ -3,6 +3,13 @@
 # public repo's tag, the tag is newer than main's pin, and every required check is
 # green on the PR's current head, it enables auto-merge (the merge queue does the
 # rest). Anything else is left for a person. The rule is scripts/ci/pin-bump-arm.ts.
+#
+# One suite run per bump (see ci.yml): on the PR the required checks end green at once
+# (scripts/ci/pin-only.ts), and the full suite runs once, in the merge queue, on the
+# commit that lands. A queue failure drops the PR from the queue with those PR checks
+# still green, so the rule also refuses a head whose merge queue run failed (it finds
+# the run by its pr-<number> branch and its date after the head commit). The PR then
+# stays un-armed until a new commit or a person acts; it is never armed again in a loop.
 # Always runs main's script (never the PR's), read-only until a PR qualifies; the
 # App token exists only right before the arm step.
 name: pin-bump-arm
