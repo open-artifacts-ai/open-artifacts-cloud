@@ -555,6 +555,12 @@ export const PRUNE_LIST_MAX = 200_000;
  * key) is kept and reported. Each version is listed again right before its
  * deletes, and kept if a record or another object shape has appeared. Deletes
  * go through r2.deleteStaged, which refuses the record and the floor.
+ *
+ * The second listing narrows, but does not close, the gap before the deletes:
+ * a stage-prod upload of the same version could still land in between. What
+ * closes it is that prod's publishes run one at a time (hosted-publish.yml's
+ * hosted-publish-prod concurrency group) and that only a version below the one
+ * just published is pruned, which no later stage-prod run uploads again.
  */
 export async function pruneStaged(o: {
   cf: Cf;
