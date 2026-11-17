@@ -539,6 +539,31 @@ describe("refusals", () => {
     });
   });
 
+  it("an install created Team with no billing row passes as Team", async () => {
+    const noRow: BillingOperatorRpc = {
+      setTier: async () => {
+        throw new Error("not used");
+      },
+      tiersOf: async (ids) => ({
+        ok: true,
+        tiers: Object.fromEntries(
+          ids.map((i) => [i, { tier: "solo", status: "active", noRow: true }]),
+        ),
+      }),
+    };
+    const { env } = await world({ bill: noRow });
+    const r = await call(await req(body(), { install: id }), env);
+    expect(r.status).toBe(202);
+  });
+
+  it("a real Solo row on an install created Team is still refused", async () => {
+    // billing("solo") has no noRow: the owner's own Solo, not the default.
+    await expectRefused({ bill: billing("solo") }, body(), {
+      status: 403,
+      error: "plan_required",
+    });
+  });
+
   it("answers 503 when billing can't say", async () => {
     await expectRefused({ bill: undefined }, body(), {
       status: 503,
