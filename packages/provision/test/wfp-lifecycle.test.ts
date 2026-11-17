@@ -1732,6 +1732,37 @@ describe("concurrency", () => {
   });
 });
 
+describe("updateVars: DOCS_PREVIEW is staging only (open-artifacts#2641)", () => {
+  it("a prod install refuses it with no write, and the row stays active", async () => {
+    const s = setup({ env: "prod" });
+    const inst = keep(await s.p.create(input()));
+    const w = s.fake.writes().length;
+    const e = await fails(s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" }));
+    expect(e.message).toMatch(/DOCS_PREVIEW is staging only/);
+    expect(s.fake.writes().length).toBe(w);
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+  it("a staging install takes it, and drops it again when the next vars omit it", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    await s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" });
+    const on = s
+      .scriptOf(inst.id)
+      ?.metadata.bindings.find(
+        (b: { name: string }) => b.name === "DOCS_PREVIEW",
+      );
+    expect(on).toMatchObject({ type: "plain_text", text: "1" });
+    await s.p.updateVars(inst.id, {});
+    expect(
+      s
+        .scriptOf(inst.id)
+        ?.metadata.bindings.some(
+          (b: { name: string }) => b.name === "DOCS_PREVIEW",
+        ),
+    ).toBe(false);
+  });
+});
+
 describe("updateVars and the session cut", () => {
   it("re-validates vars exactly as create does", async () => {
     const s = setup();
