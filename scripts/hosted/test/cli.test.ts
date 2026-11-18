@@ -1117,17 +1117,10 @@ describe("backfills (open-artifacts#2775, #2820)", () => {
         expect(w.parsed().find((l) => l.step === op.cmd)?.data.detail).toEqual([
           { id, outcome: "present" },
         ]);
-        const prev = process.env.CI;
-        process.env.CI = "true";
-        try {
-          const c = world({ ci: true });
-          expect(await main(argv(op.cmd, "--detail"), c.deps)).toBe(1);
-          expect(lastLine(c).message).toMatch(/refused in CI/);
-          noCalls(c);
-        } finally {
-          if (prev === undefined) delete process.env.CI;
-          else process.env.CI = prev;
-        }
+        const c = world({ ci: true });
+        expect(await main(argv(op.cmd, "--detail"), c.deps)).toBe(1);
+        expect(lastLine(c).message).toMatch(/refused in CI/);
+        noCalls(c);
       });
 
       it("takes no --install, and prod is refused with a staging-only CI", async () => {

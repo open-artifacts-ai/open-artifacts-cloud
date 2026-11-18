@@ -202,7 +202,10 @@ interface Flags {
 }
 
 /** Every refusal that needs no call: exits 1 before the token is read. */
-function parse(argv: string[]): { cmd: Command; f: Flags } {
+function parse(
+  argv: string[],
+  runEnv: Deps["env"],
+): { cmd: Command; f: Flags } {
   let p: ReturnType<typeof parseArgs>;
   try {
     p = parseArgs({
@@ -266,7 +269,7 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
   if (f.detail && !isBackfill)
     throw new Refused("--detail is for the backfill commands only");
   // The run log of a CI job is public: install ids go only to a laptop.
-  if (f.detail && inCi(process.env))
+  if (f.detail && inCi(runEnv))
     throw new Refused("--detail is refused in CI: the log is public");
   if (cmd === "publish-floor") need("floor", "floor");
   else if (f.floor !== undefined)
@@ -460,7 +463,7 @@ export async function main(argv: string[], d: Deps): Promise<number> {
   let cmd: Command;
   let f: Flags;
   try {
-    ({ cmd, f } = parse(argv));
+    ({ cmd, f } = parse(argv, d.env));
   } catch (e) {
     return fail("args", e);
   }
