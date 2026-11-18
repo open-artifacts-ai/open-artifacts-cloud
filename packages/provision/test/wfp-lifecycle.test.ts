@@ -2158,6 +2158,88 @@ describe("rotateTurnstileSecret", () => {
   });
 });
 
+describe("install opt-out key (open-artifacts#2820)", () => {
+  const K = "INSTALL_OPTOUT_KEY";
+  const keyOf = (s: ReturnType<typeof setup>, id: string) =>
+    s.scriptOf(id)?.secrets.get(K);
+
+  it("create mints 48 random bytes, base64url, per install, kept out of notes and audit", async () => {
+    const s = setup();
+    const a = keep(await s.p.create(input("alpha")));
+    const b = keep(await s.p.create(input("beta")));
+    const ka = keyOf(s, a.id) as string;
+    expect(ka).toMatch(/^[A-Za-z0-9_-]{64}$/);
+    expect(Buffer.from(ka, "base64url").length).toBe(48);
+    expect(keyOf(s, b.id)).not.toBe(ka);
+    const said = JSON.stringify([
+      a,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(ka);
+  });
+
+  it("backfill adds a key where none is, keeps one that is there, reports a busy install, and a rerun changes nothing", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    const busy = keep(await s.p.create(input("gamma")));
+    for (const id of [old.id, busy.id]) s.scriptOf(id)?.secrets.delete(K);
+    s.db()
+      .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
+      .run(busy.id);
+    const before = keyOf(s, kept.id);
+    const out = keep(await s.p.backfillOptoutKey("staging"));
+    const byId = Object.fromEntries(out.map((x) => [x.id, x]));
+    expect(byId[old.id]).toMatchObject({ ok: true, rotated: true });
+    expect(byId[kept.id]).toMatchObject({ ok: true, rotated: false });
+    expect(byId[busy.id]?.ok).toBe(false);
+    expect(byId[busy.id]?.reason).toMatch(/upgrading/);
+    const got = keyOf(s, old.id) as string;
+    expect(Buffer.from(got, "base64url").length).toBe(48);
+    expect(keyOf(s, kept.id)).toBe(before);
+    expect(keyOf(s, busy.id)).toBeUndefined();
+    expect(s.audit(old.id)).toContain("optout_key.backfill");
+    expect(s.audit(kept.id)).not.toContain("optout_key.backfill");
+    expect(
+      JSON.stringify([
+        out,
+        s.p.notes,
+        s.db().prepare("SELECT * FROM hosted_audit").all(),
+      ]),
+    ).not.toContain(got);
+    expect(s.row(old.id).lease).toBeNull();
+    const again = keep(await s.p.backfillOptoutKey("staging"));
+    expect(again.find((x) => x.id === old.id)).toMatchObject({
+      ok: true,
+      rotated: false,
+    });
+    expect(keyOf(s, old.id)).toBe(got);
+  });
+
+  it("an install without the key still upgrades clean, and an upgrade never rotates it", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    s.scriptOf(old.id)?.secrets.delete(K);
+    const before = keyOf(s, kept.id);
+    for (const id of [old.id, kept.id])
+      expect(keep(await s.p.upgrade(id, "0.24.2"))).toMatchObject({
+        ok: true,
+        rolledBack: false,
+      });
+    expect(keyOf(s, old.id)).toBeUndefined();
+    expect(keyOf(s, kept.id)).toBe(before);
+  });
+
+  it("refuses another env", async () => {
+    const s = setup();
+    expect(await fails(s.p.backfillOptoutKey("prod" as Env))).toBeInstanceOf(
+      ProvisionRefused,
+    );
+  });
+});
+
 describe("push keys (open-artifacts#2775)", () => {
   const PUSH = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
   const pairOf = (s: ReturnType<typeof setup>, id: string) => {

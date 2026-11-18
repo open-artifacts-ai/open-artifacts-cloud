@@ -24,6 +24,9 @@
       "preview_urls": false,
       "vars": {
         "OA_ENV": "staging",
+        // Which installs are LOGIN_EDITABLE, as provisioning's (#2520).
+        "LOGIN_CHANGE": "1",
+        "LOGIN_CHANGE_SLUGS": "",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts-staging.app",
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts-staging.app"
       },
@@ -67,6 +70,10 @@
       "preview_urls": false,
       "vars": {
         "OA_ENV": "prod",
+        // Which installs are LOGIN_EDITABLE, as provisioning's (#2520): keep
+        // both Workers' values the same. Prod has no LOGIN binding yet.
+        "LOGIN_CHANGE": "0",
+        "LOGIN_CHANGE_SLUGS": "",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts.app",
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts.app"
       },

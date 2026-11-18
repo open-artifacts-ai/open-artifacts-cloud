@@ -22,6 +22,13 @@ export interface LoginGateProps {
 
 export interface LoginGateEnv {
   LOGIN: Fetcher;
+  /**
+   * As provisioning's (#2520): "1" marks every install LOGIN_EDITABLE;
+   * otherwise only the installs whose slug LOGIN_CHANGE_SLUGS lists. An
+   * install without it shows no editable login form, so it never posts to a 404.
+   */
+  LOGIN_CHANGE?: string;
+  LOGIN_CHANGE_SLUGS?: string;
 }
 
 /** The platform side has no public origin for this route (binding only). */
@@ -119,14 +126,25 @@ export class LoginGate extends WorkerEntrypoint<LoginGateEnv, LoginGateProps> {
 }
 
 /**
- * The install's login gate for one request, for that install only. Nothing
- * when the caller has no LOGIN binding (prod, until it is turned on).
+ * The install's login gate for one request, for that install only, whenever
+ * the caller has the LOGIN binding (the opt-out list rides it too, #2652).
+ * LOGIN_EDITABLE (true) tells the install its owner may change the login
+ * domains: the switch is on, or its slug (from its app host, "" when unknown)
+ * is listed. Without it the install shows no editable form (#2802).
  */
 export function loginProps(
   exports: { LoginGate: (o: { props: LoginGateProps }) => Fetcher },
   installId: string,
-  env: { LOGIN?: Fetcher },
-): { LOGIN?: Fetcher } {
+  slug: string,
+  env: Partial<LoginGateEnv>,
+): { LOGIN?: Fetcher; LOGIN_EDITABLE?: true } {
   if (!env.LOGIN) return {};
-  return { LOGIN: exports.LoginGate({ props: { installId } }) };
+  const LOGIN = exports.LoginGate({ props: { installId } });
+  const listed = (env.LOGIN_CHANGE_SLUGS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  const editable =
+    env.LOGIN_CHANGE === "1" || (slug !== "" && listed.includes(slug));
+  return editable ? { LOGIN, LOGIN_EDITABLE: true } : { LOGIN };
 }

@@ -1848,6 +1848,7 @@ describe("WfpProvisioner.create", () => {
     expect([...(s.scriptOf(inst.id)?.secrets.keys() ?? [])].sort()).toEqual([
       "CONTENT_SIGNING_KEY",
       "DIRECTORY_TOKEN_KEY",
+      "INSTALL_OPTOUT_KEY",
       "SESSION_SECRET",
       "VAPID_PRIVATE_KEY",
       "VAPID_PUBLIC_KEY",
