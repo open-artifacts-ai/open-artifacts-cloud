@@ -32,6 +32,8 @@ describe("wrangler.jsonc", () => {
       const zone = HOSTED_DOMAINS[env].app;
       expect(e.vars).toEqual({
         OA_ENV: env,
+        LOGIN_CHANGE: env === "prod" ? "0" : "1",
+        LOGIN_CHANGE_SLUGS: env === "prod" ? "leo" : "",
         AUTH_BROKER_ORIGIN: `https://auth.${zone}`,
         DIRECTORY_BROKER_ORIGIN: `https://directory.${zone}`,
       });
@@ -45,16 +47,12 @@ describe("wrangler.jsonc", () => {
           service: platformNames(env).directoryBroker,
         },
         { binding: "BILLING", service: platformNames(env).billing },
-        // #2520: provisioning's LoginChangeGate entrypoint, staging only.
-        ...(env === "staging"
-          ? [
-              {
-                binding: "LOGIN",
-                service: "oa-s-provisioning",
-                entrypoint: "LoginChangeGate",
-              },
-            ]
-          : []),
+        // #2520: provisioning's LoginChangeGate entrypoint, this env's.
+        {
+          binding: "LOGIN",
+          service: env === "prod" ? "oa-p-provisioning" : "oa-s-provisioning",
+          entrypoint: "LoginChangeGate",
+        },
       ]);
       expect(e.dispatch_namespaces).toEqual([
         { binding: "DISPATCHER", namespace: NAMESPACES[env] },
@@ -73,6 +71,18 @@ describe("wrangler.jsonc", () => {
     }
     expect(platformNames("staging").hosts).toBe("oa-s-hosts");
     expect(platformNames("prod").hosts).toBe("oa-p-hosts");
+  });
+
+  it("gives the LOGIN gate to the installs provisioning answers (#2520)", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: untyped wrangler config
+    const prov: any = JSON.parse(
+      strip(readFileSync(join(app, "../provisioning/wrangler.jsonc"), "utf8")),
+    );
+    for (const env of ENVS)
+      for (const k of ["LOGIN_CHANGE", "LOGIN_CHANGE_SLUGS"])
+        expect(cfg.env[env].vars[k], `${env} ${k}`).toBe(
+          prov.env[env].vars[k] ?? "",
+        );
   });
 
   it("has no routes, custom domains or workers.dev, at the top or in any env", () => {
