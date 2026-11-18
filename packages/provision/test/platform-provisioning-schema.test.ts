@@ -849,7 +849,7 @@ describe("0016_login_change_nonces (an instance's login-domain change, open-arti
 
 describe("0017_email_optouts (the hosted email opt-out list, open-artifacts#2652)", () => {
   it("follows 0016 and only adds email_optouts, with a closed source set", () => {
-    expect(migrationFiles.slice(16)).toEqual(["0017_email_optouts.sql"]);
+    expect(migrationFiles[16]).toBe("0017_email_optouts.sql");
     const sql = migrationSql("0017_email_optouts.sql").replace(/--[^\n]*/g, "");
     expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|ALTER)\b/i);
     expect(
@@ -859,6 +859,8 @@ describe("0017_email_optouts (the hosted email opt-out list, open-artifacts#2652
       "source TEXT",
       "first_install TEXT",
       "created_at INTEGER",
+      // 0018 (recipient undo, #2665).
+      "undo_key TEXT",
     ]);
     expect(
       cols(platformDb(), "email_optouts_install").map((c) =>
@@ -868,6 +870,8 @@ describe("0017_email_optouts (the hosted email opt-out list, open-artifacts#2652
       "addr_hash TEXT PK",
       "install_id TEXT PK",
       "created_at INTEGER",
+      // 0018 (recipient undo, #2665).
+      "undo_key TEXT",
     ]);
     expect(() =>
       platformDb()
@@ -876,5 +880,26 @@ describe("0017_email_optouts (the hosted email opt-out list, open-artifacts#2652
         )
         .run(),
     ).toThrow();
+  });
+});
+
+describe("0018_email_optout_undo (recipient undo, open-artifacts#2665)", () => {
+  it("follows 0017 and only adds the nullable undo_key column to both opt-out tables", () => {
+    expect(migrationFiles.slice(16)).toEqual([
+      "0017_email_optouts.sql",
+      "0018_email_optout_undo.sql",
+    ]);
+    const sql = migrationSql("0018_email_optout_undo.sql")
+      .replace(/--[^\n]*/g, "")
+      .trim();
+    expect(sql).not.toMatch(/\b(?:DROP|RENAME|DELETE|CREATE)\b/i);
+    const stmts = sql
+      .split(";")
+      .map((x) => x.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    expect(stmts).toEqual([
+      "ALTER TABLE email_optouts ADD COLUMN undo_key TEXT",
+      "ALTER TABLE email_optouts_install ADD COLUMN undo_key TEXT",
+    ]);
   });
 });
