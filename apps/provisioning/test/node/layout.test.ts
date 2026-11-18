@@ -208,12 +208,15 @@ describe("the API never writes provision's tables (W4 static SQL test)", () => {
   });
 
   const OPTOUTS = "src/routes/optouts.ts";
-  it("optouts writes only one hosted_audit row, never installs, hosts, release_floor or platform_state", () => {
+  it("optouts writes only hosted_audit rows (an add, a recipient's undo), never installs, hosts, release_floor or platform_state", () => {
     const text = readFileSync(join(app, OPTOUTS), "utf8");
     const writes = [...text.matchAll(new RegExp(re.source, "gi"))].map((m) =>
       m[0].replace(/\s+/g, " ").toLowerCase(),
     );
-    expect(writes).toEqual(["insert into hosted_audit"]);
+    expect(writes).toEqual([
+      "insert into hosted_audit",
+      "insert into hosted_audit",
+    ]);
   });
 
   it("no src module writes installs, hosts, hosted_audit, release_floor or platform_state", () => {
