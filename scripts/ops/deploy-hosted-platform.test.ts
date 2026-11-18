@@ -1392,11 +1392,12 @@ describe("deploy-hosted-platform.sh", () => {
       if (app === "provisioning")
         next.result.bindings = next.result.bindings.filter(
           // v0.154.0 predates WELCOME_*, BUSINESS_REQUESTS_TO (open-artifacts#2404)
-          // and LOGIN_CHANGE (#2520).
+          // and LOGIN_CHANGE, LOGIN_CHANGE_SLUGS (#2520).
           (b: { name: string }) =>
             !b.name.startsWith("WELCOME_") &&
             b.name !== "BUSINESS_REQUESTS_TO" &&
-            b.name !== "LOGIN_CHANGE",
+            b.name !== "LOGIN_CHANGE" &&
+            b.name !== "LOGIN_CHANGE_SLUGS",
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.
