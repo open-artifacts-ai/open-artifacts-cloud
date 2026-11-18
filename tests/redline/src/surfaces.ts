@@ -426,6 +426,16 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/me/push/subscriptions/:id":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2),
+  // a browser session only.
+  "PUT /api/v1/me/agent-requests":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "GET /api/v1/me/agent-listens":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "PATCH /api/v1/me/agent-listens/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/agent-listens/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
 };
 
 /**
@@ -498,6 +508,11 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /api/v1/me/push/subscriptions",
   "PATCH /api/v1/me/push/subscriptions/:id",
   "DELETE /api/v1/me/push/subscriptions/:id",
+  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2).
+  "PUT /api/v1/me/agent-requests",
+  "GET /api/v1/me/agent-listens",
+  "PATCH /api/v1/me/agent-listens/:id",
+  "DELETE /api/v1/me/agent-listens/:id",
 ];
 
 const INBOX_READ: Citation = {
@@ -530,6 +545,16 @@ const PUSH_CHANGE: Citation = {
   file: "apps/server/test/push.2512.test.ts",
   describe: "the routes",
   test: "changes take a person in a browser: a token gets 404; deleting another's subscription is 404",
+};
+const AGENT_SWITCH: Citation = {
+  file: "apps/server/test/agent-requests.s2.2577.test.ts",
+  describe: "the switch",
+  test: "is saved by a browser session only: a token is refused and can read it; a bad body is 400",
+};
+const AGENT_LISTENS: Citation = {
+  file: "apps/server/test/agent-requests.s2.2577.test.ts",
+  describe: "the listens-to list",
+  test: "a token or an agent can neither read nor change the list",
 };
 const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
 const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
@@ -1049,6 +1074,23 @@ export const DROPPED: Readonly<
   "org DELETE /api/v1/me/push/subscriptions/:id": {
     why: "interactive-only",
     coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  // v0.219.0 (#2577 S2): a person in a browser only.
+  "org PUT /api/v1/me/agent-requests": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_SWITCH],
+  },
+  "org GET /api/v1/me/agent-listens": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
+  "org PATCH /api/v1/me/agent-listens/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
+  "org DELETE /api/v1/me/agent-listens/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
   },
 };
 

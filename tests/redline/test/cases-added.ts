@@ -137,6 +137,19 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.219.0: the agent-requests switch and listens-to list (#2577 S2),
+    // deny-only, and the switch read, probed with both credentials.
+    ...[
+      "org PUT /api/v1/me/agent-requests [session]",
+      "org GET /api/v1/me/agent-listens [session]",
+      "org PATCH /api/v1/me/agent-listens/:id [session]",
+      "org DELETE /api/v1/me/agent-listens/:id [session]",
+      "org GET /api/v1/me/agent-requests [pat]",
+      "org GET /api/v1/me/agent-requests [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // v0.213.0: prefs, mutes, Later and push subscription changes (#2512,
     // #2762), each interactive-only and deny-only (A's session at B).
     ...[

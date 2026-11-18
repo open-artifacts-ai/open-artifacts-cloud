@@ -259,7 +259,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     // (#2577) and Install now (#2552) add seven interactive-only drops.
     // v0.213.0: saving prefs, mute and unmute, Later and the three push
     // subscription changes (#2512, #2762) add seven more.
-    expect(only).toHaveLength(43);
+    // v0.219.0: the agent-requests switch save and the three listens-to
+    // routes (#2577 S2) add four more.
+    expect(only).toHaveLength(47);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
@@ -399,9 +401,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(43);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(47);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 44);
+    expect(by("own")).toHaveLength(cases.length - 2 - 48);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
