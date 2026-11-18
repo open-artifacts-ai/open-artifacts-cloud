@@ -1,0 +1,121 @@
+# Reads one Worker's Workers Logs over a narrow window and prints only counts
+# and redacted, truncated error identifiers (the repo is public, so is this
+# log). By hand only. Token: oa-x-ci-ro, gh:cf-read/CF_READ_TOKEN
+# (docs/ops/hosted.md, "Reading one Worker's logs as counts").
+name: cf-logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Worker name: oa-p-*, oa-s-*, open-artifacts-prod or open-artifacts-staging"
+        required: true
+        type: string
+      since:
+        description: "Window start, ISO8601 UTC, e.g. 2026-11-18T10:00:00Z"
+        required: true
+        type: string
+      minutes:
+        description: "Window length in minutes (1..120)"
+        required: false
+        default: "30"
+        type: string
+      filter:
+        description: "Which events to count"
+        required: false
+        default: errors
+        type: choice
+        options:
+          - errors
+          - status5xx
+          - all
+
+permissions: {}
+
+jobs:
+  logs:
+    runs-on: ubuntu-latest
+    environment: cf-read
+    timeout-minutes: 5
+    steps:
+      - name: Validate inputs
+        env:
+          WORKER: ${{ inputs.worker }}
+          SINCE: ${{ inputs.since }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          set -eu
+          printf '%s' "$WORKER" | grep -Eq '^oa-[ps]-[a-z0-9-]+$|^open-artifacts-(prod|staging)$' \
+            || { echo "worker not allowed"; exit 1; }
+          printf '%s' "$SINCE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+            || { echo "since must be ISO8601 UTC, like 2026-11-18T10:00:00Z"; exit 1; }
+          printf '%s' "$MINUTES" | grep -Eq '^[0-9]+$' && [ "$MINUTES" -ge 1 ] && [ "$MINUTES" -le 120 ] \
+            || { echo "minutes must be 1..120"; exit 1; }
+      - name: Count by status and by error
+        env:
+          CF_READ_TOKEN: ${{ secrets.CF_READ_TOKEN }}
+          WORKER: ${{ inputs.worker }}
+          SINCE: ${{ inputs.since }}
+          MINUTES: ${{ inputs.minutes }}
+          FILTER: ${{ inputs.filter }}
+          ACCOUNT: 26ac346086d4405f7a976d48747a2a75
+        run: |
+          set -eu
+          FROM=$(( $(date -u -d "$SINCE" +%s) * 1000 ))
+          TO=$(( FROM + MINUTES * 60000 ))
+          URL="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/workers/observability/telemetry/query"
+
+          # Public log: drop emails, token-like strings (20+ base64/hex chars),
+          # URL query strings and IPv4/IPv6 addresses; cut to 80 chars.
+          redact() {
+            sed -E \
+              -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g' \
+              -e 's/\?[^[:space:]"]*/?<q>/g' \
+              -e 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g' \
+              -e 's/([0-9A-Fa-f]{0,4}:){3,7}[0-9A-Fa-f]{0,4}/<ip>/g' \
+              -e 's/[A-Za-z0-9+\/_=-]{20,}/<tok>/g' \
+              -e 's/^(.{80}).+$/\1/'
+          }
+
+          # $1 label, $2 group-by field, $3 group-by type, $4 limit.
+          query() {
+            body=$(jq -n --arg w "$WORKER" --arg f "$FILTER" \
+              --argjson from "$FROM" --argjson to "$TO" \
+              --arg g "$2" --arg gt "$3" --argjson lim "$4" '
+              {queryId: "cf-logs", timeframe: {from: $from, to: $to}, view: "calculations",
+               parameters: {
+                 calculations: [{operator: "count", alias: "n"}],
+                 groupBys: [{type: $gt, value: $g}],
+                 orderBy: {value: "n", order: "desc"},
+                 limit: $lim,
+                 filters:
+                   ([{key: "$metadata.service", operation: "eq", type: "string", value: $w}]
+                    + (if $f == "errors" then [{key: "$metadata.error", operation: "exists", type: "string"}]
+                       elif $f == "status5xx" then [{key: "$metadata.statusCode", operation: "gte", type: "number", value: 500}]
+                       else [] end))}}')
+            code=$(curl -sS -o resp.json -w '%{http_code}' -X POST "$URL" \
+              -H "Authorization: Bearer $CF_READ_TOKEN" -H 'Content-Type: application/json' \
+              --data "$body") || { echo "::error::call '$1' failed to connect"; exit 1; }
+            if [ "$code" != 200 ]; then
+              cfcode=$(jq -r '.errors[0].code // "none"' resp.json 2>/dev/null || echo none)
+              echo "::error::call '$1' (POST workers/observability/telemetry/query) failed: HTTP $code, Cloudflare error code $cfcode (token missing Workers Observability read?)"
+              exit 1
+            fi
+          }
+
+          {
+            echo "### cf-logs: $WORKER"
+            echo "Window: $SINCE + $MINUTES min, filter: $FILTER"
+            echo
+            query "count by status" '$metadata.statusCode' number 50
+            echo "Count by HTTP status (events matching the filter):"
+            jq -r '.result.calculations[0].aggregates // [] | .[] | "\(.count // .value)\t\(.groups[0].value // "none")"' resp.json \
+              | awk -F'\t' '{printf "- status %s: %s\n", $2, $1}'
+            echo
+            query "count by error" '$metadata.error' string 10
+            echo "Top 10 errors (80 chars, redacted):"
+            jq -r '.result.calculations[0].aggregates // [] | .[] | "\(.count // .value)\t\(.groups[0].value // "none" | tostring | gsub("[\\r\\n\\t]"; " "))"' resp.json \
+              | while IFS="$(printf '\t')" read -r n msg; do
+                  printf -- '- %s: %s\n' "$n" "$(printf '%s' "$msg" | redact)"
+                done
+          } | tee -a "$GITHUB_STEP_SUMMARY"

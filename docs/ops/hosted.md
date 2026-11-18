@@ -838,3 +838,15 @@ One hosted-wide list of addresses that asked not to get share email. Installs ch
 - **Recipient undo (#2665).** The done page, and a later `GET` of the same link while the address is listed, show **Undo**: a form `POST` with `t` and `action=undo` in the body (a query token, so RFC 8058 one-click, never undoes; `GET` never writes). Only the exact token that added a row removes it: each recipient row stores `undo_key` = HMAC(`OPTOUT_STORE_KEY`, token) (migration 0018), so a token minted later, by any install, can't undo it, and bounce and complaint rows never go. An undo writes one `optout.undo` audit row (the minting install and an h2 prefix). The undone page offers "Don't email me again" again.
 - **No operator removal route.** An operator removes a row by hand (`DELETE FROM email_optouts WHERE addr_hash = ?` on `PLATFORM_DB`, after computing h2 from the address's h1) with the requester's confirmation.
 - **Off switch.** `OPTOUT_LIST` (a platform var): `"1"` on, anything else is the plain 404 (gate routes and the page). `"1"` on staging, `"0"` on prod in `apps/provisioning/wrangler.jsonc`. The gate routes reuse the staging-only `LOGIN` binding, so no new deploy-order requirement.
+
+## Reading one Worker's logs as counts (`cf-logs.yml`)
+
+Answers "was this a platform failure?" without raw logs. By hand only, in the `cf-read` Environment, token `oa-x-ci-ro` (`gh:cf-read/CF_READ_TOKEN`, Workers Observability read).
+
+```
+gh workflow run cf-logs.yml -f worker=oa-p-example -f since=2026-11-18T10:00:00Z -f minutes=30 -f filter=errors
+```
+
+- **Inputs.** `worker` must match `^oa-[ps]-[a-z0-9-]+$` or `^open-artifacts-(prod|staging)$`; `since` is ISO8601 UTC; `minutes` 1..120 (default 30); `filter` is `errors` (default), `status5xx` or `all`.
+- **Prints** (log and job summary, public): the count by HTTP status, and the top 10 error messages with counts, each cut to 80 characters with emails, token-like strings, URL query strings and IPs redacted. Never bodies, headers or raw lines; it runs two grouped `calculations` queries (`POST /accounts/{id}/workers/observability/telemetry/query`).
+- **Fails** with the HTTP status and Cloudflare error code, naming the call, when the token lacks the permission.
