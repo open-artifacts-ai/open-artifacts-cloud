@@ -103,6 +103,7 @@ const LOCK_OPS = [
   "rollback",
   "vars",
   "turnstile",
+  "push_keys",
   "delete",
   "suspend",
   "resume",
