@@ -110,6 +110,10 @@ ALLOW=(
   scripts/ci/pin-only.ts
   scripts/ci/pin-only.test.ts
   scripts/ci/ci-pin-once-workflow.test.ts
+  # The operator-run hosted backfills (push keys, opt-out key): a dispatch-only
+  # workflow and the test of its shape that public never had.
+  .github/workflows/hosted-backfill.yml
+  scripts/ci/hosted-backfill-workflow.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
