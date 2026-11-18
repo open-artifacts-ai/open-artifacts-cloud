@@ -137,6 +137,41 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.213.0: prefs, mutes, Later and push subscription changes (#2512,
+    // #2762), each interactive-only and deny-only (A's session at B).
+    ...[
+      "org PUT /api/v1/me/notification-prefs [session]",
+      "org POST /api/v1/me/inbox/mutes [session]",
+      "org DELETE /api/v1/me/inbox/mutes/:kind/:id [session]",
+      "org POST /api/v1/me/inbox/:id/later [session]",
+      "org POST /api/v1/me/push/subscriptions [session]",
+      "org PATCH /api/v1/me/push/subscriptions/:id [session]",
+      "org DELETE /api/v1/me/push/subscriptions/:id [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.213.0: the reads they pair with (#2512), mention candidates (#2770)
+    // and comment pictures (#2577), probed with both credentials.
+    ...[
+      "org GET /api/v1/me/inbox/mutes [pat]",
+      "org GET /api/v1/me/inbox/mutes [session]",
+      "org GET /api/v1/me/notification-prefs [pat]",
+      "org GET /api/v1/me/notification-prefs [session]",
+      "org GET /api/v1/me/push/key [pat]",
+      "org GET /api/v1/me/push/key [session]",
+      "org GET /api/v1/me/push/subscriptions [pat]",
+      "org GET /api/v1/me/push/subscriptions [session]",
+      "artifact artifact mention candidates [pat]",
+      "artifact artifact mention candidates [session]",
+      "artifact comment picture read [pat]",
+      "artifact comment picture read [session]",
+      "artifact comment picture reserve [pat]",
+      "artifact comment picture reserve [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // v0.197.0: the onboarding routes (#2632), probed now, no longer dropped.
     ...[
       "org GET /api/v1/onboarding [session]",

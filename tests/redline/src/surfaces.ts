@@ -409,6 +409,23 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "owner-only (the bus version the instance names): no admin success leg",
   "POST /api/v1/bus/machines/:id/install-now":
     "interactive-only: a hook-minted session is 404 here like a PAT, and no bus machine can be made on a hosted install; A at B is deny-only",
+  // v0.213.0: saving prefs, mutes and Later (#2512, #2762), and changing a
+  // browser push subscription (#2512 S5): the handlers refuse anything but a
+  // browser session.
+  "PUT /api/v1/me/notification-prefs":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/mutes":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/inbox/mutes/:kind/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/:id/later":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/push/subscriptions":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "PATCH /api/v1/me/push/subscriptions/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/push/subscriptions/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
 };
 
 /**
@@ -472,6 +489,15 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /api/v1/me/agent-asks/held/:id/not-now",
   // #2552: "Install now" for the caller's own machine, browser session only.
   "POST /api/v1/bus/machines/:id/install-now",
+  // v0.213.0: prefs, mutes and Later (#2512, #2762) and push subscription
+  // changes (#2512 S5), a person in a browser only (me.ts, push.ts).
+  "PUT /api/v1/me/notification-prefs",
+  "POST /api/v1/me/inbox/mutes",
+  "DELETE /api/v1/me/inbox/mutes/:kind/:id",
+  "POST /api/v1/me/inbox/:id/later",
+  "POST /api/v1/me/push/subscriptions",
+  "PATCH /api/v1/me/push/subscriptions/:id",
+  "DELETE /api/v1/me/push/subscriptions/:id",
 ];
 
 const INBOX_READ: Citation = {
@@ -484,6 +510,26 @@ const HELD_ROUTES: Citation = {
   file: "apps/server/test/agent-requests.test.ts",
   describe: "the receiver's routes",
   test: "are a browser session of the receiver only",
+};
+const PREFS_SAVE: Citation = {
+  file: "apps/server/test/notification-prefs.2512.test.ts",
+  describe: "GET and PUT /me/notification-prefs",
+  test: "saving takes a person in a browser: a token gets 404, anonymous 401; reading is open to a token",
+};
+const MUTES_CHANGE: Citation = {
+  file: "apps/server/test/inbox-mutes.2512.test.ts",
+  describe: "mutes",
+  test: "each person's own list; a token and anonymous can't change it",
+};
+const LATER_PERSON: Citation = {
+  file: "apps/server/test/inbox.needs-you.test.ts",
+  describe: "Later (#2762)",
+  test: "a personal token is refused, like the read routes",
+};
+const PUSH_CHANGE: Citation = {
+  file: "apps/server/test/push.2512.test.ts",
+  describe: "the routes",
+  test: "changes take a person in a browser: a token gets 404; deleting another's subscription is 404",
 };
 const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
 const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
@@ -974,6 +1020,35 @@ export const DROPPED: Readonly<
         test: "another member's machine, an unknown id, a PAT or anonymous: nothing sent",
       },
     ],
+  },
+  // v0.213.0 (#2512, #2762): each a person in a browser only.
+  "org PUT /api/v1/me/notification-prefs": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PREFS_SAVE],
+  },
+  "org POST /api/v1/me/inbox/mutes": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, MUTES_CHANGE],
+  },
+  "org DELETE /api/v1/me/inbox/mutes/:kind/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, MUTES_CHANGE],
+  },
+  "org POST /api/v1/me/inbox/:id/later": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, LATER_PERSON],
+  },
+  "org POST /api/v1/me/push/subscriptions": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  "org PATCH /api/v1/me/push/subscriptions/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  "org DELETE /api/v1/me/push/subscriptions/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
   },
 };
 
