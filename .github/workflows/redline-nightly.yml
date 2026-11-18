@@ -8,7 +8,8 @@
 # a run called from here isn't one. Every red-line run applies the gate, so a
 # nightly is green only if every case passes, P30 aside. A running nightly holds a candidate on the
 # `redline` group for up to about 150 min, and a second dispatch while one waits
-# replaces it, so a nightly waits 3 h after any candidate run.
+# replaces it, so a nightly waits 3 h after any candidate run. Its T19 job runs
+# every dashboard spec (t19_full: true); a gate run runs only the @gate ones.
 name: redline-nightly
 
 on:
@@ -73,6 +74,7 @@ jobs:
     uses: ./.github/workflows/redline-staging.yml
     with:
       tag: ${{ needs.pick.outputs.tag }}
+      t19_full: true
     # By name, never inherit: only the four secrets the callee declares
     # (on.workflow_call.secrets). Undeclared, a called run's jobs got none
     # (t19-dry-run 43183209806); the t19 job references none of them.

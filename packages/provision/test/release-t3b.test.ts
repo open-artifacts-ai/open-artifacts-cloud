@@ -33,6 +33,7 @@ import {
   PUBLISH_CONCURRENCY,
   PublishRefused,
   probeR2Conditionals,
+  pruneStaged,
   publishFloor,
   publishRelease,
   type R2ReleaseBucket,
@@ -2578,5 +2579,104 @@ describe("N6: openReleaseRecord checks the record itself", () => {
     expect(() =>
       openReleaseRecord(signRec(rec, "staging"), pub(), "staging"),
     ).toThrow(re);
+  });
+});
+
+describe("pruneStaged: older staged versions go once a newer release has its record", () => {
+  const files = [
+    "modules/a.js",
+    "assets/x.css",
+    "template/wrangler.template.jsonc",
+  ];
+  const stage = (
+    s: ReturnType<typeof setup>,
+    v: string,
+    variant = "release",
+  ) => {
+    for (const p of files)
+      s.fake.r2Seed(s.bucket, `releases/${v}/${variant}/${p}`, enc(p));
+  };
+  const record = (s: ReturnType<typeof setup>, v: string) =>
+    s.fake.r2Seed(s.bucket, `releases/${v}/release/record.sig.json`, enc("r"));
+  const has = (s: ReturnType<typeof setup>, k: string) =>
+    s.fake.r2Object(s.bucket, k) !== undefined;
+  const prune = (s: ReturnType<typeof setup>, published = "0.199.3") =>
+    pruneStaged({ cf: s.cf, r2: s.r2.staging, env: "staging", published });
+
+  it("deletes only record-less release versions below the published one", async () => {
+    const s = await probed(setup());
+    seedFloor(s);
+    for (const v of ["0.195.0", "0.199.3"]) {
+      stage(s, v);
+      record(s, v);
+    }
+    for (const v of ["0.196.0", "0.199.0", "0.199.2", "0.200.0"]) stage(s, v);
+    const r = await prune(s);
+    expect(r).toEqual({ pruned: ["0.196.0", "0.199.0", "0.199.2"], kept: [] });
+    for (const v of ["0.196.0", "0.199.0", "0.199.2"])
+      for (const p of files)
+        expect(has(s, `releases/${v}/release/${p}`)).toBe(false);
+    // Recorded releases, a newer staged one and the floor stay.
+    for (const v of ["0.195.0", "0.199.3", "0.200.0"])
+      for (const p of files)
+        expect(has(s, `releases/${v}/release/${p}`)).toBe(true);
+    expect(has(s, "releases/0.195.0/release/record.sig.json")).toBe(true);
+    expect(has(s, FLOOR_KEY)).toBe(true);
+    const dels = s.fake.r2Log.filter((e) => e.method === "DELETE");
+    expect(dels).toHaveLength(9);
+    for (const d of dels) expect(d.key).not.toMatch(/record\.sig\.json$|floor/);
+  });
+
+  it("refuses when the published version has no record: nothing is deleted", async () => {
+    const s = await probed(setup());
+    stage(s, "0.199.3");
+    stage(s, "0.196.0");
+    await expect(prune(s)).rejects.toThrow(/no record/);
+    expect(s.fake.r2Log.filter((e) => e.method === "DELETE")).toEqual([]);
+    expect(has(s, "releases/0.196.0/release/modules/a.js")).toBe(true);
+  });
+
+  it("keeps and reports an older version with another variant or an odd key", async () => {
+    const s = await probed(setup());
+    stage(s, "0.199.3");
+    record(s, "0.199.3");
+    stage(s, "0.196.0");
+    stage(s, "0.196.0", "redline");
+    s.fake.r2Seed(s.bucket, "releases/0.197.0/stray", enc("x"));
+    const r = await prune(s);
+    expect(r.pruned).toEqual([]);
+    expect(r.kept.map((k) => k.version)).toEqual(["0.196.0", "0.197.0"]);
+    expect(s.fake.r2Log.filter((e) => e.method === "DELETE")).toEqual([]);
+  });
+
+  it("a record written between the two listings keeps the version", async () => {
+    const s = await probed(setup());
+    stage(s, "0.199.3");
+    record(s, "0.199.3");
+    stage(s, "0.196.0");
+    const list = s.cf.r2ObjectList.bind(s.cf);
+    (s.cf as { r2ObjectList: typeof list }).r2ObjectList = async (b, p, c) => {
+      if (p === "releases/0.196.0/") record(s, "0.196.0");
+      return list(b, p, c);
+    };
+    const r = await prune(s);
+    expect(r.pruned).toEqual([]);
+    expect(r.kept[0]?.version).toBe("0.196.0");
+    expect(s.fake.r2Log.filter((e) => e.method === "DELETE")).toEqual([]);
+  });
+
+  it("deleteStaged refuses the record, the floor, redline, probe and odd keys before any call", async () => {
+    const s = await probed(setup());
+    for (const k of [
+      "releases/0.196.0/release/record.sig.json",
+      FLOOR_KEY,
+      "releases/0.196.0/redline/modules/a.js",
+      `probe/${"a".repeat(32)}`,
+      "releases/0.196.0-rc.1/release/modules/a.js",
+      "releases/0.196.0/release/",
+      "releases/0.196.0/release/../record.sig.json",
+    ])
+      await expect(s.r2.staging.deleteStaged(k), k).rejects.toThrow(/staged/);
+    expect(s.fake.r2Log).toEqual([]);
   });
 });

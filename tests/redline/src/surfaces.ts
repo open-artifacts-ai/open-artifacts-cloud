@@ -390,6 +390,25 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: an allowed request opens a Stripe Customer Portal session through billing, for a browser session only; A at B is deny-only",
   "POST /api/v1/billing/usage":
     "interactive-only: an allowed request sends this month's usage report to billing, for a browser session only; A at B is deny-only",
+  // #2512: marking the For you inbox read (me.ts interactiveSession).
+  "POST /api/v1/me/inbox/read":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/read-all":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // #2577: the receiver's held requests, a browser session only.
+  "GET /api/v1/me/agent-asks/held":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/allow":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/allow/challenge":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/not-now":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // #2552: the bus version the instance names, and Install now.
+  "PUT /api/v1/bus/run-version":
+    "owner-only (the bus version the instance names): no admin success leg",
+  "POST /api/v1/bus/machines/:id/install-now":
+    "interactive-only: a hook-minted session is 404 here like a PAT, and no bus machine can be made on a hosted install; A at B is deny-only",
 };
 
 /**
@@ -442,8 +461,31 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /api/v1/billing/checkout",
   "POST /api/v1/billing/portal",
   "POST /api/v1/billing/usage",
+  // #2512: marking the For you inbox read, a person in a browser only (me.ts).
+  "POST /api/v1/me/inbox/read",
+  "POST /api/v1/me/inbox/read-all",
+  // #2577: the receiver's held requests from another person's agent; the
+  // handlers refuse anything but a browser session.
+  "GET /api/v1/me/agent-asks/held",
+  "POST /api/v1/me/agent-asks/held/:id/allow",
+  "POST /api/v1/me/agent-asks/held/:id/allow/challenge",
+  "POST /api/v1/me/agent-asks/held/:id/not-now",
+  // #2552: "Install now" for the caller's own machine, browser session only.
+  "POST /api/v1/bus/machines/:id/install-now",
 ];
 
+const INBOX_READ: Citation = {
+  file: "apps/server/test/inbox.updates.test.ts",
+  describe:
+    "inbox items follow their comment, and the read routes are for a person",
+  test: "read and read-all are refused to a personal token, allowed to a session",
+};
+const HELD_ROUTES: Citation = {
+  file: "apps/server/test/agent-requests.test.ts",
+  describe: "the receiver's routes",
+  test: "are a browser session of the receiver only",
+};
+const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
 const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
 const ERASE_AUTHZ = "POST R.memberErase(id): authorization";
 const SHARE_NOTICE_TESTS = "apps/server/test/follows.test.ts";
@@ -883,6 +925,56 @@ export const DROPPED: Readonly<
   "space member delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
   "space mapping put (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
   "space mapping delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
+  // #2512 (public inbox.updates.test.ts): read and read-all, a person only.
+  "org POST /api/v1/me/inbox/read": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, INBOX_READ],
+  },
+  "org POST /api/v1/me/inbox/read-all": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, INBOX_READ],
+  },
+  // #2577 (public agent-requests.test.ts): the receiver's routes.
+  "org GET /api/v1/me/agent-asks/held": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/allow": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/allow/challenge": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/not-now": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  // #2552 (public bus/updates.2552.test.ts).
+  "org PUT /api/v1/bus/run-version": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: RUN_VERSION_TESTS,
+        describe: "PUT R.busRunVersion: the owner names it (#2552)",
+        test: "admins, members, guests, a PAT and anonymous callers are refused, writing nothing",
+      },
+    ],
+  },
+  "org POST /api/v1/bus/machines/:id/install-now": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: RUN_VERSION_TESTS,
+        describe:
+          "POST R.busMachineInstallNow: the machine's own member (#2552)",
+        test: "another member's machine, an unknown id, a PAT or anonymous: nothing sent",
+      },
+    ],
+  },
 };
 
 /**

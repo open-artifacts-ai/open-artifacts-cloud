@@ -33,9 +33,7 @@ import {
 } from "@oa/provision";
 import {
   type JobKind,
-  type OAuthJob,
   oauthJobOf,
-  parseOAuthJob,
   redlineCredsJobArgs,
   type WorkflowParams,
   WorkflowParamsSchema,
@@ -45,7 +43,9 @@ import { checkLoginJob, isLoginJob, loginRedeploy } from "./login-change.js";
 import {
   dropCopyKeySettled,
   leftKeyOpen,
+  type OAuthOp,
   oauthCopy,
+  parseOAuthOp,
   seeLeftKey,
   setOAuthStore,
 } from "./oauth-store.js";
@@ -136,7 +136,7 @@ export type ManageJob = {
     revoke?: boolean;
   };
   /** update: R29's mode or R30's copy (#1008). */
-  oauth?: OAuthJob;
+  oauth?: OAuthOp;
   /** update: an instance's login-domain change (#2520), the platform's own job. */
   login?: boolean;
   /** upgrade, rollback: the install is already on `to`; nothing to do. */
@@ -451,7 +451,7 @@ async function operate(
           loginRedeploy(ctx, job, labelOf(job)),
         );
       else if (job.oauth?.op === "set")
-        await setOAuthStore(ctx, step, job, labelOf(job), job.oauth.mode);
+        await setOAuthStore(ctx, step, job, labelOf(job), job.oauth);
       else await oauthCopy(ctx, step, job, labelOf(job));
       break;
   }
@@ -847,8 +847,15 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       // Admin MCP only (AUTHZ R29, R30): the row's token is an OAuth grant.
       if (!(await oauthGrant(ctx, job)))
         throw refused("update needs an OAuth grant");
-      const oauth = parseOAuthJob(args);
+      const oauth = parseOAuthOp(args);
       if (!oauth) throw refused("the update args do not parse");
+      // open-artifacts#2641: DOCS_PREVIEW is staging only, either value.
+      if (
+        oauth.op === "set" &&
+        oauth.docsPreview !== undefined &&
+        env !== "staging"
+      )
+        throw refused("DOCS_PREVIEW is staging only");
       out.oauth = oauth;
       break;
     }

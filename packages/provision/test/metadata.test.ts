@@ -956,3 +956,36 @@ describe("googleNewlyEnabled and epochBumpSql (H-ECD)", () => {
     );
   });
 });
+
+// open-artifacts#2641: DOCS_PREVIEW opens doc creation and is staging only.
+describe("DOCS_PREVIEW var (staging only)", () => {
+  const meta = (v: string, env: "staging" | "prod") =>
+    userWorkerMetadata(inst({ vars: { DOCS_PREVIEW: v } }), res({ env }));
+  it("staging renders it as the plain var 1", () => {
+    expect(
+      meta("1", "staging").bindings.find((b) => b.name === "DOCS_PREVIEW"),
+    ).toEqual({ type: "plain_text", name: "DOCS_PREVIEW", text: "1" });
+  });
+  it("prod refuses it, with any value, naming DOCS_PREVIEW and staging only", () => {
+    for (const v of ["1", "0", ""])
+      expect(() => meta(v, "prod")).toThrow(/DOCS_PREVIEW is staging only/);
+  });
+  it("staging takes only 1", () => {
+    for (const v of ["0", "true", "", "11"])
+      expect(() => meta(v, "staging")).toThrow(/invalid var DOCS_PREVIEW/);
+  });
+  it("prod refuses it from the release template's vars too", () => {
+    const t = { ...tpl, vars: { ...tpl.vars, DOCS_PREVIEW: "1" } };
+    expect(() =>
+      userWorkerMetadata(inst(), res({ env: "prod", template: t })),
+    ).toThrow(/DOCS_PREVIEW is staging only/);
+  });
+  it("an install without it has no DOCS_PREVIEW binding, on either env", () => {
+    for (const env of ["staging", "prod"] as const)
+      expect(
+        userWorkerMetadata(inst(), res({ env })).bindings.some(
+          (b) => b.name === "DOCS_PREVIEW",
+        ),
+      ).toBe(false);
+  });
+});

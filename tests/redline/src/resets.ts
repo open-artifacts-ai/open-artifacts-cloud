@@ -12,6 +12,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { subscribe } from "node:diagnostics_channel";
+import { EDGE_PREFIX } from "./edge-probe.ts";
 import { networkCode } from "./fetch-timeout.ts";
 import { note } from "./notes.ts";
 
@@ -20,7 +21,12 @@ const CONNECTIONS_PREFIX = "connections: ";
 
 type Req = { method?: string; origin?: unknown; path?: string };
 export type Sent = { reused: boolean; idleMs: number; nth: number };
-type Sock = { requests: number; lastDone: number };
+type Sock = {
+  requests: number;
+  lastDone: number;
+  /** The last valid cf-ray a response on this socket carried, and when. */
+  ray?: { id: string; at: number };
+};
 /** One fetch attempt under track(): its socket, once its headers went out. */
 export type Attempt = { sent?: Sent };
 
@@ -39,19 +45,68 @@ export const socketText = (s: Sent | undefined): string =>
       : "new socket"
     : "before the request was sent";
 
+/**
+ * A Cloudflare ray id: 8 to 32 hex digits, a dash, the three-letter edge
+ * location. Anything else is dropped, never logged (header values are data).
+ */
+export const RAY_RE = /^[0-9a-f]{8,32}-[A-Z]{3}$/;
+
+/** The valid ray among a `cf-ray` value, or undefined. */
+export const validRay = (v: unknown): string | undefined =>
+  typeof v === "string" && RAY_RE.test(v.trim()) ? v.trim() : undefined;
+
+/** The edge location of a valid ray: the part after the last dash. */
+export const coloOf = (ray: string): string =>
+  ray.slice(ray.lastIndexOf("-") + 1);
+
+/** The cf-ray value of undici's raw header list (Buffers or strings, in pairs). */
+function rayOfHeaders(headers: unknown): string | undefined {
+  if (!Array.isArray(headers)) return undefined;
+  for (let i = 0; i + 1 < headers.length; i += 2) {
+    if (String(headers[i]).toLowerCase() === "cf-ray")
+      return validRay(String(headers[i + 1]));
+  }
+  return undefined;
+}
+
+/** `ms` as seconds with one decimal, for notes. */
+export const secondsText = (ms: number): string =>
+  `${(ms / 1000).toFixed(1)} s`;
+
+/** The reset note's tail: when, and the last ray seen on the socket. */
+export function rayText(sock: Sock | undefined, at: number): string {
+  return sock?.ray
+    ? `last ray ${sock.ray.id} ${Math.max(0, at - sock.ray.at)} ms earlier`
+    : "no ray seen";
+}
+
 export interface ResetWatch {
   /** This file's totals, as a note's text. */
   totals: () => string;
+  /** The edge locations seen, as a note's text; undefined when none. */
+  edge: () => string | undefined;
   /** Runs `f`; `a.sent` is set when the fetch it starts sends its headers. */
   track: <T>(a: Attempt, f: () => T) => T;
 }
 
-export function watchResets(now: () => number = Date.now): ResetWatch {
+/** REDLINE_SUITE_START_MS: when scripts/redline.ts began, for notes' "at N s". */
+export function suiteStartFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): number | undefined {
+  const n = Number(env.REDLINE_SUITE_START_MS);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+export function watchResets(
+  now: () => number = Date.now,
+  suiteStart: number | undefined = suiteStartFromEnv(),
+): ResetWatch {
   const sockets = new WeakMap<object, Sock>();
   const sent = new WeakMap<object, Sent>();
   const socketOf = new WeakMap<object, object>();
   const attempts = new AsyncLocalStorage<Attempt>();
   const attemptOf = new WeakMap<object, Attempt>();
+  const edges = new Map<string, number>();
   let requests = 0;
   let fresh = 0;
   // A listener that throws would surface as an uncaught error and fail a
@@ -88,6 +143,21 @@ export function watchResets(now: () => number = Date.now): ResetWatch {
     if (a) a.sent = record;
     socketOf.set(request, socket);
   });
+  // Only the cf-ray header is read, and only a value of the expected shape is
+  // kept: the response's other headers are never looked at.
+  on("undici:request:headers", (m) => {
+    const { request, response } = m as {
+      request: object;
+      response: { headers?: unknown };
+    };
+    const ray = rayOfHeaders(response?.headers);
+    if (!ray) return;
+    const colo = coloOf(ray);
+    edges.set(colo, (edges.get(colo) ?? 0) + 1);
+    const socket = socketOf.get(request);
+    const s = socket && sockets.get(socket);
+    if (s) s.ray = { id: ray, at: now() };
+  });
   on("undici:request:trailers", (m) => {
     const { request } = m as { request: object };
     const socket = socketOf.get(request);
@@ -101,11 +171,24 @@ export function watchResets(now: () => number = Date.now): ResetWatch {
     if (name === "AbortError" || name === "TimeoutError") return;
     const s = sent.get(request);
     const where = `${request.method} ${routeOf(request.path)} host ${hostOf(request.origin)}`;
-    note(`${RESET_PREFIX}${networkCode(error)} ${where}, ${socketText(s)}`);
+    const at = now();
+    const socket = socketOf.get(request);
+    const when =
+      suiteStart === undefined ? "" : `; at ${secondsText(at - suiteStart)}`;
+    note(
+      `${RESET_PREFIX}${networkCode(error)} ${where}, ${socketText(s)}${when}; ${rayText(socket && sockets.get(socket), at)}`,
+    );
   });
   return {
     totals: () =>
       `${CONNECTIONS_PREFIX}${requests} requests, ${fresh} on new sockets`,
+    edge: () =>
+      edges.size
+        ? `${EDGE_PREFIX}${[...edges]
+            .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
+            .map(([c, n]) => `${c} ${n}`)
+            .join(", ")}`
+        : undefined,
     track: (a, f) => attempts.run(a, f),
   };
 }

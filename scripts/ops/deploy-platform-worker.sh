@@ -120,6 +120,17 @@ fill_opt() {
 }
 
 cp wrangler.jsonc "$copy"
+# open-artifacts#2641: DOCS_PREVIEW opens doc creation and is staging only. A
+# prod deploy refuses a config (or the prod constants file) that mentions it,
+# and one it cannot parse, before anything is filled.
+if [ "$env" = prod ]; then
+  node --experimental-strip-types --no-warnings "$here/wrangler-env.ts" wrangler.jsonc prod docs-preview > /dev/null ||
+    { echo "$dir/wrangler.jsonc: DOCS_PREVIEW is staging only; refusing a prod deploy" >&2; exit 1; }
+  if grep -qs DOCS_PREVIEW "$here/../../.github/hosted/prod.json"; then
+    echo ".github/hosted/prod.json: DOCS_PREVIEW is staging only; refusing a prod deploy" >&2
+    exit 1
+  fi
+fi
 case "$app" in
   auth-broker)
     fill "BROKER_REGISTRY_ID_${up}" "${BROKER_REGISTRY_ID:-}" "$hex32"

@@ -1732,6 +1732,37 @@ describe("concurrency", () => {
   });
 });
 
+describe("updateVars: DOCS_PREVIEW is staging only (open-artifacts#2641)", () => {
+  it("a prod install refuses it with no write, and the row stays active", async () => {
+    const s = setup({ env: "prod" });
+    const inst = keep(await s.p.create(input()));
+    const w = s.fake.writes().length;
+    const e = await fails(s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" }));
+    expect(e.message).toMatch(/DOCS_PREVIEW is staging only/);
+    expect(s.fake.writes().length).toBe(w);
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+  it("a staging install takes it, and drops it again when the next vars omit it", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    await s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" });
+    const on = s
+      .scriptOf(inst.id)
+      ?.metadata.bindings.find(
+        (b: { name: string }) => b.name === "DOCS_PREVIEW",
+      );
+    expect(on).toMatchObject({ type: "plain_text", text: "1" });
+    await s.p.updateVars(inst.id, {});
+    expect(
+      s
+        .scriptOf(inst.id)
+        ?.metadata.bindings.some(
+          (b: { name: string }) => b.name === "DOCS_PREVIEW",
+        ),
+    ).toBe(false);
+  });
+});
+
 describe("updateVars and the session cut", () => {
   it("re-validates vars exactly as create does", async () => {
     const s = setup();
@@ -2124,6 +2155,158 @@ describe("rotateTurnstileSecret", () => {
     expect(
       await fails(s.p.rotateTurnstileSecret("prod" as Env)),
     ).toBeInstanceOf(ProvisionRefused);
+  });
+});
+
+describe("push keys (open-artifacts#2775)", () => {
+  const PUSH = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
+  const pairOf = (s: ReturnType<typeof setup>, id: string) => {
+    const m = s.scriptOf(id)?.secrets;
+    return {
+      pub: m?.get("VAPID_PUBLIC_KEY"),
+      priv: m?.get("VAPID_PRIVATE_KEY"),
+    };
+  };
+  /** The pair signs and verifies: x and y from the point, d the scalar. */
+  const works = async (pub: string, priv: string) => {
+    const p = Buffer.from(pub, "base64url");
+    expect(p.length).toBe(65);
+    expect(p[0]).toBe(4);
+    expect(Buffer.from(priv, "base64url").length).toBe(32);
+    const jwk = {
+      kty: "EC",
+      crv: "P-256",
+      x: p.subarray(1, 33).toString("base64url"),
+      y: p.subarray(33).toString("base64url"),
+    };
+    const alg = { name: "ECDSA", namedCurve: "P-256" };
+    const sk = await crypto.subtle.importKey(
+      "jwk",
+      { ...jwk, d: priv },
+      alg,
+      false,
+      ["sign"],
+    );
+    const pk = await crypto.subtle.importKey("jwk", jwk, alg, false, [
+      "verify",
+    ]);
+    const msg = new TextEncoder().encode("push");
+    const sig = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      sk,
+      msg,
+    );
+    expect(
+      await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        pk,
+        sig,
+        msg,
+      ),
+    ).toBe(true);
+  };
+
+  it("create mints a working pair per install, kept out of notes and audit", async () => {
+    const s = setup();
+    const a = keep(await s.p.create(input("alpha")));
+    const b = keep(await s.p.create(input("beta")));
+    const pa = pairOf(s, a.id);
+    const pb = pairOf(s, b.id);
+    await works(pa.pub as string, pa.priv as string);
+    await works(pb.pub as string, pb.priv as string);
+    expect(pa.pub).not.toBe(pb.pub);
+    const said = JSON.stringify([
+      a,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(pa.priv as string);
+  });
+
+  it("backfill adds a pair where none is, keeps a whole pair, refuses a half pair or a busy install", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const whole = keep(await s.p.create(input("beta")));
+    const half = keep(await s.p.create(input("gamma")));
+    const busy = keep(await s.p.create(input("delta")));
+    const cut = keep(await s.p.create(input("epsilon")));
+    s.scriptOf(cut.id)?.secrets.delete("VAPID_PUBLIC_KEY");
+    const cutPriv = pairOf(s, cut.id).priv;
+    for (const id of [old.id, busy.id])
+      for (const k of PUSH) s.scriptOf(id)?.secrets.delete(k);
+    // A lone public key was not put by the backfill (it puts it last).
+    s.scriptOf(half.id)?.secrets.delete("VAPID_PRIVATE_KEY");
+    s.db()
+      .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
+      .run(busy.id);
+    const before = pairOf(s, whole.id);
+    const halfPub = pairOf(s, half.id).pub;
+
+    const out = keep(await s.p.backfillPushKeys("staging"));
+    const byId = Object.fromEntries(out.map((x) => [x.id, x]));
+    expect(byId[old.id]).toMatchObject({ ok: true, rotated: true });
+    expect(byId[whole.id]).toMatchObject({ ok: true, rotated: false });
+    expect(byId[half.id]?.ok).toBe(false);
+    expect(byId[half.id]?.reason).toMatch(/half pair/);
+    expect(byId[busy.id]?.ok).toBe(false);
+    expect(byId[busy.id]?.reason).toMatch(/upgrading/);
+
+    // A lone private key is an interrupted backfill: finished with a new pair.
+    expect(byId[cut.id]).toMatchObject({ ok: true, rotated: true });
+    const fin = pairOf(s, cut.id);
+    await works(fin.pub as string, fin.priv as string);
+    expect(fin.priv).not.toBe(cutPriv);
+    const got = pairOf(s, old.id);
+    await works(got.pub as string, got.priv as string);
+    expect(pairOf(s, whole.id)).toEqual(before);
+    expect(pairOf(s, half.id)).toEqual({ pub: halfPub, priv: undefined });
+    expect(pairOf(s, busy.id)).toEqual({ pub: undefined, priv: undefined });
+    expect(s.audit(old.id)).toContain("push_keys.backfill");
+    expect(s.audit(whole.id)).not.toContain("push_keys.backfill");
+    // The private key goes up before the public key.
+    const order = s.fake.raw
+      .filter((r) => r.method === "PUT" && r.path.endsWith("/secrets"))
+      .filter((r) => r.path.includes(old.id))
+      .map((r) => (JSON.parse(r.body) as { name: string }).name)
+      .filter((n) => n.startsWith("VAPID_"));
+    expect(order).toEqual(["VAPID_PRIVATE_KEY", "VAPID_PUBLIC_KEY"]);
+    const said = JSON.stringify([
+      out,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(got.priv as string);
+    expect(s.row(old.id).lease).toBeNull();
+
+    // A second run changes nothing.
+    const again = keep(await s.p.backfillPushKeys("staging"));
+    expect(again.find((x) => x.id === old.id)).toMatchObject({
+      ok: true,
+      rotated: false,
+    });
+    expect(pairOf(s, old.id)).toEqual(got);
+  });
+
+  it("an install without a pair still upgrades clean, and an upgrade never rotates one", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    for (const k of PUSH) s.scriptOf(old.id)?.secrets.delete(k);
+    const before = pairOf(s, kept.id);
+    for (const id of [old.id, kept.id])
+      expect(keep(await s.p.upgrade(id, "0.24.2"))).toMatchObject({
+        ok: true,
+        rolledBack: false,
+      });
+    expect(pairOf(s, old.id)).toEqual({ pub: undefined, priv: undefined });
+    expect(pairOf(s, kept.id)).toEqual(before);
+  });
+
+  it("refuses another env", async () => {
+    const s = setup();
+    expect(await fails(s.p.backfillPushKeys("prod" as Env))).toBeInstanceOf(
+      ProvisionRefused,
+    );
   });
 });
 

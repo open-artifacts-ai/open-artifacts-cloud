@@ -255,7 +255,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     // writes among them), three hosted-only billing writes (interactive-only:
     // browser sessions).
     // #2545: the first-invite flag adds one real-only drop.
-    expect(only).toHaveLength(29);
+    // v0.205.0: inbox read and read-all (#2512), the four held-request routes
+    // (#2577) and Install now (#2552) add seven interactive-only drops.
+    expect(only).toHaveLength(36);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
@@ -289,6 +291,8 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     expect(ownerOnly).toEqual([
       "DELETE /api/v1/directory",
       "POST /api/v1/directory/disconnect",
+      // #2552: the version the instance names, owner only, cookie session only.
+      "PUT /api/v1/bus/run-version",
     ]);
     expect([...INTERACTIVE_ONLY].sort()).toEqual(
       found.filter((r) => !ownerOnly.includes(r)),
@@ -378,9 +382,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(29);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(36);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 30);
+    expect(by("own")).toHaveLength(cases.length - 2 - 37);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
