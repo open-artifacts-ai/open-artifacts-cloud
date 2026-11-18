@@ -112,7 +112,7 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     return out;
   };
 
-  it("calls four hooks only: session, oauthClient (the p5-oauth member's grant, #2285), codeCapsReset (its own IP's caps) and otpLatest", () => {
+  it("calls five hooks only: session, oauthClient (the p5-oauth member's grant, #2285), codeCapsReset (its own IP's caps), otpLatest and peoplePurge (t19- people only, #2680)", () => {
     const used = new Set<string>();
     for (const f of t19Files())
       for (const m of read(f).matchAll(/TEST_HOOKS\.(\w+)/g))
@@ -120,12 +120,20 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     // oauthClient signs in only the fixed member p5-oauth@TEST_DOMAIN and mints a
     // new OAuth client per call (no shared tok: bucket); the suite uses that
     // member only as a credential, never reading its artifacts or comments.
+    // peoplePurge (public v0.199.3, #2680) erases only t19- people under
+    // TEST_DOMAIN; the suite's people are redline-*, so it can't touch them.
     expect([...used].sort()).toEqual([
       "codeCapsReset",
       "oauthClient",
       "otpLatest",
+      "peoplePurge",
       "session",
     ]);
+  });
+
+  it("the people purge matches t19- addresses only, enforced in its SQL", () => {
+    const hooks = read("apps/server/src/test-hooks/index.ts");
+    expect(hooks).toMatch(/substr\(email, 1, 4\) = 't19-'/);
   });
 
   it("the hook rate limit is per install and IP, and the caps reset deletes only the caller's IP's rows", () => {

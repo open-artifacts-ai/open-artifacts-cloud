@@ -123,6 +123,20 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.205.0: inbox read (#2512), held requests (#2577) and Install now
+    // (#2552), each interactive-only and deny-only (A's session at B).
+    ...[
+      "org POST /api/v1/me/inbox/read [session]",
+      "org POST /api/v1/me/inbox/read-all [session]",
+      "org GET /api/v1/me/agent-asks/held [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/allow [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/allow/challenge [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/not-now [session]",
+      "org POST /api/v1/bus/machines/:id/install-now [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // v0.197.0: the onboarding routes (#2632), probed now, no longer dropped.
     ...[
       "org GET /api/v1/onboarding [session]",

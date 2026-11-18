@@ -1652,6 +1652,25 @@ describe("WfpProvisioner.create", () => {
     });
   });
 
+  describe("DOCS_PREVIEW is staging only (open-artifacts#2641)", () => {
+    it("a prod create is refused with zero calls", async () => {
+      const s = setup({ env: "prod" });
+      const e = await fails(
+        s.p.create(input("finqore", { vars: { DOCS_PREVIEW: "1" } })),
+      );
+      expect(e.message).toMatch(/DOCS_PREVIEW is staging only/);
+      expect(s.fake.log).toEqual([]);
+    });
+    it("a staging create binds it as 1", async () => {
+      const s = setup();
+      await s.p.create(input("finqore", { vars: { DOCS_PREVIEW: "1" } }));
+      const meta = metaOf(uploads(s.fake)[0]?.body as string);
+      expect(
+        meta.bindings.find((b: { name: string }) => b.name === "DOCS_PREVIEW"),
+      ).toMatchObject({ type: "plain_text", text: "1" });
+    });
+  });
+
   describe("TEST_DOMAIN", () => {
     it("a test-hook install without TEST_DOMAIN is refused with zero calls", async () => {
       const s = setup();
@@ -1830,6 +1849,8 @@ describe("WfpProvisioner.create", () => {
       "CONTENT_SIGNING_KEY",
       "DIRECTORY_TOKEN_KEY",
       "SESSION_SECRET",
+      "VAPID_PRIVATE_KEY",
+      "VAPID_PUBLIC_KEY",
     ]);
   });
 

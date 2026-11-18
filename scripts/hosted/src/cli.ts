@@ -52,6 +52,7 @@ import {
   PROVISIONER_MAX_TOKEN_DAYS,
   platformNames,
   probeR2Conditionals,
+  pruneStaged,
   publishFloor,
   publishRelease,
   type R2Credentials,
@@ -693,7 +694,29 @@ async function run(
             status: r.status,
           });
         }
-        return { ok: true, data: { version, published: out } };
+        // Once this version has its record, older staged versions (files, no
+        // record) can never be published and read as dirty to prodClean:
+        // delete them (pruneStaged). Never fails the publish: the record is
+        // already written, and prodClean still reports any that are left.
+        let pruned: string[] = [];
+        if (!f.stageOnly && out.some((x) => x.variant === "release")) {
+          try {
+            const p = await pruneStaged({ cf, r2, env, published: version });
+            pruned = p.pruned;
+            c.emit({
+              step: "prune",
+              status: "ok",
+              data: { pruned: p.pruned, kept: p.kept },
+            });
+          } catch (e) {
+            c.emit({
+              step: "prune",
+              status: "warn",
+              message: `staged versions were not pruned: ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+            });
+          }
+        }
+        return { ok: true, data: { version, published: out, pruned } };
       } finally {
         d.removeTree(dir);
       }

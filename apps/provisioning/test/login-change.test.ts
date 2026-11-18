@@ -134,6 +134,7 @@ async function world(
     lifecycle?: Record<string, unknown>;
     state?: "active" | "deleting";
     on?: boolean;
+    slugs?: string;
     bill?: BillingOperatorRpc | undefined;
     unbound?: boolean;
   } = {},
@@ -148,6 +149,7 @@ async function world(
   otherId = other.id;
   const f = fakeEnv({
     LOGIN_CHANGE: o.on === false ? "0" : "1",
+    ...(o.slugs === undefined ? {} : { LOGIN_CHANGE_SLUGS: o.slugs }),
     BROKER_REGISTRY: o.unbound
       ? undefined
       : await registry({ [id]: KEY, [otherId]: OTHER_KEY }),
@@ -204,6 +206,62 @@ describe("the route is off or not for the internet", () => {
       headers: { "x-oa-gate-install": id },
     });
     expect((await call(other, env)).status).toBe(404);
+  });
+});
+
+describe("LOGIN_CHANGE_SLUGS: on for the listed installs only (#2520 rollout)", () => {
+  const slugOf = (x: string) =>
+    db
+      .prepare("SELECT slug FROM installs WHERE id = ?1")
+      .bind(x)
+      .first<{ slug: string }>()
+      .then((r) => r?.slug ?? "");
+  const nonces = (x: string) =>
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM login_change_nonces WHERE install_id = ?1",
+      )
+      .bind(x)
+      .first<{ n: number }>()
+      .then((r) => r?.n ?? 0);
+
+  it("with LOGIN_CHANGE off, a listed install's change is accepted", async () => {
+    const { env } = await world({ on: false });
+    env.LOGIN_CHANGE_SLUGS = ` nobody , ${await slugOf(id)} `;
+    const r = await call(await req(body(), { install: id }), env);
+    expect(await err(r)).toEqual({ status: 202, ok: true, applying: true });
+    expect((await vars(id)).vars.AUTH_DOMAINS).toBe("acme.test");
+    expect(await jobsOf(id)).toHaveLength(1);
+  });
+
+  it("an install not listed is the plain 404, before any nonce is kept", async () => {
+    const { env } = await world({ on: false });
+    env.LOGIN_CHANGE_SLUGS = await slugOf(otherId);
+    const r = await call(await req(body(), { install: id }), env);
+    expect(r.status).toBe(404);
+    expect(await r.text()).toBe("Not found");
+    expect(await nonces(id)).toBe(0);
+    expect((await vars(id)).vars.AUTH_DOMAINS).toBe("");
+    expect(await jobsOf(id)).toHaveLength(0);
+  });
+
+  it("an empty or blank list is off; a slug is matched exactly, never as a prefix", async () => {
+    for (const slugs of ["", " , ", "x"]) {
+      const { env } = await world({ on: false, slugs });
+      if (slugs === "x")
+        env.LOGIN_CHANGE_SLUGS = (await slugOf(id)).slice(0, -1);
+      const r = await call(await req(body(), { install: id }), env);
+      expect(r.status, JSON.stringify(slugs)).toBe(404);
+      expect(await jobsOf(id)).toHaveLength(0);
+      await resetDb();
+      clearRegistryCache();
+    }
+  });
+
+  it("with LOGIN_CHANGE on, the list doesn't narrow it", async () => {
+    const { env } = await world({ slugs: "nobody" });
+    const r = await call(await req(body(), { install: id }), env);
+    expect(r.status).toBe(202);
   });
 });
 
@@ -534,6 +592,31 @@ describe("refusals", () => {
 
   it("needs a live subscription", async () => {
     await expectRefused({ bill: billing("team", "lapsed") }, body(), {
+      status: 403,
+      error: "plan_required",
+    });
+  });
+
+  it("an install created Team with no billing row passes as Team", async () => {
+    const noRow: BillingOperatorRpc = {
+      setTier: async () => {
+        throw new Error("not used");
+      },
+      tiersOf: async (ids) => ({
+        ok: true,
+        tiers: Object.fromEntries(
+          ids.map((i) => [i, { tier: "solo", status: "active", noRow: true }]),
+        ),
+      }),
+    };
+    const { env } = await world({ bill: noRow });
+    const r = await call(await req(body(), { install: id }), env);
+    expect(r.status).toBe(202);
+  });
+
+  it("a real Solo row on an install created Team is still refused", async () => {
+    // billing("solo") has no noRow: the owner's own Solo, not the default.
+    await expectRefused({ bill: billing("solo") }, body(), {
       status: 403,
       error: "plan_required",
     });

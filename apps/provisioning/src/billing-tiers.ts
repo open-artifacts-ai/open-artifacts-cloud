@@ -19,6 +19,8 @@ export type BillingView = {
 export async function billingTiersOf(
   env: Env,
   installs: string[],
+  /** Each install's provisioned tier (install_lifecycle.tier), for billing's no-row answer. */
+  provisioned: ReadonlyMap<string, string | null> = new Map(),
 ): Promise<Map<string, BillingView>> {
   const out = new Map<string, BillingView>();
   const rpc = env.BILLING;
@@ -33,6 +35,14 @@ export async function billingTiersOf(
     ]);
     if (!r || !r.ok) return out;
     for (const [id, v] of Object.entries(r.tiers)) {
+      // No billing row: billing's solo/active is its default, not a plan. An
+      // install provisioned Team or Business keeps that tier, as the install
+      // itself does (apps/server billing/plan.ts effectivePlan, public repo).
+      const p = provisioned.get(id);
+      if (v?.noRow === true && (p === "team" || p === "business")) {
+        out.set(id, { billingTier: p, billingStatus: "active" });
+        continue;
+      }
       const t = BillingTierSchema.safeParse(v?.tier);
       if (!t.success) continue;
       const st = BillingStatusSchema.safeParse(v?.status);

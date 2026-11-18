@@ -56,6 +56,8 @@ describe("guard", () => {
   });
 
   it("prod is clean (no test hooks on any prod install)", async (ctx) => {
+    // Also fails a prod install whose script binds DOCS_PREVIEW (staging
+    // only, open-artifacts#2641): prodClean reads each install's settings.
     // Staging with no prod probe throws ProdDirty("prod probe not configured");
     // prodClean reads the OIDC inventory JWT from the secrets dir
     // (REDLINE_PROD_INVENTORY_OIDC, minted by the redline job in W12); without

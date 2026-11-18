@@ -786,6 +786,25 @@ describe("prodClean (spec 2026-10-26)", () => {
     await expect(check(w)).rejects.toThrow(/lists TEST_HOOKS/);
   });
 
+  it("an install whose script lists or binds DOCS_PREVIEW fails, as staging only (open-artifacts#2641)", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    w.bindings = ["DB", "DOCS_PREVIEW"];
+    const e = await check(w).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ProdDirty);
+    expect((e as ProdDirty).code).toBe("install_dirty");
+    expect((e as ProdDirty).installId).toBe(ID);
+    expect((e as ProdDirty).message).toMatch(
+      /lists DOCS_PREVIEW \(staging only\)/,
+    );
+    w.bindings = ["DB"];
+    w.secretNames = ["SESSION_SECRET", "DOCS_PREVIEW"];
+    await expect(check(w)).rejects.toThrow(/lists DOCS_PREVIEW/);
+    // Without it the same install is clean.
+    w.secretNames = ["SESSION_SECRET"];
+    expect(await check(w)).toMatchObject({ level: "pass" });
+  });
+
   it("an install with /healthz testHooks: true, or another installId, fails", async () => {
     const w = cleanWorld();
     publish(w, { version: "1.2.3" });
