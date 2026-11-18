@@ -847,6 +847,7 @@ Answers "was this a platform failure?" without raw logs. By hand only, in the `c
 gh workflow run cf-logs.yml -f worker=oa-p-example -f since=2026-11-18T10:00:00Z -f minutes=30 -f filter=errors
 ```
 
-- **Inputs.** `worker` must match `^oa-[ps]-[a-z0-9-]+$` or `^open-artifacts-(prod|staging)$`; `since` is ISO8601 UTC; `minutes` 1..120 (default 30); `filter` is `errors` (default), `status5xx` or `all`.
-- **Prints** (log and job summary, public): the count by HTTP status, and the top 10 error messages with counts, each cut to 80 characters with emails, token-like strings, URL query strings and IPs redacted. Never bodies, headers or raw lines; it runs two grouped `calculations` queries (`POST /accounts/{id}/workers/observability/telemetry/query`).
+- **Inputs.** `worker` must match the platform Workers only, `oa-[ps]-` plus `dispatch`, `provisioning`, `scheduler`, `provisioner`, `inventory` or `billing`, or `open-artifacts-prod` or `open-artifacts-staging` (never an install Worker); `since` is ISO8601 UTC; `minutes` 1..120 (default 30); `filter` is `errors` (default), `status5xx` or `all`.
+- **Prints** (log and job summary, public): the count by HTTP status, and the top 10 errors as `- <n>: <class> #<hash>`, where class is the message's leading identifier (up to `:` or a space, else `error`) and hash the first 8 hex of the message's sha256, so equal errors match across runs. Never error text, bodies, headers or raw lines; it runs two grouped `calculations` queries (`POST /accounts/{id}/workers/observability/telemetry/query`).
+- **Who can run it.** The `cf-read` Environment is limited to deployment branch `main` (custom policy, one rule `main:branch`, verified 2026-11-18 via the environments API). Any change to that rule needs Axe review.
 - **Fails** with the HTTP status and Cloudflare error code, naming the call, when the token lacks the permission.

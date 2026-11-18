@@ -1,6 +1,7 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: literal workflow expressions
 // cf-logs.yml: one Worker's logs as counts, by hand, from the read-only token.
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,15 +52,20 @@ describe("cf-logs.yml", () => {
 					MINUTES: "30",
 				},
 			}).status;
-		expect(run("oa-p-x")).toBe(0);
-		expect(run("oa-p-x\nevil")).not.toBe(0);
-		expect(run("evil\noa-p-x")).not.toBe(0);
-		expect(run("oa-p-x\n")).not.toBe(0);
+		expect(run("oa-p-dispatch")).toBe(0);
+		expect(run("open-artifacts-prod")).toBe(0);
+		// install-style and unknown names are refused
+		expect(run("oa-p-acme-corp")).not.toBe(0);
+		expect(run("oa-p-dispatch-acme")).not.toBe(0);
+		expect(run("acme")).not.toBe(0);
+		expect(run("oa-p-dispatch\nevil")).not.toBe(0);
+		expect(run("evil\noa-p-dispatch")).not.toBe(0);
+		expect(run("oa-p-dispatch\n")).not.toBe(0);
 	});
 
 	it("allowlists the worker and bounds minutes", () => {
 		expect(text).toContain(
-			"^(oa-[ps]-[a-z0-9-]+|open-artifacts-(prod|staging))$",
+			"^(oa-[ps]-(dispatch|provisioning|scheduler|provisioner|inventory|billing)|open-artifacts-(prod|staging))$",
 		);
 		expect(text).toContain("<= 120");
 	});
@@ -68,13 +74,24 @@ describe("cf-logs.yml", () => {
 		for (const s of job.steps) expect(s.run).not.toMatch(/\$\{\{/);
 	});
 
-	it("redacts before printing and names the failing call", () => {
-		expect(text).toContain("redact()");
-		expect(text).toContain("<email>");
-		expect(text).toContain("<tok>");
-		expect(text).toContain("<ip>");
-		expect(text).toContain("?<q>");
+	it("prints a class and hash, never error text", () => {
+		expect(text).not.toContain("redact");
+		const fn = /errline\(\) \{\n[\s\S]*?\n {10}\}\n/.exec(text)?.[0];
+		expect(fn).toBeDefined();
+		const msg =
+			"TypeError: cannot reach acme.com for Jane Doe id a1b2c3d4e5f6a7b8";
+		const out = spawnSync("bash", ["-c", `${fn}\nerrline`], {
+			input: `3\t${msg}\n2\tJane Doe failed\n`,
+			encoding: "utf8",
+		}).stdout;
+		const hash = createHash("sha256").update(msg).digest("hex").slice(0, 8);
+		expect(out).toContain(`- 3: TypeError #${hash}`);
+		expect(out).toContain("- 2: Jane #");
+		for (const leak of ["acme.com", "Doe", "a1b2c3d4e5f6a7b8", "cannot"])
+			expect(out).not.toContain(leak);
 		expect(text).toContain("Cloudflare error code");
 		expect(text).not.toMatch(/cat resp\.json|jq \. resp\.json/);
+		expect(text).toContain("Axe review");
+		expect(text).toContain("no result.calculations in the response");
 	});
 });
