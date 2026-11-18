@@ -199,7 +199,7 @@
           "id": "{{PROVISIONING_OAUTH_KV_ID_STAGING}}"
         },
         // The install registry, read-only: the keys a login change's signature
-        // is checked against (#2520). STAGING ONLY; prod has none yet.
+        // is checked against (#2520).
         {
           "binding": "BROKER_REGISTRY",
           "id": "{{BROKER_REGISTRY_ID_STAGING}}"
@@ -237,7 +237,7 @@
         // red-line case has passed on staging. LOGIN_CHANGE_SLUGS turns it on
         // for the listed installs only (leo first, on the user's go).
         "LOGIN_CHANGE": "0",
-        "LOGIN_CHANGE_SLUGS": "",
+        "LOGIN_CHANGE_SLUGS": "leo",
         "SIGNUP_DAILY_CAP": "{{SIGNUP_DAILY_CAP_PROD}}",
         // The sender of the approval email (#2096), the provisioner's value.
         "WELCOME_FROM": "{{WELCOME_FROM_PROD}}",
@@ -372,6 +372,11 @@
         {
           "binding": "OAUTH_KV",
           "id": "{{PROVISIONING_OAUTH_KV_ID_PROD}}"
+        },
+        // The install registry, read-only (#2520), as staging's.
+        {
+          "binding": "BROKER_REGISTRY",
+          "id": "{{BROKER_REGISTRY_ID_PROD}}"
         }
       ]
     }
