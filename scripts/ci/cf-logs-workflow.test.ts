@@ -1,5 +1,6 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: literal workflow expressions
 // cf-logs.yml: one Worker's logs as counts, by hand, from the read-only token.
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,11 +34,34 @@ describe("cf-logs.yml", () => {
 		expect(text).not.toContain("actions/checkout");
 	});
 
+	it("fails closed: bash, pipefail, every run step", () => {
+		for (const s of job.steps) {
+			expect(s.shell).toBe("bash");
+			expect(s.run.startsWith("set -euo pipefail\n")).toBe(true);
+		}
+	});
+
+	it("refuses a multi-line worker input", () => {
+		const run = (worker: string) =>
+			spawnSync("bash", ["-c", job.steps[0].run], {
+				env: {
+					PATH: process.env.PATH,
+					WORKER: worker,
+					SINCE: "2026-11-18T10:00:00Z",
+					MINUTES: "30",
+				},
+			}).status;
+		expect(run("oa-p-x")).toBe(0);
+		expect(run("oa-p-x\nevil")).not.toBe(0);
+		expect(run("evil\noa-p-x")).not.toBe(0);
+		expect(run("oa-p-x\n")).not.toBe(0);
+	});
+
 	it("allowlists the worker and bounds minutes", () => {
 		expect(text).toContain(
-			"^oa-[ps]-[a-z0-9-]+$|^open-artifacts-(prod|staging)$",
+			"^(oa-[ps]-[a-z0-9-]+|open-artifacts-(prod|staging))$",
 		);
-		expect(text).toContain('"$MINUTES" -le 120');
+		expect(text).toContain("<= 120");
 	});
 
 	it("passes inputs through env, never into the script text", () => {
