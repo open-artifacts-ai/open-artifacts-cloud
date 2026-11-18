@@ -45,7 +45,7 @@ import {
   runKindOf,
 } from "../src/report.ts";
 import { finalReport, type LanePart, writeReport } from "../src/reporter.ts";
-import { runWithRerun } from "../src/rerun.ts";
+import { rerunDeadlineFromEnv, runWithRerun } from "../src/rerun.ts";
 
 const pkg = join(import.meta.dirname, "..");
 // When the current run began: the lanes (env below) and the control probe share it.
@@ -99,7 +99,11 @@ function prepare(attempt: 1 | 2): void {
 
 const vitest = join(pkg, "node_modules", ".bin", "vitest");
 const live = new Set<ChildProcess>();
+// Set when a signal reaches this script or ends a lane: a cancelled job never
+// starts a second run (src/rerun.ts).
+let signalled = false;
 const forward = (sig: NodeJS.Signals) => () => {
+  signalled = true;
   for (const c of live) c.kill(sig);
 };
 process.on("SIGINT", forward("SIGINT"));
@@ -138,6 +142,7 @@ function runLane(lane: Lane, prefix: boolean): Promise<LaneResult> {
   return new Promise((res) =>
     child.on("close", (code, sig) => {
       live.delete(child);
+      if (sig) signalled = true;
       // A lane that ended releases whoever waits on it (src/barrier.ts).
       writeFileSync(laneExitFile(barrierDir, name), String(code ?? sig), {
         mode: 0o600,
@@ -212,8 +217,17 @@ function write(report: Report, where: "final" | "first"): string {
 }
 
 const outcome = await runWithRerun(
-  { run: runOnce, write, log: (l) => console.log(l) },
-  { gate, run: runKindOf(process.env) },
+  {
+    run: runOnce,
+    write,
+    log: (l) => console.log(l),
+    signalled: () => signalled,
+  },
+  {
+    gate,
+    run: runKindOf(process.env),
+    deadlineMs: rerunDeadlineFromEnv(process.env),
+  },
 );
 const report = outcome.report;
 if (report && gate)
