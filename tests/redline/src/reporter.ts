@@ -13,6 +13,7 @@ import {
   legOf,
   levelOf,
   type Manifest,
+  noAnswerOf,
   notesOf,
   parseManifest,
   type RunBinding,
@@ -118,6 +119,9 @@ export function collect(
         ...(label ? { label } : {}),
         ...(notes.length ? { notes } : {}),
         ...(level === "pass" ? {} : legOf(setupFailed ? setup : errors)),
+        ...(level === "infra" && noAnswerOf(setupFailed ? setup : errors)
+          ? { noAnswer: true as const }
+          : {}),
       });
     }
     for (const [name, h] of hooked)
@@ -136,6 +140,7 @@ export function collect(
         reason: infra
           ? redactReason(infra)
           : `error outside a test: ${failReason(m.errors())}`,
+        ...(infra && noAnswerOf(m.errors()) ? { noAnswer: true as const } : {}),
       });
     }
   }

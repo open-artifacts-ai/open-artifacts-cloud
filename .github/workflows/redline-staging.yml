@@ -192,6 +192,15 @@ jobs:
   # from the job's start: setup 5, bring-up 60, seal 10, suite (bus lane) 31,
   # t19-done cap at 110, revoke of rl-a and rl-b 40: 150; the pair's revoke
   # fits only in what a faster run leaves, never past 145.
+  #
+  # The automatic rerun (tests/redline/src/rerun.ts: the whole gate once more
+  # when the first run failed only on dropped connections) is a second suite
+  # of up to 31 min inside the same step, so it fits only in what a faster
+  # bring-up leaves: it starts only if now + 31 + 5 min margin <= job start +
+  # 150 - 40 (revoke) - 5 = 105 min, so at the latest about 69 min in. That is
+  # before the worst-case suite start (75), so on a worst-case bring-up there
+  # is no rerun and the gate fails as before. Without REDLINE_JOB_STARTED_AT
+  # (or with a value that is not a number) there is no rerun here either.
   t19:
     name: t19
     needs: platform-tags
