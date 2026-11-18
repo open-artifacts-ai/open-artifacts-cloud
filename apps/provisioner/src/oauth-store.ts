@@ -31,8 +31,9 @@ import {
   OAUTH_DUAL_SETTLE_MS,
   OAUTH_MODE_LIVE_ACTION,
   OAUTH_MODE_LIVE_SQL,
-  type OAuthJob,
+  OAUTH_STORE_MODES,
   type OAuthStoreMode,
+  parseOAuthJob,
   storedOAuthMode,
 } from "@oa/provisioning-contract";
 import { failingAt, tagFail } from "./errors.js";
@@ -163,7 +164,39 @@ async function checkModeChange(
   return { ok: true };
 }
 
-type SetWant = Extract<OAuthJob, { op: "set" }>;
+/**
+ * What an R29 job wants. Local to the cloud: it reads DOCS_PREVIEW itself, so
+ * it builds on a contract that has no docsPreview (before open-artifacts#2715)
+ * and on one that does, whether its mode is required or optional.
+ */
+export type SetWant = { mode?: OAuthStoreMode; docsPreview?: "1" | "" };
+export type OAuthOp = ({ op: "set" } & SetWant) | { op: "copy" };
+export const DOCS_PREVIEW_ACTION = "docs_preview.set";
+
+/** An `update` job's args as its operation, or null for anything else. */
+export function parseOAuthOp(a: Record<string, unknown>): OAuthOp | null {
+  if (a.oauthCopy !== undefined)
+    return parseOAuthJob(a)?.op === "copy" ? { op: "copy" } : null;
+  const vars = a.vars;
+  if (!vars || typeof vars !== "object" || Array.isArray(vars)) return null;
+  const v = vars as Record<string, unknown>;
+  const keys = Object.keys(v);
+  if (
+    keys.length === 0 ||
+    keys.some((k) => k !== "OAUTH_STORE" && k !== "DOCS_PREVIEW")
+  )
+    return null;
+  const mode = v.OAUTH_STORE;
+  const docs = v.DOCS_PREVIEW;
+  if (mode !== undefined && !OAUTH_STORE_MODES.includes(mode as OAuthStoreMode))
+    return null;
+  if (docs !== undefined && docs !== "1" && docs !== "") return null;
+  return {
+    op: "set",
+    ...(mode !== undefined && { mode: mode as OAuthStoreMode }),
+    ...(docs !== undefined && { docsPreview: docs as "1" | "" }),
+  };
+}
 
 /** updateVars with the merged vars. A LostLease leaves as it came. */
 async function putMode(
@@ -315,6 +348,30 @@ export async function setOAuthStore(
     await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
       modeLive(ctx, job, mode),
     );
+  // Marked as update_vars: the update kind's steps are fixed (JOB_STEPS).
+  if (want.docsPreview !== undefined) {
+    const value = want.docsPreview;
+    await jobStep(
+      ctx,
+      step,
+      jobId,
+      "docs_preview_audit",
+      undefined,
+      async () => {
+        await transient(
+          auditStatement(
+            ctx,
+            job.installId,
+            DOCS_PREVIEW_ACTION,
+            { value },
+            jobId,
+          ).run(),
+        );
+        return { value };
+      },
+      "update_vars",
+    );
+  }
   // Marked as mode_live: the update kind's steps are fixed (JOB_STEPS).
   if (mode === "d1")
     await jobStep(

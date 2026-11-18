@@ -282,6 +282,9 @@ describe("update: set OAUTH_STORE (R29)", () => {
     });
     expect(r.log.map((l) => l.name)).toContain("update_vars");
     expect(r.log.map((l) => l.name)).not.toContain("mode_live");
+    expect(
+      auditOf(id).filter((a) => a.action === "docs_preview.set"),
+    ).toHaveLength(1);
     expect(r.log.map((l) => l.name)).not.toContain("precheck");
     expect(
       auditOf(id).filter((a) => a.action === OAUTH_MODE_LIVE_ACTION),
@@ -295,6 +298,11 @@ describe("update: set OAUTH_STORE (R29)", () => {
     expect(JSON.parse(w.install(id)?.vars as string).DOCS_PREVIEW).toBe("1");
     const off = await run({ vars: { DOCS_PREVIEW: "" } }, id);
     expect(off.error).toBeNull();
+    expect(
+      auditOf(id)
+        .filter((a) => a.action === "docs_preview.set")
+        .map((a) => JSON.parse(a.detail)),
+    ).toEqual([{ value: "1" }, { value: "" }]);
     expect(plain(id, "DOCS_PREVIEW")).toBeUndefined();
     expect(JSON.parse(w.install(id)?.vars as string)).not.toHaveProperty(
       "DOCS_PREVIEW",
@@ -312,6 +320,29 @@ describe("update: set OAUTH_STORE (R29)", () => {
     expect(plain(id, "OAUTH_STORE")).toBe("dual");
     expect(plain(id, "DOCS_PREVIEW")).toBe("1");
     expect(r.log.map((l) => l.name)).toContain("mode_live");
+  });
+
+  it("a mode-only job writes no docs_preview row", async () => {
+    const id = await active();
+    install(id);
+    await run(setMode("dual"), id);
+    expect(
+      auditOf(id).filter((a) => a.action === "docs_preview.set"),
+    ).toHaveLength(0);
+  });
+
+  it("a bad DOCS_PREVIEW value or an extra var does not parse", async () => {
+    const id = await active();
+    install(id);
+    for (const vars of [
+      { DOCS_PREVIEW: "0" },
+      { DOCS_PREVIEW: "1", TIER: "team" },
+      {},
+    ]) {
+      const r = await run({ vars }, id);
+      expect(r.error, JSON.stringify(vars)).not.toBeNull();
+    }
+    expect(plain(id, "DOCS_PREVIEW")).toBeUndefined();
   });
 
   it("keeps the install's other vars", async () => {
