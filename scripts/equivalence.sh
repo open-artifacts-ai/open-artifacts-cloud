@@ -54,6 +54,8 @@ set -uo pipefail
 # script and its test that public never had.
 # And the deploy's CI guard and wave plan (#264 step 3): two scripts with their
 # tests that public never had.
+# And the pin-only decision for CI's run-once rule on pin bumps: a script and its test,
+# plus the test of ci.yml's shape, that public never had.
 ALLOW=(
   pnpm-lock.yaml
   scripts/ci/tag-ci-green.sh
@@ -104,6 +106,10 @@ ALLOW=(
   # The hosted-owned vars check (#262), this repo's own.
   scripts/ci/check-hosted-owned-vars.ts
   scripts/ci/check-hosted-owned-vars.test.ts
+  # The pin-only decision (run the suite once for the release bot's pin bumps).
+  scripts/ci/pin-only.ts
+  scripts/ci/pin-only.test.ts
+  scripts/ci/ci-pin-once-workflow.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

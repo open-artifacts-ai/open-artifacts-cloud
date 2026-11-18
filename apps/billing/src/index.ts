@@ -1157,7 +1157,7 @@ async function operatorSetTier(
 // many installs, in one SELECT, and no write at all (no materialize, no
 // version bump, no last_read_at, no Stripe). An ended Business trial is
 // projected as MATERIALIZE_SQL would leave it (same fragments). No row: solo,
-// active.
+// active, marked noRow.
 // now is inlined (an integer from Date.now()): D1 allows 100 bound values and
 // TIERS_OF_MAX ids use them all.
 const TIERS_OF_SQL = (n: number, now: number) =>
@@ -1187,7 +1187,8 @@ async function operatorTiersOf(
         .all<TiersOfRow>()
     ).results;
     const tiers: Record<string, TierOfView> = {};
-    for (const id of ids) tiers[id] = { tier: "solo", status: "active" };
+    for (const id of ids)
+      tiers[id] = { tier: "solo", status: "active", noRow: true };
     for (const r of rows)
       tiers[r.install_id] = { tier: r.tier, status: r.status };
     return { ok: true, tiers };
@@ -2181,12 +2182,22 @@ export default {
           ) {
             const subscriptionId = obj.id;
             try {
-              await stripe("-", () =>
+              const r = await stripe("-", () =>
                 clearCustomerCredit(
                   { customerId: customer, subscriptionId },
                   stripeConfig(env),
                 ),
               );
+              // #2588: what was cleared, so it can be given back (amount in
+              // minor units; ids only, never a name or address).
+              if (r.outcome === "cleared")
+                console.log(
+                  JSON.stringify({
+                    evt: "billing_credit_cleared",
+                    subscription: subscriptionId,
+                    amount: r.amount,
+                  }),
+                );
             } catch {
               // Stripe resends nothing for an acked event: ask for a retry.
               console.error("billing seats credit_end failed");

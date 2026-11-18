@@ -9,6 +9,13 @@ export const TIERS_OF_MAX = 100;
 export interface TierOfView {
   tier: string | null;
   status: string | null;
+  /**
+   * True when billing has no row for the install (the solo/active above is
+   * its default, version 0). Like the install's own plan rule, a reader then
+   * keeps the tier the install was provisioned with when that is Team or
+   * Business: an admin-made Team install is not Solo.
+   */
+  noRow?: true;
 }
 
 /**

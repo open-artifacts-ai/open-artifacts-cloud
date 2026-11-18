@@ -63,6 +63,8 @@ export const HOSTED_ADDED = [
   "TEST_DOMAIN",
   "SESSION_SECRET",
   "CONTENT_SIGNING_KEY",
+  "VAPID_PUBLIC_KEY",
+  "VAPID_PRIVATE_KEY",
 ] as const;
 
 /** Secrets every install has (TEST_HOOK_KEY is added for test installs). */
@@ -122,6 +124,9 @@ export const HOSTED_VARS: Record<string, (v: string) => string | undefined> = {
       ? undefined
       : "expected an https URL",
   EMAIL_FROM: (v) => (EMAIL_RE.test(v) ? undefined : "expected an email"),
+  // open-artifacts#2641: opens doc creation. Staging only; userWorkerMetadata
+  // refuses it on prod before any other check.
+  DOCS_PREVIEW: (v) => (v === "1" ? undefined : 'expected "1"'),
   // Test-hook installs only (checked in userWorkerMetadata): hooks act only
   // on emails @TEST_DOMAIN.
   TEST_DOMAIN: (v) =>
@@ -164,6 +169,7 @@ const PASSTHROUGH = [
   "DIRECTORY_BROKER_URL",
   "NIGHTLY_PUBKEY",
   "OAUTH_STORE",
+  "DOCS_PREVIEW",
 ];
 
 export type Vars = Record<string, string>;
@@ -400,6 +406,9 @@ export function userWorkerMetadata(
   // per zone. The server names each install in the From display name.
   const emailFrom = `noreply@mail.${i.appHost.slice(i.appHost.indexOf(".") + 1)}`;
 
+  // open-artifacts#2641: DOCS_PREVIEW is staging only, whatever the value.
+  if (i.vars.DOCS_PREVIEW !== undefined && r.env === "prod")
+    throw new Error("DOCS_PREVIEW is staging only; prod refuses it");
   // vars: allowlist first
   for (const [k, v] of Object.entries(i.vars)) {
     const why = hostedVarProblem(k, v);
@@ -621,6 +630,10 @@ export function userWorkerMetadata(
   if (migrations) meta.migrations = migrations;
   if (missing.length > 0) meta.keep_bindings = ["secret_text", "secret_key"];
   assertUniqueBindings(meta.bindings);
+  // open-artifacts#2641: also on what is rendered, so a release template's
+  // vars can't bind DOCS_PREVIEW on prod either.
+  if (r.env === "prod" && meta.bindings.some((b) => b.name === "DOCS_PREVIEW"))
+    throw new Error("DOCS_PREVIEW is staging only; prod refuses it");
   return meta;
 }
 

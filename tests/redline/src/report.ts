@@ -1,3 +1,10 @@
+import {
+  type ControlStats,
+  controlSummary,
+  EDGE_PREFIX,
+  nearSummary,
+} from "./edge-probe.ts";
+import { NET_CODES } from "./fetch-timeout.ts";
 // Proof levels and the gate rule (the Manager's): every case reports exactly
 // one level, and the gate passes only when EVERY case is "pass". staging-only,
 // not-applicable, unproven-live and infra never count as a pass, and neither
@@ -45,6 +52,13 @@ export interface CaseResult {
    * (infra when every error is infra, else fail).
    */
   moduleError?: true;
+  /**
+   * Set only on an infra case whose every error got no answer at all: a
+   * transport drop (a socket code in NET_CODES, no status line, no frame).
+   * Read by src/rerun.ts, which reruns the whole gate once when every failed
+   * case has it. Never set on a timeout, an abort or anything that got a reply.
+   */
+  noAnswer?: true;
 }
 
 /**
@@ -170,6 +184,18 @@ export interface Report {
   combined?: { runNonce: string; verdictsFinishedAt: number };
   /** Notes recorded outside any test (beforeAll), by file. */
   fileNotes?: { file: string; note: string }[];
+  /** Evidence only, never a verdict: what the orchestrator's edge control probe saw (src/edge-probe.ts). */
+  edge?: { control?: ControlStats };
+  /** Set on the second run's report when the first one dropped connections only (src/rerun.ts). */
+  rerun?: RerunNote;
+}
+
+/** What the second run's report says about the first (src/rerun.ts). */
+export interface RerunNote {
+  /** The first run's failed cases, each one a dropped connection. */
+  dropped: string[];
+  /** The first run's report file, kept beside this one. */
+  firstReport: string;
 }
 
 export interface RunBinding {
@@ -231,6 +257,27 @@ export function resetSummary(notes: readonly string[]): string | undefined {
   return `Resets: ${resets.length} (${reused} on reused sockets), of ${requests} requests (${fresh} on new sockets); retried ${retried.length}, recovered ${recovered}`;
 }
 
+/** `Edge: IAD 2310, EWR 150`: the edge locations the responses came from, from every file's edge note. */
+export function edgeSummary(notes: readonly string[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const n of notes) {
+    if (!n.startsWith(EDGE_PREFIX)) continue;
+    for (const part of n.slice(EDGE_PREFIX.length).split(", ")) {
+      const m = /^([A-Z]{3}) (\d+)$/.exec(part);
+      if (m)
+        counts.set(
+          m[1] as string,
+          (counts.get(m[1] as string) ?? 0) + Number(m[2]),
+        );
+    }
+  }
+  if (!counts.size) return undefined;
+  return `Edge: ${[...counts]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([c, k]) => `${c} ${k}`)
+    .join(", ")}`;
+}
+
 /** A request retried once on a new socket (src/transport.ts). */
 export const RETRIED_REQUEST_PREFIX = "request retried: ";
 /** The end of that note when the retry got a response. */
@@ -278,6 +325,7 @@ export function setupHookCase(
   file: string,
   cases: string[],
 ): CaseResult {
+  const drop = infras.length > 0 && infras.every(isNoAnswerMessage);
   // Every distinct infra message behind it, the hook's first.
   const all = [...new Set(infras)].join("; ");
   return {
@@ -285,6 +333,7 @@ export function setupHookCase(
     level: "infra",
     reason: `${redactReason(all)}; ${cases.length} case(s) in ${file} did not run`,
     blocked: { file, cases: [...cases] },
+    ...(drop ? { noAnswer: true as const } : {}),
   };
 }
 
@@ -306,6 +355,38 @@ function infraMessage(
   return typeof tag === "string" && tag.startsWith(INFRA_PREFIX)
     ? tag
     : undefined;
+}
+
+// The infra messages that mean "no answer at all". Each ends in a socket code
+// (NET_CODES), never an abort or timeout name, and none is a refusal: a setup
+// hook's refusal names a status and a body hash where these name a code.
+const NO_ANSWER_RES: readonly RegExp[] = [
+  // src/transport.ts: the tag on a fetch error that got no HTTP response.
+  /^infra: no_response ([A-Z][A-Z_]+) /,
+  // src/http.ts: a setup hook call that got no answer.
+  /^infra: setup \/__test\/[\w/-]+ no_response on [^\s()]+ \(([A-Z][A-Z_]+)\)$/,
+  // src/fetch-timeout.ts setupNetwork, src/creds.ts, src/refused.ts, src/http.ts sendProbe.
+  /^infra: .*got no response(?: twice| on [^\s()]+)? \(([A-Z][A-Z_]+)(?:; [^()]*)?\)$/,
+];
+
+/** True when `message` is an infra error that got no answer at all, by a socket code. */
+export function isNoAnswerMessage(message: unknown): boolean {
+  const m = String(message ?? "");
+  return NO_ANSWER_RES.some((re) => {
+    const code = re.exec(m)?.[1];
+    return code !== undefined && NET_CODES.has(code);
+  });
+}
+
+/** True when there is at least one error and every one is a no-answer infra error. */
+export function noAnswerOf(errors: readonly { message?: unknown }[]): boolean {
+  return (
+    errors.length > 0 &&
+    errors.every((e) => {
+      const m = infraMessage(e);
+      return m !== undefined && isNoAnswerMessage(m);
+    })
+  );
 }
 
 /**
@@ -602,6 +683,14 @@ const accepted = (c: CaseResult, run: RunKind) =>
   acceptedUnproven(c) !== undefined ||
   nightlyOnly(c, run);
 
+/** The cases that keep the gate from passing: every non-pass the gate does not accept. */
+export function gateFailures(
+  cases: readonly CaseResult[],
+  run: RunKind = {},
+): CaseResult[] {
+  return cases.filter((c) => c.level !== "pass" && !accepted(c, run));
+}
+
 export function gatePasses(
   cases: readonly CaseResult[],
   run: RunKind = {},
@@ -670,6 +759,11 @@ export function formatReport(r: Report): string {
     `Red-line report (${r.mode}): ${r.total} cases`,
     `  ${LEVELS.map((l) => `${l} ${r.counts[l]}`).join(", ")}`,
   ];
+  if (r.rerun)
+    lines.push(
+      `RERUN: the first run failed only on ${r.rerun.dropped.length} dropped connection(s) (no answer received): ${r.rerun.dropped.join("; ")}.`,
+      `  The whole gate ran once more. The result shown here is the SECOND run's and is final. The first run's report is kept at ${r.rerun.firstReport}.`,
+    );
   const nightly = r.nightlyOnly ?? [];
   const notPass = r.nonPass.filter(
     (c) => !acceptedUnproven(c) && !nightly.includes(c.name),
@@ -708,6 +802,17 @@ export function formatReport(r: Report): string {
     ...noted.flatMap((c) => c.notes ?? []),
   ]);
   if (resets) lines.push(resets);
+  const allNotes = [
+    ...(r.fileNotes ?? []).map((n) => n.note),
+    ...noted.flatMap((c) => c.notes ?? []),
+  ];
+  // Evidence lines (src/resets.ts, src/edge-probe.ts): never part of a verdict.
+  const edge = edgeSummary(allNotes);
+  if (edge) lines.push(edge);
+  const control = r.edge?.control;
+  if (control && control.sent > 0) lines.push(controlSummary(control));
+  const near = nearSummary(allNotes, control);
+  if (near) lines.push(near);
   const retried = r.cases.filter((c) =>
     c.notes?.some((n) => n.startsWith("case retried")),
   ).length;

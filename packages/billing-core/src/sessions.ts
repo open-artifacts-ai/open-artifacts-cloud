@@ -858,6 +858,12 @@ export async function ensureMonthlyPendingInvoices(
  * credit is a negative customer.balance; it is cleared with a balance
  * transaction of the opposite sign, only when the balance is below zero.
  * The key is credit-end-<subscription>, so a retry is one write.
+ *
+ * The whole balance goes, including any credit given for another reason
+ * (#2588 item 3), so the write records what it cleared: the transaction
+ * carries metadata (oa_reason credit_end, oa_subscription, oa_cleared, the
+ * amount in minor units) and the caller logs the amount. To give a credit
+ * back, an operator posts the opposite transaction for oa_cleared.
  */
 export async function clearCustomerCredit(
   input: { customerId: string; subscriptionId: string },
@@ -887,6 +893,9 @@ export async function clearCustomerCredit(
       amount: String(-balance),
       currency,
       description: "Credit ends with the plan",
+      "metadata[oa_reason]": "credit_end",
+      "metadata[oa_subscription]": sub,
+      "metadata[oa_cleared]": String(-balance),
     },
     `credit-end-${sub}`,
   );

@@ -44,7 +44,8 @@ import { callerRetries, freshAgent } from "./transport.ts";
 // prod install can run test hooks: every published prod release is the
 // signed `release` variant with the hooks define false, its bytes match the
 // signed sha, and they hold none of the hook SQL; every prod install's
-// /healthz has no testHooks and its script lists no hook secret or var.
+// /healthz has no testHooks and its script lists no hook secret or var, and
+// no staging-only var (DOCS_PREVIEW).
 // Configured with zero releases or zero installs is a pass (Manager, user's
 // decision 2026-10-30); a probe missing its R2 or inventory config, or a
 // missing releases bucket, is a fail, never not-applicable.
@@ -55,6 +56,8 @@ const PREFIX = "releases/";
 const MAX_STAGED = 5;
 const FLOOR = "releases/floor.json";
 const HOOK_NAMES = ["TEST_HOOK_KEY", "TEST_HOOKS"];
+/** Staging-only names (open-artifacts#2641: DOCS_PREVIEW opens doc creation). */
+const STAGING_ONLY_NAMES = ["DOCS_PREVIEW"];
 const MAX_KEYS = 200_000;
 
 /**
@@ -558,7 +561,7 @@ async function getJson(
   }
 }
 
-/** The script's secret names and settings bindings hold no hook name. */
+/** The script's secret names and settings bindings hold no hook or staging-only name. */
 type Get = (
   url: string,
   token: string | null,
@@ -590,6 +593,8 @@ async function checkScript(
   for (const n of [...secretNames, ...bindings.map((b) => b.name)])
     if (HOOK_NAMES.includes(String(n)))
       throw dirty(`script lists ${String(n)}`);
+    else if (STAGING_ONLY_NAMES.includes(String(n)))
+      throw dirty(`script lists ${String(n)} (staging only)`);
 }
 
 /**

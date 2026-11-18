@@ -259,7 +259,11 @@ describe("redline-nightly.yml", () => {
     expect(j.needs).toBe("pick");
     expect(j.if).toBe("needs.pick.outputs.run == 'true'");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(j.with).toEqual({ tag: "${{ needs.pick.outputs.tag }}" });
+    expect(j.with).toEqual({
+      tag: "${{ needs.pick.outputs.tag }}",
+      // The nightly runs every dashboard spec; a gate run only the @gate ones.
+      t19_full: true,
+    });
     expect(j.permissions).toEqual({
       contents: "read",
       "id-token": "write",

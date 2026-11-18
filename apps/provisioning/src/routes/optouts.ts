@@ -320,31 +320,44 @@ const page = (title: string, inner: string) =>
     `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${title}</title><style>${STYLE}</style><body>${inner}</body></html>`,
     { headers: UNSUB_HEADERS },
   );
+const BRAND = "<p><strong>Open Artifacts</strong></p>";
 const confirmPage = (token: string) =>
   page(
-    "Unsubscribe",
-    `<h1>Unsubscribe</h1><p>Stop emails from all of Open Artifacts to this address.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Stop emails from all of Open Artifacts</button></form>`,
+    "Stop these emails?",
+    `${BRAND}<h1>Stop these emails?</h1><p>We won't email you again when someone shares a page with you, from any team on Open Artifacts.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Don't email me again</button></form>`,
   );
-/** Undo shows only for the link that added the opt-out (canUndo). */
-const donePage = (token: string, canUndo: boolean) =>
-  page(
-    "Unsubscribed",
-    `<h1>You are unsubscribed</h1><p>You will not get share emails from Open Artifacts at this address.</p>${
-      canUndo
-        ? `<form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><input type="hidden" name="action" value="undo"><button type="submit">Undo</button></form>`
-        : ""
-    }`,
-  );
+/** Undo shows only for the link that added the opt-out (canUndo, #2665). */
+const undoForm = (token: string, canUndo: boolean) =>
+  canUndo
+    ? `<form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><input type="hidden" name="action" value="undo"><button type="submit">Undo</button></form>`
+    : "";
+const donePage = (scopedToTeam: boolean, token: string, canUndo: boolean) =>
+  scopedToTeam
+    ? page(
+        "You won't get emails from this team again.",
+        `${BRAND}<h1>You won't get emails from this team again.</h1><p>We've stopped emails to you about pages shared from this team. Other teams on Open Artifacts can still email you for now; we're reviewing that. Pages shared with you still open when you log in.</p>${undoForm(token, canUndo)}`,
+      )
+    : page(
+        "You won't get these emails again.",
+        `${BRAND}<h1>You won't get these emails again.</h1><p>Pages shared with you still open when you log in. We just won't email you about them.</p>${undoForm(token, canUndo)}`,
+      );
 const undonePage = (token: string) =>
   page(
-    "Subscribed again",
-    `<h1>You'll get share emails from Open Artifacts again</h1><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Stop emails from all of Open Artifacts</button></form>`,
+    "You'll get share emails from Open Artifacts again.",
+    `${BRAND}<h1>You'll get share emails from Open Artifacts again.</h1><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Don't email me again</button></form>`,
   );
 const bad = () =>
-  new Response("Bad request", {
-    status: 400,
-    headers: { "cache-control": "no-store", "referrer-policy": "no-referrer" },
-  });
+  new Response(
+    "This link doesn't work. Open the most recent email from us and use the link there.",
+    {
+      status: 400,
+      headers: {
+        "cache-control": "no-store",
+        "referrer-policy": "no-referrer",
+        "content-type": "text/plain; charset=utf-8",
+      },
+    },
+  );
 
 /**
  * The token, and whether this is an Undo: only a form POST body names
@@ -379,17 +392,18 @@ async function standing(
   h2: string,
   install: string,
   uk: string,
-): Promise<{ own: boolean; listed: boolean }> {
+): Promise<{ own: boolean; listed: boolean; all: boolean }> {
   const r = await env.PLATFORM_DB.prepare(
     `SELECT
        EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1 AND source = 'recipient' AND undo_key = ?3)
        OR EXISTS (SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND undo_key = ?3) AS own,
        EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1)
-       OR EXISTS (SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND install_id = ?2) AS listed`,
+       OR EXISTS (SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND install_id = ?2) AS listed,
+       EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1) AS allrow`,
   )
     .bind(h2, install, uk)
-    .first<{ own: number; listed: number }>();
-  return { own: r?.own === 1, listed: r?.listed === 1 };
+    .first<{ own: number; listed: number; allrow: number }>();
+  return { own: r?.own === 1, listed: r?.listed === 1, all: r?.allrow === 1 };
 }
 
 /** GET (the confirm page, no change) and POST (the opt-out) of /unsubscribe. */
@@ -434,7 +448,7 @@ export async function unsubscribe(
     // A later visit: listed shows the done page (with Undo for the link that
     // added it); otherwise the confirm page. GET never writes.
     const st = await standing(env, h2, named.install, uk);
-    return st.listed ? donePage(token, st.own) : confirmPage(token);
+    return st.listed ? donePage(!st.all, token, st.own) : confirmPage(token);
   }
   if (undo) {
     // Only this token's own recipient rows go; bounce and complaint rows, and
@@ -459,7 +473,7 @@ export async function unsubscribe(
       ]);
     }
     const st = await standing(env, h2, named.install, uk);
-    return st.listed ? donePage(token, false) : undonePage(token);
+    return st.listed ? donePage(!st.all, token, false) : undonePage(token);
   }
 
   // Per minting install: a warn line at 150. Past 200 the opt-out is stored
@@ -510,6 +524,7 @@ export async function unsubscribe(
         JSON.stringify({ hash: h2.slice(0, 8), scope }),
       )
       .run();
+  // Whichever is true now: the platform-wide row exists, or only this team's.
   const st = await standing(env, h2, named.install, uk);
-  return donePage(token, st.own);
+  return donePage(!st.all, token, st.own);
 }

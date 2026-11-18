@@ -200,7 +200,11 @@ describe("check, mint and the public unsubscribe", () => {
     const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
     const r = await unsub(e, token, { method: "GET" });
     expect(r.status).toBe(200);
-    expect(await r.text()).toContain("Stop emails from all of Open Artifacts");
+    const html = await r.text();
+    expect(html).toContain("<strong>Open Artifacts</strong>");
+    expect(html).toContain("<h1>Stop these emails?</h1>");
+    expect(html).toContain("from any team on Open Artifacts.");
+    expect(html).toContain("Don't email me again");
     expect(await rows()).toHaveLength(0);
     expect(r.headers.get("cache-control")).toBe("no-store");
     expect(r.headers.get("referrer-policy")).toBe("no-referrer");
@@ -264,7 +268,9 @@ describe("check, mint and the public unsubscribe", () => {
       for (const method of ["GET", "POST"]) {
         const r = await unsub(e, token, { method });
         expect(r.status).toBe(400);
-        expect(await r.text()).toBe("Bad request");
+        expect(await r.text()).toBe(
+          "This link doesn't work. Open the most recent email from us and use the link there.",
+        );
       }
     }
     expect(await rows()).toHaveLength(0);
@@ -413,6 +419,28 @@ describe("check, mint and the public unsubscribe", () => {
       .then((r) => r.results.map((x) => x.install_id));
   const real = () => ({ now: Date.now() });
 
+  it("the done page says all-scope normally and this-team when stored install-scoped; a repeat shows what is true now", async () => {
+    const e = await world();
+    const normal = await (
+      await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()))
+    ).text();
+    expect(normal).toContain("You won't get these emails again.");
+    expect(normal).toContain("We just won't email you about them.");
+    await overCap(e, otherId);
+    const scopedPage = await (
+      await unsub(e, await mintToken(TOKEN_KEY, otherId, H1B, Date.now()))
+    ).text();
+    expect(scopedPage).toContain("You won't get emails from this team again.");
+    expect(scopedPage).toContain(
+      "Other teams on Open Artifacts can still email you for now",
+    );
+    // Repeat of an address that now has an 'all' row: the normal page.
+    const repeat = await (
+      await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()))
+    ).text();
+    expect(repeat).toContain("You won't get these emails again.");
+  });
+
   it("two installs' install-scoped rows for one address coexist; a body-supplied install id is ignored", async () => {
     const e = await world();
     await overCap(e, id);
@@ -530,7 +558,7 @@ describe("recipient undo (#2665): only the link that added it", () => {
     expect(r.status).toBe(200);
     const text = await r.text();
     expect(text).toContain("again");
-    expect(text).toContain("Stop emails from all of Open Artifacts");
+    expect(text).toContain("Don't email me again");
     expect(await rows()).toHaveLength(0);
     expect(await checkOf(e)).toBe(false);
     const a = await undoAudit();
@@ -564,7 +592,7 @@ describe("recipient undo (#2665): only the link that added it", () => {
       const r = await (
         await unsub(e, later, { form: true, action: "undo" })
       ).text();
-      expect(r).toContain("You are unsubscribed");
+      expect(r).toContain("You won't get these emails again.");
       expect(r).not.toContain('value="undo"');
     }
     expect(await rows()).toHaveLength(1);
@@ -619,11 +647,11 @@ describe("recipient undo (#2665): only the link that added it", () => {
     const e = await world();
     const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
     expect(await (await unsub(e, token, { method: "GET" })).text()).toContain(
-      "<h1>Unsubscribe</h1>",
+      "<h1>Stop these emails?</h1>",
     );
     await unsub(e, token);
     const later = await (await unsub(e, token, { method: "GET" })).text();
-    expect(later).toContain("You are unsubscribed");
+    expect(later).toContain("You won't get these emails again.");
     expect(later).toContain('value="undo"');
     const r = await handle(
       new Request(`${SIGNUP}/unsubscribe?t=${token}&action=undo`, {

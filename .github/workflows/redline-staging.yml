@@ -87,6 +87,13 @@ on:
         type: string
         required: false
         default: ""
+      # The nightly and the dry run pass true: T19 runs every spec. Unset (a gate
+      # dispatch can't set it, workflow_dispatch has no such input) it runs only
+      # the specs tagged @gate, the short happy path that blocks a release.
+      t19_full:
+        type: boolean
+        required: false
+        default: false
     # The four secrets this file names, each declared so a called run's jobs
     # can resolve it (without a declaration, t19-dry-run 43183209806 got an
     # empty CLOUDFLARE_API_TOKEN). The jobs that use them declare their
@@ -185,6 +192,15 @@ jobs:
   # from the job's start: setup 5, bring-up 60, seal 10, suite (bus lane) 31,
   # t19-done cap at 110, revoke of rl-a and rl-b 40: 150; the pair's revoke
   # fits only in what a faster run leaves, never past 145.
+  #
+  # The automatic rerun (tests/redline/src/rerun.ts: the whole gate once more
+  # when the first run failed only on dropped connections) is a second suite
+  # of up to 31 min inside the same step, so it fits only in what a faster
+  # bring-up leaves: it starts only if now + 31 + 5 min margin <= job start +
+  # 150 - 40 (revoke) - 5 = 105 min, so at the latest about 69 min in. That is
+  # before the worst-case suite start (75), so on a worst-case bring-up there
+  # is no rerun and the gate fails as before. Without REDLINE_JOB_STARTED_AT
+  # (or with a value that is not a number) there is no rerun here either.
   t19:
     name: t19
     needs: platform-tags
@@ -330,6 +346,7 @@ jobs:
         name: Run T19
         env:
           T19_EXPECT_TIER: team
+          T19_FULL: ${{ inputs.t19_full }}
         run: |
           set -euo pipefail
           # The pin (#1251): the version the staged step saw on rl-a's and
@@ -339,9 +356,58 @@ jobs:
           T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/t19-sealed/version.txt")"
           if [ -z "$T19_EXPECT_VERSION" ]; then echo "T19: no staged version to pin"; exit 1; fi
           export T19_EXPECT_VERSION
+          # The set (the user's "trim", 2026-11-18): a gate run (T19_FULL unset)
+          # runs only the specs tagged @gate, which live beside the tests in
+          # apps/dashboard/e2e/staging; the nightly and the dry run (T19_FULL
+          # true) run every spec. A tag's public version without any @gate spec
+          # falls back to every spec, never to none. The selection is counted
+          # with --list first (with --shard, an empty --grep exits 0 on
+          # Playwright 1.64.1), and a count of zero fails the step.
+          pw() { pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts "$@"; }
+          # Sets N to the number of tests a selection lists. A list that fails
+          # for any reason but "No tests found" (which Playwright 1.64.1 exits
+          # 1 with when a --grep matches nothing and there is no --shard) stops
+          # the step: a broken list is never read as zero.
+          N=0
+          list() {
+            local out rc=0
+            out="$(pw --list "$@" 2>&1)" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              N="$(printf '%s\n' "$out" | sed -n 's/^Total: \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' | tail -1)"
+              [ -n "$N" ] || { echo "T19: could not list the tests (no total in the list output)"; exit 1; }
+            elif printf '%s\n' "$out" | grep -q 'No tests found'; then
+              N=0
+            else
+              echo "T19: could not list the tests (exit $rc)"
+              printf '%s\n' "$out" | tail -n 20
+              exit 1
+            fi
+          }
+          # @gate, then a space or the end: a tag like @gated or @gateway never matches.
+          GATE_RE='@gate(\s|$)'
+          list
+          total="$N"
+          if [ "$total" -lt 1 ]; then echo "T19: the selection (all) matched no test"; exit 1; fi
+          sel=()
+          set_name=all
+          if [ "${T19_FULL:-}" != true ]; then
+            list --grep "$GATE_RE"
+            if [ "$N" -gt 0 ]; then
+              gated="$N"
+              list --grep "$GATE_RE" --project "rl-a guard"
+              if [ "$N" -lt 1 ]; then echo "T19: the @gate set has no case of the rl-a guard project"; exit 1; fi
+              sel=(--grep "$GATE_RE")
+              set_name=gate
+              total="$gated"
+            else
+              echo "::warning title=T19 gate set::no spec is tagged @gate in this release's public version; running every spec"
+            fi
+          fi
+          echo "T19 set: $set_name, $total tests"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "T19 set: $set_name, $total tests" >> "$GITHUB_STEP_SUMMARY"; fi
           # --trace overrides the config's CI "off": a failed case keeps a trace,
           # scrubbed by the next step before anything is uploaded (#281).
-          pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure
+          pw --trace retain-on-failure "${sel[@]}"
       # The report folder is public. A trace holds cookies, Authorization and
       # hook-key headers, bodies, console lines and DOM snapshots, so every
       # trace zip is rebuilt from an allowlist (timings, methods, statuses, URLs
