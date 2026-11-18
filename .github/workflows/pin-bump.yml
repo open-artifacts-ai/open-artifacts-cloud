@@ -17,6 +17,11 @@
 #   runs `pnpm install --lockfile-only` (it reads the public tree's pnpmfile,
 #   npmrc and workspace config, so it is inside no trust boundary) and uploads
 #   pnpm-lock.yaml, as data, and nothing else.
+#   It then runs the public workspace's dependency install and build code
+#   (--ignore-scripts, but the build is public code), so NOTHING from this job is
+#   trusted beyond its two artifacts, and `open` re-validates both as data. A
+#   future cache in any job that holds secrets would make this cache poisoning,
+#   so none may be added.
 #   It also derives the surfaces port's mechanical files (tests/redline/live/manifest.json,
 #   test/cases-added.ts and the counts in test/surfaces.test.ts) from the overlaid
 #   tree's src/surfaces.ts, with an install that runs no scripts, and uploads only
@@ -105,6 +110,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lock"
           cp pnpm-lock.yaml "$RUNNER_TEMP/lock/pnpm-lock.yaml"
       # Only the lockfile and the surfaces plan leave this job, and open takes them as data.
+      # The lockfile is uploaded before any public build code runs, and v4
+      # artifacts can't be overwritten by name, so the build can't swap it.
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

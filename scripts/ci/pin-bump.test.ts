@@ -455,6 +455,15 @@ describe("pin-bump.yml", () => {
       (s) => s.name === "Regenerate the merged lockfile",
     );
     expect(prep.indexOf(plan)).toBeGreaterThan(lock);
+    // The lockfile leaves before any public build code runs (v4 artifacts can't
+    // be overwritten by name, so the build can't swap it).
+    const upLock = prep.findIndex(
+      (s) =>
+        s.uses?.startsWith("actions/upload-artifact@") &&
+        s.with?.name?.startsWith("pin-bump-lock-"),
+    );
+    expect(upLock).toBeGreaterThan(lock);
+    expect(upLock).toBeLessThan(prep.indexOf(plan));
   });
 
   it("writes only with the release App's token, scoped to contents and PRs", () => {

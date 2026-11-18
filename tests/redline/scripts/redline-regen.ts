@@ -196,7 +196,10 @@ async function main(argv: string[]) {
     if (!out) throw new Error("plan needs --out <file>");
     const c = await computePlan(root);
     writeFileSync(out, `${JSON.stringify(c, null, 2)}\n`);
-    for (const h of c.hints) console.log(`::warning::classify: ${h}`);
+    for (const h of c.hints)
+      console.log(
+        `::warning::classify: ${h.replace(/[\r\n]+/g, " ").replaceAll("::", ": :")}`,
+      );
     console.log(
       `redline-regen: plan of ${c.plan.names.length} cases in ${out}`,
     );
