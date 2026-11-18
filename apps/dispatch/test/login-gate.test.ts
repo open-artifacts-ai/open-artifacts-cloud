@@ -153,11 +153,12 @@ describe("LoginGate", () => {
     expect(loginProps(exports, A, "acme", { LOGIN_CHANGE: "1" })).toEqual({});
     expect(made).toHaveLength(0);
     const out = loginProps(exports, A, "acme", on);
-    expect(Object.keys(out)).toEqual(["LOGIN"]);
+    expect(Object.keys(out).sort()).toEqual(["LOGIN", "LOGIN_EDITABLE"]);
+    expect(out.LOGIN_EDITABLE).toBe(true);
     expect(made).toEqual([{ installId: A }]);
   });
 
-  it("with the switch off, only a listed slug gets the stub (#2520)", () => {
+  it("with the switch off, every install gets the stub; only a listed slug is LOGIN_EDITABLE (#2520)", () => {
     const made: LoginGateProps[] = [];
     const exports = {
       LoginGate: (o: { props: LoginGateProps }) => {
@@ -170,11 +171,14 @@ describe("LoginGate", () => {
       LOGIN_CHANGE: "0",
       LOGIN_CHANGE_SLUGS: " leo , other ",
     };
-    expect(Object.keys(loginProps(exports, A, "leo", off))).toEqual(["LOGIN"]);
-    expect(loginProps(exports, A, "acme", off)).toEqual({});
-    expect(loginProps(exports, A, "le", off)).toEqual({});
-    expect(loginProps(exports, A, "", off)).toEqual({});
-    expect(loginProps(exports, A, "leo", { LOGIN: {} as Fetcher })).toEqual({});
-    expect(made).toEqual([{ installId: A }]);
+    expect(loginProps(exports, A, "leo", off).LOGIN_EDITABLE).toBe(true);
+    for (const slug of ["acme", "le", ""]) {
+      const p = loginProps(exports, A, slug, off);
+      expect(Object.keys(p), slug).toEqual(["LOGIN"]);
+    }
+    expect(
+      Object.keys(loginProps(exports, A, "leo", { LOGIN: {} as Fetcher })),
+    ).toEqual(["LOGIN"]);
+    expect(made).toHaveLength(5);
   });
 });

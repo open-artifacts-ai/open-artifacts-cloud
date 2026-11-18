@@ -23,9 +23,9 @@ export interface LoginGateProps {
 export interface LoginGateEnv {
   LOGIN: Fetcher;
   /**
-   * As provisioning's (#2520): "1" gives every install the gate; otherwise
-   * only the installs whose slug LOGIN_CHANGE_SLUGS lists. An install without
-   * the gate shows no editable login form, so it never posts to a 404.
+   * As provisioning's (#2520): "1" marks every install LOGIN_EDITABLE;
+   * otherwise only the installs whose slug LOGIN_CHANGE_SLUGS lists. An
+   * install without it shows no editable login form, so it never posts to a 404.
    */
   LOGIN_CHANGE?: string;
   LOGIN_CHANGE_SLUGS?: string;
@@ -117,23 +117,25 @@ export class LoginGate extends WorkerEntrypoint<LoginGateEnv, LoginGateProps> {
 }
 
 /**
- * The install's login gate for one request, for that install only. Nothing
- * when the caller has no LOGIN binding, or when the switch is off and the
- * install's slug (from its app host, "" when unknown) isn't listed.
+ * The install's login gate for one request, for that install only, whenever
+ * the caller has the LOGIN binding (the opt-out list rides it too, #2652).
+ * LOGIN_EDITABLE (true) tells the install its owner may change the login
+ * domains: the switch is on, or its slug (from its app host, "" when unknown)
+ * is listed. Without it the install shows no editable form (#2802).
  */
 export function loginProps(
   exports: { LoginGate: (o: { props: LoginGateProps }) => Fetcher },
   installId: string,
   slug: string,
   env: Partial<LoginGateEnv>,
-): { LOGIN?: Fetcher } {
+): { LOGIN?: Fetcher; LOGIN_EDITABLE?: true } {
   if (!env.LOGIN) return {};
-  if (env.LOGIN_CHANGE !== "1") {
-    const listed = (env.LOGIN_CHANGE_SLUGS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s !== "");
-    if (slug === "" || !listed.includes(slug)) return {};
-  }
-  return { LOGIN: exports.LoginGate({ props: { installId } }) };
+  const LOGIN = exports.LoginGate({ props: { installId } });
+  const listed = (env.LOGIN_CHANGE_SLUGS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  const editable =
+    env.LOGIN_CHANGE === "1" || (slug !== "" && listed.includes(slug));
+  return editable ? { LOGIN, LOGIN_EDITABLE: true } : { LOGIN };
 }
