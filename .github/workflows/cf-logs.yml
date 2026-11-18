@@ -77,12 +77,14 @@ jobs:
           URL="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/workers/observability/telemetry/query"
 
           # Public log: never print error text. Each error becomes its class
-          # (leading identifier up to ':' or a space, else "error") and the
-          # first 8 hex of the sha256 of the full message. Reads "count<TAB>msg".
+          # and the first 8 hex of the sha256 of the full message. The class is
+          # the leading word only when it has a fixed shape (FooError,
+          # FooException, D1_ERROR); any other leading word could be a name, id
+          # or slug, so it prints as "error". Reads "count<TAB>msg".
           errline() {
             local n msg class
             while IFS=$'\t' read -r n msg; do
-              if [[ $msg =~ ^([A-Za-z_][A-Za-z0-9_]{0,39})([:\ ]|$) ]]; then
+              if [[ $msg =~ ^([A-Z][A-Za-z0-9]{0,39}(Error|Exception)|D1_ERROR)([:\ ]|$) ]]; then
                 class=${BASH_REMATCH[1]}
               else
                 class=error
@@ -112,7 +114,7 @@ jobs:
               -H "Authorization: Bearer $CF_READ_TOKEN" -H 'Content-Type: application/json' \
               --data "$body") || { echo "::error::call '$1' failed to connect"; exit 1; }
             if [ "$code" != 200 ]; then
-              cfcode=$(jq -r '.errors[0].code // "none"' resp.json 2>/dev/null || echo none)
+              cfcode=$(jq -r '.errors[0].code | numbers // "none"' resp.json 2>/dev/null || echo none)
               echo "::error::call '$1' (POST workers/observability/telemetry/query) failed: HTTP $code, Cloudflare error code $cfcode (token missing Workers Observability read?)"
               exit 1
             fi
@@ -123,7 +125,7 @@ jobs:
           # rows, or a single "0<TAB>none" row when there are truly none.
           rows() {
             jq -e '.result.calculations | type == "array"' resp.json > /dev/null \
-              || { echo "::error::call '$1': no result.calculations in the response"; exit 1; }
+              || { echo "::error::call '$1': no result.calculations in the response" >&2; exit 1; }
             jq -r '(.result.calculations[0].aggregates // []) as $a
               | if ($a | length) == 0 then "0\tnone"
                 else $a[] | "\(.count // .value)\t\(.groups[0].value // "none" | tostring | gsub("[\\r\\n\\t]"; " "))" end' resp.json

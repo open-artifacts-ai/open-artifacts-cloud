@@ -80,18 +80,33 @@ describe("cf-logs.yml", () => {
     expect(fn).toBeDefined();
     const msg =
       "TypeError: cannot reach acme.com for Jane Doe id a1b2c3d4e5f6a7b8";
+    const hex = "0123456789abcdef0123456789abcdef";
     const out = spawnSync("bash", ["-c", `${fn}\nerrline`], {
-      input: `3\t${msg}\n2\tJane Doe failed\n`,
+      input: `3\t${msg}\n2\tJane Doe failed\n4\talice123 is not a member\n5\t${hex}\n6\tD1_ERROR: no such table x\n7\tAcmeCorp: down\n`,
       encoding: "utf8",
     }).stdout;
     const hash = createHash("sha256").update(msg).digest("hex").slice(0, 8);
     expect(out).toContain(`- 3: TypeError #${hash}`);
-    expect(out).toContain("- 2: Jane #");
-    for (const leak of ["acme.com", "Doe", "a1b2c3d4e5f6a7b8", "cannot"])
+    expect(out).toContain("- 2: error #");
+    expect(out).toContain("- 4: error #");
+    expect(out).toContain("- 5: error #");
+    expect(out).toContain("- 6: D1_ERROR #");
+    expect(out).toContain("- 7: error #");
+    for (const leak of [
+      "acme.com",
+      "Jane",
+      "Doe",
+      "a1b2c3d4e5f6a7b8",
+      "cannot",
+      "alice123",
+      hex,
+      "AcmeCorp",
+    ])
       expect(out).not.toContain(leak);
     expect(text).toContain("Cloudflare error code");
     expect(text).not.toMatch(/cat resp\.json|jq \. resp\.json/);
     expect(text).toContain("Axe review");
-    expect(text).toContain("no result.calculations in the response");
+    expect(text).toContain('no result.calculations in the response" >&2');
+    expect(text).toContain(".errors[0].code | numbers");
   });
 });
