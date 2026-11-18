@@ -18,6 +18,7 @@ import {
   UNSUB_PER_IP_HOUR,
   UNSUB_STYLE,
   UNSUB_STYLE_HASH,
+  unsubscribe,
 } from "../src/routes/optouts.js";
 import {
   ctx,
@@ -137,25 +138,26 @@ const unsub = (
 ) => {
   const method = o.method ?? "POST";
   const url = `${SIGNUP}/unsubscribe${o.form ? "" : `?t=${token}`}`;
-  return handle(
-    new Request(url, {
-      method,
-      headers: {
-        "cf-connecting-ip": o.ip ?? "203.0.113.7",
-        ...(o.form
-          ? { "content-type": "application/x-www-form-urlencoded" }
-          : {}),
-      },
-      body:
-        method === "POST"
-          ? o.form
-            ? `t=${token}${o.action ? `&action=${o.action}` : ""}`
-            : "List-Unsubscribe=One-Click"
-          : undefined,
-    }),
-    e,
-    ctx(),
-  );
+  const r = new Request(url, {
+    method,
+    headers: {
+      "cf-connecting-ip": o.ip ?? "203.0.113.7",
+      ...(o.form
+        ? { "content-type": "application/x-www-form-urlencoded" }
+        : {}),
+    },
+    body:
+      method === "POST"
+        ? o.form
+          ? `t=${token}${o.action ? `&action=${o.action}` : ""}`
+          : "List-Unsubscribe=One-Click"
+        : undefined,
+  });
+  // A pinned clock skips the app's routing and hands the route its own now
+  // (#383: the day-window cases seed a counter for that same window).
+  return o.now === undefined
+    ? handle(r, e, ctx())
+    : unsubscribe(r, e, o.ip ?? "203.0.113.7", o.now);
 };
 
 describe("check, mint and the public unsubscribe", () => {
@@ -401,11 +403,7 @@ describe("check, mint and the public unsubscribe", () => {
       .prepare(
         "INSERT INTO rate_counters (key, window_start, count) VALUES (?1, ?2, ?3) ON CONFLICT (key, window_start) DO UPDATE SET count = ?3",
       )
-      .bind(
-        `optout:addday:${who}`,
-        Date.now() - (Date.now() % 86_400_000),
-        ADDS_PER_DAY,
-      )
+      .bind(`optout:addday:${who}`, NOW - (NOW % 86_400_000), ADDS_PER_DAY)
       .run();
     return who;
   };
@@ -417,27 +415,27 @@ describe("check, mint and the public unsubscribe", () => {
       .bind(h2)
       .all<{ install_id: string }>()
       .then((r) => r.results.map((x) => x.install_id));
-  const real = () => ({ now: Date.now() });
+  const real = () => ({ now: NOW });
+  // Every over-cap case runs at NOW, the window overCap seeds (#383).
+  const unsubAt = async (
+    e: Awaited<ReturnType<typeof world>>,
+    who: string,
+    h1: string,
+  ) => unsub(e, await mintToken(TOKEN_KEY, who, h1, NOW), { now: NOW });
 
   it("the done page says all-scope normally and this-team when stored install-scoped; a repeat shows what is true now", async () => {
     const e = await world();
-    const normal = await (
-      await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()))
-    ).text();
+    const normal = await (await unsubAt(e, id, H1)).text();
     expect(normal).toContain("You won't get these emails again.");
     expect(normal).toContain("We just won't email you about them.");
     await overCap(e, otherId);
-    const scopedPage = await (
-      await unsub(e, await mintToken(TOKEN_KEY, otherId, H1B, Date.now()))
-    ).text();
+    const scopedPage = await (await unsubAt(e, otherId, H1B)).text();
     expect(scopedPage).toContain("You won't get emails from this team again.");
     expect(scopedPage).toContain(
       "Other teams on Open Artifacts can still email you for now",
     );
     // Repeat of an address that now has an 'all' row: the normal page.
-    const repeat = await (
-      await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()))
-    ).text();
+    const repeat = await (await unsubAt(e, otherId, H1)).text();
     expect(repeat).toContain("You won't get these emails again.");
   });
 
@@ -446,8 +444,8 @@ describe("check, mint and the public unsubscribe", () => {
     await overCap(e, id);
     await overCap(e, otherId);
     const h2 = await storedHash(STORE, H1);
-    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
-    await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()));
+    await unsubAt(e, id, H1);
+    await unsubAt(e, otherId, H1);
     expect(await scoped(h2)).toEqual([id, otherId].sort());
     expect(await rows()).toHaveLength(0);
     // check is by the gate's install; a body naming another install is a strict-body 400.
@@ -464,10 +462,10 @@ describe("check, mint and the public unsubscribe", () => {
     const e = await world();
     const h2 = await storedHash(STORE, H1);
     await overCap(e, id);
-    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    await unsubAt(e, id, H1);
     expect(await scoped(h2)).toEqual([id]);
     // Another install, under its cap, redeems the same address: widened.
-    await unsub(e, await mintToken(TOKEN_KEY, otherId, H1, Date.now()));
+    await unsubAt(e, otherId, H1);
     expect(await rows()).toHaveLength(1);
     expect(await scoped(h2)).toEqual([]);
     expect(
@@ -481,7 +479,7 @@ describe("check, mint and the public unsubscribe", () => {
       ).json(),
     ).toEqual({ optedOut: true });
     // The first install, now over its cap again, never narrows the all row.
-    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    await unsubAt(e, id, H1);
     expect(await rows()).toHaveLength(1);
     expect(await scoped(h2)).toEqual([]);
   });
@@ -490,7 +488,7 @@ describe("check, mint and the public unsubscribe", () => {
     const e = await world();
     await overCap(e, id);
     const h2 = await storedHash(STORE, H1);
-    await unsub(e, await mintToken(TOKEN_KEY, id, H1, Date.now()));
+    await unsubAt(e, id, H1);
     expect(await rows()).toHaveLength(0);
     // The operator SQL from docs/ops/hosted.md.
     await db.batch([
