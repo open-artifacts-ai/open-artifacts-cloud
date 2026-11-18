@@ -418,6 +418,13 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_SESSION_KEY" },
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
+  // The staging tag turns the opt-out list on (open-artifacts#2652).
+  ...(env === "staging"
+    ? [
+        { type: "secret_text", name: "OPTOUT_STORE_KEY" },
+        { type: "secret_text", name: "OPTOUT_TOKEN_KEY" },
+      ]
+    : []),
 ];
 for (const [p, env] of [
   ["s", "staging"],
@@ -450,6 +457,9 @@ for (const [p, env] of [
       service: `oa-${p}-billing`,
       entrypoint: "BillingProvisionerRpc",
     });
+    // Staging's tag turns the opt-out list on (open-artifacts#2652): its root key.
+    if (env === "staging")
+      o.result.bindings.push({ type: "secret_text", name: "OPTOUT_ROOT_KEY" });
     return JSON.stringify(o);
   })();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
@@ -1065,6 +1075,8 @@ describe("deploy-hosted-platform.sh", () => {
           const base = {
             exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
             queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+            // Staging's tag turns the opt-out list on: the provisioner's root key.
+            secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY"] },
           };
           const live = setup({ ...base, files: VERIFY_FILES }).run(
             app,
@@ -1087,6 +1099,7 @@ describe("deploy-hosted-platform.sh", () => {
             configs: { [app]: withoutBilling(APP_CONFIG(app)) },
             exists: [...DEPS[app], `oa-s-${app}`],
             queues: base.queues,
+            secrets: base.secrets,
             files: {
               ...VERIFY_FILES,
               [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
@@ -1405,7 +1418,9 @@ describe("deploy-hosted-platform.sh", () => {
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) =>
-            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
+            b.name !== "PROD_BUS_ALL" &&
+            b.name !== "OAUTH_BORN_D1" &&
+            b.name !== "OPTOUT_LIST",
         );
       return JSON.stringify(next);
     };
@@ -3443,6 +3458,8 @@ describe("deploy-hosted-platform.sh", () => {
       expect(sp).toContain('"domains":[]');
       expect(puts(r.log)).toEqual([
         "ADMIN_SESSION_KEY",
+        "OPTOUT_STORE_KEY",
+        "OPTOUT_TOKEN_KEY",
         "ADMIN_BROKER_KEY",
         "ADMIN_IDENTITIES",
         "SIGNUP_BROKER_KEY",
@@ -3465,6 +3482,110 @@ describe("deploy-hosted-platform.sh", () => {
         expect(puts(none.log)).not.toContain("TURNSTILE_SITEKEY");
         expect(none.err).toContain("TURNSTILE_SITEKEY not set");
       }
+    });
+  });
+
+  describe("the opt-out keys (open-artifacts#2652): only where the tag's config turns the list on", () => {
+    const KEYS = ["OPTOUT_STORE_KEY", "OPTOUT_TOKEN_KEY"];
+    const stg = ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"];
+    const widgets = {
+      "widgets.json": JSON.stringify([
+        { name: "oa-s-turnstile", sitekey: "0x4AAAAAAAtest_key-1" },
+      ]),
+    };
+    const base = ["ADMIN_BROKER_KEY", "ADMIN_IDENTITIES", "ADMIN_SESSION_KEY"];
+    const live = [...base, ...KEYS, "SIGNUP_BROKER_KEY"];
+    const SKEY = "install:i00000signup";
+    const AKEY = "install:i000000admin";
+    const entry = (id: string, origin: string) =>
+      JSON.stringify({
+        installId: id,
+        origin,
+        keys: [{ kid: "k".repeat(16), x: "x".repeat(43) }],
+        domains: [],
+      });
+    const files = {
+      ...widgets,
+      "kvns.json": JSON.stringify([
+        { id: OAUTH, title: "oa-s-provisioning-oauth" },
+      ]),
+      [`kv-${REG}-${AKEY}`]: entry(
+        "i000000admin",
+        "https://admin.open-artifacts-staging.app",
+      ),
+      [`kv-${REG}-${SKEY}`]: entry(
+        "i00000signup",
+        "https://signup.open-artifacts-staging.app",
+      ),
+    };
+    const go = (
+      secrets: string[],
+      extra: Record<string, string> = {},
+      env: Record<string, string> = {},
+    ) =>
+      setup({
+        exists: stg,
+        secrets: { "oa-s-provisioning": secrets },
+        files: { ...files, ...extra },
+      }).run("provisioning", { NEW_KV: OAUTH, ...env }, "staging");
+
+    it("staging: both are generated once when absent, never printed", () => {
+      const r = go(base.concat("SIGNUP_BROKER_KEY"));
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).toContain(k);
+      clean(r);
+    });
+    it("staging: present keys are never overwritten, even when the list is read wrongly empty", () => {
+      const r = go(live);
+      expect(r.code, r.err).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).not.toContain(k);
+      const again = go(live, { "empty-secret-reads": "99" });
+      for (const k of KEYS) expect(puts(again.log)).not.toContain(k);
+    });
+    it("staging: the read-back requires them", () => {
+      const r = go(
+        live.filter((n) => n !== "OPTOUT_TOKEN_KEY"),
+        {},
+        { VERIFY_ONLY: "1" },
+      );
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("secrets are");
+    });
+    it("prod (OPTOUT_LIST 0): neither is made and neither is allowed", () => {
+      const r = setup({
+        exists: ["oa-p-provisioner", "oa-p-auth-broker"],
+      }).run("provisioning");
+      expect(r.code, r.err).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).not.toContain(k);
+    });
+    it("provisioner staging: OPTOUT_ROOT_KEY is made once, before the one deploy; absent from prod", () => {
+      const r = setup({ exists: ["oa-s-billing"] }).run(
+        "provisioner",
+        {},
+        "staging",
+      );
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual(["OPTOUT_ROOT_KEY"]);
+      // Put before the one deploy: the Worker never serves without it.
+      const w = r.log.flatMap((l, i) =>
+        l.startsWith("wrapper provisioner") ? [i] : [],
+      );
+      expect(w).toHaveLength(1);
+      const put = r.log.findIndex((l) =>
+        l.startsWith("stdin-len OPTOUT_ROOT_KEY"),
+      );
+      expect(put).toBeGreaterThanOrEqual(0);
+      expect(put).toBeLessThan(w[0] as number);
+      clean(r);
+      const kept = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY"] },
+      }).run("provisioner", {}, "staging");
+      expect(kept.code, kept.err).toBe(0);
+      expect(puts(kept.log)).toEqual([]);
+      const prod = setup().run("provisioner");
+      expect(puts(prod.log)).toEqual([]);
     });
   });
 

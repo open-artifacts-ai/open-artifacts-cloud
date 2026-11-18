@@ -7897,6 +7897,59 @@ describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
     expect(s.row(inst.id).state).toBe("active");
   });
 
+  describe("the hosted opt-out key and vars (open-artifacts#2652)", () => {
+    const HK = "optout-hash-key-0123456789abcdefghijklmnop";
+    const optoutBits = (s: S, id: string) => ({
+      key: s.scriptOf(id)?.secrets.get("OPTOUT_HASH_KEY"),
+      url: bindingsOf(s, id).find((b) => b.name === "OPTOUT_UNSUBSCRIBE_URL")
+        ?.text,
+      platform: bindingsOf(s, id).find((b) => b.name === "OPTOUT_PLATFORM")
+        ?.text,
+      names: bindingsOf(s, id).map((b) => b.name),
+    });
+    it("set: create and upgrade render the key, the unsubscribe URL and OPTOUT_PLATFORM=on, the same key on every install", async () => {
+      const s = setup();
+      const p = s.mk({ optoutHashKey: HK });
+      const a = keep(await p.create(input("opta")));
+      const b = keep(await p.create(input("optb")));
+      for (const i of [a, b]) {
+        const o = optoutBits(s, i.id);
+        expect(o.key).toBe(HK);
+        expect(o.url).toBe(
+          `https://signup.${HOSTED_DOMAINS.staging.app}/unsubscribe`,
+        );
+        expect(o.platform).toBe("on");
+      }
+      await p.upgrade(a.id, "0.24.0");
+      const o = optoutBits(s, a.id);
+      expect(o.key).toBe(HK);
+      expect(o.url).toBe(
+        `https://signup.${HOSTED_DOMAINS.staging.app}/unsubscribe`,
+      );
+      expect(o.platform).toBe("on");
+      expect(s.scriptOf(a.id)?.secrets.get("OPTOUT_HASH_KEY")).toBe(
+        s.scriptOf(b.id)?.secrets.get("OPTOUT_HASH_KEY"),
+      );
+    });
+    it("unset: no key, no URL, no OPTOUT_PLATFORM, on create or upgrade", async () => {
+      const s = setup();
+      const p = s.mk({});
+      const a = keep(await p.create(input("optoff")));
+      await p.upgrade(a.id, "0.24.0");
+      const o = optoutBits(s, a.id);
+      expect(o.key).toBeUndefined();
+      expect(o.names.filter((n) => n.startsWith("OPTOUT"))).toEqual([]);
+    });
+    it("the key is never in the stored row, the audit or the stored vars", async () => {
+      const s = setup();
+      const p = s.mk({ optoutHashKey: HK });
+      const a = keep(await p.create(input("optlog")));
+      await p.upgrade(a.id, "0.24.0");
+      expect(JSON.stringify(s.row(a.id))).not.toContain(HK);
+      expect(JSON.stringify(s.audit(a.id))).not.toContain(HK);
+    });
+  });
+
   it("flag off: a new install is as before (namespace, binding, no OAUTH_STORE)", async () => {
     const s = setup();
     const inst = keep(await s.mk({ oauthBornD1: false }).create(input("kv")));
