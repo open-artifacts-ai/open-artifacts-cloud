@@ -27,8 +27,9 @@ import { ulid } from "../ulid.js";
 // is installs.vars, compare-and-set on row_version, in one batch with the
 // `update` job (a `login` variant) that redeploys that one install and the
 // install.login_change hosted_audit row. A nonce is stored per install; a
-// replay is a 409 and never applies twice. LOGIN_CHANGE must be "1"; off, the
-// route is the plain 404.
+// replay is a 409 and never applies twice. LOGIN_CHANGE must be "1", or the
+// install's slug listed in LOGIN_CHANGE_SLUGS; otherwise the route is the
+// plain 404.
 //
 // Not covered: broker-signed proof of the owner (install, sub, hd, auth_time);
 // the instance checks the owner and the hd, and this side bounds what a
@@ -263,6 +264,14 @@ const joinOf = (v: Record<string, string>) => v.AUTH_DOMAIN_JOIN ?? "invite";
 const domainsOf = (v: Record<string, string>) =>
   v.AUTH_DOMAINS ? v.AUTH_DOMAINS.split(",") : [];
 
+/** LOGIN_CHANGE_SLUGS as exact, trimmed slugs; empty entries dropped. */
+export function slugList(v: string | undefined): string[] {
+  return (v ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+}
+
 /**
  * One change request. Every answer is a fixed code; nothing is logged but
  * fixed categories and the install id.
@@ -274,7 +283,8 @@ export async function loginChange(
 ): Promise<Response> {
   // The internet (cf-connecting-ip) and the switch off are the plain 404.
   if (req.headers.has("cf-connecting-ip")) return notFound();
-  if (env.LOGIN_CHANGE !== "1") return notFound();
+  const slugs = slugList(env.LOGIN_CHANGE_SLUGS);
+  if (env.LOGIN_CHANGE !== "1" && slugs.length === 0) return notFound();
   const url = new URL(req.url);
   if (
     req.method !== "POST" ||
@@ -284,6 +294,15 @@ export async function loginChange(
     return notFound();
   const install = req.headers.get(GATE_INSTALL_HEADER) ?? "";
   if (!INSTALL_ID.test(install)) return notFound();
+  // Off for everyone else: the plain 404, before any key or nonce is read.
+  if (env.LOGIN_CHANGE !== "1") {
+    const r = await env.PLATFORM_DB.prepare(
+      "SELECT slug FROM installs WHERE id = ?1",
+    )
+      .bind(install)
+      .first<{ slug: string }>();
+    if (!r || !slugs.includes(r.slug)) return notFound();
+  }
 
   const text = await bodyText(req);
   if (text === null) return reply(400, "bad_body");

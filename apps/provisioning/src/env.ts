@@ -87,6 +87,11 @@ export interface Env {
   BROKER_REGISTRY?: KVNamespace;
   /** "1" turns the instance's login-domain change route on (#2520); else its plain 404. */
   LOGIN_CHANGE?: string;
+  /**
+   * While LOGIN_CHANGE is not "1": comma-separated install slugs the route is
+   * on for (#2520 rollout, leo first). Every other install gets the plain 404.
+   */
+  LOGIN_CHANGE_SLUGS?: string;
   /** Self-serve producer (post-M1). */
   SIGNUPS: Queue;
   /** The admin SPA (single-page-application, Worker first). */
