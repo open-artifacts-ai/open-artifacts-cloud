@@ -110,6 +110,9 @@ ALLOW=(
   scripts/ci/pin-only.ts
   scripts/ci/pin-only.test.ts
   scripts/ci/ci-pin-once-workflow.test.ts
+  # The read-only Cloudflare log read (cf-read env): a workflow and its test.
+  .github/workflows/cf-logs.yml
+  scripts/ci/cf-logs-workflow.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
