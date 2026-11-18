@@ -123,6 +123,52 @@ describe("R29 set the OAuth store", () => {
     expect(r.code).toBe("invalid_input");
   });
 
+  it("DOCS_PREVIEW on staging is an update job with that var alone", async () => {
+    const e = fakeEnv();
+    const { id } = await onMode();
+    const r = await call(e, GRANT, "R29", {
+      params: params(id),
+      body: { requestId: requestId(), vars: { DOCS_PREVIEW: "1" } },
+    });
+    expect(r.status).toBe(202);
+    expect(r.body.job).toMatchObject({
+      kind: "update",
+      args: { vars: { DOCS_PREVIEW: "1" } },
+    });
+  });
+
+  it("DOCS_PREVIEW is refused on prod before any write, with either value or OAUTH_STORE beside it", async () => {
+    const e = fakeEnv({ OA_ENV: "prod" });
+    const { id } = await onMode();
+    for (const vars of [
+      { DOCS_PREVIEW: "1" },
+      { DOCS_PREVIEW: "" },
+      { OAUTH_STORE: "dual", DOCS_PREVIEW: "1" },
+    ]) {
+      const r = await call(e, GRANT, "R29", {
+        params: params(id),
+        body: { requestId: requestId(), vars },
+      });
+      expect(r.code, JSON.stringify(vars)).toBe("invalid_input");
+    }
+    expect(e.manageInstall.created).toHaveLength(0);
+    const ok = await call(e, GRANT, "R29", {
+      params: params(id),
+      body: setBody("dual"),
+    });
+    expect(ok.status).toBe(202);
+  });
+
+  it("an install on d1 may still take DOCS_PREVIEW; the d1 rule is for OAUTH_STORE", async () => {
+    const e = fakeEnv();
+    const { id } = await onMode("d1");
+    const r = await call(e, GRANT, "R29", {
+      params: params(id),
+      body: { requestId: requestId(), vars: { DOCS_PREVIEW: "1" } },
+    });
+    expect(r.status).toBe(202);
+  });
+
   it("leaving d1 is refused, a rerun of d1 is not", async () => {
     const e = fakeEnv();
     const { id } = await onMode("d1");

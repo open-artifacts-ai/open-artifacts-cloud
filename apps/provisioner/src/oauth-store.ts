@@ -31,6 +31,7 @@ import {
   OAUTH_DUAL_SETTLE_MS,
   OAUTH_MODE_LIVE_ACTION,
   OAUTH_MODE_LIVE_SQL,
+  type OAuthJob,
   type OAuthStoreMode,
   storedOAuthMode,
 } from "@oa/provisioning-contract";
@@ -162,16 +163,22 @@ async function checkModeChange(
   return { ok: true };
 }
 
+type SetWant = Extract<OAuthJob, { op: "set" }>;
+
 /** updateVars with the merged vars. A LostLease leaves as it came. */
 async function putMode(
   ctx: CreateCtx,
   job: ManageJob,
   label: string,
-  want: OAuthStoreMode,
+  want: SetWant,
 ): Promise<{ version: string }> {
   const row = await installRow(ctx, job.installId);
   if (!row) throw refused("no installs row");
-  const vars = { ...storedVars(row.vars), OAUTH_STORE: want };
+  const vars = { ...storedVars(row.vars) };
+  if (want.mode !== undefined) vars.OAUTH_STORE = want.mode;
+  // open-artifacts#2641: "1" sets the staging preview var, "" removes it.
+  if (want.docsPreview === "1") vars.DOCS_PREVIEW = "1";
+  else if (want.docsPreview === "") delete vars.DOCS_PREVIEW;
   const w = await renderOptions(ctx, {
     jobId: job.jobId,
     label,
@@ -284,26 +291,32 @@ async function removeKv(
   return { removed: true };
 }
 
-/** R29's steps. No catch here: LostLease must reach the step as it is. */
+/**
+ * R29's steps. No catch here: LostLease must reach the step as it is. A
+ * DOCS_PREVIEW-only job has no mode to check or verify: it skips both.
+ */
 export async function setOAuthStore(
   ctx: CreateCtx,
   step: WorkflowStep,
   job: ManageJob,
   label: string,
-  want: OAuthStoreMode,
+  want: SetWant,
 ): Promise<void> {
   const { jobId } = job;
-  await jobStep(ctx, step, jobId, "precheck", OAUTH_READ_STEP, () =>
-    checkModeChange(ctx, job, want),
-  );
+  const mode = want.mode;
+  if (mode !== undefined)
+    await jobStep(ctx, step, jobId, "precheck", OAUTH_READ_STEP, () =>
+      checkModeChange(ctx, job, mode),
+    );
   await jobStep(ctx, step, jobId, "update_vars", OAUTH_UPLOAD_STEP, () =>
     putMode(ctx, job, label, want),
   );
-  await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
-    modeLive(ctx, job, want),
-  );
+  if (mode !== undefined)
+    await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
+      modeLive(ctx, job, mode),
+    );
   // Marked as mode_live: the update kind's steps are fixed (JOB_STEPS).
-  if (want === "d1")
+  if (mode === "d1")
     await jobStep(
       ctx,
       step,

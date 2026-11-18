@@ -451,7 +451,7 @@ async function operate(
           loginRedeploy(ctx, job, labelOf(job)),
         );
       else if (job.oauth?.op === "set")
-        await setOAuthStore(ctx, step, job, labelOf(job), job.oauth.mode);
+        await setOAuthStore(ctx, step, job, labelOf(job), job.oauth);
       else await oauthCopy(ctx, step, job, labelOf(job));
       break;
   }
@@ -849,6 +849,13 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         throw refused("update needs an OAuth grant");
       const oauth = parseOAuthJob(args);
       if (!oauth) throw refused("the update args do not parse");
+      // open-artifacts#2641: DOCS_PREVIEW is staging only, either value.
+      if (
+        oauth.op === "set" &&
+        oauth.docsPreview !== undefined &&
+        env !== "staging"
+      )
+        throw refused("DOCS_PREVIEW is staging only");
       out.oauth = oauth;
       break;
     }

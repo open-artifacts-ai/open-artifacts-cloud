@@ -267,6 +267,53 @@ describe("update: set OAUTH_STORE (R29)", () => {
     );
   });
 
+  it("DOCS_PREVIEW alone: the var goes up, the install keeps it and its mode, no mode poll or mode_live row", async () => {
+    const id = await active();
+    install(id);
+    await run(setMode("dual"), id);
+    const r = await run({ vars: { DOCS_PREVIEW: "1" } }, id);
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done", step: "done" });
+    expect(plain(id, "DOCS_PREVIEW")).toBe("1");
+    expect(plain(id, "OAUTH_STORE")).toBe("dual");
+    expect(JSON.parse(w.install(id)?.vars as string)).toMatchObject({
+      OAUTH_STORE: "dual",
+      DOCS_PREVIEW: "1",
+    });
+    expect(r.log.map((l) => l.name)).toContain("update_vars");
+    expect(r.log.map((l) => l.name)).not.toContain("mode_live");
+    expect(r.log.map((l) => l.name)).not.toContain("precheck");
+    expect(
+      auditOf(id).filter((a) => a.action === OAUTH_MODE_LIVE_ACTION),
+    ).toHaveLength(1);
+  });
+
+  it('DOCS_PREVIEW survives an upgrade, and "" removes it', async () => {
+    const id = await active();
+    install(id);
+    await run({ vars: { DOCS_PREVIEW: "1" } }, id);
+    expect(JSON.parse(w.install(id)?.vars as string).DOCS_PREVIEW).toBe("1");
+    const off = await run({ vars: { DOCS_PREVIEW: "" } }, id);
+    expect(off.error).toBeNull();
+    expect(plain(id, "DOCS_PREVIEW")).toBeUndefined();
+    expect(JSON.parse(w.install(id)?.vars as string)).not.toHaveProperty(
+      "DOCS_PREVIEW",
+    );
+  });
+
+  it("OAUTH_STORE and DOCS_PREVIEW together: both go up and the mode is verified", async () => {
+    const id = await active();
+    install(id);
+    const r = await run(
+      { vars: { OAUTH_STORE: "dual", DOCS_PREVIEW: "1" } },
+      id,
+    );
+    expect(r.error).toBeNull();
+    expect(plain(id, "OAUTH_STORE")).toBe("dual");
+    expect(plain(id, "DOCS_PREVIEW")).toBe("1");
+    expect(r.log.map((l) => l.name)).toContain("mode_live");
+  });
+
   it("keeps the install's other vars", async () => {
     const id = await active();
     install(id);
