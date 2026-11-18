@@ -389,7 +389,20 @@ export const VERIFY_CLEAN_REFUSED_BINDING_TYPES = Object.freeze([
  */
 export const PUSH_SECRETS = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
 
-const OPTIONAL_SECRETS: readonly string[] = ["OAUTH_COPY_KEY", ...PUSH_SECRETS];
+/**
+ * The install's own opt-out hash key (open-artifacts#2820): 48 random bytes,
+ * base64url, the server's raw HMAC-SHA256 key for its opt-out table, apart
+ * from the platform-wide OPTOUT_HASH_KEY. Minted once at create and never
+ * rotated (a new key stops every stored opt-out from matching). Optional to
+ * verify_clean until backfillOptoutKey has run on every older install.
+ */
+export const INSTALL_OPTOUT_KEY = "INSTALL_OPTOUT_KEY";
+
+const OPTIONAL_SECRETS: readonly string[] = [
+  "OAUTH_COPY_KEY",
+  ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
+];
 
 /**
  * The exact secret names verify_clean expects on an install (design v7 5.2
@@ -581,6 +594,7 @@ const EXTRA_SECRETS: readonly string[] = [
   "DIRECTORY_TOKEN_KEY",
   "TURNSTILE_SECRET",
   ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
 ];
 const SITEKEY_RE = /^[0-9A-Za-z_-]{8,64}$/;
 
@@ -877,7 +891,8 @@ export interface RotationResult {
   ok: boolean;
   /**
    * False for an install with nothing to do: codes off (Turnstile), or a
-   * push pair already there (backfillPushKeys).
+   * push pair already there (backfillPushKeys), or an opt-out key
+   * (backfillOptoutKey).
    */
   rotated: boolean;
   reason?: string;
@@ -1950,6 +1965,7 @@ export class WfpProvisioner {
     for (const k of CREATE_SECRETS) secrets[k] = newSecret();
     if (testHooks) secrets.TEST_HOOK_KEY = newSecret();
     Object.assign(secrets, await newPushKeys());
+    secrets[INSTALL_OPTOUT_KEY] = newSecret();
     for (const v of Object.values(secrets)) this.sensitive.add(v);
     assertSessionSecret(
       secrets.SESSION_SECRET as string,
@@ -2548,7 +2564,7 @@ export class WfpProvisioner {
       ...(m.sitekey !== null ? ["TURNSTILE_SECRET"] : []),
       // Only on the first upload: an existing script gets its pair from
       // backfillPushKeys, under the operator's own go (never by a rerun).
-      ...(exists ? [] : PUSH_SECRETS),
+      ...(exists ? [] : [...PUSH_SECRETS, INSTALL_OPTOUT_KEY]),
     ];
     const have = exists ? await cf.secretList(target, n.script) : [];
     const missing = required.filter((k) => !have.includes(k));
@@ -4806,6 +4822,77 @@ export class WfpProvisioner {
               await this.cf.secretPut(this.target, script, k, keys[k]);
             }
             await this.logged("push_keys.backfill");
+            await this.release("active");
+          } catch (e) {
+            if (!(e instanceof LostLease))
+              await this.releaseQuietly("active", e);
+            throw e;
+          }
+          out.push({ id: row.id, ok: true, rotated: true });
+        } catch (e) {
+          out.push({
+            id: row.id,
+            ok: false,
+            rotated: false,
+            reason: this.reasonOf(e),
+          });
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
+   * open-artifacts#2820: puts a fresh INSTALL_OPTOUT_KEY on every active
+   * install of `env` that has none; one that holds it keeps it (never
+   * rotated). One secret, so a rerun after a failure simply finishes. Run by
+   * an operator, once, on the user's go; create mints its own.
+   */
+  async backfillOptoutKey(env: Env): Promise<RotationResult[]> {
+    return this.guarded(async () => {
+      this.checkOptions();
+      if (env !== this.env)
+        throw new ProvisionRefused(
+          `this provisioner is for ${this.env}, not ${String(env)}`,
+          "invalid_state",
+        );
+      await this.checkToken();
+      await this.resolvePlatform();
+      const out: RotationResult[] = [];
+      for (const row of await this.platform.inStates([
+        "creating",
+        "active",
+        "upgrading",
+      ])) {
+        try {
+          if (row.state !== "active")
+            throw new ProvisionRefused(
+              `install ${row.id} is ${row.state}; rerun the backfill once it is active`,
+              "invalid_state",
+            );
+          const script = names(row.id, this.env).script;
+          assertOwnResource(script, this.env);
+          if (
+            (await this.cf.secretList(this.target, script)).includes(
+              INSTALL_OPTOUT_KEY,
+            )
+          ) {
+            out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          await this.claim(row, ["active"], "active", "optout_key");
+          try {
+            const key = newSecret();
+            this.sensitive.add(key);
+            assertOwnResource(script, this.env);
+            await this.hold();
+            await this.cf.secretPut(
+              this.target,
+              script,
+              INSTALL_OPTOUT_KEY,
+              key,
+            );
+            await this.logged("optout_key.backfill");
             await this.release("active");
           } catch (e) {
             if (!(e instanceof LostLease))
