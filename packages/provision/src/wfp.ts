@@ -4751,7 +4751,10 @@ export class WfpProvisioner {
   /**
    * open-artifacts#2775: puts a fresh web push pair on every active install of
    * `env` that has none. An install that holds both keeps them (never
-   * rotated); one holding only one of the two is refused, not overwritten.
+   * rotated). The private key goes up first and the public key last, so a
+   * lone private key is this method's own interrupted run (no browser can
+   * subscribe without the public key) and a rerun finishes it; a lone public
+   * key was put by someone else and is refused, not overwritten.
    * Run by an operator, once, on the user's go; create mints its own pair.
    */
   async backfillPushKeys(env: Env): Promise<RotationResult[]> {
@@ -4785,7 +4788,7 @@ export class WfpProvisioner {
             out.push({ id: row.id, ok: true, rotated: false });
             continue;
           }
-          if (have.length > 0)
+          if (have.includes("VAPID_PUBLIC_KEY"))
             throw new ProvisionRefused(
               `install ${row.id} holds only ${have.join(", ")}; a half pair is never overwritten`,
               "invalid_state",
@@ -4794,7 +4797,10 @@ export class WfpProvisioner {
           try {
             const keys = await newPushKeys();
             for (const v of Object.values(keys)) this.sensitive.add(v);
-            for (const k of PUSH_SECRETS) {
+            for (const k of [
+              "VAPID_PRIVATE_KEY",
+              "VAPID_PUBLIC_KEY",
+            ] as const) {
               assertOwnResource(script, this.env);
               await this.hold();
               await this.cf.secretPut(this.target, script, k, keys[k]);

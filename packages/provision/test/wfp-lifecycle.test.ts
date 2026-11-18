@@ -2229,8 +2229,12 @@ describe("push keys (open-artifacts#2775)", () => {
     const whole = keep(await s.p.create(input("beta")));
     const half = keep(await s.p.create(input("gamma")));
     const busy = keep(await s.p.create(input("delta")));
+    const cut = keep(await s.p.create(input("epsilon")));
+    s.scriptOf(cut.id)?.secrets.delete("VAPID_PUBLIC_KEY");
+    const cutPriv = pairOf(s, cut.id).priv;
     for (const id of [old.id, busy.id])
       for (const k of PUSH) s.scriptOf(id)?.secrets.delete(k);
+    // A lone public key was not put by the backfill (it puts it last).
     s.scriptOf(half.id)?.secrets.delete("VAPID_PRIVATE_KEY");
     s.db()
       .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
@@ -2247,6 +2251,11 @@ describe("push keys (open-artifacts#2775)", () => {
     expect(byId[busy.id]?.ok).toBe(false);
     expect(byId[busy.id]?.reason).toMatch(/upgrading/);
 
+    // A lone private key is an interrupted backfill: finished with a new pair.
+    expect(byId[cut.id]).toMatchObject({ ok: true, rotated: true });
+    const fin = pairOf(s, cut.id);
+    await works(fin.pub as string, fin.priv as string);
+    expect(fin.priv).not.toBe(cutPriv);
     const got = pairOf(s, old.id);
     await works(got.pub as string, got.priv as string);
     expect(pairOf(s, whole.id)).toEqual(before);
@@ -2254,6 +2263,13 @@ describe("push keys (open-artifacts#2775)", () => {
     expect(pairOf(s, busy.id)).toEqual({ pub: undefined, priv: undefined });
     expect(s.audit(old.id)).toContain("push_keys.backfill");
     expect(s.audit(whole.id)).not.toContain("push_keys.backfill");
+    // The private key goes up before the public key.
+    const order = s.fake.raw
+      .filter((r) => r.method === "PUT" && r.path.endsWith("/secrets"))
+      .filter((r) => r.path.includes(old.id))
+      .map((r) => (JSON.parse(r.body) as { name: string }).name)
+      .filter((n) => n.startsWith("VAPID_"));
+    expect(order).toEqual(["VAPID_PRIVATE_KEY", "VAPID_PUBLIC_KEY"]);
     const said = JSON.stringify([
       out,
       s.p.notes,
