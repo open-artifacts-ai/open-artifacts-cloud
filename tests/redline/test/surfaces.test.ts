@@ -257,7 +257,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     // #2545: the first-invite flag adds one real-only drop.
     // v0.205.0: inbox read and read-all (#2512), the four held-request routes
     // (#2577) and Install now (#2552) add seven interactive-only drops.
-    expect(only).toHaveLength(36);
+    // v0.213.0: saving prefs, mute and unmute, Later and the three push
+    // subscription changes (#2512, #2762) add seven more.
+    expect(only).toHaveLength(43);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
@@ -273,8 +275,23 @@ describe("probe cases (derived from Backend's surfaces)", () => {
       "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer",
       "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer/challenge",
     ];
-    const found = scanned.filter((r) => !ANSWER_ROUTES.includes(r));
-    for (const r of ANSWER_ROUTES) expect(scanned).toContain(r);
+    // v0.213.0: these read interactiveSession for one branch only, and
+    // answer a token otherwise: push reads (pushUser checks it for writes
+    // only), a comment or reply (only one carrying people, #2770) and a
+    // comment picture (a token reads no picture of a request held for its
+    // person, #2577). The matrix covers each.
+    const PARTIAL_ROUTES = [
+      "GET /api/v1/me/push/key",
+      "GET /api/v1/me/push/subscriptions",
+      "POST /api/v1/artifacts/:id/comments",
+      "POST /api/v1/artifacts/:id/comments/:threadId/replies",
+      "GET /api/v1/artifacts/:id/pictures/:pictureId",
+    ];
+    const found = scanned.filter(
+      (r) => !ANSWER_ROUTES.includes(r) && !PARTIAL_ROUTES.includes(r),
+    );
+    for (const r of [...ANSWER_ROUTES, ...PARTIAL_ROUTES])
+      expect(scanned).toContain(r);
     // The scan's own reach: direct (erase), a function helper
     // (share-notices' browserUser) and a const arrow on R.* paths
     // (directory's disconnect).
@@ -382,9 +399,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(36);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(43);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 37);
+    expect(by("own")).toHaveLength(cases.length - 2 - 44);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
