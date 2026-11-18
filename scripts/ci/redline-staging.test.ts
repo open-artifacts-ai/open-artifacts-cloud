@@ -1996,7 +1996,11 @@ describe("t19 gate tier", () => {
   });
 
   /** A fake pnpm: lists `list` tests for a selection and logs real runs. */
-  function sandbox(counts: { all: number; gate: number; guard: number }) {
+  function sandbox(
+    counts: { all: number; gate: number; guard: number },
+    // Which listing breaks with a real error (exit 2, not "No tests found").
+    broken: "all" | "gate" | "" = "",
+  ) {
     const dir = mkdtempSync(join(tmpdir(), "t19-sel-"));
     mkdirSync(join(dir, "bin"));
     mkdirSync(join(dir, "t19-sealed"));
@@ -2006,9 +2010,10 @@ describe("t19 gate tier", () => {
       `#!/usr/bin/env bash
 case "$*" in
   *--list*)
-    if [[ "$*" == *--project* ]]; then n=${counts.guard}
-    elif [[ "$*" == *"--grep @gate"* ]]; then n=${counts.gate}
-    else n=${counts.all}; fi
+    if [[ "$*" == *--project* ]]; then n=${counts.guard}; kind=guard
+    elif [[ "$*" == *"--grep @gate(\\s|\$)"* ]]; then n=${counts.gate}; kind=gate
+    else n=${counts.all}; kind=all; fi
+    if [ "$kind" = "${broken}" ]; then echo "Error: browserType.launch crashed"; exit 2; fi
     if [ "$n" -eq 0 ]; then echo "Error: No tests found"; exit 1; fi
     echo "Listing tests:"; echo "Total: $n tests in 3 files"; exit 0;;
 esac
@@ -2039,7 +2044,7 @@ echo "RUN $*" >> "$CALLS"
         expect(r.status, r.stdout + r.stderr).toBe(0);
         expect(r.stdout).toContain("T19 set: gate, 9 tests");
         expect(calls).toBe(
-          "RUN --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure --grep @gate\n",
+          "RUN --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure --grep @gate(\\s|$)\n",
         );
       }
     } finally {
@@ -2087,6 +2092,39 @@ echo "RUN $*" >> "$CALLS"
     } finally {
       rmSync(none.dir, { recursive: true, force: true });
     }
+  });
+
+  it('a list that fails is an error, never zero: no fallback, nothing runs; only "No tests found" counts as zero', () => {
+    for (const broken of ["all", "gate"] as const) {
+      const sb = sandbox({ all: 24, gate: 9, guard: 2 }, broken);
+      try {
+        for (const env of [{}, { T19_FULL: "true" }]) {
+          const { r, calls } = sb.run(env);
+          // The gate-listing break only matters when the gate lists.
+          if (broken === "gate" && env.T19_FULL) {
+            expect(r.status).toBe(0);
+            continue;
+          }
+          expect(r.status, `${broken} ${JSON.stringify(env)}`).toBe(1);
+          expect(r.stdout).toContain("T19: could not list the tests");
+          expect(r.stdout).not.toContain("running every spec");
+          expect(calls).toBe("");
+        }
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("the @gate pattern has a boundary: @gated and @gateway never match, @gate does", () => {
+    const m = /GATE_RE='([^']+)'/.exec(String(step.run));
+    expect(m).not.toBeNull();
+    // Playwright greps "<project> › <file> › <title> @tag1 @tag2".
+    const re = new RegExp(String(m?.[1]));
+    expect(re.test("rl-a › a.spec.ts › does a thing @gate")).toBe(true);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gate @other")).toBe(true);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gated")).toBe(false);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gateway")).toBe(false);
   });
 
   it("a gate set without the rl-a guard fails and runs nothing", () => {

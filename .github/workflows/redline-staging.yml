@@ -355,27 +355,45 @@ jobs:
           # with --list first (with --shard, an empty --grep exits 0 on
           # Playwright 1.64.1), and a count of zero fails the step.
           pw() { pnpm --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts "$@"; }
-          count() {
-            local out n
-            out="$(pw --list "$@" 2>&1)" || true
-            n="$(printf '%s\n' "$out" | sed -n 's/^Total: \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' | tail -1)"
-            echo "${n:-0}"
+          # Sets N to the number of tests a selection lists. A list that fails
+          # for any reason but "No tests found" (which Playwright 1.64.1 exits
+          # 1 with when a --grep matches nothing and there is no --shard) stops
+          # the step: a broken list is never read as zero.
+          N=0
+          list() {
+            local out rc=0
+            out="$(pw --list "$@" 2>&1)" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              N="$(printf '%s\n' "$out" | sed -n 's/^Total: \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' | tail -1)"
+              [ -n "$N" ] || { echo "T19: could not list the tests (no total in the list output)"; exit 1; }
+            elif printf '%s\n' "$out" | grep -q 'No tests found'; then
+              N=0
+            else
+              echo "T19: could not list the tests (exit $rc)"
+              printf '%s\n' "$out" | tail -n 20
+              exit 1
+            fi
           }
+          # @gate, then a space or the end: a tag like @gated or @gateway never matches.
+          GATE_RE='@gate(\s|$)'
+          list
+          total="$N"
+          if [ "$total" -lt 1 ]; then echo "T19: the selection (all) matched no test"; exit 1; fi
           sel=()
           set_name=all
           if [ "${T19_FULL:-}" != true ]; then
-            gated="$(count --grep @gate)"
-            if [ "$gated" -gt 0 ]; then
-              guards="$(count --grep @gate --project "rl-a guard")"
-              if [ "$guards" -lt 1 ]; then echo "T19: the @gate set has no case of the rl-a guard project"; exit 1; fi
-              sel=(--grep @gate)
+            list --grep "$GATE_RE"
+            if [ "$N" -gt 0 ]; then
+              gated="$N"
+              list --grep "$GATE_RE" --project "rl-a guard"
+              if [ "$N" -lt 1 ]; then echo "T19: the @gate set has no case of the rl-a guard project"; exit 1; fi
+              sel=(--grep "$GATE_RE")
               set_name=gate
+              total="$gated"
             else
               echo "::warning title=T19 gate set::no spec is tagged @gate in this release's public version; running every spec"
             fi
           fi
-          total="$(count "${sel[@]}")"
-          if [ "$total" -lt 1 ]; then echo "T19: the selection ($set_name) matched no test"; exit 1; fi
           echo "T19 set: $set_name, $total tests"
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "T19 set: $set_name, $total tests" >> "$GITHUB_STEP_SUMMARY"; fi
           # --trace overrides the config's CI "off": a failed case keeps a trace,
