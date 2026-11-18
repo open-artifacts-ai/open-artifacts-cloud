@@ -24,6 +24,9 @@
       "preview_urls": false,
       "vars": {
         "OA_ENV": "staging",
+        // Which installs are LOGIN_EDITABLE, as provisioning's (#2520).
+        "LOGIN_CHANGE": "1",
+        "LOGIN_CHANGE_SLUGS": "",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts-staging.app",
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts-staging.app"
       },
@@ -37,9 +40,9 @@
         { "binding": "AUTH_BROKER", "service": "oa-s-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-s-directory-broker" },
         { "binding": "BILLING", "service": "oa-s-billing" },
-        // A login-domain change through LoginGate on LOGIN (#2520): STAGING
-        // ONLY, provisioning's LoginChangeGate entrypoint (not its internet
-        // fetch). oa-s-provisioning must be deployed first.
+        // A login-domain change through LoginGate on LOGIN (#2520):
+        // provisioning's LoginChangeGate entrypoint (not its internet fetch).
+        // oa-s-provisioning must be deployed first.
         {
           "binding": "LOGIN",
           "service": "oa-s-provisioning",
@@ -67,6 +70,10 @@
       "preview_urls": false,
       "vars": {
         "OA_ENV": "prod",
+        // Which installs are LOGIN_EDITABLE, as provisioning's (#2520): keep
+        // both Workers' values the same.
+        "LOGIN_CHANGE": "0",
+        "LOGIN_CHANGE_SLUGS": "leo",
         "AUTH_BROKER_ORIGIN": "https://auth.open-artifacts.app",
         "DIRECTORY_BROKER_ORIGIN": "https://directory.open-artifacts.app"
       },
@@ -78,7 +85,14 @@
       "services": [
         { "binding": "AUTH_BROKER", "service": "oa-p-auth-broker" },
         { "binding": "DIRECTORY_BROKER", "service": "oa-p-directory-broker" },
-        { "binding": "BILLING", "service": "oa-p-billing" }
+        { "binding": "BILLING", "service": "oa-p-billing" },
+        // As staging's (#2520); provisioning's LOGIN_CHANGE and
+        // LOGIN_CHANGE_SLUGS decide which installs it answers.
+        {
+          "binding": "LOGIN",
+          "service": "oa-p-provisioning",
+          "entrypoint": "LoginChangeGate"
+        }
       ],
       "observability": {
         "enabled": true,
