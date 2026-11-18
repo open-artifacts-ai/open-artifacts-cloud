@@ -85,6 +85,7 @@ const VERB: Record<string, string> = {
   "ci_token.sweep": "cleared old deploy tokens",
   "owner_token.reissue": "reissued the owner's token",
   "turnstile.rotate": "rotated the bot-check keys",
+  "push_keys.backfill": "added the browser notification keys",
   "oauth_store.mode_live": "switched where agent sign-ins are stored",
   "oauth_copy.counts": "counted agent sign-ins to move",
   "oauth_copy.key_gone": "removed the key for moving agent sign-ins",

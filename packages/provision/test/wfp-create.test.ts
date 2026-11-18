@@ -1849,6 +1849,8 @@ describe("WfpProvisioner.create", () => {
       "CONTENT_SIGNING_KEY",
       "DIRECTORY_TOKEN_KEY",
       "SESSION_SECRET",
+      "VAPID_PRIVATE_KEY",
+      "VAPID_PUBLIC_KEY",
     ]);
   });
 
