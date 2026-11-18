@@ -908,6 +908,8 @@ export interface RotationResult {
    */
   rotated: boolean;
   reason?: string;
+  /** A dry run: this install would be written (nothing was). */
+  planned?: boolean;
 }
 
 /** H-DV: what delete prints when the directory revoke is skipped. */
@@ -4806,8 +4808,13 @@ export class WfpProvisioner {
    * subscribe without the public key) and a rerun finishes it; a lone public
    * key was put by someone else and is refused, not overwritten.
    * Run by an operator, once, on the user's go; create mints its own pair.
+   * `dryRun` reads only (no lease, no secret, no audit row) and marks each
+   * install it would write `planned`.
    */
-  async backfillPushKeys(env: Env): Promise<RotationResult[]> {
+  async backfillPushKeys(
+    env: Env,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<RotationResult[]> {
     return this.guarded(async () => {
       this.checkOptions();
       if (env !== this.env)
@@ -4843,6 +4850,10 @@ export class WfpProvisioner {
               `install ${row.id} holds only ${have.join(", ")}; a half pair is never overwritten`,
               "invalid_state",
             );
+          if (opts.dryRun) {
+            out.push({ id: row.id, ok: true, rotated: false, planned: true });
+            continue;
+          }
           await this.claim(row, ["active"], "active", "push_keys");
           try {
             const keys = await newPushKeys();
@@ -4882,7 +4893,10 @@ export class WfpProvisioner {
    * rotated). One secret, so a rerun after a failure simply finishes. Run by
    * an operator, once, on the user's go; create mints its own.
    */
-  async backfillOptoutKey(env: Env): Promise<RotationResult[]> {
+  async backfillOptoutKey(
+    env: Env,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<RotationResult[]> {
     return this.guarded(async () => {
       this.checkOptions();
       if (env !== this.env)
@@ -4912,6 +4926,10 @@ export class WfpProvisioner {
             )
           ) {
             out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          if (opts.dryRun) {
+            out.push({ id: row.id, ok: true, rotated: false, planned: true });
             continue;
           }
           await this.claim(row, ["active"], "active", "optout_key");
