@@ -23,12 +23,7 @@ describe("hosted-backfill.yml", () => {
   it("is dispatch only, with op, env, dry_run (default true) and confirm", () => {
     expect(Object.keys(w.on)).toEqual(["workflow_dispatch"]);
     const i = w.on.workflow_dispatch.inputs;
-    expect(Object.keys(i).sort()).toEqual([
-      "confirm",
-      "dry_run",
-      "env",
-      "op",
-    ]);
+    expect(Object.keys(i).sort()).toEqual(["confirm", "dry_run", "env", "op"]);
     expect(i.op.options).toEqual(["push-keys", "optout-key"]);
     expect(i.env.options).toEqual(["staging", "prod"]);
     expect(i.dry_run.default).toBe(true);
@@ -57,9 +52,9 @@ describe("hosted-backfill.yml", () => {
 
   it("calls only the two backfill commands, never with --detail", () => {
     const run = named("Backfill").run as string;
-    const calls = [
-      ...run.matchAll(/--filter @oa\/hosted start (\S+)/g),
-    ].map((m) => m[1]);
+    const calls = [...run.matchAll(/--filter @oa\/hosted start (\S+)/g)].map(
+      (m) => m[1],
+    );
     expect(calls).toEqual(["backfill-push-keys", "backfill-optout-key"]);
     expect(run).not.toContain("--detail");
     expect(run).toContain("--dry-run");

@@ -1073,9 +1073,7 @@ describe("backfills (open-artifacts#2775, #2820)", () => {
         const put = secretsOf(w, lacking);
         for (const k of op.secrets) expect(put.has(k)).toBe(true);
         expect(secretsOf(w, holding)).toEqual(keptBefore);
-        expect(w.audit().map((a) => a.action)).toContain(
-          `cli.${op.cmd}.done`,
-        );
+        expect(w.audit().map((a) => a.action)).toContain(`cli.${op.cmd}.done`);
         // Rerun: nothing to write, nothing changes.
         w.lines.length = 0;
         const writesAt = secretWrites(w).length;
@@ -1116,9 +1114,9 @@ describe("backfills (open-artifacts#2775, #2820)", () => {
         expect(await main(argv(op.cmd, "--dry-run", "--detail"), w.deps)).toBe(
           0,
         );
-        expect(
-          w.parsed().find((l) => l.step === op.cmd)?.data.detail,
-        ).toEqual([{ id, outcome: "present" }]);
+        expect(w.parsed().find((l) => l.step === op.cmd)?.data.detail).toEqual([
+          { id, outcome: "present" },
+        ]);
         const prev = process.env.CI;
         process.env.CI = "true";
         try {
@@ -1139,9 +1137,9 @@ describe("backfills (open-artifacts#2775, #2820)", () => {
         ).toBe(1);
         noCalls(w);
         const c = world({ ci: true, env: "prod" });
-        expect(
-          await main([op.cmd, "--env", "prod", "--dry-run"], c.deps),
-        ).toBe(1);
+        expect(await main([op.cmd, "--env", "prod", "--dry-run"], c.deps)).toBe(
+          1,
+        );
         expect(lastLine(c).message).toMatch(/prod refused/);
       });
     });
@@ -1150,7 +1148,9 @@ describe("backfills (open-artifacts#2775, #2820)", () => {
   it("--dry-run and --detail belong to the backfills only", async () => {
     for (const flag of ["--dry-run", "--detail"]) {
       const w = world();
-      expect(await main(STATUS("iaaaaaaaaaaa", "staging").concat(flag), w.deps)).toBe(1);
+      expect(
+        await main(STATUS("iaaaaaaaaaaa", "staging").concat(flag), w.deps),
+      ).toBe(1);
       expect(lastLine(w)).toMatchObject({ step: "args", status: "error" });
       noCalls(w);
     }

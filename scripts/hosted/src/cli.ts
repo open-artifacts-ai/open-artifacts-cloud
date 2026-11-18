@@ -57,8 +57,8 @@ import {
   publishRelease,
   type R2Credentials,
   type R2Releases,
-  type RotationResult,
   type ReleaseReader,
+  type RotationResult,
   r2ReleaseReader,
   r2S3Client,
   WfpProvisioner,
@@ -649,9 +649,12 @@ export type BackfillOutcome =
   | "failed";
 
 function outcomeOf(r: RotationResult): BackfillOutcome {
-  if (r.ok) return r.planned ? "would_write" : r.rotated ? "written" : "present";
+  if (r.ok)
+    return r.planned ? "would_write" : r.rotated ? "written" : "present";
   // The reason names the install: only its kind is kept for a public log.
-  if (/ is (creating|upgrading|[a-z_]+); rerun the backfill/.test(r.reason ?? ""))
+  if (
+    / is (creating|upgrading|[a-z_]+); rerun the backfill/.test(r.reason ?? "")
+  )
     return "not_active";
   if (/half pair/.test(r.reason ?? "")) return "half_pair";
   return "failed";
