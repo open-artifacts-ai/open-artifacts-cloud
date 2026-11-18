@@ -9,7 +9,7 @@ import {
   platformNames,
   TEST_HOOKS_DEFINE,
 } from "@oa/provision";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InfraError } from "../src/fetch-timeout.ts";
 import { takeFileNotes } from "../src/notes.ts";
 import {
@@ -786,6 +786,25 @@ describe("prodClean (spec 2026-10-26)", () => {
     await expect(check(w)).rejects.toThrow(/lists TEST_HOOKS/);
   });
 
+  it("an install whose script lists or binds DOCS_PREVIEW fails, as staging only (open-artifacts#2641)", async () => {
+    const w = cleanWorld();
+    publish(w, { version: "1.2.3" });
+    w.bindings = ["DB", "DOCS_PREVIEW"];
+    const e = await check(w).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ProdDirty);
+    expect((e as ProdDirty).code).toBe("install_dirty");
+    expect((e as ProdDirty).installId).toBe(ID);
+    expect((e as ProdDirty).message).toMatch(
+      /lists DOCS_PREVIEW \(staging only\)/,
+    );
+    w.bindings = ["DB"];
+    w.secretNames = ["SESSION_SECRET", "DOCS_PREVIEW"];
+    await expect(check(w)).rejects.toThrow(/lists DOCS_PREVIEW/);
+    // Without it the same install is clean.
+    w.secretNames = ["SESSION_SECRET"];
+    expect(await check(w)).toMatchObject({ level: "pass" });
+  });
+
   it("an install with /healthz testHooks: true, or another installId, fails", async () => {
     const w = cleanWorld();
     publish(w, { version: "1.2.3" });
@@ -1064,10 +1083,115 @@ describe("prodClean: releases and installs are checked a few at a time", () => {
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
   });
 
-  it("a release with no record, among clean ones, fails", async () => {
+  it("a version with files but no record is staged: skipped and listed, the rest still checked", async () => {
+    const w = many(12);
+    w.objects?.delete("releases/1.0.11/release/record.sig.json");
+    const { fetch } = await serve(w);
+    const r = await prodClean(probe(), { fetch, pubkey: PUB, ...bearerOf({}) });
+    expect(r).toEqual({
+      level: "pass",
+      releases: 11,
+      installs: 1,
+      staged: ["1.0.11"],
+    });
+  });
+
+  it("a staged version older than a recorded one fails", async () => {
     const w = many(12);
     w.objects?.delete("releases/1.0.7/release/record.sig.json");
     await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a staged version with hook SQL fails", async () => {
+    const w = many(2);
+    publish(w, { version: "1.0.9", js: HOOK_SQL_MARKERS[0] });
+    w.objects?.delete("releases/1.0.9/release/record.sig.json");
+    await expect(check(w)).rejects.toThrow(/holds hook SQL/);
+  });
+
+  it("a staged version plus a bad record on another version fails", async () => {
+    const w = many(2);
+    publish(w, { version: "1.0.9" });
+    w.objects?.delete("releases/1.0.9/release/record.sig.json");
+    publish(w, {
+      version: "1.0.1",
+      key: generateKeyPairSync("ed25519").privateKey,
+    });
+    await expect(check(w)).rejects.toThrow(/does not verify/);
+  });
+
+  it("six staged versions fail; five pass", async () => {
+    const w = many(1);
+    for (let i = 1; i <= 5; i++) {
+      publish(w, { version: `2.0.${i}` });
+      w.objects?.delete(`releases/2.0.${i}/release/record.sig.json`);
+    }
+    const { fetch } = await serve(w);
+    const r = await prodClean(probe(), { fetch, pubkey: PUB, ...bearerOf({}) });
+    expect(r.staged).toHaveLength(5);
+    publish(w, { version: "2.0.6" });
+    w.objects?.delete("releases/2.0.6/release/record.sig.json");
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a staged version whose files are half uploaded passes and is listed incomplete", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0" });
+    w.objects?.delete("releases/2.0.0/release/record.sig.json");
+    w.objects?.delete("releases/2.0.0/release/modules/index.js");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { fetch } = await serve(w);
+      const r = await prodClean(probe(), {
+        fetch,
+        pubkey: PUB,
+        ...bearerOf({}),
+      });
+      expect(r.staged).toEqual(["2.0.0"]);
+      expect(log).toHaveBeenCalledWith("prodClean: staged, incomplete: 2.0.0");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("a record-less version with release plus another variant fails", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0" });
+    w.objects?.delete("releases/2.0.0/release/record.sig.json");
+    publish(w, { version: "2.0.0", variant: "redline" });
+    await expect(check(w)).rejects.toThrow(ProdDirty);
+  });
+
+  it("a redline-variant version without a record fails", async () => {
+    const w = many(1);
+    publish(w, { version: "2.0.0", variant: "redline" });
+    w.objects?.delete("releases/2.0.0/redline/record.sig.json");
+    await expect(check(w)).rejects.toThrow(/variant redline in prod/);
+  });
+
+  it("a recorded version is still fully checked beside a staged one (a bad file fails)", async () => {
+    const w = many(3);
+    w.objects?.delete("releases/1.0.2/release/record.sig.json");
+    publish(w, { version: "1.0.1", js: HOOK_SQL_MARKERS[0] });
+    await expect(failCode(check(w))).resolves.toBe("release_dirty");
+  });
+
+  it("a record without its files still fails", async () => {
+    const w = many(3);
+    w.objects?.delete("releases/1.0.1/release/modules/index.js");
+    await expect(check(w)).rejects.toThrow();
+  });
+
+  it("a listing error fails", async () => {
+    const w = many(2);
+    const { fetch } = await serve(w);
+    const bad: typeof fetch = async (i, init) =>
+      String(i instanceof Request ? i.url : i).includes("prefix=")
+        ? new Response("{}", { status: 500 })
+        : fetch(i, init);
+    await expect(
+      prodClean(probe(), { fetch: bad, pubkey: PUB, ...bearerOf({}) }),
+    ).rejects.toThrow();
   });
 
   it("an unreadable install (its script's secret list answers 404 on a serving row) fails, among clean ones", async () => {

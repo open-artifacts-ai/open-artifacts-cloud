@@ -460,6 +460,9 @@ const fileLevel = (c: CaseResult): boolean =>
 function mergeFileLevel(a: CaseResult, b: CaseResult): CaseResult {
   const worse = a.level === "fail" || b.level !== "fail" ? a : b;
   const out: CaseResult = { ...worse };
+  // A drop only when both shards' copies are drops (src/rerun.ts).
+  if (a.noAnswer && b.noAnswer) out.noAnswer = true;
+  else delete out.noAnswer;
   if (a.blocked && b.blocked)
     out.blocked = {
       file: a.blocked.file,

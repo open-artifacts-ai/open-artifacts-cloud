@@ -233,6 +233,13 @@ export interface WfpOptions {
    */
   oauthBornD1?: boolean;
   /**
+   * open-artifacts#2652: the hosted-wide opt-out purpose key. Set (by the
+   * provisioner Worker, only when its OPTOUT_LIST is "1"), every render, create
+   * and update, binds it as the install's OPTOUT_HASH_KEY secret_text; unset,
+   * no install gets it. Never logged.
+   */
+  optoutHashKey?: string;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -380,7 +387,29 @@ export const VERIFY_CLEAN_REFUSED_BINDING_TYPES = Object.freeze([
  * for an oauth copy job, and one the job couldn't delete is left rotated to a
  * value nobody holds (#1008).
  */
-const OPTIONAL_SECRETS: readonly string[] = ["OAUTH_COPY_KEY"];
+/**
+ * The install's web push pair (open-artifacts#2775), as the server reads it:
+ * the P-256 public key as an uncompressed point and the private scalar, both
+ * base64url. Minted once at create and never rotated: a new pair silently
+ * breaks every browser that turned notifications on. Optional to verify_clean
+ * until backfillPushKeys has run on every install made before this.
+ */
+export const PUSH_SECRETS = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
+
+/**
+ * The install's own opt-out hash key (open-artifacts#2820): 48 random bytes,
+ * base64url, the server's raw HMAC-SHA256 key for its opt-out table, apart
+ * from the platform-wide OPTOUT_HASH_KEY. Minted once at create and never
+ * rotated (a new key stops every stored opt-out from matching). Optional to
+ * verify_clean until backfillOptoutKey has run on every older install.
+ */
+export const INSTALL_OPTOUT_KEY = "INSTALL_OPTOUT_KEY";
+
+const OPTIONAL_SECRETS: readonly string[] = [
+  "OAUTH_COPY_KEY",
+  ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
+];
 
 /**
  * The exact secret names verify_clean expects on an install (design v7 5.2
@@ -391,12 +420,15 @@ export function expectedSecretNames(o: {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the install carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
 }): string[] {
   return [
     ...CREATE_SECRETS,
     ...(o.broker ? ["BROKER_SIGNING_KEY"] : []),
     ...(o.codes ? ["TURNSTILE_SECRET"] : []),
     ...(o.testHooks ? ["TEST_HOOK_KEY"] : []),
+    ...(o.optout ? ["OPTOUT_HASH_KEY"] : []),
   ].sort();
 }
 
@@ -428,6 +460,8 @@ export interface VerifyCleanInput {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the render carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
   /** The template's last Durable Object migration tag (null: none). */
   lastTag: string | null;
   /** The tag the script runs: the upload's, or the row's when none ran. */
@@ -568,7 +602,12 @@ export const CREATE_SECRETS = [
   "DIRECTORY_TOKEN_KEY",
 ] as const;
 /** Secrets metadata.ts does not know; appended to its bindings here. */
-const EXTRA_SECRETS = ["DIRECTORY_TOKEN_KEY", "TURNSTILE_SECRET"];
+const EXTRA_SECRETS: readonly string[] = [
+  "DIRECTORY_TOKEN_KEY",
+  "TURNSTILE_SECRET",
+  ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
+];
 const SITEKEY_RE = /^[0-9A-Za-z_-]{8,64}$/;
 
 /**
@@ -607,6 +646,26 @@ export function normOwnerEmail(s: string): string | null {
 }
 
 /** 48 bytes from the CSPRNG, base64url. Generated per install, never derived. */
+/** A fresh web push pair (PUSH_SECRETS), never logged. */
+export async function newPushKeys(): Promise<
+  Record<(typeof PUSH_SECRETS)[number], string>
+> {
+  const k = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const j = await crypto.subtle.exportKey("jwk", k.privateKey);
+  if (!j.x || !j.y || !j.d) throw new Error("push key export is incomplete");
+  const pub = Buffer.concat([
+    Buffer.from([4]),
+    Buffer.from(j.x, "base64url"),
+    Buffer.from(j.y, "base64url"),
+  ]);
+  if (pub.length !== 65) throw new Error("push public key is not 65 bytes");
+  return { VAPID_PUBLIC_KEY: b64u(pub), VAPID_PRIVATE_KEY: j.d };
+}
+
 export function newSecret(): string {
   return b64u(crypto.getRandomValues(new Uint8Array(SECRET_BYTES)));
 }
@@ -842,7 +901,11 @@ export interface VarsResult {
 export interface RotationResult {
   id: InstallId;
   ok: boolean;
-  /** False for an install with codes off (nothing to rotate). */
+  /**
+   * False for an install with nothing to do: codes off (Turnstile), or a
+   * push pair already there (backfillPushKeys), or an opt-out key
+   * (backfillOptoutKey).
+   */
   rotated: boolean;
   reason?: string;
 }
@@ -1913,6 +1976,8 @@ export class WfpProvisioner {
     const secrets: Record<string, string> = {};
     for (const k of CREATE_SECRETS) secrets[k] = newSecret();
     if (testHooks) secrets.TEST_HOOK_KEY = newSecret();
+    Object.assign(secrets, await newPushKeys());
+    secrets[INSTALL_OPTOUT_KEY] = newSecret();
     for (const v of Object.values(secrets)) this.sensitive.add(v);
     assertSessionSecret(
       secrets.SESSION_SECRET as string,
@@ -2435,6 +2500,25 @@ export class WfpProvisioner {
       if (v !== undefined)
         meta.bindings.push({ type: "secret_text", name: k, text: v });
     }
+    // open-artifacts#2652: the hosted-wide opt-out key, on every render.
+    if (this.o.optoutHashKey !== undefined) {
+      this.sensitive.add(this.o.optoutHashKey);
+      meta.bindings.push({
+        type: "secret_text",
+        name: "OPTOUT_HASH_KEY",
+        text: this.o.optoutHashKey,
+      });
+      // Its plain vars (public #2665): where the unsubscribe link lands, and
+      // that the platform list is on. Hosted renders only, with the key.
+      meta.bindings.push(
+        {
+          type: "plain_text",
+          name: "OPTOUT_UNSUBSCRIBE_URL",
+          text: `https://signup.${this.o.domains.app}/unsubscribe`,
+        },
+        { type: "plain_text", name: "OPTOUT_PLATFORM", text: "on" },
+      );
+    }
     // An update never drops the secrets already on the script.
     if (r.mode === "update") meta.keep_bindings = ["secret_text", "secret_key"];
     if (
@@ -2509,6 +2593,9 @@ export class WfpProvisioner {
       ...CREATE_SECRETS,
       ...(testHooks ? ["TEST_HOOK_KEY"] : []),
       ...(m.sitekey !== null ? ["TURNSTILE_SECRET"] : []),
+      // Only on the first upload: an existing script gets its pair from
+      // backfillPushKeys, under the operator's own go (never by a rerun).
+      ...(exists ? [] : [...PUSH_SECRETS, INSTALL_OPTOUT_KEY]),
     ];
     const have = exists ? await cf.secretList(target, n.script) : [];
     const missing = required.filter((k) => !have.includes(k));
@@ -2605,6 +2692,7 @@ export class WfpProvisioner {
         rec,
         broker: this.o.brokerEnabled === true,
         codes: m.sitekey !== null,
+        optout: this.o.optoutHashKey !== undefined,
         testHooks,
         lastTag: latest,
         tag,
@@ -3975,6 +4063,7 @@ export class WfpProvisioner {
             rec: rel.rec,
             broker: row.broker_kid !== null,
             codes: m.sitekey !== null,
+            optout: this.o.optoutHashKey !== undefined,
             testHooks: m.testHooks,
             lastTag: tagsOf(rel.template).at(-1) ?? null,
             tag: reached,
@@ -4344,6 +4433,7 @@ export class WfpProvisioner {
           rec: rel.rec,
           broker: row.broker_kid !== null,
           codes: p.m.sitekey !== null,
+          optout: this.o.optoutHashKey !== undefined,
           testHooks: p.m.testHooks,
           lastTag: tagsOf(rel.template).at(-1) ?? null,
           tag: row.do_migration_tag,
@@ -4688,6 +4778,155 @@ export class WfpProvisioner {
               ts.secret,
             );
             await this.logged("turnstile.rotate", { sitekey: ts.sitekey });
+            await this.release("active");
+          } catch (e) {
+            if (!(e instanceof LostLease))
+              await this.releaseQuietly("active", e);
+            throw e;
+          }
+          out.push({ id: row.id, ok: true, rotated: true });
+        } catch (e) {
+          out.push({
+            id: row.id,
+            ok: false,
+            rotated: false,
+            reason: this.reasonOf(e),
+          });
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
+   * open-artifacts#2775: puts a fresh web push pair on every active install of
+   * `env` that has none. An install that holds both keeps them (never
+   * rotated). The private key goes up first and the public key last, so a
+   * lone private key is this method's own interrupted run (no browser can
+   * subscribe without the public key) and a rerun finishes it; a lone public
+   * key was put by someone else and is refused, not overwritten.
+   * Run by an operator, once, on the user's go; create mints its own pair.
+   */
+  async backfillPushKeys(env: Env): Promise<RotationResult[]> {
+    return this.guarded(async () => {
+      this.checkOptions();
+      if (env !== this.env)
+        throw new ProvisionRefused(
+          `this provisioner is for ${this.env}, not ${String(env)}`,
+          "invalid_state",
+        );
+      await this.checkToken();
+      await this.resolvePlatform();
+      const out: RotationResult[] = [];
+      for (const row of await this.platform.inStates([
+        "creating",
+        "active",
+        "upgrading",
+      ])) {
+        try {
+          if (row.state !== "active")
+            throw new ProvisionRefused(
+              `install ${row.id} is ${row.state}; rerun the backfill once it is active`,
+              "invalid_state",
+            );
+          const script = names(row.id, this.env).script;
+          assertOwnResource(script, this.env);
+          const have = (await this.cf.secretList(this.target, script)).filter(
+            (k) => (PUSH_SECRETS as readonly string[]).includes(k),
+          );
+          if (have.length === PUSH_SECRETS.length) {
+            out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          if (have.includes("VAPID_PUBLIC_KEY"))
+            throw new ProvisionRefused(
+              `install ${row.id} holds only ${have.join(", ")}; a half pair is never overwritten`,
+              "invalid_state",
+            );
+          await this.claim(row, ["active"], "active", "push_keys");
+          try {
+            const keys = await newPushKeys();
+            for (const v of Object.values(keys)) this.sensitive.add(v);
+            for (const k of [
+              "VAPID_PRIVATE_KEY",
+              "VAPID_PUBLIC_KEY",
+            ] as const) {
+              assertOwnResource(script, this.env);
+              await this.hold();
+              await this.cf.secretPut(this.target, script, k, keys[k]);
+            }
+            await this.logged("push_keys.backfill");
+            await this.release("active");
+          } catch (e) {
+            if (!(e instanceof LostLease))
+              await this.releaseQuietly("active", e);
+            throw e;
+          }
+          out.push({ id: row.id, ok: true, rotated: true });
+        } catch (e) {
+          out.push({
+            id: row.id,
+            ok: false,
+            rotated: false,
+            reason: this.reasonOf(e),
+          });
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
+   * open-artifacts#2820: puts a fresh INSTALL_OPTOUT_KEY on every active
+   * install of `env` that has none; one that holds it keeps it (never
+   * rotated). One secret, so a rerun after a failure simply finishes. Run by
+   * an operator, once, on the user's go; create mints its own.
+   */
+  async backfillOptoutKey(env: Env): Promise<RotationResult[]> {
+    return this.guarded(async () => {
+      this.checkOptions();
+      if (env !== this.env)
+        throw new ProvisionRefused(
+          `this provisioner is for ${this.env}, not ${String(env)}`,
+          "invalid_state",
+        );
+      await this.checkToken();
+      await this.resolvePlatform();
+      const out: RotationResult[] = [];
+      for (const row of await this.platform.inStates([
+        "creating",
+        "active",
+        "upgrading",
+      ])) {
+        try {
+          if (row.state !== "active")
+            throw new ProvisionRefused(
+              `install ${row.id} is ${row.state}; rerun the backfill once it is active`,
+              "invalid_state",
+            );
+          const script = names(row.id, this.env).script;
+          assertOwnResource(script, this.env);
+          if (
+            (await this.cf.secretList(this.target, script)).includes(
+              INSTALL_OPTOUT_KEY,
+            )
+          ) {
+            out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          await this.claim(row, ["active"], "active", "optout_key");
+          try {
+            const key = newSecret();
+            this.sensitive.add(key);
+            assertOwnResource(script, this.env);
+            await this.hold();
+            await this.cf.secretPut(
+              this.target,
+              script,
+              INSTALL_OPTOUT_KEY,
+              key,
+            );
+            await this.logged("optout_key.backfill");
             await this.release("active");
           } catch (e) {
             if (!(e instanceof LostLease))

@@ -60,6 +60,7 @@ afterAll(({}, file) => {
   const notes = [
     ...takeFileNotes(),
     resets.totals(),
+    ...(resets.edge() ? [resets.edge() as string] : []),
     // Per lane and file: the claims and the time they waited, so the first
     // real run measures the pacing (#1730).
     ...(targets.length ? [pacingNote(file.name)] : []),

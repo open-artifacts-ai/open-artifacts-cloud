@@ -89,6 +89,111 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
     })),
+    // v0.189.0: the login settings routes (#2545).
+    ...[
+      "org GET /api/v1/members/reach [session]",
+      "org GET /api/v1/members/reach [pat]",
+      "org GET /api/v1/settings/login [session]",
+      "org GET /api/v1/settings/login [pat]",
+      "org POST /api/v1/settings/login/first-invite-seen [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.190.1: the doc ops route (#2542) and the edit_doc MCP tool.
+    ...[
+      "artifact rest doc ops [session]",
+      "artifact rest doc ops [pat]",
+      "artifact mcp edit_doc [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.195.0: doc versions (#1100), withdraw_ask and edit_comment (#2511).
+    ...[
+      "artifact comments ask withdraw [session]",
+      "artifact comments ask withdraw [pat]",
+      "artifact mcp withdraw_ask [pat]",
+      "artifact mcp edit_comment [pat]",
+      "artifact rest doc save version [session]",
+      "artifact rest doc save version [pat]",
+      "artifact rest doc restore [session]",
+      "artifact rest doc restore [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.205.0: inbox read (#2512), held requests (#2577) and Install now
+    // (#2552), each interactive-only and deny-only (A's session at B).
+    ...[
+      "org POST /api/v1/me/inbox/read [session]",
+      "org POST /api/v1/me/inbox/read-all [session]",
+      "org GET /api/v1/me/agent-asks/held [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/allow [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/allow/challenge [session]",
+      "org POST /api/v1/me/agent-asks/held/:id/not-now [session]",
+      "org POST /api/v1/bus/machines/:id/install-now [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.219.0: the agent-requests switch and listens-to list (#2577 S2),
+    // deny-only, and the switch read, probed with both credentials.
+    ...[
+      "org PUT /api/v1/me/agent-requests [session]",
+      "org GET /api/v1/me/agent-listens [session]",
+      "org PATCH /api/v1/me/agent-listens/:id [session]",
+      "org DELETE /api/v1/me/agent-listens/:id [session]",
+      "org GET /api/v1/me/agent-requests [pat]",
+      "org GET /api/v1/me/agent-requests [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.213.0: prefs, mutes, Later and push subscription changes (#2512,
+    // #2762), each interactive-only and deny-only (A's session at B).
+    ...[
+      "org PUT /api/v1/me/notification-prefs [session]",
+      "org POST /api/v1/me/inbox/mutes [session]",
+      "org DELETE /api/v1/me/inbox/mutes/:kind/:id [session]",
+      "org POST /api/v1/me/inbox/:id/later [session]",
+      "org POST /api/v1/me/push/subscriptions [session]",
+      "org PATCH /api/v1/me/push/subscriptions/:id [session]",
+      "org DELETE /api/v1/me/push/subscriptions/:id [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.213.0: the reads they pair with (#2512), mention candidates (#2770)
+    // and comment pictures (#2577), probed with both credentials.
+    ...[
+      "org GET /api/v1/me/inbox/mutes [pat]",
+      "org GET /api/v1/me/inbox/mutes [session]",
+      "org GET /api/v1/me/notification-prefs [pat]",
+      "org GET /api/v1/me/notification-prefs [session]",
+      "org GET /api/v1/me/push/key [pat]",
+      "org GET /api/v1/me/push/key [session]",
+      "org GET /api/v1/me/push/subscriptions [pat]",
+      "org GET /api/v1/me/push/subscriptions [session]",
+      "artifact artifact mention candidates [pat]",
+      "artifact artifact mention candidates [session]",
+      "artifact comment picture read [pat]",
+      "artifact comment picture read [session]",
+      "artifact comment picture reserve [pat]",
+      "artifact comment picture reserve [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // v0.197.0: the onboarding routes (#2632), probed now, no longer dropped.
+    ...[
+      "org GET /api/v1/onboarding [session]",
+      "org GET /api/v1/onboarding [pat]",
+      "org PUT /api/v1/onboarding [session]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
     // #859: the provisioner probes, run last in the prov lane.
     {
       file: "live/provisioner.test.ts",

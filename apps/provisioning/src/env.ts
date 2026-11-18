@@ -35,7 +35,10 @@ export type BillingSetTierResult =
 export type BillingTiersOfResult =
   | {
       ok: true;
-      tiers: Record<string, { tier: string | null; status: string | null }>;
+      tiers: Record<
+        string,
+        { tier: string | null; status: string | null; noRow?: boolean }
+      >;
     }
   | { ok: false; error: "bad_installs" | "unavailable" };
 export interface BillingOperatorRpc {
@@ -84,6 +87,21 @@ export interface Env {
   BROKER_REGISTRY?: KVNamespace;
   /** "1" turns the instance's login-domain change route on (#2520); else its plain 404. */
   LOGIN_CHANGE?: string;
+  /**
+   * While LOGIN_CHANGE is not "1": comma-separated install slugs the route is
+   * on for (#2520 rollout, leo first). Every other install gets the plain 404.
+   */
+  LOGIN_CHANGE_SLUGS?: string;
+  /** "1" turns the hosted opt-out list routes on (#2652); else their plain 404. */
+  OPTOUT_LIST?: string;
+  /** Secret: HMAC key for h2 = HMAC(OPTOUT_STORE_KEY, h1), what the list stores. Unset: 503. */
+  OPTOUT_STORE_KEY?: string;
+  /** Secret: HMAC key that signs and verifies opt-out tokens. Unset: 503. */
+  OPTOUT_TOKEN_KEY?: string;
+  /** Checks per install per day that log optout_check_spike (default 800; hard cap 1000). */
+  OPTOUT_CHECK_SPIKE?: string;
+  /** Adds per install per day that log optout_add_spike (default 150; hard cap 200). */
+  OPTOUT_ADD_SPIKE?: string;
   /** Self-serve producer (post-M1). */
   SIGNUPS: Queue;
   /** The admin SPA (single-page-application, Worker first). */

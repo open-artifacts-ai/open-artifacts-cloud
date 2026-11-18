@@ -8,6 +8,7 @@ import { parse } from "yaml";
 import {
   BOT,
   type Check,
+  commitOk,
   decide,
   type Exec,
   GATE_WORKFLOWS,
@@ -15,6 +16,11 @@ import {
   type Input,
   isChainProdDeploy,
   parseView,
+  type QueueRun,
+  queueFailure,
+  queueMarker,
+  queueNotice,
+  queueVerdict,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -27,6 +33,12 @@ const HEAD = "c".repeat(40);
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
+const HEAD_AT = "2026-11-17T10:00:00Z";
+const qrun = (createdAt: string, conclusion: string | null): QueueRun => ({
+  createdAt,
+  status: conclusion === null ? "in_progress" : "completed",
+  conclusion,
+});
 const REQUIRED_CHECKS = [
   "scripts",
   "overlay",
@@ -66,6 +78,8 @@ const base = (o: Partial<Input> = {}): Input => ({
   commits: [{ author: BOT, committer: BOT, verified: true }],
   required: REQUIRED_CHECKS,
   armed: false,
+  headAt: HEAD_AT,
+  queueRuns: [],
   ...o,
 });
 const left = (o: Partial<Input>, why: RegExp) => {
@@ -310,10 +324,53 @@ describe("decide", () => {
       { commits: [{ author: BOT, committer: "leourbina", verified: true }] },
       /committed by leourbina/,
     );
+  });
+  it("accepts web-flow as committer only for a verified commit authored by the bot", () => {
+    const wf = (author: string, verified: boolean) => ({
+      commits: [{ author, committer: "web-flow", verified }],
+    });
+    expect(decide(base(wf(BOT, true))).arm).toBe(true);
     left(
-      { commits: [{ author: BOT, committer: "web-flow", verified: true }] },
-      /committed by web-flow/,
+      wf("leourbina", true),
+      /commit is by leourbina, committed by web-flow/,
     );
+    left(wf(BOT, false), /unverified/);
+    left(wf("", true), /committed by web-flow/);
+    left(wf("web-flow", true), /commit is by web-flow/);
+    left(wf(`x${BOT}`, true), /commit is by/);
+    // One bad commit among good ones still refuses.
+    left(
+      {
+        commits: [
+          { author: BOT, committer: "web-flow", verified: true },
+          { author: "leourbina", committer: "web-flow", verified: true },
+        ],
+      },
+      /leourbina/,
+    );
+    // Other committers stay refused, even for the bot's own commit.
+    left(
+      { commits: [{ author: BOT, committer: "github", verified: true }] },
+      /committed by github/,
+    );
+    expect(
+      commitOk({ author: BOT, committer: "web-flow", verified: true }),
+    ).toBe(true);
+    expect(commitOk({ author: BOT, committer: BOT, verified: true })).toBe(
+      true,
+    );
+  });
+  it("takes back the bot's arming over a human web-flow commit, keeps it for the bot's", () => {
+    expect(
+      go(
+        "arm",
+        fake({ armed: true, commitAuthor: "leourbina", committer: "web-flow" }),
+      ).disarmed,
+    ).toEqual([7]);
+    expect(
+      go("arm", fake({ armed: true, committer: "web-flow" })).disarmed,
+    ).toEqual([]);
+    expect(go("arm", fake({ committer: "web-flow" })).armed).toEqual([7]);
   });
   it("leaves a commit GitHub could not attribute, or a PR with no commits", () => {
     left(
@@ -434,6 +491,280 @@ const RULES = JSON.stringify([
   },
   { type: "merge_queue", parameters: {} },
 ]);
+describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
+  const FAIL = qrun("2026-11-17T10:30:00Z", "failure");
+  it("leaves a head whose merge queue run failed, timed out or never started", () => {
+    for (const c of ["failure", "timed_out", "startup_failure"])
+      left(
+        { queueRuns: [qrun(FAIL.createdAt, c)] },
+        new RegExp(`merge queue run on this head ended ${c}`),
+      );
+  });
+  it("does not hold a head for one cancelled, skipped or neutral run (no verdict)", () => {
+    for (const c of [
+      "cancelled",
+      "skipped",
+      "neutral",
+      "action_required",
+      null,
+    ])
+      expect(
+        decide(base({ queueRuns: [qrun(FAIL.createdAt, c)] })).arm,
+        String(c),
+      ).toBe(true);
+  });
+  it("a cancelled run newer than a failure does not clear the failure; a success does", () => {
+    const cancelled = qrun("2026-11-17T11:00:00Z", "cancelled");
+    expect(decide(base({ queueRuns: [FAIL, cancelled] })).arm).toBe(false);
+    const ok = qrun("2026-11-17T12:00:00Z", "success");
+    expect(decide(base({ queueRuns: [FAIL, cancelled, ok] })).arm).toBe(true);
+  });
+  it("holds a head whose newest three queue runs were all cancelled", () => {
+    const c = (at: string) => qrun(at, "cancelled");
+    const three = [
+      c("2026-11-17T10:10:00Z"),
+      c("2026-11-17T10:20:00Z"),
+      c("2026-11-17T10:30:00Z"),
+    ];
+    left({ queueRuns: three }, /last 3 merge queue runs.*all cancelled/);
+    left({ queueRuns: [...three].reverse() }, /all cancelled/);
+    // Two are not enough, a success or a still-running newest run breaks the streak,
+    // and cancels made before the head commit are another head's.
+    expect(decide(base({ queueRuns: three.slice(1) })).arm).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [...three, qrun("2026-11-17T10:40:00Z", "success")],
+        }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({ queueRuns: [...three, qrun("2026-11-17T10:40:00Z", null)] }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [
+            c("2026-11-17T09:00:00Z"),
+            c("2026-11-17T09:10:00Z"),
+            c("2026-11-17T10:10:00Z"),
+          ],
+        }),
+      ).arm,
+    ).toBe(true);
+    // The newest three decide: an older failure under three newer cancels holds as cancels.
+    expect(
+      queueVerdict(HEAD_AT, [
+        FAIL,
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
+    expect(
+      queueVerdict(HEAD_AT, [
+        qrun("2026-11-17T10:05:00Z", "success"),
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
+  });
+  it("arms a head whose queue run is still going, or ended green", () => {
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", null)] })).arm,
+    ).toBe(true);
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", "success")] }))
+        .arm,
+    ).toBe(true);
+  });
+  it("ignores a failed run made before this head commit (an older head)", () => {
+    const old = qrun("2026-11-17T09:59:59Z", "failure");
+    expect(decide(base({ queueRuns: [old] })).arm).toBe(true);
+  });
+  it("judges by the newest run after the head, whatever the order", () => {
+    const bad = qrun("2026-11-17T10:30:00Z", "failure");
+    const good = qrun("2026-11-17T11:00:00Z", "success");
+    expect(decide(base({ queueRuns: [bad, good] })).arm).toBe(true);
+    expect(decide(base({ queueRuns: [good, bad] })).arm).toBe(true);
+    const late = qrun("2026-11-17T12:00:00Z", "failure");
+    expect(decide(base({ queueRuns: [good, bad, late] })).arm).toBe(false);
+    expect(decide(base({ queueRuns: [late, good, bad] })).arm).toBe(false);
+  });
+  it("fails closed on an unreadable head date or run date", () => {
+    left({ headAt: "" }, /date is unreadable/);
+    left({ headAt: "soon" }, /date is unreadable/);
+    left({ queueRuns: [qrun("", "success")] }, /no readable date/);
+  });
+  it("queueFailure says nothing without runs", () => {
+    expect(queueFailure(HEAD_AT, [])).toBeUndefined();
+  });
+  it("run: a failed queue run keeps the PR un-armed on every pass, until a new head", () => {
+    // The first pass leaves its one comment (see the next describe); with the
+    // marker there, every later pass writes nothing at all.
+    const f = fake({
+      queue: [FAIL],
+      comments: [{ user: { login: BOT }, body: queueMarker(HEAD) }],
+    });
+    for (let n = 0; n < 3; n++) {
+      const r = go("arm", f);
+      expect(r.armed).toEqual([]);
+      expect(r.write).toBe(false);
+      expect(r.merges).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(
+        /#7: leave: its merge queue run on this head ended failure/,
+      );
+    }
+    // A new head commit made after the failed run is judged afresh.
+    expect(
+      go("arm", fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" })).armed,
+    ).toEqual([7]);
+  });
+  it("run: a queue run in the API that cannot be read leaves the PR", () => {
+    const r = go("arm", fake({ notFound: ["event=merge_group"] }));
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/could not read what it needs/);
+    const g = go("arm", fake({ notFound: ["/git/commits/"] }));
+    expect(g.armed).toEqual([]);
+  });
+  it("run: a bot-armed PR with a failed queue run is disarmed", () => {
+    const f = fake({ armed: true, queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+  });
+});
+
+describe("the failed queue run leaves one visible trace per head", () => {
+  const RUN_URL = `https://github.com/${REPO}/actions/runs/123456`;
+  const FAIL: QueueRun = {
+    ...qrun("2026-11-17T10:30:00Z", "failure"),
+    url: RUN_URL,
+  };
+  const posts = (f: ReturnType<typeof fake>) =>
+    f.calls.filter((c) => c.join(" ").includes("-X POST"));
+  const mine = (head = HEAD) => ({
+    user: { login: BOT },
+    body: `${queueMarker(head)}\nold`,
+  });
+  it("plan reports write=true, and posts nothing", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("plan", f);
+    expect(r.write).toBe(true);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([]);
+  });
+  it("arm posts one comment with the marker and the run link, and never arms", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    expect(r.armed).toEqual([]);
+    expect(r.merges).toEqual([]);
+    expect(posts(f)).toHaveLength(1);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toContain(`repos/${REPO}/issues/7/comments`);
+    expect(call).toContain(queueMarker(HEAD));
+    expect(call).toContain(RUN_URL);
+    expect(call).toMatch(/port or fix is needed/);
+    expect(call).toMatch(/new commit/);
+    expect(call).toMatch(/by hand/);
+    expect(call).not.toContain("\u2014");
+  });
+  it("posts nothing more once its own marker for this head is there", () => {
+    const f = fake({ queue: [FAIL], comments: [mine()] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.noticed).toEqual([]);
+    expect(r.write).toBe(false);
+    expect(go("plan", fake({ queue: [FAIL], comments: [mine()] })).write).toBe(
+      false,
+    );
+  });
+  it("counts only the bot's marker, and only for this head", () => {
+    const stranger = { user: { login: "someone" }, body: queueMarker(HEAD) };
+    expect(posts(fake({ queue: [FAIL], comments: [stranger] }))).toEqual([]);
+    for (const comments of [[stranger], [mine("9".repeat(40))]]) {
+      const f = fake({ queue: [FAIL], comments });
+      go("arm", f);
+      expect(posts(f)).toHaveLength(1);
+    }
+  });
+  it("says nothing when the PR is held back for another reason, or the queue run is fine", () => {
+    for (const o of [
+      { checks: green.slice(1) },
+      { commitAuthor: "leourbina" },
+      { released: false },
+    ]) {
+      const f = fake({ queue: [FAIL], ...o });
+      go("arm", f);
+      expect(posts(f)).toEqual([]);
+    }
+    const ok = fake({ queue: [qrun("2026-11-17T10:30:00Z", "success")] });
+    go("arm", ok);
+    expect(posts(ok)).toEqual([]);
+    const g = fake({ queue: [FAIL], armed: true, autoBy: "leourbina" });
+    go("arm", g);
+    expect(posts(g)).toEqual([]);
+  });
+  it("a new head after the failure is judged afresh and gets no comment", () => {
+    const f = fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
+  });
+  it("takes back the bot's own arming over a failed queue run, and says so once", () => {
+    const f = fake({ queue: [FAIL], armed: true });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+    expect(posts(f)).toHaveLength(1);
+  });
+  it("turns the run red when the comment cannot be read or posted", () => {
+    expect(() => go("arm", fake({ queue: [FAIL], postFails: true }))).toThrow(
+      /403/,
+    );
+    expect(() =>
+      go("arm", fake({ queue: [FAIL], notFound: ["/issues/7/comments"] })),
+    ).toThrow(/Not Found/);
+  });
+  it("says so when the hold is three cancels in a row", () => {
+    const runs = [1, 2, 3].map((n) => ({
+      ...qrun(`2026-11-17T10:${n}0:00Z`, "cancelled"),
+      url: `https://github.com/${REPO}/actions/runs/${n}`,
+    }));
+    const f = fake({ queue: runs });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toMatch(/cancelled 3 times in a row/);
+    expect(call).toContain("/actions/runs/3");
+    expect(r.armed).toEqual([]);
+  });
+  it("a cancelled run alone leaves no comment, and the PR is armed", () => {
+    const f = fake({ queue: [qrun("2026-11-17T10:30:00Z", "cancelled")] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
+  });
+  it("links only this repository's run pages", () => {
+    const i = base({ queueRuns: [{ ...FAIL, url: "https://evil.example/x" }] });
+    expect(queueNotice(i, REPO)).not.toContain("evil.example");
+    expect(queueNotice(i, REPO)).toContain(queueMarker(HEAD));
+    expect(queueNotice(base({ queueRuns: [FAIL] }), REPO)).toContain(RUN_URL);
+  });
+  it("reads the run url in the gh query", () => {
+    const f = fake({ queue: [FAIL] });
+    go("arm", f);
+    const q = f.calls
+      .map((c) => c.join(" "))
+      .find((c) => c.includes("event=merge_group"));
+    expect(q).toContain("url: .html_url");
+  });
+});
+
 describe("requiredChecks", () => {
   it("reads the contexts of the required_status_checks rule", () => {
     expect(requiredChecks(RULES)).toEqual(REQUIRED_CHECKS);
@@ -472,6 +803,7 @@ const fake = (
     armed?: boolean;
     author?: string;
     commitAuthor?: string;
+    committer?: string;
     rulesFail?: boolean;
     unverified?: boolean;
     released?: boolean;
@@ -488,6 +820,10 @@ const fake = (
     deployTitles?: string[];
     deepDeploy?: boolean;
     tagSha?: string;
+    queue?: QueueRun[];
+    headAt?: string;
+    comments?: { user: { login: string }; body: string }[];
+    postFails?: boolean;
   } = {},
 ) => {
   const calls: Call[] = [];
@@ -533,6 +869,13 @@ const fake = (
           : "0",
       );
     }
+    if (a.includes("/git/commits/"))
+      return ok(JSON.stringify({ committer: { date: o.headAt ?? HEAD_AT } }));
+    if (a.includes("actions/workflows/ci.yml/runs?event=merge_group")) {
+      expect(a).toContain("per_page=100");
+      expect(a).toContain("gh-readonly-queue/main/pr-7-");
+      return ok(JSON.stringify(o.queue ?? []));
+    }
     if (a.includes("/pulls?state=open"))
       return ok(
         JSON.stringify([
@@ -572,7 +915,7 @@ const fake = (
           [
             {
               author: { login: o.commitAuthor ?? BOT },
-              committer: { login: BOT },
+              committer: { login: o.committer ?? BOT },
               commit: { verification: { verified: !o.unverified } },
             },
           ],
@@ -640,6 +983,13 @@ const fake = (
           },
         }),
       );
+    }
+    if (a.includes("/issues/7/comments")) {
+      if (a.includes("-X POST"))
+        return o.postFails
+          ? { code: 1, stdout: "", stderr: "HTTP 403" }
+          : ok("{}");
+      return ok(JSON.stringify([o.comments ?? []]));
     }
     if (a.startsWith("pr merge")) return ok("");
     return { code: 1, stdout: "", stderr: `unexpected ${cmd} ${a}` };
@@ -1061,7 +1411,10 @@ describe("the release gate in run", () => {
     go("arm", f);
     const reads = f.calls
       .map((c) => c.join(" "))
-      .filter((c) => c.includes("/actions/workflows/"));
+      .filter(
+        (c) =>
+          c.includes("/actions/workflows/") && !c.includes("workflows/ci.yml/"),
+      );
     expect(reads.length).toBe(GATE_WORKFLOWS.length * 2 + 1);
     expect(reads.filter((c) => c.includes("per_page=100")).length).toBe(1);
     for (const c of reads) {

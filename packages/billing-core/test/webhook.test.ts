@@ -1795,7 +1795,10 @@ describe("a paid checkout records the subscription's interval and renewal (#2135
     const f = (async () =>
       body
         ? Response.json(body)
-        : Response.json({ error: {} }, { status: 500 })) as unknown as typeof fetch;
+        : Response.json(
+            { error: {} },
+            { status: 500 },
+          )) as unknown as typeof fetch;
     return { ...env, stripeFetch: f } as WebhookEnv;
   };
   const checkout = (created: number, o: Record<string, unknown> = {}) =>
@@ -1852,9 +1855,9 @@ describe("a paid checkout records the subscription's interval and renewal (#2135
 
   it("a failed read of the row's own subscription still applies the checkout; the renewal waits for the next event", async () => {
     await ownSub(A);
-    expect((await deliver(checkout(T + 100), { env: stripeOf(null) })).status).toBe(
-      200,
-    );
+    expect(
+      (await deliver(checkout(T + 100), { env: stripeOf(null) })).status,
+    ).toBe(200);
     expect(await row(A)).toMatchObject({
       tier: "team",
       stripe_subscription_id: "sub_Test1",

@@ -376,7 +376,13 @@ export interface SuspendIo {
   /** One upgrade with the daemon's token: its status, and whether it is dispatch's paused 503. */
   reconnect(): Promise<{ status: number; paused: boolean }>;
   /** After the resume: the same token's upgrade, hello, the receiver up again, and whether msgId came again. */
-  reopen(msgId: string): Promise<{ status: number; redelivered: boolean }>;
+  reopen(msgId: string): Promise<{
+    status: number;
+    redelivered: boolean;
+    /** A refusal's body and Retry-After header. */
+    body?: string;
+    retryAfter?: string | null;
+  }>;
   /** The suspended install's machines and roster (hubView), and whether the case's machine and receiver are on them. */
   hub(): Promise<{ view: string; ours: boolean }>;
 }
@@ -384,7 +390,19 @@ export interface SuspendIo {
 export interface SuspendResult {
   closeMs: number;
   reconnects: number;
+  /** Every non-101 answer after the resume, then the 101: for the case's notes, pass or fail. */
+  resumeNotes: string[];
 }
+
+/**
+ * How long after the resume a reconnect answering 503 is retried (OA Bus: real
+ * daemons retry a 503). Starts at 60 s; to be set to the window the gate runs
+ * measure (the notes carry the 503 count and the ms from the resume to the 101).
+ */
+export const RESUME_503_WINDOW_MS = 60_000;
+/** One wait between retries: Retry-After, at most this; 1 s without one. */
+const RESUME_RETRY_CAP_MS = 10_000;
+const RESUME_RETRY_DEFAULT_MS = 1_000;
 
 /**
  * Case 2, OA Bus's assertions in order: with a daemon socket (an agent up and
@@ -412,7 +430,7 @@ export async function suspendCase(
     throw new ProbeFail(
       `${X}'s roster does not list the case's machine and receiver before the suspend`,
     );
-  const out: SuspendResult = { closeMs: 0, reconnects: 0 };
+  const out: SuspendResult = { closeMs: 0, reconnects: 0, resumeNotes: [] };
   const stillUp = (when: string) => {
     if (!bystander.isOpen()) {
       const code = bystander.closeCode();
@@ -427,6 +445,7 @@ export async function suspendCase(
   let resumeFailure: unknown;
   // Marked before the request: a suspend whose answer was lost is still resumed.
   let suspended = false;
+  let resumedAt = 0;
   try {
     if (!d.isOpen())
       throw new ProbeFail(`${X}'s daemon socket closed before the suspend`);
@@ -480,6 +499,7 @@ export async function suspendCase(
   if (suspended)
     try {
       await io.resume();
+      resumedAt = io.now();
     } catch (e) {
       resumeFailure = e;
     }
@@ -491,11 +511,35 @@ export async function suspendCase(
     throw new ProbeFail(
       `after the resume ${X}'s hub is not the one before the suspend (${hubAfter.ours ? "machines or roster changed" : "the case's machine or receiver is gone"})`,
     );
-  const r = await io.reopen(d.msgId);
-  if (r.status !== 101)
-    throw new ProbeFail(
-      `after the resume ${X} answered the same machine token with ${r.status}, want 101`,
+  let r = await io.reopen(d.msgId);
+  while (r.status !== 101) {
+    const ms = Math.round(io.now() - resumedAt);
+    const ra = r.retryAfter ?? null;
+    out.resumeNotes.push(
+      `${r.status} ${ms} ms after the resume, Retry-After ${ra ?? "none"}, body '${(r.body ?? "").slice(0, 200)}'`,
     );
+    const log = out.resumeNotes.join("; ");
+    if (r.status !== 503)
+      throw new ProbeFail(
+        `after the resume ${X} answered the same machine token with ${r.status}, want 101 (${log})`,
+      );
+    if (ms >= RESUME_503_WINDOW_MS)
+      throw new ProbeFail(
+        `after the resume ${X} answered the same machine token with 503 for ${RESUME_503_WINDOW_MS / 1000} s, want 101 (${log})`,
+      );
+    const secs =
+      ra !== null && /^\d+$/.test(ra.trim()) ? Number(ra) * 1000 : NaN;
+    await io.wait(
+      Math.min(
+        Number.isFinite(secs) ? secs : RESUME_RETRY_DEFAULT_MS,
+        RESUME_RETRY_CAP_MS,
+      ),
+    );
+    r = await io.reopen(d.msgId);
+  }
+  out.resumeNotes.push(
+    `101 ${Math.round(io.now() - resumedAt)} ms after the resume`,
+  );
   if (!r.redelivered)
     throw new ProbeFail(
       `after the resume the pending mail did not come again on ${X} within ${FRAME_WAIT_MS / 1000} s`,
@@ -915,7 +959,13 @@ export function liveSuspendIo(
         connectRequest(x.side.app, await minted.token(x)),
       );
       held.push(h);
-      if (h.status !== 101) return { status: h.status, redelivered: false };
+      if (h.status !== 101)
+        return {
+          status: h.status,
+          redelivered: false,
+          body: h.body,
+          retryAfter: h.retryAfter,
+        };
       await hello(h, `${x.side.name} after the resume`);
       await agentUp(
         h,

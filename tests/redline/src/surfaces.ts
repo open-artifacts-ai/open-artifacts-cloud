@@ -16,9 +16,11 @@ import {
 import {
   CONTENT_PUBLIC,
   contentUnlisted,
+  hiddenToolAnswer,
   needsCookie,
   ORG_SURFACES,
   type OrgTarget,
+  offeredTools,
   PROBE_SHARE_EMAIL,
   type Cred as ProbeCred,
   PUBLIC_ROUTES,
@@ -132,6 +134,12 @@ export interface ProbeCase {
    * installs with no success leg. The route stays a recorded drop.
    */
   denyOnly?: true;
+  /**
+   * An MCP tool the install offers only conditionally (edit_doc, with docs
+   * on; #2630). Where tools/list does not show it, hiddenToolGate runs in
+   * place of the case's legs.
+   */
+  offeredTool?: string;
   /** This case's own timeout, when its waits exceed the suite's budget. */
   timeout?: number;
   /** Read-only: runs on the seeded world. */
@@ -298,10 +306,6 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "owner-only (the broker check): no admin success leg",
   "POST /api/v1/notices/guest_summary/dismiss":
     "owner-only (the guest summary notice, parity 2): no admin success leg",
-  "GET /api/v1/onboarding":
-    "owner-only (the first-run checklist state): no admin success leg",
-  "PUT /api/v1/onboarding":
-    "owner-only (the first-run checklist state): no admin success leg",
   "GET /api/v1/bus/ping":
     "bus-off: 404 on every hosted install (the bus is off until #1299), the same as a refusal; no success leg",
   "GET /api/v1/directory/callback":
@@ -371,6 +375,12 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
   "POST /api/v1/passkeys/settings/challenge":
     "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
+  // #2545: the login settings. The owner rule is the PUT's, and the first
+  // visit flag is a write the red-line installs have no throwaway for.
+  "POST /api/v1/settings/login/first-invite-seen":
+    "real-only: it sets the caller's own first-invite flag, with no row to make on the red-line installs; A at B is deny-only",
+  "PUT /api/v1/settings/login":
+    "owner-only (the login settings): no admin success leg",
   // Self-serve billing (hosted only): an allowed caller's request reaches
   // billing (a Stripe session or a usage report), so no success leg runs
   // live. A at B is deny-only.
@@ -380,6 +390,52 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: an allowed request opens a Stripe Customer Portal session through billing, for a browser session only; A at B is deny-only",
   "POST /api/v1/billing/usage":
     "interactive-only: an allowed request sends this month's usage report to billing, for a browser session only; A at B is deny-only",
+  // #2512: marking the For you inbox read (me.ts interactiveSession).
+  "POST /api/v1/me/inbox/read":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/read-all":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // #2577: the receiver's held requests, a browser session only.
+  "GET /api/v1/me/agent-asks/held":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/allow":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/allow/challenge":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-asks/held/:id/not-now":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // #2552: the bus version the instance names, and Install now.
+  "PUT /api/v1/bus/run-version":
+    "owner-only (the bus version the instance names): no admin success leg",
+  "POST /api/v1/bus/machines/:id/install-now":
+    "interactive-only: a hook-minted session is 404 here like a PAT, and no bus machine can be made on a hosted install; A at B is deny-only",
+  // v0.213.0: saving prefs, mutes and Later (#2512, #2762), and changing a
+  // browser push subscription (#2512 S5): the handlers refuse anything but a
+  // browser session.
+  "PUT /api/v1/me/notification-prefs":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/mutes":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/inbox/mutes/:kind/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/inbox/:id/later":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/push/subscriptions":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "PATCH /api/v1/me/push/subscriptions/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/push/subscriptions/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2),
+  // a browser session only.
+  "PUT /api/v1/me/agent-requests":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "GET /api/v1/me/agent-listens":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "PATCH /api/v1/me/agent-listens/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "DELETE /api/v1/me/agent-listens/:id":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
 };
 
 /**
@@ -432,8 +488,75 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /api/v1/billing/checkout",
   "POST /api/v1/billing/portal",
   "POST /api/v1/billing/usage",
+  // #2512: marking the For you inbox read, a person in a browser only (me.ts).
+  "POST /api/v1/me/inbox/read",
+  "POST /api/v1/me/inbox/read-all",
+  // #2577: the receiver's held requests from another person's agent; the
+  // handlers refuse anything but a browser session.
+  "GET /api/v1/me/agent-asks/held",
+  "POST /api/v1/me/agent-asks/held/:id/allow",
+  "POST /api/v1/me/agent-asks/held/:id/allow/challenge",
+  "POST /api/v1/me/agent-asks/held/:id/not-now",
+  // #2552: "Install now" for the caller's own machine, browser session only.
+  "POST /api/v1/bus/machines/:id/install-now",
+  // v0.213.0: prefs, mutes and Later (#2512, #2762) and push subscription
+  // changes (#2512 S5), a person in a browser only (me.ts, push.ts).
+  "PUT /api/v1/me/notification-prefs",
+  "POST /api/v1/me/inbox/mutes",
+  "DELETE /api/v1/me/inbox/mutes/:kind/:id",
+  "POST /api/v1/me/inbox/:id/later",
+  "POST /api/v1/me/push/subscriptions",
+  "PATCH /api/v1/me/push/subscriptions/:id",
+  "DELETE /api/v1/me/push/subscriptions/:id",
+  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2).
+  "PUT /api/v1/me/agent-requests",
+  "GET /api/v1/me/agent-listens",
+  "PATCH /api/v1/me/agent-listens/:id",
+  "DELETE /api/v1/me/agent-listens/:id",
 ];
 
+const INBOX_READ: Citation = {
+  file: "apps/server/test/inbox.updates.test.ts",
+  describe:
+    "inbox items follow their comment, and the read routes are for a person",
+  test: "read and read-all are refused to a personal token, allowed to a session",
+};
+const HELD_ROUTES: Citation = {
+  file: "apps/server/test/agent-requests.test.ts",
+  describe: "the receiver's routes",
+  test: "are a browser session of the receiver only",
+};
+const PREFS_SAVE: Citation = {
+  file: "apps/server/test/notification-prefs.2512.test.ts",
+  describe: "GET and PUT /me/notification-prefs",
+  test: "saving takes a person in a browser: a token gets 404, anonymous 401; reading is open to a token",
+};
+const MUTES_CHANGE: Citation = {
+  file: "apps/server/test/inbox-mutes.2512.test.ts",
+  describe: "mutes",
+  test: "each person's own list; a token and anonymous can't change it",
+};
+const LATER_PERSON: Citation = {
+  file: "apps/server/test/inbox.needs-you.test.ts",
+  describe: "Later (#2762)",
+  test: "a personal token is refused, like the read routes",
+};
+const PUSH_CHANGE: Citation = {
+  file: "apps/server/test/push.2512.test.ts",
+  describe: "the routes",
+  test: "changes take a person in a browser: a token gets 404; deleting another's subscription is 404",
+};
+const AGENT_SWITCH: Citation = {
+  file: "apps/server/test/agent-requests.s2.2577.test.ts",
+  describe: "the switch",
+  test: "is saved by a browser session only: a token is refused and can read it; a bad body is 400",
+};
+const AGENT_LISTENS: Citation = {
+  file: "apps/server/test/agent-requests.s2.2577.test.ts",
+  describe: "the listens-to list",
+  test: "a token or an agent can neither read nor change the list",
+};
+const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
 const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
 const ERASE_AUTHZ = "POST R.memberErase(id): authorization";
 const SHARE_NOTICE_TESTS = "apps/server/test/follows.test.ts";
@@ -530,28 +653,6 @@ export const DROPPED: Readonly<
         file: "apps/server/test/notices.test.ts",
         describe: "Me.notices.guestSummary (parity 2)",
         test: "only the uncapped org owner sees it; others get 404 on dismiss",
-      },
-    ],
-  },
-  "org GET /api/v1/onboarding": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/onboarding.test.ts",
-        describe: "R.onboarding",
-        test: "refuses everyone but the owner, and writes nothing",
-      },
-    ],
-  },
-  "org PUT /api/v1/onboarding": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/onboarding.test.ts",
-        describe: "R.onboarding",
-        test: "refuses everyone but the owner, and writes nothing",
       },
     ],
   },
@@ -810,6 +911,29 @@ export const DROPPED: Readonly<
     why: "interactive-only",
     coveredBy: [INSTANCE, ...PASSKEY_TESTS],
   },
+  // #2545: the login settings (public login-api.2520.test.ts).
+  "org POST /api/v1/settings/login/first-invite-seen": {
+    why: "real-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/login-api.2520.test.ts",
+        describe: "login settings",
+        test: "first-invite-seen is 204, per person, and sets the flag",
+      },
+    ],
+  },
+  "org PUT /api/v1/settings/login": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/login-api.2520.test.ts",
+        describe: "PUT login settings",
+        test: "no fresh login: 401 reauth_required",
+      },
+    ],
+  },
   "org DELETE /api/v1/spaces/:id/mappings/:groupId": {
     why: "real-only",
     coveredBy: [INSTANCE],
@@ -872,6 +996,102 @@ export const DROPPED: Readonly<
   "space member delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
   "space mapping put (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
   "space mapping delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
+  // #2512 (public inbox.updates.test.ts): read and read-all, a person only.
+  "org POST /api/v1/me/inbox/read": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, INBOX_READ],
+  },
+  "org POST /api/v1/me/inbox/read-all": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, INBOX_READ],
+  },
+  // #2577 (public agent-requests.test.ts): the receiver's routes.
+  "org GET /api/v1/me/agent-asks/held": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/allow": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/allow/challenge": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  "org POST /api/v1/me/agent-asks/held/:id/not-now": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, HELD_ROUTES],
+  },
+  // #2552 (public bus/updates.2552.test.ts).
+  "org PUT /api/v1/bus/run-version": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: RUN_VERSION_TESTS,
+        describe: "PUT R.busRunVersion: the owner names it (#2552)",
+        test: "admins, members, guests, a PAT and anonymous callers are refused, writing nothing",
+      },
+    ],
+  },
+  "org POST /api/v1/bus/machines/:id/install-now": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: RUN_VERSION_TESTS,
+        describe:
+          "POST R.busMachineInstallNow: the machine's own member (#2552)",
+        test: "another member's machine, an unknown id, a PAT or anonymous: nothing sent",
+      },
+    ],
+  },
+  // v0.213.0 (#2512, #2762): each a person in a browser only.
+  "org PUT /api/v1/me/notification-prefs": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PREFS_SAVE],
+  },
+  "org POST /api/v1/me/inbox/mutes": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, MUTES_CHANGE],
+  },
+  "org DELETE /api/v1/me/inbox/mutes/:kind/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, MUTES_CHANGE],
+  },
+  "org POST /api/v1/me/inbox/:id/later": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, LATER_PERSON],
+  },
+  "org POST /api/v1/me/push/subscriptions": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  "org PATCH /api/v1/me/push/subscriptions/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  "org DELETE /api/v1/me/push/subscriptions/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, PUSH_CHANGE],
+  },
+  // v0.219.0 (#2577 S2): a person in a browser only.
+  "org PUT /api/v1/me/agent-requests": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_SWITCH],
+  },
+  "org GET /api/v1/me/agent-listens": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
+  "org PATCH /api/v1/me/agent-listens/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
+  "org DELETE /api/v1/me/agent-listens/:id": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
 };
 
 /**
@@ -887,6 +1107,65 @@ export const SMOKES: Readonly<Record<Variant, string>> = {
   pat: "artifact rest get [pat]",
   oauth: "artifact mcp get_artifact [oauth]",
 };
+
+/** What hiddenToolGate reads and asks; the live run uses the real ones. */
+export interface HiddenToolDeps {
+  offered: (t: Target, cred: ProbeCred) => Promise<Set<string> | null>;
+  answer: (
+    t: Target,
+    cred: ProbeCred,
+    name: string,
+  ) => Promise<"unknown_tool" | "callable">;
+}
+
+const liveHidden: HiddenToolDeps = {
+  offered: (t, cred) =>
+    offeredTools({ fetch: viaTarget(t, fetch) }, t.app, cred),
+  answer: (t, cred, name) =>
+    hiddenToolAnswer({ fetch: viaTarget(t, fetch) }, t.app, cred, name),
+};
+
+/**
+ * Conditionally offered tools (#2630, as scripts/authz-probe.ts): where an
+ * install's /mcp tools/list does not offer the case's tool, every caller (B's
+ * own at B, and for a cross case A's at A and A's at B) must get
+ * "unknown_tool"; "callable" throws. Returns true when the tool is hidden and
+ * every answer passed (the case's legs are skipped); false when the tool is
+ * offered, the case names none, or a list can't be read (run the normal legs).
+ * A tool offered on one install and hidden on the other runs the hidden check
+ * only on the hidden one, then the normal legs.
+ */
+export async function hiddenToolGate(
+  c: Pick<ProbeCase, "name" | "offeredTool" | "legs">,
+  p: { a: Target; b: Target; credA: ProbeCred; credB: ProbeCred },
+  deps: HiddenToolDeps = liveHidden,
+): Promise<boolean> {
+  const tool = c.offeredTool;
+  if (!tool) return false;
+  const own = c.legs === "own";
+  const hosts = own
+    ? [{ t: p.b, own: p.credB, others: [] as ProbeCred[] }]
+    : [
+        { t: p.a, own: p.credA, others: [p.credB] },
+        { t: p.b, own: p.credB, others: [p.credA] },
+      ];
+  let hiddenAll = true;
+  const bad: string[] = [];
+  for (const h of hosts) {
+    const offered = await deps.offered(h.t, h.own);
+    if (!offered || offered.has(tool)) {
+      hiddenAll = false;
+      continue;
+    }
+    for (const cred of [h.own, ...h.others]) {
+      const got = await deps.answer(h.t, cred, tool);
+      if (got !== "unknown_tool")
+        bad.push(`${c.name}: ${h.t.name} hides ${tool}, a caller got ${got}`);
+    }
+  }
+  if (bad.length) throw new Error(bad.join("; "));
+  return hiddenAll;
+}
 
 /** The SURFACES entry the OAuth smoke runs (no per-route OAuth case exists). */
 const OAUTH_SMOKE = "mcp get_artifact";
@@ -1085,6 +1364,7 @@ export function derive(): Derived {
         name: `${name} [${v}]`,
         routes: s.routes,
         variant: v,
+        ...(s.offeredTool ? { offeredTool: s.offeredTool } : {}),
         ...(s.mutates
           ? {
               write: {

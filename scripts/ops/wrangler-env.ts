@@ -60,6 +60,16 @@ export function committedObservability(src: string, env: Env): boolean {
   return block(src, env).observability?.enabled === true;
 }
 
+/**
+ * open-artifacts#2641: DOCS_PREVIEW opens doc creation and is staging only.
+ * True when anything a prod deploy of this config would carry (the top level
+ * or env.prod, any key or value) names it. Throws on a config it cannot parse.
+ */
+export function docsPreviewInProd(src: string): boolean {
+  const { env, ...top } = JSON.parse(stripJsonc(src));
+  return JSON.stringify([top, env?.prod ?? null]).includes("DOCS_PREVIEW");
+}
+
 function block(src: string, env: Env): Block {
   const b = JSON.parse(stripJsonc(src)).env?.[env] as Block | undefined;
   if (!b) throw new Error(`no env.${env} block`);
@@ -220,7 +230,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|observability",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|observability|docs-preview",
     );
     process.exit(2);
   }
@@ -231,7 +241,11 @@ if (
     else if (what === "ratelimits") out = committedRateLimits(src, env);
     else if (what === "signups") out = committedSignups(src, env, process.env);
     else if (what === "observability") out = committedObservability(src, env);
-    else if (what === "billing") out = committedBilling(src, env);
+    else if (what === "docs-preview") {
+      if (env === "prod" && docsPreviewInProd(src))
+        throw new Error("DOCS_PREVIEW is staging only; prod refuses it");
+      out = false;
+    } else if (what === "billing") out = committedBilling(src, env);
     else if (what === "login") out = committedLogin(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";

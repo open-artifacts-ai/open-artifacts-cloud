@@ -5,6 +5,10 @@
 # it as any other: pin-check's port check and equivalence. This workflow never
 # arms or merges, and never opens a second PR: while any pin-bump/* PR is open,
 # or a PR already took the newest tag (open, merged or closed), it does nothing.
+# CI runs once for the bump: the required checks pass at once on the PR (ci.yml,
+# scripts/ci/pin-only.ts) and the full suite runs in the merge queue, on the commit
+# that lands. If that run fails, the PR leaves the queue and stays un-armed
+# (pin-bump-arm.yml); the stale rule below is what finally turns this run red.
 # An open pin-bump PR older than STALE_PR_MS (3 days) turns the run red, so a
 # stuck PR cannot quietly block later releases.
 #

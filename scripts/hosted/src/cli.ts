@@ -52,6 +52,7 @@ import {
   PROVISIONER_MAX_TOKEN_DAYS,
   platformNames,
   probeR2Conditionals,
+  pruneStaged,
   publishFloor,
   publishRelease,
   type R2Credentials,
@@ -85,7 +86,7 @@ export const HELP = `Usage: pnpm -s --filter @oa/hosted start <command> --env st
 
 Commands:
   status          --install <id>  (read-only)
-  publish-release --tag v<version>  (gh release download of oa-release-<env>-*, verified, then uploaded)
+  publish-release --tag v<version> [--stage-only]  (gh release download of oa-release-<env>-*, verified, then uploaded in parallel, the record last; --stage-only stops before the record)
   publish-floor   --floor <path to floor-<env>-<seq>.sig.json>
 
 Install writes (create, upgrade, rollback, update-vars, delete, release-lease,
@@ -180,6 +181,7 @@ interface Flags {
   install?: string;
   tag?: string;
   floor?: string;
+  stageOnly?: boolean;
 }
 
 /** Every refusal that needs no call: exits 1 before the token is read. */
@@ -195,6 +197,7 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
         install: { type: "string" },
         tag: { type: "string" },
         floor: { type: "string" },
+        "stage-only": { type: "boolean" },
       },
     });
   } catch (e) {
@@ -217,6 +220,7 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
     install: v.install as string | undefined,
     tag: v.tag as string | undefined,
     floor: v.floor as string | undefined,
+    ...(v["stage-only"] === true ? { stageOnly: true } : {}),
   };
   const need = (k: keyof Flags, flag: string) => {
     if (typeof f[k] !== "string" || f[k] === "")
@@ -233,6 +237,8 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
       throw new Refused("--tag must be a release tag like v1.2.3");
   } else if (f.tag !== undefined)
     throw new Refused("--tag is for publish-release only");
+  if (f.stageOnly && cmd !== "publish-release")
+    throw new Refused("--stage-only is for publish-release only");
   if (cmd === "publish-floor") need("floor", "floor");
   else if (f.floor !== undefined)
     throw new Refused("--floor is for publish-floor only");
@@ -667,6 +673,7 @@ async function run(
             r2,
             env,
             version,
+            ...(f.stageOnly ? { stageOnly: true } : {}),
             files: {
               tar: d.readFile(`${base}.tar`),
               sig: d.readFile(`${base}.sig.json`),
@@ -687,7 +694,29 @@ async function run(
             status: r.status,
           });
         }
-        return { ok: true, data: { version, published: out } };
+        // Once this version has its record, older staged versions (files, no
+        // record) can never be published and read as dirty to prodClean:
+        // delete them (pruneStaged). Never fails the publish: the record is
+        // already written, and prodClean still reports any that are left.
+        let pruned: string[] = [];
+        if (!f.stageOnly && out.some((x) => x.variant === "release")) {
+          try {
+            const p = await pruneStaged({ cf, r2, env, published: version });
+            pruned = p.pruned;
+            c.emit({
+              step: "prune",
+              status: "ok",
+              data: { pruned: p.pruned, kept: p.kept },
+            });
+          } catch (e) {
+            c.emit({
+              step: "prune",
+              status: "warn",
+              message: `staged versions were not pruned: ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+            });
+          }
+        }
+        return { ok: true, data: { version, published: out, pruned } };
       } finally {
         d.removeTree(dir);
       }

@@ -237,7 +237,8 @@ describe("deploy-hosted-platform.yml", () => {
       group: "hosted-platform-${{ inputs.env }}",
       "cancel-in-progress": false,
     });
-    expect(job["timeout-minutes"]).toBeLessThanOrEqual(30);
+    // 25 min of it may be the CI guard waiting for main's push CI (tag-ci-green.sh).
+    expect(job["timeout-minutes"]).toBeLessThanOrEqual(40);
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
@@ -277,7 +278,7 @@ describe("deploy-hosted-platform.yml", () => {
     });
     const use = named("Use main's deploy scripts").run as string;
     expect(use).toContain(
-      "for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
+      "for f in deploy-hosted-platform.sh deploy-waves.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
     );
     // The broker's Google client pin is main's, never the tag's.
     expect(use).toContain(
@@ -851,24 +852,23 @@ describe("deploy-hosted-platform.yml", () => {
     );
   });
 
-  it("builds and tests the Provisioning API Workers and the admin SPA too", () => {
-    const run = named("Build and test the Workers being deployed")
-      .run as string;
-    for (const p of ["@oa/provisioner", "@oa/provisioning", "@oa/admin"])
-      expect(run).toContain(`--filter ${p}`);
-    // The billing service and its Stripe core (#1568): built and tested only
-    // when the run deploys it, on either env; a run without it is what it was.
-    const step = named("Build and test the Workers being deployed");
-    expect(step.env).toEqual({
-      DEPLOY_ENV: "${{ inputs.env }}",
-      TARGETS: "${{ inputs.targets }}",
-    });
-    expect(run).toContain(
-      'case ",$TARGETS," in *,billing,*) pnpm --filter @oa/billing --filter @oa/billing-core test ;; esac',
+  it("builds only: the package tests are CI's, and a guard refuses a tag whose commit has no green CI (#264)", () => {
+    const run = named("Build the Workers being deployed").run as string;
+    expect(run).toBe("pnpm --filter @oa/provision build");
+    expect(text).not.toContain("Build and test the Workers");
+    for (const st of steps)
+      expect(String(st.run ?? ""), st.name).not.toMatch(/pnpm .*\btest\b/);
+    // The guard is main's copy, in the release gate step, so it runs before the
+    // tag's code is checked out and for every run, verify_only included.
+    const gate = named("The tag passed every earlier check");
+    expect(gate.run).toContain(
+      'bash .release-gate/scripts/ci/tag-ci-green.sh "$TAG"',
     );
-    const main =
-      run.split("\n").find((l) => l.includes("--filter @oa/admin test")) ?? "";
-    expect(main).not.toContain("billing");
+    expect(gate.run.indexOf("tag-passed-checks.sh")).toBeLessThan(
+      gate.run.indexOf("tag-ci-green.sh"),
+    );
+    expect(gate.run).toContain("set -euo pipefail");
+    expect(gate["continue-on-error"]).toBeUndefined();
   });
 
   it("reads every Worker's tag back with main's script after a full-list run (#1064)", () => {
@@ -1172,9 +1172,59 @@ describe("deploy-hosted-platform.yml", () => {
         .join(",");
     };
     expect(ran(FULL)).toBe(
-      "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory",
+      "platform-db,auth-broker,directory-broker,provision-token,inventory,provisioner,provisioning,dispatch",
     );
     expect(ran("scheduler")).toBe("");
+    // A failed target fails the run: its wave-mates still finish and are
+    // logged under their own group, and no later wave starts.
+    const failing = spawnSync(
+      "bash",
+      [
+        "-c",
+        loop.replace(
+          'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
+          `bash -c 'if [ "$0" = billing ]; then echo "$0 broke"; exit 3; fi; echo "$0"' "$t"`,
+        ),
+      ],
+      {
+        env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS: FULLB },
+        encoding: "utf8",
+      },
+    );
+    expect(failing.status).not.toBe(0);
+    expect(failing.stdout).toContain("::group::prod billing (wave 2)");
+    expect(failing.stdout).toContain("billing broke");
+    expect(failing.stdout).toContain("::group::prod inventory (wave 2)");
+    expect(failing.stdout).toContain("wave 2 failed: billing");
+    expect(failing.stdout).not.toContain("provisioner");
+    // L2: killed mid-wave, the buffered logs still print, each under its group.
+    // Billing cancels the run only once its wave-mates have all signalled that
+    // they started (a file each), so the test does not race the wave's start.
+    const startedDir = mkdtempSync(join(tmpdir(), "wave-started-"));
+    const slow = spawnSync(
+      "bash",
+      [
+        "-c",
+        loop.replace(
+          'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
+          `bash -c 'echo "started $0"; touch "$STARTED/$0"; if [ "$0" = billing ]; then for i in $(seq 400); do n=0; for w in auth-broker directory-broker provision-token inventory; do [ -e "$STARTED/$w" ] && n=$((n+1)); done; [ "$n" = 4 ] && break; sleep 0.05; done; kill -TERM $PPID; fi; sleep 5' "$t"`,
+        ),
+      ],
+      {
+        env: {
+          PATH: process.env.PATH,
+          DEPLOY_ENV: "prod",
+          TARGETS: FULLB,
+          STARTED: startedDir,
+        },
+        encoding: "utf8",
+        timeout: 20000,
+      },
+    );
+    expect(slow.status).not.toBe(0);
+    expect(slow.stdout).toContain("::group::prod billing (unfinished)");
+    expect(slow.stdout).toContain("started billing");
+    expect(slow.stdout).toContain("started inventory");
   });
 
   it("require_newer (the chain's): the tag must be newer than prod's scheduler, before anything deploys", () => {

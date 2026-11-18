@@ -55,6 +55,29 @@ const err = async (r: Response) => {
   return { status: r.status, ...((await r.json()) as object) };
 };
 
+describe("LoginGate opt-out routes", () => {
+  it("forwards the two fixed /optouts routes, and add is gone from the gate; and nothing else under it", async () => {
+    for (const path of ["/optouts/check", "/optouts/mint"]) {
+      const { env, got } = world();
+      const r = await passLoginGate(post(path, { h1: "x" }), props, env);
+      expect(r.status).toBe(202);
+      expect(got[0]?.url).toBe(`${LOGIN_ORIGIN}${path}`);
+      expect(got[0]?.headers["x-oa-gate-install"]).toBe(A);
+    }
+    for (const path of [
+      "/optouts/add",
+      "/optouts/remove",
+      "/optouts",
+      "/optouts/check/",
+    ]) {
+      const { env, got } = world();
+      const r = await passLoginGate(post(path, {}), props, env);
+      expect(r.status).toBe(404);
+      expect(got).toHaveLength(0);
+    }
+  });
+});
+
 describe("LoginGate", () => {
   it("forwards the fixed route with the gate's install and the assertion headers only", async () => {
     const { env, got } = world();
@@ -149,10 +172,36 @@ describe("LoginGate", () => {
         return {} as Fetcher;
       },
     };
-    expect(loginProps(exports, A, {})).toEqual({});
+    const on = { LOGIN: {} as Fetcher, LOGIN_CHANGE: "1" };
+    expect(loginProps(exports, A, "acme", { LOGIN_CHANGE: "1" })).toEqual({});
     expect(made).toHaveLength(0);
-    const out = loginProps(exports, A, { LOGIN: {} as Fetcher });
-    expect(Object.keys(out)).toEqual(["LOGIN"]);
+    const out = loginProps(exports, A, "acme", on);
+    expect(Object.keys(out).sort()).toEqual(["LOGIN", "LOGIN_EDITABLE"]);
+    expect(out.LOGIN_EDITABLE).toBe(true);
     expect(made).toEqual([{ installId: A }]);
+  });
+
+  it("with the switch off, every install gets the stub; only a listed slug is LOGIN_EDITABLE (#2520)", () => {
+    const made: LoginGateProps[] = [];
+    const exports = {
+      LoginGate: (o: { props: LoginGateProps }) => {
+        made.push(o.props);
+        return {} as Fetcher;
+      },
+    };
+    const off = {
+      LOGIN: {} as Fetcher,
+      LOGIN_CHANGE: "0",
+      LOGIN_CHANGE_SLUGS: " leo , other ",
+    };
+    expect(loginProps(exports, A, "leo", off).LOGIN_EDITABLE).toBe(true);
+    for (const slug of ["acme", "le", ""]) {
+      const p = loginProps(exports, A, slug, off);
+      expect(Object.keys(p), slug).toEqual(["LOGIN"]);
+    }
+    expect(
+      Object.keys(loginProps(exports, A, "leo", { LOGIN: {} as Fetcher })),
+    ).toEqual(["LOGIN"]);
+    expect(made).toHaveLength(5);
   });
 });

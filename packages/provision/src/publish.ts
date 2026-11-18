@@ -149,6 +149,38 @@ const is412 = (e: unknown) => e instanceof CfError && e.status === 412;
 const same = (a: Uint8Array, b: Uint8Array) =>
   Buffer.from(a).equals(Buffer.from(b));
 
+/** How many objects publishRelease uploads or reads back at once. */
+export const PUBLISH_CONCURRENCY = 8;
+
+/**
+ * Runs `fn` over `items`, at most `limit` at a time. After the first failure
+ * nothing new starts; the calls already running finish, then the first error
+ * is thrown. So a caller that awaits this and then writes a record knows
+ * every item succeeded.
+ */
+async function pool<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failed: { error: unknown } | undefined;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const item = items[next++] as T;
+      try {
+        await fn(item);
+      } catch (error) {
+        failed ??= { error };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  if (failed) throw failed.error;
+}
+
 /** One page of a listing: the objects under `prefix` from `cursor` on. */
 type ListPage = (
   prefix: string,
@@ -287,6 +319,14 @@ async function checkFloor(
  * now holds exactly the tar's bytes; otherwise it refuses. Writes and the
  * reads they rest on go through `r2` (S3); `cf` only lists. Needs
  * probeR2Conditionals(r2, env) first.
+ *
+ * Files upload and read back PUBLISH_CONCURRENCY at a time. The record is
+ * written only after every file's upload (or byte-identical read-back)
+ * finished: one failure stops new uploads and the record is never written.
+ * `stageOnly` writes the files and stops before the record (status "staged"):
+ * with no record nothing can install the version, so a release can be staged
+ * ahead of its gate; a later call without it finds the files present and
+ * byte-identical, and writes only the record.
  */
 export async function publishRelease(o: {
   cf: Cf;
@@ -294,11 +334,16 @@ export async function publishRelease(o: {
   env: Env;
   version: string;
   files: { tar: Uint8Array; sig: Uint8Array };
+  /** Write the files but not the record (see above). */
+  stageOnly?: boolean;
 }): Promise<{
   variant: BundleVariant;
   keys: string[];
-  /** "already-published": the identical release was there; nothing written. */
-  status?: "published" | "already-published";
+  /**
+   * "already-published": the identical release was there; nothing written.
+   * "staged": stageOnly wrote the files; keys has no record.
+   */
+  status?: "published" | "already-published" | "staged";
 }> {
   const { cf, env, version } = o;
   const bucket = bucketOf(env);
@@ -420,17 +465,18 @@ export async function publishRelease(o: {
     );
     want.set(RECORD_FILE, o.files.sig);
     let identical = present.length === want.size;
-    for (const x of present) {
-      if (!identical) break;
-      const b = want.get(x.name);
-      if (!b || x.size !== b.length) {
-        identical = false;
-        break;
-      }
-      // null is not-found (differs); any other error (transient, auth) throws.
-      const cur = await r2.get(x.key, { maxBytes: b.length });
-      if (!cur || !same(cur.bytes, b)) identical = false;
-    }
+    if (identical)
+      await pool(present, PUBLISH_CONCURRENCY, async (x) => {
+        if (!identical) return;
+        const b = want.get(x.name);
+        if (!b || x.size !== b.length) {
+          identical = false;
+          return;
+        }
+        // null is not-found (differs); any other error (transient, auth) throws.
+        const cur = await r2.get(x.key, { maxBytes: b.length });
+        if (!cur || !same(cur.bytes, b)) identical = false;
+      });
     if (!identical)
       throw new PublishRefused(
         `release ${version} (${variant}) is already published to ${bucket} and differs from this tar; a version is never overwritten`,
@@ -444,11 +490,13 @@ export async function publishRelease(o: {
   const byName = new Map(files.map((f) => [f.path, f]));
   const done = new Set<string>();
   for (const x of present) {
-    const f = byName.get(x.name);
-    if (!f)
+    if (!byName.has(x.name))
       throw new PublishRefused(
         `release ${version} (${variant}): ${x.key} is in ${bucket} but not in the tar; refusing to resume`,
       );
+  }
+  await pool(present, PUBLISH_CONCURRENCY, async (x) => {
+    const f = byName.get(x.name) as ReleaseAsset;
     let cur: { bytes: Uint8Array } | null = null;
     if (x.size === f.bytes.length)
       cur = await r2.get(x.key, { maxBytes: f.bytes.length }).catch(() => null);
@@ -457,7 +505,7 @@ export async function publishRelease(o: {
         `release ${version} (${variant}): ${x.key} differs from the tar; refusing to resume`,
       );
     done.add(f.path);
-  }
+  });
   /** Create-once; a 412 is "already exists": byte-identical resumes, else refuse. */
   const createOnce = async (key: string, bytes: Uint8Array, what: string) => {
     try {
@@ -473,12 +521,16 @@ export async function publishRelease(o: {
       );
     }
   };
-  const keys: string[] = [];
-  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : 1))) {
-    if (!done.has(f.path))
-      await createOnce(prefix + f.path, f.bytes, "and differs from the tar");
-    keys.push(prefix + f.path);
-  }
+  const sorted = [...files].sort((a, b) => (a.path < b.path ? -1 : 1));
+  const keys = sorted.map((f) => prefix + f.path);
+  // Every file first, in parallel; pool throws on the first failure after the
+  // running uploads settle, so the record below is never reached then.
+  await pool(
+    sorted.filter((f) => !done.has(f.path)),
+    PUBLISH_CONCURRENCY,
+    (f) => createOnce(prefix + f.path, f.bytes, "and differs from the tar"),
+  );
+  if (o.stageOnly) return { variant, keys, status: "staged" };
   // The record last: a reader that finds it finds every file.
   await createOnce(
     prefix + RECORD_FILE,
@@ -487,6 +539,97 @@ export async function publishRelease(o: {
   );
   keys.push(prefix + RECORD_FILE);
   return { variant, keys, status: "published" };
+}
+
+/** Most objects pruneStaged lists under releases/ (prodClean's MAX_KEYS). */
+export const PRUNE_LIST_MAX = 200_000;
+
+/**
+ * After `published` has its record: deletes every staged version older than
+ * it. A staged version is one with files under releases/<v>/release/ and no
+ * record (publishRelease stageOnly, the stage-prod job). Once an older one is
+ * passed by a recorded release it can never be published cleanly, and
+ * prodClean reads it as release_dirty. Only a plain X.Y.Z version strictly
+ * below `published` whose only variant is release and that has no record is
+ * deleted; anything else (a record, another variant, a prerelease, an odd
+ * key) is kept and reported. Each version is listed again right before its
+ * deletes, and kept if a record or another object shape has appeared. Deletes
+ * go through r2.deleteStaged, which refuses the record and the floor.
+ *
+ * The second listing narrows, but does not close, the gap before the deletes:
+ * a stage-prod upload of the same version could still land in between. What
+ * closes it is that prod's publishes run one at a time (hosted-publish.yml's
+ * hosted-publish-prod concurrency group) and that only a version below the one
+ * just published is pruned, which no later stage-prod run uploads again.
+ */
+export async function pruneStaged(o: {
+  cf: Cf;
+  r2: R2Releases;
+  env: Env;
+  published: string;
+}): Promise<{ pruned: string[]; kept: { version: string; why: string }[] }> {
+  const { cf, env, published } = o;
+  const r2 = assertProbed(o.r2, env);
+  if (!isReleaseVersion(published))
+    throw new PublishRefused(`version ${published} is not a release version`);
+  const bucket = bucketOf(env);
+  const ownRecord = await listAll(
+    cf,
+    bucket,
+    releaseKey(published, "release", RECORD_FILE),
+    10,
+  );
+  if (!ownRecord.some((x) => x.name === ""))
+    throw new PublishRefused(
+      `release ${published} has no record in ${bucket}; nothing is pruned`,
+    );
+  const byVersion = new Map<string, string[]>();
+  for (const x of await listAll(cf, bucket, "releases/", PRUNE_LIST_MAX)) {
+    if (x.key === FLOOR_KEY) continue;
+    const v = x.name.split("/")[0] ?? "";
+    byVersion.set(v, [...(byVersion.get(v) ?? []), x.name]);
+  }
+  const pruned: string[] = [];
+  const kept: { version: string; why: string }[] = [];
+  /** Why `v` must stay, from its names under releases/; undefined: prune it. */
+  const keepWhy = (names: string[]): string | undefined => {
+    for (const n of names) {
+      const [, variant, ...rest] = n.split("/");
+      if (variant !== "release" || rest.length === 0)
+        return `holds ${n.slice(0, 80)}`;
+      if (rest.join("/") === RECORD_FILE) return "has a record";
+    }
+    return undefined;
+  };
+  for (const [v, names] of [...byVersion].sort((a, b) =>
+    a[0] < b[0] ? -1 : 1,
+  )) {
+    if (v === published) continue;
+    if (!/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(v)) {
+      kept.push({
+        version: v.slice(0, 40),
+        why: "not a plain release version",
+      });
+      continue;
+    }
+    if (compareVersions(v, published) >= 0) continue;
+    const why = keepWhy(names);
+    if (why) {
+      if (why !== "has a record") kept.push({ version: v, why });
+      continue;
+    }
+    // Again, right before deleting: a record written meanwhile keeps it.
+    const prefix = `releases/${v}/`;
+    const now = await listAll(cf, bucket, prefix, ASSET_LIMITS.files + 2000);
+    const again = keepWhy(now.map((x) => `${v}/${x.name}`));
+    if (again) {
+      kept.push({ version: v, why: `${again} (seen just before deleting)` });
+      continue;
+    }
+    await pool(now, PUBLISH_CONCURRENCY, (x) => r2.deleteStaged(x.key));
+    pruned.push(v);
+  }
+  return { pruned, kept };
 }
 
 /**

@@ -842,6 +842,102 @@ async function overagePayment(
   return json({ received: true });
 }
 
+const SEAT_OWNER_SQL =
+  "SELECT s.install_id AS install, s.seat_failures AS failures FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.stripe_customer_id = ?1 AND s.per_member = 1";
+const SEAT_FAILED_SQL =
+  "UPDATE seats SET seat_failed_at = max(coalesce(seat_failed_at, 0), ?2), seat_amount_due = coalesce(?3, seat_amount_due), seat_failures = seat_failures + 1 WHERE changes() = 1 AND install_id = ?4";
+const SEAT_PAID_SQL =
+  "UPDATE seats SET seat_paid_at = max(coalesce(seat_paid_at, 0), ?1) WHERE install_id IN (SELECT install_id FROM tiers WHERE stripe_customer_id = ?2)";
+
+/**
+ * Whether an invoice is a seat-proration invoice (#2580): the one the
+ * pending-invoice-item interval makes (billing_reason subscription_cycle or
+ * manual), every line a proration of a Team or Business price. A renewal
+ * (it carries the plan's own line), a plan change or an add-on is not one.
+ */
+export function isSeatInvoice(
+  o: Record<string, unknown>,
+  prices: readonly (string | undefined)[],
+): boolean {
+  if (
+    o.billing_reason !== "subscription_cycle" &&
+    o.billing_reason !== "manual"
+  )
+    return false;
+  const lines = isObj(o.lines) ? o.lines.data : null;
+  if (!Array.isArray(lines) || lines.length === 0) return false;
+  const ids = prices.filter((y): y is string => !!y);
+  return lines.every((l) => {
+    if (!isObj(l)) return false;
+    const price = isObj(l.price)
+      ? l.price.id
+      : isObj(l.pricing) && isObj(l.pricing.price_details)
+        ? l.pricing.price_details.price
+        : undefined;
+    const d = isObj(l.parent) ? l.parent.subscription_item_details : null;
+    const proration =
+      l.proration === true || (isObj(d) && d.proration === true);
+    return typeof price === "string" && ids.includes(price) && proration;
+  });
+}
+
+/**
+ * Payment events of a seat-proration invoice on an install that reports
+ * /seats. invoice.payment_failed of one isSeatInvoice accepts is recorded on
+ * the seats row (the first failure is logged) and nowhere else, like the
+ * overage invoice: tier, status and grace never move, and increases wait
+ * (unpaid_hold) until a payment lands. invoice.paid only notes a payment (it
+ * ends the hold) and lets the event take its normal path (null). Anything
+ * else, and installs without a seats row, take the normal path too.
+ */
+async function seatInvoiceEvent(
+  db: D1Database,
+  ev: StripeEvent,
+  customer: string,
+  env: WebhookEnv,
+  now: number,
+): Promise<Response | null> {
+  if (ev.type === "invoice.paid") {
+    await db
+      .prepare(SEAT_PAID_SQL)
+      .bind(ev.created * 1000, customer)
+      .run();
+    return null;
+  }
+  if (ev.type !== "invoice.payment_failed") return null;
+  const p = pricesOf(env);
+  if (
+    !isSeatInvoice(ev.object, [
+      p.team,
+      p.business,
+      p.teamYearly,
+      p.businessYearly,
+    ])
+  )
+    return null;
+  const mine = await db
+    .prepare(SEAT_OWNER_SQL)
+    .bind(customer)
+    .first<{ install: string; failures: number }>();
+  if (!mine) return null;
+  const due = ev.object.amount_due;
+  const amount =
+    typeof due === "number" && Number.isSafeInteger(due) && due >= 0
+      ? due
+      : null;
+  const res = await db.batch([
+    db.prepare(INSERT_KNOWN_EVENT).bind(ev.id, now, customer),
+    db
+      .prepare(SEAT_FAILED_SQL)
+      .bind(customer, ev.created * 1000, amount, mine.install),
+  ]);
+  if ((res[0]?.meta.changes ?? 0) === 0) log("replay");
+  else if (mine.failures === 0)
+    console.log("billing_seat_invoice_failed", mine.install);
+  else log("seat_invoice_failed");
+  return json({ received: true });
+}
+
 /** One fixed-category line, the install id only (never a Stripe id). */
 const log = (category: string, install?: string | null) =>
   console.log("billing webhook", category, ...(install ? [install] : []));
@@ -1082,6 +1178,10 @@ export async function handleStripeWebhook(
       isOverage(ev.object)
     )
       return await overagePayment(db, ev, customer, now);
+    if (customer) {
+      const seat = await seatInvoiceEvent(db, ev, customer, env, now);
+      if (seat) return seat;
+    }
     if (!change || !customer) {
       const res = await db.batch([db.prepare(INSERT_EVENT).bind(ev.id, now)]);
       const fresh = (res[0]?.meta.changes ?? 0) > 0;
@@ -1205,7 +1305,8 @@ export async function handleStripeWebhook(
             stripeConfigOf(env),
           );
           const st = statusFromSubscription(got.status);
-          if (st === "active" || st === "past_due") live = got.subscription ?? null;
+          if (st === "active" || st === "past_due")
+            live = got.subscription ?? null;
         } catch {
           log("subscription_read_failed");
         }

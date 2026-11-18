@@ -67,6 +67,7 @@ jobs:
       tag: ${{ inputs.tag }}
       t19_public_branch: ${{ inputs.public_branch }}
       t19_public_sha: ${{ inputs.public_sha }}
+      t19_full: true
     # By name, never inherit: only the four secrets the callee declares
     # (on.workflow_call.secrets). Undeclared, a called run's jobs got none
     # (t19-dry-run 43183209806); the t19 job references none of them.

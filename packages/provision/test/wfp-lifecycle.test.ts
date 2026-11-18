@@ -1732,6 +1732,37 @@ describe("concurrency", () => {
   });
 });
 
+describe("updateVars: DOCS_PREVIEW is staging only (open-artifacts#2641)", () => {
+  it("a prod install refuses it with no write, and the row stays active", async () => {
+    const s = setup({ env: "prod" });
+    const inst = keep(await s.p.create(input()));
+    const w = s.fake.writes().length;
+    const e = await fails(s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" }));
+    expect(e.message).toMatch(/DOCS_PREVIEW is staging only/);
+    expect(s.fake.writes().length).toBe(w);
+    expect(s.row(inst.id)).toMatchObject({ state: "active", lease: null });
+  });
+  it("a staging install takes it, and drops it again when the next vars omit it", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    await s.p.updateVars(inst.id, { DOCS_PREVIEW: "1" });
+    const on = s
+      .scriptOf(inst.id)
+      ?.metadata.bindings.find(
+        (b: { name: string }) => b.name === "DOCS_PREVIEW",
+      );
+    expect(on).toMatchObject({ type: "plain_text", text: "1" });
+    await s.p.updateVars(inst.id, {});
+    expect(
+      s
+        .scriptOf(inst.id)
+        ?.metadata.bindings.some(
+          (b: { name: string }) => b.name === "DOCS_PREVIEW",
+        ),
+    ).toBe(false);
+  });
+});
+
 describe("updateVars and the session cut", () => {
   it("re-validates vars exactly as create does", async () => {
     const s = setup();
@@ -2124,6 +2155,240 @@ describe("rotateTurnstileSecret", () => {
     expect(
       await fails(s.p.rotateTurnstileSecret("prod" as Env)),
     ).toBeInstanceOf(ProvisionRefused);
+  });
+});
+
+describe("install opt-out key (open-artifacts#2820)", () => {
+  const K = "INSTALL_OPTOUT_KEY";
+  const keyOf = (s: ReturnType<typeof setup>, id: string) =>
+    s.scriptOf(id)?.secrets.get(K);
+
+  it("create mints 48 random bytes, base64url, per install, kept out of notes and audit", async () => {
+    const s = setup();
+    const a = keep(await s.p.create(input("alpha")));
+    const b = keep(await s.p.create(input("beta")));
+    const ka = keyOf(s, a.id) as string;
+    expect(ka).toMatch(/^[A-Za-z0-9_-]{64}$/);
+    expect(Buffer.from(ka, "base64url").length).toBe(48);
+    expect(keyOf(s, b.id)).not.toBe(ka);
+    const said = JSON.stringify([
+      a,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(ka);
+  });
+
+  it("backfill adds a key where none is, keeps one that is there, reports a busy install, and a rerun changes nothing", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    const busy = keep(await s.p.create(input("gamma")));
+    for (const id of [old.id, busy.id]) s.scriptOf(id)?.secrets.delete(K);
+    s.db()
+      .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
+      .run(busy.id);
+    const before = keyOf(s, kept.id);
+    const out = keep(await s.p.backfillOptoutKey("staging"));
+    const byId = Object.fromEntries(out.map((x) => [x.id, x]));
+    expect(byId[old.id]).toMatchObject({ ok: true, rotated: true });
+    expect(byId[kept.id]).toMatchObject({ ok: true, rotated: false });
+    expect(byId[busy.id]?.ok).toBe(false);
+    expect(byId[busy.id]?.reason).toMatch(/upgrading/);
+    const got = keyOf(s, old.id) as string;
+    expect(Buffer.from(got, "base64url").length).toBe(48);
+    expect(keyOf(s, kept.id)).toBe(before);
+    expect(keyOf(s, busy.id)).toBeUndefined();
+    expect(s.audit(old.id)).toContain("optout_key.backfill");
+    expect(s.audit(kept.id)).not.toContain("optout_key.backfill");
+    expect(
+      JSON.stringify([
+        out,
+        s.p.notes,
+        s.db().prepare("SELECT * FROM hosted_audit").all(),
+      ]),
+    ).not.toContain(got);
+    expect(s.row(old.id).lease).toBeNull();
+    const again = keep(await s.p.backfillOptoutKey("staging"));
+    expect(again.find((x) => x.id === old.id)).toMatchObject({
+      ok: true,
+      rotated: false,
+    });
+    expect(keyOf(s, old.id)).toBe(got);
+  });
+
+  it("an install without the key still upgrades clean, and an upgrade never rotates it", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    s.scriptOf(old.id)?.secrets.delete(K);
+    const before = keyOf(s, kept.id);
+    for (const id of [old.id, kept.id])
+      expect(keep(await s.p.upgrade(id, "0.24.2"))).toMatchObject({
+        ok: true,
+        rolledBack: false,
+      });
+    expect(keyOf(s, old.id)).toBeUndefined();
+    expect(keyOf(s, kept.id)).toBe(before);
+  });
+
+  it("refuses another env", async () => {
+    const s = setup();
+    expect(await fails(s.p.backfillOptoutKey("prod" as Env))).toBeInstanceOf(
+      ProvisionRefused,
+    );
+  });
+});
+
+describe("push keys (open-artifacts#2775)", () => {
+  const PUSH = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
+  const pairOf = (s: ReturnType<typeof setup>, id: string) => {
+    const m = s.scriptOf(id)?.secrets;
+    return {
+      pub: m?.get("VAPID_PUBLIC_KEY"),
+      priv: m?.get("VAPID_PRIVATE_KEY"),
+    };
+  };
+  /** The pair signs and verifies: x and y from the point, d the scalar. */
+  const works = async (pub: string, priv: string) => {
+    const p = Buffer.from(pub, "base64url");
+    expect(p.length).toBe(65);
+    expect(p[0]).toBe(4);
+    expect(Buffer.from(priv, "base64url").length).toBe(32);
+    const jwk = {
+      kty: "EC",
+      crv: "P-256",
+      x: p.subarray(1, 33).toString("base64url"),
+      y: p.subarray(33).toString("base64url"),
+    };
+    const alg = { name: "ECDSA", namedCurve: "P-256" };
+    const sk = await crypto.subtle.importKey(
+      "jwk",
+      { ...jwk, d: priv },
+      alg,
+      false,
+      ["sign"],
+    );
+    const pk = await crypto.subtle.importKey("jwk", jwk, alg, false, [
+      "verify",
+    ]);
+    const msg = new TextEncoder().encode("push");
+    const sig = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      sk,
+      msg,
+    );
+    expect(
+      await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        pk,
+        sig,
+        msg,
+      ),
+    ).toBe(true);
+  };
+
+  it("create mints a working pair per install, kept out of notes and audit", async () => {
+    const s = setup();
+    const a = keep(await s.p.create(input("alpha")));
+    const b = keep(await s.p.create(input("beta")));
+    const pa = pairOf(s, a.id);
+    const pb = pairOf(s, b.id);
+    await works(pa.pub as string, pa.priv as string);
+    await works(pb.pub as string, pb.priv as string);
+    expect(pa.pub).not.toBe(pb.pub);
+    const said = JSON.stringify([
+      a,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(pa.priv as string);
+  });
+
+  it("backfill adds a pair where none is, keeps a whole pair, refuses a half pair or a busy install", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const whole = keep(await s.p.create(input("beta")));
+    const half = keep(await s.p.create(input("gamma")));
+    const busy = keep(await s.p.create(input("delta")));
+    const cut = keep(await s.p.create(input("epsilon")));
+    s.scriptOf(cut.id)?.secrets.delete("VAPID_PUBLIC_KEY");
+    const cutPriv = pairOf(s, cut.id).priv;
+    for (const id of [old.id, busy.id])
+      for (const k of PUSH) s.scriptOf(id)?.secrets.delete(k);
+    // A lone public key was not put by the backfill (it puts it last).
+    s.scriptOf(half.id)?.secrets.delete("VAPID_PRIVATE_KEY");
+    s.db()
+      .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
+      .run(busy.id);
+    const before = pairOf(s, whole.id);
+    const halfPub = pairOf(s, half.id).pub;
+
+    const out = keep(await s.p.backfillPushKeys("staging"));
+    const byId = Object.fromEntries(out.map((x) => [x.id, x]));
+    expect(byId[old.id]).toMatchObject({ ok: true, rotated: true });
+    expect(byId[whole.id]).toMatchObject({ ok: true, rotated: false });
+    expect(byId[half.id]?.ok).toBe(false);
+    expect(byId[half.id]?.reason).toMatch(/half pair/);
+    expect(byId[busy.id]?.ok).toBe(false);
+    expect(byId[busy.id]?.reason).toMatch(/upgrading/);
+
+    // A lone private key is an interrupted backfill: finished with a new pair.
+    expect(byId[cut.id]).toMatchObject({ ok: true, rotated: true });
+    const fin = pairOf(s, cut.id);
+    await works(fin.pub as string, fin.priv as string);
+    expect(fin.priv).not.toBe(cutPriv);
+    const got = pairOf(s, old.id);
+    await works(got.pub as string, got.priv as string);
+    expect(pairOf(s, whole.id)).toEqual(before);
+    expect(pairOf(s, half.id)).toEqual({ pub: halfPub, priv: undefined });
+    expect(pairOf(s, busy.id)).toEqual({ pub: undefined, priv: undefined });
+    expect(s.audit(old.id)).toContain("push_keys.backfill");
+    expect(s.audit(whole.id)).not.toContain("push_keys.backfill");
+    // The private key goes up before the public key.
+    const order = s.fake.raw
+      .filter((r) => r.method === "PUT" && r.path.endsWith("/secrets"))
+      .filter((r) => r.path.includes(old.id))
+      .map((r) => (JSON.parse(r.body) as { name: string }).name)
+      .filter((n) => n.startsWith("VAPID_"));
+    expect(order).toEqual(["VAPID_PRIVATE_KEY", "VAPID_PUBLIC_KEY"]);
+    const said = JSON.stringify([
+      out,
+      s.p.notes,
+      s.db().prepare("SELECT * FROM hosted_audit").all(),
+    ]);
+    expect(said).not.toContain(got.priv as string);
+    expect(s.row(old.id).lease).toBeNull();
+
+    // A second run changes nothing.
+    const again = keep(await s.p.backfillPushKeys("staging"));
+    expect(again.find((x) => x.id === old.id)).toMatchObject({
+      ok: true,
+      rotated: false,
+    });
+    expect(pairOf(s, old.id)).toEqual(got);
+  });
+
+  it("an install without a pair still upgrades clean, and an upgrade never rotates one", async () => {
+    const s = setup();
+    const old = keep(await s.p.create(input("alpha")));
+    const kept = keep(await s.p.create(input("beta")));
+    for (const k of PUSH) s.scriptOf(old.id)?.secrets.delete(k);
+    const before = pairOf(s, kept.id);
+    for (const id of [old.id, kept.id])
+      expect(keep(await s.p.upgrade(id, "0.24.2"))).toMatchObject({
+        ok: true,
+        rolledBack: false,
+      });
+    expect(pairOf(s, old.id)).toEqual({ pub: undefined, priv: undefined });
+    expect(pairOf(s, kept.id)).toEqual(before);
+  });
+
+  it("refuses another env", async () => {
+    const s = setup();
+    expect(await fails(s.p.backfillPushKeys("prod" as Env))).toBeInstanceOf(
+      ProvisionRefused,
+    );
   });
 });
 
@@ -7630,6 +7895,59 @@ describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
     expect(oauthNamespaces(s)).toEqual([]);
     expect(s.row(inst.id).kv_id).toBeNull();
     expect(s.row(inst.id).state).toBe("active");
+  });
+
+  describe("the hosted opt-out key and vars (open-artifacts#2652)", () => {
+    const HK = "optout-hash-key-0123456789abcdefghijklmnop";
+    const optoutBits = (s: S, id: string) => ({
+      key: s.scriptOf(id)?.secrets.get("OPTOUT_HASH_KEY"),
+      url: bindingsOf(s, id).find((b) => b.name === "OPTOUT_UNSUBSCRIBE_URL")
+        ?.text,
+      platform: bindingsOf(s, id).find((b) => b.name === "OPTOUT_PLATFORM")
+        ?.text,
+      names: bindingsOf(s, id).map((b) => b.name),
+    });
+    it("set: create and upgrade render the key, the unsubscribe URL and OPTOUT_PLATFORM=on, the same key on every install", async () => {
+      const s = setup();
+      const p = s.mk({ optoutHashKey: HK });
+      const a = keep(await p.create(input("opta")));
+      const b = keep(await p.create(input("optb")));
+      for (const i of [a, b]) {
+        const o = optoutBits(s, i.id);
+        expect(o.key).toBe(HK);
+        expect(o.url).toBe(
+          `https://signup.${HOSTED_DOMAINS.staging.app}/unsubscribe`,
+        );
+        expect(o.platform).toBe("on");
+      }
+      await p.upgrade(a.id, "0.24.0");
+      const o = optoutBits(s, a.id);
+      expect(o.key).toBe(HK);
+      expect(o.url).toBe(
+        `https://signup.${HOSTED_DOMAINS.staging.app}/unsubscribe`,
+      );
+      expect(o.platform).toBe("on");
+      expect(s.scriptOf(a.id)?.secrets.get("OPTOUT_HASH_KEY")).toBe(
+        s.scriptOf(b.id)?.secrets.get("OPTOUT_HASH_KEY"),
+      );
+    });
+    it("unset: no key, no URL, no OPTOUT_PLATFORM, on create or upgrade", async () => {
+      const s = setup();
+      const p = s.mk({});
+      const a = keep(await p.create(input("optoff")));
+      await p.upgrade(a.id, "0.24.0");
+      const o = optoutBits(s, a.id);
+      expect(o.key).toBeUndefined();
+      expect(o.names.filter((n) => n.startsWith("OPTOUT"))).toEqual([]);
+    });
+    it("the key is never in the stored row, the audit or the stored vars", async () => {
+      const s = setup();
+      const p = s.mk({ optoutHashKey: HK });
+      const a = keep(await p.create(input("optlog")));
+      await p.upgrade(a.id, "0.24.0");
+      expect(JSON.stringify(s.row(a.id))).not.toContain(HK);
+      expect(JSON.stringify(s.audit(a.id))).not.toContain(HK);
+    });
   });
 
   it("flag off: a new install is as before (namespace, binding, no OAUTH_STORE)", async () => {

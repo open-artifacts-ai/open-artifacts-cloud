@@ -52,8 +52,16 @@ set -uo pipefail
 # And the T19 dry-run workflow (#166): a workflow that public never had.
 # And the staging half of the release chain (#264 step 1): a workflow, its
 # script and its test that public never had.
+# And the deploy's CI guard and wave plan (#264 step 3): two scripts with their
+# tests that public never had.
+# And the pin-only decision for CI's run-once rule on pin bumps: a script and its test,
+# plus the test of ci.yml's shape, that public never had.
 ALLOW=(
   pnpm-lock.yaml
+  scripts/ci/tag-ci-green.sh
+  scripts/ci/tag-ci-green.test.ts
+  scripts/ops/deploy-waves.sh
+  scripts/ops/deploy-waves.test.ts
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/pin-bump-arm.yml
@@ -100,6 +108,10 @@ ALLOW=(
   scripts/ci/check-hosted-owned-vars.test.ts
   # The release App environment check (#302), this repo's own.
   scripts/ci/release-app-environment.test.ts
+  # The pin-only decision (run the suite once for the release bot's pin bumps).
+  scripts/ci/pin-only.ts
+  scripts/ci/pin-only.test.ts
+  scripts/ci/ci-pin-once-workflow.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

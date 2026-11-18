@@ -134,6 +134,42 @@ describe("hosted-publish.yml", () => {
     );
   });
 
+  it("stage-prod uploads prod's files during staging deploy and the gate, and writes no record", () => {
+    const j = w.jobs["stage-prod"];
+    expect(j.needs).toEqual(["resolve", "publish-staging"]);
+    // Best effort: a failed stage leaves a green run; publish-prod uploads the rest.
+    expect(j["continue-on-error"]).toBe(true);
+    // Only the release-please trigger (prod false), only after staging published.
+    expect(j.if).toContain("needs.resolve.outputs.prod != 'true'");
+    expect(j.if).toContain("needs.publish-staging.result == 'success'");
+    expect(j.if).toContain("needs.resolve.outputs.kind == 'release'");
+    // Not named publish-prod: the chain's "published" check reads that record.
+    expect(j.name).toBe(
+      "stage-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
+    );
+    expect(j.environment).toBe("hosted-prod-deploy");
+    // Serialized with publish-prod, so the two never race on one bucket.
+    expect(j.concurrency).toEqual(w.jobs["publish-prod"].concurrency);
+    const run = named("stage-prod", "Stage the files (no record)").run;
+    expect(run).toContain('--env prod --tag "$TAG" --stage-only');
+    expect(JSON.stringify(j)).not.toContain("--env staging");
+    expect(JSON.stringify(j)).not.toContain("publish-floor");
+    const i = (n: string) =>
+      steps("stage-prod").indexOf(named("stage-prod", n));
+    expect(i("Release gate")).toBeLessThan(i("Write the token files"));
+    expect(steps("stage-prod").at(-1)?.if).toBe("${{ always() }}");
+  });
+
+  it("publish-prod still runs the record after the red-line gate, with no stage-only flag", () => {
+    expect(named("publish-prod", "Staging passed this tag").run).toBe(
+      'bash scripts/ci/staging-first-gate.sh "$TAG"',
+    );
+    expect(JSON.stringify(w.jobs["publish-prod"])).not.toContain("stage-only");
+    expect(JSON.stringify(w.jobs["publish-staging"])).not.toContain(
+      "stage-only",
+    );
+  });
+
   for (const [job, env] of Object.entries(ENVS)) {
     describe(job, () => {
       it("runs in the env's deploy Environment, main only, one at a time, actions pinned", () => {
