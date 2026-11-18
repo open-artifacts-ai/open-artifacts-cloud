@@ -10,6 +10,7 @@ import {
   MINTS_PER_DAY,
   mintToken,
   OPTOUT_ADD_ACTION,
+  OPTOUT_UNDO_ACTION,
   optout,
   storedHash,
   TOKEN_TTL_MS,
@@ -126,7 +127,13 @@ beforeEach(async () => {
 const unsub = (
   e: Awaited<ReturnType<typeof world>>,
   token: string,
-  o: { method?: string; form?: boolean; ip?: string; now?: number } = {},
+  o: {
+    method?: string;
+    form?: boolean;
+    ip?: string;
+    now?: number;
+    action?: string;
+  } = {},
 ) => {
   const method = o.method ?? "POST";
   const url = `${SIGNUP}/unsubscribe${o.form ? "" : `?t=${token}`}`;
@@ -142,7 +149,7 @@ const unsub = (
       body:
         method === "POST"
           ? o.form
-            ? `t=${token}`
+            ? `t=${token}${o.action ? `&action=${o.action}` : ""}`
             : "List-Unsubscribe=One-Click"
           : undefined,
     }),
@@ -521,6 +528,159 @@ describe("check, mint and the public unsubscribe", () => {
       { install: id },
     );
     expect((await call(add, e)).status).toBe(404);
+  });
+});
+
+describe("recipient undo (#2665): only the link that added it", () => {
+  const checkOf = async (e: Awaited<ReturnType<typeof world>>, h1 = H1) =>
+    (
+      (await (await post("/optouts/check", e, { h1 })).json()) as {
+        optedOut: boolean;
+      }
+    ).optedOut;
+  const undoAudit = () =>
+    db
+      // hosted_audit outlives resetDb: this world's installs only.
+      .prepare(
+        "SELECT * FROM hosted_audit WHERE action = ?1 AND install_id IN (?2, ?3)",
+      )
+      .bind(OPTOUT_UNDO_ACTION, id, otherId)
+      .all<{ detail: string; install_id: string }>()
+      .then((r) => r.results);
+
+  it("the done page offers Undo; Undo removes the opt-out, audits a hash prefix, and offers to stop again", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    const done = await (await unsub(e, token, { form: true })).text();
+    expect(done).toContain('name="action" value="undo"');
+    expect(await checkOf(e)).toBe(true);
+    const r = await unsub(e, token, { form: true, action: "undo" });
+    expect(r.status).toBe(200);
+    const text = await r.text();
+    expect(text).toContain("again");
+    expect(text).toContain("Don't email me again");
+    expect(await rows()).toHaveLength(0);
+    expect(await checkOf(e)).toBe(false);
+    const a = await undoAudit();
+    expect(a).toHaveLength(1);
+    expect(a[0]?.install_id).toBe(id);
+    expect(a[0]?.detail).toBe(
+      JSON.stringify({ hash: (await storedHash(STORE, H1)).slice(0, 8) }),
+    );
+    expect(JSON.stringify(a)).not.toContain(H1);
+    // A second Undo changes nothing and audits nothing more.
+    await unsub(e, token, { form: true, action: "undo" });
+    expect(await undoAudit()).toHaveLength(1);
+    // Stop again works, and can be undone again.
+    await unsub(e, token, { form: true });
+    expect(await checkOf(e)).toBe(true);
+  });
+
+  it("a token minted later, by any install, can't undo an opt-out it didn't add", async () => {
+    const e = await world();
+    const first = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    await unsub(e, first);
+    for (const [inst, at] of [
+      [id, Date.now() + 1],
+      [otherId, Date.now() + 2],
+    ] as const) {
+      const later = await mintToken(TOKEN_KEY, inst, H1, at);
+      // Its POST adds nothing (already listed) and gets no Undo.
+      expect(
+        await (await unsub(e, later, { form: true })).text(),
+      ).not.toContain('value="undo"');
+      const r = await (
+        await unsub(e, later, { form: true, action: "undo" })
+      ).text();
+      expect(r).toContain("You won't get these emails again.");
+      expect(r).not.toContain('value="undo"');
+    }
+    expect(await rows()).toHaveLength(1);
+    expect(await checkOf(e)).toBe(true);
+    expect(await undoAudit()).toHaveLength(0);
+  });
+
+  it("never removes a bounce or complaint row, or another address's", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    const h2 = await storedHash(STORE, H1);
+    const { undoKey } = await import("../src/routes/optouts.js");
+    await db
+      .prepare(
+        "INSERT INTO email_optouts (addr_hash, source, first_install, created_at, undo_key) VALUES (?1, 'bounce', NULL, 1, ?2)",
+      )
+      .bind(h2, await undoKey(STORE, token))
+      .run();
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1B, Date.now()));
+    await unsub(e, token, { form: true, action: "undo" });
+    expect((await rows()).map((r) => r.source).sort()).toEqual([
+      "bounce",
+      "recipient",
+    ]);
+    expect(await undoAudit()).toHaveLength(0);
+  });
+
+  it("an install-scoped opt-out (over the cap) is undone by its own link too", async () => {
+    const e = await world();
+    // One redemption makes the day's counter; then it is set to the cap.
+    await unsub(e, await mintToken(TOKEN_KEY, id, H1B, Date.now()));
+    await db
+      .prepare("UPDATE rate_counters SET count = ?2 WHERE key = ?1")
+      .bind(`optout:addday:${id}`, ADDS_PER_DAY)
+      .run();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    await unsub(e, token);
+    const h2 = await storedHash(STORE, H1);
+    const scoped = () =>
+      db
+        .prepare("SELECT * FROM email_optouts_install WHERE addr_hash = ?1")
+        .bind(h2)
+        .all()
+        .then((r) => r.results);
+    expect(await scoped()).toHaveLength(1);
+    await unsub(e, token, { form: true, action: "undo" });
+    expect(await scoped()).toHaveLength(0);
+    expect(await undoAudit()).toHaveLength(1);
+  });
+
+  it("GET never writes: a later visit shows the done page with Undo, ?action=undo included", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    expect(await (await unsub(e, token, { method: "GET" })).text()).toContain(
+      "<h1>Stop these emails?</h1>",
+    );
+    await unsub(e, token);
+    const later = await (await unsub(e, token, { method: "GET" })).text();
+    expect(later).toContain("You won't get these emails again.");
+    expect(later).toContain('value="undo"');
+    const r = await handle(
+      new Request(`${SIGNUP}/unsubscribe?t=${token}&action=undo`, {
+        headers: { "cf-connecting-ip": "203.0.113.7" },
+      }),
+      e,
+      ctx(),
+    );
+    expect(r.status).toBe(200);
+    expect(await rows()).toHaveLength(1);
+  });
+
+  it("a one-click POST (query token) never undoes, whatever its body says", async () => {
+    const e = await world();
+    const token = await mintToken(TOKEN_KEY, id, H1, Date.now());
+    await unsub(e, token);
+    await handle(
+      new Request(`${SIGNUP}/unsubscribe?t=${token}`, {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "203.0.113.7",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: "action=undo",
+      }),
+      e,
+      ctx(),
+    );
+    expect(await rows()).toHaveLength(1);
   });
 });
 

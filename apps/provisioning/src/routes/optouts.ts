@@ -34,7 +34,9 @@ import type { Env } from "../env.js";
 // links: it can mint a token for any h1 it computes. Only the mint rate limit,
 // the per-install daily redemption cap and the audit row bound that. There is
 // no add route on the gate and no removal route; operators remove a row by
-// hand (docs/ops/hosted.md).
+// hand (docs/ops/hosted.md). The one other removal is the recipient's Undo
+// (#2665): only the exact token that added a row removes it (undo_key), so a
+// token minted later, by any install, can never undo an opt-out.
 
 export const OPTOUT_PATHS: ReadonlySet<string> = new Set([
   "/optouts/check",
@@ -42,6 +44,7 @@ export const OPTOUT_PATHS: ReadonlySet<string> = new Set([
 ]);
 export const UNSUBSCRIBE_PATH = "/unsubscribe";
 export const OPTOUT_ADD_ACTION = "optout.add";
+export const OPTOUT_UNDO_ACTION = "optout.undo";
 export const OPTOUT_ACTOR = "system:optout";
 export const TOKEN_TTL_MS = 365 * 86_400_000;
 export const CHECKS_PER_MIN = 60;
@@ -142,6 +145,11 @@ const fromB64u = (s: string) =>
 /** h2: what the list stores for an h1. */
 export async function storedHash(key: string, h1: string): Promise<string> {
   return hex(await hmacBytes(key, `optout-store:${h1}`));
+}
+
+/** undo_key: the token that added a row, keyed; only that token removes it. */
+export async function undoKey(key: string, token: string): Promise<string> {
+  return hex(await hmacBytes(key, `optout-undo:${token}`));
 }
 
 /** A token binding h1, the install and an expiry: payload.mac, both base64url. */
@@ -318,16 +326,26 @@ const confirmPage = (token: string) =>
     "Stop these emails?",
     `${BRAND}<h1>Stop these emails?</h1><p>We won't email you again when someone shares a page with you, from any team on Open Artifacts.</p><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Don't email me again</button></form>`,
   );
-const donePage = (scopedToTeam: boolean) =>
+/** Undo shows only for the link that added the opt-out (canUndo, #2665). */
+const undoForm = (token: string, canUndo: boolean) =>
+  canUndo
+    ? `<form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><input type="hidden" name="action" value="undo"><button type="submit">Undo</button></form>`
+    : "";
+const donePage = (scopedToTeam: boolean, token: string, canUndo: boolean) =>
   scopedToTeam
     ? page(
         "You won't get emails from this team again.",
-        `${BRAND}<h1>You won't get emails from this team again.</h1><p>We've stopped emails to you about pages shared from this team. Other teams on Open Artifacts can still email you for now; we're reviewing that. Pages shared with you still open when you log in.</p>`,
+        `${BRAND}<h1>You won't get emails from this team again.</h1><p>We've stopped emails to you about pages shared from this team. Other teams on Open Artifacts can still email you for now; we're reviewing that. Pages shared with you still open when you log in.</p>${undoForm(token, canUndo)}`,
       )
     : page(
         "You won't get these emails again.",
-        `${BRAND}<h1>You won't get these emails again.</h1><p>Pages shared with you still open when you log in. We just won't email you about them.</p>`,
+        `${BRAND}<h1>You won't get these emails again.</h1><p>Pages shared with you still open when you log in. We just won't email you about them.</p>${undoForm(token, canUndo)}`,
       );
+const undonePage = (token: string) =>
+  page(
+    "You'll get share emails from Open Artifacts again.",
+    `${BRAND}<h1>You'll get share emails from Open Artifacts again.</h1><form method="post" action="/unsubscribe"><input type="hidden" name="t" value="${token}"><button type="submit">Don't email me again</button></form>`,
+  );
 const bad = () =>
   new Response(
     "This link doesn't work. Open the most recent email from us and use the link there.",
@@ -341,22 +359,51 @@ const bad = () =>
     },
   );
 
-async function tokenOf(req: Request, url: URL): Promise<string | null> {
+/**
+ * The token, and whether this is an Undo: only a form POST body names
+ * action=undo (a query token, RFC 8058 one-click included, never undoes).
+ */
+async function tokenOf(
+  req: Request,
+  url: URL,
+): Promise<{ token: string | null; undo: boolean }> {
   const q = url.searchParams.get("t");
   if (q !== null) {
     await req.body?.cancel();
-    return q;
+    return { token: q, undo: false };
   }
-  if (req.method !== "POST") return null;
+  if (req.method !== "POST") return { token: null, undo: false };
   const type = req.headers.get("content-type") ?? "";
-  if (!/^application\/x-www-form-urlencoded(\s*;|$)/i.test(type)) return null;
+  if (!/^application\/x-www-form-urlencoded(\s*;|$)/i.test(type))
+    return { token: null, undo: false };
   try {
     const buf = await req.arrayBuffer();
-    if (buf.byteLength > 2048) return null;
-    return new URLSearchParams(new TextDecoder().decode(buf)).get("t");
+    if (buf.byteLength > 2048) return { token: null, undo: false };
+    const f = new URLSearchParams(new TextDecoder().decode(buf));
+    return { token: f.get("t"), undo: f.get("action") === "undo" };
   } catch {
-    return null;
+    return { token: null, undo: false };
   }
+}
+
+/** This token's own rows (it can undo) and whether any row lists the address for its install. */
+async function standing(
+  env: Env,
+  h2: string,
+  install: string,
+  uk: string,
+): Promise<{ own: boolean; listed: boolean; all: boolean }> {
+  const r = await env.PLATFORM_DB.prepare(
+    `SELECT
+       EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1 AND source = 'recipient' AND undo_key = ?3)
+       OR EXISTS (SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND undo_key = ?3) AS own,
+       EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1)
+       OR EXISTS (SELECT 1 FROM email_optouts_install WHERE addr_hash = ?1 AND install_id = ?2) AS listed,
+       EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1) AS allrow`,
+  )
+    .bind(h2, install, uk)
+    .first<{ own: number; listed: number; allrow: number }>();
+  return { own: r?.own === 1, listed: r?.listed === 1, all: r?.allrow === 1 };
 }
 
 /** GET (the confirm page, no change) and POST (the opt-out) of /unsubscribe. */
@@ -375,7 +422,7 @@ export async function unsubscribe(
   if (!env.OPTOUT_STORE_KEY || !env.OPTOUT_TOKEN_KEY)
     return new Response("Unavailable", { status: 503, headers: noStore });
   const url = new URL(req.url);
-  const token = await tokenOf(req, url);
+  const { token, undo } = await tokenOf(req, url);
   const named = token
     ? await readToken(env.OPTOUT_TOKEN_KEY, token, now)
     : null;
@@ -395,7 +442,39 @@ export async function unsubscribe(
       });
     return bad();
   }
-  if (req.method === "GET") return confirmPage(token);
+  const h2 = await storedHash(env.OPTOUT_STORE_KEY, named.h1);
+  const uk = await undoKey(env.OPTOUT_STORE_KEY, token);
+  if (req.method === "GET") {
+    // A later visit: listed shows the done page (with Undo for the link that
+    // added it); otherwise the confirm page. GET never writes.
+    const st = await standing(env, h2, named.install, uk);
+    return st.listed ? donePage(!st.all, token, st.own) : confirmPage(token);
+  }
+  if (undo) {
+    // Only this token's own recipient rows go; bounce and complaint rows, and
+    // rows another link added, stay.
+    if ((await standing(env, h2, named.install, uk)).own) {
+      await env.PLATFORM_DB.batch([
+        env.PLATFORM_DB.prepare(
+          "DELETE FROM email_optouts WHERE addr_hash = ?1 AND source = 'recipient' AND undo_key = ?2",
+        ).bind(h2, uk),
+        env.PLATFORM_DB.prepare(
+          "DELETE FROM email_optouts_install WHERE addr_hash = ?1 AND undo_key = ?2",
+        ).bind(h2, uk),
+        env.PLATFORM_DB.prepare(
+          "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        ).bind(
+          now,
+          OPTOUT_ACTOR,
+          named.install,
+          OPTOUT_UNDO_ACTION,
+          JSON.stringify({ hash: h2.slice(0, 8) }),
+        ),
+      ]);
+    }
+    const st = await standing(env, h2, named.install, uk);
+    return st.listed ? donePage(!st.all, token, false) : undonePage(token);
+  }
 
   // Per minting install: a warn line at 150. Past 200 the opt-out is stored
   // install-scoped (never dropped); that install's mint answers 429 for the rest of
@@ -414,18 +493,17 @@ export async function unsubscribe(
   // under-cap add always creates or keeps the 'all' row and never narrows one.
   const scope = day > ADDS_PER_DAY ? "install" : "all";
   if (scope === "install") console.warn("optout_scoped", named.install, day);
-  const h2 = await storedHash(env.OPTOUT_STORE_KEY, named.h1);
   const ins =
     scope === "all"
       ? await env.PLATFORM_DB.prepare(
-          "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at) VALUES (?1, 'recipient', ?2, ?3)",
+          "INSERT OR IGNORE INTO email_optouts (addr_hash, source, first_install, created_at, undo_key) VALUES (?1, 'recipient', ?2, ?3, ?4)",
         )
-          .bind(h2, named.install, now)
+          .bind(h2, named.install, now, uk)
           .run()
       : await env.PLATFORM_DB.prepare(
-          "INSERT OR IGNORE INTO email_optouts_install (addr_hash, install_id, created_at) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1)",
+          "INSERT OR IGNORE INTO email_optouts_install (addr_hash, install_id, created_at, undo_key) SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM email_optouts WHERE addr_hash = ?1)",
         )
-          .bind(h2, named.install, now)
+          .bind(h2, named.install, now, uk)
           .run();
   if (scope === "all")
     // Widened: the install-scoped rows for this address are now redundant.
@@ -447,10 +525,6 @@ export async function unsubscribe(
       )
       .run();
   // Whichever is true now: the platform-wide row exists, or only this team's.
-  const all = await env.PLATFORM_DB.prepare(
-    "SELECT 1 AS x FROM email_optouts WHERE addr_hash = ?1",
-  )
-    .bind(h2)
-    .first();
-  return donePage(all === null);
+  const st = await standing(env, h2, named.install, uk);
+  return donePage(!st.all, token, st.own);
 }
