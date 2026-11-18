@@ -7959,7 +7959,10 @@ describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
     });
     it("create renders the key as a secret and the host as a var, on every install", async () => {
       const s = setup();
-      const p = s.mk({ posthogKey: PK, posthogHost: "https://eu.i.posthog.com" });
+      const p = s.mk({
+        posthogKey: PK,
+        posthogHost: "https://eu.i.posthog.com",
+      });
       const a = keep(await p.create(input("pha")));
       const b = keep(await p.create(input("phb")));
       for (const i of [a, b]) {
@@ -7986,14 +7989,18 @@ describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
     it("a host with no key renders nothing", async () => {
       const s = setup();
       const a = keep(
-        await s.mk({ posthogHost: "https://eu.i.posthog.com" }).create(input("phd")),
+        await s
+          .mk({ posthogHost: "https://eu.i.posthog.com" })
+          .create(input("phd")),
       );
       expect(bits(s, a.id).names).not.toContain("POSTHOG_HOST");
     });
     it("an upgrade passes a rotated platform key, and removing it deletes the install's", async () => {
       const s = setup();
       const a = keep(await s.mk({ posthogKey: PK }).create(input("phrot")));
-      await s.mk({ posthogKey: "phc_rotated_key_9876543210" }).upgrade(a.id, "0.24.0");
+      await s
+        .mk({ posthogKey: "phc_rotated_key_9876543210" })
+        .upgrade(a.id, "0.24.0");
       expect(bits(s, a.id).key).toBe("phc_rotated_key_9876543210");
       await s.mk({}).upgrade(a.id, "0.24.1");
       expect(s.scriptOf(a.id)?.secrets.has("POSTHOG_KEY")).toBe(false);
