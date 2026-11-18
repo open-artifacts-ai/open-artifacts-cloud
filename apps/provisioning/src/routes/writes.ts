@@ -288,9 +288,19 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   R29: async (a, row) => {
     refuseUnless(can(row, "update", a.principal));
     const body = bodyOf<typeof SetOAuthStoreSchema>(a);
+    // open-artifacts#2641: DOCS_PREVIEW is staging only, either value. The
+    // job's recheck and provision's metadata guard refuse it on prod too.
+    // A narrow cast: the pinned contract may not name DOCS_PREVIEW yet.
+    const sent = body.vars as { OAUTH_STORE?: string; DOCS_PREVIEW?: string };
+    if (sent.DOCS_PREVIEW !== undefined && a.env.OA_ENV !== "staging")
+      throw new ApiError(
+        "invalid_input",
+        "DOCS_PREVIEW is staging only; prod refuses it",
+      );
     if (
+      sent.OAUTH_STORE !== undefined &&
       storedOAuthMode(row.install_vars) === "d1" &&
-      body.vars.OAUTH_STORE !== "d1"
+      sent.OAUTH_STORE !== "d1"
     )
       throw new ApiError("invalid_state", "an install on d1 stays on d1");
     return { kind: "update", args: oauthStoreJobArgs(body) };
