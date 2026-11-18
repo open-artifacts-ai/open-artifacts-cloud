@@ -45,6 +45,10 @@ export interface ProvisionerEnv {
   OPTOUT_LIST?: string;
   /** Secret: the platform root of OPTOUT_HASH_KEY (HKDF, info oa-optout-v1). Required when OPTOUT_LIST is "1". */
   OPTOUT_ROOT_KEY?: string;
+  /** Secret, optional (open-artifacts#2479): the env's PostHog project key; every install gets it as POSTHOG_KEY at create and upgrade. Unset: none do. */
+  POSTHOG_KEY?: string;
+  /** Optional var: the PostHog host an install sends to (the server defaults to https://us.i.posthog.com). */
+  POSTHOG_HOST?: string;
 }
 
 /** The runtime's network and clock; the tests' run on fakes. */
@@ -110,6 +114,11 @@ export async function provisionerOptions(
     prodBusAll: e === "prod" && env.PROD_BUS_ALL === "1",
     oauthBornD1: env.OAUTH_BORN_D1 === "1",
     ...(optoutHashKey !== undefined ? { optoutHashKey } : {}),
+    // Absent or empty is absent: never an empty secret on an install.
+    ...(env.POSTHOG_KEY ? { posthogKey: env.POSTHOG_KEY } : {}),
+    ...(env.POSTHOG_KEY && env.POSTHOG_HOST
+      ? { posthogHost: env.POSTHOG_HOST }
+      : {}),
     target: { kind: "namespace", ns: NAMESPACES[e] },
     domains: HOSTED_DOMAINS[e],
     release: r2BindingReleaseReader(env.RELEASES, e),

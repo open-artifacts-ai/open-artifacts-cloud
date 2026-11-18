@@ -7950,6 +7950,71 @@ describe("OAuth namespace: born on d1, and its removal (#1008)", () => {
     });
   });
 
+  describe("the platform PostHog key (open-artifacts#2479)", () => {
+    const PK = "phc_platform_key_0123456789";
+    const bits = (s: S, id: string) => ({
+      key: s.scriptOf(id)?.secrets.get("POSTHOG_KEY"),
+      host: bindingsOf(s, id).find((b) => b.name === "POSTHOG_HOST")?.text,
+      names: bindingsOf(s, id).map((b) => b.name),
+    });
+    it("create renders the key as a secret and the host as a var, on every install", async () => {
+      const s = setup();
+      const p = s.mk({ posthogKey: PK, posthogHost: "https://eu.i.posthog.com" });
+      const a = keep(await p.create(input("pha")));
+      const b = keep(await p.create(input("phb")));
+      for (const i of [a, b]) {
+        expect(bits(s, i.id).key).toBe(PK);
+        expect(bits(s, i.id).host).toBe("https://eu.i.posthog.com");
+      }
+    });
+    it("a key without a host renders no POSTHOG_HOST", async () => {
+      const s = setup();
+      const a = keep(await s.mk({ posthogKey: PK }).create(input("phc")));
+      expect(bits(s, a.id).key).toBe(PK);
+      expect(bits(s, a.id).names).not.toContain("POSTHOG_HOST");
+    });
+    it("absent on the platform is absent on the install: no secret, no var, create or upgrade", async () => {
+      const s = setup();
+      const p = s.mk({});
+      const a = keep(await p.create(input("phoff")));
+      await p.upgrade(a.id, "0.24.0");
+      const o = bits(s, a.id);
+      expect(o.key).toBeUndefined();
+      expect(s.scriptOf(a.id)?.secrets.has("POSTHOG_KEY")).toBe(false);
+      expect(o.names).not.toContain("POSTHOG_HOST");
+    });
+    it("a host with no key renders nothing", async () => {
+      const s = setup();
+      const a = keep(
+        await s.mk({ posthogHost: "https://eu.i.posthog.com" }).create(input("phd")),
+      );
+      expect(bits(s, a.id).names).not.toContain("POSTHOG_HOST");
+    });
+    it("an upgrade passes a rotated platform key, and removing it deletes the install's", async () => {
+      const s = setup();
+      const a = keep(await s.mk({ posthogKey: PK }).create(input("phrot")));
+      await s.mk({ posthogKey: "phc_rotated_key_9876543210" }).upgrade(a.id, "0.24.0");
+      expect(bits(s, a.id).key).toBe("phc_rotated_key_9876543210");
+      await s.mk({}).upgrade(a.id, "0.24.1");
+      expect(s.scriptOf(a.id)?.secrets.has("POSTHOG_KEY")).toBe(false);
+      expect(s.row(a.id).state).toBe("active");
+    });
+    it("verify_clean accepts an install with and without it (upgrade to a new platform state stays active)", async () => {
+      const s = setup();
+      const a = keep(await s.mk({}).create(input("phv")));
+      await s.mk({ posthogKey: PK }).upgrade(a.id, "0.24.0");
+      expect(bits(s, a.id).key).toBe(PK);
+      expect(s.row(a.id).state).toBe("active");
+    });
+    it("the key is never in the stored row, the audit or the stored metadata", async () => {
+      const s = setup();
+      const a = keep(await s.mk({ posthogKey: PK }).create(input("phlog")));
+      await s.mk({ posthogKey: PK }).upgrade(a.id, "0.24.0");
+      expect(JSON.stringify(s.row(a.id))).not.toContain(PK);
+      expect(JSON.stringify(s.audit(a.id))).not.toContain(PK);
+    });
+  });
+
   it("flag off: a new install is as before (namespace, binding, no OAUTH_STORE)", async () => {
     const s = setup();
     const inst = keep(await s.mk({ oauthBornD1: false }).create(input("kv")));
