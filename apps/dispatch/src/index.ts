@@ -125,7 +125,7 @@ export default {
       const props = {
         ...brokerProps(gates, id),
         ...billingProps(gates, id, appHost, env),
-        ...loginProps(gates, id, env),
+        ...loginProps(gates, id, appHost.split(".")[0] ?? "", env),
       };
       return await env.DISPATCHER.get(names(id, env.OA_ENV).script, {
         props,
