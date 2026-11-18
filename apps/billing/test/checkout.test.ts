@@ -3843,6 +3843,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
           return Response.json({ id: "cbtxn_1" });
         return undefined;
       });
+      const lines = logs();
       const r = await hook(
         `evt_del_${posts}${balance > 0 ? "p" : "n"}${Math.abs(balance)}`,
         "customer.subscription.deleted",
@@ -3863,8 +3864,21 @@ describe("per-member seats: POST /seats (#2580)", () => {
             amount: "700",
             currency: "usd",
             description: "Credit ends with the plan",
+            // #2588: what was cleared, recorded on the transaction itself.
+            "metadata[oa_reason]": "credit_end",
+            "metadata[oa_subscription]": SUB,
+            "metadata[oa_cleared]": "700",
           },
         ]);
+      if (posts)
+        expect(
+          lines.some(
+            (l) =>
+              l.includes('"evt":"billing_credit_cleared"') &&
+              l.includes('"amount":700') &&
+              l.includes(SUB),
+          ),
+        ).toBe(true);
       s.spy.mockRestore();
     }
     // A Solo subscription ending is left alone.

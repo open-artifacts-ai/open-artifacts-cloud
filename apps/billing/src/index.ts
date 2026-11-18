@@ -2182,12 +2182,22 @@ export default {
           ) {
             const subscriptionId = obj.id;
             try {
-              await stripe("-", () =>
+              const r = await stripe("-", () =>
                 clearCustomerCredit(
                   { customerId: customer, subscriptionId },
                   stripeConfig(env),
                 ),
               );
+              // #2588: what was cleared, so it can be given back (amount in
+              // minor units; ids only, never a name or address).
+              if (r.outcome === "cleared")
+                console.log(
+                  JSON.stringify({
+                    evt: "billing_credit_cleared",
+                    subscription: subscriptionId,
+                    amount: r.amount,
+                  }),
+                );
             } catch {
               // Stripe resends nothing for an acked event: ask for a retry.
               console.error("billing seats credit_end failed");
