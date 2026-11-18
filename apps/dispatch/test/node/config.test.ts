@@ -73,7 +73,7 @@ describe("wrangler.jsonc", () => {
     expect(platformNames("prod").hosts).toBe("oa-p-hosts");
   });
 
-  it("gives the LOGIN gate to the installs provisioning answers (#2520)", () => {
+  it("marks LOGIN_EDITABLE the installs provisioning answers (#2520)", () => {
     // biome-ignore lint/suspicious/noExplicitAny: untyped wrangler config
     const prov: any = JSON.parse(
       strip(readFileSync(join(app, "../provisioning/wrangler.jsonc"), "utf8")),
