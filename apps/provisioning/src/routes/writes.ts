@@ -290,7 +290,7 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
     const body = bodyOf<typeof SetOAuthStoreSchema>(a);
     // open-artifacts#2641: DOCS_PREVIEW is staging only, either value. The
     // job's recheck and provision's metadata guard refuse it on prod too.
-    if (body.vars.DOCS_PREVIEW !== undefined && a.env.OA_ENV === "prod")
+    if (body.vars.DOCS_PREVIEW !== undefined && a.env.OA_ENV !== "staging")
       throw new ApiError(
         "invalid_input",
         "DOCS_PREVIEW is staging only; prod refuses it",
