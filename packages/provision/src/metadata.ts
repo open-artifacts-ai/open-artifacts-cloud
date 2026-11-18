@@ -63,6 +63,8 @@ export const HOSTED_ADDED = [
   "TEST_DOMAIN",
   "SESSION_SECRET",
   "CONTENT_SIGNING_KEY",
+  "VAPID_PUBLIC_KEY",
+  "VAPID_PRIVATE_KEY",
 ] as const;
 
 /** Secrets every install has (TEST_HOOK_KEY is added for test installs). */
