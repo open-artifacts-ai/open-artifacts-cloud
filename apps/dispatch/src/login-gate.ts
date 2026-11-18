@@ -5,7 +5,7 @@
 // a stub of this class in ctx.props.LOGIN, valid for that one request.
 //
 // The gate is the identity: it sets x-oa-gate-install to its own install; the
-// body names no install. It forwards one fixed route, POST /login-domains, and
+// body names no install. It forwards fixed routes (POST /login-domains and the two /optouts/* ones), and
 // only the content type and the install's Ed25519 assertion headers.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
@@ -27,6 +27,15 @@ export interface LoginGateEnv {
 /** The platform side has no public origin for this route (binding only). */
 export const LOGIN_ORIGIN = "https://login.oa.internal";
 export const LOGIN_GATE_PATH = "/login-domains";
+/**
+ * The hosted-wide email opt-out list (open-artifacts#2652) rides the same
+ * gate: two more fixed routes (an opt-out is redeemed on a public page, never through the gate), forwarded verbatim, never a caller's path.
+ */
+export const OPTOUT_GATE_PATHS = ["/optouts/check", "/optouts/mint"] as const;
+const GATE_PATHS: ReadonlySet<string> = new Set([
+  LOGIN_GATE_PATH,
+  ...OPTOUT_GATE_PATHS,
+]);
 
 const FORWARD = ["content-type", "x-oa-kid", "x-oa-sig"] as const;
 const INSTALL_ID = /^i[a-z0-9]{11}$/;
@@ -60,7 +69,7 @@ export async function passLoginGate(
   if (
     req.method !== "POST" ||
     url.search !== "" ||
-    url.pathname !== LOGIN_GATE_PATH
+    !GATE_PATHS.has(url.pathname)
   ) {
     await req.body?.cancel();
     return refuse(404, "not_found");
@@ -94,7 +103,7 @@ export async function passLoginGate(
   // The platform's only source of the install id: this gate's, never a caller's.
   headers.set(GATE_INSTALL_HEADER, props.installId);
   return env.LOGIN.fetch(
-    new Request(`${LOGIN_ORIGIN}${LOGIN_GATE_PATH}`, {
+    new Request(`${LOGIN_ORIGIN}${url.pathname}`, {
       method: "POST",
       headers,
       body: text,

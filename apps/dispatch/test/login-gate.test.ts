@@ -55,6 +55,29 @@ const err = async (r: Response) => {
   return { status: r.status, ...((await r.json()) as object) };
 };
 
+describe("LoginGate opt-out routes", () => {
+  it("forwards the two fixed /optouts routes, and add is gone from the gate; and nothing else under it", async () => {
+    for (const path of ["/optouts/check", "/optouts/mint"]) {
+      const { env, got } = world();
+      const r = await passLoginGate(post(path, { h1: "x" }), props, env);
+      expect(r.status).toBe(202);
+      expect(got[0]?.url).toBe(`${LOGIN_ORIGIN}${path}`);
+      expect(got[0]?.headers["x-oa-gate-install"]).toBe(A);
+    }
+    for (const path of [
+      "/optouts/add",
+      "/optouts/remove",
+      "/optouts",
+      "/optouts/check/",
+    ]) {
+      const { env, got } = world();
+      const r = await passLoginGate(post(path, {}), props, env);
+      expect(r.status).toBe(404);
+      expect(got).toHaveLength(0);
+    }
+  });
+});
+
 describe("LoginGate", () => {
   it("forwards the fixed route with the gate's install and the assertion headers only", async () => {
     const { env, got } = world();

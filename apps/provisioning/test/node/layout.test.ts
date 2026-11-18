@@ -207,13 +207,22 @@ describe("the API never writes provision's tables (W4 static SQL test)", () => {
     );
   });
 
+  const OPTOUTS = "src/routes/optouts.ts";
+  it("optouts writes only one hosted_audit row, never installs, hosts, release_floor or platform_state", () => {
+    const text = readFileSync(join(app, OPTOUTS), "utf8");
+    const writes = [...text.matchAll(new RegExp(re.source, "gi"))].map((m) =>
+      m[0].replace(/\s+/g, " ").toLowerCase(),
+    );
+    expect(writes).toEqual(["insert into hosted_audit"]);
+  });
+
   it("no src module writes installs, hosts, hosted_audit, release_floor or platform_state", () => {
     expect(src.length).toBeGreaterThan(10);
     // The one exception (#2520): the instance's login-domain change writes its
     // own install's vars and audit row in one CAS batch (design approved by
     // the security reviewer); the test below pins what it may touch.
     const hits = src.flatMap((f) => {
-      if (rel(f) === LOGIN_CHANGE) return [];
+      if (rel(f) === LOGIN_CHANGE || rel(f) === OPTOUTS) return [];
       const m = re.exec(readFileSync(f, "utf8"));
       return m ? [`${rel(f)}: ${m[0]}`] : [];
     });

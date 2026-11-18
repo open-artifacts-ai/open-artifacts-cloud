@@ -68,6 +68,9 @@ const TABLES = [
   "signup_allowlist",
   "signup_waitlist",
   "business_requests",
+  "login_change_nonces",
+  "email_optouts",
+  "email_optouts_install",
 ];
 export async function resetDb() {
   await migrate();
