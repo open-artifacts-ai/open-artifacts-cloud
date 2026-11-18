@@ -2039,7 +2039,12 @@ echo "RUN $*" >> "$CALLS"
   it("a gate run (T19_FULL unset or false) runs only the @gate set", () => {
     const sb = sandbox({ all: 24, gate: 9, guard: 2 });
     try {
-      for (const env of [{}, { T19_FULL: "false" }, { T19_FULL: "" }]) {
+      const envs: Record<string, string>[] = [
+        {},
+        { T19_FULL: "false" },
+        { T19_FULL: "" },
+      ];
+      for (const env of envs) {
         const { r, calls } = sb.run(env);
         expect(r.status, r.stdout + r.stderr).toBe(0);
         expect(r.stdout).toContain("T19 set: gate, 9 tests");
@@ -2083,7 +2088,10 @@ echo "RUN $*" >> "$CALLS"
   it("a selection that matches no test fails and runs nothing", () => {
     const none = sandbox({ all: 0, gate: 0, guard: 0 });
     try {
-      for (const env of [{}, { T19_FULL: "true" }]) {
+      for (const env of [{}, { T19_FULL: "true" }] as Record<
+        string,
+        string
+      >[]) {
         const { r, calls } = none.run(env);
         expect(r.status, JSON.stringify(env)).toBe(1);
         expect(r.stdout).toContain("matched no test");
@@ -2098,7 +2106,10 @@ echo "RUN $*" >> "$CALLS"
     for (const broken of ["all", "gate"] as const) {
       const sb = sandbox({ all: 24, gate: 9, guard: 2 }, broken);
       try {
-        for (const env of [{}, { T19_FULL: "true" }]) {
+        for (const env of [{}, { T19_FULL: "true" }] as Record<
+          string,
+          string
+        >[]) {
           const { r, calls } = sb.run(env);
           // The gate-listing break only matters when the gate lists.
           if (broken === "gate" && env.T19_FULL) {
