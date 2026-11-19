@@ -76,7 +76,7 @@ jobs:
             d="$RUNNER_TEMP/pin-only"
             mkdir -p "$d"
             ok=true
-            for f in pin-only pin-bump-arm pin-bump; do
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
             if [ "$ok" != true ]; then
@@ -363,7 +363,7 @@ jobs:
             d="$RUNNER_TEMP/pin-only"
             mkdir -p "$d"
             ok=true
-            for f in pin-only pin-bump-arm pin-bump; do
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
             if [ "$ok" != true ]; then
@@ -473,7 +473,7 @@ jobs:
             d="$RUNNER_TEMP/pin-only"
             mkdir -p "$d"
             ok=true
-            for f in pin-only pin-bump-arm pin-bump; do
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
               git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
             done
             if [ "$ok" != true ]; then
