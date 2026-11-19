@@ -3655,12 +3655,151 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(lines.filter((l) => l.includes("jump")).join()).not.toMatch(/14/);
     // No hold is left behind: an ordinary increase applies and is no jump.
     const ok = await call(seatsReq(20, Date.now() + 1));
+    // The jump is still pending (it rides two answers), so this one carries it too.
     expect(await ok.json()).toEqual({
       members: 20,
       applied: "updated",
       retry: false,
+      jump: { from: 3, to: 14 },
     });
     expect(s.held()).toBe(20);
+  });
+
+  describe("the jump notice is durable (#2940)", () => {
+    const body = async (r: Response) =>
+      (await r.json()) as { applied?: string; jump?: unknown };
+    const jumpCols = async () =>
+      (await db
+        .prepare(
+          "SELECT jump_from, jump_to, jump_sent FROM seats WHERE install_id = ?1",
+        )
+        .bind(A)
+        .first()) as {
+        jump_from: number | null;
+        jump_to: number | null;
+        jump_sent: number;
+      };
+
+    it("a jump rides two /seats answers, then clears", async () => {
+      await live();
+      stripeAt(3);
+      expect((await body(await call(seatsReq(14)))).jump).toEqual({
+        from: 3,
+        to: 14,
+      });
+      expect(await jumpCols()).toMatchObject({ jump_to: 14, jump_sent: 1 });
+      // The next call (nothing to change) carries it once more, then it is cleared.
+      const again = await body(await call(seatsReq(14, Date.now() + 1)));
+      expect(again).toMatchObject({ applied: "unchanged" });
+      expect(again.jump).toEqual({ from: 3, to: 14 });
+      expect(await jumpCols()).toMatchObject({
+        jump_from: null,
+        jump_to: null,
+      });
+      expect((await body(await call(seatsReq(14, Date.now() + 2)))).jump).toBe(
+        undefined,
+      );
+    });
+
+    it("(a) the row write after a Stripe write fails: the resend finds the jump again", async () => {
+      await live();
+      const s = stripeAt(3);
+      await call(seatsReq(3)); // the row records applied_quantity 3
+      await db
+        .prepare(
+          "CREATE TRIGGER seat_done_fails BEFORE UPDATE ON seats WHEN new.apply_outcome = 'updated' BEGIN SELECT RAISE(ABORT, 'down'); END",
+        )
+        .run();
+      try {
+        const bad = await call(seatsReq(14, Date.now() + 1)).catch(() => null);
+        expect(bad === null || bad.status >= 500).toBe(true);
+      } finally {
+        await db.prepare("DROP TRIGGER seat_done_fails").run();
+      }
+      // Stripe moved, the row did not.
+      expect(s.held()).toBe(14);
+      const r = await body(await call(seatsReq(14, Date.now() + 2)));
+      expect(r.applied).toBe("unchanged");
+      expect(r.jump).toEqual({ from: 3, to: 14 });
+    });
+
+    it("(b) a refusal carries the pending jump without counting it, and nothing is dropped", async () => {
+      await live();
+      stripeAt(3);
+      await call(seatsReq(14)); // carried once (jump_sent 1)
+      const bad = fakeStripe(async () =>
+        Response.json({ error: { message: "down" } }, { status: 500 }),
+      );
+      const refused = await call(seatsReq(15, Date.now() + 1));
+      expect(refused.status).toBeGreaterThanOrEqual(429);
+      expect((await body(refused)).jump).toEqual({ from: 3, to: 14 });
+      expect(await jumpCols()).toMatchObject({ jump_to: 14, jump_sent: 1 });
+      bad.spy.mockRestore();
+      stripeAt(14);
+      // The next good answer carries it (second carry) and clears it.
+      const ok = await body(await call(seatsReq(15, Date.now() + 2)));
+      expect(ok.jump).toEqual({ from: 3, to: 14 });
+      expect(await jumpCols()).toMatchObject({ jump_to: null });
+    });
+
+    it("(c) the daily cron's apply keeps a jump for the next /seats answer", async () => {
+      await live();
+      await db
+        .prepare(
+          "INSERT INTO seats (install_id, members, ts, applied_quantity, apply_outcome, per_member, updated_at) VALUES (?1, 14, 1, 3, 'updated', 1, 1)",
+        )
+        .bind(A)
+        .run();
+      const s = stripeAt(3);
+      await cron();
+      expect(s.held()).toBe(14);
+      expect(await jumpCols()).toMatchObject({
+        jump_from: 3,
+        jump_to: 14,
+        jump_sent: 0,
+      });
+      const r = await body(await call(seatsReq(14, Date.now() + 1)));
+      expect(r.jump).toEqual({ from: 3, to: 14 });
+    });
+
+    it("a checkout correction is never a jump", async () => {
+      await seed(A, "cus_existingA", "trial");
+      await db
+        .prepare(
+          "INSERT INTO seats (install_id, members, ts, apply_outcome, updated_at) VALUES (?1, 30, 1, 'trial', 1)",
+        )
+        .bind(A)
+        .run();
+      const s = stripeAt(2);
+      const r = await hook("evt_co_jump", "checkout.session.completed", {
+        subscription: SUB,
+        payment_status: "paid",
+        metadata: { tier: "team" },
+      });
+      expect(r.status).toBe(200);
+      expect(s.posts.map((c) => c.form.quantity)).toEqual(["30"]);
+      expect(await jumpCols()).toMatchObject({
+        jump_from: null,
+        jump_to: null,
+      });
+      expect((await body(await call(seatsReq(30, Date.now() + 1)))).jump).toBe(
+        undefined,
+      );
+    });
+
+    it("a second jump before the first was reported keeps the first from and the latest to", async () => {
+      await live();
+      stripeAt(3);
+      await call(seatsReq(14)); // jump_sent 1
+      stripeAt(14);
+      const r = await body(await call(seatsReq(40, Date.now() + 1)));
+      expect(r.jump).toEqual({ from: 3, to: 40 });
+      expect(await jumpCols()).toMatchObject({
+        jump_from: 3,
+        jump_to: 40,
+        jump_sent: 1,
+      });
+    });
   });
 
   it("yearly increase and decrease: create_prorations, applied at once", async () => {
