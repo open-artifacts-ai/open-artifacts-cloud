@@ -50,3 +50,27 @@ describe("OPTOUT_HASH_KEY derivation", () => {
     ).rejects.toBeInstanceOf(Transient);
   });
 });
+
+describe("the platform PostHog key (open-artifacts#2479)", () => {
+  it("passes POSTHOG_KEY and POSTHOG_HOST from the Worker's own env", async () => {
+    const o = await provisionerOptions(
+      env({ POSTHOG_KEY: "phc_x", POSTHOG_HOST: "https://eu.i.posthog.com" }),
+      "l",
+      io,
+      "p1",
+    );
+    expect(o.posthogKey).toBe("phc_x");
+    expect(o.posthogHost).toBe("https://eu.i.posthog.com");
+  });
+  it("absent or empty is absent, and a host without a key is dropped", async () => {
+    for (const e of [
+      {},
+      { POSTHOG_KEY: "" },
+      { POSTHOG_HOST: "https://eu.i.posthog.com" },
+    ]) {
+      const o = await provisionerOptions(env(e), "l", io, "p2");
+      expect(o.posthogKey).toBeUndefined();
+      expect(o.posthogHost).toBeUndefined();
+    }
+  });
+});
