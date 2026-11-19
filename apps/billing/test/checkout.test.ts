@@ -3641,7 +3641,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       members: 14,
       applied: "updated",
       retry: false,
-      jump: { from: 3, to: 14 },
+      jump: { from: 3, to: 14, at: expect.any(Number) },
     });
     expect(s.posts.map((c) => c.form)).toEqual([
       { quantity: "14", proration_behavior: "create_prorations" },
@@ -3660,7 +3660,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       members: 20,
       applied: "updated",
       retry: false,
-      jump: { from: 3, to: 14 },
+      jump: { from: 3, to: 14, at: expect.any(Number) },
     });
     expect(s.held()).toBe(20);
   });
@@ -3683,15 +3683,17 @@ describe("per-member seats: POST /seats (#2580)", () => {
     it("a jump rides two /seats answers, then clears", async () => {
       await live();
       stripeAt(3);
-      expect((await body(await call(seatsReq(14)))).jump).toEqual({
-        from: 3,
-        to: 14,
-      });
+      const first = (await body(await call(seatsReq(14)))).jump as {
+        at: number;
+      };
+      expect(first).toEqual({ from: 3, to: 14, at: expect.any(Number) });
+      expect(first.at).toBeGreaterThan(0);
       expect(await jumpCols()).toMatchObject({ jump_to: 14, jump_sent: 1 });
       // The next call (nothing to change) carries it once more, then it is cleared.
       const again = await body(await call(seatsReq(14, Date.now() + 1)));
       expect(again).toMatchObject({ applied: "unchanged" });
-      expect(again.jump).toEqual({ from: 3, to: 14 });
+      // The same jump keeps the same `at`: a redelivery is recognisable.
+      expect(again.jump).toEqual({ from: 3, to: 14, at: first.at });
       expect(await jumpCols()).toMatchObject({
         jump_from: null,
         jump_to: null,
@@ -3720,7 +3722,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       expect(s.held()).toBe(14);
       const r = await body(await call(seatsReq(14, Date.now() + 2)));
       expect(r.applied).toBe("unchanged");
-      expect(r.jump).toEqual({ from: 3, to: 14 });
+      expect(r.jump).toEqual({ from: 3, to: 14, at: expect.any(Number) });
     });
 
     it("(b) a refusal carries the pending jump without counting it, and nothing is dropped", async () => {
@@ -3732,13 +3734,17 @@ describe("per-member seats: POST /seats (#2580)", () => {
       );
       const refused = await call(seatsReq(15, Date.now() + 1));
       expect(refused.status).toBeGreaterThanOrEqual(429);
-      expect((await body(refused)).jump).toEqual({ from: 3, to: 14 });
+      expect((await body(refused)).jump).toEqual({
+        from: 3,
+        to: 14,
+        at: expect.any(Number),
+      });
       expect(await jumpCols()).toMatchObject({ jump_to: 14, jump_sent: 1 });
       bad.spy.mockRestore();
       stripeAt(14);
       // The next good answer carries it (second carry) and clears it.
       const ok = await body(await call(seatsReq(15, Date.now() + 2)));
-      expect(ok.jump).toEqual({ from: 3, to: 14 });
+      expect(ok.jump).toEqual({ from: 3, to: 14, at: expect.any(Number) });
       expect(await jumpCols()).toMatchObject({ jump_to: null });
     });
 
@@ -3759,7 +3765,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
         jump_sent: 0,
       });
       const r = await body(await call(seatsReq(14, Date.now() + 1)));
-      expect(r.jump).toEqual({ from: 3, to: 14 });
+      expect(r.jump).toEqual({ from: 3, to: 14, at: expect.any(Number) });
     });
 
     it("a checkout correction is never a jump", async () => {
@@ -3793,7 +3799,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
       await call(seatsReq(14)); // jump_sent 1
       stripeAt(14);
       const r = await body(await call(seatsReq(40, Date.now() + 1)));
-      expect(r.jump).toEqual({ from: 3, to: 40 });
+      expect(r.jump).toEqual({ from: 3, to: 40, at: expect.any(Number) });
       expect(await jumpCols()).toMatchObject({
         jump_from: 3,
         jump_to: 40,

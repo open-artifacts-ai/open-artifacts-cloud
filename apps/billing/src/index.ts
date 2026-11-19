@@ -1705,7 +1705,7 @@ const SEATS_READ_SQL = "SELECT members, ts FROM seats WHERE install_id = ?1";
 const SEATS_APPLIED_SQL =
   "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5, per_member = coalesce(?6, per_member), jump_from = CASE WHEN ?8 IS NULL THEN jump_from ELSE coalesce(jump_from, ?7) END, jump_to = coalesce(?8, jump_to), jump_at = coalesce(?9, jump_at), jump_sent = CASE WHEN ?8 IS NULL THEN jump_sent ELSE 0 END WHERE install_id = ?1 AND ts = ?2";
 const SEATS_JUMP_READ_SQL =
-  "SELECT jump_from, jump_to, jump_sent, applied_quantity FROM seats WHERE install_id = ?1";
+  "SELECT jump_from, jump_to, jump_at, jump_sent, applied_quantity FROM seats WHERE install_id = ?1";
 const SEATS_JUMP_SENT_SQL =
   "UPDATE seats SET jump_sent = jump_sent + 1 WHERE install_id = ?1 AND jump_to IS NOT NULL";
 const SEATS_JUMP_CLEAR_SQL =
@@ -1915,18 +1915,21 @@ async function pendingJump(
   db: D1Database,
   install: string,
   count: boolean,
-): Promise<{ jump?: { from: number; to: number } }> {
+): Promise<{ jump?: { from: number; to: number; at: number } }> {
   try {
-    const j = await db
-      .prepare(SEATS_JUMP_READ_SQL)
-      .bind(install)
-      .first<{ jump_from: number | null; jump_to: number | null }>();
-    if (j?.jump_from == null || j.jump_to == null) return {};
+    const j = await db.prepare(SEATS_JUMP_READ_SQL).bind(install).first<{
+      jump_from: number | null;
+      jump_to: number | null;
+      jump_at: number | null;
+    }>();
+    if (j?.jump_from == null || j.jump_to == null || j.jump_at == null)
+      return {};
     if (count) {
       await db.prepare(SEATS_JUMP_SENT_SQL).bind(install).run();
       await db.prepare(SEATS_JUMP_CLEAR_SQL).bind(install, JUMP_CARRIES).run();
     }
-    return { jump: { from: j.jump_from, to: j.jump_to } };
+    // `at` (ms) names the jump: the instance keys its email on it, so a redelivery is never a second email.
+    return { jump: { from: j.jump_from, to: j.jump_to, at: j.jump_at } };
   } catch {
     return {};
   }
@@ -1935,7 +1938,7 @@ async function pendingJump(
 /** The refusal with the pending jump added to its JSON body (status and headers kept). */
 async function withJump(
   res: Response,
-  j: { jump?: { from: number; to: number } },
+  j: { jump?: { from: number; to: number; at: number } },
 ): Promise<Response> {
   if (!j.jump) return res;
   try {
