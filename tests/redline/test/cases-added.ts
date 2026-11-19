@@ -203,6 +203,19 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       file: "live/provisioner.test.ts",
       name: "provisioner > a signup for a taken slug fails cleanly",
     },
+    // regen:begin (scripts/redline-regen.ts writes this block; do not edit it by hand)
+    ...[
+      "org GET /api/v1/me/teammates [session]",
+      "org GET /api/v1/me/teammates [pat]",
+      "org POST /api/v1/me/onboarding/listens-asked [session]",
+      "org POST /api/v1/me/agent-listens [session]",
+      "org GET /api/v1/me/agent-asks/history [session]",
+      "org GET /api/v1/me/agent-asks/history [pat]",
+    ].map((n) => ({
+      file: "live/surfaces.test.ts",
+      name: `surface probes (cross-install) > ${n}`,
+    })),
+    // regen:end
   ];
 
 // The accepted-unproven entries added after #1730's base (main-cases.json holds
