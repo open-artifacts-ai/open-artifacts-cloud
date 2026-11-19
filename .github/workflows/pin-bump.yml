@@ -17,10 +17,20 @@
 #   runs `pnpm install --lockfile-only` (it reads the public tree's pnpmfile,
 #   npmrc and workspace config, so it is inside no trust boundary) and uploads
 #   pnpm-lock.yaml, as data, and nothing else.
+#   It then runs the public workspace's dependency install and build code
+#   (--ignore-scripts, but the build is public code), so NOTHING from this job is
+#   trusted beyond its two artifacts, and `open` re-validates both as data. A
+#   future cache in any job that holds secrets would make this cache poisoning,
+#   so none may be added.
+#   It also derives the surfaces port's mechanical files (tests/redline/live/manifest.json,
+#   test/cases-added.ts and the counts in test/surfaces.test.ts) from the overlaid
+#   tree's src/surfaces.ts, with an install that runs no scripts, and uploads only
+#   the resulting plan (case names and counts) as data.
 # - open: a fresh runner on main's checkout. It never checks out or runs the
 #   public tree, and never installs. It plans again itself (nothing from
-#   prepare but the lockfile is trusted), re-applies the pin files, takes the
-#   lockfile as data, and only then mints the App token to push and open the PR.
+#   prepare but the lockfile and the plan are trusted), re-applies the pin files,
+#   takes the lockfile as data, applies the plan with main's own
+#   tests/redline/scripts/redline-regen.ts (which accepts only plain case names), and only then mints the App token to push and open the PR.
 # - report: issues: write, no checkout. Red keeps one `blocker` issue titled
 #   "pin-bump failed" open with the run URL; green closes it. A run past its
 #   timeout is reported as cancelled, so cancelled counts as red: anything but
@@ -99,12 +109,35 @@ jobs:
           pnpm install --lockfile-only
           mkdir -p "$RUNNER_TEMP/lock"
           cp pnpm-lock.yaml "$RUNNER_TEMP/lock/pnpm-lock.yaml"
-      # Only the lockfile leaves this job, and open takes it as data.
+      # Only the lockfile and the surfaces plan leave this job, and open takes them as data.
+      # The lockfile is uploaded before any public build code runs, and v4
+      # artifacts can't be overwritten by name, so the build can't swap it.
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pin-bump-lock-${{ steps.plan.outputs.tag }}
           path: ${{ runner.temp }}/lock/pnpm-lock.yaml
+          if-no-files-found: error
+          retention-days: 1
+      # The mechanical half of a surfaces port, derived from the overlaid tree's
+      # src/surfaces.ts (tests/redline/src/regen.ts). The install runs no
+      # lifecycle scripts. A route that still needs its classification is a
+      # warning here and a named failure in CI (tests/redline/test/regen.test.ts).
+      - if: steps.plan.outputs.bump == 'true'
+        name: Plan the surfaces port (manifest, cases-added, counts)
+        working-directory: public
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --filter "@oa/redline^..." build
+          mkdir -p "$RUNNER_TEMP/regen"
+          cd tests/redline
+          node --experimental-strip-types --no-warnings scripts/redline-regen.ts plan --out "$RUNNER_TEMP/regen/plan.json"
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/regen/plan.json
           if-no-files-found: error
           retention-days: 1
 
@@ -150,6 +183,22 @@ jobs:
           [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular pnpm-lock.yaml in the artifact"; exit 1; }
           [ "$(wc -c < "$f")" -le 10000000 ] || { echo "::error::the lockfile is over 10 MB"; exit 1; }
           cp "$f" pnpm-lock.yaml
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/regen
+      # The plan is data: main's own script validates every case name (plain
+      # printable text, no quote, backtick, backslash or dollar sign) and writes the
+      # three files from fixed templates. Nothing from the public tree runs here.
+      - if: steps.plan.outputs.bump == 'true'
+        name: Apply the surfaces plan as data
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/regen/plan.json"
+          [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular plan.json in the artifact"; exit 1; }
+          [ "$(wc -c < "$f")" -le 2000000 ] || { echo "::error::the plan is over 2 MB"; exit 1; }
+          node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan "$f" --dir tests/redline
       - id: app
         if: steps.plan.outputs.bump == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -172,7 +221,7 @@ jobs:
         run: |
           set -euo pipefail
           entries='[]'
-          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml; do
+          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts; do
             base64 < "$f" | tr -d '\n' | jq -Rs '{content: ., encoding: "base64"}' > "$RUNNER_TEMP/blob.json"
             blob=$(gh api "repos/$REPO/git/blobs" --input "$RUNNER_TEMP/blob.json" --jq .sha)
             entries=$(jq -c --arg p "$f" --arg s "$blob" '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<< "$entries")

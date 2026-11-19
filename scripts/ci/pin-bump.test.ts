@@ -360,12 +360,17 @@ describe("pin-bump.yml", () => {
     expect(jobs.prepare.permissions.contents).toBe("read");
   });
 
-  it("prepare sends out only the lockfile", () => {
+  it("prepare sends out only the lockfile and the surfaces plan", () => {
     const ups = stepsOf("prepare").filter((s) =>
       s.uses?.startsWith("actions/upload-artifact@"),
     );
-    expect(ups).toHaveLength(1);
+    expect(ups).toHaveLength(2);
     expect(ups[0].with.path).toMatch(/\/pnpm-lock\.yaml$/);
+    expect(ups[1].with.path).toMatch(/\/regen\/plan\.json$/);
+    expect(ups[1].with.name).toBe(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "pin-bump-regen-${{ steps.plan.outputs.tag }}",
+    );
     expect(ups[0].with.name).toBe(
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       "pin-bump-lock-${{ steps.plan.outputs.tag }}",
@@ -415,6 +420,52 @@ describe("pin-bump.yml", () => {
     expect(take.run).toContain("10000000");
   });
 
+  it("open applies the surfaces plan as data, with main's own script, before the token is minted", () => {
+    const open = stepsOf("open");
+    const names = open.map((s) => s.id ?? s.name ?? s.uses);
+    const apply = open.find(
+      (s) => s.name === "Apply the surfaces plan as data",
+    );
+    expect(apply.run).toContain("-L");
+    expect(apply.run).toContain("2000000");
+    expect(apply.run).toContain(
+      "node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan",
+    );
+    expect(open.indexOf(apply)).toBeLessThan(names.indexOf("app"));
+    const dl = open.filter((s) =>
+      s.uses?.startsWith("actions/download-artifact@"),
+    );
+    expect(dl.map((s) => s.with.name)).toEqual([
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "pin-bump-lock-${{ steps.plan.outputs.tag }}",
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "pin-bump-regen-${{ steps.plan.outputs.tag }}",
+    ]);
+  });
+
+  it("prepare plans the surfaces port after the lockfile, with an install that runs no scripts", () => {
+    const prep = stepsOf("prepare");
+    const plan = prep.find((s) => s.name?.startsWith("Plan the surfaces port"));
+    expect(plan.run).toContain(
+      "pnpm install --frozen-lockfile --ignore-scripts",
+    );
+    expect(plan.run).toContain("scripts/redline-regen.ts plan --out");
+    expect(plan["working-directory"]).toBe("public");
+    const lock = prep.findIndex(
+      (s) => s.name === "Regenerate the merged lockfile",
+    );
+    expect(prep.indexOf(plan)).toBeGreaterThan(lock);
+    // The lockfile leaves before any public build code runs (v4 artifacts can't
+    // be overwritten by name, so the build can't swap it).
+    const upLock = prep.findIndex(
+      (s) =>
+        s.uses?.startsWith("actions/upload-artifact@") &&
+        s.with?.name?.startsWith("pin-bump-lock-"),
+    );
+    expect(upLock).toBeGreaterThan(lock);
+    expect(upLock).toBeLessThan(prep.indexOf(plan));
+  });
+
   it("writes only with the release App's token, scoped to contents and PRs", () => {
     const app = step("open", "app");
     expect(app.uses).toMatch(/^actions\/create-github-app-token@[0-9a-f]{40}/);
@@ -448,8 +499,11 @@ describe("pin-bump.yml", () => {
       "git/refs",
     ])
       expect(c.run).toContain(call);
-    // Only the three pin files, as regular files, on top of the main sha the job checked out.
-    expect(c.run).toContain("for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml");
+    // Only the pin files, the lockfile and the three surfaces-port files the plan
+    // regenerates, as regular files, on top of the main sha the job checked out.
+    expect(c.run).toContain(
+      "for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts; do",
+    );
     expect(c.run).toContain('mode: "100644"');
     expect(c.run).toContain("parents: [$p]");
     // No author or committer is set, so GitHub records the App and signs it.
