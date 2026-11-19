@@ -240,6 +240,16 @@ export interface WfpOptions {
    */
   optoutHashKey?: string;
   /**
+   * open-artifacts#2479: the platform's PostHog project key, from the
+   * rendering Worker's own env (so staging installs only ever get staging's).
+   * Set, every render (create, update, rollback) binds it as the install's
+   * POSTHOG_KEY secret_text; unset, an install gets none and an upgrade
+   * removes one it holds. Never logged.
+   */
+  posthogKey?: string;
+  /** The optional POSTHOG_HOST var; rendered only with a key, only when set. */
+  posthogHost?: string;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -405,10 +415,18 @@ export const PUSH_SECRETS = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
  */
 export const INSTALL_OPTOUT_KEY = "INSTALL_OPTOUT_KEY";
 
+/**
+ * open-artifacts#2479: the platform's PostHog project key on an install, so
+ * the public server sends its activation events. Present or absent is clean
+ * to verify_clean (it follows the platform's env, which may change).
+ */
+export const POSTHOG_KEY = "POSTHOG_KEY";
+
 const OPTIONAL_SECRETS: readonly string[] = [
   "OAUTH_COPY_KEY",
   ...PUSH_SECRETS,
   INSTALL_OPTOUT_KEY,
+  POSTHOG_KEY,
 ];
 
 /**
@@ -2521,6 +2539,21 @@ export class WfpProvisioner {
         { type: "plain_text", name: "OPTOUT_PLATFORM", text: "on" },
       );
     }
+    // open-artifacts#2479: the platform's PostHog key (and host), when set.
+    if (this.o.posthogKey !== undefined) {
+      this.sensitive.add(this.o.posthogKey);
+      meta.bindings.push({
+        type: "secret_text",
+        name: POSTHOG_KEY,
+        text: this.o.posthogKey,
+      });
+      if (this.o.posthogHost !== undefined)
+        meta.bindings.push({
+          type: "plain_text",
+          name: "POSTHOG_HOST",
+          text: this.o.posthogHost,
+        });
+    }
     // An update never drops the secrets already on the script.
     if (r.mode === "update") meta.keep_bindings = ["secret_text", "secret_key"];
     if (
@@ -2831,6 +2864,13 @@ export class WfpProvisioner {
       assertOwnResource(u.script, env);
       await send(meta, mods.modules);
       sent = meta;
+      // keep_bindings keeps every secret, so a key the platform no longer has
+      // is deleted here (open-artifacts#2479): absent there is absent here.
+      if (u.exists && this.o.posthogKey === undefined) {
+        await this.hold();
+        if ((await cf.secretList(target, u.script)).includes(POSTHOG_KEY))
+          await cf.secretDelete(target, u.script, POSTHOG_KEY);
+      }
       // What the script now runs: the new tag when steps went, else the one sent against.
       if (u.out) u.out.reached = meta.migrations?.new_tag ?? tag;
     };
@@ -4320,6 +4360,8 @@ export class WfpProvisioner {
       ...Object.keys(vars),
       "FEATURES",
       "TURNSTILE_SITE_KEY",
+      // Platform-rendered (open-artifacts#2479): follows the env, not the version.
+      "POSTHOG_HOST",
     ]);
     const notVars = (x: Record<string, unknown>) =>
       canonicalJson({

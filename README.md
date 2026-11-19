@@ -170,7 +170,14 @@ below, done for you); fix what CI finds on its branch by hand. By hand:
 3. Build the overlay (`scripts/dev-overlay.sh`) and run `pnpm install` in it
    without `--frozen-lockfile`, to regenerate the merged lockfile. Copy the
    overlay's `pnpm-lock.yaml` back here.
-4. Fix whatever the new public release broke, in this repo.
+4. Fix whatever the new public release broke, in this repo. A new public route
+   needs its classification by hand in `tests/redline/src/surfaces.ts`
+   (`INTERACTIVE_ONLY`, `EXCLUDED_ROUTES`, `DROPPED`, each citing a public
+   test). The files that follow from it are generated: the pin-bump bot commits
+   them, and by hand run, in the overlay's `tests/redline` (after
+   `pnpm --filter "@oa/redline^..." build`),
+   `node --experimental-strip-types --no-warnings scripts/redline-regen.ts write`
+   (`check` fails and prints each route with the list it needs).
 5. CI must be green on the PR: it checks out the new tag, so a collision with
    a file public added fails here first.
 

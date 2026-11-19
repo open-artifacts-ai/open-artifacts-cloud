@@ -530,9 +530,12 @@ case "$target" in
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
     observability_is "$S" provisioner
-    got="$(jq -r '[.result.bindings[] | select(.type == "secret_text") | .name] | join(",")' <<< "$S")"
+    # POSTHOG_KEY (open-artifacts#2479) is optional: set by hand with wrangler
+    # secret put, never by a deploy; present or absent is clean.
+    got="$(jq -r '[.result.bindings[] | select(.type == "secret_text" and .name != "POSTHOG_KEY") | .name] | join(",")' <<< "$S")"
     [ "$got" = "$PROVISIONER_SECRET" ] || { echo "oa-$P-provisioner has secret bindings ($got); want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
-    names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
+    raw="$(secret_names oa-$P-provisioner)"
+    names="$(grep -vxe POSTHOG_KEY -e '' <<< "$raw" | tr '\n' ' ' || true)"
     [ "$names" = "${PROVISIONER_SECRET:+$PROVISIONER_SECRET }" ] || { echo "oa-$P-provisioner has secrets '$names'; want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
     ;;
   provisioning)
@@ -750,6 +753,8 @@ case "$target" in
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"
+    # POSTHOG_KEY (open-artifacts#2479, signed_up): optional, set by hand.
+    names="${names/POSTHOG_KEY /}"
     want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${OPTOUT_KEYS_WANTED:+$OPTOUT_KEYS_WANTED }${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
     [ "$names" = "$want_names" ] || { echo "$W secrets are '$names'" >&2; exit 1; }
     if [ -n "$SIGNUP_KEY_WANTED" ]; then

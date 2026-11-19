@@ -745,6 +745,14 @@ describe("deploy-hosted-platform.sh", () => {
     expect(r.err).toContain("list oa-p-auth-broker secrets failed");
     clean(r);
   });
+  it("provisioner: a failed secrets listing fails the read-back instead of passing on an empty read", () => {
+    const r = setup({
+      exists: ["oa-p-billing", "oa-p-provisioner"],
+      failSecrets: true,
+    }).run("provisioner");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("list oa-p-provisioner secrets failed");
+  });
   it("a deployed binding that doesn't match fails the run", () => {
     const bad = NEXT["oa-p-auth-broker"]?.replace(
       REG,
@@ -3543,6 +3551,10 @@ describe("deploy-hosted-platform.sh", () => {
       const again = go(live, { "empty-secret-reads": "99" });
       for (const k of KEYS) expect(puts(again.log)).not.toContain(k);
     });
+    it("staging: an optional POSTHOG_KEY (open-artifacts#2479, signed_up) passes the read-back", () => {
+      const r = go(live.concat("POSTHOG_KEY"), {}, { VERIFY_ONLY: "1" });
+      expect(r.code, r.err).toBe(0);
+    });
     it("staging: the read-back requires them", () => {
       const r = go(
         live.filter((n) => n !== "OPTOUT_TOKEN_KEY"),
@@ -3586,6 +3598,25 @@ describe("deploy-hosted-platform.sh", () => {
       expect(puts(kept.log)).toEqual([]);
       const prod = setup().run("provisioner");
       expect(puts(prod.log)).toEqual([]);
+    });
+    // open-artifacts#2479: POSTHOG_KEY is set by hand, present or absent is clean.
+    it("provisioner: an optional POSTHOG_KEY secret (binding and name) passes the read-back", () => {
+      const next = JSON.parse(NEXT["oa-s-provisioner"] as string);
+      next.result.bindings.push({ type: "secret_text", name: "POSTHOG_KEY" });
+      const r = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY", "POSTHOG_KEY"] },
+        next: { "oa-s-provisioner": JSON.stringify(next) },
+      }).run("provisioner", {}, "staging");
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([]);
+    });
+    it("provisioner: any other extra secret is still refused", () => {
+      const r = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY", "OTHER_KEY"] },
+      }).run("provisioner", {}, "staging");
+      expect(r.code).toBe(1);
     });
   });
 
