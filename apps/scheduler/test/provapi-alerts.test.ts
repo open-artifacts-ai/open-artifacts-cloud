@@ -52,7 +52,7 @@ const FROM = "alerts@example.test";
 const KEY = "job_failed" as const;
 const ALERT = alertFor(KEY, "staging");
 
-type Mode = "ok" | "fail" | "hang";
+type Mode = "ok" | "fail" | "hang" | "slow";
 type Sent = { from: string; to: string; subject: string; text: string };
 
 function mail() {
@@ -61,6 +61,11 @@ function mail() {
   const binding = {
     send: async (m: Sent) => {
       if (mode === "hang") return new Promise(() => {});
+      // Delivered, but the call never settles in time (outcome unknown).
+      if (mode === "slow") {
+        sent.push(m);
+        return new Promise(() => {});
+      }
       if (mode === "fail")
         throw Object.assign(new Error(`rejected for ${TO}`), {
           code: "E_RATE_LIMIT",
@@ -211,6 +216,53 @@ describe("stepAlert", () => {
     await stepAlert(m.env(), ALERT, null, T0 + H + TICK);
     expect(m.subjects()).toEqual([OPEN, CLEAR]);
     expect(await state("cleared_at")).toBeNull();
+  });
+
+  it("a clear whose send times out (outcome unknown) goes out once, not every tick (#394)", async () => {
+    const m = mail();
+    const lines = captureLogs(vi.spyOn);
+    await stepAlert(m.env(), ALERT, true, T0);
+    m.set("slow");
+    const o = { timeoutMs: 10 };
+    await stepAlert(m.env(), ALERT, false, T0 + H, o);
+    for (let i = 1; i <= 5; i++)
+      await stepAlert(m.env(), ALERT, null, T0 + H + i * TICK, o);
+    expect(m.subjects()).toEqual([OPEN, CLEAR]);
+    expect(await state("cleared_at")).toBeNull();
+    expect(lines).toContain(`${P} ${KEY} send_failed timeout`);
+  });
+
+  it("an owed clear older than a day is dropped, never sent", async () => {
+    const m = mail();
+    const lines = captureLogs(vi.spyOn);
+    await insert("platform_state", {
+      key: `${KEY}_cleared_at`,
+      value: T0,
+      updated_at: T0,
+    });
+    await stepAlert(m.env(), ALERT, null, T0 + DAY + 1);
+    expect(m.sent).toEqual([]);
+    expect(await state("cleared_at")).toBeNull();
+    expect(lines).toEqual([`${P} ${KEY} dropped stale clear`]);
+  });
+
+  it("a new clear replaces a stale owed row, and a re-owe keeps the newest time", async () => {
+    const m = mail();
+    captureLogs(vi.spyOn);
+    for (const [k, v] of [
+      ["cleared_at", T0 + H],
+      ["opened_at", T0 + 2 * H],
+      ["notified_at", T0 + 2 * H],
+    ] as const)
+      await insert("platform_state", {
+        key: `${KEY}_${k}`,
+        value: v,
+        updated_at: v,
+      });
+    m.set("fail");
+    await stepAlert(m.env(), ALERT, false, T0 + 3 * H);
+    // The failed send is re-owed with the newest clear time.
+    expect(await state("cleared_at")).toBe(T0 + 3 * H);
   });
 
   it("a send that never settles times out, and is retried", async () => {

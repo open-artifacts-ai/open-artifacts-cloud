@@ -76,8 +76,13 @@ export interface AlertPolicy {
 export const ALERT_REMIND_MS = 24 * 60 * 60_000;
 /** signin_refused_burst: at most one email per hour (design v7 4.8). */
 export const BURST_EMAIL_INTERVAL_MS = 60 * 60_000;
-/** A send that hasn't settled by then counts as failed (and is retried). */
+/**
+ * A send that hasn't settled by then is "unknown": an open or reminder is
+ * retried, a clear is not (Email Service may still deliver it).
+ */
 export const ALERT_SEND_TIMEOUT_MS = 5_000;
+/** An owed clear older than this is dropped, never sent. */
+export const CLEAR_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /**
  * TODO(contract): the design sets only the burst's policy. The other keys
@@ -121,10 +126,11 @@ const OPEN =
 // The clear email is owed only if this episode's open email went out
 // (notified at or after opened).
 const OWE_CLEAR =
-  "INSERT INTO platform_state (key, value, updated_at) SELECT ?1, ?2, ?2 WHERE EXISTS (SELECT 1 FROM platform_state o JOIN platform_state n ON n.key = ?4 WHERE o.key = ?3 AND n.value >= o.value) ON CONFLICT (key) DO NOTHING";
+  "INSERT INTO platform_state (key, value, updated_at) SELECT ?1, ?2, ?2 WHERE EXISTS (SELECT 1 FROM platform_state o JOIN platform_state n ON n.key = ?4 WHERE o.key = ?3 AND n.value >= o.value) ON CONFLICT (key) DO UPDATE SET value = MAX(value, excluded.value), updated_at = excluded.updated_at";
 const DELETE = "DELETE FROM platform_state WHERE key = ?1 RETURNING value";
+// A re-owe keeps the newest clear time (a newer clear may have landed).
 const OWE =
-  "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2) ON CONFLICT (key) DO NOTHING";
+  "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2) ON CONFLICT (key) DO UPDATE SET value = MAX(value, excluded.value), updated_at = excluded.updated_at";
 
 class SendTimeout extends Error {}
 
@@ -136,9 +142,10 @@ function sendCategory(e: unknown): string {
 }
 
 /**
- * True when the email went out. False on a failed send or with no
- * destination (logged), so the caller gives its claim back and the email
- * goes out once the destination is configured.
+ * "sent": the email went out. "failed": a definite failure (a thrown send
+ * error, or no destination, logged), so the caller gives its claim back and
+ * the email goes out once it can. "unknown": the send timed out; it may
+ * still have been delivered.
  */
 async function send(
   env: AlertEnv,
@@ -146,12 +153,12 @@ async function send(
   state: AlertState,
   at: number,
   timeoutMs: number,
-): Promise<boolean> {
+): Promise<"sent" | "failed" | "unknown"> {
   const to = env.ALERT_TO ?? "";
   const from = env.ALERT_FROM ?? "";
   if (!env.ALERT_EMAIL || !ADDRESS.test(to) || !ADDRESS.test(from)) {
     console.log("provapi alert", alert.key, "skipped no_destination");
-    return false;
+    return "failed";
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -167,10 +174,10 @@ async function send(
       }),
     ]);
     console.log("provapi alert", alert.key, "sent", state);
-    return true;
+    return "sent";
   } catch (e) {
     console.error("provapi alert", alert.key, "send_failed", sendCategory(e));
-    return false;
+    return e instanceof SendTimeout ? "unknown" : "failed";
   } finally {
     clearTimeout(timer);
   }
@@ -218,8 +225,15 @@ export async function stepAlert(
     const owed = await db.prepare(DELETE).bind(cleared).first<{
       value: number;
     }>();
-    if (owed && !(await send(env, alert, "clear", owed.value, timeoutMs)))
-      await db.prepare(OWE).bind(cleared, owed.value).run();
+    if (owed) {
+      if (now - owed.value > CLEAR_MAX_AGE_MS)
+        console.log("provapi alert", alert.key, "dropped stale clear");
+      else if (
+        (await send(env, alert, "clear", owed.value, timeoutMs)) === "failed"
+      )
+        // Only a definite failure is re-owed; a timeout is at most once.
+        await db.prepare(OWE).bind(cleared, owed.value).run();
+    }
 
     const open = await getState(db, opened);
     if (open === null) return;
@@ -237,7 +251,7 @@ export async function stepAlert(
       // Another tick may have sent between the read and the claim.
       if ((await getState(db, notified)) !== prev) return;
       // Phase 2: notified moves only once the email went out.
-      if (await send(env, alert, state, open, timeoutMs))
+      if ((await send(env, alert, state, open, timeoutMs)) === "sent")
         await raiseState(db, notified, now);
     } finally {
       await unclaimState(db, sending, now, null);
