@@ -3632,34 +3632,35 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(t.posts.map((c) => c.form.quantity)).toEqual(["1"]);
   });
 
-  it("a jump past max(current + 10, 2 x current) is held: stored, nothing applied, logged without counts", async () => {
+  it("a jump past max(current + 10, 2 x current) is billed at once, reported as a jump and logged without counts (#2588)", async () => {
     await live();
     const s = stripeAt(3);
     const lines = logs();
     const r = await call(seatsReq(14));
     expect(await r.json()).toEqual({
       members: 14,
-      applied: "held",
-      retry: true,
+      applied: "updated",
+      retry: false,
+      jump: { from: 3, to: 14 },
     });
-    expect(s.posts).toEqual([]);
+    expect(s.posts.map((c) => c.form)).toEqual([
+      { quantity: "14", proration_behavior: "create_prorations" },
+    ]);
     expect(await stored()).toMatchObject({
       members: 14,
-      apply_outcome: "held",
+      applied_quantity: 14,
+      apply_outcome: "updated",
     });
-    expect(lines).toContain(`billing_seats_held ${A}`);
-    expect(lines.filter((l) => l.includes("held")).join()).not.toMatch(/14/);
-    // At the limit it applies.
-    const ok = await call(seatsReq(13, Date.now() + 1));
+    expect(lines).toContain(`billing_seats_jump ${A}`);
+    expect(lines.filter((l) => l.includes("jump")).join()).not.toMatch(/14/);
+    // No hold is left behind: an ordinary increase applies and is no jump.
+    const ok = await call(seatsReq(20, Date.now() + 1));
     expect(await ok.json()).toEqual({
-      members: 13,
+      members: 20,
       applied: "updated",
       retry: false,
     });
-    // A held install is left alone by the daily cron.
-    await call(seatsReq(80, Date.now() + 2));
-    await cron();
-    expect(s.held()).toBe(13);
+    expect(s.held()).toBe(20);
   });
 
   it("yearly increase and decrease: create_prorations, applied at once", async () => {
@@ -3740,84 +3741,38 @@ describe("per-member seats: POST /seats (#2580)", () => {
     expect(await stored()).toMatchObject({ apply_outcome: "unchanged" });
   });
 
-  it("a failed seat-proration invoice is logged once, blocks increases, and a replay counts once", async () => {
+  it("a failed seat-proration invoice takes the normal failed-payment path (past due, grace), a replay changes nothing more, and increases still apply (#2588)", async () => {
     await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
     const s = stripeAt(3, "year");
     await call(seatsReq(4));
-    const before = await rowOf(A);
-    const lines = logs();
     const fail = () => hook("evt_sf1", "invoice.payment_failed", seatInvoice());
     expect((await fail()).status).toBe(200);
+    const once = await rowOf(A);
+    expect(once).toMatchObject({ status: "past_due" });
+    expect(once?.grace_until).toBeGreaterThan(Date.now());
+    // A replay of the same event is acknowledged and changes nothing.
     expect((await fail()).status).toBe(200);
-    expect(
-      lines.filter((l) => l.startsWith("billing_seat_invoice_failed")),
-    ).toEqual([`billing_seat_invoice_failed ${A}`]);
-    expect(await stored()).toMatchObject({
-      seat_amount_due: 5000,
-      seat_failures: 1,
-    });
-    expect(await rowOf(A)).toEqual(before);
-    const r = await call(seatsReq(6, Date.now() + 1));
-    expect(await r.json()).toEqual({
-      members: 6,
-      applied: "unpaid_hold",
-      retry: false,
-    });
-    expect(s.posts.length).toBe(1);
-    // A decrease is still applied.
-    expect(
-      (
-        (await (await call(seatsReq(2, Date.now() + 2))).json()) as {
-          applied: string;
-        }
-      ).applied,
-    ).toBe("updated");
-    // A later payment ends the hold.
-    await hook(
-      "evt_sp1",
-      "invoice.paid",
-      { id: "in_seat1" },
-      Math.floor(Date.now() / 1000) + 5,
-    );
-    const ok = await call(seatsReq(6, Date.now() + 3));
-    expect(((await ok.json()) as { applied: string }).applied).toBe("updated");
-  });
-
-  it("only a pure seat-proration invoice counts as a seat failure (L1)", async () => {
-    await live({ interval: "year", renewsAt: Date.now() + 100 * DAY });
-    stripeAt(3, "year");
-    await call(seatsReq(4));
-    const line = (price: string, proration: boolean) => ({
-      price: { id: price },
-      proration,
-    });
-    for (const [i, o] of [
-      seatInvoice({ billing_reason: "subscription_update" }),
-      seatInvoice({ billing_reason: "subscription_create" }),
-      seatInvoice({ lines: { data: [line("price_teamY1", false)] } }),
-      seatInvoice({ lines: { data: [line("price_other", true)] } }),
-      seatInvoice({
-        lines: {
-          data: [line("price_teamY1", true), line("price_teamY1", false)],
-        },
-      }),
-      seatInvoice({ lines: { data: [] } }),
-    ].entries())
-      await hook(`evt_l1_${i}`, "invoice.payment_failed", o);
+    expect(await rowOf(A)).toEqual(once);
+    // Nothing is recorded as a seat failure, and nothing blocks an increase.
     expect(await stored()).toMatchObject({
       seat_failures: 0,
       seat_failed_at: null,
     });
-    // manual counts, and a monthly price too.
+    const r = await call(seatsReq(6, Date.now() + 1));
+    expect(await r.json()).toEqual({
+      members: 6,
+      applied: "updated",
+      retry: false,
+    });
+    expect(s.posts.length).toBe(2);
+    // A later payment brings the plan back.
     await hook(
-      "evt_l1_ok",
-      "invoice.payment_failed",
-      seatInvoice({
-        billing_reason: "manual",
-        lines: { data: [line("price_team1", true)] },
-      }),
+      "evt_sp1",
+      "invoice.paid",
+      seatInvoice(),
+      Math.floor(Date.now() / 1000) + 5,
     );
-    expect(await stored()).toMatchObject({ seat_failures: 1 });
+    expect(await rowOf(A)).toMatchObject({ status: "active" });
   });
 
   it("Team or Business ending zeroes a credit balance (credit-end-<sub>), only when the balance is below zero", async () => {
@@ -4167,7 +4122,7 @@ describe("per-member seats: POST /seats (#2580)", () => {
     });
   });
 
-  it("retry is true only for held and failed (a permanent Stripe 4xx)", async () => {
+  it("retry is true only for failed (a permanent Stripe 4xx)", async () => {
     await live();
     const failedStripe = fakeStripe(async (c) => {
       if (c.method === "GET" && c.path === SUBS)
