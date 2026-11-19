@@ -110,7 +110,7 @@ describe("wrangler.jsonc", () => {
 });
 
 describe("migrations", () => {
-  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage, 0007_retry, 0008_cancels_at and 0009_seats are the migrations; 0001 creates the three tables", () => {
+  it("0001_init, 0002_solo_tier, 0003_solo_checked_out, 0004_test_clock, 0005_usage_applied, 0006_overage, 0007_retry, 0008_cancels_at, 0009_seats and 0010_seat_jump are the migrations; 0001 creates the three tables", () => {
     const dir = join(app, "migrations");
     expect(readdirSync(dir).sort()).toEqual([
       "0001_init.sql",
@@ -122,6 +122,7 @@ describe("migrations", () => {
       "0007_retry.sql",
       "0008_cancels_at.sql",
       "0009_seats.sql",
+      "0010_seat_jump.sql",
     ]);
     const sql = readFileSync(join(dir, "0001_init.sql"), "utf8");
     for (const t of ["tiers", "stripe_events", "usage"])
@@ -178,6 +179,20 @@ describe("migrations", () => {
     );
     expect(sql).toMatch(
       /ALTER TABLE tiers ADD COLUMN stripe_test_clock_id TEXT;/,
+    );
+  });
+
+  it("0010 adds the jump columns to seats (#2940)", () => {
+    const sql = readFileSync(
+      join(app, "migrations/0010_seat_jump.sql"),
+      "utf8",
+    );
+    for (const c of ["jump_from", "jump_to", "jump_at"])
+      expect(sql).toMatch(
+        new RegExp(`ALTER TABLE seats ADD COLUMN ${c} INTEGER;`),
+      );
+    expect(sql).toMatch(
+      /ALTER TABLE seats ADD COLUMN correction_pending INTEGER NOT NULL DEFAULT 0;/,
     );
   });
 
