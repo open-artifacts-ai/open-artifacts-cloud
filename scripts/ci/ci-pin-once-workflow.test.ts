@@ -111,7 +111,9 @@ describe("ci.yml pin-only gating", () => {
       it("runs the base commit's script, never the checkout's own copy", () => {
         const run: string = roOf(job).run;
         expect(run).toContain('git show "$BASE_SHA:scripts/ci/$f.ts"');
-        expect(run).toContain("for f in pin-only pin-bump-arm pin-bump; do");
+        expect(run).toContain(
+          "for f in pin-only pin-bump-arm pin-bump gh-retry; do",
+        );
         expect(run).toContain('"$d/pin-only.ts"');
         expect(run).not.toMatch(
           /(private|_cloud)\/scripts|\.\/scripts|scripts\/ci\/pin-only\.ts"? *\)/,
@@ -199,7 +201,7 @@ describe("the decision step, run as written", () => {
     mkdirSync(join(dir, "scripts/ci"), { recursive: true });
     git(dir, "init", "-q", "-b", "main");
     if (withScripts)
-      for (const f of ["pin-only", "pin-bump-arm", "pin-bump"])
+      for (const f of ["pin-only", "pin-bump-arm", "pin-bump", "gh-retry"])
         copyFileSync(
           join(root, `scripts/ci/${f}.ts`),
           join(dir, `scripts/ci/${f}.ts`),

@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { type Exec, type ExecResult, gh } from "./gh-retry.ts";
 
 export const PUBLIC_REPO = "open-artifacts-ai/open-artifacts";
 /** Every bump branch starts with this; one open PR from such a branch is the limit. */
@@ -19,21 +20,11 @@ export const BRANCH_PREFIX = "pin-bump/";
 export const STALE_PR_MS = 3 * 24 * 3_600_000;
 export const branchOf = (tag: string) => `${BRANCH_PREFIX}${tag}`;
 
-export type ExecResult = { code: number; stdout: string; stderr: string };
-export type Exec = (cmd: string, args: string[]) => ExecResult;
+export type { Exec, ExecResult };
 export type Plan = { bump: boolean; tag: string; sha: string; why: string };
 
 const TAG = /^v(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/;
 const SHA = /^[0-9a-f]{40}$/;
-
-function gh(exec: Exec, args: string[]): string {
-  const r = exec("gh", args);
-  if (r.code !== 0)
-    throw new Error(
-      `gh ${args.slice(0, 2).join(" ")}: ${r.stderr.trim() || `exit ${r.code}`}`,
-    );
-  return r.stdout;
-}
 
 const parts = (tag: string) => {
   const m = TAG.exec(tag);
@@ -206,20 +197,24 @@ export function openPr(o: {
     "",
     'Opened by the pin-bump workflow. It never arms or merges. CI decides: pin-check (the port check against the base\'s SYNCED_FROM) and equivalence must pass. If public touched a hosted path, port it in this branch (README, "Hand-porting a public fix") before merging.',
   ].join("\n");
-  const url = gh(o.exec, [
-    "pr",
-    "create",
-    "--repo",
-    o.repo,
-    "--base",
-    "main",
-    "--head",
-    o.branch,
-    "--title",
-    `chore(pin): bump PUBLIC_PIN to ${o.tag}`,
-    "--body",
-    body,
-  ]).trim();
+  const url = gh(
+    o.exec,
+    [
+      "pr",
+      "create",
+      "--repo",
+      o.repo,
+      "--base",
+      "main",
+      "--head",
+      o.branch,
+      "--title",
+      `chore(pin): bump PUBLIC_PIN to ${o.tag}`,
+      "--body",
+      body,
+    ],
+    { write: true },
+  ).trim();
   return { action: "opened", url };
 }
 

@@ -5,8 +5,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
+import { sleeper } from "./gh-retry.ts";
 import {
   applyPin,
   branchOf,
@@ -17,6 +18,11 @@ import {
   rewritePin,
   STALE_PR_MS,
 } from "./pin-bump.ts";
+
+// A faked 502 would otherwise sleep through the real backoff.
+beforeEach(() => {
+  vi.spyOn(sleeper, "sleep").mockImplementation(() => {});
+});
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const PUB = "open-artifacts-ai/open-artifacts";
