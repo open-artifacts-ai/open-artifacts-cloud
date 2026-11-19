@@ -436,6 +436,16 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/me/agent-listens/:id":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  // v0.232.0: the teammates picker, the listens-asked flag, adding a listens-to
+  // entry and the asks history (#2577), a browser session only.
+  "GET /api/v1/me/teammates":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/onboarding/listens-asked":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/me/agent-listens":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "GET /api/v1/me/agent-asks/history":
+    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
 };
 
 /**
@@ -513,6 +523,12 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "GET /api/v1/me/agent-listens",
   "PATCH /api/v1/me/agent-listens/:id",
   "DELETE /api/v1/me/agent-listens/:id",
+  // v0.232.0: the teammates picker, listens-asked, adding a listens-to entry
+  // and the asks history (#2577).
+  "GET /api/v1/me/teammates",
+  "POST /api/v1/me/onboarding/listens-asked",
+  "POST /api/v1/me/agent-listens",
+  "GET /api/v1/me/agent-asks/history",
 ];
 
 const INBOX_READ: Citation = {
@@ -550,6 +566,26 @@ const AGENT_SWITCH: Citation = {
   file: "apps/server/test/agent-requests.s2.2577.test.ts",
   describe: "the switch",
   test: "is saved by a browser session only: a token is refused and can read it; a bad body is 400",
+};
+const TEAMMATES: Citation = {
+  file: "apps/server/test/teammates.2577.test.ts",
+  describe: "GET R.meTeammates",
+  test: "refuses a token (404): a browser session only",
+};
+const LISTENS_ASKED: Citation = {
+  file: "apps/server/test/teammates.2577.test.ts",
+  describe: "POST R.meOnboardingListensAsked",
+  test: "refuses a token (404), a guest (403) and anonymous (401)",
+};
+const LISTENS_ADD: Citation = {
+  file: "apps/server/test/agent-listens-add.2577.test.ts",
+  describe: "POST agent-listens",
+  test: "refuses a token, an MCP-style bearer and a signed-out caller; a guest account cannot add",
+};
+const ASKS_HISTORY: Citation = {
+  file: "apps/server/test/agent-listens-add.2577.test.ts",
+  describe: "GET agent-asks/history",
+  test: "browser session only",
 };
 const AGENT_LISTENS: Citation = {
   file: "apps/server/test/agent-requests.s2.2577.test.ts",
@@ -1091,6 +1127,23 @@ export const DROPPED: Readonly<
   "org DELETE /api/v1/me/agent-listens/:id": {
     why: "interactive-only",
     coveredBy: [INSTANCE, AGENT_LISTENS],
+  },
+  // v0.232.0 (#2577): a person in a browser only.
+  "org GET /api/v1/me/teammates": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, TEAMMATES],
+  },
+  "org POST /api/v1/me/onboarding/listens-asked": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, LISTENS_ASKED],
+  },
+  "org POST /api/v1/me/agent-listens": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, LISTENS_ADD],
+  },
+  "org GET /api/v1/me/agent-asks/history": {
+    why: "interactive-only",
+    coveredBy: [INSTANCE, ASKS_HISTORY],
   },
 };
 
