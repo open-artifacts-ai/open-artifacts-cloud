@@ -426,8 +426,11 @@ describe("the workflow", () => {
       "needs.plan.outputs.tag",
     );
     expect(w.jobs.dispatch.concurrency["cancel-in-progress"]).toBe(false);
-    for (const j of Object.values(w.jobs))
-      expect((j as { environment?: unknown }).environment).toBeUndefined();
+    // Only the job that mints the release App token has an environment (#302).
+    expect(w.jobs.dispatch.environment).toBe("release-app");
+    for (const [name, j] of Object.entries(w.jobs))
+      if (name !== "dispatch")
+        expect((j as { environment?: unknown }).environment).toBeUndefined();
   });
   it("leaves prod-release-chain's trigger as it was", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));

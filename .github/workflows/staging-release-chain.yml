@@ -75,6 +75,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.go == 'true'
     runs-on: ubuntu-latest
+    environment: release-app
     # The dispatch uses the release App's installation token (actions: write,
     # minted below), not the default token: a run the default token starts
     # raises no workflow_run event, so nothing after the deploy would fire

@@ -488,7 +488,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       contents: "read",
       actions: "read",
     });
-    expect(jobs.mirror.environment).toBeUndefined();
+    // The App token lives in the main-only release-app environment (#302).
+    expect(jobs.mirror.environment).toBe("release-app");
   });
 
   it("the mirror checks the public release before any tag", () => {

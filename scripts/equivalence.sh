@@ -106,6 +106,8 @@ ALLOW=(
   # The hosted-owned vars check (#262), this repo's own.
   scripts/ci/check-hosted-owned-vars.ts
   scripts/ci/check-hosted-owned-vars.test.ts
+  # The release App environment check (#302), this repo's own.
+  scripts/ci/release-app-environment.test.ts
   # The pin-only decision (run the suite once for the release bot's pin bumps).
   scripts/ci/pin-only.ts
   scripts/ci/pin-only.test.ts
