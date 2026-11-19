@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cfClient } from "@oa/provision";
+import { cfClient, NAMESPACES, names } from "@oa/provision";
 import { describe, expect, it, vi } from "vitest";
 import {
   COMMANDS,
@@ -123,7 +123,13 @@ describe("refusals before any call", () => {
   });
 
   it("every documented command is accepted", () => {
-    expect(COMMANDS).toEqual(["status", "publish-release", "publish-floor"]);
+    expect(COMMANDS).toEqual([
+      "status",
+      "publish-release",
+      "publish-floor",
+      "backfill-push-keys",
+      "backfill-optout-key",
+    ]);
   });
 
   // W9b (design 10.1): install writes are the Provisioning API's. Moved here
@@ -987,6 +993,159 @@ describe("H-S3: R2 credentials for publish", () => {
     for (const v of halves(w)) {
       expect(v.length).toBeGreaterThan(8);
       expect(seen).not.toContain(v);
+    }
+  });
+});
+
+describe("backfills (open-artifacts#2775, #2820)", () => {
+  const OPS = [
+    {
+      cmd: "backfill-push-keys",
+      secrets: ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"],
+      audit: "push_keys.backfill",
+    },
+    {
+      cmd: "backfill-optout-key",
+      secrets: ["INSTALL_OPTOUT_KEY"],
+      audit: "optout_key.backfill",
+    },
+  ] as const;
+  const scriptOf = (w: W, id: string) =>
+    w.fake.script(NAMESPACES[w.env], names(id, w.env).script);
+  const argv = (cmd: string, ...more: string[]) => [
+    cmd,
+    "--env",
+    "staging",
+    ...more,
+  ];
+  const secretsOf = (w: W, id: string) =>
+    new Map(scriptOf(w, id)?.secrets ?? []);
+  const secretWrites = (w: W) =>
+    w.fake.writes().filter((x) => /\/secrets/.test(x));
+
+  for (const op of OPS) {
+    describe(op.cmd, () => {
+      it("a dry run counts what it would write and writes nothing", async () => {
+        const w = world();
+        const lacking = await w.seed({}, "alpha");
+        const holding = await w.seed({}, "beta");
+        for (const k of op.secrets) scriptOf(w, lacking)?.secrets.delete(k);
+        const before = secretsOf(w, lacking);
+        const keptBefore = secretsOf(w, holding);
+        const secretsAt = secretWrites(w).length;
+        expect(await main(argv(op.cmd, "--dry-run"), w.deps)).toBe(0);
+        const data = w.parsed().find((l) => l.step === op.cmd)?.data;
+        expect(data).toEqual({
+          dryRun: true,
+          installs: 2,
+          would_write: 1,
+          written: 0,
+          present: 1,
+          not_active: 0,
+          half_pair: 0,
+          failed: 0,
+          failed_total: 0,
+        });
+        expect(secretsOf(w, lacking)).toEqual(before);
+        expect(secretsOf(w, holding)).toEqual(keptBefore);
+        expect(secretWrites(w).length).toBe(secretsAt);
+        // No lease taken, no per-install audit row.
+        expect(w.audit().map((a) => a.action)).toEqual([
+          `cli.${op.cmd}.start`,
+          `cli.${op.cmd}.done`,
+        ]);
+      });
+
+      it("a real run writes where none is, never rotates, and a rerun changes nothing", async () => {
+        const w = world();
+        const lacking = await w.seed({}, "alpha");
+        const holding = await w.seed({}, "beta");
+        for (const k of op.secrets) scriptOf(w, lacking)?.secrets.delete(k);
+        const keptBefore = secretsOf(w, holding);
+        expect(await main(argv(op.cmd), w.deps)).toBe(0);
+        expect(w.parsed().find((l) => l.step === op.cmd)?.data).toMatchObject({
+          dryRun: false,
+          installs: 2,
+          written: 1,
+          present: 1,
+          failed_total: 0,
+        });
+        const put = secretsOf(w, lacking);
+        for (const k of op.secrets) expect(put.has(k)).toBe(true);
+        expect(secretsOf(w, holding)).toEqual(keptBefore);
+        expect(w.audit().map((a) => a.action)).toContain(`cli.${op.cmd}.done`);
+        // Rerun: nothing to write, nothing changes.
+        w.lines.length = 0;
+        const writesAt = secretWrites(w).length;
+        expect(await main(argv(op.cmd), w.deps)).toBe(0);
+        expect(w.parsed().find((l) => l.step === op.cmd)?.data).toMatchObject({
+          written: 0,
+          present: 2,
+        });
+        expect(secretWrites(w).length).toBe(writesAt);
+        expect(secretsOf(w, lacking)).toEqual(put);
+        // No key value reaches stdout.
+        const out = w.lines.join("\n");
+        for (const v of put.values()) expect(out).not.toContain(v);
+      });
+
+      it("an install that is not active is counted, with no id in the output", async () => {
+        const w = world();
+        const busy = await w.seed({}, "alpha");
+        for (const k of op.secrets) scriptOf(w, busy)?.secrets.delete(k);
+        w.db()
+          .prepare("UPDATE installs SET state = 'upgrading' WHERE id = ?")
+          .run(busy);
+        expect(await main(argv(op.cmd, "--dry-run"), w.deps)).toBe(1);
+        expect(w.parsed().find((l) => l.step === op.cmd)?.data).toMatchObject({
+          installs: 1,
+          not_active: 1,
+          failed_total: 1,
+        });
+        const out = w.lines.join("\n");
+        expect(out).not.toContain(busy);
+        expect(out).not.toContain("alpha");
+        expect(secretsOf(w, busy).has(op.secrets[0])).toBe(false);
+      });
+
+      it("--detail lists installs on a laptop and is refused in CI", async () => {
+        const w = world();
+        const id = await w.seed({}, "alpha");
+        expect(await main(argv(op.cmd, "--dry-run", "--detail"), w.deps)).toBe(
+          0,
+        );
+        expect(w.parsed().find((l) => l.step === op.cmd)?.data.detail).toEqual([
+          { id, outcome: "present" },
+        ]);
+        const c = world({ ci: true });
+        expect(await main(argv(op.cmd, "--detail"), c.deps)).toBe(1);
+        expect(lastLine(c).message).toMatch(/refused in CI/);
+        noCalls(c);
+      });
+
+      it("takes no --install, and prod is refused with a staging-only CI", async () => {
+        const w = world();
+        expect(
+          await main(argv(op.cmd, "--install", "iaaaaaaaaaaa"), w.deps),
+        ).toBe(1);
+        noCalls(w);
+        const c = world({ ci: true, env: "prod" });
+        expect(await main([op.cmd, "--env", "prod", "--dry-run"], c.deps)).toBe(
+          1,
+        );
+        expect(lastLine(c).message).toMatch(/prod refused/);
+      });
+    });
+  }
+
+  it("--dry-run and --detail belong to the backfills only", async () => {
+    for (const flag of ["--dry-run", "--detail"]) {
+      const w = world();
+      expect(
+        await main(STATUS("iaaaaaaaaaaa", "staging").concat(flag), w.deps),
+      ).toBe(1);
+      expect(lastLine(w)).toMatchObject({ step: "args", status: "error" });
+      noCalls(w);
     }
   });
 });

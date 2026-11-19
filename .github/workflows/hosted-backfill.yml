@@ -1,0 +1,119 @@
+# One operator-run backfill on one env's hosted installs: the browser push key
+# pair (open-artifacts#2775) or the email opt-out key (open-artifacts#2820) on
+# every active install that lacks it. By hand only (workflow_dispatch on main),
+# in the env's deploy Environment, through `oa:hosted backfill-*` (the same
+# token, audit rows and prod guard as hosted-publish).
+#
+# dry_run defaults to true: it reads the installs' secret names and prints
+# counts per outcome, writes no secret and takes no lease. A real run on prod
+# needs `confirm` = "write prod". Idempotent: a rerun finds the key there and
+# changes nothing; an existing key or pair is never rotated.
+# The run log is PUBLIC: counts only, never an install id, slug, customer name
+# or key (the CLI refuses --detail in CI). Per-install detail: run the same
+# command on a laptop with --detail (docs/ops/hosted.md, "Hosted backfills").
+name: hosted-backfill
+run-name: hosted-backfill ${{ inputs.op }} ${{ inputs.env }}${{ inputs.dry_run && ' dry-run' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "Which backfill"
+        required: true
+        type: choice
+        options: [push-keys, optout-key]
+      env:
+        description: "Which env"
+        required: true
+        type: choice
+        options: [staging, prod]
+      dry_run:
+        description: "Count what would be written; write nothing"
+        required: true
+        default: true
+        type: boolean
+      confirm:
+        description: 'A real prod run only: type "write prod"'
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-backfill-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env == 'prod' && 'hosted-prod-deploy' || 'hosted-staging-deploy' }}
+    timeout-minutes: 30
+    steps:
+      - name: Runs only from main, and a real prod run is confirmed
+        env:
+          REF: ${{ github.ref }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "dispatch hosted-backfill on main"; exit 1; }
+          if [ "$DEPLOY_ENV" = prod ] && [ "$DRY_RUN" != true ] && [ "$CONFIRM" != "write prod" ]; then
+            echo 'a real prod run needs confirm = "write prod"; run the dry run first'
+            exit 1
+          fi
+      # main, overlaid on the public tree at PUBLIC_PIN.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @oa/provision build
+      - name: Load the hosted constants
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+        run: bash scripts/ci/hosted-constants.sh "$DEPLOY_ENV" .github/hosted
+      # Only this step sees the secret.
+      - name: Write the token file
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/hosted-backfill-secrets"
+          mkdir -m 700 "$dir"
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "CLOUDFLARE_API_TOKEN is not set in this Environment"; exit 1; }
+          printf '%s\n' "$CLOUDFLARE_API_TOKEN" > "$dir/token"
+      - name: Backfill
+        env:
+          OP: ${{ inputs.op }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          OA_HOSTED_TOKEN_FILE: ${{ runner.temp }}/hosted-backfill-secrets/token
+          OA_HOSTED_ENVIRONMENT: ${{ inputs.env == 'prod' && 'hosted-prod-deploy' || 'hosted-staging-deploy' }}
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$DRY_RUN" = true ] && flags+=(--dry-run)
+          case "$DEPLOY_ENV" in staging | prod) ;; *) echo "unknown env"; exit 1 ;; esac
+          case "$OP" in
+            push-keys) pnpm -s --filter @oa/hosted start backfill-push-keys --env "$DEPLOY_ENV" "${flags[@]}" ;;
+            optout-key) pnpm -s --filter @oa/hosted start backfill-optout-key --env "$DEPLOY_ENV" "${flags[@]}" ;;
+            *) echo "unknown op"; exit 1 ;;
+          esac
+      - name: Remove the token file
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/hosted-backfill-secrets"
+          rm -rf "$d"
+          test ! -e "$d"

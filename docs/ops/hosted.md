@@ -841,6 +841,19 @@ One hosted-wide list of addresses that asked not to get share email. Installs ch
 - **No operator removal route.** An operator removes a row by hand (`DELETE FROM email_optouts WHERE addr_hash = ?` on `PLATFORM_DB`, after computing h2 from the address's h1) with the requester's confirmation.
 - **Off switch.** `OPTOUT_LIST` (a platform var): `"1"` on, anything else is the plain 404 (gate routes and the page). `"1"` on staging, `"0"` on prod in `apps/provisioning/wrangler.jsonc`. The gate routes reuse the staging-only `LOGIN` binding, so no new deploy-order requirement.
 
+### Hosted backfills (push keys, opt-out key)
+
+Two one-time backfills put a secret on every active install of an env that lacks it: the browser push key pair (`VAPID_PRIVATE_KEY`, `VAPID_PUBLIC_KEY`, open-artifacts#2775) and `INSTALL_OPTOUT_KEY` (open-artifacts#2820). Create mints its own, so only installs made before need them. Each is idempotent: an install that holds the secret keeps it (never rotated), a rerun changes nothing, a lone private key (an interrupted run) is finished, a lone public key or an install that is not active is refused and counted. No key is ever printed.
+
+Run by hand: the `hosted-backfill` workflow (Actions > hosted-backfill > Run workflow, on main). Inputs: `op` (`push-keys` or `optout-key`), `env`, `dry_run` (default true), `confirm`. Steps, staging then prod:
+
+1. `op` X, `env` staging, `dry_run` true. Read the counts.
+2. Same with `dry_run` false. Rerun the dry run: `would_write` is 0.
+3. Prod, `dry_run` true, read the counts.
+4. Prod with `dry_run` false and `confirm` = `write prod`, on the user's go.
+
+The job runs in the env's deploy Environment through `pnpm -s --filter @oa/hosted start backfill-push-keys|backfill-optout-key --env <env> [--dry-run]` (same token and audit rows as the other CLI commands; each real write also adds `push_keys.backfill` or `optout_key.backfill` for its install). The run log is public, so it prints counts only: `installs`, `would_write`, `written`, `present`, `not_active`, `half_pair`, `failed`, `failed_total` (the exit code is 1 when `failed_total` is not 0). A dry run takes no lease and writes no secret; it adds only the CLI's own before and after audit rows. To see which installs, run the command on a laptop with `--detail` (refused in CI).
+
 ## Reading one Worker's logs as counts (`cf-logs.yml`)
 
 Answers "was this a platform failure?" without raw logs. By hand only, in the `cf-read` Environment, token `oa-x-ci-ro` (`gh:cf-read/CF_READ_TOKEN`, Workers Observability read).
