@@ -192,7 +192,7 @@ describe("migrations", () => {
         new RegExp(`ALTER TABLE seats ADD COLUMN ${c} INTEGER;`),
       );
     expect(sql).toMatch(
-      /ALTER TABLE seats ADD COLUMN jump_sent INTEGER NOT NULL DEFAULT 0;/,
+      /ALTER TABLE seats ADD COLUMN correction_pending INTEGER NOT NULL DEFAULT 0;/,
     );
   });
 

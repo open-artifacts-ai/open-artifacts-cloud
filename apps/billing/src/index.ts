@@ -406,7 +406,7 @@ const BODY_KEYS: Readonly<Record<string, readonly string[]>> = {
   "/portal": ["install", "ts"],
   "/trial/start": ["install", "ts"],
   "/usage": ["install", "ts", "month", "creators", "count"],
-  "/seats": ["install", "ts", "members"],
+  "/seats": ["install", "ts", "members", "jumpAck"],
 };
 /** Only a Stripe-hosted page is ever passed back. */
 const CHECKOUT_URL = /^https:\/\/checkout\.stripe\.com\//;
@@ -1699,19 +1699,25 @@ async function usage(
 const SEATS_SQL =
   "INSERT INTO seats (install_id, members, ts, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id) DO UPDATE SET members = excluded.members, ts = excluded.ts, updated_at = excluded.updated_at WHERE excluded.ts >= seats.ts RETURNING 1 AS ok";
 const SEATS_READ_SQL = "SELECT members, ts FROM seats WHERE install_id = ?1";
-// ?7/?8/?9: a jump billed by this apply (from, to, at), or null. A new jump
-// keeps the earliest unreported `from`, takes the latest `to` and restarts the
-// count of answers that carried it (jump_sent), #2940.
 const SEATS_APPLIED_SQL =
-  "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5, per_member = coalesce(?6, per_member), jump_from = CASE WHEN ?8 IS NULL THEN jump_from ELSE coalesce(jump_from, ?7) END, jump_to = coalesce(?8, jump_to), jump_at = coalesce(?9, jump_at), jump_sent = CASE WHEN ?8 IS NULL THEN jump_sent ELSE 0 END WHERE install_id = ?1 AND ts = ?2";
+  "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5, per_member = coalesce(?6, per_member), correction_pending = CASE WHEN ?5 IN ('updated', 'unchanged') THEN 0 ELSE correction_pending END WHERE install_id = ?1 AND ts = ?2";
+// A jump billed by an apply (#2588, #2940): its own statement, keyed on the
+// install only (a newer report moving `ts` during the Stripe call must not
+// lose it). A jump that is not yet acknowledged keeps its earliest `from`;
+// after an acknowledgement the row is clear, so the next one starts fresh.
+const SEATS_JUMP_SET_SQL =
+  "UPDATE seats SET jump_from = coalesce(jump_from, ?2), jump_to = ?3, jump_at = ?4 WHERE install_id = ?1";
 const SEATS_JUMP_READ_SQL =
-  "SELECT jump_from, jump_to, jump_at, jump_sent, applied_quantity FROM seats WHERE install_id = ?1";
-const SEATS_JUMP_SENT_SQL =
-  "UPDATE seats SET jump_sent = jump_sent + 1 WHERE install_id = ?1 AND jump_to IS NOT NULL";
-const SEATS_JUMP_CLEAR_SQL =
-  "UPDATE seats SET jump_from = NULL, jump_to = NULL, jump_at = NULL, jump_sent = 0 WHERE install_id = ?1 AND jump_sent >= ?2";
-/** An answer that carried a pending jump this many times has told the instance enough. */
-const JUMP_CARRIES = 2;
+  "SELECT jump_from, jump_to, jump_at, applied_quantity, correction_pending FROM seats WHERE install_id = ?1";
+// The instance echoed the `at` of the last jump it handled: cleared only on a match.
+const SEATS_JUMP_ACK_SQL =
+  "UPDATE seats SET jump_from = NULL, jump_to = NULL, jump_at = NULL WHERE install_id = ?1 AND jump_at = ?2";
+const SEATS_JUMP_EXPIRE_SQL =
+  "UPDATE seats SET jump_from = NULL, jump_to = NULL, jump_at = NULL WHERE install_id = ?1 AND jump_at = ?2";
+const SEATS_CORRECTION_SQL =
+  "UPDATE seats SET correction_pending = 1 WHERE install_id = ?1";
+/** A jump the instance never acknowledged is dropped after this long (logged). */
+const JUMP_UNACKED_MS = 7 * 86_400_000;
 const SEATS_TIER_SQL =
   "SELECT tier, status, stripe_subscription_id FROM tiers WHERE install_id = ?1";
 
@@ -1729,8 +1735,9 @@ const perMemberFrom = (env: Env): number | undefined => {
  * subscription (monthly or yearly) and answers the outcome string:
  * not_started (PER_MEMBER_FROM unset), legacy (the subscription predates
  * it), or what Stripe did. Every increase is applied at once, a big jump
- * included (#2588): it is also reported (`jump`) and logged
- * (billing_seats_jump) so the owner and we are told. A Stripe failure the install should retry (network, 5xx, 401,
+ * included (#2588): it is kept on the row and carried by every /seats answer
+ * until the instance acknowledges it (`jumpAck`), and logged
+ * (billing_seats_jump), so the owner and we are told. A Stripe failure the install should retry (network, 5xx, 401,
  * 403, 409, 429, config) is the refusal; any other failure is recorded as
  * failed. No subscription (trial, solo, free): stored only.
  */
@@ -1749,21 +1756,10 @@ async function applySeats(
     o: string,
     applied: number | null = null,
     perMember: number | null = null,
-    jump: { from: number; to: number } | null = null,
   ) => {
     await db
       .prepare(SEATS_APPLIED_SQL)
-      .bind(
-        install,
-        ts,
-        applied,
-        now,
-        o,
-        perMember,
-        jump?.from ?? null,
-        jump?.to ?? null,
-        jump ? now : null,
-      )
+      .bind(install, ts, applied, now, o, perMember)
       .run();
     console.log("billing seats", o, install);
     return { outcome: o };
@@ -1789,12 +1785,14 @@ async function applySeats(
   // What the row last recorded as applied: if a Stripe write went through and
   // the row write after it failed, the resend sees `unchanged` and this is how
   // the jump is found again (#2940).
-  const recorded = (
-    await db
-      .prepare(SEATS_JUMP_READ_SQL)
-      .bind(install)
-      .first<{ applied_quantity: number | null }>()
-  )?.applied_quantity;
+  const before = await db.prepare(SEATS_JUMP_READ_SQL).bind(install).first<{
+    applied_quantity: number | null;
+    correction_pending: number | null;
+  }>();
+  const recorded = before?.applied_quantity;
+  // A checkout's correction, until an apply lands, is not a jump: what Stripe
+  // held before it is the checkout's count, not a "from".
+  const canJump = recordJump && before?.correction_pending !== 1;
   try {
     const r = await stripe(install, () =>
       setSeatQuantity(
@@ -1815,20 +1813,28 @@ async function applySeats(
       // statement as the outcome) until /seats answers have carried it, so a
       // lost response, a refusal or a cron apply cannot drop the owner's
       // notice. A checkout correction is never a jump.
-      let jump = recordJump ? (r.jump ?? null) : null;
+      let jump = canJump ? (r.jump ?? null) : null;
       if (
         !jump &&
-        recordJump &&
+        canJump &&
         r.outcome === "unchanged" &&
         typeof recorded === "number" &&
         recorded !== quantity &&
         quantity > seatJumpLimit(recorded)
       )
         jump = { from: recorded, to: quantity };
-      const out = await done(r.outcome, quantity, 1, jump);
-      // A fixed line for operators, the install id only (never the counts).
-      if (jump) console.log("billing_seats_jump", install);
-      return out;
+      // Written first and on the install alone: a newer report moving `ts`
+      // during the Stripe call must not lose it, and a failing outcome write
+      // after it is found again by the resend (`recorded` above).
+      if (jump) {
+        await db
+          .prepare(SEATS_JUMP_SET_SQL)
+          .bind(install, jump.from, jump.to, now)
+          .run();
+        // A fixed line for operators, the install id only (never the counts).
+        console.log("billing_seats_jump", install);
+      }
+      return done(r.outcome, quantity, 1);
     }
     return done(
       r.outcome,
@@ -1839,7 +1845,7 @@ async function applySeats(
     if (!(e instanceof StripeFailure)) throw e;
     await db
       .prepare(SEATS_APPLIED_SQL)
-      .bind(install, ts, null, now, "failed", null, null, null, null)
+      .bind(install, ts, null, now, "failed", null)
       .run();
     console.error("billing seats failed", install);
     return { outcome: "failed", refused: usageRefusal(e) ?? undefined };
@@ -1864,6 +1870,14 @@ async function seats(
     (members as number) > MAX_CREATORS
   )
     return bad("bad_members");
+  // The instance echoes the `at` of the last jump it handled: that jump is
+  // cleared (a different or newer one stays), before anything else changes.
+  const { jumpAck } = body as { jumpAck?: unknown };
+  if (jumpAck !== undefined) {
+    if (!Number.isSafeInteger(jumpAck) || (jumpAck as number) <= 0)
+      return bad("bad_jump_ack");
+    await db.prepare(SEATS_JUMP_ACK_SQL).bind(install, jumpAck).run();
+  }
   const written = await db
     .prepare(SEATS_SQL)
     .bind(install, members, ts, now)
@@ -1879,7 +1893,7 @@ async function seats(
       members: kept?.members ?? members,
       applied: "stale",
       retry: false,
-      ...(await pendingJump(db, install, true)),
+      ...(await pendingJump(db, install, now)),
     });
   }
   console.log("billing seats", install);
@@ -1896,25 +1910,25 @@ async function seats(
     r = await applySeats(env, install, cur.members, cur.ts, now);
   }
   if (r.refused)
-    return withJump(r.refused, await pendingJump(db, install, false));
+    return withJump(r.refused, await pendingJump(db, install, now));
   return Response.json({
     members: cur.members,
     applied: r.outcome,
     retry: SEATS_RETRY.has(r.outcome),
-    ...(await pendingJump(db, install, true)),
+    ...(await pendingJump(db, install, now)),
   });
 }
 
 /**
- * The jump kept on the install's row, as `{ jump }` (or nothing). `count`:
- * this answer will be delivered, so it counts toward JUMP_CARRIES and the jump
- * is cleared after the second one (a lost first answer is covered by the next
- * call's). A refusal carries it without counting (#2940).
+ * The jump kept on the install's row, as `{ jump }` (or nothing): carried by
+ * every /seats answer, a refusal's too, until the instance acknowledges its
+ * `at` (jumpAck). One never acknowledged is dropped after JUMP_UNACKED_MS, with
+ * a log line (#2940).
  */
 async function pendingJump(
   db: D1Database,
   install: string,
-  count: boolean,
+  now: number,
 ): Promise<{ jump?: { from: number; to: number; at: number } }> {
   try {
     const j = await db.prepare(SEATS_JUMP_READ_SQL).bind(install).first<{
@@ -1924,11 +1938,12 @@ async function pendingJump(
     }>();
     if (j?.jump_from == null || j.jump_to == null || j.jump_at == null)
       return {};
-    if (count) {
-      await db.prepare(SEATS_JUMP_SENT_SQL).bind(install).run();
-      await db.prepare(SEATS_JUMP_CLEAR_SQL).bind(install, JUMP_CARRIES).run();
+    if (now - j.jump_at > JUMP_UNACKED_MS) {
+      await db.prepare(SEATS_JUMP_EXPIRE_SQL).bind(install, j.jump_at).run();
+      console.log("billing_seats_jump_unacked", install);
+      return {};
     }
-    // `at` (ms) names the jump: the instance keys its email on it, so a redelivery is never a second email.
+    // `at` names the jump: the instance keys its email on it and echoes it back.
     return { jump: { from: j.jump_from, to: j.jump_to, at: j.jump_at } };
   } catch {
     return {};
@@ -1994,8 +2009,13 @@ async function applySeatsOnCheckout(
   const r = await env.BILLING_DB.prepare(SEATS_CUSTOMER_SQL)
     .bind(customer)
     .first<{ install_id: string; members: number; ts: number }>();
-  // A correction to what checkout priced: never a jump (#2940).
-  if (r) await applySeats(env, r.install_id, r.members, r.ts, now, false);
+  // A correction to what checkout priced: never a jump (#2940). It is marked
+  // on the row until an apply lands, so a failed attempt retried later by the
+  // cron or /seats is not one either.
+  if (r) {
+    await env.BILLING_DB.prepare(SEATS_CORRECTION_SQL).bind(r.install_id).run();
+    await applySeats(env, r.install_id, r.members, r.ts, now, false);
+  }
 }
 
 /** Closed months the daily cron re-tries per run (oldest last try first). */
