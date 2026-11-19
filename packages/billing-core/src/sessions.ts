@@ -634,11 +634,7 @@ export type SeatOutcome =
   /** Not one item at the tier's monthly or yearly price: left alone. */
   | "unknown_price"
   /** Created before perMemberFrom: it keeps the old counting, nothing written. */
-  | "legacy"
-  /** An increase past max(current + 10, 2 x current): not applied. */
-  | "held"
-  /** An increase while a yearly seat invoice is unpaid: not applied. */
-  | "unpaid_hold";
+  | "legacy";
 
 export interface SeatInput {
   subscriptionId: string;
@@ -651,11 +647,13 @@ export interface SeatInput {
   idempotencyKey: string;
   /** ms: a subscription created before this is "legacy" and left alone. */
   perMemberFrom?: number;
-  /** Refuse any increase (a yearly seat invoice is unpaid). */
-  blockIncrease?: boolean;
 }
 
-/** An increase past this is held for a person to look at (#2580). */
+/**
+ * An increase past this is a jump (#2588): billed at once like any increase
+ * (prorated, on the normal true-up), and the owner and operators are told.
+ * Nothing is held back.
+ */
 export const seatJumpLimit = (current: number): number =>
   Math.max(current + 10, 2 * current);
 
@@ -712,6 +710,8 @@ export async function setSeatQuantity(
   proration?: Proration;
   /** The subscription's creation time (ms), when Stripe gave one. */
   created?: number;
+  /** Set on a jump (#2588): the quantity before and after. The increase was applied. */
+  jump?: { from: number; to: number };
 }> {
   const id = check(SUBSCRIPTION, "subscriptionId", input.subscriptionId);
   const quantity = input.quantity;
@@ -776,10 +776,6 @@ export async function setSeatQuantity(
   )
     return { outcome: "legacy", ...seen };
   if (previous === quantity) return { outcome: "unchanged", ...seen };
-  if (previous !== undefined && quantity > previous) {
-    if (input.blockIncrease) return { outcome: "unpaid_hold", ...seen };
-    if (quantity > seatJumpLimit(previous)) return { outcome: "held", ...seen };
-  }
   const proration = seatProration(interval, previous ?? 0, quantity);
   await post(
     cfg,
@@ -787,7 +783,14 @@ export async function setSeatQuantity(
     { quantity: String(quantity), proration_behavior: proration },
     input.idempotencyKey,
   );
-  return { outcome: "updated", proration, ...seen };
+  return {
+    outcome: "updated",
+    proration,
+    ...seen,
+    ...(previous !== undefined && quantity > seatJumpLimit(previous)
+      ? { jump: { from: previous, to: quantity } }
+      : {}),
+  };
 }
 
 /**

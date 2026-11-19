@@ -1697,8 +1697,7 @@ async function usage(
 
 const SEATS_SQL =
   "INSERT INTO seats (install_id, members, ts, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (install_id) DO UPDATE SET members = excluded.members, ts = excluded.ts, updated_at = excluded.updated_at WHERE excluded.ts >= seats.ts RETURNING 1 AS ok";
-const SEATS_READ_SQL =
-  "SELECT members, ts, seat_failed_at, seat_paid_at FROM seats WHERE install_id = ?1";
+const SEATS_READ_SQL = "SELECT members, ts FROM seats WHERE install_id = ?1";
 const SEATS_APPLIED_SQL =
   "UPDATE seats SET applied_quantity = coalesce(?3, applied_quantity), applied_at = ?4, apply_outcome = ?5, per_member = coalesce(?6, per_member) WHERE install_id = ?1 AND ts = ?2";
 const SEATS_TIER_SQL =
@@ -1717,8 +1716,9 @@ const perMemberFrom = (env: Env): number | undefined => {
  * Writes the stored member count to the install's Team or Business
  * subscription (monthly or yearly) and answers the outcome string:
  * not_started (PER_MEMBER_FROM unset), legacy (the subscription predates
- * it), held (a jump past max(current + 10, 2 x current)), unpaid_hold (an
- * increase while a seat invoice is unpaid), or what Stripe did. A Stripe failure the install should retry (network, 5xx, 401,
+ * it), or what Stripe did. Every increase is applied at once, a big jump
+ * included (#2588): it is also reported (`jump`) and logged
+ * (billing_seats_jump) so the owner and we are told. A Stripe failure the install should retry (network, 5xx, 401,
  * 403, 409, 429, config) is the refusal; any other failure is recorded as
  * failed. No subscription (trial, solo, free): stored only.
  */
@@ -1728,7 +1728,11 @@ async function applySeats(
   members: number,
   ts: number,
   now: number,
-): Promise<{ outcome: string; refused?: Response }> {
+): Promise<{
+  outcome: string;
+  refused?: Response;
+  jump?: { from: number; to: number };
+}> {
   const db = env.BILLING_DB;
   const quantity = Math.max(1, members);
   const done = async (
@@ -1761,13 +1765,6 @@ async function applySeats(
     row.tier === "team"
       ? env.STRIPE_PRICE_TEAM_YEARLY
       : env.STRIPE_PRICE_BUSINESS_YEARLY;
-  const state = await db.prepare(SEATS_READ_SQL).bind(install).first<{
-    seat_failed_at: number | null;
-    seat_paid_at: number | null;
-  }>();
-  const unpaid =
-    state?.seat_failed_at != null &&
-    state.seat_failed_at > (state.seat_paid_at ?? 0);
   try {
     const r = await stripe(install, () =>
       setSeatQuantity(
@@ -1778,15 +1775,18 @@ async function applySeats(
           yearlyPriceIds: yearly ? [yearly] : [],
           idempotencyKey: `seats-${install}-${ts}-${quantity}`,
           perMemberFrom: from,
-          blockIncrease: unpaid,
         },
         stripeConfig(env),
       ),
     );
     if (r.outcome === "legacy") return done("legacy", null, 0);
-    if (r.outcome === "held") console.log("billing_seats_held", install);
-    if (r.outcome === "updated" || r.outcome === "unchanged")
-      return done(r.outcome, quantity, 1);
+    if (r.outcome === "updated" || r.outcome === "unchanged") {
+      const out = await done(r.outcome, quantity, 1);
+      // #2588: a big jump was billed at once; tell operators (a fixed line, the
+      // install id only, never the counts) and report it so the owner is told.
+      if (r.jump) console.log("billing_seats_jump", install);
+      return r.jump ? { ...out, jump: r.jump } : out;
+    }
     return done(
       r.outcome,
       null,
@@ -1804,7 +1804,7 @@ async function applySeats(
 }
 
 /** Outcomes after which the instance should resend soon (#2580). */
-const SEATS_RETRY = new Set(["held", "failed"]);
+const SEATS_RETRY = new Set(["failed"]);
 
 async function seats(
   env: Env,
@@ -1841,6 +1841,7 @@ async function seats(
   console.log("billing seats", install);
   let cur = { members: members as number, ts };
   let r = await applySeats(env, install, cur.members, cur.ts, now);
+  let jump = r.jump;
   // A newer report landed while the Stripe call ran: apply it too.
   for (let i = 0; i < 3 && !r.refused; i++) {
     const latest = await db
@@ -1850,17 +1851,20 @@ async function seats(
     if (!latest || latest.ts === cur.ts) break;
     cur = latest;
     r = await applySeats(env, install, cur.members, cur.ts, now);
+    if (r.jump) jump = { from: jump?.from ?? r.jump.from, to: r.jump.to };
   }
   if (r.refused) return r.refused;
   return Response.json({
     members: cur.members,
     applied: r.outcome,
     retry: SEATS_RETRY.has(r.outcome),
+    // #2588: set only when this report was a jump that was billed at once.
+    ...(jump ? { jump } : {}),
   });
 }
 
 const SEATS_BACKLOG_SQL =
-  "SELECT s.install_id, s.members, s.ts FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.tier IN ('team', 'business') AND t.status IN ('active', 'past_due') AND t.stripe_subscription_id IS NOT NULL AND coalesce(s.apply_outcome, '') NOT IN ('legacy', 'held') AND (coalesce(s.applied_quantity, 0) != max(1, s.members) OR s.apply_outcome = 'failed') ORDER BY s.updated_at, s.install_id LIMIT ?1";
+  "SELECT s.install_id, s.members, s.ts FROM seats s JOIN tiers t ON t.install_id = s.install_id WHERE t.tier IN ('team', 'business') AND t.status IN ('active', 'past_due') AND t.stripe_subscription_id IS NOT NULL AND coalesce(s.apply_outcome, '') != 'legacy' AND (coalesce(s.applied_quantity, 0) != max(1, s.members) OR s.apply_outcome = 'failed') ORDER BY s.updated_at, s.install_id LIMIT ?1";
 
 /**
  * The daily seats work: every install whose stored count differs from what
