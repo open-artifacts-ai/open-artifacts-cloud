@@ -7,6 +7,7 @@
 // makes GitHub refuse). Needs GH_TOKEN; `arm` runs with the release App's token.
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { type Exec, type ExecResult, gh } from "./gh-retry.ts";
 import {
   BRANCH_PREFIX,
   compareTags,
@@ -344,17 +345,8 @@ export function gateRefusal(g: Gate): string | undefined {
   return undefined;
 }
 
-export type ExecResult = { code: number; stdout: string; stderr: string };
-export type Exec = (cmd: string, args: string[]) => ExecResult;
+export type { Exec, ExecResult };
 
-function gh(exec: Exec, args: string[]): string {
-  const r = exec("gh", args);
-  if (r.code !== 0)
-    throw new Error(
-      `gh ${args.slice(0, 2).join(" ")}: ${r.stderr.trim() || `exit ${r.code}`}`,
-    );
-  return r.stdout;
-}
 const raw = (exec: Exec, repo: string, path: string, ref: string) =>
   gh(exec, [
     "api",
@@ -701,14 +693,18 @@ export function run(o: {
         if (!hasQueueNotice(o.exec, o.repo, p.number, input.headOid)) {
           write = true;
           if (o.mode === "arm") {
-            gh(o.exec, [
-              "api",
-              "-X",
-              "POST",
-              `repos/${o.repo}/issues/${p.number}/comments`,
-              "-f",
-              `body=${queueNotice(input, o.repo)}`,
-            ]);
+            gh(
+              o.exec,
+              [
+                "api",
+                "-X",
+                "POST",
+                `repos/${o.repo}/issues/${p.number}/comments`,
+                "-f",
+                `body=${queueNotice(input, o.repo)}`,
+              ],
+              { write: true },
+            );
             noticed.push(p.number);
             o.log(`#${p.number}: commented that its merge queue run failed`);
           }
@@ -735,17 +731,21 @@ export function run(o: {
       }
       write = true;
       if (o.mode === "arm") {
-        gh(o.exec, [
-          "pr",
-          "merge",
-          String(p.number),
-          "--auto",
-          "--squash",
-          "--match-head-commit",
-          input.headOid,
-          "--repo",
-          o.repo,
-        ]);
+        gh(
+          o.exec,
+          [
+            "pr",
+            "merge",
+            String(p.number),
+            "--auto",
+            "--squash",
+            "--match-head-commit",
+            input.headOid,
+            "--repo",
+            o.repo,
+          ],
+          { write: true },
+        );
         armed.push(p.number);
       }
       continue;
@@ -760,14 +760,11 @@ export function run(o: {
     if (again.arm) continue;
     write = true;
     if (o.mode === "arm") {
-      gh(o.exec, [
-        "pr",
-        "merge",
-        String(p.number),
-        "--disable-auto",
-        "--repo",
-        o.repo,
-      ]);
+      gh(
+        o.exec,
+        ["pr", "merge", String(p.number), "--disable-auto", "--repo", o.repo],
+        { write: true },
+      );
       disarmed.push(p.number);
       o.log(`#${p.number}: disabled auto-merge: ${again.why}`);
     }
