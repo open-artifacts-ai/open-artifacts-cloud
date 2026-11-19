@@ -745,6 +745,14 @@ describe("deploy-hosted-platform.sh", () => {
     expect(r.err).toContain("list oa-p-auth-broker secrets failed");
     clean(r);
   });
+  it("provisioner: a failed secrets listing fails the read-back instead of passing on an empty read", () => {
+    const r = setup({
+      exists: ["oa-p-billing", "oa-p-provisioner"],
+      failSecrets: true,
+    }).run("provisioner");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("list oa-p-provisioner secrets failed");
+  });
   it("a deployed binding that doesn't match fails the run", () => {
     const bad = NEXT["oa-p-auth-broker"]?.replace(
       REG,

@@ -534,7 +534,8 @@ case "$target" in
     # secret put, never by a deploy; present or absent is clean.
     got="$(jq -r '[.result.bindings[] | select(.type == "secret_text" and .name != "POSTHOG_KEY") | .name] | join(",")' <<< "$S")"
     [ "$got" = "$PROVISIONER_SECRET" ] || { echo "oa-$P-provisioner has secret bindings ($got); want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
-    names="$(secret_names oa-$P-provisioner | grep -vx POSTHOG_KEY | tr '\n' ' ')" || names=""
+    raw="$(secret_names oa-$P-provisioner)"
+    names="$(grep -vxe POSTHOG_KEY -e '' <<< "$raw" | tr '\n' ' ' || true)"
     [ "$names" = "${PROVISIONER_SECRET:+$PROVISIONER_SECRET }" ] || { echo "oa-$P-provisioner has secrets '$names'; want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
     ;;
   provisioning)
