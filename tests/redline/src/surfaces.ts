@@ -409,6 +409,9 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "owner-only (the bus version the instance names): no admin success leg",
   "POST /api/v1/bus/machines/:id/install-now":
     "interactive-only: a hook-minted session is 404 here like a PAT, and no bus machine can be made on a hosted install; A at B is deny-only",
+  // #2819: the owner's pause switch, a cookie session only.
+  "PUT /api/v1/bus/updates-paused":
+    "owner-only (the bus pause switch): no admin success leg",
   // v0.213.0: saving prefs, mutes and Later (#2512, #2762), and changing a
   // browser push subscription (#2512 S5): the handlers refuse anything but a
   // browser session.
@@ -593,6 +596,8 @@ const AGENT_LISTENS: Citation = {
   test: "a token or an agent can neither read nor change the list",
 };
 const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
+/** #2819: the owner's pause switch. */
+const PAUSE_TESTS = "apps/server/test/bus/updates.follow.2552.test.ts";
 const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
 const ERASE_AUTHZ = "POST R.memberErase(id): authorization";
 const SHARE_NOTICE_TESTS = "apps/server/test/follows.test.ts";
@@ -1079,6 +1084,17 @@ export const DROPPED: Readonly<
         describe:
           "POST R.busMachineInstallNow: the machine's own member (#2552)",
         test: "another member's machine, an unknown id, a PAT or anonymous: nothing sent",
+      },
+    ],
+  },
+  "org PUT /api/v1/bus/updates-paused": {
+    why: "owner-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: PAUSE_TESTS,
+        describe: "pause (#2552)",
+        test: "PUT R.busUpdatesPaused: the owner only, in a cookie session, audited",
       },
     ],
   },

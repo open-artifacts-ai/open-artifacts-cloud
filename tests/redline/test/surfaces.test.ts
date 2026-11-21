@@ -288,6 +288,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
       "POST /api/v1/artifacts/:id/comments",
       "POST /api/v1/artifacts/:id/comments/:threadId/replies",
       "GET /api/v1/artifacts/:id/pictures/:pictureId",
+      // #2819: the machines read is a token's too; only the owner's own pause
+      // state in it needs a browser session.
+      "GET /api/v1/bus/machines",
     ];
     const found = scanned.filter(
       (r) => !ANSWER_ROUTES.includes(r) && !PARTIAL_ROUTES.includes(r),
@@ -312,6 +315,8 @@ describe("probe cases (derived from Backend's surfaces)", () => {
       "POST /api/v1/directory/disconnect",
       // #2552: the version the instance names, owner only, cookie session only.
       "PUT /api/v1/bus/run-version",
+      // #2819: the pause switch, the same.
+      "PUT /api/v1/bus/updates-paused",
     ]);
     expect([...INTERACTIVE_ONLY].sort()).toEqual(
       found.filter((r) => !ownerOnly.includes(r)),
