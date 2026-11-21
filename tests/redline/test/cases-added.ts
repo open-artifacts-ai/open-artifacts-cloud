@@ -205,6 +205,8 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
     },
     // regen:begin (scripts/redline-regen.ts writes this block; do not edit it by hand)
     ...[
+      "artifact ask slots [session]",
+      "artifact ask slots [pat]",
       "org GET /api/v1/me/teammates [session]",
       "org POST /api/v1/me/onboarding/listens-asked [session]",
       "org POST /api/v1/me/agent-listens [session]",
