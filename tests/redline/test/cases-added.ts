@@ -209,6 +209,7 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       "artifact ask slots [pat]",
       "org GET /api/v1/me/teammates [session]",
       "org POST /api/v1/me/onboarding/listens-asked [session]",
+      "artifact mcp get_comment_picture [pat]",
       "org POST /api/v1/me/agent-listens [session]",
       "org GET /api/v1/me/agent-asks/history [session]",
     ].map((n) => ({
