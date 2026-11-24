@@ -13,6 +13,9 @@
       "migrations_dir": "<root>/apps/server/migrations"
     }
   ],
+  "images": {
+    "binding": "IMAGES"
+  },
   "r2_buckets": [
     {
       "binding": "FILES",
