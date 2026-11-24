@@ -37,11 +37,23 @@ jobs:
       - name: Workers do not hardcode settings the hosted env files own
         run: node --experimental-strip-types --no-warnings scripts/ci/check-hosted-owned-vars.ts
 
-  overlay:
+  # The overlay's tests in three parallel shards (cloud #264: one job took 13
+  # min, most of a pin bump's queue run). Every shard runs the same prelude
+  # (pin checks, equivalence, install, build), then its own part: a and b split
+  # the private packages (shard-plan below, b also typechecks), c runs the
+  # root-vitest tests and the private tests inside public packages. The
+  # required check is the `overlay` job after it.
+  overlay-shard:
+    name: overlay (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c]
     env:
       # Real-build tests fail instead of skipping when the build is missing.
       OA_REQUIRE_REAL_BUILD: "1"
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -224,6 +236,26 @@ jobs:
           private/scripts/ci-plan.sh public private "$PLAN"
           echo "count=$(grep -c '' "$PLAN/packages.txt" || true)" >> "$GITHUB_OUTPUT"
           echo "dir=$PLAN" >> "$GITHUB_OUTPUT"
+      # Shard a takes the slowest packages, b the rest, c none. A name in A
+      # that the plan doesn't hold fails, so a rename can't drop a package
+      # from every shard; b is the plan minus A, so a new package lands in b.
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' }}
+        name: this shard's packages
+        env:
+          PLAN: ${{ steps.pkgs.outputs.dir }}
+        run: |
+          set -euo pipefail
+          A=(apps/provisioning packages/provision tests/redline)
+          for d in "${A[@]}"; do
+            grep -qxF "$d" "$PLAN/packages.txt" || { echo "::error::shard a names $d, which the plan does not hold"; exit 1; }
+          done
+          case "$SHARD" in
+            a) printf '%s\n' "${A[@]}" > "$PLAN/shard.txt" ;;
+            b) grep -vxF -f <(printf '%s\n' "${A[@]}") "$PLAN/packages.txt" > "$PLAN/shard.txt" || true ;;
+            c) : > "$PLAN/shard.txt" ;;
+            *) echo "::error::unknown shard '$SHARD'"; exit 1 ;;
+          esac
+          echo "shard $SHARD packages:"; cat "$PLAN/shard.txt"
       - name: no private packages yet
         if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count == '0' }}
         run: |
@@ -250,7 +282,7 @@ jobs:
       # Each private package must define typecheck and test (ci-plan checks);
       # run them one by one, without --if-present, so each one visibly runs.
       - name: typecheck
-        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' && matrix.shard == 'b' }}
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
@@ -274,8 +306,8 @@ jobs:
             pnpm --filter "./$d" run test
             echo "::endgroup::"
             echo "test ran: $d"
-          done < "$PLAN/packages.txt"
-      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+          done < "$PLAN/shard.txt"
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && matrix.shard == 'c' }}
         name: test (private scripts/ci, scripts/ops and scripts/audit)
         working-directory: public
         env:
@@ -285,12 +317,27 @@ jobs:
           mapfile -t t < "$PLAN/root-tests.txt"
           if [ "${#t[@]}" -eq 0 ]; then echo "no private root-vitest tests"; exit 0; fi
           pnpm exec vitest run "${t[@]}"
-      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && matrix.shard == 'c' }}
         name: test (private tests inside public packages)
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
         run: ../private/scripts/ci-public-tests.sh . "$PLAN"
+
+  # The required check: green only when every shard succeeded. always() so it
+  # runs, and reports red, when a shard fails or is cancelled: a skipped job
+  # would count as passing.
+  overlay:
+    needs: [overlay-shard]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: every overlay shard succeeded
+        env:
+          RESULT: ${{ needs.overlay-shard.result }}
+        run: |
+          [ "$RESULT" = success ] || { echo "::error::overlay shards: $RESULT"; exit 1; }
+          echo "every overlay shard succeeded"
 
   # The overlay prelude the hosted workflows use (.github/actions/overlay),
   # run for real: this repo at _cloud, then the action. Proves the tree lands
