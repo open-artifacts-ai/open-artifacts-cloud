@@ -35,7 +35,11 @@ const ci: any = parse(src);
 type Step = Record<string, any>;
 const GATE = "steps.ro.outputs.pin_only != 'true'";
 /** The jobs that carry a required check, with the checkout dir their ro step reads. */
-const GATED = { overlay: "private", lint: "_cloud", e2e: "_cloud" } as const;
+const GATED = {
+  "overlay-shard": "private",
+  lint: "_cloud",
+  e2e: "_cloud",
+} as const;
 /** Overlay steps that stay on the PR: cheap checks of the pin files themselves. */
 const STAYS = ["pin", "synced"];
 
@@ -63,10 +67,60 @@ describe("ci.yml pin-only gating", () => {
     expect(ci.jobs.e2e.name).toBeUndefined();
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     for (const [name, job] of Object.entries(ci.jobs))
-      expect(
-        (job as any).if,
-        `${name} must not have a job-level if`,
-      ).toBeUndefined();
+      if (name !== "overlay")
+        expect(
+          (job as any).if,
+          `${name} must not have a job-level if`,
+        ).toBeUndefined();
+  });
+  it("overlay is the shards' gate: it always runs and is green only when every shard is", () => {
+    const o = ci.jobs.overlay;
+    expect(o.needs).toEqual(["overlay-shard"]);
+    // always(): a skipped job would count as passing the required check.
+    expect(o.if).toBe("${{ always() }}");
+    expect(o.steps).toHaveLength(1);
+    expect(o.steps[0].env.RESULT).toBe("${{ needs.overlay-shard.result }}");
+    expect(o.steps[0].run).toContain('[ "$RESULT" = success ] ||');
+    expect(o.steps[0].run).toContain("exit 1");
+    const sh = ci.jobs["overlay-shard"];
+    expect(sh.strategy.matrix.shard).toEqual(["a", "b", "c"]);
+    expect(sh.strategy["fail-fast"]).toBe(false);
+  });
+  it("every private package is tested in exactly one shard", () => {
+    const step = steps("overlay-shard").find(
+      (x) => x.name === "this shard's packages",
+    );
+    const plan = mkdtempSync(join(tmpdir(), "shard-"));
+    const pkgs = [
+      "apps/admin",
+      "apps/provisioning",
+      "apps/scheduler",
+      "packages/provision",
+      "tests/redline",
+    ];
+    writeFileSync(join(plan, "packages.txt"), `${pkgs.join("\n")}\n`);
+    const got: string[] = [];
+    for (const shard of ["a", "b", "c"]) {
+      const r = spawnSync("bash", ["-c", step?.run], {
+        env: { ...process.env, PLAN: plan, SHARD: shard },
+        encoding: "utf8",
+      });
+      expect(r.status, r.stderr).toBe(0);
+      got.push(
+        ...readFileSync(join(plan, "shard.txt"), "utf8")
+          .split("\n")
+          .filter(Boolean),
+      );
+    }
+    expect(got.sort()).toEqual([...pkgs].sort());
+    // A shard-a name the plan lacks fails rather than dropping it.
+    writeFileSync(join(plan, "packages.txt"), "apps/admin\n");
+    const r = spawnSync("bash", ["-c", step?.run], {
+      env: { ...process.env, PLAN: plan, SHARD: "b" },
+      encoding: "utf8",
+    });
+    expect(r.status).not.toBe(0);
+    rmSync(plan, { recursive: true, force: true });
   });
   for (const [job, dir] of Object.entries(GATED)) {
     describe(job, () => {
@@ -133,7 +187,7 @@ describe("ci.yml pin-only gating", () => {
         for (const x of s.slice(from)) {
           const label = x.name ?? x.uses ?? x.run ?? x.id;
           if (STAYS.includes(x.id)) {
-            expect(job, label).toBe("overlay");
+            expect(job, label).toBe("overlay-shard");
             expect(x.if, label).toBeUndefined();
             continue;
           }
@@ -147,18 +201,18 @@ describe("ci.yml pin-only gating", () => {
     });
   }
   it("keeps the pin read and SYNCED_FROM read on the PR, ahead of every gated step", () => {
-    const ids = steps("overlay").map((x) => x.id);
+    const ids = steps("overlay-shard").map((x) => x.id);
     expect(ids.indexOf("pin")).toBeGreaterThan(ids.indexOf("ro"));
     expect(ids.indexOf("synced")).toBeGreaterThan(ids.indexOf("pin"));
-    expect(steps("overlay").find((x) => x.id === "pin")?.run).toContain(
+    expect(steps("overlay-shard").find((x) => x.id === "pin")?.run).toContain(
       "is not vX.Y.Z",
     );
   });
   it("runs the three decision steps identically", () => {
     const text = (j: string) =>
       JSON.stringify({ ...roOf(j), "working-directory": 0 });
-    expect(text("lint")).toBe(text("overlay"));
-    expect(text("e2e")).toBe(text("overlay"));
+    expect(text("lint")).toBe(text("overlay-shard"));
+    expect(text("e2e")).toBe(text("overlay-shard"));
   });
   it("leaves the scripts and overlay-action jobs alone", () => {
     for (const j of ["scripts", "overlay-action"]) {
@@ -228,7 +282,7 @@ describe("the decision step, run as written", () => {
   ) => {
     const out = join(dir, "..", `out-${Math.random()}`);
     writeFileSync(out, "");
-    const r = spawnSync("bash", ["-c", roOf("overlay").run], {
+    const r = spawnSync("bash", ["-c", roOf("overlay-shard").run], {
       cwd: dir,
       encoding: "utf8",
       env: {
