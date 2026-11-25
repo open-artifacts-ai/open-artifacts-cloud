@@ -744,7 +744,9 @@ export function run(o: {
             "--repo",
             o.repo,
           ],
-          { write: true },
+          // Pinned to the head sha: a repeat after a 5xx enables the same
+          // auto-merge again, or is refused if the head moved.
+          { write: true, idempotent: true },
         );
         armed.push(p.number);
       }
@@ -763,7 +765,7 @@ export function run(o: {
       gh(
         o.exec,
         ["pr", "merge", String(p.number), "--disable-auto", "--repo", o.repo],
-        { write: true },
+        { write: true, idempotent: true },
       );
       disarmed.push(p.number);
       o.log(`#${p.number}: disabled auto-merge: ${again.why}`);
