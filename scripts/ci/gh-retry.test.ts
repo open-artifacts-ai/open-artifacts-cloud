@@ -40,6 +40,23 @@ describe("gh retry", () => {
     expect(s.calls()).toBe(1);
   });
 
+  it("GraphQL's 502 wording is transient too (pin-bump-arm, 11-25)", () => {
+    const s = script([
+      fail('non-200 OK status code: 502 Bad Gateway body: "<html>502</html>"'),
+      ok("fine"),
+    ]);
+    expect(gh(s.exec, ["pr", "view", "1"])).toBe("fine");
+    expect(s.calls()).toBe(2);
+  });
+
+  it("an idempotent write retries like a read", () => {
+    const s = script([fail("gh: Server Error (HTTP 502)"), ok("armed")]);
+    expect(
+      gh(s.exec, ["pr", "merge", "1"], { write: true, idempotent: true }),
+    ).toBe("armed");
+    expect(s.calls()).toBe(2);
+  });
+
   it("a write is not retried", () => {
     const s = script([fail("gh: Server Error (HTTP 502)"), ok("no")]);
     expect(() => gh(s.exec, ["pr", "create"], { write: true })).toThrow(/502/);
