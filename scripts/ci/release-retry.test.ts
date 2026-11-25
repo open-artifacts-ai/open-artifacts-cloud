@@ -1,4 +1,4 @@
-// cloud #264: a failed release-chain run is rerun whole, at most twice, on its own.
+// cloud #264: a failed release-chain run has its failed jobs rerun, at most twice, one layer only.
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,14 +55,65 @@ describe("release-retry", () => {
       "github.event.workflow_run.head_branch == 'main'",
       "!contains(github.event.workflow_run.display_title, '(dry run)')",
       "github.event.workflow_run.event != 'workflow_dispatch'",
-      "contains(github.event.workflow_run.display_title, ' [')",
+      "contains(github.event.workflow_run.display_title, ' [sc')",
     ])
       expect(cond).toContain(c);
-    // The one || only lets a chain-dispatched run (its id in the run-name) through.
+    // The one || only lets a staging-chain deploy (" [sc..]") through.
     expect(cond.match(/\|\|/g)?.length).toBe(1);
   });
 
-  it("backs off, then reruns the whole run with an App token narrowed to actions, and never checks out code", () => {
+  // Mirrors the job's condition for the cases that matter (GitHub's contains()
+  // is a case-insensitive substring test).
+  const retried = (r: {
+    conclusion: string;
+    attempt: number;
+    event: string;
+    title: string;
+    branch?: string;
+  }) =>
+    r.conclusion === "failure" &&
+    r.attempt <= 2 &&
+    (r.branch ?? "main") === "main" &&
+    !r.title.toLowerCase().includes("(dry run)") &&
+    (r.event !== "workflow_dispatch" ||
+      r.title.toLowerCase().includes(" [sc"));
+  const fail = { conclusion: "failure", attempt: 1 };
+
+  it("a chain-id deploy or publish under a waiting prod chain is not retried; the chain is", () => {
+    expect(
+      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform prod v0.246.1 [c45669888802-1]" }),
+    ).toBe(false);
+    expect(
+      retried({ ...fail, event: "workflow_dispatch", title: "hosted-publish prod v0.246.1 [p45669888802-1]" }),
+    ).toBe(false);
+    expect(
+      retried({ ...fail, event: "workflow_run", title: "prod-release-chain" }),
+    ).toBe(true);
+  });
+
+  it("a staging-chain deploy is retried, since staging-release-chain waits for nothing", () => {
+    expect(
+      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform staging v0.246.1 [sc45693158538-1]" }),
+    ).toBe(true);
+    expect(
+      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform staging v0.246.1" }),
+    ).toBe(false);
+    expect(
+      retried({ ...fail, event: "workflow_dispatch", title: "hosted-release (dry run)" }),
+    ).toBe(false);
+    expect(retried({ ...fail, event: "push", title: "hosted-release" })).toBe(true);
+    expect(retried({ ...fail, attempt: 3, event: "push", title: "hosted-release" })).toBe(false);
+  });
+
+  it("the prod chain waits on its children, so they are its to redo", () => {
+    const chain = readFileSync(
+      join(dir, "../../.github/workflows/prod-release-chain.yml"),
+      "utf8",
+    );
+    expect(chain).toMatch(/gh run watch|run watch|wait/i);
+  });
+
+  it("backs off, then reruns only the failed jobs with an App token narrowed to actions, and never checks out code", () => {
     const job = wf.jobs.retry;
     expect(job.environment).toBe("release-app");
     expect(job.permissions).toEqual({ issues: "write" });
@@ -79,9 +130,9 @@ describe("release-retry", () => {
     expect(app?.with?.["permission-actions"]).toBe("write");
     const rerun = steps.find((s) => s.run?.includes("gh run rerun"));
     expect(rerun?.env?.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
-    expect(rerun?.run).toContain('gh run rerun "$RUN_ID" --repo "$REPO"');
+    expect(rerun?.run).toContain('gh run rerun "$RUN_ID" --failed --repo "$REPO"');
     expect(rerun?.run).toMatch(/sleep 30; else sleep 120/);
-    for (const s of steps) expect(s.run ?? "").not.toMatch(/--failed|--job/);
+    for (const s of steps) expect(s.run ?? "").not.toMatch(/--job/);
     expect(job["timeout-minutes"]).toBeGreaterThanOrEqual(3);
   });
 });

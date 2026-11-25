@@ -4,12 +4,21 @@
 # a public release to prod: hosted-release, hosted-publish,
 # staging-release-chain, deploy-hosted-platform and prod-release-chain
 # (redline-staging has its own, redline-retry.yml, retried once).
-# A failed run on main is rerun WHOLE (every job, never --failed: AGENTS.md),
-# at most twice: after 30 s when attempt 1 fails, after 120 s when attempt 2
-# fails. Attempt 3 is never retried: red there waits for a person. Only runs
-# the chain itself started are retried: pushes and workflow_run events, and
-# dispatches whose run-name carries a chain id (" [sc..]", " [c..]", " [p..]").
-# A hand dispatch without one, and a hosted-release dry run, are left alone.
+# A failed run on main gets its FAILED jobs rerun (gh run rerun --failed), at
+# most twice: after 30 s when attempt 1 fails, after 120 s when attempt 2
+# fails. Attempt 3 is never retried: red there waits for a person. Not a whole
+# rerun: these are release steps, not test runs (AGENTS.md's whole-rerun rule
+# is for CI, so a flake can't hide). A whole hosted-release rerun re-runs
+# hosted-attach-staging, which refuses ("the release already has staging
+# assets"), so it could never recover; --failed keeps the jobs that succeeded,
+# their outputs and attachments.
+# One layer only: prod-release-chain waits on the deploy (" [c..]") and the
+# prod publish (" [p..]") it dispatches, so those children are never retried
+# here; the chain's failed jobs are, which dispatch the child again. Retrying
+# both would start two prod deploys per failure. staging-release-chain waits
+# for nothing, so its staging deploy (" [sc..]") is retried on its own.
+# Retried: pushes, workflow_run events, and dispatches whose run-name has
+# " [sc". A hand dispatch, and a hosted-release dry run, are left alone.
 # Each retry notes the run on #428. The rerun uses the release App's token
 # (actions: write, this repo only) from the main-only release-app Environment,
 # so its completion fires the next workflow_run as a person's rerun does.
@@ -35,7 +44,7 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       !contains(github.event.workflow_run.display_title, '(dry run)') &&
       (github.event.workflow_run.event != 'workflow_dispatch' ||
-      contains(github.event.workflow_run.display_title, ' ['))
+      contains(github.event.workflow_run.display_title, ' [sc'))
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 5
@@ -48,7 +57,7 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-actions: write
-      - name: Back off, then rerun the whole run
+      - name: Back off, then rerun the failed jobs
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
@@ -58,8 +67,8 @@ jobs:
           set -euo pipefail
           # A pause before the rerun, not a test wait: outages last minutes.
           if [ "$ATTEMPT" = 1 ]; then sleep 30; else sleep 120; fi
-          gh run rerun "$RUN_ID" --repo "$REPO"
-          echo "reran run $RUN_ID (attempt $((ATTEMPT + 1)))"
+          gh run rerun "$RUN_ID" --failed --repo "$REPO"
+          echo "reran the failed jobs of run $RUN_ID (attempt $((ATTEMPT + 1)))"
       - name: Note it on the tracking issue
         env:
           GH_TOKEN: ${{ github.token }}
