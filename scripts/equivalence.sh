@@ -122,6 +122,9 @@ ALLOW=(
   # The read-only Cloudflare log read (cf-read env): a workflow and its test.
   .github/workflows/cf-logs.yml
   scripts/ci/cf-logs-workflow.test.ts
+  # The one automatic rerun of a red release gate (#428): a workflow and its test.
+  .github/workflows/redline-retry.yml
+  scripts/ci/redline-retry.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
