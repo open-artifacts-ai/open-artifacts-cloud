@@ -220,7 +220,7 @@ export function newIssueBody(o: {
     ? o.owner.assignable
       ? `${o.owner.login} (assigned)`
       : `${o.owner.login} (named only: GitHub can't assign them here)`
-    : "unknown (no commit found)";
+    : "unknown (no commit found, or the lookup failed)";
   return [
     `<!-- flaky-key: ${keyOf(f.id)} -->`,
     `A ${f.suite === "t19" ? "T19" : "red-line"} test failed on attempt ${s.attempt} of redline-staging ${run.tag} and the same run passed on attempt ${run.attempt}, with the same commit and tag. Nothing changed between the attempts, so the test is flaky.`,
@@ -465,20 +465,13 @@ function ensureLabel(exec: Exec, repo: string) {
 
 export type Done = { action: Action["kind"]; id: string; issue?: number };
 
-export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
-  done: Done[];
-  notes: string[];
-} {
-  const { exec, run } = o;
-  const { found, notes } = collect(exec, run);
-  if (!found.length) return { done: [], notes };
-  ensureLabel(exec, run.repo);
-  const open = JSON.parse(
+function listOpen(exec: Exec, repo: string): Issue[] {
+  return JSON.parse(
     gh(exec, [
       "issue",
       "list",
       "--repo",
-      run.repo,
+      repo,
       "--label",
       LABEL,
       "--state",
@@ -489,27 +482,34 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       "500",
     ]),
   ) as Issue[];
+}
+
+export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
+  done: Done[];
+  notes: string[];
+} {
+  const { exec, run } = o;
+  const { found, notes } = collect(exec, run);
+  if (!found.length) return { done: [], notes };
+  ensureLabel(exec, run.repo);
   const done: Done[] = [];
-  for (const a of plan(found, open)) {
+  // One sighting per test, then a fresh list of the open issues right before
+  // each write. Tracker runs are not serialized (a shared concurrency group
+  // would let a newer event cancel a pending one), so another run may have
+  // opened or bumped the issue a moment ago.
+  for (const first of plan(found, [])) {
+    if (first.kind !== "create") continue;
+    const sighting = first.seen[0] as Sighting;
+    const a = plan([{ f: first.f, sighting }], listOpen(exec, run.repo))[0];
+    if (!a) continue;
     if (a.kind === "skip") {
       done.push({ action: "skip", id: a.f.id, issue: a.issue });
       continue;
     }
     if (a.kind === "bump") {
       const twice = twiceInWindow(a.seen, o.nowMs);
-      gh(
-        exec,
-        [
-          "issue",
-          "comment",
-          String(a.issue),
-          "--repo",
-          run.repo,
-          "--body",
-          bumpComment({ f: a.f, run, sighting: a.sighting, twice }),
-        ],
-        { write: true },
-      );
+      // The body first: it is what plan() reads, so a rerun after a failed
+      // comment skips this run instead of commenting twice.
       gh(
         exec,
         [
@@ -523,10 +523,29 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
         ],
         { write: true, idempotent: true },
       );
+      gh(
+        exec,
+        [
+          "issue",
+          "comment",
+          String(a.issue),
+          "--repo",
+          run.repo,
+          "--body",
+          bumpComment({ f: a.f, run, sighting: a.sighting, twice }),
+        ],
+        { write: true },
+      );
       done.push({ action: "bump", id: a.f.id, issue: a.issue });
       continue;
     }
-    const owner = ownerOf(exec, run, a.f);
+    // The owner is extra information: a failed lookup never stops the issue.
+    let owner: Owner = null;
+    try {
+      owner = ownerOf(exec, run, a.f);
+    } catch (e) {
+      notes.push(`owner of ${a.f.id} unknown: ${(e as Error).message}`);
+    }
     const body = newIssueBody({
       f: a.f,
       run,

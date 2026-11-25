@@ -214,9 +214,13 @@ describe("grouping and the 7-day note", () => {
 type Call = { args: string[] };
 function fakeGh(o: {
   open?: { number: number; body: string }[];
+  // The open list on the nth `issue list` call, when it changes mid-run.
+  openAt?: (n: number) => { number: number; body: string }[];
   assignable?: boolean;
   labelExists?: boolean;
+  pinFails?: boolean;
 }) {
+  let lists = 0;
   const calls: Call[] = [];
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
   const exec: Exec = (_cmd, args) => {
@@ -248,9 +252,12 @@ function fakeGh(o: {
     if (a.includes("actions/jobs/2/logs")) return ok(T19_LOG);
     if (a.startsWith("label list"))
       return ok(JSON.stringify(o.labelExists ? [{ name: "flaky" }] : []));
-    if (a.startsWith("issue list")) return ok(JSON.stringify(o.open ?? []));
+    if (a.startsWith("issue list"))
+      return ok(JSON.stringify(o.openAt?.(lists++) ?? o.open ?? []));
     if (a.includes("contents/PUBLIC_PIN"))
-      return ok("tag=v0.246.0\nsha=cfb23586cd1e3b59c7db1ad287d70ce3b68f4a52\n");
+      return o.pinFails
+        ? { code: 1, stdout: "", stderr: "HTTP 404: Not Found" }
+        : ok("tag=v0.246.0\nsha=cfb23586cd1e3b59c7db1ad287d70ce3b68f4a52\n");
     if (a.includes("/commits?path="))
       return ok(JSON.stringify([{ author: { login: "writer" } }]));
     if (a.includes("/assignees/"))
@@ -309,6 +316,53 @@ describe("track", () => {
       g.calls.some((c) => c.args[0] === "label" && c.args[1] === "create"),
     ).toBe(false);
   });
+
+  it("edits the body before the comment, so a rerun after a failed comment never comments twice", () => {
+    const joins = parsePlaywright(T19_LOG)[0] as Failure;
+    const open = [
+      {
+        number: 5,
+        body: `<!-- flaky-key: ${keyOf(joins.id)} -->\n<!-- flaky-seen: 2026-11-22T00:00:00Z 700/1 -->`,
+      },
+    ];
+    const g = fakeGh({ open, labelExists: true, assignable: true });
+    track({ exec: g.exec, run, nowMs: NOW });
+    const edit = g.calls.findIndex((c) => c.args[1] === "edit");
+    const comment = g.calls.findIndex((c) => c.args[1] === "comment");
+    expect(edit).toBeGreaterThanOrEqual(0);
+    expect(edit).toBeLessThan(comment);
+  });
+
+  it("still opens the issue when the owner lookup fails, and says why in a note", () => {
+    const g = fakeGh({ labelExists: true, assignable: true, pinFails: true });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done.map((d) => d.action)).toEqual(["create", "create"]);
+    const creates = g.calls.filter((c) => c.args[1] === "create");
+    expect(creates[0]?.args).not.toContain("--assignee");
+    expect(creates[0]?.args.join(" ")).toContain("unknown (no commit found, or the lookup failed)");
+    expect(r.notes.some((n) => n.includes("owner of") && n.includes("HTTP 404"))).toBe(true);
+  });
+
+  it("re-lists the open issues before each write, so an issue another run just opened is bumped", () => {
+    // The second test: another run opens its issue while the first is created.
+    const second = parsePlaywright(T19_LOG)[1] as Failure;
+    const other = {
+      number: 9,
+      body: `<!-- flaky-key: ${keyOf(second.id)} -->\n<!-- flaky-seen: 2026-11-26T10:00:00Z 901/1 -->`,
+    };
+    const g = fakeGh({
+      labelExists: true,
+      assignable: true,
+      openAt: (n) => (n === 0 ? [] : [other]),
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    const lists = g.calls.filter((c) => c.args[0] === "issue" && c.args[1] === "list");
+    expect(lists).toHaveLength(2);
+    expect(r.done).toEqual([
+      { action: "create", id: expect.stringContaining("joins.spec.ts") },
+      { action: "bump", id: second.id, issue: 9 },
+    ]);
+  });
 });
 
 describe("flaky-tracker.yml", () => {
@@ -336,6 +390,13 @@ describe("flaky-tracker.yml", () => {
     ])
       expect(cond).toContain(c);
     expect(cond).not.toMatch(/\|\|/);
+    // Per event and on the job: a skipped run joins no group, and no newer
+    // event can cancel a pending one.
+    expect(wf.concurrency).toBeUndefined();
+    expect(wf.jobs.track.concurrency).toEqual({
+      group: "flaky-tracker-${{ github.event.workflow_run.id }}",
+      "cancel-in-progress": false,
+    });
   });
 
   it("uses the default token with read, read and issues, no secret, and SHA-pinned actions", () => {

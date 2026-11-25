@@ -20,10 +20,6 @@ on:
     workflows: [redline-staging]
     types: [completed]
 permissions: {}
-# One at a time, so two events never open two issues for one test.
-concurrency:
-  group: flaky-tracker
-  cancel-in-progress: false
 jobs:
   track:
     if: >-
@@ -31,6 +27,13 @@ jobs:
       github.event.workflow_run.run_attempt > 1 &&
       github.event.workflow_run.event == 'workflow_dispatch' &&
       github.event.workflow_run.head_branch == 'main'
+    # Per event, and on the job so a skipped run joins no group. A shared
+    # group would let a newer pending run cancel an older one, and that
+    # event's flakes would never be recorded. The script re-lists the open
+    # issues right before each write instead.
+    concurrency:
+      group: flaky-tracker-${{ github.event.workflow_run.id }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
