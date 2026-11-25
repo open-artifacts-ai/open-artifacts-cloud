@@ -125,6 +125,10 @@ ALLOW=(
   # The one automatic rerun of a red release gate (#428): a workflow and its test.
   .github/workflows/redline-retry.yml
   scripts/ci/redline-retry.test.ts
+  # The flaky tracker (#447): a workflow, its script and its test.
+  .github/workflows/flaky-tracker.yml
+  scripts/ci/flaky-tracker.ts
+  scripts/ci/flaky-tracker.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

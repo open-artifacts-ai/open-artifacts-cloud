@@ -1,0 +1,55 @@
+# The flaky tracker (cloud #447, #264). Tracking only: it reruns nothing and
+# changes nothing that blocks. When a release gate (a redline-staging run
+# dispatched on main) passes on attempt 2 or later, every test that failed on
+# an earlier attempt of that same run (same commit, same tag) failed and then
+# passed with nothing changed, so it is flaky. scripts/ci/flaky-tracker.ts
+# reads the earlier attempts' failed job logs, then opens or bumps one open
+# issue labelled `flaky` per test, with the run links, the last author of the
+# test file (assigned when GitHub allows it, else named in plain text), and a
+# "fails twice in 7 days" note when it failed in two runs within 7 days.
+# The default token only: it reads the run's jobs and logs and the commits of
+# the test files, and writes issues. No App, no secret, no Environment.
+#
+# TODO(lane 3): a run that calls redline-staging as a reusable workflow (the
+# nightly today, a queue gate later) raises workflow_run under the caller's
+# name, so this file never sees it. When the queue gate lands, add it to
+# `workflows` below and read its called jobs the same way. Not built yet.
+name: flaky-tracker
+on:
+  workflow_run:
+    workflows: [redline-staging]
+    types: [completed]
+permissions: {}
+# One at a time, so two events never open two issues for one test.
+concurrency:
+  group: flaky-tracker
+  cancel-in-progress: false
+jobs:
+  track:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.run_attempt > 1 &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Record the flaky tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+        run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --run-id "$RUN_ID" --attempt "$ATTEMPT" --title "$TITLE"
