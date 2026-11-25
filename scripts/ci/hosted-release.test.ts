@@ -815,7 +815,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(src).toContain("--lockfile pnpm-lock.yaml");
   });
 
-  it("attaches to this repo's release, once per env, refusing existing assets", () => {
+  it("attaches to this repo's release, once per env, refusing existing assets that differ", () => {
     for (const e of ENVS) {
       const run = runOf(allSteps(`hosted-attach-${e}`));
       expect(run).toContain(`grep '^oa-release-${e}-'`);
@@ -1110,7 +1110,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     });
 
   for (const env of ENVS)
-    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets`, () => {
+    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets unless identical`, () => {
       const name = `hosted-attach-${env}`;
       const job = jobs[name];
       const other = env === "prod" ? "staging" : "prod";
@@ -1135,6 +1135,16 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         run.indexOf("gh release upload"),
       );
       expect(run).not.toContain("--clobber");
+      // A rerun passes only when the attached files match this run's, byte for byte.
+      expect(run.indexOf("scripts/ci/assemble-release.mjs")).toBeLessThan(
+        run.indexOf("gh release view"),
+      );
+      expect(run).toContain(
+        `gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-${env}-*'`,
+      );
+      expect(run).toContain(`sha256sum oa-release-${env}-* | sort`);
+      expect(run).toContain('[ "$mine" = "$theirs" ] || {');
+      expect(run).toContain("differ from this run's");
       expect(
         allSteps(name).filter((x) =>
           String(x.uses ?? "").startsWith("actions/setup-node@"),
