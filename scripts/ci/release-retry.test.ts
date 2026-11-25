@@ -75,16 +75,23 @@ describe("release-retry", () => {
     r.attempt <= 2 &&
     (r.branch ?? "main") === "main" &&
     !r.title.toLowerCase().includes("(dry run)") &&
-    (r.event !== "workflow_dispatch" ||
-      r.title.toLowerCase().includes(" [sc"));
+    (r.event !== "workflow_dispatch" || r.title.toLowerCase().includes(" [sc"));
   const fail = { conclusion: "failure", attempt: 1 };
 
   it("a chain-id deploy or publish under a waiting prod chain is not retried; the chain is", () => {
     expect(
-      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform prod v0.246.1 [c45669888802-1]" }),
+      retried({
+        ...fail,
+        event: "workflow_dispatch",
+        title: "deploy-hosted-platform prod v0.246.1 [c45669888802-1]",
+      }),
     ).toBe(false);
     expect(
-      retried({ ...fail, event: "workflow_dispatch", title: "hosted-publish prod v0.246.1 [p45669888802-1]" }),
+      retried({
+        ...fail,
+        event: "workflow_dispatch",
+        title: "hosted-publish prod v0.246.1 [p45669888802-1]",
+      }),
     ).toBe(false);
     expect(
       retried({ ...fail, event: "workflow_run", title: "prod-release-chain" }),
@@ -93,16 +100,32 @@ describe("release-retry", () => {
 
   it("a staging-chain deploy is retried, since staging-release-chain waits for nothing", () => {
     expect(
-      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform staging v0.246.1 [sc45693158538-1]" }),
+      retried({
+        ...fail,
+        event: "workflow_dispatch",
+        title: "deploy-hosted-platform staging v0.246.1 [sc45693158538-1]",
+      }),
     ).toBe(true);
     expect(
-      retried({ ...fail, event: "workflow_dispatch", title: "deploy-hosted-platform staging v0.246.1" }),
+      retried({
+        ...fail,
+        event: "workflow_dispatch",
+        title: "deploy-hosted-platform staging v0.246.1",
+      }),
     ).toBe(false);
     expect(
-      retried({ ...fail, event: "workflow_dispatch", title: "hosted-release (dry run)" }),
+      retried({
+        ...fail,
+        event: "workflow_dispatch",
+        title: "hosted-release (dry run)",
+      }),
     ).toBe(false);
-    expect(retried({ ...fail, event: "push", title: "hosted-release" })).toBe(true);
-    expect(retried({ ...fail, attempt: 3, event: "push", title: "hosted-release" })).toBe(false);
+    expect(retried({ ...fail, event: "push", title: "hosted-release" })).toBe(
+      true,
+    );
+    expect(
+      retried({ ...fail, attempt: 3, event: "push", title: "hosted-release" }),
+    ).toBe(false);
   });
 
   it("the prod chain waits on its children, so they are its to redo", () => {
@@ -111,7 +134,7 @@ describe("release-retry", () => {
       "utf8",
     );
     expect(chain).toContain("Dispatch the prod deploy and wait for its run");
-    expect(chain).toContain("Dispatch the prod publish and wait for its run");|run watch|wait/i);
+    expect(chain).toContain("Dispatch the prod publish and wait for its run");
   });
 
   it("backs off, then reruns only the failed jobs with an App token narrowed to actions, and never checks out code", () => {
@@ -131,7 +154,9 @@ describe("release-retry", () => {
     expect(app?.with?.["permission-actions"]).toBe("write");
     const rerun = steps.find((s) => s.run?.includes("gh run rerun"));
     expect(rerun?.env?.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
-    expect(rerun?.run).toContain('gh run rerun "$RUN_ID" --failed --repo "$REPO"');
+    expect(rerun?.run).toContain(
+      'gh run rerun "$RUN_ID" --failed --repo "$REPO"',
+    );
     expect(rerun?.run).toMatch(/sleep 30; else sleep 120/);
     for (const s of steps) expect(s.run ?? "").not.toMatch(/--job/);
     expect(job["timeout-minutes"]).toBeGreaterThanOrEqual(3);
