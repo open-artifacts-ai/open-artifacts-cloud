@@ -46,9 +46,8 @@ describe("wrangler.jsonc", () => {
         SIGNUPS_ENABLED: `{{SIGNUPS_ENABLED_${env.toUpperCase()}}}`,
         // #1343: prod's fleet is on, its canary first.
         FLEET_CANARY: env === "staging" ? "i33m6mbc3zuz" : "ifhx5rpmrhwh",
-        // #1343: leo goes second on prod. The smoke's token and share
-        // target are secrets, never vars: no address is ever committed.
-        FLEET_SECOND: env === "staging" ? "" : "iwfhpuiwmfba",
+        // The smoke's token and share target are secrets, never vars: no
+        // address is ever committed. No install goes second (cloud #433).
         // #1343: required on prod, its smoke secrets set; off on staging
         // until its setup.
         FLEET_SMOKE: env === "staging" ? "off" : "required",
