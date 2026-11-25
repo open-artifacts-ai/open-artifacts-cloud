@@ -13,8 +13,12 @@ import {
   branchOf,
   compareTags,
   type Exec,
+  LAND_ATTEMPTS,
+  land,
+  lockfileSensitive,
   openPr,
   plan,
+  planDirect,
   rewritePin,
   STALE_PR_MS,
 } from "./pin-bump.ts";
@@ -613,21 +617,22 @@ describe("pin-bump.yml", () => {
   });
 
   it("commits through the git-data API with the App token, not local git", () => {
-    const c = stepsOf("open").find((s) =>
-      s.name?.startsWith("Commit and push"),
-    );
+    const c = step("open", "commit");
+    const push = stepsOf("open").find((s) => s.name === "Push the branch");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(c.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(push.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(c.env.BASE).toBe("${{ github.sha }}");
-    for (const call of [
-      "git/blobs",
-      "git/trees",
-      "git/commits",
-      "git/refs/heads/$BRANCH",
-      "git/refs",
-    ])
+    for (const call of ["git/blobs", "git/trees", "git/commits"])
       expect(c.run).toContain(call);
+    expect(c.run).toContain('echo "commit=$commit" >> "$GITHUB_OUTPUT"');
+    expect(c.run).not.toContain("git/refs");
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+    expect(push.env.COMMIT).toBe("${{ steps.commit.outputs.commit }}");
+    for (const call of ["git/refs/heads/$BRANCH", "git/refs"])
+      expect(push.run).toContain(call);
     // Only the pin files, the lockfile and the three surfaces-port files the plan
     // regenerates, as regular files, on top of the main sha the job checked out.
     expect(c.run).toContain(
@@ -638,17 +643,85 @@ describe("pin-bump.yml", () => {
     // No author or committer is set, so GitHub records the App and signs it.
     expect(c.run).not.toMatch(/author|committer/);
     // An existing branch is moved with force; a new one is created.
-    expect(c.run).toContain("-F force=true");
-    expect(c.run).toContain("-X POST");
-    expect(c.run).not.toMatch(/\bgit (commit|push|config|switch|add)\b/);
+    expect(push.run).toContain("-F force=true");
+    expect(push.run).toContain("-X POST");
+    for (const r of [c.run, push.run])
+      expect(r).not.toMatch(/\bgit (commit|push|config|switch|add)\b/);
     expect(text).not.toMatch(/github-actions\[bot\]|x-access-token/);
     const names = stepsOf("open").map((s) => s.name ?? s.id);
     expect(names.indexOf(c.name)).toBeGreaterThan(
       names.indexOf("Take the lockfile as data"),
     );
-    expect(names.indexOf(c.name)).toBeLessThan(
+    expect(names.indexOf(c.name)).toBeLessThan(names.indexOf(push.name));
+    expect(names.indexOf(push.name)).toBeLessThan(
       names.indexOf("Open the PR (never armed)"),
     );
+  });
+
+  describe("direct mode (PIN_BUMP_DIRECT, cloud #264)", () => {
+    // A step's `if` or a MODE expression is plain JS once its contexts are bound.
+    const evalExpr = (expr: string, direct: string | null) =>
+      new Function(
+        "vars",
+        "steps",
+        `return ${String(expr)
+          .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+          .replaceAll("vars.PIN_BUMP_DIRECT", "vars.direct")};`,
+      )({ direct }, { plan: { outputs: { bump: "true" } } });
+    const runs = (direct: string | null) =>
+      stepsOf("open")
+        .filter((s) => !s.if || evalExpr(s.if, direct))
+        .map((s) => s.name ?? s.id ?? s.uses);
+
+    it("unset (or not exactly on), the steps and the plan are today's", () => {
+      for (const v of [null, "", "off", "ON"]) {
+        const names = runs(v);
+        expect(names).toContain("Push the branch");
+        expect(names).toContain("Open the PR (never armed)");
+        expect(names).not.toContain("Land the pin on main (direct mode)");
+        for (const j of ["prepare", "open"])
+          expect(evalExpr(step(j, "plan").env.MODE, v)).toBe("plan");
+      }
+    });
+
+    it("on, it lands on main and never pushes a branch or opens a PR", () => {
+      const names = runs("on");
+      expect(names).not.toContain("Push the branch");
+      expect(names).not.toContain("Open the PR (never armed)");
+      expect(names).toContain("Land the pin on main (direct mode)");
+      for (const j of ["prepare", "open"])
+        expect(evalExpr(step(j, "plan").env.MODE, "on")).toBe("plan-direct");
+    });
+
+    it("lands with the App token, after the commit, with the plan's tag and sha", () => {
+      const open = stepsOf("open");
+      const l = open.find(
+        (s) => s.name === "Land the pin on main (direct mode)",
+      );
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.BASE).toBe("${{ github.sha }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.COMMIT).toBe("${{ steps.commit.outputs.commit }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.TAG).toBe("${{ steps.plan.outputs.tag }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.SHA).toBe("${{ steps.plan.outputs.sha }}");
+      expect(l.run).toBe(
+        'node --experimental-strip-types scripts/ci/pin-bump.ts land --repo "$GITHUB_REPOSITORY" --base "$BASE" --commit "$COMMIT" --tag "$TAG" --sha "$SHA"',
+      );
+      expect(open.indexOf(l)).toBeGreaterThan(
+        open.findIndex((s) => s.id === "commit"),
+      );
+      // The only steps that see the App token are the open job's own.
+      const tokened = Object.entries(jobs).filter(([, j]) =>
+        // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+        JSON.stringify((j as any).steps).includes("steps.app.outputs.token"),
+      );
+      expect(tokened.map(([k]) => k)).toEqual(["open"]);
+      expect(jobs.open.environment).toBe("release-app");
+    });
   });
 
   it("never arms or merges", () => {
@@ -778,5 +851,380 @@ esac
       expect(list).toContain("--label blocker");
       expect(list).toContain("pin-bump failed");
     });
+  });
+});
+
+describe("planDirect", () => {
+  const go = (o: Parameters<typeof world>[0], pin = PIN) => {
+    const w = world(o);
+    return { r: planDirect({ exec: w.exec, publicRepo: PUB, pin }), w };
+  };
+
+  it("bumps to the newest release and resolves its sha", () => {
+    expect(go({}).r).toMatchObject({
+      bump: true,
+      tag: "v0.137.0",
+      sha: NEW_SHA,
+    });
+  });
+
+  it("an equal tag is no bump", () => {
+    const { r } = go({ releases: [rel("v0.136.1"), rel("v0.136.0")] });
+    expect(r).toMatchObject({ bump: false, tag: "", sha: "" });
+  });
+
+  it("reads no PR: an open or taken bump PR is ignored", () => {
+    const { r, w } = go({
+      open: [
+        {
+          number: 7,
+          headRefName: branchOf("v0.137.0"),
+          url: "u",
+          createdAt: hoursAgo(100),
+        },
+      ],
+      taken: [{ number: 7, state: "CLOSED" }],
+    });
+    expect(r).toMatchObject({ bump: true, tag: "v0.137.0" });
+    expect(w.calls.some((c) => c[0] === "pr")).toBe(false);
+  });
+
+  it("ignores drafts and prereleases", () => {
+    const { r } = go({
+      releases: [
+        rel("v0.140.0", { draft: true }),
+        rel("v0.139.0", { prerelease: true }),
+        rel("v0.137.0"),
+      ],
+    });
+    expect(r).toMatchObject({ bump: true, tag: "v0.137.0" });
+  });
+
+  it("throws on an API error, a bad sha, or no stable release", () => {
+    expect(() => go({ failApi: "releases" })).toThrow("502");
+    expect(() => go({ sha: "nope" })).toThrow("not a full sha");
+    expect(() => go({ releases: [rel("v0.140.0", { draft: true })] })).toThrow(
+      "no stable",
+    );
+  });
+});
+
+describe("land", () => {
+  const BASE = "b".repeat(40);
+  const COMMIT = "c".repeat(40);
+  const MAIN2 = "d".repeat(40);
+  const REBUILT = "e".repeat(40);
+  const TAG = "v0.137.0";
+  const pinAt = (tag: string, sha: string) => `# pin\ntag=${tag}\nsha=${sha}\n`;
+  const mod = (filename: string, status = "modified") => ({
+    filename,
+    status,
+    sha: `${filename.length.toString(16).padStart(2, "0")}${"f".repeat(38)}`,
+  });
+  type LandWorld = {
+    parents?: string[];
+    files?: { filename: string; status: string; sha: string }[];
+    ahead?: number;
+    pinText?: string;
+    syncedText?: string;
+    /** main's sha, read by read; the last one repeats. */
+    mains?: string[];
+    mainPin?: string;
+    moved?: { status?: string; behind_by?: number; files?: string[] };
+    /** stderr of each PATCH in turn; "" is success. */
+    patches?: string[];
+  };
+  const landWorld = (o: LandWorld) => {
+    const calls: string[][] = [];
+    const bodies: unknown[] = [];
+    let reads = 0;
+    let patch = 0;
+    const exec: Exec = (_c, args) => {
+      calls.push(args);
+      const ok = (v: unknown) => ({
+        code: 0,
+        stdout: typeof v === "string" ? v : JSON.stringify(v),
+        stderr: "",
+      });
+      const path = args[1] === "-X" ? (args[3] ?? "") : (args[1] ?? "");
+      if (args[1] === "-X" && args[2] === "PATCH") {
+        const err = o.patches?.[patch++] ?? "";
+        return err
+          ? { code: 1, stdout: "", stderr: err }
+          : ok({ object: { sha: "x" } });
+      }
+      if (path.endsWith(`git/commits/${COMMIT}`))
+        return ok({
+          sha: COMMIT,
+          message: `chore(pin): bump PUBLIC_PIN to ${TAG}`,
+          tree: { sha: "1".repeat(40) },
+          parents: (o.parents ?? [BASE]).map((sha) => ({ sha })),
+        });
+      if (path.endsWith(`git/commits/${MAIN2}`))
+        return ok({
+          sha: MAIN2,
+          message: "m",
+          tree: { sha: "2".repeat(40) },
+          parents: [],
+        });
+      if (path.endsWith(`compare/${BASE}...${COMMIT}`))
+        return ok({
+          status: "ahead",
+          ahead_by: o.ahead ?? 1,
+          behind_by: 0,
+          files: o.files ?? [mod("PUBLIC_PIN"), mod("SYNCED_FROM")],
+        });
+      if (path.includes(`compare/${BASE}...`))
+        return ok({
+          status: o.moved?.status ?? "ahead",
+          ahead_by: 1,
+          behind_by: o.moved?.behind_by ?? 0,
+          files: (o.moved?.files ?? ["apps/x/src/a.ts"]).map((f) => mod(f)),
+        });
+      if (path.endsWith("git/ref/heads/main")) {
+        const m = o.mains ?? [BASE];
+        return ok(`${m[Math.min(reads++, m.length - 1)]}\n`);
+      }
+      if (path.includes("contents/PUBLIC_PIN?ref=") && !path.endsWith(COMMIT))
+        return ok(o.mainPin ?? PIN);
+      if (path.endsWith(`contents/PUBLIC_PIN?ref=${COMMIT}`))
+        return ok(o.pinText ?? pinAt(TAG, NEW_SHA));
+      if (path.endsWith(`contents/SYNCED_FROM?ref=${COMMIT}`))
+        return ok(o.syncedText ?? pinAt(TAG, NEW_SHA));
+      if (path.endsWith("git/trees") || path.endsWith("git/commits")) {
+        const i = args.indexOf("--input");
+        bodies.push(JSON.parse(readFileSync(args[i + 1] ?? "", "utf8")));
+        return ok(`${path.endsWith("git/trees") ? "3".repeat(40) : REBUILT}\n`);
+      }
+      throw new Error(`unexpected ${args.join(" ")}`);
+    };
+    const run = () =>
+      land({
+        exec,
+        repo: REPO,
+        base: BASE,
+        commit: COMMIT,
+        tag: TAG,
+        sha: NEW_SHA,
+      });
+    return { exec, calls, bodies, run };
+  };
+  const patches = (calls: string[][]) =>
+    calls.filter((c) => c[1] === "-X" && c[2] === "PATCH");
+
+  it("fast-forwards main when it is still the base, never with force", () => {
+    const w = landWorld({});
+    expect(w.run()).toEqual({ action: "landed", sha: COMMIT, rebuilt: false });
+    const p = patches(w.calls);
+    expect(p).toHaveLength(1);
+    expect(p[0]).toEqual([
+      "api",
+      "-X",
+      "PATCH",
+      `repos/${REPO}/git/refs/heads/main`,
+      "-f",
+      `sha=${COMMIT}`,
+      "-F",
+      "force=false",
+    ]);
+    expect(w.calls.flat().join(" ")).not.toContain("force=true");
+  });
+
+  it("accepts the lockfile and surfaces files beside the pin files", () => {
+    const w = landWorld({
+      files: [
+        mod("PUBLIC_PIN"),
+        mod("SYNCED_FROM"),
+        mod("pnpm-lock.yaml"),
+        mod("tests/redline/live/manifest.json"),
+        mod("tests/redline/test/cases-added.ts"),
+        mod("tests/redline/test/surfaces.test.ts"),
+      ],
+    });
+    expect(w.run()).toMatchObject({ action: "landed" });
+  });
+
+  it("a main moved on unrelated paths gets the same blobs on its own tree", () => {
+    const files = [
+      mod("PUBLIC_PIN"),
+      mod("SYNCED_FROM"),
+      mod("pnpm-lock.yaml"),
+    ];
+    const w = landWorld({ mains: [MAIN2], files });
+    expect(w.run()).toEqual({ action: "landed", sha: REBUILT, rebuilt: true });
+    expect(w.bodies[0]).toEqual({
+      base_tree: "2".repeat(40),
+      tree: files.map((f) => ({
+        path: f.filename,
+        mode: "100644",
+        type: "blob",
+        sha: f.sha,
+      })),
+    });
+    expect(w.bodies[1]).toEqual({
+      message: `chore(pin): bump PUBLIC_PIN to ${TAG}`,
+      tree: "3".repeat(40),
+      parents: [MAIN2],
+    });
+    expect(patches(w.calls)[0]).toContain(`sha=${REBUILT}`);
+  });
+
+  it.each([
+    "package.json",
+    "packages/provision/package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".npmrc",
+    "SYNCED_FROM",
+    "tests/redline/src/regen.ts",
+  ])("refuses a main moved under %s", (f) => {
+    const w = landWorld({ mains: [MAIN2], moved: { files: [f] } });
+    expect(() => w.run()).toThrow("lockfile-sensitive");
+    expect(patches(w.calls)).toHaveLength(0);
+  });
+
+  it("refuses a main that is not ahead of the base", () => {
+    const w = landWorld({
+      mains: [MAIN2],
+      moved: { status: "diverged", behind_by: 1 },
+    });
+    expect(() => w.run()).toThrow("not ahead");
+    expect(patches(w.calls)).toHaveLength(0);
+  });
+
+  it("does nothing when main already has this pin or a newer one", () => {
+    const same = landWorld({ mains: [MAIN2], mainPin: pinAt(TAG, NEW_SHA) });
+    expect(same.run()).toMatchObject({ action: "already" });
+    const newer = landWorld({
+      mains: [MAIN2],
+      mainPin: pinAt("v0.138.0", NEW_SHA),
+    });
+    expect(newer.run()).toMatchObject({ action: "already" });
+    const at = landWorld({ mains: [COMMIT] });
+    expect(at.run()).toMatchObject({ action: "already" });
+    for (const w of [same, newer, at]) expect(patches(w.calls)).toHaveLength(0);
+  });
+
+  it.each([
+    [
+      "a seventh path",
+      { files: [mod("PUBLIC_PIN"), mod("SYNCED_FROM"), mod("apps/x/a.ts")] },
+      "not a pin file",
+    ],
+    [
+      "an added pin file",
+      {
+        files: [
+          mod("PUBLIC_PIN"),
+          mod("SYNCED_FROM"),
+          mod("pnpm-lock.yaml", "added"),
+        ],
+      },
+      "is added",
+    ],
+    [
+      "no SYNCED_FROM change",
+      { files: [mod("PUBLIC_PIN")] },
+      "does not change SYNCED_FROM",
+    ],
+    ["a parent that is not the base", { parents: [MAIN2] }, "not just"],
+    ["two parents", { parents: ["b".repeat(40), MAIN2] }, "not just"],
+    ["two commits ahead", { ahead: 2 }, "not one commit ahead"],
+    [
+      "a PUBLIC_PIN for another tag",
+      { pinText: pinAt("v0.137.1", NEW_SHA) },
+      "not v0.137.0",
+    ],
+    [
+      "a SYNCED_FROM for another sha",
+      { syncedText: pinAt(TAG, OLD_SHA) },
+      "not v0.137.0",
+    ],
+  ] as [string, LandWorld, string][])("refuses %s", (_n, o, msg) => {
+    const w = landWorld(o);
+    expect(() => w.run()).toThrow(msg);
+    expect(patches(w.calls)).toHaveLength(0);
+  });
+
+  it("refuses arguments that are not a tag or full shas", () => {
+    const { exec } = landWorld({});
+    const base = {
+      exec,
+      repo: REPO,
+      base: BASE,
+      commit: COMMIT,
+      tag: TAG,
+      sha: NEW_SHA,
+    };
+    expect(() => land({ ...base, tag: "latest" })).toThrow("vX.Y.Z");
+    expect(() => land({ ...base, commit: "abc" })).toThrow("--commit");
+    expect(() => land({ ...base, sha: "" })).toThrow("--sha");
+  });
+
+  const NFF = "gh: Update is not a fast forward (HTTP 422)";
+
+  it("a lost race reads main again and lands", () => {
+    const w = landWorld({ mains: [BASE, MAIN2], patches: [NFF, ""] });
+    expect(w.run()).toEqual({ action: "landed", sha: REBUILT, rebuilt: true });
+    expect(patches(w.calls)).toHaveLength(2);
+  });
+
+  it(`${LAND_ATTEMPTS} lost races throw`, () => {
+    const w = landWorld({ patches: [NFF, NFF, NFF, ""] });
+    expect(() => w.run()).toThrow("fast forward");
+    expect(patches(w.calls)).toHaveLength(LAND_ATTEMPTS);
+  });
+
+  it("any other refusal of the ref update throws at once", () => {
+    const w = landWorld({
+      patches: ["gh: Repository rule violations found (HTTP 422)", ""],
+    });
+    expect(() => w.run()).toThrow("rule violations");
+    expect(patches(w.calls)).toHaveLength(1);
+  });
+
+  it("a GitHub 5xx on the ref update retries", () => {
+    const w = landWorld({ patches: ["HTTP 502", ""] });
+    expect(w.run()).toMatchObject({ action: "landed", sha: COMMIT });
+    expect(patches(w.calls)).toHaveLength(2);
+  });
+
+  it("an API error on a read throws", () => {
+    const w = landWorld({});
+    const exec: Exec = (c, a) =>
+      a.join(" ").includes("compare/")
+        ? { code: 1, stdout: "", stderr: "HTTP 404" }
+        : w.exec(c, a);
+    expect(() =>
+      land({
+        exec,
+        repo: REPO,
+        base: BASE,
+        commit: COMMIT,
+        tag: TAG,
+        sha: NEW_SHA,
+      }),
+    ).toThrow("404");
+  });
+});
+
+describe("lockfileSensitive", () => {
+  it("names the install inputs, the pin and the redline tree, and nothing else", () => {
+    for (const p of [
+      "package.json",
+      "apps/scheduler/package.json",
+      ".nvmrc",
+      ".pnpmfile.cjs",
+      "PUBLIC_PIN",
+      "scripts/overlay.sh",
+      "tests/redline/live/manifest.json",
+    ])
+      expect(lockfileSensitive(p)).toBe(true);
+    for (const p of [
+      "apps/scheduler/src/fleet.ts",
+      "README.md",
+      ".github/workflows/ci.yml",
+    ])
+      expect(lockfileSensitive(p)).toBe(false);
   });
 });
