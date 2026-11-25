@@ -1,13 +1,18 @@
-// The scheduled pin-bump PR opener (cloud #20). When public has a release newer
+// The scheduled pin-bump opener (cloud #20). When public has a release newer
 // than PUBLIC_PIN, one PR bumps the pin (and SYNCED_FROM, with the regenerated
-// lockfile); CI's pin-check port check and equivalence check judge it. This
-// script never arms or merges anything, and never opens a second PR.
-// Direct mode (cloud #264, repo variable PIN_BUMP_DIRECT=on): `plan-direct`
-// plans with no PR checks, and `land` moves main to the pin commit itself, after
-// checking it changes only the pin files and names the planned tag and sha.
+// lockfile); CI's pin-check port check and equivalence check judge it. On the
+// PR path this script never arms or merges anything, and never opens a second PR.
+// Direct mode (cloud #264, repo variable PIN_BUMP_DIRECT=on) lands without a PR:
+// `plan-direct` plans with no PR checks, `stage` pushes the pin commit to
+// pin-land/<tag> (never main), and `land` fast-forwards main to that exact sha
+// only when every required check of main's ruleset is green on it, the commit is
+// the bot's verified one and it changes only PUBLIC_PIN, SYNCED_FROM and the
+// lockfile. A bump that also ports surfaces goes to a PR for a person (`route`).
 // Usage: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo owner/name [--public owner/name]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts plan-direct --repo owner/name [--public owner/name]
-//        node --experimental-strip-types scripts/ci/pin-bump.ts land --repo owner/name --base <sha> --commit <sha> --tag vX.Y.Z --sha <sha>
+//        node --experimental-strip-types scripts/ci/pin-bump.ts route --repo owner/name --tag vX.Y.Z --direct on|off --surfaces changed|same [--branch b --supersede n]
+//        node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo owner/name --base <sha> --commit <sha> --tag vX.Y.Z --sha <sha>
+//        node --experimental-strip-types scripts/ci/pin-bump.ts land --repo owner/name [--public owner/name]   (READ_TOKEN reads, GH_TOKEN writes)
 //        node --experimental-strip-types scripts/ci/pin-bump.ts apply --tag vX.Y.Z --sha <40 hex> [--dir .]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo owner/name --tag vX.Y.Z --sha <sha> --branch pin-bump/vX.Y.Z
 // `plan` prints `bump=true|false`, `tag`, `sha`, `branch` for $GITHUB_OUTPUT.
@@ -18,6 +23,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { type Exec, type ExecResult, gh } from "./gh-retry.ts";
+// Used only inside functions: pin-bump-arm.ts imports this module too.
+import { BOT, commitOk, requiredChecks } from "./pin-bump-arm.ts";
 
 export const PUBLIC_REPO = "open-artifacts-ai/open-artifacts";
 /** Every bump branch starts with this; one open PR from such a branch is the limit. */
@@ -171,24 +178,23 @@ function resolveSha(exec: Exec, publicRepo: string, tag: string): string {
 
 /**
  * Direct mode's plan (cloud #264): a bump when the newest public release is
- * newer than PUBLIC_PIN. No PR is read: in direct mode the pin lands on main
- * itself, and `land` refuses a pin main already has.
+ * newer than PUBLIC_PIN and is not already staged on pin-land/<tag> (`land`
+ * takes a staged one, or holds it red for a person). No PR is read.
  */
 export function planDirect(o: {
   exec: Exec;
+  repo: string;
   publicRepo: string;
   pin: string; // PUBLIC_PIN's text
 }): Plan {
   const current = pinField(o.pin, "tag");
   parts(current);
   const newest = newestRelease(o.exec, o.publicRepo);
+  const none = (why: string): Plan => ({ bump: false, tag: "", sha: "", why });
   if (compareTags(newest, current) <= 0)
-    return {
-      bump: false,
-      tag: "",
-      sha: "",
-      why: `PUBLIC_PIN ${current} is the newest release (${newest})`,
-    };
+    return none(`PUBLIC_PIN ${current} is the newest release (${newest})`);
+  if (staged(o.exec, o.repo, newest))
+    return none(`${landBranchOf(newest)} is already staged; land takes it`);
   return {
     bump: true,
     tag: newest,
@@ -385,22 +391,27 @@ export function openPr(o: {
 }
 
 /**
- * The files a pin commit may change (the ones the workflow writes), each a plain
- * modification. PUBLIC_PIN and SYNCED_FROM must be among them.
+ * The files a direct-mode pin commit may change, each a plain modification:
+ * exactly what pin-bump-arm.ts arms without a person (its PIN_FILES). A bump
+ * that also ports surfaces (tests/redline/...) goes to a PR for review.
  */
-export const PIN_FILES = [
-  "PUBLIC_PIN",
-  "SYNCED_FROM",
-  "pnpm-lock.yaml",
+export const DIRECT_FILES = ["PUBLIC_PIN", "SYNCED_FROM", "pnpm-lock.yaml"];
+const REQUIRED_FILES = ["PUBLIC_PIN", "SYNCED_FROM"];
+/** The surfaces-port files the workflow writes; any change sends the bump to a PR. */
+export const SURFACES_FILES = [
   "tests/redline/live/manifest.json",
   "tests/redline/test/cases-added.ts",
   "tests/redline/test/surfaces.test.ts",
-] as const;
-const REQUIRED_FILES = ["PUBLIC_PIN", "SYNCED_FROM"];
+];
+/** Direct mode's staging branches: CI runs on them before main moves. */
+export const LAND_PREFIX = "pin-land/";
+export const landBranchOf = (tag: string) => `${LAND_PREFIX}${tag}`;
 
 /**
  * A change on main between the pin commit's base and now that would make its
  * lockfile or surfaces port stale, or that moved the pin itself.
+ * private-paths.txt decides pre-split vs strict in overlay.sh --auto-split and
+ * which public paths are removed before the lockfile is regenerated.
  */
 export function lockfileSensitive(path: string): boolean {
   return (
@@ -414,14 +425,54 @@ export function lockfileSensitive(path: string): boolean {
       ".nvmrc",
       "PUBLIC_PIN",
       "SYNCED_FROM",
+      "private-paths.txt",
       "scripts/overlay.sh",
     ].includes(path) ||
     path.startsWith("tests/redline/")
   );
 }
 
-/** How many times a ref update that lost a race is tried again from a fresh read. */
-export const LAND_ATTEMPTS = 3;
+/**
+ * Direct mode or a PR, for a bump the open job has written (cloud #264). Not
+ * direct: the PR plan's own branch and supersede, as before. Direct with an
+ * empty surfaces port: stage it. Direct with a surfaces port: a person reviews
+ * it in a PR, so the PR plan is taken now, for this same tag only (anything
+ * else opens nothing).
+ */
+export function route(o: {
+  direct: boolean;
+  surfacesChanged: boolean;
+  tag: string;
+  planned: { branch: string; supersede?: number };
+  prPlan: () => Plan;
+}):
+  | { route: "direct" }
+  | {
+      route: "pr";
+      pr: boolean;
+      branch: string;
+      supersede?: number;
+      why: string;
+    } {
+  if (!o.direct)
+    return { route: "pr", pr: true, ...o.planned, why: "PIN_BUMP_DIRECT is off" };
+  if (!o.surfacesChanged) return { route: "direct" };
+  const p = o.prPlan();
+  if (!p.bump || p.tag !== o.tag)
+    return {
+      route: "pr",
+      pr: false,
+      branch: "",
+      why: p.bump ? `the PR plan is for ${p.tag}, not ${o.tag}` : p.why,
+    };
+  return {
+    route: "pr",
+    pr: true,
+    branch: branchOf(p.tag),
+    supersede: p.supersede,
+    why: `the surfaces port is not empty: ${o.tag} goes to a PR for a person`,
+  };
+}
 
 type CompareFile = { filename: string; status: string; sha: string };
 type Compare = {
@@ -438,6 +489,7 @@ type GitCommit = {
 };
 
 const NOT_FAST_FORWARD = /not a fast.?forward/i;
+const ALREADY_EXISTS = /already exists/i;
 
 /**
  * POSTs a JSON body (from a file: gh api reads a nested body only that way) and
@@ -457,25 +509,113 @@ function post(exec: Exec, repo: string, path: string, body: unknown): string {
   return sha;
 }
 
+const reader = (exec: Exec, repo: string) => {
+  const api = (path: string, extra: string[] = []) =>
+    gh(exec, ["api", `repos/${repo}/${path}`, ...extra]);
+  return {
+    api,
+    json: <T>(path: string): T => JSON.parse(api(path)) as T,
+    raw: (file: string, ref: string) =>
+      api(`contents/${file}?ref=${ref}`, [
+        "-H",
+        "Accept: application/vnd.github.raw",
+      ]),
+    sha: (path: string) => {
+      const s = api(path, ["-q", ".object.sha"]).trim();
+      if (!SHA.test(s)) throw new Error(`${path} resolved to '${s}'`);
+      return s;
+    },
+  };
+};
+
 /**
- * Direct mode (cloud #264): moves main to the pin commit, never with force.
- * Refuses unless the commit's one parent is `base`, it changes only PIN_FILES
- * (PUBLIC_PIN and SYNCED_FROM among them, each a plain modification), and both
- * pin files name exactly `tag` and `sha`. When main has moved on paths that
- * cannot touch the lockfile, the same file blobs are committed again on main's
- * head; a lockfile-sensitive move is refused, so the next run regenerates.
- * A main whose pin is already `tag` or newer is left alone.
+ * The pin commit is one step on `parent`, changes only DIRECT_FILES (PUBLIC_PIN
+ * and SYNCED_FROM among them, each a plain modification), and both pin files
+ * name exactly `tag` and `sha`. Returns the changed files.
  */
-export function land(o: {
+function checkPinCommit(
+  r: ReturnType<typeof reader>,
+  parent: string,
+  commit: string,
+  tag: string,
+  sha: string,
+): CompareFile[] {
+  const diff = r.json<Compare>(`compare/${parent}...${commit}`);
+  if (diff.status !== "ahead" || diff.ahead_by !== 1)
+    throw new Error(
+      `${commit} is not one commit ahead of ${parent} (${diff.status}, ${diff.ahead_by} ahead)`,
+    );
+  const files = diff.files ?? [];
+  for (const f of files) {
+    if (!DIRECT_FILES.includes(f.filename))
+      throw new Error(
+        `the pin commit changes ${f.filename}: only ${DIRECT_FILES.join(", ")} land without a person`,
+      );
+    if (f.status !== "modified")
+      throw new Error(`the pin commit's ${f.filename} is ${f.status}`);
+  }
+  for (const f of REQUIRED_FILES)
+    if (!files.some((x) => x.filename === f))
+      throw new Error(`the pin commit does not change ${f}`);
+  for (const f of REQUIRED_FILES) {
+    const text = r.raw(f, commit);
+    if (pinField(text, "tag") !== tag || pinField(text, "sha") !== sha)
+      throw new Error(
+        `${f} in the pin commit is ${pinField(text, "tag")} ${pinField(text, "sha")}, not ${tag} ${sha}`,
+      );
+  }
+  return files;
+}
+
+/** Points `branch` at `sha`: creates it, or moves an existing one with force. */
+function pointBranch(exec: Exec, repo: string, branch: string, sha: string) {
+  try {
+    gh(
+      exec,
+      [
+        "api",
+        "-X",
+        "POST",
+        `repos/${repo}/git/refs`,
+        "-f",
+        `ref=refs/heads/${branch}`,
+        "-f",
+        `sha=${sha}`,
+      ],
+      { write: true },
+    );
+  } catch (e) {
+    if (!ALREADY_EXISTS.test(String(e))) throw e;
+    gh(
+      exec,
+      [
+        "api",
+        "-X",
+        "PATCH",
+        `repos/${repo}/git/refs/heads/${branch}`,
+        "-f",
+        `sha=${sha}`,
+        "-F",
+        "force=true",
+      ],
+      { write: true, idempotent: true },
+    );
+  }
+}
+
+/**
+ * Direct mode, step 1 (cloud #264): checks the fresh pin commit and pushes it to
+ * pin-land/<tag>, where CI runs in full. Main does not move here: `land` moves
+ * it only once every required check is green on that exact sha.
+ */
+export function stage(o: {
   exec: Exec;
   repo: string;
   base: string;
   commit: string;
   tag: string;
   sha: string;
-}):
-  | { action: "landed"; sha: string; rebuilt: boolean }
-  | { action: "already"; why: string } {
+}): { branch: string; sha: string } {
   parts(o.tag);
   for (const [k, v] of [
     ["base", o.base],
@@ -483,97 +623,132 @@ export function land(o: {
     ["sha", o.sha],
   ] as const)
     if (!SHA.test(v)) throw new Error(`--${k} ${v} isn't a full sha`);
-  const api = (path: string, extra: string[] = []) =>
-    gh(o.exec, ["api", `repos/${o.repo}/${path}`, ...extra]);
-  const json = <T>(path: string): T => JSON.parse(api(path)) as T;
-  const raw = (file: string, ref: string) =>
-    api(`contents/${file}?ref=${ref}`, [
-      "-H",
-      "Accept: application/vnd.github.raw",
-    ]);
-
-  // a) The commit is one step on base and changes only the pin files.
-  const c = json<GitCommit>(`git/commits/${o.commit}`);
+  const r = reader(o.exec, o.repo);
+  const c = r.json<GitCommit>(`git/commits/${o.commit}`);
   if (c.parents.length !== 1 || c.parents[0]?.sha !== o.base)
     throw new Error(
       `${o.commit}'s parents are [${c.parents.map((p) => p.sha).join(", ")}], not just ${o.base}`,
     );
-  const diff = json<Compare>(`compare/${o.base}...${o.commit}`);
-  if (diff.status !== "ahead" || diff.ahead_by !== 1)
-    throw new Error(
-      `${o.commit} is not one commit ahead of ${o.base} (${diff.status}, ${diff.ahead_by} ahead)`,
-    );
-  const files = diff.files ?? [];
-  for (const f of files) {
-    if (!(PIN_FILES as readonly string[]).includes(f.filename))
-      throw new Error(`the pin commit changes ${f.filename}, not a pin file`);
-    if (f.status !== "modified")
-      throw new Error(`the pin commit's ${f.filename} is ${f.status}`);
-  }
-  for (const r of REQUIRED_FILES)
-    if (!files.some((f) => f.filename === r))
-      throw new Error(`the pin commit does not change ${r}`);
-  // The pin files name the planned tag and sha.
-  for (const f of REQUIRED_FILES) {
-    const text = raw(f, o.commit);
-    if (pinField(text, "tag") !== o.tag || pinField(text, "sha") !== o.sha)
-      throw new Error(
-        `${f} in the pin commit is ${pinField(text, "tag")} ${pinField(text, "sha")}, not ${o.tag} ${o.sha}`,
-      );
-  }
+  checkPinCommit(r, o.base, o.commit, o.tag, o.sha);
+  const branch = landBranchOf(o.tag);
+  pointBranch(o.exec, o.repo, branch, o.commit);
+  return { branch, sha: o.commit };
+}
 
-  for (let attempt = 1; ; attempt++) {
-    // b) Where main is now.
-    const main = gh(o.exec, [
-      "api",
-      `repos/${o.repo}/git/ref/heads/main`,
-      "-q",
-      ".object.sha",
-    ]).trim();
-    if (!SHA.test(main)) throw new Error(`main resolved to '${main}'`);
-    if (main === o.commit)
-      return { action: "already", why: `main is already ${o.commit}` };
-    const mainTag = pinField(raw("PUBLIC_PIN", main), "tag");
-    if (compareTags(mainTag, o.tag) >= 0)
-      return {
-        action: "already",
-        why: `main's PUBLIC_PIN is ${mainTag}, not older than ${o.tag}`,
-      };
-    let target = o.commit;
-    if (main !== o.base) {
-      const moved = json<Compare>(`compare/${o.base}...${main}`);
-      if (moved.status !== "ahead" || moved.behind_by !== 0)
-        throw new Error(
-          `main ${main} is not ahead of ${o.base} (${moved.status}); rerun pin-bump`,
-        );
-      const changed = moved.files ?? [];
-      // compare lists at most 300 files: a list that long may be cut short.
-      if (changed.length >= 300)
-        throw new Error(
-          `main moved by ${changed.length} files or more; rerun pin-bump`,
-        );
-      const hit = changed.find((f) => lockfileSensitive(f.filename));
-      if (hit)
-        throw new Error(
-          `main moved under a lockfile-sensitive change (${hit.filename}); rerun pin-bump`,
-        );
-      // The same blobs, on main's tree, in a commit on main.
-      const mainTree = json<GitCommit>(`git/commits/${main}`).tree.sha;
-      const tree = post(o.exec, o.repo, "git/trees", {
-        base_tree: mainTree,
-        tree: files.map((f) => ({
-          path: f.filename,
-          mode: "100644",
-          type: "blob",
-          sha: f.sha,
-        })),
-      });
-      target = post(o.exec, o.repo, "git/commits", {
-        message: c.message,
-        tree,
-        parents: [main],
-      });
-    }
+export type LandResult =
+  | { action: "landed"; sha: string }
+  | { action: "retest"; sha: string; why: string }
+  | { action: "waiting"; why: string }
+  | { action: "already"; why: string };
+
+/** Best effort: a branch left behind is deleted by the next run. */
+function dropBranch(exec: Exec, repo: string, branch: string) {
+  try {
+    gh(exec, ["api", "-X", "DELETE", `repos/${repo}/git/refs/heads/${branch}`], {
+      write: true,
+    });
+  } catch (e) {
+    console.error(`pin-bump: could not delete ${branch}: ${String(e)}`);
+  }
+}
+
+/**
+ * Direct mode, step 2 (cloud #264): lands one pin-land/<tag> branch. Its head
+ * must be the release bot's verified commit, one step on its parent, changing
+ * only DIRECT_FILES to the public tag's sha, with every required check of
+ * main's ruleset green on that exact sha (pending waits; red throws, and the
+ * branch stays for a person). Then main fast-forwards to it, never with force.
+ * When main has moved off the parent on paths that cannot touch the lockfile,
+ * the same blobs are committed on main's head and pushed to the branch, so CI
+ * runs again on what would land; a lockfile-sensitive move drops the branch and
+ * throws, so the next pin-bump run regenerates.
+ * `exec` writes (the App token); `read` reads (the job token, checks: read).
+ */
+export function landBranch(o: {
+  exec: Exec;
+  read: Exec;
+  repo: string;
+  publicRepo: string;
+  branch: string;
+}): LandResult {
+  const m = /^pin-land\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/.exec(o.branch);
+  if (!m?.[1]) throw new Error(`${o.branch} is not ${LAND_PREFIX}vX.Y.Z`);
+  const tag = m[1];
+  const r = reader(o.read, o.repo);
+  let main = r.sha("git/ref/heads/main");
+  const mainTag = pinField(r.raw("PUBLIC_PIN", main), "tag");
+  if (compareTags(mainTag, tag) >= 0) {
+    dropBranch(o.exec, o.repo, o.branch);
+    return {
+      action: "already",
+      why: `main's PUBLIC_PIN is ${mainTag}, not older than ${tag}`,
+    };
+  }
+  const head = r.sha(`git/ref/heads/${o.branch}`);
+  const hc = r.json<{
+    author: { login?: string } | null;
+    committer: { login?: string } | null;
+    parents: { sha: string }[];
+    commit: { message: string; verification?: { verified?: boolean } };
+  }>(`commits/${head}`);
+  const who = {
+    author: hc.author?.login ?? "",
+    committer: hc.committer?.login ?? "",
+    verified: hc.commit.verification?.verified === true,
+  };
+  if (!commitOk(who))
+    throw new Error(
+      `${o.branch} at ${head} is not ${BOT}'s verified commit (${who.author}, ${who.committer}, verified ${who.verified}); left for a person`,
+    );
+  const parent = hc.parents.length === 1 ? hc.parents[0]?.sha : undefined;
+  if (!parent)
+    throw new Error(`${head} has ${hc.parents.length} parents, not one`);
+  const sha = resolveSha(o.read, o.publicRepo, tag);
+  const files = checkPinCommit(r, parent, head, tag, sha);
+
+  // Every required check of main's ruleset, by GitHub Actions, on this sha.
+  const required = requiredChecks(r.api("rules/branches/main"));
+  if (required.length === 0)
+    throw new Error("main's required checks could not be read");
+  const runs = (
+    JSON.parse(
+      gh(o.read, [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${o.repo}/commits/${head}/check-runs?filter=latest&per_page=100`,
+      ]),
+    ) as {
+      check_runs: {
+        name: string;
+        status: string;
+        conclusion: string | null;
+        app?: { slug?: string } | null;
+      }[];
+    }[]
+  )
+    .flatMap((pg) => pg.check_runs)
+    .filter((c) => c.app?.slug === "github-actions");
+  const pending: string[] = [];
+  for (const name of required) {
+    const got = runs.filter((c) => c.name === name);
+    const red = got.find(
+      (c) => c.status === "completed" && c.conclusion !== "success",
+    );
+    if (red)
+      throw new Error(
+        `required check ${name} is ${red.conclusion} on ${o.branch} at ${head}: a port may be needed (README, "Hand-porting a public fix"); the branch stays for a person`,
+      );
+    if (got.length === 0 || got.some((c) => c.status !== "completed"))
+      pending.push(name);
+  }
+  if (pending.length > 0)
+    return {
+      action: "waiting",
+      why: `${pending.join(", ")} not done on ${head}`,
+    };
+
+  if (main === parent) {
     try {
       // force=false: GitHub refuses anything but a fast-forward.
       gh(
@@ -584,19 +759,91 @@ export function land(o: {
           "PATCH",
           `repos/${o.repo}/git/refs/heads/main`,
           "-f",
-          `sha=${target}`,
+          `sha=${head}`,
           "-F",
           "force=false",
         ],
         { write: true, idempotent: true },
       );
-      return { action: "landed", sha: target, rebuilt: target !== o.commit };
+      dropBranch(o.exec, o.repo, o.branch);
+      return { action: "landed", sha: head };
     } catch (e) {
-      // c) main moved between the read and the write: read again.
-      if (NOT_FAST_FORWARD.test(String(e)) && attempt < LAND_ATTEMPTS) continue;
-      throw e;
+      // main moved between the read and the write: rebuild on the new main.
+      if (!NOT_FAST_FORWARD.test(String(e))) throw e;
+      main = r.sha("git/ref/heads/main");
     }
   }
+  const moved = r.json<Compare>(`compare/${parent}...${main}`);
+  const changed = moved.files ?? [];
+  // compare lists at most 300 files: a list that long may be cut short.
+  const why =
+    moved.status !== "ahead" || moved.behind_by !== 0
+      ? `main ${main} is not ahead of ${parent} (${moved.status})`
+      : changed.length >= 300
+        ? `main moved by ${changed.length} files or more`
+        : changed
+            .filter((f) => lockfileSensitive(f.filename))
+            .map((f) => `a lockfile-sensitive change (${f.filename})`)[0];
+  if (why) {
+    dropBranch(o.exec, o.repo, o.branch);
+    throw new Error(`${why}; the next pin-bump run regenerates ${tag}`);
+  }
+  // The same blobs, on main's tree, in a commit on main; CI runs on it next.
+  const mainTree = r.json<GitCommit>(`git/commits/${main}`).tree.sha;
+  const tree = post(o.exec, o.repo, "git/trees", {
+    base_tree: mainTree,
+    tree: files.map((f) => ({
+      path: f.filename,
+      mode: "100644",
+      type: "blob",
+      sha: f.sha,
+    })),
+  });
+  const next = post(o.exec, o.repo, "git/commits", {
+    message: hc.commit.message,
+    tree,
+    parents: [main],
+  });
+  pointBranch(o.exec, o.repo, o.branch, next);
+  return {
+    action: "retest",
+    sha: next,
+    why: `main moved to ${main}; ${o.branch} rebuilt on it, CI runs again`,
+  };
+}
+
+/** Lands every pin-land/* branch in turn; any one that throws makes the whole run red. */
+export function land(o: {
+  exec: Exec;
+  read: Exec;
+  repo: string;
+  publicRepo: string;
+}): { branch: string; result?: LandResult; error?: string }[] {
+  const refs = JSON.parse(
+    gh(o.read, [
+      "api",
+      `repos/${o.repo}/git/matching-refs/heads/${LAND_PREFIX}`,
+    ]),
+  ) as { ref: string }[];
+  return refs
+    .map((x) => x.ref.replace(/^refs\/heads\//, ""))
+    .map((branch) => {
+      try {
+        return { branch, result: landBranch({ ...o, branch }) };
+      } catch (e) {
+        return { branch, error: String(e instanceof Error ? e.message : e) };
+      }
+    });
+}
+
+/** Whether pin-land/<tag> exists (a staged bump that `land` has not finished). */
+export function staged(exec: Exec, repo: string, tag: string): boolean {
+  const want = `refs/heads/${landBranchOf(tag)}`;
+  return (
+    JSON.parse(
+      gh(exec, ["api", `repos/${repo}/git/matching-refs/heads/${landBranchOf(tag)}`]),
+    ) as { ref: string }[]
+  ).some((x) => x.ref === want);
 }
 
 const realExec: Exec = (cmd, args) => {
@@ -606,6 +853,12 @@ const realExec: Exec = (cmd, args) => {
     stdout: r.stdout ?? "",
     stderr: r.stderr ?? "",
   };
+};
+
+const gitShow = (spec: string) => {
+  const r = spawnSync("git", ["show", spec], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`git show ${spec}: ${r.stderr.trim()}`);
+  return r.stdout;
 };
 
 const flag = (argv: string[], name: string, fallback?: string) => {
@@ -643,6 +896,7 @@ function main(argv: string[]) {
   if (mode === "plan-direct") {
     const p = planDirect({
       exec: realExec,
+      repo: flag(argv, "repo"),
       publicRepo: flag(argv, "public", PUBLIC_REPO),
       pin: readFileSync("PUBLIC_PIN", "utf8"),
     });
@@ -652,8 +906,41 @@ function main(argv: string[]) {
     );
     return;
   }
-  if (mode === "land") {
-    const r = land({
+  if (mode === "route") {
+    const surfaces = flag(argv, "surfaces");
+    if (surfaces !== "changed" && surfaces !== "same")
+      throw new Error(`--surfaces ${surfaces} isn't changed or same`);
+    const repo = flag(argv, "repo");
+    const r = route({
+      direct: flag(argv, "direct") === "on",
+      surfacesChanged: surfaces === "changed",
+      tag: flag(argv, "tag"),
+      planned: {
+        branch: argv.includes("--branch") ? flag(argv, "branch") : "",
+        supersede: supersedeOf(argv),
+      },
+      prPlan: () =>
+        plan({
+          exec: realExec,
+          repo,
+          publicRepo: flag(argv, "public", PUBLIC_REPO),
+          // main's own pin: the working tree's was already moved by apply.
+          pin: gitShow("HEAD:PUBLIC_PIN"),
+        }),
+    });
+    if (r.route === "direct") {
+      console.error("pin-bump: route=direct");
+      console.log("route=direct\npr=false\nbranch=\nsupersede=");
+    } else {
+      console.error(`pin-bump: route=pr pr=${r.pr} ${r.why}`);
+      console.log(
+        `route=pr\npr=${r.pr}\nbranch=${r.branch}\nsupersede=${r.supersede ?? ""}`,
+      );
+    }
+    return;
+  }
+  if (mode === "stage") {
+    const r = stage({
       exec: realExec,
       repo: flag(argv, "repo"),
       base: flag(argv, "base"),
@@ -661,15 +948,39 @@ function main(argv: string[]) {
       tag: flag(argv, "tag"),
       sha: flag(argv, "sha"),
     });
-    if (r.action === "landed") {
+    console.error(
+      `pin-bump: staged ${r.sha} on ${r.branch}; main moves when CI is green on it`,
+    );
+    return;
+  }
+  if (mode === "land") {
+    const token = process.env.READ_TOKEN;
+    if (!token) throw new Error("land reads with READ_TOKEN, which is unset");
+    const results = land({
+      exec: realExec,
+      read: (cmd, args) => {
+        const r = spawnSync(cmd, args, {
+          encoding: "utf8",
+          env: { ...process.env, GH_TOKEN: token },
+        });
+        return {
+          code: r.status ?? 1,
+          stdout: r.stdout ?? "",
+          stderr: r.stderr ?? "",
+        };
+      },
+      repo: flag(argv, "repo"),
+      publicRepo: flag(argv, "public", PUBLIC_REPO),
+    });
+    for (const x of results)
       console.error(
-        `pin-bump: main is now ${r.sha}${r.rebuilt ? " (rebuilt on a moved main)" : ""}`,
+        x.error
+          ? `pin-bump: ${x.branch}: ${x.error}`
+          : `pin-bump: ${x.branch}: ${x.result?.action} ${JSON.stringify(x.result)}`,
       );
-      console.log(`landed=${r.sha}`);
-    } else {
-      console.error(`pin-bump: nothing to land: ${r.why}`);
-      console.log("landed=");
-    }
+    if (results.length === 0) console.error("pin-bump: nothing staged");
+    if (results.some((x) => x.error))
+      throw new Error("a staged pin could not land (above)");
     return;
   }
   if (mode === "apply") {
@@ -690,7 +1001,7 @@ function main(argv: string[]) {
     return;
   }
   throw new Error(
-    "usage: pin-bump.ts <plan|plan-direct|apply|open-pr|land> ...",
+    "usage: pin-bump.ts <plan|plan-direct|route|stage|land|apply|open-pr> ...",
   );
 }
 
