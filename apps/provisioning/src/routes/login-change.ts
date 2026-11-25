@@ -247,7 +247,9 @@ FROM installs i JOIN install_lifecycle l ON l.install_id = i.id WHERE i.id = ?1`
 const isConstraint = (e: unknown) =>
   e instanceof Error && /constraint/i.test(e.message);
 
-const parseVars = (raw: string | null): Record<string, string> | null => {
+export const parseVars = (
+  raw: string | null,
+): Record<string, string> | null => {
   if (raw === null) return null;
   try {
     const v = JSON.parse(raw) as unknown;

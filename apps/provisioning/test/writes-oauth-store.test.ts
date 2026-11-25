@@ -55,6 +55,11 @@ const docsInContract = SetOAuthStoreSchema.safeParse({
   requestId: "a".repeat(16),
   vars: { DOCS_PREVIEW: "1" },
 }).success;
+/** The pinned contract may not take AUTH_PROVIDERS yet (cloud#435). */
+const authInContract = SetOAuthStoreSchema.safeParse({
+  requestId: "a".repeat(16),
+  vars: { AUTH_PROVIDERS: "google,email" },
+}).success;
 const params = (id: string) => ({ id });
 const setBody = (mode: string) => ({
   requestId: requestId(),
@@ -195,6 +200,64 @@ describe("R29 set the OAuth store", () => {
       body: setBody("d1"),
     });
     expect(r.status).toBe(202);
+  });
+
+  describe.skipIf(!authInContract)("AUTH_PROVIDERS (cloud#435)", () => {
+    const auth = (v: string) => ({
+      requestId: requestId(),
+      vars: { AUTH_PROVIDERS: v },
+    });
+    it.each(["google,email", "google"])(
+      "%s on a Google install (prod too) is an update job with that var alone",
+      async (v) => {
+        const e = fakeEnv({ OA_ENV: "prod" });
+        const { id } = await onMode();
+        const r = await call(e, GRANT, "R29", {
+          params: params(id),
+          body: auth(v),
+        });
+        expect(r.status).toBe(202);
+        expect(r.body.job).toMatchObject({
+          kind: "update",
+          args: { vars: { AUTH_PROVIDERS: v } },
+        });
+      },
+    );
+    it("refused before any write on an install without Google", async () => {
+      const e = fakeEnv();
+      const { id } = await seedInstall({
+        vars: { ...VARS, AUTH_PROVIDERS: "email" },
+      });
+      const r = await call(e, GRANT, "R29", {
+        params: params(id),
+        body: auth("google,email"),
+      });
+      expect(r.code).toBe("invalid_state");
+      expect(e.manageInstall.created).toHaveLength(0);
+    });
+    it("refused with EMAIL_CODE_DOMAIN set", async () => {
+      const e = fakeEnv();
+      const { id } = await seedInstall({
+        vars: { ...VARS, EMAIL_CODE_DOMAIN: "on" },
+      });
+      const r = await call(e, GRANT, "R29", {
+        params: params(id),
+        body: auth("google,email"),
+      });
+      expect(r.code).toBe("invalid_state");
+    });
+    it("never turns Google off or on: other values are invalid_input", async () => {
+      const e = fakeEnv();
+      const { id } = await onMode();
+      for (const v of ["email", "email,google", "google,access"]) {
+        const r = await call(e, GRANT, "R29", {
+          params: params(id),
+          body: auth(v),
+        });
+        expect(r.code, v).toBe("invalid_input");
+      }
+      expect(e.manageInstall.created).toHaveLength(0);
+    });
   });
 
   it("a suspended install is refused", async () => {
