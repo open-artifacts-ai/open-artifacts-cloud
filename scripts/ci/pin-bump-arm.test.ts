@@ -1456,9 +1456,17 @@ describe("workflow", () => {
     for (const ev of ["schedule", "push", "workflow_dispatch"])
       expect(cond).toContain(`github.event_name == '${ev}'`);
     expect(wf.on.workflow_run).toEqual({
-      workflows: ["CI"],
+      workflows: ["CI", "prod-release-chain"],
       types: ["completed"],
     });
+    // A bump that waited on an open candidate re-plans when the prod chain ends
+    // (cloud #264): CI only counts on a bump branch, the chain on any branch.
+    expect(cond).toContain(
+      "startsWith(github.event.workflow_run.head_branch, 'pin-bump/')",
+    );
+    expect(cond).toContain(
+      "github.event.workflow_run.name == 'prod-release-chain'",
+    );
     expect(wf.concurrency["cancel-in-progress"]).toBe(false);
     expect(wf.permissions).toEqual({});
   });
