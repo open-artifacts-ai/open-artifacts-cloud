@@ -19,7 +19,10 @@ import {
   FLEET_BLOCKED_MS,
   FLEET_BLOCKED_PREFIX,
   FLEET_CONCURRENCY,
+  FLEET_FAIL_GAP_MS,
   FLEET_FAIL_PREFIX,
+  FLEET_FAST_BUDGET_MS,
+  FLEET_FAST_POLL_MS,
   FLEET_HALT_ALERT_MS,
   FLEET_KEEP_MS,
   FLEET_RETRY_PREFIX,
@@ -35,8 +38,8 @@ import {
   fleetBlockedMs,
   fleetConditions,
   fleetDue,
+  fleetFast,
   fleetRequestId,
-  fleetSecond,
   fleetSmokeMode,
   fleetSoakOffMs,
   fleetTarget,
@@ -118,7 +121,6 @@ const release = (version: string, installable = true) => ({
 function fakes(
   o: {
     canary?: string;
-    second?: string;
     /** The canary smoke's answers in turn (the last repeats); default pass. */
     smoke?: SmokeResult[];
     tag?: string;
@@ -150,7 +152,6 @@ function fakes(
       releases: o.releases ?? [release(tag.slice(1))],
     }),
     FLEET_CANARY: o.canary ?? "",
-    ...(o.second === undefined ? {} : { FLEET_SECOND: o.second }),
     CF_VERSION_METADATA: {
       id: "x",
       tag,
@@ -730,12 +731,21 @@ describe("the rollout", () => {
     ]);
   });
 
-  it("the rest wait while the canary hasn't soaked on the target", async () => {
+  it("the rest wait while the canary on the target hasn't answered a healthy probe", async () => {
     const canary = await on(TARGET);
     await on("0.92.0");
-    const f = fakes({ canary });
+    const f = fakes({ canary, answers: new Map([[canary, "down"]]) });
     await fleetDue(f.env, NOW, f.opts);
     expect(await fleetJobs()).toEqual([]);
+  });
+
+  it("#433: one healthy probe and the smoke, and the rest start in the same pass", async () => {
+    const canary = await on(TARGET);
+    const rest = await on("0.92.0");
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    expect(f.smokes).toHaveLength(1);
+    expect(await queued()).toEqual([rest]);
   });
 
   it("canary soaked: the rest, oldest first, one batch of FLEET_CONCURRENCY", async () => {
@@ -776,14 +786,15 @@ describe("soak", () => {
     expect(await queued()).toEqual([rest]);
   });
 
-  it("no settle: one passing probe never releases a batch, nor two in one tick's time", async () => {
+  it("#433: no settle wait: one passing probe settles the canary", async () => {
     const canary = await on(TARGET, { created: 0 });
     await on("0.92.0", { created: 5 });
     const f = fakes({ canary });
     await fleetDue(f.env, NOW, f.opts);
-    await fleetDue(f.env, NOW + FLEET_SOAK_MS - 1, f.opts);
-    expect(await queued()).toEqual([]);
-    expect(await stateKeys(FLEET_SOAKED_PREFIX)).toEqual([]);
+    expect(await stateKeys(FLEET_SOAKED_PREFIX)).toEqual([
+      `${FLEET_SOAKED_PREFIX}${TARGET}:${canary}`,
+    ]);
+    expect(FLEET_SOAK_MS).toBe(0);
   });
 
   it("a canary on the target with no fleet upgrade soaks all the same", async () => {
@@ -794,33 +805,40 @@ describe("soak", () => {
     expect(await queued()).toEqual([rest]);
   });
 
-  it("a failed probe restarts the soak", async () => {
+  // With the smoke off (staging), the passive soak's clock: 4 minutes here.
+  const SOAK = 4 * MIN;
+  const passive = (f: ReturnType<typeof fakes>) =>
+    Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "4" });
+
+  it("smoke off: a failed probe restarts the soak", async () => {
     const { canary, id } = await upgraded();
     const f = fakes({ canary });
+    passive(f);
     await fleetDue(f.env, NOW, f.opts);
     f.answers.set(id, "down");
     await fleetDue(f.env, NOW + 2 * MIN, f.opts);
     f.answers.delete(id);
-    await ticks(f, NOW + 4 * MIN, NOW + 4 * MIN + FLEET_SOAK_MS - 2 * MIN);
+    await ticks(f, NOW + 4 * MIN, NOW + 4 * MIN + SOAK - 2 * MIN);
     expect(await stateKeys(FLEET_SOAKED_PREFIX)).toEqual([
       `${FLEET_SOAKED_PREFIX}${TARGET}:${canary}`,
     ]);
-    await fleetDue(f.env, NOW + 4 * MIN + FLEET_SOAK_MS, f.opts);
+    await fleetDue(f.env, NOW + 4 * MIN + SOAK, f.opts);
     expect(await stateKeys(FLEET_SOAKED_PREFIX)).toContain(
       `${FLEET_SOAKED_PREFIX}${TARGET}:${id}`,
     );
   });
 
-  it("a gap in the ticks doesn't count: over FLEET_SOAK_GAP_MS restarts the clock", async () => {
+  it("smoke off: a gap in the ticks doesn't count: over FLEET_SOAK_GAP_MS restarts the clock", async () => {
     const { canary, id } = await upgraded();
     const f = fakes({ canary });
+    passive(f);
     await fleetDue(f.env, NOW, f.opts);
     const back = NOW + FLEET_SOAK_GAP_MS + MIN;
-    await ticks(f, back, back + FLEET_SOAK_MS - 2 * MIN);
+    await ticks(f, back, back + SOAK - 2 * MIN);
     expect(await stateKeys(FLEET_SOAKED_PREFIX)).not.toContain(
       `${FLEET_SOAKED_PREFIX}${TARGET}:${id}`,
     );
-    await fleetDue(f.env, back + FLEET_SOAK_MS, f.opts);
+    await fleetDue(f.env, back + SOAK, f.opts);
     expect(await stateKeys(FLEET_SOAKED_PREFIX)).toContain(
       `${FLEET_SOAKED_PREFIX}${TARGET}:${id}`,
     );
@@ -845,22 +863,25 @@ describe("soak", () => {
     const f = fakes({ canary });
     await fleetDue(f.env, NOW, f.opts);
     const jobs = await fleetJobs();
-    // Two finish and soak; one is still running.
-    await finish(jobs[0]?.id, "done", NOW + MIN);
-    await finish(jobs[1]?.id, "done", NOW + MIN);
-    await setVersion(ids[0] as string, TARGET);
-    await setVersion(ids[1] as string, TARGET);
-    await soaked(ids[0] as string);
-    await soaked(ids[1] as string);
+    // All but one finish and soak; the last is still running.
+    for (let i = 0; i < FLEET_CONCURRENCY - 1; i++) {
+      await finish(jobs[i]?.id, "done", NOW + MIN);
+      await setVersion(ids[i] as string, TARGET);
+      await soaked(ids[i] as string);
+    }
     await fleetDue(f.env, NOW + 2 * MIN, f.opts);
     expect(await fleetJobs()).toHaveLength(FLEET_CONCURRENCY);
-    // The last finishes, and holds until it soaks.
-    await finish(jobs[2]?.id, "done", NOW + 3 * MIN);
-    await setVersion(ids[2] as string, TARGET);
-    await ticks(f, NOW + 4 * MIN, NOW + 4 * MIN + FLEET_SOAK_MS - 2 * MIN);
+    // The last finishes, and holds until it answers a healthy probe: down
+    // once, then up.
+    const last = ids[FLEET_CONCURRENCY - 1] as string;
+    await finish(jobs[FLEET_CONCURRENCY - 1]?.id, "done", NOW + 3 * MIN);
+    await setVersion(last, TARGET);
+    f.answers.set(last, "down");
+    await fleetDue(f.env, NOW + 4 * MIN, f.opts);
     expect(await fleetJobs()).toHaveLength(FLEET_CONCURRENCY);
-    await fleetDue(f.env, NOW + 4 * MIN + FLEET_SOAK_MS, f.opts);
-    expect(await queued()).toEqual([ids[3]]);
+    f.answers.delete(last);
+    await fleetDue(f.env, NOW + 6 * MIN, f.opts);
+    expect(await queued()).toEqual([ids[FLEET_CONCURRENCY]]);
   });
 
   it("the watch runs with no canary set", async () => {
@@ -954,15 +975,31 @@ describe("halts", () => {
     );
   });
 
-  it("item 2: a pass doesn't reset a failure, so flapping halts", async () => {
+  it("item 2: a pass doesn't reset a failure, so a later failure halts", async () => {
+    const { canary, id } = await upgraded();
+    const other = await on(TARGET, { created: 6 });
+    await fleetJob(other, { finished_at: NOW - MIN });
+    const f = fakes({
+      canary,
+      answers: new Map([
+        [id, "down"],
+        [other, "0.92.0"],
+      ]),
+    });
+    await fleetDue(f.env, NOW, f.opts);
+    // id passes (and settles); other still answers wrong, a tick later.
+    f.answers.delete(id);
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect(await marks()).toEqual([`fleet_halt:${TARGET}:${other}`]);
+  });
+
+  it("#433: a second failure under FLEET_FAIL_GAP_MS after the first doesn't halt; at it, it does", async () => {
     const { canary, id } = await upgraded();
     const f = fakes({ canary, answers: new Map([[id, "down"]]) });
     await fleetDue(f.env, NOW, f.opts);
-    f.answers.delete(id);
-    // One pass (it settles only after two), then a failure again.
-    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
-    f.answers.set(id, "down");
-    await fleetDue(f.env, NOW + 4 * MIN, f.opts);
+    await fleetDue(f.env, NOW + FLEET_FAIL_GAP_MS - 1, f.opts);
+    expect(await marks()).toEqual([]);
+    await fleetDue(f.env, NOW + FLEET_FAIL_GAP_MS, f.opts);
     expect(await marks()).toEqual([`fleet_halt:${TARGET}:${id}`]);
   });
 
@@ -1160,13 +1197,14 @@ describe("halts", () => {
           await on("0.92.0", { created: 6 }),
           await on("0.92.0", { created: 7 }),
         ];
-        const later = await on("0.92.0", { created: 8 });
         const f = fakes({ canary });
         await fleetDue(f.env, NOW, f.opts);
         const batch = await fleetJobs();
+        // #433: everything behind at once.
         expect(batch.map((x) => x.install_id)).toEqual([m, ...peers]);
         const j = batch.find((x) => x.install_id === m);
         await refuse(j?.id, NOW + MIN);
+        const later = await on("0.92.0", { created: 8 });
         await ticks(f, NOW + 2 * MIN, NOW + 60 * MIN);
         expect(await marks()).toEqual([`fleet_halt:${TARGET}:${m}`]);
         const after = await fleetJobs();
@@ -1608,7 +1646,7 @@ describe("#1110 review: the batch gate", () => {
     expect(member).toBeTruthy();
   });
 
-  it("R25 on a job after it landed: the install soaks all the same, and holds", async () => {
+  it("R25 on a job after it landed: the install is probed all the same, and holds until healthy", async () => {
     const canary = await on(TARGET, { created: 0 });
     await soaked(canary);
     const member = await on(TARGET, { created: 5 });
@@ -1616,11 +1654,14 @@ describe("#1110 review: the batch gate", () => {
       status: "failed",
       error_code: "canceled",
     });
-    await on("0.92.0", { created: 9 });
-    const f = fakes({ canary });
+    const rest = await on("0.92.0", { created: 9 });
+    const f = fakes({ canary, answers: new Map([[member, "down"]]) });
     await fleetDue(f.env, NOW, f.opts);
     expect(f.probed).toContain(member);
     expect(await queued()).toEqual([]);
+    f.answers.delete(member);
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
+    expect(await queued()).toEqual([rest]);
   });
 
   it("the gate counts a landed, canceled job on its own, with the member out of the watch", async () => {
@@ -1727,8 +1768,8 @@ describe("#1110 review: canary_blocked is a catch-all", () => {
   it("R25 lands after the canary's upgrade did", async () => {
     const canary = await on(TARGET);
     await fleetJob(canary, { status: "failed", error_code: "canceled" });
-    const f = fakes({ canary, answers: new Map() });
-    // One tick: it hasn't settled yet (two passes), so the clock runs.
+    const f = fakes({ canary, answers: new Map([[canary, "down"]]) });
+    // One tick: its probe failed, so it hasn't settled and the clock runs.
     await fleetDue(f.env, NOW, f.opts);
     await opens(f);
   });
@@ -1799,10 +1840,17 @@ describe("#1110 review: halts count per version, and say so", () => {
 
   it("one failed probe on each of two installs, on separate ticks, halts the version", async () => {
     const { canary, a, b } = await two();
-    const f = fakes({ canary, answers: new Map([[a, "down"]]) });
+    // b is held back the first tick (it answers its old version: a failure
+    // too, but one failure per tick), then b fails again a tick later.
+    const f = fakes({
+      canary,
+      answers: new Map([
+        [a, "down"],
+        [b, "down"],
+      ]),
+    });
     await fleetDue(f.env, NOW, f.opts);
-    f.answers.clear();
-    f.answers.set(b, "down");
+    f.answers.delete(a);
     await fleetDue(f.env, NOW + 2 * MIN, f.opts);
     expect(await stateKeys("fleet_halt:")).toEqual([
       `fleet_halt:${TARGET}:${b}`,
@@ -2315,131 +2363,105 @@ describe("the alerts", () => {
   });
 });
 
-describe("#1343: FLEET_SECOND (leo) after the canary smoke", () => {
-  /** Ticks until `id`'s upgrade lands: done, on the target. */
-  async function land(id: string, at: number) {
-    const j = (await fleetJobs()).find((r) => r.install_id === id);
-    await finish(j?.id, "done", at);
-    await setVersion(id, TARGET);
-  }
-
-  it("FLEET_SECOND is an install id other than the canary", () => {
-    const a = installId();
-    const b = installId();
-    expect(fleetSecond(b, a)).toBe(b);
-    expect(fleetSecond(b, null)).toBe(b);
-    expect(fleetSecond(a, a)).toBeNull();
-    expect(fleetSecond("", a)).toBeNull();
-    expect(fleetSecond("leo", a)).toBeNull();
-    expect(fleetSecond(undefined, a)).toBeNull();
-  });
-
-  it("canary settles and passes the smoke, then leo alone, then batches of 3, oldest first", async () => {
+describe("#433: no timers, leo with the rest", () => {
+  it("canary healthy and smoked in one pass, then every install behind at once, oldest first", async () => {
     const canary = await on(TARGET, { created: 0 });
     await fleetJob(canary, { finished_at: NOW - MIN });
     const old = [];
-    for (let i = 0; i < FLEET_CONCURRENCY + 1; i++)
+    for (let i = 0; i < 5; i++)
       old.push(await on("0.92.0", { created: 1 + i }));
     const leo = await on("0.92.0", { created: 50 });
-    const f = fakes({ canary, second: leo });
-    // First pass: not settled, no smoke yet.
+    const f = fakes({ canary });
     await fleetDue(f.env, NOW, f.opts);
-    expect(f.smokes).toEqual([]);
-    expect(await queued()).toEqual([]);
-    // Second pass on a later tick: settled, smoked, leo goes alone.
-    await fleetDue(f.env, NOW + FLEET_SOAK_MS, f.opts);
     expect(f.smokes).toHaveLength(1);
     expect(f.smokes[0]).toMatchObject({ installId: canary, version: TARGET });
-    expect(await queued()).toEqual([leo]);
-    // While leo runs, and until it settles, no batch starts.
-    const t1 = NOW + FLEET_SOAK_MS + 2 * MIN;
-    await fleetDue(f.env, t1, f.opts);
-    await land(leo, t1 + MIN);
-    await fleetDue(f.env, t1 + 2 * MIN, f.opts);
-    expect(await queued()).toEqual([]);
-    await fleetDue(f.env, t1 + 4 * MIN, f.opts);
-    expect(await queued()).toEqual(old.slice(0, FLEET_CONCURRENCY));
+    expect(await queued()).toEqual([...old, leo]);
     // The smoke ran once for the version: a passed smoke is never rerun.
+    await fleetDue(f.env, NOW + 2 * MIN, f.opts);
     expect(f.smokes).toHaveLength(1);
   });
 
-  it("leo already on the target, or not eligible: the batches go as before", async () => {
+  it("FLEET_CONCURRENCY only bounds open upgrades: the next group goes once these are healthy", async () => {
     const canary = await on(TARGET, { created: 0 });
     await soaked(canary);
-    const leo = await on("0.92.0", { created: 0, suspended: true });
-    const rest = [];
+    const ids = [];
     for (let i = 0; i < FLEET_CONCURRENCY + 1; i++)
-      rest.push(await on("0.92.0", { created: 1 + i }));
-    const f = fakes({ canary, second: leo });
+      ids.push(await on("0.92.0", { created: 1 + i }));
+    const f = fakes({ canary });
     await fleetDue(f.env, NOW, f.opts);
-    expect(await queued()).toEqual(rest.slice(0, FLEET_CONCURRENCY));
+    expect(await queued()).toEqual(ids.slice(0, FLEET_CONCURRENCY));
   });
 
-  it("FLEET_SECOND equal to the canary changes nothing", async () => {
+  it("fleetFast re-checks a pending canary within the tick, and the rest start", async () => {
     const canary = await on(TARGET, { created: 0 });
-    await soaked(canary);
-    const rest = [];
-    for (let i = 0; i < FLEET_CONCURRENCY; i++)
-      rest.push(await on("0.92.0", { created: 1 + i }));
-    const f = fakes({ canary, second: canary });
-    await fleetDue(f.env, NOW, f.opts);
-    expect(await queued()).toEqual(rest);
+    await fleetJob(canary, { finished_at: NOW - MIN });
+    const rest = await on("0.92.0", { created: 5 });
+    const f = fakes({ canary, answers: new Map([[canary, "down"]]) });
+    let t = 0;
+    const slept: number[] = [];
+    await fleetFast(f.env, NOW, {
+      ...f.opts,
+      clock: () => t,
+      sleep: async (ms) => {
+        slept.push(ms);
+        t += ms;
+        // Healthy by the second check.
+        f.answers.delete(canary);
+      },
+    });
+    expect(slept).toEqual([FLEET_FAST_POLL_MS]);
+    expect(await queued()).toEqual([rest]);
+    // One failure, the pass 3 s later: no halt.
+    expect(await stateKeys(`fleet_halt:${TARGET}:`)).toEqual([]);
+  });
+
+  it("fleetFast stops at its budget, and a canary down the whole time doesn't halt inside it", async () => {
+    const canary = await on(TARGET, { created: 0 });
+    await fleetJob(canary, { finished_at: NOW - MIN });
+    await on("0.92.0", { created: 5 });
+    const f = fakes({ canary, answers: new Map([[canary, "down"]]) });
+    let t = 0;
+    let passes = 0;
+    const probe = f.opts.probe;
+    await fleetFast(f.env, NOW, {
+      ...f.opts,
+      probe: async (...a) => {
+        passes++;
+        return probe(...a);
+      },
+      clock: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+    });
+    // t = 0, 3, ... 18 s: never past the budget.
+    expect(passes).toBe(
+      Math.floor(FLEET_FAST_BUDGET_MS / FLEET_FAST_POLL_MS) + 1,
+    );
+    expect(FLEET_FAST_BUDGET_MS).toBeLessThan(FLEET_FAIL_GAP_MS);
+    expect(await stateKeys(`fleet_halt:${TARGET}:`)).toEqual([]);
+    expect(await queued()).toEqual([]);
+  });
+
+  it("fleetFast makes one pass when nothing waits on the canary", async () => {
+    const f = fakes({});
+    let slept = 0;
+    await fleetFast(f.env, NOW, {
+      ...f.opts,
+      clock: () => 0,
+      sleep: async () => {
+        slept++;
+      },
+    });
+    expect(slept).toBe(0);
   });
 
   it(
-    "leo's failed upgrade halts the version: no batch starts",
+    "with no canary, a required smoke is inert: no smoke, nothing queued, no alert",
     async () => {
-      const canary = await on(TARGET, { created: 0 });
-      await soaked(canary);
-      const leo = await on("0.92.0", { created: 50 });
-      const rest = await on("0.92.0", { created: 1 });
-      const f = fakes({ canary, second: leo });
-      await fleetDue(f.env, NOW, f.opts);
-      const [j] = await fleetJobs();
-      await finish(j?.id, "failed", NOW + MIN, "upgrade_incomplete");
-      await ticks(f, NOW + 2 * MIN, NOW + 20 * MIN);
-      expect(await stateKeys(`fleet_halt:${TARGET}:`)).toEqual([
-        `fleet_halt:${TARGET}:${leo}`,
-      ]);
-      expect((await fleetJobs()).map((r) => r.install_id)).not.toContain(rest);
-      // 10 ticks above: 10 x 93 ms x 3.
-    },
-    fleetTicksTimeout(10),
-  );
-
-  it(
-    "leo's job canceled before it landed: the batches still start",
-    async () => {
-      const canary = await on(TARGET, { created: 0 });
-      await soaked(canary);
-      const old = [];
-      for (let i = 0; i < FLEET_CONCURRENCY + 1; i++)
-        old.push(await on("0.92.0", { created: 1 + i }));
-      const leo = await on("0.92.0", { created: 50 });
-      const f = fakes({ canary, second: leo });
-      await fleetDue(f.env, NOW, f.opts);
-      expect(await queued()).toEqual([leo]);
-      // R25 cancels it: its request id for the target is spent, and leo stays
-      // on 0.92.0. That's no failure of the release, and no halt.
-      const [j] = await fleetJobs();
-      await finish(j?.id, "failed", NOW + MIN, "canceled");
-      await ticks(f, NOW + 2 * MIN, NOW + 2 * 60 * MIN);
-      expect(await stateKeys("fleet_halt:")).toEqual([]);
-      expect(await queued()).toEqual(old.slice(0, FLEET_CONCURRENCY));
-      expect(
-        (await fleetJobs()).filter((r) => r.install_id === leo),
-      ).toHaveLength(1);
-      // 60 ticks above (t = 2 to 120): 60 x 93 ms x 3.
-    },
-    fleetTicksTimeout(60),
-  );
-
-  it(
-    "with no canary, FLEET_SECOND and a required smoke are inert: no smoke, nothing queued, no alert",
-    async () => {
-      const leo = await on("0.92.0", { created: 0 });
+      await on("0.92.0", { created: 0 });
       await on("0.92.0", { created: 1 });
-      const f = fakes({ canary: "", second: leo });
+      const f = fakes({ canary: "" });
       // The smoke required, a 60-minute soak, no smoke token.
       Object.assign(f.env, { FLEET_SMOKE: "required", FLEET_SOAK_MIN: "60" });
       const lines = captureLogs(vi.spyOn);
@@ -2644,7 +2666,7 @@ describe("#1343: the canary smoke gates the rollout", () => {
   it("no smoke before the canary has settled", async () => {
     const canary = await on(TARGET, { created: 0 });
     await fleetJob(canary, { finished_at: NOW - MIN });
-    const f = fakes({ canary });
+    const f = fakes({ canary, answers: new Map([[canary, "down"]]) });
     await fleetDue(f.env, NOW, f.opts);
     expect(f.smokes).toEqual([]);
   });
@@ -2659,21 +2681,16 @@ describe("#1343: the canary smoke gates the rollout", () => {
     expect(await halted()).toEqual([`fleet_halt:${TARGET}:${id}`]);
   });
 
-  it("settle is two passes on separate ticks: one pass is not enough", async () => {
+  it("#433: settle is one passing probe", async () => {
     const canary = await on(TARGET, { created: 0 });
     await soaked(canary);
     const id = await on(TARGET, { created: 7 });
     await fleetJob(id, { finished_at: NOW - MIN });
     const f = fakes({ canary });
     await fleetDue(f.env, NOW, f.opts);
-    expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:${id}`)).toEqual(
-      [],
-    );
-    await fleetDue(f.env, NOW + FLEET_SOAK_MS, f.opts);
     expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:${id}`)).toEqual([
       `${FLEET_SOAKED_PREFIX}${TARGET}:${id}`,
     ]);
-    expect(FLEET_SOAK_MS).toBe(2 * MIN);
   });
 
   it("smoke marks of older versions are pruned with the rest", async () => {
