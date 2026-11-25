@@ -1,3 +1,4 @@
+import { OwnerVarsRefusal, withAuthProviders } from "@oa/provision";
 import {
   type ApiRouteId,
   type CancelJobSchema,
@@ -41,6 +42,7 @@ import {
 } from "../services/jobs.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
+import { parseVars } from "./login-change.js";
 import { releaseDeletedSignupSlug, slugState } from "./reads.js";
 
 // The lifecycle writes R5-R13 and R26 (3.4, 5.4-5.6), R25 cancel (3.6).
@@ -291,7 +293,30 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
     // open-artifacts#2641: DOCS_PREVIEW is staging only, either value. The
     // job's recheck and provision's metadata guard refuse it on prod too.
     // A narrow cast: the pinned contract may not name DOCS_PREVIEW yet.
-    const sent = body.vars as { OAUTH_STORE?: string; DOCS_PREVIEW?: string };
+    const sent = body.vars as {
+      OAUTH_STORE?: string;
+      DOCS_PREVIEW?: string;
+      AUTH_PROVIDERS?: string;
+    };
+    // cloud#435: email codes on or off, Google kept; what a create would
+    // refuse is refused now. The job checks the stored vars again.
+    if (sent.AUTH_PROVIDERS !== undefined) {
+      const stored = parseVars(row.install_vars);
+      if (!stored)
+        throw new ApiError("invalid_state", "the install has no vars");
+      try {
+        withAuthProviders(stored, sent.AUTH_PROVIDERS, {
+          source: row.source,
+          selfServeTier: a.env.SELF_SERVE_TIER,
+          testHooks: row.test_hooks === 1,
+          env: a.env.OA_ENV,
+        });
+      } catch (e) {
+        if (e instanceof OwnerVarsRefusal)
+          throw new ApiError("invalid_state", e.why);
+        throw e;
+      }
+    }
     if (sent.DOCS_PREVIEW !== undefined && a.env.OA_ENV !== "staging")
       throw new ApiError(
         "invalid_input",

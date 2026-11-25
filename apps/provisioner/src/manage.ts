@@ -41,6 +41,7 @@ import {
 import { codeOf } from "./errors.js";
 import { checkLoginJob, isLoginJob, loginRedeploy } from "./login-change.js";
 import {
+  checkAuthProviders,
   dropCopyKeySettled,
   leftKeyOpen,
   type OAuthOp,
@@ -139,6 +140,8 @@ export type ManageJob = {
   oauth?: OAuthOp;
   /** update: an instance's login-domain change (#2520), the platform's own job. */
   login?: boolean;
+  /** update with AUTH_PROVIDERS (cloud#435): the install's source, for ownerVars. */
+  source?: "admin" | "self-serve";
   /** upgrade, rollback: the install is already on `to`; nothing to do. */
   already?: boolean;
   /** purge: the skip reason for the directory revoke, if any. */
@@ -856,6 +859,20 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         env !== "staging"
       )
         throw refused("DOCS_PREVIEW is staging only");
+      // cloud#435: the stored vars with the new list pass now, and again
+      // right before the write (putMode).
+      if (oauth.op === "set" && oauth.authProviders !== undefined) {
+        if (!row || row.vars === null) throw refused("no installs vars");
+        checkAuthProviders(
+          storedVars(row.vars),
+          oauth.authProviders,
+          st.source,
+          ctx.env.SELF_SERVE_TIER,
+          out.testHooks,
+          env,
+        );
+        out.source = st.source;
+      }
       out.oauth = oauth;
       break;
     }
