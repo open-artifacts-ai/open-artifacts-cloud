@@ -110,7 +110,8 @@ describe("release-retry", () => {
       join(dir, "../../.github/workflows/prod-release-chain.yml"),
       "utf8",
     );
-    expect(chain).toMatch(/gh run watch|run watch|wait/i);
+    expect(chain).toContain("Dispatch the prod deploy and wait for its run");
+    expect(chain).toContain("Dispatch the prod publish and wait for its run");|run watch|wait/i);
   });
 
   it("backs off, then reruns only the failed jobs with an App token narrowed to actions, and never checks out code", () => {
