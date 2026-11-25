@@ -13,6 +13,7 @@ import {
   type Exec,
   GATE_WORKFLOWS,
   gateRefusal,
+  gateRejected,
   type Input,
   isChainProdDeploy,
   parseView,
@@ -819,6 +820,8 @@ const fake = (
     junkCount?: boolean;
     deployTitles?: string[];
     deepDeploy?: boolean;
+    /** The completed redline-staging runs, newest first. */
+    gateRuns?: { t: string; c: string | null; a: number }[];
     tagSha?: string;
     queue?: QueueRun[];
     headAt?: string;
@@ -836,6 +839,12 @@ const fake = (
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
     const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
     if (wr) {
+      if (wr[1] === "redline-staging.yml" && wr[2] === "completed") {
+        expect(a).toMatch(/per_page=20\b/);
+        expect(a).toContain("--jq");
+        if (o.junkCount) return ok("oops");
+        return ok(JSON.stringify(o.gateRuns ?? []));
+      }
       if (wr[2] !== "success") {
         expect(a).toMatch(/per_page=1\b/);
         expect(a).toContain("--jq");
@@ -1179,10 +1188,58 @@ describe("gateRefusal", () => {
       /candidate open: hosted-publish.yml/,
     );
   });
+  it("lets the next bump through when main's pin was rejected", () => {
+    expect(
+      gateRefusal({ ...idle, prodDeployed: false, rejected: true }),
+    ).toBeUndefined();
+    expect(
+      gateRefusal({
+        ...idle,
+        busy: ["redline-staging.yml"],
+        prodDeployed: false,
+        rejected: true,
+      }),
+    ).toMatch(/candidate open: redline-staging.yml/);
+  });
   it("refuses while main's pin has no prod deploy", () => {
     expect(gateRefusal({ ...idle, prodDeployed: false })).toMatch(
       /v0.181.0 has no successful prod deploy/,
     );
+  });
+});
+
+describe("gateRejected", () => {
+  const T = "v0.246.0";
+  it("is the newest run for the tag failing on a rerun", () => {
+    expect(
+      gateRejected(
+        [
+          { t: `redline-staging ${T}`, c: "failure", a: 2 },
+          { t: `redline-staging ${T}`, c: "success", a: 1 },
+        ],
+        T,
+      ),
+    ).toBe(true);
+  });
+  it("a newer passing run for the tag wins over an older rejection", () => {
+    expect(
+      gateRejected(
+        [
+          { t: `redline-staging ${T}`, c: "success", a: 1 },
+          { t: `redline-staging ${T}`, c: "failure", a: 2 },
+        ],
+        T,
+      ),
+    ).toBe(false);
+  });
+  it("a first-attempt failure, no run, or a longer tag is not a rejection", () => {
+    expect(
+      gateRejected([{ t: `redline-staging ${T}`, c: "failure", a: 1 }], T),
+    ).toBe(false);
+    expect(gateRejected([], T)).toBe(false);
+    expect(
+      gateRejected([{ t: `redline-staging ${T}0`, c: "failure", a: 2 }], T),
+    ).toBe(false);
   });
 });
 
@@ -1387,6 +1444,35 @@ describe("the release gate in run", () => {
     const r = go("arm", fake({ prodDone: false }));
     expect(r.armed).toEqual([]);
     expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+  });
+  it("arms past main's pin when the gate rejected it after the retry (#448)", () => {
+    const rejected = [
+      { t: "redline-staging v0.181.0", c: "failure", a: 2 },
+      { t: "redline-staging v0.180.0", c: "success", a: 1 },
+    ];
+    expect(
+      go("arm", fake({ prodDone: false, gateRuns: rejected })).armed,
+    ).toEqual([7]);
+  });
+  it("still waits on main's pin while its gate failed only once, or another tag's did", () => {
+    for (const gateRuns of [
+      [{ t: "redline-staging v0.181.0", c: "failure", a: 1 }],
+      [{ t: "redline-staging v0.180.0", c: "failure", a: 2 }],
+      [{ t: "redline-staging v0.181.0", c: "cancelled", a: 2 }],
+    ]) {
+      const r = go("arm", fake({ prodDone: false, gateRuns }));
+      expect(r.armed, JSON.stringify(gateRuns)).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    }
+  });
+  it("does not read gate runs when main's pin is on prod", () => {
+    const f = fake();
+    go("arm", f);
+    expect(
+      f.calls.some((c) =>
+        c.join(" ").includes("redline-staging.yml/runs?status=completed"),
+      ),
+    ).toBe(false);
   });
   it("arms when every gate workflow is idle and prod has the current pin", () => {
     expect(go("arm", fake()).armed).toEqual([7]);

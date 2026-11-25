@@ -315,6 +315,20 @@ export const PROD_DEPLOY_WORKFLOW = "deploy-hosted-platform.yml";
 export const PROD_TITLE = "deploy-hosted-platform prod ";
 /** Pages of 100 successful dispatched deploy runs to look through for the pin's prod deploy. */
 export const DEPLOY_PAGES = 5;
+export const GATE_WORKFLOW = "redline-staging.yml";
+/** The newest completed gate runs to look through for main's pin. */
+export const GATE_RUNS = 20;
+type GateRun = { t: string; c: string | null; a: number };
+/**
+ * Pure: main's pin `tag` was rejected by the gate. The newest completed run titled
+ * `redline-staging <tag>` (the API lists newest first) failed on attempt 2 or later:
+ * redline-retry has already rerun it once, so nothing will deploy it. A first-attempt
+ * failure is not a rejection: the retry may still pass.
+ */
+export function gateRejected(runs: GateRun[], tag: string): boolean {
+  const run = runs.find((r) => r.t === `redline-staging ${tag}`);
+  return run !== undefined && run.c === "failure" && run.a >= 2;
+}
 /**
  * A full prod deploy of `tag`: the chain's run (prod-release-chain dispatches the
  * full target list, verify_only false, and puts its id in the run-name):
@@ -335,12 +349,17 @@ export type Gate = {
   prodDeployed: boolean;
   /** main's current PUBLIC_PIN tag. */
   mainTag: string;
+  /**
+   * main's pin was rejected: its latest redline-staging run failed on a rerun (the
+   * retry is spent), so it never reaches prod and must not hold the next bump (#448).
+   */
+  rejected?: boolean;
 };
 /** Pure: why a qualifying bump must wait (candidate open), or undefined. */
 export function gateRefusal(g: Gate): string | undefined {
   if (g.busy.length > 0)
     return `candidate open: ${g.busy.join(", ")} queued or in progress`;
-  if (!g.prodDeployed)
+  if (!g.prodDeployed && !g.rejected)
     return `candidate open: main's pin ${g.mainTag} has no successful prod deploy yet`;
   return undefined;
 }
@@ -625,10 +644,24 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
     prodDeployed = r.t.some((t) => isChainProdDeploy(t, mainTag));
     if (r.n < 100) break;
   }
+  let rejected = false;
+  if (!prodDeployed) {
+    const runs = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/workflows/${GATE_WORKFLOW}/runs?status=completed&event=workflow_dispatch&per_page=${GATE_RUNS}`,
+        "--jq",
+        "[.workflow_runs[] | {t: .display_title, c: .conclusion, a: .run_attempt}]",
+      ]),
+    ) as GateRun[];
+    if (!Array.isArray(runs)) throw new Error("unreadable gate runs");
+    rejected = gateRejected(runs, mainTag);
+  }
   return {
     busy,
     mainTag,
     prodDeployed,
+    rejected,
   };
 }
 
