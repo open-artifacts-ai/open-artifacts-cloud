@@ -1,0 +1,73 @@
+# Reruns a failed release-chain run on its own (cloud #264). On 11-25 v0.246.1
+# stalled because hosted-attach-prod failed at "Set up job" (a GitHub download
+# outage) and nothing retried it. This covers every workflow on the path from
+# a public release to prod: hosted-release, hosted-publish,
+# staging-release-chain, deploy-hosted-platform and prod-release-chain
+# (redline-staging has its own, redline-retry.yml, retried once).
+# A failed run on main is rerun WHOLE (every job, never --failed: AGENTS.md),
+# at most twice: after 30 s when attempt 1 fails, after 120 s when attempt 2
+# fails. Attempt 3 is never retried: red there waits for a person. Only runs
+# the chain itself started are retried: pushes and workflow_run events, and
+# dispatches whose run-name carries a chain id (" [sc..]", " [c..]", " [p..]").
+# A hand dispatch without one, and a hosted-release dry run, are left alone.
+# Each retry notes the run on #428. The rerun uses the release App's token
+# (actions: write, this repo only) from the main-only release-app Environment,
+# so its completion fires the next workflow_run as a person's rerun does.
+name: release-retry
+on:
+  workflow_run:
+    workflows:
+      - hosted-release
+      - hosted-publish
+      - staging-release-chain
+      - deploy-hosted-platform
+      - prod-release-chain
+    types: [completed]
+permissions: {}
+concurrency:
+  group: release-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+jobs:
+  retry:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt <= 2 &&
+      github.event.workflow_run.head_branch == 'main' &&
+      !contains(github.event.workflow_run.display_title, '(dry run)') &&
+      (github.event.workflow_run.event != 'workflow_dispatch' ||
+      contains(github.event.workflow_run.display_title, ' ['))
+    runs-on: ubuntu-latest
+    environment: release-app
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-actions: write
+      - name: Back off, then rerun the whole run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # A pause before the rerun, not a test wait: outages last minutes.
+          if [ "$ATTEMPT" = 1 ]; then sleep 30; else sleep 120; fi
+          gh run rerun "$RUN_ID" --repo "$REPO"
+          echo "reran run $RUN_ID (attempt $((ATTEMPT + 1)))"
+      - name: Note it on the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          NAME: ${{ github.event.workflow_run.name }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh issue comment 428 --repo "$REPO" --body "Automatic rerun: $NAME ($TITLE) attempt $ATTEMPT failed, $URL. Attempt $((ATTEMPT + 1)) started; find the cause in attempt $ATTEMPT."
