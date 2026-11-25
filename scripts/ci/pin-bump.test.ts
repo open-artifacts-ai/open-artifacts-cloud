@@ -53,6 +53,12 @@ const world = (o: {
   taken?: { number: number; state: string }[];
   sha?: string;
   failApi?: string;
+  /** gh pr view's answer for the open PR (#425). */
+  view?: {
+    state?: string;
+    autoMergeRequest?: unknown;
+    statusCheckRollup?: { conclusion?: string; state?: string }[];
+  };
 }) => {
   const calls: string[][] = [];
   const exec: Exec = (_c, args) => {
@@ -72,6 +78,15 @@ const world = (o: {
     if (args[0] === "pr" && args[1] === "list") return json(o.open ?? []);
     if (args[0] === "api" && args[1]?.includes("/commits/"))
       return { code: 0, stdout: `${o.sha ?? NEW_SHA}\n`, stderr: "" };
+    if (args[0] === "pr" && args[1] === "view")
+      return json({
+        state: "OPEN",
+        autoMergeRequest: null,
+        statusCheckRollup: [],
+        ...o.view,
+      });
+    if (args[0] === "pr" && args[1] === "close")
+      return { code: 0, stdout: "", stderr: "" };
     if (args[0] === "pr" && args[1] === "create")
       return { code: 0, stdout: `https://github.com/x/y/pull/9\n`, stderr: "" };
     throw new Error(`unexpected ${line}`);
@@ -219,6 +234,114 @@ describe("a stuck bump PR", () => {
   });
 });
 
+describe("a red, unarmed bump for an older tag (#425)", () => {
+  const old = {
+    number: 3,
+    headRefName: "pin-bump/v0.136.2",
+    url: "u3",
+    createdAt: hoursAgo(1),
+  };
+  const red = {
+    statusCheckRollup: [{ conclusion: "SUCCESS" }, { conclusion: "FAILURE" }],
+  };
+
+  it("is replaced by the bump to the newest release", () => {
+    expect(go({ open: [old], view: red })).toMatchObject({
+      bump: true,
+      tag: "v0.137.0",
+      supersede: 3,
+    });
+  });
+
+  it("a commit status in error counts as red too", () => {
+    expect(
+      go({ open: [old], view: { statusCheckRollup: [{ state: "ERROR" }] } }),
+    ).toMatchObject({ bump: true, supersede: 3 });
+  });
+
+  it("a green, pending or cancelled one holds the line", () => {
+    for (const c of [
+      [],
+      [{ conclusion: "SUCCESS" }],
+      [{ conclusion: "" }],
+      [{ conclusion: "CANCELLED" }],
+    ])
+      expect(go({ open: [old], view: { statusCheckRollup: c } })).toMatchObject(
+        {
+          bump: false,
+        },
+      );
+  });
+
+  it("an armed one is never touched, red or not", () => {
+    const r = go({
+      open: [old],
+      view: { ...red, autoMergeRequest: { enabledAt: "x" } },
+    });
+    expect(r).toMatchObject({ bump: false });
+    expect(r.why).toContain("armed");
+  });
+
+  it("one for the newest tag, or a newer one, is never replaced", () => {
+    for (const h of ["pin-bump/v0.137.0", "pin-bump/v0.138.0", "pin-bump/odd"])
+      expect(
+        go({ open: [{ ...old, headRefName: h }], view: red }),
+      ).toMatchObject({
+        bump: false,
+      });
+  });
+
+  it("a stale one that can be replaced is replaced, not a red run", () => {
+    expect(
+      go({ open: [{ ...old, createdAt: hoursAgo(24 * 4) }], view: red }),
+    ).toMatchObject({ bump: true, supersede: 3 });
+  });
+
+  it("open-pr closes it with a comment, then opens the new PR", () => {
+    const { exec, calls } = world({ open: [old] });
+    const r = openPr({
+      exec,
+      repo: REPO,
+      publicRepo: PUB,
+      tag: "v0.137.0",
+      sha: NEW_SHA,
+      branch: branchOf("v0.137.0"),
+      supersede: 3,
+    });
+    expect(r.action).toBe("opened");
+    const close = calls.findIndex((c) => c[0] === "pr" && c[1] === "close");
+    const create = calls.findIndex((c) => c[0] === "pr" && c[1] === "create");
+    expect(close).toBeGreaterThan(-1);
+    expect(close).toBeLessThan(create);
+    expect(calls[close]).toContain("3");
+    expect(calls[close]?.join(" ")).toContain("v0.137.0");
+  });
+
+  it("open-pr leaves it if it was armed since the plan, or is not the one planned", () => {
+    for (const [view, supersede] of [
+      [{ autoMergeRequest: { enabledAt: "x" } }, 3],
+      [{}, 4],
+      [{}, undefined],
+    ] as const) {
+      const { exec, calls } = world({ open: [old], view });
+      expect(
+        openPr({
+          exec,
+          repo: REPO,
+          publicRepo: PUB,
+          tag: "v0.137.0",
+          sha: NEW_SHA,
+          branch: branchOf("v0.137.0"),
+          supersede,
+        }),
+      ).toEqual({ action: "left", url: "u3" });
+      expect(calls.some((c) => c[1] === "close" || c[1] === "create")).toBe(
+        false,
+      );
+    }
+  });
+});
+
 describe("rewritePin", () => {
   it("moves tag and sha and keeps every other line", () => {
     expect(rewritePin(PIN, "v0.137.0", NEW_SHA)).toBe(
@@ -331,14 +454,14 @@ describe("pin-bump.yml", () => {
 
   it("grants nothing wide, one run at a time", () => {
     expect(w.permissions).toEqual({});
-    expect(jobs.prepare.permissions).toEqual({
-      contents: "read",
-      "pull-requests": "read",
-    });
-    expect(jobs.open.permissions).toEqual({
-      contents: "read",
-      "pull-requests": "read",
-    });
+    // checks and statuses read: the plan reads an open bump's checks (#425).
+    for (const j of [jobs.prepare, jobs.open])
+      expect(j.permissions).toEqual({
+        contents: "read",
+        "pull-requests": "read",
+        checks: "read",
+        statuses: "read",
+      });
     expect(jobs.report.permissions).toEqual({ issues: "write" });
     expect(w.concurrency).toEqual({
       group: "pin-bump",

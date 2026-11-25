@@ -5,6 +5,8 @@
 # it as any other: pin-check's port check and equivalence. This workflow never
 # arms or merges, and never opens a second PR: while any pin-bump/* PR is open,
 # or a PR already took the newest tag (open, merged or closed), it does nothing.
+# One exception (#425): an open bump for an older tag that is red and not armed
+# is closed, with a comment, and replaced by the bump to the newest release.
 # CI runs once for the bump: the required checks pass at once on the PR (ci.yml,
 # scripts/ci/pin-only.ts) and the full suite runs in the merge queue, on the commit
 # that lands. If that run fails, the PR leaves the queue and stays un-armed
@@ -56,6 +58,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+      statuses: read
     outputs:
       bump: ${{ steps.plan.outputs.bump }}
     steps:
@@ -150,6 +154,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+      statuses: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -247,7 +253,8 @@ jobs:
           TAG: ${{ steps.plan.outputs.tag }}
           SHA: ${{ steps.plan.outputs.sha }}
           BRANCH: ${{ steps.plan.outputs.branch }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH"
+          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH" --supersede "$SUPERSEDE"
 
   report:
     needs: [prepare, open]
