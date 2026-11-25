@@ -52,7 +52,13 @@ import { bound, d1, type ProvapiEnv, within } from "./env.js";
 import { type HealthProbe, publicRouteProbe } from "./health.js";
 import { insertSystemJob, startJob } from "./jobs.js";
 import { dutyCategory } from "./run.js";
-import { type SmokeInput, type SmokeResult, smoke } from "./smoke.js";
+import {
+  SMOKE_BUDGET_MS,
+  SMOKE_CALL_MS,
+  type SmokeInput,
+  type SmokeResult,
+  smoke,
+} from "./smoke.js";
 
 /**
  * Open fleet upgrades at a time, the insert's own guard included. After the
@@ -72,8 +78,14 @@ export const FLEET_SOAK_MS = 0;
 export const FLEET_FAIL_GAP_MS = 60_000;
 /** While the canary's upgrade is open, the tick re-checks it this often. */
 export const FLEET_FAST_POLL_MS = 3_000;
-/** How long one tick keeps re-checking: inside the fleet duty's 25 s budget. */
-export const FLEET_FAST_BUDGET_MS = 18_000;
+/**
+ * fleetFast's deadline from the duty's start: the fleet duty's 25 s budget
+ * less a 2 s margin. A pass starts only if a slow probe and the smoke's
+ * cleanup still fit; the smoke gets only the time left (smokeCanary).
+ */
+export const FLEET_FAST_DEADLINE_MS = 23_000;
+/** The smoke's cleanup runs past its budget: two calls (unshare, delete). */
+export const FLEET_SMOKE_CLEANUP_MS = 2 * SMOKE_CALL_MS;
 /**
  * With the smoke off (FLEET_SMOKE "off"): the passive soak as before #1343's
  * smoke, FLEET_SOAK_MIN minutes per env (staging 15, prod 60), and no smoke.
@@ -481,10 +493,11 @@ export async function onTarget(
 export interface FleetOptions {
   probe?: HealthProbe;
   timeoutMs?: number;
-  /** Tests only: fleetFast's clock, sleep and budget. */
+  /** Tests only: fleetFast's clock and sleep. */
   clock?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  fastBudgetMs?: number;
+  /** fleetFast: the ms left before its deadline; bounds the smoke. */
+  left?: () => number;
   /** Tests only: the canary smoke (default smoke() over fetch). */
   smoke?: (i: SmokeInput) => Promise<SmokeResult>;
 }
@@ -513,10 +526,15 @@ export async function fleetFast(
   const sleep =
     o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const t0 = clock();
-  const budget = o.fastBudgetMs ?? FLEET_FAST_BUDGET_MS;
+  const deadline = t0 + FLEET_FAST_DEADLINE_MS;
+  const pass = { ...o, left: () => deadline - clock() };
+  // The worst pass: a probe at its full timeout, then the smoke's cleanup
+  // (the smoke itself takes only what is left).
+  const worst = FLEET_PROBE_TIMEOUT_MS + FLEET_SMOKE_CLEANUP_MS;
   for (;;) {
-    const r = await fleetDue(env, now + (clock() - t0), o);
-    if (r !== "canary" || clock() - t0 + FLEET_FAST_POLL_MS > budget) return;
+    const r = await fleetDue(env, now + (clock() - t0), pass);
+    if (r !== "canary" || clock() + FLEET_FAST_POLL_MS + worst > deadline)
+      return;
     await sleep(FLEET_FAST_POLL_MS);
   }
 }
@@ -822,7 +840,18 @@ async function smokeCanary(
 ): Promise<boolean> {
   const db = env.PLATFORM_DB;
   const id = canary.install_id;
+  // Inside fleetFast, only the time left, its cleanup aside: too little for
+  // one call and the smoke waits for the next pass. Neither a pass nor a fail.
+  const budgetMs =
+    o.left === undefined
+      ? SMOKE_BUDGET_MS
+      : Math.min(SMOKE_BUDGET_MS, o.left() - FLEET_SMOKE_CLEANUP_MS);
+  if (budgetMs < SMOKE_CALL_MS) {
+    console.log("provapi fleet smoke deferred");
+    return false;
+  }
   const r = await (o.smoke ?? smoke)({
+    budgetMs,
     fetch: (url, init) => fetch(url, init),
     installId: id,
     appHost: canary.app_host ?? "",

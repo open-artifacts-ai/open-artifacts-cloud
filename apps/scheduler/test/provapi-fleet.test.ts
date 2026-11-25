@@ -21,12 +21,14 @@ import {
   FLEET_CONCURRENCY,
   FLEET_FAIL_GAP_MS,
   FLEET_FAIL_PREFIX,
-  FLEET_FAST_BUDGET_MS,
+  FLEET_FAST_DEADLINE_MS,
   FLEET_FAST_POLL_MS,
   FLEET_HALT_ALERT_MS,
   FLEET_KEEP_MS,
+  FLEET_PROBE_TIMEOUT_MS,
   FLEET_RETRY_PREFIX,
   FLEET_SKEW_MS,
+  FLEET_SMOKE_CLEANUP_MS,
   FLEET_SMOKED_PREFIX,
   FLEET_SOAK_GAP_MS,
   FLEET_SOAK_MIN_MAX,
@@ -2434,12 +2436,72 @@ describe("#433: no timers, leo with the rest", () => {
         t += ms;
       },
     });
-    // t = 0, 3, ... 18 s: never past the budget.
-    expect(passes).toBe(
-      Math.floor(FLEET_FAST_BUDGET_MS / FLEET_FAST_POLL_MS) + 1,
-    );
-    expect(FLEET_FAST_BUDGET_MS).toBeLessThan(FLEET_FAIL_GAP_MS);
+    // t = 0, 3, 6, 9 s: a pass starts only if a slow probe and the smoke's
+    // cleanup still fit before the deadline.
+    expect(passes).toBe(4);
+    expect(
+      t + FLEET_PROBE_TIMEOUT_MS + FLEET_SMOKE_CLEANUP_MS,
+    ).toBeLessThanOrEqual(FLEET_FAST_DEADLINE_MS);
+    expect(FLEET_FAST_DEADLINE_MS).toBeLessThan(FLEET_FAIL_GAP_MS);
     expect(await stateKeys(`fleet_halt:${TARGET}:`)).toEqual([]);
+    expect(await queued()).toEqual([]);
+  });
+
+  it("fleetFast: a slow probe, then the smoke with only the time left, ends inside the duty's 25 s", async () => {
+    const canary = await on(TARGET, { created: 0 });
+    await fleetJob(canary, { finished_at: NOW - MIN });
+    const rest = await on("0.92.0", { created: 5 });
+    const f = fakes({ canary });
+    let t = 0;
+    const budgets: (number | undefined)[] = [];
+    const probe = f.opts.probe;
+    await fleetFast(f.env, NOW, {
+      ...f.opts,
+      clock: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+      // Every probe takes its whole timeout.
+      probe: async (...a) => {
+        t += FLEET_PROBE_TIMEOUT_MS;
+        return probe(...a);
+      },
+      // The smoke spends its whole budget, then its whole cleanup.
+      smoke: async (i) => {
+        budgets.push(i.budgetMs);
+        t += (i.budgetMs ?? 0) + FLEET_SMOKE_CLEANUP_MS;
+        return { ok: true, notes: [] };
+      },
+    });
+    expect(budgets).toEqual([
+      FLEET_FAST_DEADLINE_MS - FLEET_PROBE_TIMEOUT_MS - FLEET_SMOKE_CLEANUP_MS,
+    ]);
+    expect(t).toBeLessThanOrEqual(FLEET_FAST_DEADLINE_MS);
+    expect(t).toBeLessThan(25_000);
+    expect(await queued()).toEqual([rest]);
+  });
+
+  it("fleetFast: too little time left for the smoke defers it, never a failure", async () => {
+    const canary = await on(TARGET, { created: 0 });
+    await fleetJob(canary, { finished_at: NOW - MIN });
+    await on("0.92.0", { created: 5 });
+    const f = fakes({ canary });
+    let t = 0;
+    const probe = f.opts.probe;
+    await fleetFast(f.env, NOW, {
+      ...f.opts,
+      clock: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+      // A probe that eats almost the whole deadline.
+      probe: async (...a) => {
+        t += FLEET_FAST_DEADLINE_MS - FLEET_SMOKE_CLEANUP_MS - 1_000;
+        return probe(...a);
+      },
+    });
+    expect(f.smokes).toEqual([]);
+    expect(await stateKeys("fleet_smoke_")).toEqual([]);
     expect(await queued()).toEqual([]);
   });
 
