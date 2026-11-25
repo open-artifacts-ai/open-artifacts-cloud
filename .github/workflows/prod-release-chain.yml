@@ -24,15 +24,20 @@
 # matches the one run it started and waits for it, failing closed), so all its
 # gates and the platform-tags.sh read-back run unchanged, every secret comes
 # from its own Environment, and its concurrency group serializes the chain
-# against a manual deploy; before it, the publish job dispatches
+# against a manual deploy. Beside it, the publish job dispatches
 # hosted-publish.yml for the tag (env prod) unless prod's bucket has the
 # release already (#1412: hosted-publish publishes staging alone after a
-# release; prod's bucket waits for this red-line); require_newer re-checks the tag against prod once
+# release; prod's bucket waits for this red-line). The deploy does not wait
+# for the publish: the fleet queues no upgrade until the target is
+# installable in the release catalog (fleet.ts, published()), so a scheduler
+# that runs the tag before its record lands only holds the fleet until it
+# does. require_newer re-checks the tag against prod once
 # the run holds that group, so a manual deploy of a newer tag is never
 # downgraded. The scheduler deploys last there, so a run
 # that stops before the scheduler step never moves the fleet; once that step's
 # first deploy has run, the fleet follows even if the run goes red afterwards. A red chain run keeps one
-# `blocker` issue open; a green one closes it.
+# `blocker` issue open; a green one closes it. A failed publish beside a green
+# deploy is red too, and its issue says the fleet holds until the record lands.
 name: prod-release-chain
 
 on:
@@ -143,9 +148,12 @@ jobs:
   # would cross in. See chain-dispatch.ts.
   # #1412: the release is published to prod's bucket only after this red-line
   # (hosted-publish.yml publishes staging alone after a release and its
-  # publish-prod job re-checks the red-line). Before the deploy, so the fleet
-  # never targets a release prod cannot create from. Skipped inside the job
-  # when prod already has it (publishing is create-only).
+  # publish-prod job re-checks the red-line). It runs beside the deploy, off
+  # the critical path (cloud #264): the fleet's catalog check (fleet.ts,
+  # published()) holds every upgrade until the record is written, and the
+  # record is written before publish-release prunes older staged versions, so
+  # the prune never delays an install either. Skipped inside the job when prod
+  # already has it (publishing is create-only).
   publish:
     needs: gate
     if: needs.gate.outputs.go == 'true'
@@ -182,7 +190,7 @@ jobs:
           CHAIN_ID: p${{ github.run_id }}-${{ github.run_attempt }}
         run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
   deploy:
-    needs: [gate, publish]
+    needs: [gate]
     if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     # actions: write is this job's alone: it dispatches the workflow.
@@ -235,10 +243,17 @@ jobs:
           TAG: ${{ needs.gate.outputs.tag }}
           # A failed gate is reported too: the chain never fails quietly. A
           # skip (go false) leaves deploy "skipped", which leaves the issue.
-          RESULT: ${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}
+          # Then the deploy's result, then a publish that neither succeeded
+          # nor skipped (prod's bucket had it): publish and deploy run side by
+          # side, so either one going red is red.
+          RESULT: ${{ needs.gate.result != 'success' && needs.gate.result || needs.deploy.result != 'success' && needs.deploy.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || 'success' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # The dispatched deploy run (empty when it never started).
-          DEPLOY_RUN: ${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}
-          # Why the dispatch step failed, e.g. that it cancelled the run.
-          DEPLOY_NOTE: ${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}
-        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"
+          # Each dispatched run (empty when it never started) and why its
+          # dispatch step failed, e.g. that it cancelled the run.
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          DEPLOY_RUN: ${{ needs.deploy.outputs.url }}
+          DEPLOY_NOTE: ${{ needs.deploy.outputs.note }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PUBLISH_RUN: ${{ needs.publish.outputs.url }}
+          PUBLISH_NOTE: ${{ needs.publish.outputs.note }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-result "$DEPLOY_RESULT" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE" --publish-result "$PUBLISH_RESULT" --publish-run "$PUBLISH_RUN" --publish-note "$PUBLISH_NOTE"

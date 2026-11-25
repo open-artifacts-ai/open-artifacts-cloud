@@ -262,7 +262,8 @@ describe("prod-release-chain.yml", () => {
 
   it("dispatches deploy-hosted-platform.yml (no workflow_call): prod, every target, after the gate", () => {
     const d = w.jobs.deploy;
-    expect(d.needs).toEqual(["gate", "publish"]);
+    // Only the gate: the publish runs beside it (cloud #264).
+    expect(d.needs).toEqual(["gate"]);
     expect(d.uses).toBeUndefined();
     // Only when the gate says go: a skip deploys nothing.
     expect(d.if).toBe("needs.gate.outputs.go == 'true'");
@@ -328,16 +329,22 @@ describe("prod-release-chain.yml", () => {
       GH_TOKEN: "${{ github.token }}",
       TAG: "${{ needs.gate.outputs.tag }}",
       RESULT:
-        "${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}",
+        "${{ needs.gate.result != 'success' && needs.gate.result || needs.deploy.result != 'success' && needs.deploy.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || 'success' }}",
       RUN: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-      DEPLOY_RUN:
-        "${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}",
-      DEPLOY_NOTE:
-        "${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}",
+      DEPLOY_RESULT: "${{ needs.deploy.result }}",
+      DEPLOY_RUN: "${{ needs.deploy.outputs.url }}",
+      DEPLOY_NOTE: "${{ needs.deploy.outputs.note }}",
+      PUBLISH_RESULT: "${{ needs.publish.result }}",
+      PUBLISH_RUN: "${{ needs.publish.outputs.url }}",
+      PUBLISH_NOTE: "${{ needs.publish.outputs.note }}",
     });
     expect(step.run).toBe(
-      'node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"',
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-result "$DEPLOY_RESULT" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE" --publish-result "$PUBLISH_RESULT" --publish-run "$PUBLISH_RUN" --publish-note "$PUBLISH_NOTE"',
     );
+    // Every flag the step passes is one main() reads.
+    const src = read("scripts/ci/prod-release-chain.ts");
+    for (const f of step.run.split(" report ")[1].match(/--[a-z-]+/g) ?? [])
+      expect(src, f).toContain(`flag(argv, "${f.slice(2)}")`);
   });
 });
 
@@ -755,12 +762,12 @@ describe("the gate's neutral skips", () => {
     );
     // gate success and go false: deploy is skipped, so RESULT is "skipped".
     expect(step.env.RESULT).toBe(
-      "${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}",
+      "${{ needs.gate.result != 'success' && needs.gate.result || needs.deploy.result != 'success' && needs.deploy.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || 'success' }}",
     );
     expect(w.jobs.deploy.if).toBe("needs.gate.outputs.go == 'true'");
     expect(w.jobs.publish.if).toBe("needs.gate.outputs.go == 'true'");
   });
-  it("the publish job (#1412) puts the release in prod's bucket before the deploy, unless it is there", () => {
+  it("the publish job (#1412) puts the release in prod's bucket beside the deploy, unless it is there", () => {
     const p = w.jobs.publish;
     expect(p.needs).toBe("gate");
     expect(p.if).toBe("needs.gate.outputs.go == 'true'");
@@ -772,9 +779,13 @@ describe("the gate's neutral skips", () => {
     expect(step.run).toBe(
       'node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"',
     );
-    // The deploy waits for it; a failed publish never reaches the deploy.
-    expect(w.jobs.deploy.needs).toEqual(["gate", "publish"]);
-    // The RESULT: gate failure, then publish failure, then the deploy's.
+    // The deploy does not wait for it (cloud #264): the fleet's catalog check
+    // holds every upgrade until the record lands (fleet.ts, published()).
+    expect(w.jobs.deploy.needs).toEqual(["gate"]);
+    expect(read("apps/scheduler/src/provapi/fleet.ts")).toContain(
+      'console.log("provapi fleet release_unpublished", target);',
+    );
+    // The RESULT: gate failure, then the deploy's, then a publish failure.
     const result = (g: string, pu: string, d: string) =>
       new Function(
         "needs",
@@ -791,8 +802,15 @@ describe("the gate's neutral skips", () => {
         deploy: { result: d },
       }) as string;
     expect(result("success", "success", "success")).toBe("success");
-    expect(result("success", "failure", "skipped")).toBe("failure");
+    // Prod's bucket had it: a skipped publish beside a green deploy is green.
+    expect(result("success", "skipped", "success")).toBe("success");
+    // A failed publish beside a green deploy is red: the fleet holds.
+    expect(result("success", "failure", "success")).toBe("failure");
+    expect(result("success", "cancelled", "success")).toBe("cancelled");
     expect(result("success", "success", "failure")).toBe("failure");
+    expect(result("success", "failure", "failure")).toBe("failure");
+    expect(result("success", "success", "cancelled")).toBe("cancelled");
+    // A skip (go false) skips both.
     expect(result("success", "skipped", "skipped")).toBe("skipped");
     expect(result("failure", "skipped", "skipped")).toBe("failure");
   });
@@ -912,5 +930,70 @@ describe("the gate's neutral skips", () => {
       })() ?? "";
     expect(body).toContain("Deploy run: https://x/deploy");
     expect(body).toContain("cancelled the dispatched run https://x/deploy");
+  });
+  const created = (o: Partial<Parameters<typeof report>[0]>) => {
+    const calls: string[][] = [];
+    const exec: Exec = (_c, a) => {
+      calls.push(a);
+      return {
+        code: 0,
+        stdout:
+          a[0] === "issue" && a[1] === "list"
+            ? "[]"
+            : a[0] === "label"
+              ? '[{"name":"blocker"}]'
+              : "",
+        stderr: "",
+      };
+    };
+    report({
+      exec,
+      repo: "o/r",
+      tag: "v1.2.3",
+      result: "failure",
+      run: "https://x/chain",
+      ...o,
+    });
+    const c = calls.find((x) => x[1] === "create") ?? [];
+    return {
+      title: c[c.indexOf("--title") + 1] ?? "",
+      body: c[c.indexOf("--body") + 1] ?? "",
+      labels: c[c.indexOf("--label") + 1] ?? "",
+    };
+  };
+  it("a failed publish beside a green deploy opens a blocker that says the fleet holds", () => {
+    const r = created({
+      deployResult: "success",
+      deployRun: "https://x/deploy",
+      publishResult: "failure",
+      publishRun: "https://x/publish",
+      publishNote: "the dispatched run failed",
+    });
+    expect(r.labels).toBe("blocker");
+    expect(r.title).toBe(
+      "Prod release chain failed: v1.2.3 (publish failed, the fleet holds)",
+    );
+    expect(r.body).toContain("its prod publish ended with `failure`");
+    expect(r.body).toContain("release_unpublished");
+    // Creates with no version are refused too: the platform runs the tag.
+    expect(r.body).toContain("new signups included");
+    expect(r.body).toContain("dispatch hosted-publish.yml on main with env prod");
+    expect(r.body).toContain("Publish run: https://x/publish");
+    expect(r.body).toContain("Publish step: the dispatched run failed");
+    expect(r.body).toContain("Deploy run: https://x/deploy");
+    // Still a chain issue: a later green chain run closes it.
+    expect(r.title.startsWith("Prod release chain ")).toBe(true);
+  });
+  it("a failed deploy keeps the deploy wording, whatever the publish did", () => {
+    for (const publishResult of ["failure", "success", "skipped"]) {
+      const r = created({
+        deployResult: "failure",
+        deployRun: "https://x/deploy",
+        publishResult,
+      });
+      expect(r.title, publishResult).toBe("Prod release chain failed: v1.2.3");
+      expect(r.body).toContain("Every platform Worker runs the tag");
+      expect(r.body).not.toContain("release_unpublished");
+    }
   });
 });

@@ -7,7 +7,8 @@
 // above what prod's scheduler runs. Both print `go=true|false`: false is a
 // neutral skip (a stale or repeated event, a release prod already runs), not
 // a failure. `require-newer` is the deploy's re-check, which fails instead.
-// `report` keeps one `blocker` issue open while the last chain run is red.
+// `report` keeps one `blocker` issue open while the last chain run is red;
+// a failed publish beside a green deploy is red too, and says the fleet holds.
 // Usage: node --experimental-strip-types scripts/ci/prod-release-chain.ts tag --title "<display_title>"
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts fresh --repo owner/name --tag vX.Y.Z --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag vX.Y.Z --current vX.Y.Z
@@ -182,10 +183,18 @@ export function report(o: {
   tag: string;
   result: string;
   run: string;
+  /** The deploy job's result (success, failure, skipped, cancelled). */
+  deployResult?: string;
   /** The dispatched deploy run's link, when it started. */
   deployRun?: string;
   /** What the dispatch step said when it failed (one line). */
   deployNote?: string;
+  /** The publish job's result: it runs beside the deploy. */
+  publishResult?: string;
+  /** The dispatched hosted-publish run's link, when it started. */
+  publishRun?: string;
+  /** What the publish dispatch step said when it failed (one line). */
+  publishNote?: string;
 }): Report {
   // A neutral skip (a stale event, a release prod already runs) leaves the
   // issue as it is: it neither opens nor closes it.
@@ -226,16 +235,38 @@ export function report(o: {
       : { action: "none" };
   }
 
-  const title = `${ISSUE} failed: ${tag || "no release tag"}`;
-  const body = [
-    `The prod release chain ended with \`${o.result}\` before the fleet started.`,
-    "",
-    `Run: ${o.run}`,
-    "",
+  // The deploy went green but the publish beside it did not: the scheduler
+  // runs the tag, and the fleet holds (release_unpublished) until prod's
+  // catalog has it, with nothing else saying so.
+  const held =
+    o.deployResult === "success" &&
+    !!o.publishResult &&
+    o.publishResult !== "success" &&
+    o.publishResult !== "skipped";
+  const title = `${ISSUE} failed: ${tag || "no release tag"}${held ? " (publish failed, the fleet holds)" : ""}`;
+  const links = [
     ...(o.deployRun ? [`Deploy run: ${o.deployRun}`, ""] : []),
     ...(o.deployNote ? [`Deploy step: ${o.deployNote}`, ""] : []),
-    "The scheduler deploys last and its tag is the fleet's target. Whether it moved is not known from here: the deploy run's \"Every platform Worker runs the tag\" step reads every Worker's tag back, and runs even when a deploy step failed, so read it (or `platform-tags.sh prod`). If the scheduler runs the tag, the fleet follows it and the next chain run cannot undo that (forward only). The deploy re-runs the tagged scheduler deploy after a failed secret put, so an untagged scheduler is not expected; if the read-back still shows one, every later chain run fails at the tag-newer gate until it is repaired: dispatch deploy-hosted-platform.yml on main with the same tag, the full target list and require_newer false. Read the run: a gate refused the tag, or the deploy or its read-back failed. Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
-  ].join("\n");
+    ...(o.publishRun ? [`Publish run: ${o.publishRun}`, ""] : []),
+    ...(o.publishNote ? [`Publish step: ${o.publishNote}`, ""] : []),
+  ];
+  const body = held
+    ? [
+        `The prod deploy of ${tag || "the tag"} is green, but its prod publish ended with \`${o.publishResult}\`.`,
+        "",
+        `Run: ${o.run}`,
+        "",
+        ...links,
+        "The scheduler runs the tag, so it is the fleet's target, but prod's release catalog does not have it: the fleet queues no upgrade and logs `provapi fleet release_unpublished` every tick until it does. No install moves, and the Provisioning API, which runs the tag too, refuses every create or upgrade with no version (`release_not_published`), new signups included. To clear it, read the publish run, fix the cause, then dispatch hosted-publish.yml on main with env prod and this tag. The fleet starts on its next tick once the record lands. A later chain run for this tag skips (prod already runs it), so close this issue by hand once the publish is green (docs/ops/hosted.md).",
+      ].join("\n")
+    : [
+        `The prod release chain ended with \`${o.result}\` before the fleet started.`,
+        "",
+        `Run: ${o.run}`,
+        "",
+        ...links,
+        "The scheduler deploys last and its tag is the fleet's target. Whether it moved is not known from here: the deploy run's \"Every platform Worker runs the tag\" step reads every Worker's tag back, and runs even when a deploy step failed, so read it (or `platform-tags.sh prod`). If the scheduler runs the tag, the fleet follows it and the next chain run cannot undo that (forward only). The deploy re-runs the tagged scheduler deploy after a failed secret put, so an untagged scheduler is not expected; if the read-back still shows one, every later chain run fails at the tag-newer gate until it is repaired: dispatch deploy-hosted-platform.yml on main with the same tag, the full target list and require_newer false. Read the run: a gate refused the tag, or the deploy or its read-back failed. Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
+      ].join("\n");
   const existing = open[0];
   if (existing) {
     gh(o.exec, [
@@ -363,8 +394,12 @@ function main(argv: string[]) {
       tag: flag(argv, "tag"),
       result: flag(argv, "result"),
       run: flag(argv, "run"),
+      deployResult: flag(argv, "deploy-result"),
       deployRun: flag(argv, "deploy-run"),
       deployNote: flag(argv, "deploy-note"),
+      publishResult: flag(argv, "publish-result"),
+      publishRun: flag(argv, "publish-run"),
+      publishNote: flag(argv, "publish-note"),
     });
     console.error(`prod-release-chain: ${JSON.stringify(r)}`);
     return;
