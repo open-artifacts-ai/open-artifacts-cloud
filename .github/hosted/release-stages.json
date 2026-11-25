@@ -1,0 +1,36 @@
+{
+  "notes": [
+    "The release chain's stages in order, read by scripts/ci/release-watch.ts (cloud #264). Each stage runs from one event to the next, so the stages are contiguous and the hand-off gaps count in the stage they lead into.",
+    "Events: merged (the oldest public PR merged into the release), published (the public release), pin_opened (the pin-bump/<tag> PR opened), pinned (the pin commit on cloud main: the PR's merge, or the direct pin commit), then <step>.started and <step>.done for the runs of hosted_release, staging_publish, staging_deploy, redline, prod_publish and prod_deploy.",
+    "mode pr stages count only for a release pinned through a pin-bump PR, mode direct only for one pinned by a direct commit on main. pinMode is the mode a release with neither yet is waiting in.",
+    "Budgets are minutes, about the measured p90 x 1.25 of the chain as it is (v0.245.0 to v0.246.0). Retune after 20 releases. e2eWorst is the sum of the measured budgets: a release past it opens the blocker. e2eTarget is reported, never alerted on.",
+    "fleet is not measured yet: it needs a public fleet done signal (the scheduler's fleet_done mark served at GET /api/v1/fleet on the signup hosts, Lane 5 PR2). The watcher never reads fleet state through admin tools."
+  ],
+  "pinMode": "pr",
+  "e2eTarget": 10,
+  "e2eWorst": 71,
+  "lookbackHours": 6,
+  "statsWindow": 20,
+  "historySize": 200,
+  "stages": [
+    { "name": "tag", "from": "merged", "to": "published", "budget": 6 },
+    { "name": "pin_open", "from": "published", "to": "pin_opened", "budget": 4, "mode": "pr" },
+    { "name": "pin_merge", "from": "pin_opened", "to": "pinned", "budget": 14, "mode": "pr" },
+    { "name": "direct_pin", "from": "published", "to": "pinned", "budget": 5, "mode": "direct" },
+    { "name": "hosted_release", "from": "pinned", "to": "hosted_release.done", "budget": 5 },
+    { "name": "staging_publish", "from": "hosted_release.done", "to": "staging_publish.done", "budget": 6 },
+    { "name": "staging_deploy", "from": "staging_publish.done", "to": "staging_deploy.done", "budget": 7 },
+    { "name": "redline_queue", "from": "staging_deploy.done", "to": "redline.started", "budget": 2 },
+    { "name": "redline", "from": "redline.started", "to": "redline.done", "budget": 14 },
+    { "name": "prod_publish", "from": "redline.done", "to": "prod_publish.done", "budget": 5 },
+    { "name": "prod_deploy", "from": "prod_publish.done", "to": "prod_deploy.done", "budget": 8 },
+    {
+      "name": "fleet",
+      "from": "prod_deploy.done",
+      "to": "fleet.done",
+      "budget": 6,
+      "measured": false,
+      "todo": "needs a public fleet done signal (GET /api/v1/fleet on the signup hosts, Lane 5 PR2); no admin reads"
+    }
+  ]
+}

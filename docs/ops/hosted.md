@@ -470,6 +470,18 @@ Until an env's `FLEET_SMOKE` is `required`, its fleet keeps the passive `FLEET_S
 
 **Clearing a halt.** Forward only: the next release clears it. Fix the cause, cut a new release and red-line it. When it passes, the chain runs again, canary first. A halted version is never retried on its own; a manual clear-and-retry would be a new admin write that needs the user's yes, and it is out of scope here.
 
+## Release budgets (`release-watch.yml`, #264)
+
+`release-watch.yml` measures each release from the oldest public PR merged into it to the prod platform deploy. It only measures: it gates nothing and must never be a required check.
+
+- The stages and their budgets (minutes) are data in `.github/hosted/release-stages.json`. Each stage runs from the previous stage's end, so the hand-off gaps count too: `tag` (merge to public release), `pin_open` and `pin_merge` (the pin-bump PR) or `direct_pin` (a direct pin commit on main), `hosted_release`, `staging_publish`, `staging_deploy`, `redline_queue` (waiting for the `redline` group), `redline`, `prod_publish`, `prod_deploy`. When the chain changes, edit that file, not the script.
+- `fleet` (prod deploy to the last install on the version) is not measured yet. It needs a public fleet done signal (Lane 5 PR2); the watcher never reads fleet state through admin tools.
+- Runs link to a release by their run names (`deploy-hosted-platform <env> <tag> [id]`, `redline-staging <tag>`, `hosted-publish prod <tag> [id]`) and, for `hosted-release` and the staging publish, by the pin commit's subject and sha. `release-watch.test.ts` fails if a run-name changes.
+- Each run writes `current.json` (releases in flight with their stage, elapsed minutes and ETA at p50 and p90; per-stage p50/p90 over the last 20 finished releases) to the job summary and to the `release-stats` artifact, with `history.jsonl`, which the next run reads back.
+- One `blocker` issue, "release over budget", is open while a release in flight is over its current stage's budget or past `e2eWorst` since its merge, or while the newest finished release went over. A red run is listed there but opens nothing itself: that run's own red blocker covers it. The issue closes itself.
+- A release still unfinished when a newer one is pinned is superseded: it is not alerted on, and its e2e counts to when the newer release is done.
+- To rebuild the history (once, or after a lost artifact): dispatch `release-watch.yml` with `backfill_since`, such as `2026-11-20`. It reads every release since that day, about two public reads per release.
+
 ## OAuth store jobs (#1008)
 
 An install moves kv, dual, copy, d1 through two Provisioning API jobs, on both envs, from the admin MCP only: the tools `set_oauth_store` and `copy_oauth_store`. R29 and R30 pass only an OAuth grant with `installs:write`, the token an admin's MCP client gets at consent. `/v1` answers that token 401, so the routes have no REST use; an admin session, an `oat_` token, OIDC, the test admin and users are forbidden, and there is no panel control. The provisioner's recheck reads the grant's `agent_tokens` row again. Each flip is a separate user yes for that one operation.
