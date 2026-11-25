@@ -539,7 +539,8 @@ jobs:
           path: ${{ runner.temp }}/hosted
       # Rebuilt from the same verified bytes; refused unless the tar and the
       # record hash to what hosted-sign-staging signed and the signature verifies
-      # (pinned key). Refuses if any staging asset is already on the release.
+      # (pinned key). If staging assets are already on the release, passes only
+      # when they are byte-identical to these (a rerun), else refuses.
       # The release is this repo's, created by the mirror.
       - name: Attach the signed staging release files to the GitHub release
         working-directory: public
@@ -555,9 +556,21 @@ jobs:
           REDLINE: ${{ needs.hosted-sign-staging.outputs.staging_redline_signature }}:${{ needs.hosted-sign-staging.outputs.staging_redline_tar_sha256 }}:${{ needs.hosted-sign-staging.outputs.staging_redline_record_sha256 }}
         run: |
           set -euo pipefail
-          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-staging-' || true)
-          [ -z "$existing" ] || { echo "the release already has staging assets: $existing"; exit 1; }
           node scripts/ci/assemble-release.mjs --dir "$RUNNER_TEMP/hosted" --env staging --version "$VERSION" --manifest-sha256 "$MANIFEST_SHA256" --bundle-sha256 "$BUNDLE_SHA256" --commit "$PUB_SHA" --lockfile pnpm-lock.yaml --out "$RUNNER_TEMP/signed" --release "$RELEASE" --redline "$REDLINE"
+          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-staging-' || true)
+          if [ -n "$existing" ]; then
+            # A rerun (release-retry, or by hand) after an earlier attempt
+            # attached them. The build is reproducible, so pass only when the
+            # attached files are byte-identical to this run's verified ones:
+            # same names, same sha256. Anything else is refused, never replaced.
+            mkdir -p "$RUNNER_TEMP/attached"
+            gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-staging-*' --dir "$RUNNER_TEMP/attached"
+            mine=$(cd "$RUNNER_TEMP/signed" && sha256sum oa-release-staging-* | sort)
+            theirs=$(cd "$RUNNER_TEMP/attached" && sha256sum oa-release-staging-* | sort)
+            [ "$mine" = "$theirs" ] || { echo "the release already has staging assets that differ from this run's: $existing"; exit 1; }
+            echo "the staging assets are already attached and identical to this run's; nothing to upload"
+            exit 0
+          fi
           gh release upload "$TAG" --repo "$REPO" "$RUNNER_TEMP"/signed/oa-release-staging-*
   hosted-attach-prod:
     needs: [hosted-guard, hosted-build, hosted-check, hosted-sign-prod]
@@ -593,7 +606,8 @@ jobs:
           path: ${{ runner.temp }}/hosted
       # Rebuilt from the same verified bytes; refused unless the tar and the
       # record hash to what hosted-sign-prod signed and the signature verifies
-      # (pinned key). Refuses if any prod asset is already on the release.
+      # (pinned key). If prod assets are already on the release, passes only
+      # when they are byte-identical to these (a rerun), else refuses.
       # The release is this repo's, created by the mirror.
       - name: Attach the signed prod release files to the GitHub release
         working-directory: public
@@ -608,9 +622,21 @@ jobs:
           RELEASE: ${{ needs.hosted-sign-prod.outputs.prod_release_signature }}:${{ needs.hosted-sign-prod.outputs.prod_release_tar_sha256 }}:${{ needs.hosted-sign-prod.outputs.prod_release_record_sha256 }}
         run: |
           set -euo pipefail
-          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-prod-' || true)
-          [ -z "$existing" ] || { echo "the release already has prod assets: $existing"; exit 1; }
           node scripts/ci/assemble-release.mjs --dir "$RUNNER_TEMP/hosted" --env prod --version "$VERSION" --manifest-sha256 "$MANIFEST_SHA256" --bundle-sha256 "$BUNDLE_SHA256" --commit "$PUB_SHA" --lockfile pnpm-lock.yaml --out "$RUNNER_TEMP/signed" --release "$RELEASE"
+          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-prod-' || true)
+          if [ -n "$existing" ]; then
+            # A rerun (release-retry, or by hand) after an earlier attempt
+            # attached them. The build is reproducible, so pass only when the
+            # attached files are byte-identical to this run's verified ones:
+            # same names, same sha256. Anything else is refused, never replaced.
+            mkdir -p "$RUNNER_TEMP/attached"
+            gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-prod-*' --dir "$RUNNER_TEMP/attached"
+            mine=$(cd "$RUNNER_TEMP/signed" && sha256sum oa-release-prod-* | sort)
+            theirs=$(cd "$RUNNER_TEMP/attached" && sha256sum oa-release-prod-* | sort)
+            [ "$mine" = "$theirs" ] || { echo "the release already has prod assets that differ from this run's: $existing"; exit 1; }
+            echo "the prod assets are already attached and identical to this run's; nothing to upload"
+            exit 0
+          fi
           gh release upload "$TAG" --repo "$REPO" "$RUNNER_TEMP"/signed/oa-release-prod-*
   # Dry run only: what hosted-attach-staging would do, without a release. The
   # signed files are re-assembled from the verified bytes (assemble-release.mjs
