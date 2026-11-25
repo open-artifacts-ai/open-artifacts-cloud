@@ -35,19 +35,74 @@ const text = (v: unknown) =>
 // exactly what JSON.stringify(config, null, 2) wrote before the flag.
 const fixture = (name: string) =>
   readFileSync(join(FIXTURES, `${name}.txt`), "utf8");
+// The pinned public tree's own test config, which wranglerConfig starts from.
+const PUBLIC = JSON.parse(
+  readFileSync(join(ROOT, "apps", "server", "wrangler.test.jsonc"), "utf8"),
+) as Record<string, unknown> & { vars?: Record<string, unknown> };
+const same = (a: unknown, b: unknown) =>
+  JSON.stringify(a) === JSON.stringify(b);
+/**
+ * The part of a config this repo's code decides: every top-level key and var
+ * that differs from the public file, plus the names of the public ones it
+ * drops. What passes through unchanged is the public release's, so a binding
+ * public adds (open-artifacts#3010's IMAGES) needs no fixture port in the
+ * bump (cloud #264); a change to a key wranglerConfig rewrites still shows.
+ */
+function cloudPart(cfg: Record<string, unknown>) {
+  const pubVars = PUBLIC.vars ?? {};
+  const vars = (cfg.vars ?? {}) as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(cfg))
+    if (k === "vars")
+      out.vars = Object.fromEntries(
+        Object.entries(vars).filter(([n, x]) => !same(x, pubVars[n])),
+      );
+    else if (!same(v, PUBLIC[k])) out[k] = v;
+  out.dropped = Object.keys(PUBLIC).filter((k) => !(k in cfg));
+  out.droppedVars = Object.keys(pubVars).filter((n) => !(n in vars));
+  return out;
+}
+const part = (cfg: unknown) => text(cloudPart(cfg as Record<string, unknown>));
 
 describe("local pair config, T19 flag off", () => {
-  it("is byte-identical to the config before the flag (base, google, d1)", () => {
-    expect(text(wranglerConfig(I, 8787))).toBe(fixture("base-kv"));
-    expect(text(wranglerConfig(I, 8787, undefined, "base", "kv", false))).toBe(
+  it("is byte-identical to the config before the flag (base, google, d1), past the public file", () => {
+    expect(part(wranglerConfig(I, 8787))).toBe(fixture("base-kv"));
+    expect(part(wranglerConfig(I, 8787, undefined, "base", "kv", false))).toBe(
       fixture("base-kv"),
     );
-    expect(text(wranglerConfig(I, 8787, undefined, "google"))).toBe(
+    expect(part(wranglerConfig(I, 8787, undefined, "google"))).toBe(
       fixture("google-kv"),
     );
-    expect(text(wranglerConfig(I, 8787, undefined, "base", "d1"))).toBe(
+    expect(part(wranglerConfig(I, 8787, undefined, "base", "d1"))).toBe(
       fixture("base-d1"),
     );
+  });
+
+  it("passes every other public key and var through unchanged", () => {
+    for (const cfg of [
+      wranglerConfig(I, 8787),
+      wranglerConfig(I, 8787, undefined, "google"),
+      wranglerConfig(I, 8787, undefined, "base", "d1"),
+    ] as Record<string, unknown>[]) {
+      const p = cloudPart(cfg);
+      for (const k of Object.keys(PUBLIC))
+        if (k !== "vars" && !(k in p) && !(p.dropped as string[]).includes(k))
+          expect(cfg[k]).toEqual(PUBLIC[k]);
+      const vars = cfg.vars as Record<string, unknown>;
+      const pv = p.vars as Record<string, unknown>;
+      for (const [n, x] of Object.entries(PUBLIC.vars ?? {}))
+        if (!(n in pv) && !(p.droppedVars as string[]).includes(n))
+          expect(vars[n]).toEqual(x);
+      // The secrets never pass through.
+      for (const s of [
+        "SESSION_SECRET",
+        "CONTENT_SIGNING_KEY",
+        "TEST_HOOK_KEY",
+        "ACCESS_CLIENT_SECRET",
+        "GOOGLE_CLIENT_SECRET",
+      ])
+        expect(vars[s]).toBeUndefined();
+    }
   });
 
   it("REDLINE_LOCAL_T19: off unless exactly 1", () => {
