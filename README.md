@@ -155,7 +155,10 @@ listed path.
 ## Bumping the pin
 
 One PR per bump. The `pin-bump` workflow opens it for a new public release (steps 1 to 3
-below, done for you); fix what CI finds on its branch by hand. By hand:
+below, done for you). Its `pin-bump/*` branch takes no hand pushes: when CI finds a port,
+open a PR of your own from the bot's commit with the fix (as #422 did for #421), then
+close the bot's. If a newer release lands while a bump is red and not armed, the workflow
+closes that bump itself and opens one for the newest release (#425). By hand:
 
 1. Set `tag=` and `sha=` in PUBLIC_PIN to the new public release. The sha is
    `gh api repos/open-artifacts-ai/open-artifacts/commits/<tag> --jq .sha`.

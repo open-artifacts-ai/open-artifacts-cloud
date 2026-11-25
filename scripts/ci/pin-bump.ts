@@ -21,7 +21,14 @@ export const STALE_PR_MS = 3 * 24 * 3_600_000;
 export const branchOf = (tag: string) => `${BRANCH_PREFIX}${tag}`;
 
 export type { Exec, ExecResult };
-export type Plan = { bump: boolean; tag: string; sha: string; why: string };
+export type Plan = {
+  bump: boolean;
+  tag: string;
+  sha: string;
+  why: string;
+  /** An open bump PR this bump replaces (#425): older tag, red, not armed. */
+  supersede?: number;
+};
 
 const TAG = /^v(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -71,6 +78,67 @@ type Pr = {
   createdAt?: string;
 };
 
+/** Check conclusions that make a PR red. Cancelled, skipped and neutral give no verdict. */
+const RED = new Set([
+  "FAILURE",
+  "TIMED_OUT",
+  "STARTUP_FAILURE",
+  "ACTION_REQUIRED",
+  "ERROR",
+]);
+type Rollup = { conclusion?: string | null; state?: string | null };
+
+/**
+ * Why an open bump PR may be replaced by one for `newest` (#425), or the
+ * reason it may not. Only a PR for an older tag, with no auto-merge (so not
+ * armed and not in the queue) and at least one red check on its head. A green
+ * or armed PR is never touched.
+ */
+export function supersedable(o: {
+  exec: Exec;
+  repo: string;
+  pr: { number: number; headRefName: string };
+  newest: string;
+  /**
+   * false in open-pr's re-check: the App token there has no checks read, and
+   * the plan just found the PR red; armed and closed are what can change.
+   */
+  checks?: boolean;
+}): { ok: true; why: string } | { ok: false; why: string } {
+  const tag = o.pr.headRefName.slice(BRANCH_PREFIX.length);
+  if (!TAG.test(tag) || compareTags(tag, o.newest) >= 0)
+    return { ok: false, why: `its tag ${tag} is not older than ${o.newest}` };
+  const v = JSON.parse(
+    gh(o.exec, [
+      "pr",
+      "view",
+      String(o.pr.number),
+      "--repo",
+      o.repo,
+      "--json",
+      o.checks === false
+        ? "state,autoMergeRequest"
+        : "state,autoMergeRequest,statusCheckRollup",
+    ]),
+  ) as {
+    state: string;
+    autoMergeRequest: unknown;
+    statusCheckRollup: Rollup[] | null;
+  };
+  if (v.state !== "OPEN") return { ok: false, why: `it is ${v.state}` };
+  if (v.autoMergeRequest) return { ok: false, why: "it is armed" };
+  if (o.checks === false)
+    return { ok: true, why: `${tag} is still open and not armed` };
+  const red = (v.statusCheckRollup ?? []).filter(
+    (c) => RED.has(c.conclusion ?? "") || RED.has(c.state ?? ""),
+  );
+  if (red.length === 0) return { ok: false, why: "no check on it is red" };
+  return {
+    ok: true,
+    why: `${tag} is red (${red.length} checks) and not armed`,
+  };
+}
+
 /** What tonight does: nothing, or one bump to the newest public release. */
 export function plan(o: {
   exec: Exec;
@@ -104,7 +172,8 @@ export function plan(o: {
       ]),
     ) as Pr[]
   ).find((p) => p.headRefName.startsWith(BRANCH_PREFIX));
-  if (open) {
+  const stale = () => {
+    if (!open) return;
     const opened = Date.parse(open.createdAt ?? "");
     if (Number.isNaN(opened))
       throw new Error(
@@ -114,7 +183,7 @@ export function plan(o: {
       throw new Error(
         `${open.url} has been open for over 3 days; merge or close it so later releases are not blocked`,
       );
-  }
+  };
 
   const releases = JSON.parse(
     gh(o.exec, ["api", `repos/${o.publicRepo}/releases?per_page=30`]),
@@ -122,16 +191,28 @@ export function plan(o: {
   const tags = releases
     .filter((r) => !r.draft && !r.prerelease && TAG.test(r.tag_name))
     .map((r) => r.tag_name);
-  if (tags.length === 0) throw new Error("no stable vX.Y.Z public release");
+  if (tags.length === 0) {
+    stale();
+    throw new Error("no stable vX.Y.Z public release");
+  }
   const newest = tags.reduce((a, b) => (compareTags(a, b) >= 0 ? a : b));
-  if (compareTags(newest, current) <= 0)
+  if (compareTags(newest, current) <= 0) {
+    stale();
     return none(`PUBLIC_PIN ${current} is the newest release (${newest})`);
+  }
 
-  if (open)
-    return none(
-      `${open.url} (${open.headRefName}) is open; ${newest} waits for it`,
-      newest,
-    );
+  let supersede: number | undefined;
+  if (open) {
+    const s = supersedable({ exec: o.exec, repo: o.repo, pr: open, newest });
+    if (!s.ok) {
+      stale();
+      return none(
+        `${open.url} (${open.headRefName}) is open; ${newest} waits for it (${s.why})`,
+        newest,
+      );
+    }
+    supersede = open.number;
+  }
 
   const seen = JSON.parse(
     gh(o.exec, [
@@ -161,7 +242,15 @@ export function plan(o: {
   ]).trim();
   if (!SHA.test(sha))
     throw new Error(`${newest} resolved to '${sha}', not a full sha`);
-  return { bump: true, tag: newest, sha, why: `${current} -> ${newest}` };
+  return {
+    bump: true,
+    tag: newest,
+    sha,
+    why: supersede
+      ? `${current} -> ${newest}, replacing #${supersede}`
+      : `${current} -> ${newest}`,
+    ...(supersede ? { supersede } : {}),
+  };
 }
 
 /** Opens the PR. Re-checks for an open bump PR first: a race never makes two. */
@@ -172,6 +261,8 @@ export function openPr(o: {
   tag: string;
   sha: string;
   branch: string;
+  /** The plan's superseded PR: closed here, after a fresh check, then replaced. */
+  supersede?: number;
 }): { action: "opened"; url: string } | { action: "left"; url: string } {
   const open = (
     JSON.parse(
@@ -189,7 +280,31 @@ export function openPr(o: {
       ]),
     ) as Pr[]
   ).find((p) => p.headRefName.startsWith(BRANCH_PREFIX));
-  if (open) return { action: "left", url: open.url };
+  if (open) {
+    if (open.number !== o.supersede) return { action: "left", url: open.url };
+    // Checked again: someone may have armed or fixed it since the plan.
+    const s = supersedable({
+      exec: o.exec,
+      repo: o.repo,
+      pr: open,
+      newest: o.tag,
+      checks: false,
+    });
+    if (!s.ok) return { action: "left", url: open.url };
+    gh(
+      o.exec,
+      [
+        "pr",
+        "close",
+        String(open.number),
+        "--repo",
+        o.repo,
+        "--comment",
+        `Replaced by the bump to ${o.tag} (cloud #425): ${s.why}. A newer release carries this one's changes; the new PR runs CI again.`,
+      ],
+      { write: true },
+    );
+  }
   const body = [
     `Bumps PUBLIC_PIN and SYNCED_FROM to the public release ${o.tag} (${o.sha}), with the lockfile regenerated in the overlay (\`pnpm install --lockfile-only\`).`,
     "",
@@ -234,6 +349,16 @@ const flag = (argv: string[], name: string, fallback?: string) => {
   return v;
 };
 
+/** --supersede: empty (nothing to replace) or a PR number. */
+const supersedeOf = (argv: string[]) => {
+  const i = argv.indexOf("--supersede");
+  const v = i >= 0 ? (argv[i + 1] ?? "") : "";
+  if (v === "") return undefined;
+  if (!/^[1-9]\d{0,6}$/.test(v))
+    throw new Error(`--supersede ${v} isn't a PR number`);
+  return Number(v);
+};
+
 function main(argv: string[]) {
   const [mode] = argv;
   if (mode === "plan") {
@@ -245,7 +370,7 @@ function main(argv: string[]) {
     });
     console.error(`pin-bump: bump=${p.bump} ${p.why}`);
     console.log(
-      `bump=${p.bump}\ntag=${p.tag}\nsha=${p.sha}\nbranch=${p.tag ? branchOf(p.tag) : ""}`,
+      `bump=${p.bump}\ntag=${p.tag}\nsha=${p.sha}\nbranch=${p.tag ? branchOf(p.tag) : ""}\nsupersede=${p.supersede ?? ""}`,
     );
     return;
   }
@@ -261,6 +386,7 @@ function main(argv: string[]) {
       tag: flag(argv, "tag"),
       sha: flag(argv, "sha"),
       branch: flag(argv, "branch"),
+      supersede: supersedeOf(argv),
     });
     console.error(`pin-bump: ${r.action} ${r.url}`);
     return;
