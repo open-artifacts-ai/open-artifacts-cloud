@@ -568,7 +568,6 @@ describe("redline-staging.yml", () => {
         "handoff-up",
         "marker-up",
         "rl-agents",
-        "rl-agents-report",
       ]);
       const t19 = t19Named("t19");
       // T19 itself runs only after the key was opened: no key, no T19, and
@@ -1402,12 +1401,12 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
-    // The job ends with the revoke, the rl-agents report (never failing) and
-    // the file removal, all always, then the check that the hand-off happened
-    // (so none is skipped by its failure).
+    // The job ends with the revoke, the rl-agents upgrade (only after a green
+    // gate, never failing) and the file removal, then the check that the
+    // hand-off happened (so none is skipped by its failure).
     expect(steps.slice(-4).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
-      "Report the rl-agents upgrade",
+      "Upgrade rl-agents to the tag once the whole gate passed (never waits for the job)",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
     ]);
@@ -2157,51 +2156,38 @@ echo "RUN $*" >> "$CALLS"
   });
 });
 
-// Cloud #264, public #3167: each gate run upgrades rl-agents, the agents'
-// staging install, to the tag under test. One R5 in a detached process,
-// started after the suite; the 202 is its answer. It never waits, never
-// fails the gate and touches no other install (tests/redline/test/rl-agents.test.ts).
+// Cloud #264, public #3167: a gate run upgrades rl-agents, the agents'
+// staging install, to the tag under test, only once the whole gate passed:
+// every step of the redline job so far, the hand-off and the t19 job. One R5,
+// the 202 its answer; it never waits, never fails the gate and touches no
+// other install (tests/redline/test/rl-agents.test.ts).
 describe("the rl-agents upgrade (cloud #264)", () => {
-  const start = named("rl-agents");
-  const report = named("rl-agents-report");
+  const step = named("rl-agents");
   const idx = (n: string) => steps.findIndex((s) => s.name === n || s.id === n);
   const LOOPS = /\b(sleep|while|until|wait)\b/;
+  const GATE_REF =
+    "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main";
 
-  it("starts right after the suite, on a gate run only, only when the suite passed, and never fails the gate", () => {
-    expect(idx("rl-agents")).toBe(idx("Run the suite") + 1);
-    expect(named("suite").name).toBe("Run the suite");
-    expect(start.name).toBe("Start the rl-agents upgrade, without waiting");
-    // A called run (the nightly, the dry run) has the caller's workflow_ref.
-    // A red suite (the gate failed) never puts rl-agents on that release.
-    expect(start.if).toBe(
-      "${{ !cancelled() && steps.suite.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}",
+  it("runs last before the file removal, on a gate run only, only when every step so far passed and the hand-off was made, and never fails the gate", () => {
+    expect(idx("rl-agents")).toBe(idx("Revoke this run's R26 credentials") + 1);
+    expect(idx("Remove the secret files")).toBe(idx("rl-agents") + 1);
+    // success(): the suite, the scan and the revoke all passed. A called run
+    // (the nightly, the dry run) has the caller's workflow_ref.
+    expect(step.if).toBe(
+      `\${{ success() && steps.handoff-up.outcome == 'success' && github.workflow_ref == '${GATE_REF}' }}`,
     );
-    expect(start.if).not.toContain("always()");
-    expect(start.if).not.toContain("steps.staged");
-    expect(start["continue-on-error"]).toBe(true);
-    expect(start["timeout-minutes"]).toBe(1);
-    expect(start.env).toBeUndefined();
-    expect(start.run).not.toMatch(LOOPS);
-    // Detached, its log (which holds masks) in the secrets dir, nothing on stdin.
-    expect(start.run).toContain(
-      'setsid nohup pnpm --filter @oa/redline provisioning rl-agents-upgrade "$out/result.json" >> "$RUNNER_TEMP/redline-secrets/rl-agents-upgrade.log" 2>&1 < /dev/null &',
-    );
+    expect(step.if).not.toMatch(/always\(\)|cancelled\(\)|failure\(\)/);
+    expect(step["continue-on-error"]).toBe(true);
+    expect(step["timeout-minutes"]).toBe(1);
+    expect(step.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
+    expect(step.run).not.toMatch(LOOPS);
+    // No other step touches rl-agents, and nothing waits for its job.
+    expect(
+      steps.filter((s) => JSON.stringify(s).includes("rl-agents-upgrade")),
+    ).toEqual([step]);
   });
 
-  it("is reported after the revoke and before the secret files go, reading only result.json, never waiting", () => {
-    expect(idx("rl-agents-report")).toBe(
-      idx("Revoke this run's R26 credentials") + 1,
-    );
-    expect(idx("Remove the secret files")).toBe(idx("rl-agents-report") + 1);
-    expect(report.if).toBe("always() && steps.rl-agents.outcome == 'success'");
-    expect(report["continue-on-error"]).toBe(true);
-    expect(report["timeout-minutes"]).toBe(1);
-    expect(report.run).not.toMatch(LOOPS);
-    expect(report.run).not.toContain("rl-agents-upgrade.log");
-    expect(report.run).toContain('>> "$GITHUB_STEP_SUMMARY"');
-  });
-
-  function sandbox(withCommand: boolean) {
+  function sandbox(o: { t19: string; withCommand?: boolean; result?: string }) {
     const d = mkdtempSync(join(tmpdir(), "oa-rl-agents-"));
     const bin = join(d, "bin");
     const tmp = join(d, "tmp");
@@ -2210,122 +2196,124 @@ describe("the rl-agents upgrade (cloud #264)", () => {
     mkdirSync(join(d, "tests/redline/scripts"), { recursive: true });
     writeFileSync(
       join(d, "tests/redline/scripts/provisioning.ts"),
-      withCommand ? 'if (cmd === "rl-agents-upgrade") {}\n' : "// old tag\n",
+      o.withCommand === false
+        ? "// old tag\n"
+        : 'if (cmd === "rl-agents-upgrade") {}\n',
     );
-    // setsid is util-linux's (not on macOS): the step's own detach is nohup and &.
-    writeFileSync(join(bin, "setsid"), '#!/bin/sh\nexec "$@"\n', {
-      mode: 0o755,
-    });
-    // Blocks on GATE until the test opens it, then writes its result and
-    // signals DONE: proof the step returned while the upgrade still ran.
+    // The jobs API, as gh --jq prints it: this attempt's t19 conclusion.
     writeFileSync(
-      join(bin, "pnpm"),
-      `#!/usr/bin/env bash
-printf '%s\\n' "$*" > "$ARGS_FILE"
-read -r _ < "$GATE"
-printf '%s\\n' '{"kind":"current","line":"rl-agents (https://rl-agents.open-artifacts-staging.app): already on 0.82.0."}' > "\${@: -1}"
-echo done > "$DONE"
-`,
+      join(bin, "gh"),
+      `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(o.t19)}\n`,
       { mode: 0o755 },
     );
-    for (const f of ["gate", "done"])
-      spawnSync("mkfifo", [join(d, f)], { encoding: "utf8" });
+    // Records its call and writes the result the real command would.
+    writeFileSync(
+      join(d, "canned.json"),
+      o.result ??
+        JSON.stringify({
+          kind: "started",
+          line: "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 started, job j01ABC. The gate does not wait for it.",
+        }),
+    );
+    writeFileSync(
+      join(bin, "pnpm"),
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "$CALLS"\ncp "$CANNED" "\${@: -1}"\n`,
+      { mode: 0o755 },
+    );
     const env = {
       PATH: `${bin}:${process.env.PATH}`,
       RUNNER_TEMP: tmp,
-      GATE: join(d, "gate"),
-      DONE: join(d, "done"),
-      ARGS_FILE: join(d, "args"),
+      CALLS: join(d, "calls"),
+      CANNED: join(d, "canned.json"),
       GITHUB_STEP_SUMMARY: join(d, "summary"),
+      GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
+      GITHUB_RUN_ID: "1",
+      GITHUB_RUN_ATTEMPT: "1",
     };
-    return { d, tmp, env, result: join(tmp, "rl-agents-upgrade/result.json") };
+    const run = () => {
+      const r = runBash(step.run, env, d, 10_000);
+      return {
+        ...r,
+        summary: existsSync(env.GITHUB_STEP_SUMMARY)
+          ? readFileSync(env.GITHUB_STEP_SUMMARY, "utf8")
+          : "",
+        calls: existsSync(env.CALLS)
+          ? readFileSync(env.CALLS, "utf8").trim().split("\n")
+          : [],
+      };
+    };
+    return { d, tmp, run, result: join(tmp, "rl-agents-upgrade/result.json") };
   }
 
-  it("a tag without the command is reported as skipped and starts nothing", () => {
-    const sb = sandbox(false);
-    try {
-      const r = runBash(start.run, sb.env, sb.d, 10_000);
-      expect(r.status, r.stderr).toBe(0);
-      expect(existsSync(sb.env.ARGS_FILE)).toBe(false);
-      expect(JSON.parse(readFileSync(sb.result, "utf8")).kind).toBe("skipped");
-      const rep = runBash(report.run, sb.env, sb.d, 10_000);
-      expect(rep.status, rep.stderr).toBe(0);
-      expect(readFileSync(sb.env.GITHUB_STEP_SUMMARY, "utf8")).toContain(
-        "this tag has no rl-agents upgrade",
-      );
-    } finally {
-      rmSync(sb.d, { recursive: true, force: true });
-    }
-  });
-
-  it("the step returns while the upgrade still runs; the report then shows its line", () => {
-    const sb = sandbox(true);
-    let released = false;
-    try {
-      const r = runBash(start.run, sb.env, sb.d, 10_000);
-      expect(r.status, r.stderr).toBe(0);
-      expect(r.stdout).toContain("rl-agents upgrade: started");
-      // Still blocked on GATE: no result yet, and the report says so.
-      expect(existsSync(sb.result)).toBe(false);
-      let rep = runBash(report.run, sb.env, sb.d, 10_000);
-      expect(rep.status, rep.stderr).toBe(0);
-      expect(readFileSync(sb.env.GITHUB_STEP_SUMMARY, "utf8")).toContain(
-        "had not answered when this step ran",
-      );
-      // Release it and wait for its own signal, no sleep.
-      runBash(
-        'echo go > "$GATE"; cat "$DONE" > /dev/null',
-        sb.env,
-        sb.d,
-        10_000,
-      );
-      released = true;
-      expect(readFileSync(sb.env.ARGS_FILE, "utf8").trim()).toBe(
-        `--filter @oa/redline provisioning rl-agents-upgrade ${sb.result}`,
-      );
-      rep = runBash(report.run, sb.env, sb.d, 10_000);
-      expect(rep.status, rep.stderr).toBe(0);
-      expect(readFileSync(sb.env.GITHUB_STEP_SUMMARY, "utf8")).toContain(
-        "rl-agents (https://rl-agents.open-artifacts-staging.app): already on 0.82.0.",
-      );
-    } finally {
-      // A failed check must not leave the fake blocked: a read-write open of
-      // the fifo never blocks, and the fake reads what it holds.
-      if (!released)
-        runBash('exec 3<> "$GATE"; echo go >&3', sb.env, sb.d, 10_000);
-      rmSync(sb.d, { recursive: true, force: true });
-    }
-  });
-
-  it("the report withholds a line holding a secret, and replaces one that is not plain text or not JSON", () => {
-    const sb = sandbox(true);
-    try {
-      mkdirSync(dirname(sb.result), { recursive: true });
-      const secret = "eyJhbGciOiJSUzI1NiJ9.secret.value";
-      writeFileSync(join(sb.tmp, "redline-secrets/provisioning.jwt"), secret);
-      const cases: [string, string][] = [
-        [
-          JSON.stringify({ line: `rl-agents: ${secret}` }),
-          "the result was withheld",
-        ],
-        [
-          JSON.stringify({ line: "rl-agents: `x`\nmore" }),
-          "was not plain text",
-        ],
-        ["{not json", "could not be read"],
-      ];
-      for (const [body, want] of cases) {
-        writeFileSync(sb.result, body);
-        writeFileSync(sb.env.GITHUB_STEP_SUMMARY, "");
-        const rep = runBash(report.run, sb.env, sb.d, 10_000);
-        expect(rep.status, rep.stderr).toBe(0);
-        const out = readFileSync(sb.env.GITHUB_STEP_SUMMARY, "utf8");
-        expect(out).toContain(want);
-        expect(out).not.toContain(secret);
-        expect(rep.stdout).not.toContain(secret);
+  it("the suite passed but T19 failed (the v0.247.0 replay): no upgrade", () => {
+    for (const t19 of ["failure", "cancelled", "none", "unreadable", ""]) {
+      const sb = sandbox({ t19 });
+      try {
+        const r = sb.run();
+        expect(r.status, r.stderr).toBe(0);
+        expect(r.calls, t19).toEqual([]);
+        expect(r.summary).toContain(
+          "rl-agents: not upgraded, the t19 job did not pass",
+        );
+      } finally {
+        rmSync(sb.d, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("the whole gate passed: one upgrade call for the tag's rl-agents, and its line in the summary", () => {
+    const sb = sandbox({ t19: "success" });
+    try {
+      const r = sb.run();
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.calls).toEqual([
+        `--filter @oa/redline provisioning rl-agents-upgrade ${sb.result}`,
+      ]);
+      expect(r.summary).toContain(
+        "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 started, job j01ABC.",
+      );
     } finally {
       rmSync(sb.d, { recursive: true, force: true });
+    }
+  });
+
+  it("a tag without the command is reported as skipped and calls nothing", () => {
+    const sb = sandbox({ t19: "success", withCommand: false });
+    try {
+      const r = sb.run();
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.calls).toEqual([]);
+      expect(r.summary).toContain("this tag has no rl-agents upgrade");
+    } finally {
+      rmSync(sb.d, { recursive: true, force: true });
+    }
+  });
+
+  it("withholds a line holding a secret, and replaces one that is not plain text or not JSON", () => {
+    const secret = "eyJhbGciOiJSUzI1NiJ9.secret.value";
+    const cases: [string, string][] = [
+      [
+        JSON.stringify({ line: `rl-agents: ${secret}` }),
+        "the result was withheld",
+      ],
+      [JSON.stringify({ line: "rl-agents: `x`\nmore" }), "was not plain text"],
+      ["{not json", "could not be read"],
+    ];
+    for (const [result, want] of cases) {
+      const sb = sandbox({ t19: "success", result });
+      try {
+        writeFileSync(
+          join(sb.tmp, "redline-secrets/REDLINE_PROVISIONING_OIDC"),
+          secret,
+        );
+        const r = sb.run();
+        expect(r.status, r.stderr).toBe(0);
+        expect(r.summary).toContain(want);
+        expect(r.summary).not.toContain(secret);
+        expect(r.stdout).not.toContain(secret);
+      } finally {
+        rmSync(sb.d, { recursive: true, force: true });
+      }
     }
   });
 });

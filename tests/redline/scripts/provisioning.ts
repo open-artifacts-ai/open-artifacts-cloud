@@ -98,7 +98,7 @@ async function main(): Promise<number> {
     return 0;
   }
   if (cmd === "revoke") return revokeAll(env, t);
-  // Cloud #264: in the detached process the gate starts after its suite.
+  // Cloud #264: the gate's last upgrade, once the whole gate passed.
   if (cmd === "rl-agents-upgrade") {
     if (rest.length !== 1 || !rest[0])
       throw new Error("rl-agents-upgrade: one output file");
