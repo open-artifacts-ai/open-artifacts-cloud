@@ -33,7 +33,11 @@ import {
 import * as INDEX from "../src/index.js";
 import { RELEASE_PUBKEY_PLACEHOLDER } from "../src/internal/gates.js";
 import { loadTemplate } from "../src/internal/template.js";
-import { HOSTED_ADDED, userWorkerMetadata } from "../src/metadata.js";
+import {
+  HOSTED_ADDED,
+  type Template,
+  userWorkerMetadata,
+} from "../src/metadata.js";
 import {
   ENV_PREFIX,
   type Env,
@@ -1472,6 +1476,23 @@ describe("WfpProvisioner.create", () => {
       "PLAN",
     ]);
     for (const b of meta.bindings) expect(known.has(b.name), b.name).toBe(true);
+    // Public #3200's RL_HOOKS is the test variant's only: a red-line install
+    // gets every template hook binding, this release create none.
+    const hooks = ((t.ratelimits ?? []) as { name: string }[])
+      .map((r) => r.name)
+      .filter((n) => /hook/i.test(n));
+    await s.p.create(hookInput());
+    const test = metaOf(uploads(s.fake).at(-1)?.body as string);
+    const testNames = test.bindings.map((b: { name: string }) => b.name);
+    for (const n of testNames)
+      expect(known.has(n) || hooks.includes(n), n).toBe(true);
+    for (const n of hooks) {
+      expect(testNames, n).toContain(n);
+      expect(
+        meta.bindings.map((b: { name: string }) => b.name),
+        n,
+      ).not.toContain(n);
+    }
   });
 
   describe("bundle variants and the release record (decision 8, H2)", () => {
@@ -2468,14 +2489,20 @@ describe("WfpProvisioner.create", () => {
             x.namespace_id,
           ]),
         );
+        // A release create drops hook limiters (public #3200's RL_HOOKS);
+        // the rest keep rlNs + their template index.
         expect(by).toEqual(
           Object.fromEntries(
-            tplRl.map((r, k) => [r.name, String(row.rl_ns + k)]),
+            tplRl.flatMap((r, k) =>
+              /hook/i.test(r.name) ? [] : [[r.name, String(row.rl_ns + k)]],
+            ),
           ),
         );
         ids.push(...Object.values(by as Record<string, string>));
       }
-      expect(new Set(ids).size).toBe(2 * tplRl.length);
+      expect(new Set(ids).size).toBe(
+        2 * tplRl.filter((r) => !/hook/i.test(r.name)).length,
+      );
       for (const r of tplRl) expect(ids).not.toContain(r.namespace_id);
     });
 
@@ -2507,6 +2534,76 @@ describe("WfpProvisioner.create", () => {
         expect(s.fake.log).toEqual([]);
       },
     );
+  });
+
+  describe("hook bindings are the test variant's only (public #3200)", () => {
+    type Rl = {
+      name: string;
+      namespace_id: string;
+      simple: { limit: number; period: number };
+    };
+    /** The release template with RL_HOOKS, whether this pin has it or not. */
+    const withHooks = (): Template => {
+      const t = structuredClone(loadTemplate());
+      const rls = (t.ratelimits ?? []) as Rl[];
+      if (!rls.some((r) => r.name === "RL_HOOKS"))
+        rls.push({
+          name: "RL_HOOKS",
+          namespace_id: "1005",
+          simple: { limit: 600, period: 60 },
+        });
+      t.ratelimits = rls;
+      return t;
+    };
+    const created = async (env: Env, i: ReturnType<typeof input>) => {
+      const t = withHooks();
+      const s = setup({ env, release: makeRelease({ env, template: t }) });
+      const inst = await s.p.create(i);
+      const meta = s.scriptOf(inst.id)?.metadata as {
+        bindings: { name: string; type: string; namespace_id?: string }[];
+      };
+      const row = s.rows().find((r) => r.id === inst.id);
+      const rl = Object.fromEntries(
+        meta.bindings
+          .filter((b) => b.type === "ratelimit")
+          .map((b) => [b.name, b.namespace_id]),
+      );
+      const slot = (n: string) =>
+        String(
+          row.rl_ns +
+            ((t.ratelimits ?? []) as Rl[]).findIndex((r) => r.name === n),
+        );
+      return { t, meta, rl, slot };
+    };
+
+    it.each(["staging", "prod"] as const)(
+      "a %s release create has no hook binding even when the template has RL_HOOKS",
+      async (env) => {
+        const { t, meta, rl, slot } = await created(env, input());
+        expect(meta.bindings.map((b) => b.name)).not.toContain("RL_HOOKS");
+        expect(JSON.stringify(meta)).not.toMatch(/hook/i);
+        // The other limiters keep their rlNs + index slots.
+        const rest = ((t.ratelimits ?? []) as Rl[]).filter(
+          (r) => r.name !== "RL_HOOKS",
+        );
+        expect(rl).toEqual(
+          Object.fromEntries(rest.map((r) => [r.name, slot(r.name)])),
+        );
+      },
+    );
+
+    it("a test-variant create has RL_HOOKS at rlNs + its template index", async () => {
+      const { t, meta, rl, slot } = await created("staging", hookInput());
+      expect(meta.bindings.find((b) => b.name === "RL_HOOKS")).toMatchObject({
+        type: "ratelimit",
+        simple: { limit: 600, period: 60 },
+      });
+      expect(rl).toEqual(
+        Object.fromEntries(
+          ((t.ratelimits ?? []) as Rl[]).map((r) => [r.name, slot(r.name)]),
+        ),
+      );
+    });
   });
 
   describe("env and target (decisions 1, 2)", () => {
