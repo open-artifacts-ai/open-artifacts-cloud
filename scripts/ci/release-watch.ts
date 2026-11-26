@@ -147,6 +147,12 @@ export type Step = {
   runId?: number;
   /** Every attempt of every run of the step. */
   attempts?: number;
+  /**
+   * fleet only: doneAt is the scheduler's own fleet_done time (a "Fleet done
+   * of earlier releases" record); false: the "Fleet done" step's end, an
+   * upper bound some seconds after it.
+   */
+  exact?: boolean;
 };
 export type StageRow = {
   name: string;
@@ -218,6 +224,13 @@ export type Red = { tag: string; stage: string; url?: string };
 
 /** What a release's total runs to when its prod deploy recorded no fleet finish. */
 export const NO_FLEET = "prod deploy (fleet not yet measured)";
+/**
+ * A total to the "Fleet done" step's end: an upper bound, the step running
+ * some seconds after the scheduler's own mark. A later prod deploy's record
+ * of the mark corrects it.
+ */
+export const FLEET_UPPER =
+  "every install (upper bound: the Fleet done step's end)";
 const ms = (iso: string) => Date.parse(iso);
 const mins = (a: string, b: string) =>
   Math.max(0, Math.round(((ms(b) - ms(a)) / MIN) * 10) / 10);
@@ -444,20 +457,34 @@ export function fleetStep(
       )
         going = going ?? r.url;
     }
-  // A finish the next deploy recorded counts the same; the earliest wins.
-  if (late && (!done || ms(late.at) < ms(done.at))) done = late;
+  // The scheduler's own mark, as a later deploy recorded it, is the exact
+  // finish; the "Fleet done" step ends after the mark, so it is only an
+  // upper bound until a record is seen. Never the time the watcher saw it.
+  const fin = late
+    ? { ...late, exact: true }
+    : done
+      ? { ...done, exact: false }
+      : undefined;
   if (!deployEnd)
-    return done
-      ? { fleet: { state: "done", doneAt: done.at, url: done.url } }
+    return fin
+      ? {
+          fleet: {
+            state: "done",
+            doneAt: fin.at,
+            url: fin.url,
+            exact: fin.exact,
+          },
+        }
       : { fleet: { state: "none" } };
-  if (done)
+  if (fin)
     return {
       deployEnd,
       fleet: {
         state: "done",
         startedAt: deployEnd,
-        doneAt: done.at,
-        url: done.url,
+        doneAt: fin.at,
+        url: fin.url,
+        exact: fin.exact,
       },
     };
   return {
@@ -479,8 +506,9 @@ const prodDeploys = (runs: Run[], tag: string) =>
 /**
  * Pure: a finished release in history whose total stopped at the prod deploy
  * (its fleet wait ran out, or was not read yet) takes a later successful
- * "Fleet done" for the same tag: the total then runs to every install. A
- * release already measured to every install, or one that never reached prod,
+ * "Fleet done" for the same tag, and one to the "Fleet done" step's end (an
+ * upper bound) takes the scheduler's exact mark once a later deploy records
+ * it. A release measured to the exact mark, or one that never reached prod,
  * is left as it is.
  */
 export function upgradeFleet(h: HistoryEntry, runs: Run[]): HistoryEntry {
@@ -490,11 +518,19 @@ export function upgradeFleet(h: HistoryEntry, runs: Run[]): HistoryEntry {
     lateFleetDone(runs, h.tag),
   );
   if (fleet.state !== "done" || !fleet.doneAt) return h;
+  // An upper bound already recorded gives way only to the exact mark, or to
+  // an earlier step end.
+  if (
+    h.e2eTo === FLEET_UPPER &&
+    !fleet.exact &&
+    ms(fleet.doneAt) >= ms(h.doneAt)
+  )
+    return h;
   return {
     ...h,
     doneAt: fleet.doneAt,
     e2e: h.mergedAt ? mins(h.mergedAt, fleet.doneAt) : h.e2e,
-    e2eTo: "every install",
+    e2eTo: fleet.exact ? "every install" : FLEET_UPPER,
     stages: {
       ...h.stages,
       ...(fleet.startedAt
@@ -733,7 +769,9 @@ export function timeline(o: {
     .map((r) => r.name);
   const e2eTo =
     skipped.length === 0
-      ? "every install"
+      ? st.fleet?.exact === false
+        ? FLEET_UPPER
+        : "every install"
       : `${(tail?.name ?? "").replace(/_/g, " ")} (${skipped.join(", ")} not yet measured)`;
   const prodAt = ev["prod_deploy.done"];
   // Merge to every install is measured from the code merge only. With no
@@ -1113,6 +1151,60 @@ export function fromHistory(h: HistoryEntry, config: Config): Timeline {
   };
 }
 
+/**
+ * Pure: what a run comments on (events only, no poll): every stage that
+ * finished past its limit, in every release this run sees (in flight, done,
+ * superseded or read back from history), and every failed stage of a release
+ * not done. Each release is judged on its own runs: a newer release in flight
+ * never hides an older one's. One still going is in the summary only; one
+ * that never finishes raises no event and is the release agent's to catch.
+ * The comments dedupe by release and stage (commentPlan).
+ */
+export function stuck(
+  tls: Timeline[],
+  config: Config,
+  since?: string,
+): Overrun[] {
+  const out: Overrun[] = [];
+  for (const t of [...tls].sort((a, b) => compareTags(a.tag, b.tag))) {
+    if (since && ms(t.publishedAt) < ms(since)) continue;
+    for (const s of t.stages) {
+      const ids = s.runId ? { runId: s.runId, attempts: s.attempts ?? 1 } : {};
+      if (
+        s.state === "done" &&
+        s.usual !== undefined &&
+        s.minutes !== undefined &&
+        s.minutes > limitOf(s.usual, config)
+      )
+        out.push({
+          tag: t.tag,
+          stage: s.name,
+          kind: "finished",
+          startedAt: s.startedAt,
+          ...ids,
+          minutes: s.minutes,
+          usual: s.usual,
+          limit: limitOf(s.usual, config),
+          url: s.url,
+        });
+      else if (s.state === "red" && !t.doneAt)
+        out.push({
+          tag: t.tag,
+          stage: s.name,
+          kind: "failed",
+          red: true,
+          ...(s.startedAt ? { startedAt: s.startedAt } : {}),
+          ...ids,
+          minutes: s.minutes ?? 0,
+          usual: s.usual ?? 0,
+          limit: s.usual !== undefined ? limitOf(s.usual, config) : 0,
+          url: s.url,
+        });
+    }
+  }
+  return out;
+}
+
 /** Pure: the whole tick from what was read. */
 export function compute(o: {
   releases: Release[];
@@ -1122,6 +1214,8 @@ export function compute(o: {
   history: HistoryEntry[];
   config: Config;
   now: string;
+  /** Only releases published since then are commented on (a backfill's old ones are not). */
+  notifySince?: string;
 }) {
   // A recorded total to the prod deploy takes a later fleet finish.
   const prior = o.history.map((h) => upgradeFleet(h, o.runs));
@@ -1148,11 +1242,11 @@ export function compute(o: {
     o.config.historySize,
   );
   const s = stats(history, o.config);
-  const { over, red, failed } = overruns(all, o.config);
+  const { over, red } = overruns(all, o.config);
   // What a run comments on (events only, no poll): a stage that finished
   // past its limit, or failed. One still going is in the summary; one that
   // never finishes raises no event and is the release agent's to catch.
-  const notify = [...over.filter((x) => x.kind === "finished"), ...failed];
+  const notify = stuck(all, o.config, o.notifySince);
   const inFlight = tls
     .filter((t) => !t.doneAt && !t.supersededBy)
     .map((t) => {
@@ -1643,6 +1737,14 @@ export function tick(o: {
     history,
     config: o.config,
     now: o.now,
+    // A backfill comments only on what a normal run would see.
+    ...(backfill
+      ? {
+          notifySince: new Date(
+            ms(o.now) - o.config.lookbackHours * 3_600_000,
+          ).toISOString(),
+        }
+      : {}),
   });
   const issue = o.issue
     ? notifyStuck(o.exec, o.repo, out.notify, o.config)

@@ -17,9 +17,11 @@ import {
   earlierFleetList,
   eta,
   FLEET_DONE_STEP,
+  FLEET_UPPER,
   FLEET_WAIT_STEP,
   FLEET_WAKE_STEP,
   fleetStep,
+  fromHistory,
   type HistoryEntry,
   ISSUE_TITLE,
   type Job,
@@ -41,6 +43,7 @@ import {
   STAGING_RE,
   stats,
   step,
+  stuck,
   summary,
   supersede,
   tick,
@@ -1041,7 +1044,8 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       url: `${RUNS}3`,
     });
     expect(t.doneAt).toBe(D("05:05:53"));
-    expect(t.e2eTo).toBe("every install");
+    // The step ends after the scheduler's own mark: an upper bound, said so.
+    expect(t.e2eTo).toBe(FLEET_UPPER);
     expect(t.e2e).toBe(44.1);
     const r = compute({
       ...world2(chain({ prod: prodRuns(fleetDone) }), now),
@@ -1051,12 +1055,12 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     });
     expect(r.history[0]).toMatchObject({
       tag: "v0.248.2",
-      e2eTo: "every install",
+      e2eTo: FLEET_UPPER,
       e2e: 44.1,
     });
     expect(r.history[0]?.stages.fleet).toBe(4.9);
     expect(summary(r.current)).toContain(
-      "| v0.248.2 | 44.1 | every install | 24.1 over |",
+      `| v0.248.2 | 44.1 | ${FLEET_UPPER} | 24.1 over |`,
     );
     // Fleet has no usual time yet: never an alert.
     expect(r.over.map((o) => o.stage)).not.toContain("fleet");
@@ -1171,6 +1175,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
         startedAt: D("05:01:00"),
         doneAt: D("05:39:39"),
         url: `${RUNS}4`,
+        exact: false,
       },
     };
     // Whatever order the runs come in.
@@ -1189,7 +1194,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       endedAt: D("05:39:39"),
     });
     expect(row(t, "prod_deploy")?.endedAt).toBe(D("05:01:00"));
-    expect(t.e2eTo).toBe("every install");
+    expect(t.e2eTo).toBe(FLEET_UPPER);
     expect(t.doneAt).toBe(D("05:39:39"));
     // A backfill rebuilds from the runs, so it takes the later success too.
     const r = compute({
@@ -1199,7 +1204,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       now,
     });
     expect(r.history[0]).toMatchObject({
-      e2eTo: "every install",
+      e2eTo: FLEET_UPPER,
       doneAt: D("05:39:39"),
     });
   });
@@ -1226,12 +1231,12 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       ...recorded,
       doneAt: D("05:39:39"),
       e2e: 77.9,
-      e2eTo: "every install",
+      e2eTo: FLEET_UPPER,
       stages: { prod_deploy: 4.8, fleet: 38.7 },
     });
     // History from before e2eTo also ran to the prod deploy.
     const { e2eTo: _, ...old } = recorded;
-    expect(upgradeFleet(old, prod).e2eTo).toBe("every install");
+    expect(upgradeFleet(old, prod).e2eTo).toBe(FLEET_UPPER);
     // Nothing new: unchanged. Already to every install, or superseded: unchanged.
     expect(upgradeFleet(recorded, [ranOutRun()])).toBe(recorded);
     const full = { ...recorded, e2eTo: "every install" };
@@ -1247,7 +1252,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     });
     expect(r.history).toEqual([up]);
     expect(summary(r.current)).toContain(
-      "| v0.248.2 | 77.9 | every install | 57.9 over |",
+      `| v0.248.2 | 77.9 | ${FLEET_UPPER} | 57.9 over |`,
     );
   });
 
@@ -1361,10 +1366,11 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     });
     expect(t.e2eTo).toBe("every install");
     expect(t.doneAt).toBe(D("05:39:39"));
-    // The earliest of all sources: a same-run "Fleet done" before the record wins.
-    const both = [...prod, laterRun(4, "05:20:00", "05:25:00")];
+    // The record is the scheduler's own mark: exact, so a "Fleet done" step
+    // (which only ever ends after the mark) never replaces it.
+    const both = [...prod, laterRun(4, "05:39:00", "05:40:05")];
     expect(row(tl2(chain({ prod: both }), now), "fleet")?.endedAt).toBe(
-      D("05:25:00"),
+      D("05:39:39"),
     );
     // And a record before a later same-run success wins over it.
     const recFirst = [...prod, laterRun(4, "05:45:00", "05:50:00")];
@@ -1415,6 +1421,218 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       e2eTo: "every install",
       doneAt: D("05:39:39"),
     });
+  });
+});
+
+// cloud #456 third review (comment 7192575452), from the live v0.251.0 and
+// v0.251.1: PR #486 opened 11:14:42, merged 12:11:36; PR #490 opened
+// 12:14:48, merged 12:53:57; v0.251.0's prod deploy 45820756312, its "Fleet
+// done" step ending 12:45:26 while the scheduler's mark was 12:44:59.732.
+describe("overlapping releases and the exact fleet finish (v0.251.0, v0.251.1)", () => {
+  const D = (hms: string) => `2026-11-26T${hms}Z`;
+  const RUNS =
+    "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/";
+  const releases = [
+    { tag: "v0.251.0", publishedAt: D("11:12:34") },
+    { tag: "v0.251.1", publishedAt: D("12:12:37") },
+  ];
+  const merges = { "v0.251.0": D("10:03:10"), "v0.251.1": D("12:00:00") };
+  const pr = (
+    number: number,
+    tag: string,
+    created: string,
+    merged: string | null,
+  ): Pr => ({
+    number,
+    ref: `pin-bump/${tag}`,
+    createdAt: D(created),
+    mergedAt: merged ? D(merged) : null,
+    url: `https://github.com/open-artifacts-ai/open-artifacts-cloud/pull/${number}`,
+  });
+  const v0510: HistoryEntry = {
+    tag: "v0.251.0",
+    mode: "pr",
+    mergedAt: merges["v0.251.0"],
+    publishedAt: D("11:12:34"),
+    doneAt: D("12:45:26"),
+    e2e: 162.3,
+    e2eTo: FLEET_UPPER,
+    stages: {
+      tag: 69.4,
+      pin_open: 2.1,
+      pin_merge: 56.9,
+      prod_deploy: 3.8,
+      fleet: 8.2,
+    },
+  };
+
+  it("a newer release in flight never hides an older one's stages that finished past their limits", () => {
+    const run = (now: string, prs: Pr[], history: HistoryEntry[]) =>
+      compute({ releases, runs: [], prs, merges, history, config, now });
+    // v0.251.0 alone: both its finished overruns are comments.
+    const alone = compute({
+      releases: releases.slice(0, 1),
+      runs: [],
+      prs: [],
+      merges,
+      history: [v0510],
+      config,
+      now: D("12:50:00"),
+    });
+    expect(
+      alone.notify.map((o) => [o.tag, o.stage, o.minutes, o.limit]),
+    ).toEqual([
+      ["v0.251.0", "tag", 69.4, 40.8],
+      ["v0.251.0", "pin_merge", 56.9, 30.1],
+    ]);
+    // With v0.251.1 in flight, its pin PR open 35.2 min (past 30.1): v0.251.0's
+    // two stay, and v0.251.1's pin, still going, is in the summary only.
+    const both = run(
+      D("12:50:00"),
+      [pr(490, "v0.251.1", "12:14:48", null)],
+      [v0510],
+    );
+    expect(both.notify.map((o) => [o.tag, o.stage])).toEqual([
+      ["v0.251.0", "tag"],
+      ["v0.251.0", "pin_merge"],
+    ]);
+    expect(both.over.map((o) => [o.tag, o.stage, o.kind])).toContainEqual([
+      "v0.251.1",
+      "pin_merge",
+      "in_flight",
+    ]);
+    // The pin merges at 12:53:57 (39.2 min): that event comments on it too.
+    const merged = run(
+      D("12:54:30"),
+      [pr(490, "v0.251.1", "12:14:48", "12:53:57")],
+      [v0510],
+    );
+    expect(
+      merged.notify.map((o) => [o.tag, o.stage, o.kind, o.minutes]),
+    ).toEqual([
+      ["v0.251.0", "tag", "finished", 69.4],
+      ["v0.251.0", "pin_merge", "finished", 56.9],
+      ["v0.251.1", "pin_merge", "finished", 39.2],
+    ]);
+    // Said once: a later event with all three keys on the issue posts nothing.
+    const said = merged.notify.map((o) => ({
+      author: "github-actions[bot]",
+      body: commentKey(o),
+    }));
+    expect(commentPlan(said, merged.notify)).toEqual([]);
+    // A backfill comments only on what a normal run would see.
+    expect(stuck([fromHistory(v0510, config)], config, D("12:00:00"))).toEqual(
+      [],
+    );
+  });
+
+  const deploy = (o: {
+    id: number;
+    tag: string;
+    created: string;
+    updated: string;
+    steps: Job["steps"];
+  }): Run => ({
+    id: o.id,
+    path: ".github/workflows/deploy-hosted-platform.yml",
+    event: "workflow_dispatch",
+    title: `deploy-hosted-platform prod ${o.tag} [c${o.id}-1]`,
+    status: "completed",
+    conclusion: "success",
+    headSha: "a".repeat(40),
+    createdAt: D(o.created),
+    startedAt: D(o.created),
+    updatedAt: D(o.updated),
+    attempt: 1,
+    url: `${RUNS}${o.id}`,
+    commitMessage: "x",
+    commitAt: D(o.created),
+    jobs: [{ name: "deploy", conclusion: "success", steps: o.steps }],
+  });
+  const st = (name: string, a: string, b: string, conclusion = "success") => ({
+    name,
+    status: "completed",
+    conclusion,
+    startedAt: D(a),
+    completedAt: D(b),
+  });
+  // Run 45820756312's steps as recorded.
+  const ownDeploy = deploy({
+    id: 45820756312,
+    tag: "v0.251.0",
+    created: "12:33:28",
+    updated: "12:45:33",
+    steps: [
+      st("Read the fleet finish of earlier releases", "12:34:43", "12:34:44"),
+      st(
+        "Fleet done of earlier releases ()",
+        "12:34:44",
+        "12:34:44",
+        "skipped",
+      ),
+      st("Mark the platform verified", "12:37:16", "12:37:16"),
+      st(FLEET_WAKE_STEP, "12:37:17", "12:37:17"),
+      st(FLEET_WAIT_STEP, "12:37:17", "12:45:26"),
+      st(FLEET_DONE_STEP, "12:45:26", "12:45:26"),
+    ],
+  });
+  // v0.251.1's prod deploy records the mark's own time.
+  const nextDeploy = deploy({
+    id: 45830000001,
+    tag: "v0.251.1",
+    created: "13:20:00",
+    updated: "13:32:00",
+    steps: [
+      st("Read the fleet finish of earlier releases", "13:21:00", "13:21:01"),
+      st(
+        "Fleet done of earlier releases (v0.251.0 at 2026-11-26T12:44:59.732Z)",
+        "13:21:01",
+        "13:21:01",
+      ),
+    ],
+  });
+
+  it("the Fleet done step's end is an upper bound; the scheduler's own mark, once recorded, is the exact finish", () => {
+    expect(fleetStep([ownDeploy]).fleet).toMatchObject({
+      state: "done",
+      doneAt: D("12:45:26"),
+      exact: false,
+    });
+    expect(
+      fleetStep([ownDeploy], lateFleetDone([ownDeploy, nextDeploy], "v0.251.0"))
+        .fleet,
+    ).toMatchObject({
+      state: "done",
+      doneAt: "2026-11-26T12:44:59.732Z",
+      exact: true,
+    });
+  });
+
+  it("history kept at the step's end takes the exact mark from the next deploy: 26.268 s earlier", () => {
+    const fixed = upgradeFleet(v0510, [ownDeploy, nextDeploy]);
+    expect(fixed).toEqual({
+      ...v0510,
+      doneAt: "2026-11-26T12:44:59.732Z",
+      e2e: 161.8,
+      e2eTo: "every install",
+      stages: { ...v0510.stages, fleet: 7.7 },
+    });
+    expect(ms(v0510.doneAt) - ms(fixed.doneAt)).toBe(26_268);
+    // Without the record it stays an upper bound, never the time the watcher saw it.
+    expect(upgradeFleet(v0510, [ownDeploy])).toBe(v0510);
+    // Exact already: a later step end never moves it.
+    expect(upgradeFleet(fixed, [ownDeploy, nextDeploy])).toBe(fixed);
+    // Through a run's compute: the history line moves.
+    const r = compute({
+      releases,
+      runs: [ownDeploy, nextDeploy],
+      prs: [pr(490, "v0.251.1", "12:14:48", "12:53:57")],
+      merges,
+      history: [v0510],
+      config,
+      now: D("13:35:00"),
+    });
+    expect(r.history.find((h) => h.tag === "v0.251.0")).toEqual(fixed);
   });
 });
 
@@ -1823,10 +2041,12 @@ describe("the stuck-stage issue", () => {
     expect(world(now, w).notify.map((o) => [o.stage, o.kind])).toEqual([
       ["staging_deploy", "failed"],
     ]);
-    // v0.246.1 at 23:30: its tag and pin merge finished past their limits.
+    // At 23:30: v0.246.1's tag and pin merge finished past their limits, and
+    // v0.246.0, superseded, failed its red-line: each release on its own runs.
     expect(
       world(T("23:30:00")).notify.map((o) => [o.tag, o.stage, o.kind]),
     ).toEqual([
+      ["v0.246.0", "redline", "failed"],
       ["v0.246.1", "tag", "finished"],
       ["v0.246.1", "pin_merge", "finished"],
     ]);
