@@ -251,7 +251,7 @@ describe("the probes on a conforming staging fake", () => {
     expect([...listed].filter((k) => !named.has(k)).map(show)).toEqual([]);
     expect([...named].filter((k) => !listed.has(k)).map(show)).toEqual([]);
     expect(listed.size).toBe(live.length);
-    expect(RETIRED_PROBE_IDS.size).toBe(29);
+    expect(RETIRED_PROBE_IDS.size).toBe(27);
     for (const id of RETIRED_PROBE_IDS)
       expect(
         PROBES.some((p) => p.id === id),

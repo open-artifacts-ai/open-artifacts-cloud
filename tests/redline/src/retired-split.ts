@@ -1,3 +1,9 @@
+import { CALLERS } from "../../../apps/server/test/authz/expect.ts";
+import {
+  ORG_SURFACES,
+  SPACE_SURFACES,
+  SURFACES,
+} from "../../../apps/server/test/authz/surfaces.ts";
 import { PROBES, type ProbeId } from "./provisioning.ts";
 import type { Retired } from "./retired.ts";
 import { type Citation, probeCases } from "./surfaces.ts";
@@ -12,17 +18,13 @@ import { type Citation, probeCases } from "./surfaces.ts";
 
 const MATRIX = "apps/server/test/authz.surface-matrix.test.ts";
 const PROV = "apps/provisioning/test";
-const c = (file: string, describe: string, test?: string): Citation =>
-  test === undefined ? { file, describe } : { file, describe, test };
+/** A citation names its test: file, describe and test (retiredGaps refuses one without). */
+const c = (file: string, describe: string, test: string): Citation => ({
+  file,
+  describe,
+  test,
+});
 
-const HOSTED_MATRIX: Citation[] = [
-  c(MATRIX, "artifact surfaces (sync stale 8 days)"),
-  c(MATRIX, "instance routes"),
-  c(MATRIX, "space writes (the service rules behind { user })"),
-  // #3158: the same matrix once more with hosted settings (staging's rl-b).
-  c(MATRIX, "GET /api/v1/settings/login: editable as the install's setup says"),
-  c("apps/server/package.json", "test:authz:hosted"),
-];
 const FOREIGN = c(
   MATRIX,
   "foreign credentials: another install's, valid there (#1137)",
@@ -69,8 +71,14 @@ const CASES: Retired[] = [
     `${DELETED}: a check of the two-install setup; the smoke's shared health check reads each install's own id`,
     [
       c(
-        "apps/dashboard/e2e/staging/rl-a/guard.setup.ts",
-        "rl-a reports testHooks and its own installId",
+        "apps/server/test/test-hooks.test.ts",
+        "hooks",
+        "/healthz reports testHooks",
+      ),
+      c(
+        "apps/server/test/skeleton.test.ts",
+        "skeleton",
+        "GET /healthz on app host",
       ),
     ],
   ),
@@ -215,35 +223,20 @@ const CASES: Retired[] = [
     `${PR_CI}: the same per-install signing key as content links, whose reuse the nightly content-link check covers`,
     [FOREIGN_SIGNED],
   ),
-  one(
-    "credentials.test.ts",
-    "credentials > B's private artifact id fetched with A's credentials at A: 404",
-    `${DELETED}: an unknown id in A's own database`,
-    [c(MATRIX, "artifact surfaces (sync stale 8 days)")],
-  ),
+  // Kept live: no single named PR test covers "another install's id is an
+  // unknown id here" (credentials > B's private artifact id fetched with A's
+  // credentials at A: 404).
   one(
     "credentials.test.ts",
     "credentials > links > A's invite link opened at B by a B member: no membership on B",
     `${DELETED}: re-proves isolation, and needed a lock on rl-b's member list`,
-    [
-      c(
-        "apps/server/test/invite-reach.test.ts",
-        "invite reachability (review item 11)",
-      ),
-      FOREIGN,
-    ],
+    [FOREIGN],
   ),
   one(
     "credentials.test.ts",
     "credentials > links > A's share email link opened at B by a B member: no share on B",
     `${DELETED}: re-proves isolation, and needed a lock on rl-b's member list`,
-    [
-      c(
-        "apps/server/test/share-reach.test.ts",
-        "share recipient reach (review item 37)",
-      ),
-      FOREIGN,
-    ],
+    [FOREIGN],
   ),
   // edge.test.ts
   ...both(
@@ -438,6 +431,9 @@ const CASES: Retired[] = [
           c(
             "apps/server/test/socket-origin.test.ts",
             "socket Origin check with hosted neighbouring addresses",
+            // A literal in the test file (its socket names are data-subscribe and events).
+            // biome-ignore lint/suspicious/noTemplateCurlyInString: the test's own title template
+            "${name}: every neighbouring origin is refused; B's own app origin connects",
           ),
         ],
       ),
@@ -447,7 +443,18 @@ const CASES: Retired[] = [
     "live.test.ts",
     "anonymous writes on a B public artifact > the fixture accepts an anonymous write",
     `${PR_CI}: plain app behaviour in the artifact's storage`,
-    [c("apps/server/test/anon-id.test.ts", "anonId issuance")],
+    [
+      c(
+        "apps/server/test/anon-id.test.ts",
+        "anonId issuance",
+        "a token-less write mints one and uses it",
+      ),
+      c(
+        "apps/server/test/anon-id.test.ts",
+        "publicActor",
+        "maps anonymous actors to anon / anon:{short}",
+      ),
+    ],
   ),
   one(
     "live.test.ts",
@@ -522,23 +529,31 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "the api host ignores the cookie",
       ),
     ],
-    P4: [
-      c(
-        `${PROV}/authenticate.test.ts`,
-        "authenticate: admin host (W5a session)",
-      ),
-      c(`${PROV}/app.test.ts`, "host policy (2.2)"),
-    ],
     P5: [
-      c(`${PROV}/session.test.ts`, "Origin and Sec-Fetch-Site (before authn)"),
-      c(`${PROV}/refuse.test.ts`, "refuse (4.9)"),
+      c(
+        `${PROV}/session.test.ts`,
+        "Origin and Sec-Fetch-Site (before authn)",
+        "a write needs the exact admin origin; Sec-Fetch-Site, when sent, same-origin",
+      ),
+      c(
+        `${PROV}/refuse.test.ts`,
+        "refuse (4.9)",
+        "answers the envelope with the code's one status, no-store",
+      ),
     ],
     P8: [
-      c(`${PROV}/test-member.test.ts`, "authz: the test member's allowlist"),
-      c(`${PROV}/reads.test.ts`, "R2 list and R3 detail"),
+      c(
+        `${PROV}/test-member.test.ts`,
+        "authz: the test member's allowlist",
+        "staging: exactly R2, R15 and R26, each with own reach; every other route is 403",
+      ),
+      c(
+        `${PROV}/reads.test.ts`,
+        "R2 list and R3 detail",
+        "O sees rl- test installs only; U its own only",
+      ),
     ],
     P9: [
-      c(`${PROV}/test-member.test.ts`, "authz: the test member's allowlist"),
       c(
         `${PROV}/writes.test.ts`,
         "R4 self-serve policy (4.2 order)",
@@ -551,7 +566,11 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "R2 list and R3 detail",
         "O sees rl- test installs only; U its own only",
       ),
-      c(`${PROV}/mcp-oidc.test.ts`, "OIDC on staging /mcp (9A.10)"),
+      c(
+        `${PROV}/test-member.test.ts`,
+        "authz: the test member's allowlist",
+        "the other OIDC scopes are unchanged: red-line keeps rl- reach and no R28; the test admin only R28",
+      ),
     ],
     P11: [
       c(
@@ -559,14 +578,6 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "authz: the test member's allowlist",
         "staging: exactly R2, R15 and R26, each with own reach; every other route is 403",
       ),
-    ],
-    P12: [
-      c(
-        `${PROV}/test-member.test.ts`,
-        "authz: the test member's allowlist",
-        "through invokeRoute: every API route off the allowlist answers 403 forbidden",
-      ),
-      c(`${PROV}/writes.test.ts`, "lifecycle writes (R5-R13)"),
     ],
     P14: [
       c(
@@ -644,7 +655,11 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "transport (9A.2, 9A.6)",
         "/mcp on the admin host is 404",
       ),
-      c(`${PROV}/routes.test.ts`, "route table (3.4)"),
+      c(
+        `${PROV}/app.test.ts`,
+        "host policy (2.2)",
+        "/mcp on the admin host and /oauth/authorize on the api host are 404",
+      ),
     ],
     P41: [
       c(
@@ -666,6 +681,11 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "GET /oauth/authorize: cookie, bounce, session left",
         "no session, cross-site: 200 bounce page to the same URL plus b=1",
       ),
+      c(
+        `${PROV}/oauth.test.ts`,
+        "GET /oauth/authorize: cookie, bounce, session left",
+        "no session with b=1, or same-origin: the sign-in page links /auth/start with the query, b dropped",
+      ),
     ],
     P44: [
       c(
@@ -673,9 +693,18 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
         "DCR (/oauth/register)",
         "loopback with a port and the exact MCP_REDIRECT_URIS entry are accepted",
       ),
+      c(
+        `${PROV}/oauth.test.ts`,
+        "DCR (/oauth/register)",
+        "refuses %s with invalid_redirect_uri, counted in oauth_register",
+      ),
     ],
     P47: [
-      c(`${PROV}/authenticate.test.ts`, "authenticate: oat_ bearer (api host)"),
+      c(
+        `${PROV}/authenticate.test.ts`,
+        "authenticate: oat_ bearer (api host)",
+        "an OAuth access token on /v1 is 401 (9A.3)",
+      ),
     ],
     P48: [
       c(
@@ -692,7 +721,13 @@ export const RETIRED_PROBES: Readonly<Partial<Record<ProbeId, Citation[]>>> =
       ),
     ],
     // Deleted: the bus file's own pair proves the suspend close (4403).
-    P51: [c("tests/redline/live/bus.test.ts", "bus")],
+    P51: [
+      c(
+        "tests/redline/live/bus.test.ts",
+        "bus",
+        "suspend rl-busb: its daemon socket closes within 30 s with 4403, reconnects at 10, 60 and 125 s get dispatch's paused answer and never 101, rl-busa's socket stays open; after the resume the same token connects, the pending mail is there and the hub is intact",
+      ),
+    ],
   });
 
 /** The probe ids out of the live run. */
@@ -714,19 +749,104 @@ const PROBE_CASES: Retired[] = PROBES.filter((p) =>
 );
 
 /**
- * The surface probes that stay live (nightly): one session and one PAT
- * cross-install refusal (the page's "one install's real login and token"),
- * the OAuth token at the other install's MCP, the OAuth grant edit and
- * revoke on the real KV, and the upload reservation the smoke also runs.
+ * The matrix's own test for one surface probe case: the named test the
+ * matrix generates for that surface, route or space write (its describe.each
+ * parameter), with the caller that stands for the live case's B credential.
+ * The matrix sends a REST, org or space probe with the caller's cookie, and
+ * an MCP probe with its PAT (apps/server/test/authz/surfaces.ts), so only
+ * those legs have a named test: a REST, org or space [pat] case has none, and
+ * stays live. Every caller runs in the same test, the foreign ones (another
+ * install's session and PAT) included, so the A-at-B leg is covered too.
  */
-export const KEPT_SURFACES: ReadonlySet<string> = new Set([
+export interface SurfaceCite extends Citation {
+  test: string;
+  each: {
+    table: "SURFACES" | "ORG_SURFACES" | "SPACE_SURFACES";
+    value: string;
+    caller: (typeof CALLERS)[number] | "every caller";
+  };
+}
+
+const VARIANT = /^(.*) \[(session|pat|oauth)\]$/;
+
+/** The named matrix test for a surface probe case, or null when it has none. */
+export function surfaceCite(name: string): SurfaceCite | null {
+  const m = VARIANT.exec(name);
+  if (!m) return null;
+  const base = m[1] as string;
+  const v = m[2] as string;
+  if (base.startsWith("artifact ")) {
+    const s = SURFACES.find((x) => x.name === base.slice("artifact ".length));
+    if (!s) return null;
+    // The matrix's credential for this surface: the PAT on MCP, else the cookie.
+    if ((s.via === "mcp") !== (v === "pat")) return null;
+    return {
+      file: MATRIX,
+      describe: "artifact surfaces (sync stale 8 days)",
+      test: "%s",
+      each: { table: "SURFACES", value: s.name, caller: "orgAdmin" },
+    };
+  }
+  if (base.startsWith("org ") && v === "session") {
+    const s = ORG_SURFACES.find((x) => x.route === base.slice("org ".length));
+    if (!s || s.instance) return null;
+    return {
+      file: MATRIX,
+      describe: "instance routes",
+      test: "every caller",
+      each: { table: "ORG_SURFACES", value: s.route, caller: "every caller" },
+    };
+  }
+  if (base.startsWith("space ") && v === "session") {
+    const s = SPACE_SURFACES.find(
+      (x) => x.name === base.slice("space ".length),
+    );
+    if (!s) return null;
+    return {
+      file: MATRIX,
+      describe: "space writes (the service rules behind { user })",
+      test: "every caller",
+      each: { table: "SPACE_SURFACES", value: s.name, caller: "every caller" },
+    };
+  }
+  return null;
+}
+
+/** What's wrong with a surface citation: its parameter must still be in the matrix's table. */
+export function surfaceCiteGaps(name: string, c: SurfaceCite): string[] {
+  const { table, value, caller } = c.each;
+  const has =
+    table === "SURFACES"
+      ? SURFACES.some((x) => x.name === value)
+      : table === "ORG_SURFACES"
+        ? ORG_SURFACES.some((x) => x.route === value)
+        : SPACE_SURFACES.some((x) => x.name === value);
+  const out: string[] = [];
+  if (!has) out.push(`${name}: the matrix's ${table} has no ${value}`);
+  if (caller !== "every caller" && !CALLERS.includes(caller))
+    out.push(`${name}: the matrix has no caller ${caller}`);
+  return out;
+}
+
+/** The pinned live cases: what the page keeps nightly (the session and PAT refusal, OAuth, the grant edit and revoke, the upload). */
+const PINNED = [
   "artifact rest uploads [session]",
   "artifact rest uploads [pat]",
   "artifact mcp create_upload [pat]",
   "artifact mcp get_artifact [oauth]",
   "org PATCH /api/v1/oauth-clients/:grantId [session]",
   "org DELETE /api/v1/oauth-clients/:grantId [session]",
-]);
+];
+
+/**
+ * The surface probes that stay live (nightly): the pinned ones above, and
+ * every case no named matrix test covers (surfaceCite null).
+ */
+export const KEPT_SURFACES: ReadonlySet<string> = new Set(
+  probeCases()
+    .map((p) => p.name)
+    .filter((n) => PINNED.includes(n) || surfaceCite(n) === null),
+);
 
 const SURFACE = "surface probes (cross-install) > ";
 export const SURFACE_COVERAGE =
@@ -743,19 +863,26 @@ const SURFACE_CASES: Retired[] = [
         "probe cases (derived from Backend's surfaces)",
         "cover every ROUTE_POLICY route, MCP tool and content route",
       ),
-      c(MATRIX, "coverage (derived from the router and the registries)"),
+      c(
+        MATRIX,
+        "coverage (derived from the router and the registries)",
+        "every mounted app route is listed (artifact surface, instance route or public)",
+      ),
     ],
   ),
   ...probeCases()
     .filter((p) => !KEPT_SURFACES.has(p.name))
-    .map((p) =>
-      one(
+    .map((p) => {
+      const cite = surfaceCite(p.name) as SurfaceCite;
+      return one(
         "surfaces.test.ts",
         `${SURFACE}${p.name}`,
-        `${PR_CI} (public #3158): the allow/deny table on every route runs on every PR, once with hosted settings; another install's login with no allowed leg is deleted`,
-        HOSTED_MATRIX,
-      ),
-    ),
+        p.denyOnly
+          ? `${DELETED}: another install's login with no allowed leg; the matrix runs another install's session and PAT on ${cite.each.value} in the same test`
+          : `${PR_CI} (public #3158): the matrix's test for ${cite.each.value}, as ${cite.each.caller}, runs on every PR, once with hosted settings`,
+        [cite],
+      );
+    }),
 ];
 
 export const SPLIT_RETIRED: readonly Retired[] = [

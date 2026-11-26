@@ -24,7 +24,8 @@ import { loadTargets, type Target, type Targets } from "../src/targets.ts";
 // other's MCP, and its signed content link at the other's content address.
 // A provisioning bug that shared an OAuth store or CONTENT_SIGNING_KEY would
 // let one through. The token and login-session parts run in the smoke; the
-// cases the page moves to PR CI or deletes are in src/retired-split.ts.
+// cases the page moves to PR CI or deletes are in src/retired-split.ts, but
+// for the id case below, which no single named PR test covers yet.
 
 let T: Targets;
 let A: Side;
@@ -43,6 +44,8 @@ afterAll(async () => {
     if (s) bad += await deleteThrowaways(s.t, s.pat, [s.markerId]);
   if (bad) note(`cleanup: ${bad} marker artifact(s) not deleted`);
 });
+
+const side = (t: Target) => (t === T.a ? A : B);
 
 const pair = (credA: Cred, credB: Cred) => ({
   a: T.a,
@@ -106,6 +109,26 @@ describe("credentials", () => {
       return { kind: "oauth", token: r.accessToken };
     };
     await crossCheck(mcpList, pair(await grant(T.a), await grant(T.b)));
+  });
+
+  // Kept live (cloud #264 step 2): the page deletes it, but no single named
+  // PR test covers it, so it stays until one does.
+  it("B's private artifact id fetched with A's credentials at A: 404", async () => {
+    // The id is the credential here: B's id is refused at A (the roles of
+    // crossCheck's a and b swap), with A's PAT and A's cookie.
+    for (const k of ["pat", "cookie"] as const) {
+      const req = (c: Cred, t: Target) =>
+        new Request(
+          `${t.app}/api/v1/artifacts/${encodeURIComponent(slotValue<string>(c, t))}`,
+          withCred(side(t)[k]),
+        );
+      await crossCheck(req, {
+        a: T.b,
+        b: T.a,
+        credA: slot(() => B.markerId),
+        credB: slot(() => A.markerId),
+      });
+    }
   });
 
   it("A's signed content URL at B's content host", async () => {

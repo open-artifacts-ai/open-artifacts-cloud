@@ -51,16 +51,15 @@ describe("retired live cases (#1235)", () => {
     );
   });
 
-  it("cloud #264 step 2: every PR CI or deleted case the page lists is out, and the nightly and smoke cases stay", () => {
+  it("cloud #264 step 2: every retired case is out of the manifest, and the nightly and smoke cases stay", () => {
     const m = manifest();
     const has = (file: string, name: string) =>
       m.some((c) => c.file === file && c.name === name);
-    // 422 cases before, 44 after: 378 retired.
-    expect(m).toHaveLength(44);
-    expect(SPLIT_RETIRED).toHaveLength(378);
+    // 422 cases before: 283 retired, 139 live (nightly).
+    expect(m).toHaveLength(139);
+    expect(SPLIT_RETIRED).toHaveLength(283);
     for (const r of SPLIT_RETIRED)
       expect(has(r.file, r.name), r.name).toBe(false);
-    // The page's nightly rows, kept in the live suite (now nightly only).
     for (const [file, name] of [
       [
         "live/guard.test.ts",
@@ -77,6 +76,11 @@ describe("retired live cases (#1235)", () => {
       [
         "live/credentials.test.ts",
         "credentials > A's signed content URL at B's content host",
+      ],
+      // No single named PR test yet: kept live.
+      [
+        "live/credentials.test.ts",
+        "credentials > B's private artifact id fetched with A's credentials at A: 404",
       ],
       [
         "live/edge.test.ts",
@@ -96,7 +100,10 @@ describe("retired live cases (#1235)", () => {
       ],
     ] as const)
       expect(has(file, name), name).toBe(true);
+    // P4 and P12 have no named PR test for every leg: kept live.
     for (const id of [
+      "P4",
+      "P12",
       "P15",
       "P20",
       "P21",
@@ -116,5 +123,42 @@ describe("retired live cases (#1235)", () => {
         id,
       ).toBe(true);
     expect(m.filter((c) => c.file === "live/bus.test.ts")).toHaveLength(2);
+  });
+
+  it("every citation names its test: file, describe and test name", () => {
+    for (const r of RETIRED)
+      for (const c of r.coveredBy)
+        expect(c.test, `${r.name}: ${c.file}`).toBeTruthy();
+  });
+
+  it("refuses a citation that names no test", () => {
+    const [r] = SPLIT_RETIRED;
+    if (!r) throw new Error("no retired case");
+    const c = r.coveredBy[0];
+    if (!c) throw new Error("no citation");
+    const saved = c.test;
+    try {
+      delete (c as { test?: string }).test;
+      expect(retiredGaps(manifest(), readRepoFile)).toContain(
+        `${r.file} > ${r.name}: a citation names no test (${c.file} "${c.describe}")`,
+      );
+    } finally {
+      (c as { test?: string }).test = saved;
+    }
+  });
+
+  it("P43 and P44 cite a named test for each of their legs", () => {
+    const of = (id: string) =>
+      SPLIT_RETIRED.find((r) =>
+        r.name.startsWith(`provisioning > ${id}: `),
+      )?.coveredBy.map((c) => c.test);
+    expect(of("P43")).toEqual([
+      "no session, cross-site: 200 bounce page to the same URL plus b=1",
+      "no session with b=1, or same-origin: the sign-in page links /auth/start with the query, b dropped",
+    ]);
+    expect(of("P44")).toEqual([
+      "loopback with a port and the exact MCP_REDIRECT_URIS entry are accepted",
+      "refuses %s with invalid_redirect_uri, counted in oauth_register",
+    ]);
   });
 });

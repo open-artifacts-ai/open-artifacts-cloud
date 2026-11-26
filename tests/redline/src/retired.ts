@@ -1,4 +1,8 @@
-import { SPLIT_RETIRED } from "./retired-split.ts";
+import {
+  SPLIT_RETIRED,
+  type SurfaceCite,
+  surfaceCiteGaps,
+} from "./retired-split.ts";
 import { type Citation, resolveCitations } from "./surfaces.ts";
 
 // #1235: live cases taken out of the red-line run, each with the failure it
@@ -24,8 +28,11 @@ const HARNESS = "credentials (harness smoke)";
 
 /** The matrix's foreign PAT on every data and storage route, and its proof (#1224). */
 const FOREIGN_PAT_ON_DATA: Citation[] = [
-  { file: MATRIX, describe: "artifact surfaces (sync stale 8 days)" },
-  { file: MATRIX, describe: "refusal mode writes nothing on the world space" },
+  {
+    file: MATRIX,
+    describe: "refusal mode writes nothing on the world space",
+    test: "every refusal-mode instance write, every caller, both target shapes",
+  },
   {
     file: MATRIX,
     describe: "foreign credentials: another install's, valid there (#1137)",
@@ -119,6 +126,7 @@ export const RETIRED: readonly Retired[] = [
       {
         file: MATRIX,
         describe: "coverage (derived from the router and the registries)",
+        test: "every mounted app route is listed (artifact surface, instance route or public)",
       },
     ],
   },
@@ -185,6 +193,18 @@ export function retiredGaps(
     if (r.guards !== "none" && !/^[A-Z]+-\d+$/.test(r.guards))
       gaps.push(`${key(r)}: guards no failure-model id (${r.guards})`);
   }
+  // Cloud #264 step 2: every citation names its replacing test, never a file
+  // or a describe alone; a surface citation's parameter must still be in the
+  // matrix's table (src/retired-split.ts surfaceCiteGaps).
+  for (const r of RETIRED)
+    for (const c of r.coveredBy) {
+      if (!c.test)
+        gaps.push(
+          `${key(r)}: a citation names no test (${c.file} "${c.describe}")`,
+        );
+      const each = (c as Partial<SurfaceCite>).each;
+      if (each) gaps.push(...surfaceCiteGaps(key(r), c as SurfaceCite));
+    }
   return [
     ...gaps,
     ...resolveCitations(
