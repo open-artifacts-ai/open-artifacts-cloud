@@ -486,6 +486,41 @@ cat "$STATE/$k.json"`;
     }
   });
 
+  it("accepts a verified public migration hold only on staging", () => {
+    const step = (name: string, conclusion: string) => ({
+      name,
+      status: "completed",
+      conclusion,
+    });
+    const steps = [
+      step("Non-additive migration guard", "success"),
+      step("Fail the run when the deploy was held", "failure"),
+      step("Upgrade prod (deploy + selftest, CI token)", "skipped"),
+    ];
+    const held = (evidence: typeof steps) =>
+      tweak((s) =>
+        s["pub-jobs"].jobs.push({
+          name: "deploy-prod",
+          status: "completed",
+          conclusion: "failure",
+          steps: evidence,
+        }),
+      );
+    const staging = runTwo(held(steps), "staging");
+    expect(staging.code, staging.err).toBe(0);
+    expect(runTwo(held(steps)).err).toContain("deploy-prod: failure");
+    for (const evidence of [
+      [],
+      steps.slice(1),
+      [...steps, step("Cleanup", "failure")],
+      [...steps.slice(0, 2), step(steps[2].name, "success")],
+    ]) {
+      expect(runTwo(held(evidence), "staging").err).toContain(
+        "deploy-prod: failure",
+      );
+    }
+  });
+
   it("reads the hosted jobs and assets from the hosted repo, not the public one", () => {
     // The public run has no hosted-* jobs and no assets: still a pass.
     const r = runTwo(two());

@@ -151,6 +151,25 @@ check_jobs() {
     got="$(jq -r --arg n "$j" '[.jobs[] | select(.name == $n)] | if length == 1 then (if .[0].status == "completed" then (.[0].conclusion // "unknown") else "not completed (" + (.[0].status // "unknown") + ")" end) else "missing" end' <<< "$jobs")"
     [ "$got" = success ] || fail "job $j: $got"
   done
+  # Staging rehearses releases held by the public production migration guard.
+  # Match the Actions steps on the selected public release run, including older
+  # tags. A failed deploy or a second unsuccessful step still blocks staging.
+  if [[ "$env" == staging && "$wf" == release-please.yml && "$r" == "$P" ]]; then
+    jobs="$(jq '
+      def exactly_one_step($name; $result):
+        [.steps[] | select(.name == $name) | [.status, .conclusion]] == [["completed", $result]];
+      def migration_hold:
+        .name == "deploy-prod" and .status == "completed" and .conclusion == "failure"
+        and (.steps | type) == "array"
+        and exactly_one_step("Non-additive migration guard"; "success")
+        and exactly_one_step("Fail the run when the deploy was held"; "failure")
+        and exactly_one_step("Upgrade prod (deploy + selftest, CI token)"; "skipped")
+        and all(.steps[] | select(.name != "Fail the run when the deploy was held");
+                .status == "completed" and (.conclusion == "success" or .conclusion == "skipped"));
+      if ([.jobs[] | select(.name == "deploy-prod")] | length) == 1
+      then .jobs |= map(select(migration_hold | not)) else . end
+    ' <<< "$jobs")" || fail "$label jobs: unreadable migration hold"
+  fi
   bad="$(jq -r --argjson npm "$(printf '%s\n' "${NPM_JOBS[@]}" | jq -R . | jq -sc .)" '[.jobs[] | select(.name as $n | $npm | index($n) | not) | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped")) | .name + ": " + (if .status != "completed" then "not completed (" + (.status // "unknown") + ")" else (.conclusion // "unknown") end)] | first // empty' <<< "$jobs")" || fail "$label jobs: unreadable"
   [ -z "$bad" ] || fail "job $bad"
 }
