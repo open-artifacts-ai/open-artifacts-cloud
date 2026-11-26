@@ -1835,7 +1835,8 @@ describe("the release gate in run", () => {
     expect(stageSpent(pair(hr("completed", "success", 1)), no)).toBe(true);
     expect(stageSpent(pair(hr("completed", "success", 1)))).toBe(false);
     expect(stageSpent(pair(hr("completed", "failure", 1)), no)).toBe(false);
-    expect(stageSpent(pair(hr("completed", "cancelled", 1)), no)).toBe(false);
+    // A cancel is no evidence: the next older run decides.
+    expect(stageSpent(pair(hr("completed", "cancelled", 1)))).toBe(true);
   });
   // The Prover's four replays on #506 at 9db6e4e8.
   const spentStagingDeploy = hr(
@@ -1924,6 +1925,57 @@ describe("the release gate in run", () => {
       }),
     );
     expect(r.armed).toEqual([]);
+  });
+  // The Prover's replay on #506 at 2dce4dca: a cancelled gate dispatch after a
+  // green gate hid that success and released the pin on an older staging failure.
+  it("a cancelled gate dispatch after a passed gate is no evidence: the passed gate still holds", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        gateRuns: [
+          { t: "redline-staging v0.181.0", c: "cancelled", a: 1 },
+          { t: "redline-staging v0.181.0", c: "success", a: 1 },
+        ],
+        stagingDeploys: [spentStagingDeploy],
+      }),
+    );
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    // A passed gate holds even over a later rejection, until the prod deploy.
+    const later = go(
+      "arm",
+      fake({
+        prodDone: false,
+        gateRuns: [
+          { t: "redline-staging v0.181.0", c: "failure", a: 2 },
+          { t: "redline-staging v0.181.0", c: "success", a: 1 },
+        ],
+        stagingDeploys: [spentStagingDeploy],
+      }),
+    );
+    expect(later.armed).toEqual([]);
+    // ... and the prod deploy's success releases it.
+    expect(
+      go(
+        "arm",
+        fake({
+          gateRuns: [{ t: "redline-staging v0.181.0", c: "success", a: 1 }],
+        }),
+      ).armed,
+    ).toEqual([7]);
+    // A cancelled gate after a rejected one: the rejection still decides.
+    const rej = go(
+      "arm",
+      fake({
+        prodDone: false,
+        gateRuns: [
+          { t: "redline-staging v0.181.0", c: "cancelled", a: 1 },
+          { t: "redline-staging v0.181.0", c: "failure", a: 2 },
+        ],
+      }),
+    );
+    expect(rej.armed).toEqual([7]);
   });
   it("pinFate and retryDue: every stage, the gate included, holds while a run is active or due its retry", () => {
     expect(GATE_RETRY_SPENT).toBe(2);

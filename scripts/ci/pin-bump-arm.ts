@@ -373,9 +373,10 @@ export function didNoWork(jobs: { n: string; c: string | null }[]): boolean {
  * Pure: a release-chain stage's runs for main's pin (newest first, dry runs aside)
  * say it is spent. Its newest run with evidence completed as a failure on attempt
  * RELEASE_RETRY_SPENT or later, so release-retry will not rerun it and the pin can
- * never reach prod. A run still queued or running, a failure due a retry, a cancel,
- * or a run that did work and passed: not spent. A run that passed having done no
- * work (`noWork`) is skipped: the next older run decides.
+ * never reach prod. A run still queued or running, a failure due a retry, or a run
+ * that did work and passed: not spent. A cancelled run, and a run that passed
+ * having done no work (`noWork`), are no evidence: skipped, the next older run
+ * decides.
  */
 export function stageSpent(
   runs: StageRun[],
@@ -385,6 +386,7 @@ export function stageSpent(
     if (r.t.includes("(dry run)")) continue;
     if (r.s !== "completed") return false;
     if (r.c === "failure") return r.a >= RELEASE_RETRY_SPENT;
+    if (r.c === "cancelled") continue;
     if (r.c === "success" && noWork(r)) continue;
     return false;
   }
@@ -792,10 +794,13 @@ export function retryDue(r: StageRun & { e?: string }, gate = false): boolean {
  * - a relevant run queued or running, or the newest one with evidence due its
  *   automatic retry, in any stage, is a recovery under way: recovering, which holds
  *   whatever an older failure says;
- * - else a passed gate means the pin is on its way to prod: nothing;
- * - else a gate failed on its rerun is rejected (#448);
+ * - else a passed gate for the pin, any of its gate runs, holds whatever came
+ *   after it, until the pin's prod deploy succeeds: nothing;
+ * - else a gate failed on its rerun (its newest run with evidence) is rejected
+ *   (#448);
  * - else the first stage before the gate whose newest run with evidence failed with
- *   its retry spent is dead. A pass that did no work (`noWork`) is no evidence.
+ *   its retry spent is dead. A cancelled run, and a pass that did no work
+ *   (`noWork`), are no evidence.
  */
 export function pinFate(
   stages: [string, (StageRun & { e?: string })[]][],
@@ -806,6 +811,7 @@ export function pinFate(
     runs.find(
       (r) =>
         !r.t.includes("(dry run)") &&
+        !(r.s === "completed" && r.c === "cancelled") &&
         !(r.s === "completed" && r.c === "success" && noWork(r)),
     );
   for (const [, runs] of stages) {
@@ -814,9 +820,10 @@ export function pinFate(
     if (e && retryDue(e)) return { recovering: true };
   }
   if (anyActive(gate)) return { recovering: true };
-  const g = gate[0];
+  // A passed gate holds whatever came after it (a cancel, a later failure).
+  if (gate.some((r) => r.s === "completed" && r.c === "success")) return {};
+  const g = evidence(gate);
   if (g && retryDue(g, true)) return { recovering: true };
-  if (g?.c === "success") return {};
   if (g?.c === "failure" && g.a >= GATE_RETRY_SPENT) return { rejected: true };
   for (const [name, runs] of stages)
     if (stageSpent(runs, noWork)) return { dead: name };
