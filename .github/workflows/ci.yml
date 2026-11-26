@@ -11,12 +11,14 @@ name: CI
 # other PR, and every push, dispatch and merge_group run, runs in full. The
 # decision is made inside each job, never by a paths filter or a job-level if: a
 # skipped job would leave a required check unreported. Any error means full.
+# A push to pin-land/* (pin-bump.yml direct mode, cloud #264) runs in full too:
+# main moves to that sha only once this push run passed in full (pin-bump.ts land).
 on:
   pull_request:
   merge_group:
     types: [checks_requested]
   push:
-    branches: [main, scaffold]
+    branches: [main, scaffold, "pin-land/**"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -156,8 +158,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          # A staged pin's base is its one parent (the main it was built on), not
+          # the branch's previous head: a new branch has none, a rebuilt one moved.
+          if [ "$EVENT_NAME" = push ] && [[ "$REF" == refs/heads/pin-land/* ]]; then
+            BASE_SHA=$(gh api "repos/$REPO/commits/$GITHUB_SHA" --jq '.parents | if length == 1 then .[0].sha else "" end')
+            [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::a pin-land commit must have one parent"; exit 1; }
+          fi
           sha=""
           if [ -e private/SYNCED_FROM ] || [ -L private/SYNCED_FROM ]; then
             [ -f private/SYNCED_FROM ] && [ ! -L private/SYNCED_FROM ] || { echo "::error::SYNCED_FROM exists but is not a regular file"; exit 1; }
