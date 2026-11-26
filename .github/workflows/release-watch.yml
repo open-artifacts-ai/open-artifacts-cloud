@@ -1,7 +1,7 @@
 # Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
-# takes, stage by stage (.github/hosted/release-stages.json), and one `blocker`
-# issue "release stage stuck" while a stage runs past its limit,
-# max(2 x usual, usual + 5 min). Merge to every install is reported against a
+# takes, stage by stage (.github/hosted/release-stages.json), and one comment
+# per release and stage, on the one open issue "release stuck", when a stage
+# runs past its limit, max(2 x usual, usual + 5 min). Merge to every install is reported against a
 # 20 min target, never alerted on: to the prod deploy's "Fleet done" step
 # (cloud #474) where it ran, else to the prod deploy, labelled "to prod deploy
 # (fleet not yet measured)". Each stage is timed from its own start, so
@@ -35,7 +35,8 @@
 #   carry the clock meanwhile). A stage that never starts raises no event, so
 #   the schedule is what notices a stall.
 # - No secret but the default token: contents read (the checkout), actions
-#   read (runs and the previous artifact) and issues write (the one issue).
+#   read (runs, jobs, a failed job's log, the previous artifact) and issues
+#   write (the one issue and its comments).
 #   The public repo's releases and commits are public reads. The only input,
 #   backfill_since, goes through env: and is checked by the script.
 # - The concurrency group keeps two runs from racing on the issue; a replaced

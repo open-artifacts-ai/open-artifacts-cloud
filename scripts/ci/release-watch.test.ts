@@ -9,6 +9,9 @@ import type { Exec } from "./gh-retry.ts";
 import {
   BUILT_RE,
   type Config,
+  commentBody,
+  commentKey,
+  commentPlan,
   compute,
   EARLIER_FLEET_RE,
   earlierFleetList,
@@ -19,14 +22,14 @@ import {
   fleetStep,
   type HistoryEntry,
   ISSUE_TITLE,
-  issueBody,
-  issuePlan,
   type Job,
   lateFleetDone,
   limitOf,
   loadConfig,
   mergeHistory,
   namedTag,
+  notifyStuck,
+  type Overrun,
   overruns,
   PROD_RE,
   type Pr,
@@ -36,11 +39,11 @@ import {
   type Release,
   type Run,
   STAGING_RE,
+  safeLine,
   stats,
   step,
   summary,
   supersede,
-  syncIssue,
   tick,
   timeline,
   upgradeFleet,
@@ -237,10 +240,10 @@ describe("timeline on the recorded chain", () => {
     expect(t?.e2e).toBe(45.8);
     const w = world(now);
     expect(w.over).toEqual([]);
-    expect(issuePlan([], w.over, w.red, config)).toEqual({ action: "none" });
+    expect(commentPlan([], w.over)).toEqual([]);
   });
 
-  it("staging_deploy past its limit mid-flight opens the blocker naming the stage and release", () => {
+  it("staging_deploy past its limit mid-flight is a comment naming the release, stage, run and attempts", () => {
     const now = T("19:30:00");
     const w = at(now);
     w.runs = w.runs
@@ -257,6 +260,8 @@ describe("timeline on the recorded chain", () => {
         stage: "staging_deploy",
         kind: "in_flight",
         startedAt: T("19:20:38"),
+        runId: 45684245945,
+        attempts: 1,
         minutes: 9.4,
         usual: 4.3,
         limit: 9.3,
@@ -271,12 +276,16 @@ describe("timeline on the recorded chain", () => {
       usual: 4.3,
       limit: 9.3,
     });
-    const a = issuePlan([], r.over, r.red, config);
-    expect(a.action).toBe("create");
-    if (a.action === "create")
-      expect(a.body).toContain(
-        "- v0.245.1 staging_deploy: still going past 9.3 min (usual 4.3 min), started 2026-11-25T19:20:38Z.",
-      );
+    const [o] = commentPlan([], r.over);
+    const body = commentBody(o as never, "o/c", config);
+    expect(body).toContain(
+      "**v0.245.1 staging_deploy** is past its limit: it has been going 9.4 min (since 2026-11-25T19:20:38Z); usual 4.3 min, limit 9.3 min",
+    );
+    expect(body).toContain(
+      '- Run: [45684245945](https://github.com/o/c/actions/runs/45684245945). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45684245945 --failed -R o/c`.',
+    );
+    expect(body).toContain("- Attempts: 1");
+    expect(body).toContain("<!-- release-watch v0.245.1 staging_deploy -->");
   });
 
   it("no pin PR 7.5 minutes after the release is a pin_open stall; 4.5 minutes is under the 5 min floor", () => {
@@ -317,16 +326,16 @@ describe("timeline on the recorded chain", () => {
         url: expect.stringContaining("/actions/runs/"),
       },
     ]);
-    // The red stage is no overrun: the red run's blocker covers it. Its
-    // finished stages past twice their usual time still are (93 min to tag,
+    // The red stage is listed; at 7 min it is under its limit, so no
+    // comment. Its finished stages past their limits are (93 min to tag,
     // 37.6 min to merge the pin PR).
     expect(r.over.map((o) => [o.stage, o.kind, o.minutes])).toEqual([
       ["tag", "finished", 93],
       ["pin_merge", "finished", 37.6],
     ]);
-    expect(issuePlan([], [], r.red, config)).toEqual({ action: "none" });
-    expect(issueBody(r.over, r.red, config)).toContain(
-      "Red, covered by that run's own blocker issue:\n- v0.246.1 hosted_release: https://",
+    // The tag and pin stages have no run of their own: the comment says so.
+    expect(commentBody(r.over[1] as never, "o/c", config)).toContain(
+      "- Run: none. This stage is a wait between events (https://github.com/open-artifacts-ai/open-artifacts-cloud/pull/448).",
     );
     expect(eta(tl("v0.246.1", now, w) as never, r.current.stages, now)).toBe(
       null,
@@ -933,6 +942,8 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
         stage: "staging_publish",
         kind: "in_flight",
         startedAt: D("04:39:09"),
+        runId: 45756565482,
+        attempts: 1,
         minutes: 9.9,
         usual: 2.8,
         limit: 7.8,
@@ -959,8 +970,8 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     expect(r.over.map((o) => [o.stage, o.waiting])).toEqual([
       ["staging_deploy", true],
     ]);
-    expect(issueBody(r.over, r.red, config)).toContain(
-      "- v0.248.2 staging_deploy: not started 9.3 min after what it waits on ended (usual 4.3 min), waiting since 2026-11-26T04:39:06Z.",
+    expect(commentBody(r.over[0] as never, "o/c", config)).toContain(
+      "**v0.248.2 staging_deploy** is past its limit: it has not started 10 min after what it waits on ended (since 2026-11-26T04:39:06Z); usual 4.3 min, limit 9.3 min",
     );
   });
 
@@ -1651,11 +1662,8 @@ describe("the stuck-stage issue", () => {
         url: undefined,
       },
     ]);
-    expect(issueBody(r.over, [], config)).toContain(
-      "- v1.0.0 hosted_release: took 78.4 min (usual 3.2 min, limit 8.2 min).",
-    );
-    expect(issueBody(r.over, [], config)).toContain(
-      "ran past its limit, the larger of 2 x its usual time and its usual time plus 5 min.",
+    expect(commentBody(r.over[0] as Overrun, "o/r", config)).toContain(
+      "**v1.0.0 hosted_release** is past its limit: it took 78.4 min; usual 3.2 min, limit 8.2 min (the larger of 2 x its usual time and its usual time plus 5 min).",
     );
   });
   it("the newest finished release's overruns keep it open until a release completes with none; its total never alerts", () => {
@@ -1690,121 +1698,238 @@ describe("the stuck-stage issue", () => {
       overruns([done, { ...newer, e2e: 300 } as never], config).over,
     ).toEqual([]);
   });
-  it("creates once, edits only on a change, closes when nothing is stuck", () => {
-    const body = issueBody(over.over, [], config);
-    expect(issuePlan([], over.over, [], config)).toEqual({
-      action: "create",
-      body,
-    });
-    const open = [
-      { number: 5, title: ISSUE_TITLE, body },
-      { number: 3, title: "hosted-release failed", body: "" },
-    ];
-    expect(issuePlan(open, over.over, [], config)).toEqual({ action: "none" });
+  it("comments once per release and stage: a key already said by the bot, or twice in one tick, is skipped", () => {
+    const o = over.over[0] as Overrun;
+    expect(commentKey(o)).toBe("<!-- release-watch v1.0.0 pin_open -->");
+    expect(commentPlan([], over.over)).toEqual(over.over);
+    const said = {
+      author: "github-actions[bot]",
+      body: `x\n${commentKey(o)}`,
+    };
+    expect(commentPlan([said], over.over)).toEqual([]);
+    // The same overrun again (a refresh, or listed twice): still once.
+    expect(commentPlan([], [o, { ...o, minutes: 30 }])).toEqual([o]);
+    // A person's comment with the key does not silence the bot.
+    expect(commentPlan([{ ...said, author: "someone" }], over.over)).toEqual(
+      over.over,
+    );
+    // Another stage of the same release is its own comment.
     expect(
-      issuePlan(
-        [{ number: 5, title: ISSUE_TITLE, body: `${body}\n` }],
-        over.over,
-        [],
-        config,
+      commentPlan([said], [o, { ...o, stage: "pin_merge" }]).map(
+        (x) => x.stage,
       ),
-    ).toEqual({ action: "none" });
-    expect(
-      issuePlan(
-        [{ number: 5, title: ISSUE_TITLE, body: "old" }],
-        over.over,
-        [],
-        config,
-      ),
-    ).toEqual({ action: "edit", number: 5, body });
-    expect(issuePlan(open, [], [], config)).toMatchObject({
-      action: "close",
-      number: 5,
-    });
-    expect(issuePlan(open.slice(1), [], [], config)).toEqual({
-      action: "none",
-    });
+    ).toEqual(["pin_merge"]);
   });
-  it("the body holds no moving clock: the same state twice gives the same body", () => {
-    const later = overruns(
-      [
-        {
-          tag: "v1.0.0",
-          mode: "pr",
-          publishedAt: T("10:00:00"),
-          stages: [
-            {
-              name: "pin_open",
-              usual: 4,
-              startedAt: T("10:00:00"),
-              minutes: 14,
-              state: "current",
-            },
-          ],
-        },
-      ],
-      config,
+  it("the comment names the release, stage, run with a rerun, failed job with one error line, and attempts; nothing else", () => {
+    const o: Overrun = {
+      tag: "v0.248.2",
+      stage: "redline",
+      kind: "in_flight",
+      red: true,
+      startedAt: T("10:00:00"),
+      runId: 45750964492,
+      attempts: 2,
+      minutes: 31,
+      usual: 10.4,
+      limit: 20.8,
+      url: "https://github.com/o/c/actions/runs/45750964492",
+    };
+    const body = commentBody(o, "o/c", config, {
+      job: "redline",
+      step: "T19",
+      line: "T19 failed: expected 200, got 500",
+    });
+    expect(body.split("\n")).toEqual([
+      "**v0.248.2 redline** is past its limit: it failed and has been stuck 31 min (since 2026-11-25T10:00:00Z); usual 10.4 min, limit 20.8 min (the larger of 2 x its usual time and its usual time plus 5 min).",
+      "",
+      '- Run: [45750964492](https://github.com/o/c/actions/runs/45750964492). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45750964492 --failed -R o/c`.',
+      "- Failed job: `redline`, step `T19`: `T19 failed: expected 200, got 500`",
+      "- Attempts: 2",
+      "",
+      "Every stage, time and ETA: the [release-watch job summary](https://github.com/o/c/actions/workflows/release-watch.yml).",
+      "<!-- release-watch v0.248.2 redline -->",
+    ]);
+  });
+  it("a failed stage past its limit is an overrun too, marked red; under its limit it is only listed", () => {
+    const t = (minutes: number) =>
+      overruns(
+        [
+          {
+            tag: "v1.0.0",
+            mode: "pr",
+            publishedAt: T("10:00:00"),
+            stages: [
+              {
+                name: "redline",
+                usual: 10,
+                startedAt: T("10:00:00"),
+                minutes,
+                state: "red",
+                runId: 7,
+                attempts: 2,
+              },
+            ],
+          },
+        ],
+        config,
+      );
+    expect(t(15).over).toEqual([]);
+    expect(t(15).red).toHaveLength(1);
+    expect(t(21).over).toEqual([
+      expect.objectContaining({
+        stage: "redline",
+        red: true,
+        runId: 7,
+        attempts: 2,
+        minutes: 21,
+        limit: 20,
+      }),
+    ]);
+  });
+  it("the error line is made safe for a public issue: no host, URL, email, quoted value, install name or token", () => {
+    expect(
+      safeLine(
+        "2026-11-26T03:45:40.1234567Z ##[error]install mit-ai at https://mit-ai.open-artifacts.app failed for leo@example.com: 'secret-ish' rl-a oat_abcdef ghs_123 0123456789abcdef0123456789abcdef01",
+      ),
+    ).toBe(
+      "install <name> at <url> failed for <email>: '…' <name> <redacted> <redacted> <redacted>",
     );
-    expect(issueBody(later.over, [], config)).toBe(
-      issueBody(over.over, [], config),
-    );
+    expect(
+      safeLine("##[error]deploy to artifacts.leourbina.com timed out"),
+    ).toBe("deploy to <host> timed out");
+    expect(safeLine(`##[error]${"x ".repeat(200)}`)).toHaveLength(200);
   });
 
-  const stub = (issues: unknown[]) => {
+  const stub = (o: {
+    issues?: { number: number; title: string }[];
+    comments?: { author: string; body: string }[];
+    jobs?: unknown[];
+    log?: string;
+  }) => {
     const calls: string[][] = [];
     const exec: Exec = (_cmd, args) => {
       calls.push(args);
-      return args[0] === "issue" && args[1] === "list"
-        ? { code: 0, stdout: JSON.stringify(issues), stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
+      const path = args[args.length - 1] ?? "";
+      let out = "";
+      if (args[0] === "issue" && args[1] === "list")
+        out = JSON.stringify(o.issues ?? []);
+      else if (args[0] === "issue" && args[1] === "create")
+        out = "https://github.com/o/r/issues/42\n";
+      else if (path.includes("/comments"))
+        out = (o.comments ?? []).map((c) => JSON.stringify(c)).join("\n");
+      else if (path.includes("/jobs?"))
+        out = (o.jobs ?? []).map((j) => JSON.stringify(j)).join("\n");
+      else if (path.endsWith("/logs")) out = o.log ?? "";
+      return { code: 0, stdout: out, stderr: "" };
     };
     return { exec, calls };
   };
-  it("syncIssue lists blocker issues once and writes nothing when unchanged", () => {
-    const body = issueBody(over.over, [], config);
-    const s = stub([{ number: 5, title: ISSUE_TITLE, body }]);
-    expect(syncIssue(s.exec, "o/r", over.over, [], config).action).toBe("none");
-    expect(s.calls).toEqual([
-      [
-        "issue",
-        "list",
-        "--repo",
-        "o/r",
-        "--state",
-        "open",
-        "--label",
-        "blocker",
-        "--limit",
-        "100",
-        "--json",
-        "number,title,body",
-      ],
-    ]);
+  it("nothing past its limit: no read, no write", () => {
+    const s = stub({});
+    expect(notifyStuck(s.exec, "o/r", [], config)).toEqual({
+      action: "none",
+      posted: [],
+    });
+    expect(s.calls).toEqual([]);
   });
-  it("syncIssue opens the issue with the blocker label", () => {
-    const s = stub([]);
-    syncIssue(s.exec, "o/r", over.over, [], config);
-    expect(s.calls[1]?.slice(0, 7)).toEqual([
+  it("creates the issue the first time (no label, the default token), then comments", () => {
+    const s = stub({ issues: [{ number: 3, title: "hosted-release failed" }] });
+    const r = notifyStuck(s.exec, "o/r", over.over, config);
+    expect(r).toEqual({
+      action: "comment",
+      issue: 42,
+      posted: ["v1.0.0 pin_open"],
+    });
+    expect(s.calls.map((c) => c.slice(0, 2).join(" "))).toEqual([
+      "issue list",
+      "issue create",
+      "issue comment",
+    ]);
+    expect(s.calls[1]?.slice(0, 6)).toEqual([
       "issue",
       "create",
       "--repo",
       "o/r",
       "--title",
-      ISSUE_TITLE,
-      "--label",
+      "release stuck",
     ]);
-    expect(s.calls[1]?.[7]).toBe("blocker");
-  });
-  it("syncIssue closes with a comment", () => {
-    const s = stub([{ number: 5, title: ISSUE_TITLE, body: "x" }]);
-    syncIssue(s.exec, "o/r", [], [], config);
-    expect(s.calls[1]?.slice(0, 5)).toEqual([
+    expect(s.calls[1]).not.toContain("--label");
+    expect(s.calls[2]?.slice(0, 5)).toEqual([
       "issue",
-      "close",
-      "5",
+      "comment",
+      "42",
       "--repo",
       "o/r",
     ]);
+    expect(s.calls[2]?.[6]).toContain("<!-- release-watch v1.0.0 pin_open -->");
+  });
+  it("reuses the open issue and says nothing already said: a refresh writes nothing", () => {
+    const s = stub({
+      issues: [
+        { number: 9, title: ISSUE_TITLE },
+        { number: 12, title: ISSUE_TITLE },
+      ],
+      comments: [
+        {
+          author: "github-actions[bot]",
+          body: commentKey(over.over[0] as Overrun),
+        },
+      ],
+    });
+    expect(notifyStuck(s.exec, "o/r", over.over, config)).toEqual({
+      action: "none",
+      issue: 9,
+      posted: [],
+    });
+    expect(s.calls.map((c) => c.slice(0, 2).join(" "))).toEqual([
+      "issue list",
+      "api --paginate",
+    ]);
+    expect(s.calls[1]?.[s.calls[1].length - 1]).toBe(
+      "repos/o/r/issues/9/comments?per_page=100",
+    );
+  });
+  it("a failed stage's comment reads its failed job and one safe error line", () => {
+    const red: Overrun = {
+      tag: "v0.248.1",
+      stage: "redline",
+      kind: "in_flight",
+      red: true,
+      startedAt: T("10:00:00"),
+      runId: 45750964492,
+      attempts: 2,
+      minutes: 70.3,
+      usual: 10.4,
+      limit: 20.8,
+    };
+    const s = stub({
+      issues: [{ number: 9, title: ISSUE_TITLE }],
+      jobs: [
+        { id: 1, name: "plan", conclusion: "success", steps: [] },
+        {
+          id: 2,
+          name: "redline",
+          conclusion: "failure",
+          steps: [
+            { name: "Set up job", conclusion: "success" },
+            { name: "T19", conclusion: "failure" },
+          ],
+        },
+      ],
+      log: "2026-11-26T03:40:00.0000000Z ok\n2026-11-26T03:45:40.0000000Z ##[error]T19 failed on rl-b: expected 200\n2026-11-26T03:45:41.0000000Z ##[error]second",
+    });
+    notifyStuck(s.exec, "o/r", [red], config);
+    expect(s.calls.map((c) => c[c.length - 1])).toContain(
+      "repos/o/r/actions/runs/45750964492/jobs?filter=latest&per_page=100",
+    );
+    expect(s.calls.map((c) => c[c.length - 1])).toContain(
+      "repos/o/r/actions/jobs/2/logs",
+    );
+    const body = s.calls.find((c) => c[1] === "comment")?.[6] ?? "";
+    expect(body).toContain(
+      "- Failed job: `redline`, step `T19`: `T19 failed on <name>: expected 200`",
+    );
+    expect(body).toContain("- Attempts: 2");
   });
 });
 
@@ -1848,7 +1973,7 @@ describe("tick reads", () => {
     return { exec, calls };
   };
 
-  it("a normal tick reads the window, skips merge reads for releases in history, and syncs the issue", () => {
+  it("a normal tick reads the window, skips merge reads for releases in history, and reads no issue with nothing stuck", () => {
     const now = T("19:50:00");
     const f = fake(now);
     const history: HistoryEntry[] = [
@@ -1884,9 +2009,8 @@ describe("tick reads", () => {
           `repos/o/c/actions/workflows/${x}/runs?branch=main&created=>=2026-11-25T13:50:00Z&per_page=100`,
       ),
     );
-    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
-      "issue list",
-    ]);
+    // Nothing past its limit: the issue is not even read.
+    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([]);
     expect(f.calls.filter((c) => c.includes("/pulls?"))).toEqual([
       "repos/o/c/pulls?state=all&head=o:pin-bump/v0.245.1&per_page=100",
     ]);
@@ -2022,9 +2146,8 @@ describe("tick reads", () => {
     const t = r.current.releases.find((x) => x.tag === "v0.245.1");
     expect(t?.stages.find((s) => s.name === "pin_open")?.state).toBe("done");
     expect(r.over).toEqual([]);
-    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
-      "issue list",
-    ]);
+    // Nothing past its limit: the issue is not even read.
+    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([]);
   });
 
   it("a release finished in history is not rebuilt: no PR read, done even with nothing left to read", () => {
@@ -2060,9 +2183,8 @@ describe("tick reads", () => {
     expect(r.over).toEqual([]);
     expect(r.current.inFlight).toEqual([]);
     expect(r.history).toEqual([h]);
-    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
-      "issue list",
-    ]);
+    // Nothing past its limit: the issue is not even read.
+    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([]);
   });
 
   it("the newest finished release in history still keeps its own overruns", () => {

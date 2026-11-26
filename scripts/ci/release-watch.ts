@@ -1,6 +1,7 @@
 // Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
-// takes, stage by stage, against each stage's usual time, and one `blocker`
-// issue while a stage runs past its limit: the larger of alertFactor (2) x its
+// takes, stage by stage, against each stage's usual time, and one comment, on
+// the one open issue "release stuck", when a stage runs past its limit (each
+// release and stage once, never per refresh): the larger of alertFactor (2) x its
 // usual time and its usual time plus alertFloor (5) minutes, so a stage that
 // usually takes half a minute does not alert on a one-minute wait. Each stage
 // is timed from its own start to its own end, so stages can overlap (the
@@ -33,7 +34,9 @@
 // its publish job, and the prod deploy's steps record the fleet finish. A
 // release in history is done and not rebuilt, but one whose total stopped at
 // the prod deploy has its prod deploys' jobs read in the window, and takes a
-// later "Fleet done" for its tag. Writes: only the one issue, through gh().
+// later "Fleet done" for its tag. Writes, through gh() and only when a stage
+// is past its limit: the issue (created once) and one comment per release and
+// stage; for a failed stage, its run's jobs and failed job's log are read.
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -47,7 +50,11 @@ import { pathToFileURL } from "node:url";
 import { type Exec, gh } from "./gh-retry.ts";
 import { BRANCH_PREFIX, compareTags, PUBLIC_REPO } from "./pin-bump.ts";
 
-export const ISSUE_TITLE = "release stage stuck";
+/**
+ * The one issue: a comment per release and stage that went past its limit,
+ * once each (cloud #264; the release watcher's ask).
+ */
+export const ISSUE_TITLE = "release stuck";
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const MIN = 60_000;
 
@@ -133,6 +140,10 @@ export type Step = {
   startedAt?: string;
   doneAt?: string;
   url?: string;
+  /** The run `url` names. */
+  runId?: number;
+  /** Every attempt of every run of the step. */
+  attempts?: number;
 };
 export type StageRow = {
   name: string;
@@ -146,6 +157,9 @@ export type StageRow = {
   /** Not started yet: startedAt is when what it waits on ended. */
   waiting?: boolean;
   url?: string;
+  /** The stage's own run, and every attempt of its runs (a run stage only). */
+  runId?: number;
+  attempts?: number;
 };
 export type Timeline = {
   tag: string;
@@ -184,6 +198,10 @@ export type Overrun = {
   startedAt?: string;
   /** In flight and not started: startedAt is when what it waits on ended. */
   waiting?: boolean;
+  /** red: the stage's run failed and it is past its limit. */
+  red?: boolean;
+  runId?: number;
+  attempts?: number;
   minutes: number;
   usual: number;
   /** max(alertFactor x usual, usual + alertFloor). */
@@ -268,12 +286,22 @@ export function step(runs: Run[]): Step {
   const ok = sorted.find(
     (r) => r.status === "completed" && r.conclusion === "success",
   );
+  const attempts = sorted.reduce((n, r) => n + Math.max(1, r.attempt), 0);
   if (ok)
-    return { state: "done", startedAt, doneAt: ok.updatedAt, url: ok.url };
+    return {
+      state: "done",
+      startedAt,
+      doneAt: ok.updatedAt,
+      url: ok.url,
+      runId: ok.id,
+      attempts,
+    };
   const last = sorted[sorted.length - 1] as Run;
   const running = last.status !== "completed";
   return {
     state: running ? "running" : "red",
+    runId: last.id,
+    attempts,
     // A queued first attempt has not started: the step has not either.
     startedAt:
       running &&
@@ -642,7 +670,13 @@ export function timeline(o: {
       (s.to === "pin_opened" || s.to === "pinned"
         ? (merged ?? pr[pr.length - 1])?.url
         : undefined);
-    const base = { name: s.name, ...(s.usual ? { usual: s.usual } : {}) };
+    const base = {
+      name: s.name,
+      ...(s.usual ? { usual: s.usual } : {}),
+      ...(owner?.runId
+        ? { runId: owner.runId, attempts: owner.attempts ?? 1 }
+        : {}),
+    };
     const going = (since: string, waiting: boolean, red = false): StageRow => ({
       ...base,
       startedAt: since,
@@ -893,6 +927,8 @@ export function overruns(
 ): { over: Overrun[]; red: Red[] } {
   const over: Overrun[] = [];
   const red: Red[] = [];
+  const ids = (s: StageRow) =>
+    s.runId ? { runId: s.runId, attempts: s.attempts ?? 1 } : {};
   const finishedOver = (t: Timeline) => {
     for (const s of t.stages)
       if (
@@ -906,6 +942,7 @@ export function overruns(
           stage: s.name,
           kind: "finished",
           startedAt: s.startedAt,
+          ...ids(s),
           minutes: s.minutes,
           usual: s.usual,
           limit: limitOf(s.usual, config),
@@ -918,12 +955,11 @@ export function overruns(
     // Stages can overlap (the staging copy beside the staging deploy, #471):
     // each one going is timed from its own start, or from what it waits on.
     for (const cur of t.stages) {
-      if (cur.state === "red") {
+      if (cur.state === "red")
         red.push({ tag: t.tag, stage: cur.name, url: cur.url });
-        continue;
-      }
+      // A red stage past its limit is stuck too: no rerun has moved it on.
       if (
-        cur.state === "current" &&
+        (cur.state === "current" || cur.state === "red") &&
         cur.startedAt &&
         cur.usual !== undefined &&
         (cur.minutes ?? 0) > limitOf(cur.usual, config)
@@ -934,6 +970,8 @@ export function overruns(
           kind: "in_flight",
           startedAt: cur.startedAt,
           ...(cur.waiting ? { waiting: true } : {}),
+          ...(cur.state === "red" ? { red: true } : {}),
+          ...ids(cur),
           minutes: cur.minutes ?? 0,
           usual: cur.usual,
           limit: limitOf(cur.usual, config),
@@ -952,64 +990,109 @@ export function overruns(
   return { over, red };
 }
 
+/** The hidden key that makes a comment once per release and stage. */
+export const commentKey = (o: { tag: string; stage: string }) =>
+  `<!-- release-watch ${o.tag} ${o.stage} -->`;
+
+/** What a failed stage's run says: its failed job and one error line. */
+export type Failure = { job: string; step?: string; line?: string };
+
 /**
- * Pure: the issue body. It holds no clock that moves between ticks (no
- * elapsed figure for an in-flight stage), so an unchanged state gives an
- * unchanged body and no edit.
+ * Pure: one comment for a stage past its limit. The repo is public: it names
+ * only the release, the stage, the run and its workflow-defined job and step
+ * names, and an error line made safe by safeLine. The rest is on the
+ * release-watch job summary.
  */
-export function issueBody(over: Overrun[], red: Red[], config: Config): string {
+export function commentBody(
+  o: Overrun,
+  repo: string,
+  config: Config,
+  failure?: Failure,
+): string {
+  const what =
+    o.kind === "finished"
+      ? `took ${o.minutes} min`
+      : o.waiting
+        ? `has not started ${o.minutes} min after what it waits on ended (since ${o.startedAt})`
+        : `${o.red ? "failed and has been stuck" : "has been going"} ${o.minutes} min (since ${o.startedAt})`;
+  const runUrl = o.runId
+    ? `https://github.com/${repo}/actions/runs/${o.runId}`
+    : undefined;
   const lines = [
-    `Release watch (cloud #264): a release stage ran past its limit, ${ruleText(config)}.`,
-    "Usual times: `.github/hosted/release-stages.json`. This issue closes itself once no stage of a release in flight, or of the newest finished release, is past its limit.",
+    `**${o.tag} ${o.stage}** is past its limit: it ${what}; usual ${o.usual} min, limit ${o.limit} min (${ruleText(config)}).`,
     "",
+    runUrl
+      ? `- Run: [${o.runId}](${runUrl}). To rerun it, open the run and choose "Re-run failed jobs", or \`gh run rerun ${o.runId} --failed -R ${repo}\`.`
+      : `- Run: none. This stage is a wait between events${o.url ? ` (${o.url})` : ""}.`,
   ];
-  for (const o of over) {
-    const run = o.url ? ` Run: ${o.url}` : "";
+  if (failure)
     lines.push(
-      o.kind !== "in_flight"
-        ? `- ${o.tag} ${o.stage}: took ${o.minutes} min (usual ${o.usual} min, limit ${o.limit} min).${run}`
-        : o.waiting
-          ? `- ${o.tag} ${o.stage}: not started ${o.limit} min after what it waits on ended (usual ${o.usual} min), waiting since ${o.startedAt}.${run}`
-          : `- ${o.tag} ${o.stage}: still going past ${o.limit} min (usual ${o.usual} min), started ${o.startedAt}.${run}`,
+      `- Failed job: \`${failure.job}\`${failure.step ? `, step \`${failure.step}\`` : ""}${failure.line ? `: \`${failure.line}\`` : ""}`,
     );
-  }
-  if (red.length > 0) {
-    lines.push("", "Red, covered by that run's own blocker issue:");
-    for (const r of red)
-      lines.push(`- ${r.tag} ${r.stage}${r.url ? `: ${r.url}` : ""}`);
-  }
+  if (o.attempts) lines.push(`- Attempts: ${o.attempts}`);
+  lines.push(
+    "",
+    `Every stage, time and ETA: the [release-watch job summary](https://github.com/${repo}/actions/workflows/release-watch.yml).`,
+    commentKey(o),
+  );
   return lines.join("\n");
 }
 
-export type IssueAction =
-  | { action: "none" }
-  | { action: "create"; body: string }
-  | { action: "edit"; number: number; body: string }
-  | { action: "close"; number: number; comment: string };
-
-/** Pure: what to do with the one issue, given the open ones titled ISSUE_TITLE. */
-export function issuePlan(
-  open: { number: number; title: string; body: string }[],
+/**
+ * Pure: the stages to comment on, each release and stage once. A comment
+ * already on the issue with the key, from a bot (this workflow's token), means
+ * it was said; a refresh says nothing new.
+ */
+export function commentPlan(
+  existing: { author: string; body: string }[],
   over: Overrun[],
-  red: Red[],
-  config: Config,
-): IssueAction {
-  const mine = open
-    .filter((i) => i.title === ISSUE_TITLE)
-    .sort((a, b) => a.number - b.number)[0];
-  if (over.length === 0)
-    return mine
-      ? {
-          action: "close",
-          number: mine.number,
-          comment:
-            "Unstuck: no stage of a release in flight, or of the newest finished release, is past its limit.",
-        }
-      : { action: "none" };
-  const body = issueBody(over, red, config);
-  if (!mine) return { action: "create", body };
-  if (mine.body.trim() === body.trim()) return { action: "none" };
-  return { action: "edit", number: mine.number, body };
+): Overrun[] {
+  const said = new Set(
+    existing
+      .filter((c) => c.author.endsWith("[bot]"))
+      .flatMap((c) => [...c.body.matchAll(/<!-- release-watch \S+ \S+ -->/g)])
+      .map((m) => m[0]),
+  );
+  const out: Overrun[] = [];
+  for (const o of over) {
+    const k = commentKey(o);
+    if (said.has(k)) continue;
+    said.add(k);
+    out.push(o);
+  }
+  return out;
+}
+
+/**
+ * Pure: an error line safe for a public issue, at most 200 characters. Log
+ * lines can name an install, a host or a token: hosts, emails, URLs, quoted
+ * values, the word after install/slug/instance/tenant, rl- fixtures and long
+ * token-like strings are replaced. GitHub already masks the secrets it knows.
+ */
+export function safeLine(raw: string): string {
+  let x = raw
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI colour codes
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s*/, "")
+    .replace(/##\[error\]/g, "")
+    .trim();
+  x = x
+    .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, "<email>")
+    .replace(/\b[\w-]+(\.[\w-]+)+\.[a-z]{2,}\b/gi, "<host>")
+    .replace(/\b[\w-]+\.(app|com|dev|net|io|org|ai)\b/gi, "<host>")
+    .replace(/(["'`])[^"'`]*\1/g, "$1…$1")
+    .replace(
+      /\b(install|installs|slug|instance|tenant|org|workspace)(\s*[:=]?\s*)\S+/gi,
+      "$1$2<name>",
+    )
+    .replace(/\brl-[a-z0-9-]+/gi, "<name>")
+    .replace(
+      /\b(oat|ghp|gho|ghs|ghu|github_pat|sk|pk|whsec)_\S+/gi,
+      "<redacted>",
+    )
+    .replace(/[A-Za-z0-9_\-+/=]{32,}/g, "<redacted>");
+  return x.length > 200 ? `${x.slice(0, 199)}…` : x;
 }
 
 /**
@@ -1179,7 +1262,7 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
   if (c.overruns.length > 0)
     out.push(
       "",
-      `Stuck: ${c.overruns.length} stage(s) past their limit, see the blocker issue.`,
+      `Stuck: ${c.overruns.length} stage(s) past their limit, each said once on the "${ISSUE_TITLE}" issue.`,
     );
   return `${out.join("\n")}\n`;
 }
@@ -1386,13 +1469,54 @@ export function readMerge(
   return merged || first.date;
 }
 
-export function syncIssue(
+/**
+ * The failed job of a run and the first error line of its log, made safe.
+ * Reads only (actions: read); a log that can't be read leaves the line out.
+ */
+export function readFailure(
+  exec: Exec,
+  repo: string,
+  runId: number,
+): Failure | undefined {
+  const jobs = lines<Job & { id: number }>(
+    gh(exec, [
+      "api",
+      "-X",
+      "GET",
+      "--jq",
+      ".jobs[] | {id, name, conclusion, steps: [(.steps // [])[] | {name, conclusion}]} | tojson",
+      `repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`,
+    ]),
+  );
+  const j = jobs.find((x) => x.conclusion === "failure");
+  if (!j) return undefined;
+  const step = j.steps?.find((x) => x.conclusion === "failure")?.name;
+  let line: string | undefined;
+  try {
+    const log = gh(exec, ["api", `repos/${repo}/actions/jobs/${j.id}/logs`]);
+    const raw = log.split("\n").find((l) => l.includes("##[error]"));
+    if (raw) line = safeLine(raw) || undefined;
+  } catch {}
+  return {
+    job: j.name,
+    ...(step ? { step } : {}),
+    ...(line ? { line } : {}),
+  };
+}
+
+/**
+ * One comment per release and stage past its limit, on the one open issue
+ * titled ISSUE_TITLE, created (default token, issues: write) the first time
+ * one is needed and reused after. It is never edited or closed by a tick, and
+ * nothing is read or written while nothing is past its limit.
+ */
+export function notifyStuck(
   exec: Exec,
   repo: string,
   over: Overrun[],
-  red: Red[],
   config: Config,
-) {
+): { action: "none" | "comment"; issue?: number; posted: string[] } {
+  if (over.length === 0) return { action: "none", posted: [] };
   const open = JSON.parse(
     gh(exec, [
       "issue",
@@ -1401,17 +1525,32 @@ export function syncIssue(
       repo,
       "--state",
       "open",
-      "--label",
-      "blocker",
       "--limit",
-      "100",
+      "500",
       "--json",
-      "number,title,body",
+      "number,title",
     ]),
-  ) as { number: number; title: string; body: string }[];
-  const a = issuePlan(open, over, red, config);
-  if (a.action === "create")
-    gh(
+  ) as { number: number; title: string }[];
+  let issue = open
+    .filter((i) => i.title === ISSUE_TITLE)
+    .sort((a, b) => a.number - b.number)[0]?.number;
+  const existing = issue
+    ? lines<{ author: string; body: string }>(
+        gh(exec, [
+          "api",
+          "--paginate",
+          "-X",
+          "GET",
+          "--jq",
+          ".[] | {author: .user.login, body} | tojson",
+          `repos/${repo}/issues/${issue}/comments?per_page=100`,
+        ]),
+      )
+    : [];
+  const todo = commentPlan(existing, over);
+  if (todo.length === 0) return { action: "none", issue, posted: [] };
+  if (!issue) {
+    const url = gh(
       exec,
       [
         "issue",
@@ -1420,34 +1559,35 @@ export function syncIssue(
         repo,
         "--title",
         ISSUE_TITLE,
-        "--label",
-        "blocker",
         "--body",
-        a.body,
+        `Release watch (cloud #264): one comment per release and stage that runs past its limit, ${ruleText(config)}. Usual times: \`.github/hosted/release-stages.json\`. Every stage, time and ETA: the [release-watch job summary](https://github.com/${repo}/actions/workflows/release-watch.yml).`,
       ],
       { write: true },
-    );
-  else if (a.action === "edit")
-    gh(
-      exec,
-      ["issue", "edit", String(a.number), "--repo", repo, "--body", a.body],
-      { write: true, idempotent: true },
-    );
-  else if (a.action === "close")
+    ).trim();
+    issue = Number(/\/issues\/(\d+)\s*$/.exec(url)?.[1]);
+    if (!Number.isInteger(issue) || issue <= 0)
+      throw new Error(`release-watch: no issue number in "${url}"`);
+  }
+  const posted: string[] = [];
+  for (const o of todo) {
+    const failure =
+      o.red && o.runId ? readFailure(exec, repo, o.runId) : undefined;
     gh(
       exec,
       [
         "issue",
-        "close",
-        String(a.number),
+        "comment",
+        String(issue),
         "--repo",
         repo,
-        "--comment",
-        a.comment,
+        "--body",
+        commentBody(o, repo, config, failure),
       ],
       { write: true },
     );
-  return a;
+    posted.push(`${o.tag} ${o.stage}`);
+  }
+  return { action: "comment", issue, posted };
 }
 
 export function tick(o: {
@@ -1519,7 +1659,7 @@ export function tick(o: {
     now: o.now,
   });
   const issue = o.issue
-    ? syncIssue(o.exec, o.repo, out.over, out.red, o.config)
+    ? notifyStuck(o.exec, o.repo, out.over, o.config)
     : { action: "skipped" };
   return { ...out, issue };
 }
