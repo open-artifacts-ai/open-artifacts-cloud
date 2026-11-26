@@ -39,7 +39,6 @@ import {
   type Release,
   type Run,
   STAGING_RE,
-  safeLine,
   stats,
   step,
   summary,
@@ -1720,11 +1719,11 @@ describe("the stuck-stage issue", () => {
       ),
     ).toEqual(["pin_merge"]);
   });
-  it("the comment names the release, stage, run with a rerun, failed job with one error line, and attempts; nothing else", () => {
+  it("the comment names the release, stage, run with a rerun, failed job and step, and attempts; never a log line", () => {
     const o: Overrun = {
       tag: "v0.248.2",
       stage: "redline",
-      kind: "in_flight",
+      kind: "failed",
       red: true,
       startedAt: T("10:00:00"),
       runId: 45750964492,
@@ -1737,21 +1736,20 @@ describe("the stuck-stage issue", () => {
     const body = commentBody(o, "o/c", config, {
       job: "redline",
       step: "T19",
-      line: "T19 failed: expected 200, got 500",
     });
     expect(body.split("\n")).toEqual([
-      "**v0.248.2 redline** is past its limit: it failed and has been stuck 31 min (since 2026-11-25T10:00:00Z); usual 10.4 min, limit 20.8 min (the larger of 2 x its usual time and its usual time plus 5 min).",
+      "**v0.248.2 redline** failed 31 min after it started (2026-11-25T10:00:00Z); usual 10.4 min, limit 20.8 min (the larger of 2 x its usual time and its usual time plus 5 min).",
       "",
       '- Run: [45750964492](https://github.com/o/c/actions/runs/45750964492). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45750964492 --failed -R o/c`.',
-      "- Failed job: `redline`, step `T19`: `T19 failed: expected 200, got 500`",
+      "- Failed job: `redline`, step `T19`. Its log is on the run.",
       "- Attempts: 2",
       "",
       "Every stage, time and ETA: the [release-watch job summary](https://github.com/o/c/actions/workflows/release-watch.yml).",
       "<!-- release-watch v0.248.2 redline -->",
     ]);
   });
-  it("a failed stage past its limit is an overrun too, marked red; under its limit it is only listed", () => {
-    const t = (minutes: number) =>
+  it("a failed stage is commented on whatever its time; one still going is never, however long (no poll catches it)", () => {
+    const t = (state: "red" | "current", minutes: number) =>
       overruns(
         [
           {
@@ -1764,7 +1762,7 @@ describe("the stuck-stage issue", () => {
                 usual: 10,
                 startedAt: T("10:00:00"),
                 minutes,
-                state: "red",
+                state,
                 runId: 7,
                 attempts: 2,
               },
@@ -1773,38 +1771,71 @@ describe("the stuck-stage issue", () => {
         ],
         config,
       );
-    expect(t(15).over).toEqual([]);
-    expect(t(15).red).toHaveLength(1);
-    expect(t(21).over).toEqual([
-      expect.objectContaining({
+    // Failed at 3 min, under its limit: still a comment.
+    expect(t("red", 3).failed).toEqual([
+      {
+        tag: "v1.0.0",
         stage: "redline",
+        kind: "failed",
         red: true,
+        startedAt: T("10:00:00"),
         runId: 7,
         attempts: 2,
-        minutes: 21,
+        minutes: 3,
+        usual: 10,
         limit: 20,
-      }),
+        url: undefined,
+      },
     ]);
+    expect(t("red", 3).over).toEqual([]);
+    expect(t("red", 3).red).toHaveLength(1);
+    // Going past its limit: an overrun for the summary, but not a comment.
+    expect(t("current", 25).over.map((o) => o.kind)).toEqual(["in_flight"]);
+    expect(t("current", 25).failed).toEqual([]);
   });
-  it("the error line is made safe for a public issue: no host, URL, email, quoted value, install name or token", () => {
-    expect(
-      safeLine(
-        "2026-11-26T03:45:40.1234567Z ##[error]install mit-ai at https://mit-ai.open-artifacts.app failed for leo@example.com: 'secret-ish' rl-a oat_abcdef ghs_123 0123456789abcdef0123456789abcdef01",
-      ),
-    ).toBe(
-      "install <name> at <url> failed for <email>: '…' <name> <redacted> <redacted> <redacted>",
+  it("a run comments on stages that finished past their limit or failed, never on one still going", () => {
+    // v0.245.1 at 19:30 with its staging deploy still going past its limit.
+    const now = T("19:30:00");
+    const w = at(now);
+    w.runs = w.runs
+      .filter((r) => !r.path.endsWith("redline-staging.yml"))
+      .map((r) =>
+        r.title.startsWith("deploy-hosted-platform staging v0.245.1")
+          ? { ...r, status: "in_progress", conclusion: null }
+          : r,
+      );
+    const going = world(now, w);
+    expect(going.over.map((o) => [o.stage, o.kind])).toEqual([
+      ["staging_deploy", "in_flight"],
+    ]);
+    expect(going.notify).toEqual([]);
+    // The same deploy failed: a comment for it.
+    w.runs = w.runs.map((r) =>
+      r.title.startsWith("deploy-hosted-platform staging v0.245.1")
+        ? {
+            ...r,
+            status: "completed",
+            conclusion: "failure",
+            updatedAt: T("19:29:00"),
+          }
+        : r,
     );
+    expect(world(now, w).notify.map((o) => [o.stage, o.kind])).toEqual([
+      ["staging_deploy", "failed"],
+    ]);
+    // v0.246.1 at 23:30: its tag and pin merge finished past their limits.
     expect(
-      safeLine("##[error]deploy to artifacts.leourbina.com timed out"),
-    ).toBe("deploy to <host> timed out");
-    expect(safeLine(`##[error]${"x ".repeat(200)}`)).toHaveLength(200);
+      world(T("23:30:00")).notify.map((o) => [o.tag, o.stage, o.kind]),
+    ).toEqual([
+      ["v0.246.1", "tag", "finished"],
+      ["v0.246.1", "pin_merge", "finished"],
+    ]);
   });
 
   const stub = (o: {
     issues?: { number: number; title: string }[];
     comments?: { author: string; body: string }[];
     jobs?: unknown[];
-    log?: string;
   }) => {
     const calls: string[][] = [];
     const exec: Exec = (_cmd, args) => {
@@ -1819,7 +1850,6 @@ describe("the stuck-stage issue", () => {
         out = (o.comments ?? []).map((c) => JSON.stringify(c)).join("\n");
       else if (path.includes("/jobs?"))
         out = (o.jobs ?? []).map((j) => JSON.stringify(j)).join("\n");
-      else if (path.endsWith("/logs")) out = o.log ?? "";
       return { code: 0, stdout: out, stderr: "" };
     };
     return { exec, calls };
@@ -1889,11 +1919,11 @@ describe("the stuck-stage issue", () => {
       "repos/o/r/issues/9/comments?per_page=100",
     );
   });
-  it("a failed stage's comment reads its failed job and one safe error line", () => {
+  it("a failed stage's comment names its failed job and step from the run's jobs, and never reads a log", () => {
     const red: Overrun = {
       tag: "v0.248.1",
       stage: "redline",
-      kind: "in_flight",
+      kind: "failed",
       red: true,
       startedAt: T("10:00:00"),
       runId: 45750964492,
@@ -1916,18 +1946,21 @@ describe("the stuck-stage issue", () => {
           ],
         },
       ],
-      log: "2026-11-26T03:40:00.0000000Z ok\n2026-11-26T03:45:40.0000000Z ##[error]T19 failed on rl-b: expected 200\n2026-11-26T03:45:41.0000000Z ##[error]second",
     });
     notifyStuck(s.exec, "o/r", [red], config);
     expect(s.calls.map((c) => c[c.length - 1])).toContain(
       "repos/o/r/actions/runs/45750964492/jobs?filter=latest&per_page=100",
     );
-    expect(s.calls.map((c) => c[c.length - 1])).toContain(
-      "repos/o/r/actions/jobs/2/logs",
+    // No log is read: a log line could name an install or a customer.
+    expect(s.calls.some((c) => (c[c.length - 1] ?? "").endsWith("/logs"))).toBe(
+      false,
     );
     const body = s.calls.find((c) => c[1] === "comment")?.[6] ?? "";
     expect(body).toContain(
-      "- Failed job: `redline`, step `T19`: `T19 failed on <name>: expected 200`",
+      "- Failed job: `redline`, step `T19`. Its log is on the run.",
+    );
+    expect(body).toContain(
+      "- Run: [45750964492](https://github.com/o/r/actions/runs/45750964492).",
     );
     expect(body).toContain("- Attempts: 2");
   });
@@ -2307,23 +2340,26 @@ describe("release-watch.yml", () => {
   // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
   const steps: any[] = w.jobs.watch.steps;
 
-  it("runs after the chain's workflows on main, every 5 minutes, and on dispatch", () => {
+  it("runs on events only: every release workflow's completion on main, a PUBLIC_PIN push to main, and dispatch; never a schedule", () => {
     expect(Object.keys(w.on)).toEqual([
       "workflow_run",
-      "schedule",
+      "push",
       "workflow_dispatch",
     ]);
     expect(w.on.workflow_run.workflows).toEqual([
       "pin-bump",
       "hosted-release",
       "hosted-publish",
+      "staging-release-chain",
       "deploy-hosted-platform",
       "redline-staging",
       "prod-release-chain",
     ]);
     expect(w.on.workflow_run.types).toEqual(["completed"]);
     expect(w.on.workflow_run.branches).toEqual(["main"]);
-    expect(w.on.schedule).toEqual([{ cron: "*/5 * * * *" }]);
+    expect(w.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
+    expect(w.on).not.toHaveProperty("schedule");
+    expect(raw).not.toMatch(/cron:|sleep /);
     expect(Object.keys(w.on.workflow_dispatch.inputs)).toEqual([
       "backfill_since",
     ]);
@@ -2335,7 +2371,7 @@ describe("release-watch.yml", () => {
       );
   });
   it("is never a pull_request check", () => {
-    expect(raw).not.toMatch(/pull_request|merge_group|push:/);
+    expect(raw).not.toMatch(/pull_request|merge_group/);
   });
   it("grants nothing at the top; the one job reads and writes issues only", () => {
     expect(w.permissions).toEqual({});

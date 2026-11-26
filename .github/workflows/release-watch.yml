@@ -1,13 +1,13 @@
 # Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
 # takes, stage by stage (.github/hosted/release-stages.json), and one comment
 # per release and stage, on the one open issue "release stuck", when a stage
-# runs past its limit, max(2 x usual, usual + 5 min). Merge to every install is reported against a
-# 20 min target, never alerted on: to the prod deploy's "Fleet done" step
-# (cloud #474) where it ran, else to the prod deploy, labelled "to prod deploy
-# (fleet not yet measured)". Each stage is timed from its own start, so
-# stages can overlap (cloud #471). It gates nothing: it runs beside the
-# chain, on workflow_run and a schedule, so it is never a check on any PR and
-# must never be made required.
+# finished past its limit, max(2 x usual, usual + 5 min), or failed. Merge to
+# every install is reported against a 20 min target, never alerted on: to the
+# prod deploy's "Fleet done" step (cloud #474) where it ran, else to the prod
+# deploy, labelled "to prod deploy (fleet not yet measured)". Each stage is
+# timed from its own start, so stages can overlap (cloud #471). It gates
+# nothing: it runs beside the chain, on events only, so it is never a check
+# on any PR and must never be made required.
 #
 # - Stateless: each run rebuilds every recent release's timeline from GitHub
 #   timestamps (scripts/ci/release-watch.ts). Finished releases go into
@@ -30,17 +30,22 @@
 #   later main commit names the release in a job ("publish-staging release
 #   <tag>", or "hosted-built <tag> <sha>" from cloud #469), never by its head
 #   sha, and a copy ends with its publish job.
-# - Triggers: each completed run of the chain's workflows, plus every 5
-#   minutes (GitHub's schedule can skip for hours; the workflow_run events
-#   carry the clock meanwhile). A stage that never starts raises no event, so
-#   the schedule is what notices a stall.
+# - Triggers, events only, never a schedule or a poll (Leo, 2026-11-26:
+#   "Everything should be event-based, push, never PULL"): each completed run
+#   of every release workflow on main, a push to main that moves PUBLIC_PIN,
+#   and a dispatch. Each run refreshes the times and comments on any stage
+#   that finished past its limit or failed. A stage that never finishes
+#   raises no event: catching it is the release agent's (OA Manager L-2) job,
+#   with this run's summary and current.json as its picture.
 # - No secret but the default token: contents read (the checkout), actions
-#   read (runs, jobs, a failed job's log, the previous artifact) and issues
+#   read (runs, jobs, the previous artifact; never a log) and issues
 #   write (the one issue and its comments).
 #   The public repo's releases and commits are public reads. The only input,
 #   backfill_since, goes through env: and is checked by the script.
-# - The concurrency group keeps two runs from racing on the issue; a replaced
-#   pending run loses nothing, because the next one recomputes everything.
+# - The concurrency group keeps two runs from racing on the issue (and the
+#   hidden key per release and stage keeps a comment from repeating); a
+#   replaced pending run loses nothing, because the next one recomputes
+#   everything.
 # - workflow_run runs only from the default branch's copy of this file.
 name: release-watch
 
@@ -51,14 +56,16 @@ on:
         pin-bump,
         hosted-release,
         hosted-publish,
+        staging-release-chain,
         deploy-hosted-platform,
         redline-staging,
         prod-release-chain,
       ]
     types: [completed]
     branches: [main]
-  schedule:
-    - cron: "*/5 * * * *"
+  push:
+    branches: [main]
+    paths: [PUBLIC_PIN]
   workflow_dispatch:
     inputs:
       backfill_since:
@@ -99,7 +106,7 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p prev
-          run=$(gh api -X GET "repos/$REPO/actions/workflows/release-watch.yml/runs?branch=main&status=success&per_page=20" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPO\" and (.event == \"schedule\" or .event == \"workflow_run\" or .event == \"workflow_dispatch\"))][0].id // empty" 2> /dev/null || true)
+          run=$(gh api -X GET "repos/$REPO/actions/workflows/release-watch.yml/runs?branch=main&status=success&per_page=20" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPO\" and (.event == \"push\" or .event == \"workflow_run\" or .event == \"workflow_dispatch\"))][0].id // empty" 2> /dev/null || true)
           id=""
           if [ -n "$run" ]; then
             id=$(gh api -X GET "repos/$REPO/actions/runs/$run/artifacts?name=release-stats&per_page=1" --jq '.artifacts[0] | select(.expired | not) | .id' 2> /dev/null || true)

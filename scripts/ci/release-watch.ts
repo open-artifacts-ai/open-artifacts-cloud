@@ -1,7 +1,9 @@
 // Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
 // takes, stage by stage, against each stage's usual time, and one comment, on
-// the one open issue "release stuck", when a stage runs past its limit (each
-// release and stage once, never per refresh): the larger of alertFactor (2) x its
+// the one open issue "release stuck", when a stage finished past its limit or
+// failed (each release and stage once, never per refresh). It runs on events
+// only, never a schedule or a poll: a stage that never finishes raises no
+// event and is the release agent's to catch. The limit: the larger of alertFactor (2) x its
 // usual time and its usual time plus alertFloor (5) minutes, so a stage that
 // usually takes half a minute does not alert on a one-minute wait. Each stage
 // is timed from its own start to its own end, so stages can overlap (the
@@ -35,8 +37,9 @@
 // release in history is done and not rebuilt, but one whose total stopped at
 // the prod deploy has its prod deploys' jobs read in the window, and takes a
 // later "Fleet done" for its tag. Writes, through gh() and only when a stage
-// is past its limit: the issue (created once) and one comment per release and
-// stage; for a failed stage, its run's jobs and failed job's log are read.
+// finished past its limit or failed: the issue (created once) and one comment
+// per release and stage; for a failed stage, its run's jobs are read (never
+// its log).
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -192,8 +195,11 @@ export type HistoryEntry = {
 export type Overrun = {
   tag: string;
   stage: string;
-  /** in_flight: the stage is still going; finished: it ended past the limit. */
-  kind: "in_flight" | "finished";
+  /**
+   * in_flight: the stage is still going past its limit; finished: it ended
+   * past its limit; failed: its run failed (any time).
+   */
+  kind: "in_flight" | "finished" | "failed";
   /** Unknown for a finished release read back from history. */
   startedAt?: string;
   /** In flight and not started: startedAt is when what it waits on ended. */
@@ -924,9 +930,10 @@ export const ruleText = (config: Config) =>
 export function overruns(
   tls: Timeline[],
   config: Config,
-): { over: Overrun[]; red: Red[] } {
+): { over: Overrun[]; red: Red[]; failed: Overrun[] } {
   const over: Overrun[] = [];
   const red: Red[] = [];
+  const failed: Overrun[] = [];
   const ids = (s: StageRow) =>
     s.runId ? { runId: s.runId, attempts: s.attempts ?? 1 } : {};
   const finishedOver = (t: Timeline) => {
@@ -955,11 +962,24 @@ export function overruns(
     // Stages can overlap (the staging copy beside the staging deploy, #471):
     // each one going is timed from its own start, or from what it waits on.
     for (const cur of t.stages) {
-      if (cur.state === "red")
+      if (cur.state === "red") {
         red.push({ tag: t.tag, stage: cur.name, url: cur.url });
-      // A red stage past its limit is stuck too: no rerun has moved it on.
+        failed.push({
+          tag: t.tag,
+          stage: cur.name,
+          kind: "failed",
+          red: true,
+          ...(cur.startedAt ? { startedAt: cur.startedAt } : {}),
+          ...ids(cur),
+          minutes: cur.minutes ?? 0,
+          usual: cur.usual ?? 0,
+          limit: cur.usual !== undefined ? limitOf(cur.usual, config) : 0,
+          url: cur.url,
+        });
+        continue;
+      }
       if (
-        (cur.state === "current" || cur.state === "red") &&
+        cur.state === "current" &&
         cur.startedAt &&
         cur.usual !== undefined &&
         (cur.minutes ?? 0) > limitOf(cur.usual, config)
@@ -970,7 +990,6 @@ export function overruns(
           kind: "in_flight",
           startedAt: cur.startedAt,
           ...(cur.waiting ? { waiting: true } : {}),
-          ...(cur.state === "red" ? { red: true } : {}),
           ...ids(cur),
           minutes: cur.minutes ?? 0,
           usual: cur.usual,
@@ -987,21 +1006,21 @@ export function overruns(
     (t) => newest && compareTags(t.tag, newest.tag) > 0,
   );
   if (newest && !newerLive) finishedOver(newest);
-  return { over, red };
+  return { over, red, failed };
 }
 
 /** The hidden key that makes a comment once per release and stage. */
 export const commentKey = (o: { tag: string; stage: string }) =>
   `<!-- release-watch ${o.tag} ${o.stage} -->`;
 
-/** What a failed stage's run says: its failed job and one error line. */
-export type Failure = { job: string; step?: string; line?: string };
+/** What a failed stage's run says: its failed job and step, by name. */
+export type Failure = { job: string; step?: string };
 
 /**
  * Pure: one comment for a stage past its limit. The repo is public: it names
  * only the release, the stage, the run and its workflow-defined job and step
- * names, and an error line made safe by safeLine. The rest is on the
- * release-watch job summary.
+ * names, never a log line (one could name an install or a customer); the log
+ * is behind the run link, and the rest is on the release-watch job summary.
  */
 export function commentBody(
   o: Overrun,
@@ -1009,17 +1028,22 @@ export function commentBody(
   config: Config,
   failure?: Failure,
 ): string {
-  const what =
-    o.kind === "finished"
-      ? `took ${o.minutes} min`
-      : o.waiting
-        ? `has not started ${o.minutes} min after what it waits on ended (since ${o.startedAt})`
-        : `${o.red ? "failed and has been stuck" : "has been going"} ${o.minutes} min (since ${o.startedAt})`;
+  const usual = `usual ${o.usual} min, limit ${o.limit} min (${ruleText(config)})`;
+  const head =
+    o.kind === "failed"
+      ? `**${o.tag} ${o.stage}** failed${o.startedAt ? ` ${o.minutes} min after it started (${o.startedAt})` : ""}; ${usual}.`
+      : `**${o.tag} ${o.stage}** is past its limit: it ${
+          o.kind === "finished"
+            ? `took ${o.minutes} min`
+            : o.waiting
+              ? `has not started ${o.minutes} min after what it waits on ended (since ${o.startedAt})`
+              : `has been going ${o.minutes} min (since ${o.startedAt})`
+        }; ${usual}.`;
   const runUrl = o.runId
     ? `https://github.com/${repo}/actions/runs/${o.runId}`
     : undefined;
   const lines = [
-    `**${o.tag} ${o.stage}** is past its limit: it ${what}; usual ${o.usual} min, limit ${o.limit} min (${ruleText(config)}).`,
+    head,
     "",
     runUrl
       ? `- Run: [${o.runId}](${runUrl}). To rerun it, open the run and choose "Re-run failed jobs", or \`gh run rerun ${o.runId} --failed -R ${repo}\`.`
@@ -1027,7 +1051,7 @@ export function commentBody(
   ];
   if (failure)
     lines.push(
-      `- Failed job: \`${failure.job}\`${failure.step ? `, step \`${failure.step}\`` : ""}${failure.line ? `: \`${failure.line}\`` : ""}`,
+      `- Failed job: \`${failure.job}\`${failure.step ? `, step \`${failure.step}\`` : ""}. Its log is on the run.`,
     );
   if (o.attempts) lines.push(`- Attempts: ${o.attempts}`);
   lines.push(
@@ -1061,38 +1085,6 @@ export function commentPlan(
     out.push(o);
   }
   return out;
-}
-
-/**
- * Pure: an error line safe for a public issue, at most 200 characters. Log
- * lines can name an install, a host or a token: hosts, emails, URLs, quoted
- * values, the word after install/slug/instance/tenant, rl- fixtures and long
- * token-like strings are replaced. GitHub already masks the secrets it knows.
- */
-export function safeLine(raw: string): string {
-  let x = raw
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI colour codes
-    .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s*/, "")
-    .replace(/##\[error\]/g, "")
-    .trim();
-  x = x
-    .replace(/https?:\/\/\S+/g, "<url>")
-    .replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, "<email>")
-    .replace(/\b[\w-]+(\.[\w-]+)+\.[a-z]{2,}\b/gi, "<host>")
-    .replace(/\b[\w-]+\.(app|com|dev|net|io|org|ai)\b/gi, "<host>")
-    .replace(/(["'`])[^"'`]*\1/g, "$1…$1")
-    .replace(
-      /\b(install|installs|slug|instance|tenant|org|workspace)(\s*[:=]?\s*)\S+/gi,
-      "$1$2<name>",
-    )
-    .replace(/\brl-[a-z0-9-]+/gi, "<name>")
-    .replace(
-      /\b(oat|ghp|gho|ghs|ghu|github_pat|sk|pk|whsec)_\S+/gi,
-      "<redacted>",
-    )
-    .replace(/[A-Za-z0-9_\-+/=]{32,}/g, "<redacted>");
-  return x.length > 200 ? `${x.slice(0, 199)}…` : x;
 }
 
 /**
@@ -1156,7 +1148,11 @@ export function compute(o: {
     o.config.historySize,
   );
   const s = stats(history, o.config);
-  const { over, red } = overruns(all, o.config);
+  const { over, red, failed } = overruns(all, o.config);
+  // What a run comments on (events only, no poll): a stage that finished
+  // past its limit, or failed. One still going is in the summary; one that
+  // never finishes raises no event and is the release agent's to catch.
+  const notify = [...over.filter((x) => x.kind === "finished"), ...failed];
   const inFlight = tls
     .filter((t) => !t.doneAt && !t.supersededBy)
     .map((t) => {
@@ -1208,7 +1204,7 @@ export function compute(o: {
     red,
     releases: tls,
   };
-  return { current, history, over, red };
+  return { current, history, over, red, notify };
 }
 
 /** Pure: the job summary, markdown. */
@@ -1470,38 +1466,28 @@ export function readMerge(
 }
 
 /**
- * The failed job of a run and the first error line of its log, made safe.
- * Reads only (actions: read); a log that can't be read leaves the line out.
+ * The failed job and step of a run, by name. Reads only the run's jobs
+ * (actions: read), never a log.
  */
 export function readFailure(
   exec: Exec,
   repo: string,
   runId: number,
 ): Failure | undefined {
-  const jobs = lines<Job & { id: number }>(
+  const jobs = lines<Job>(
     gh(exec, [
       "api",
       "-X",
       "GET",
       "--jq",
-      ".jobs[] | {id, name, conclusion, steps: [(.steps // [])[] | {name, conclusion}]} | tojson",
+      ".jobs[] | {name, conclusion, steps: [(.steps // [])[] | {name, conclusion}]} | tojson",
       `repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`,
     ]),
   );
   const j = jobs.find((x) => x.conclusion === "failure");
   if (!j) return undefined;
   const step = j.steps?.find((x) => x.conclusion === "failure")?.name;
-  let line: string | undefined;
-  try {
-    const log = gh(exec, ["api", `repos/${repo}/actions/jobs/${j.id}/logs`]);
-    const raw = log.split("\n").find((l) => l.includes("##[error]"));
-    if (raw) line = safeLine(raw) || undefined;
-  } catch {}
-  return {
-    job: j.name,
-    ...(step ? { step } : {}),
-    ...(line ? { line } : {}),
-  };
+  return { job: j.name, ...(step ? { step } : {}) };
 }
 
 /**
@@ -1659,7 +1645,7 @@ export function tick(o: {
     now: o.now,
   });
   const issue = o.issue
-    ? notifyStuck(o.exec, o.repo, out.over, o.config)
+    ? notifyStuck(o.exec, o.repo, out.notify, o.config)
     : { action: "skipped" };
   return { ...out, issue };
 }
