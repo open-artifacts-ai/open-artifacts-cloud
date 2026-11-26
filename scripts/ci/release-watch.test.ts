@@ -745,6 +745,21 @@ describe("a release across recovery runs (v0.246.1)", () => {
       carries: ["v0.246.0"],
       firstMergeAt: fx.merges["v0.246.0"],
     });
+    // current.json matches: v0.246.1 keeps its own 237.5 min and adds the
+    // carried total and list; v0.246.0 says it was superseded.
+    const cur = (tag: string) => r.current.releases.find((x) => x.tag === tag);
+    expect(cur("v0.246.1")).toMatchObject({
+      e2e: 237.5,
+      carries: ["v0.246.0"],
+      firstMergeAt: fx.merges["v0.246.0"],
+      carriedE2e: 315.7,
+    });
+    expect(cur("v0.246.0")).toMatchObject({
+      supersededBy: "v0.246.1",
+      e2eTo: "superseded by v0.246.1",
+    });
+    expect(cur("v0.246.0")).not.toHaveProperty("e2e");
+    expect(cur("v0.246.0")).not.toHaveProperty("carriedE2e");
     expect(h).not.toHaveProperty("supersededBy");
     expect(h?.stages.staging_publish).toBe(2.5);
     // v0.246.0 never reached prod: superseded, closed by v0.246.1's prod deploy.

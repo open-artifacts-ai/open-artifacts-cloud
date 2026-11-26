@@ -187,7 +187,15 @@ export type Timeline = {
   supersededBy?: string;
   /** For a superseded release: when the newer release that carries it was done. */
   closedAt?: string;
+  /** Its own merge to its endpoint; none for a superseded release. */
   e2e?: number;
+  /**
+   * For a shipped release that carries superseded ones (carryMerges): them,
+   * the earliest first merge among it and them, and the total from there.
+   */
+  carries?: string[];
+  firstMergeAt?: string;
+  carriedE2e?: number;
 };
 export type HistoryEntry = {
   tag: string;
@@ -1508,7 +1516,19 @@ export function compute(o: {
     unmeasured,
     overruns: over,
     red,
-    releases: tls,
+    // Each release keeps its own total; a shipped one that carries
+    // superseded releases also shows them and the total from their merge.
+    releases: tls.map((t) => {
+      const h = history.find((x) => x.tag === t.tag);
+      return h?.carries?.length && !t.supersededBy
+        ? {
+            ...t,
+            carries: h.carries,
+            ...(h.firstMergeAt ? { firstMergeAt: h.firstMergeAt } : {}),
+            ...(h.e2e !== undefined ? { carriedE2e: h.e2e } : {}),
+          }
+        : t;
+    }),
   };
   return { current, history, over, red, notify };
 }
