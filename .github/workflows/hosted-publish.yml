@@ -2,7 +2,8 @@
 # oa-<p>-releases (design v7 6.4): the only CI step on the provisioning path.
 # After every hosted-release run on main (not cancelled; the release gate
 # decides, so an npm-only failure does not block), the release whose tag's
-# commit is that run's head goes to STAGING only; most runs cut no release and
+# commit is the commit that run built (its hosted-built job's name, #459;
+# else its head) goes to STAGING only; most runs cut no release and
 # publish nothing. A release reaches prod's bucket only after staging's
 # red-line passed the tag (#1412): the publish-prod job runs
 # scripts/ci/staging-first-gate.sh for every release, and prod-release-chain.yml
@@ -93,6 +94,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           TAG: ${{ inputs.tag }}

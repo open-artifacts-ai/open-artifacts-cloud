@@ -37,12 +37,41 @@
 #   "pin-bump failed" open with the run URL; green closes it. A run past its
 #   timeout is reported as cancelled, so cancelled counts as red: anything but
 #   success is red, except an `open` skipped because there was nothing to bump.
+#
+# Direct mode (cloud #264): with the repo variable PIN_BUMP_DIRECT set to `on`,
+# both plans run `plan-direct` (no PR is read) and there is no PR, but CI still
+# gates main. `open` pushes the same App-signed commit to pin-land/<tag>, never to
+# main, and CI runs on it in full. The `land` job (after each CI run on a
+# pin-land/* branch, and on every schedule and dispatch) fast-forwards main to
+# that exact sha, with force=false, only when ci.yml's push run on that branch
+# and sha passed in full (every job main's ruleset requires green, none skipped,
+# none on the pin-only short path), the commit is the bot's verified one, it changes only
+# PUBLIC_PIN, SYNCED_FROM and pnpm-lock.yaml, and both pin files name the public
+# tag's sha. Red stays red and the branch waits for a person; a main that moved
+# meanwhile gets the same blobs on its head, pushed to the branch for CI to run
+# again, unless it moved on a lockfile-sensitive path (the branch is dropped and
+# the next run regenerates). A bump whose surfaces port is not empty is what
+# pin-bump-arm leaves for a person, so it goes the PR path below instead. Both
+# plan-direct and land wait while pin-bump-arm's release pipeline gate is shut
+# (a gate workflow queued or running, or main's pin not yet on prod and not
+# rejected), so a direct bump lands no sooner than an armed PR would.
+# land writes with its own App, never the release App: its id and key are the
+# secrets PIN_LAND_APP_ID and PIN_LAND_APP_PRIVATE_KEY in the main-only
+# Environment `pin-land`, and that App is the only bypass actor main's ruleset
+# needs. The release App (minted unnarrowed elsewhere) never moves main. Unset
+# (or anything but `on`), the PR path runs exactly as before.
 name: pin-bump
 
 on:
   schedule:
     - cron: "23 */6 * * *"
   workflow_dispatch:
+  # Direct mode: CI finished on a staged pin. Only the land job runs, from main's
+  # copy of this file and script; nothing from the event is used.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: ["pin-land/**"]
 
 permissions: {}
 
@@ -52,7 +81,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -72,11 +101,12 @@ jobs:
         with:
           node-version-file: private/.nvmrc
       - id: plan
-        name: Is there a newer public release with no PR
+        name: Is there a newer public release to take
         working-directory: private
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+          MODE: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'plan-direct' || 'plan' }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts "$MODE" --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -147,7 +177,7 @@ jobs:
 
   open:
     needs: prepare
-    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.bump == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'workflow_run' && needs.prepare.outputs.bump == 'true'
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 10
@@ -169,7 +199,8 @@ jobs:
         name: Plan again
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+          MODE: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'plan-direct' || 'plan' }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts "$MODE" --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.bump == 'true'
         name: Move the pin files
         env:
@@ -206,6 +237,22 @@ jobs:
           [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular plan.json in the artifact"; exit 1; }
           [ "$(wc -c < "$f")" -le 2000000 ] || { echo "::error::the plan is over 2 MB"; exit 1; }
           node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan "$f" --dir tests/redline
+      # Direct mode lands only what pin-bump-arm would arm without a person: a
+      # surfaces port (new redline cases and counts) goes to a PR for review.
+      - id: route
+        if: steps.plan.outputs.bump == 'true'
+        name: Direct or a PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
+          DIRECT: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'on' || 'off' }}
+        run: |
+          set -euo pipefail
+          surfaces=same
+          git diff --quiet HEAD -- tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts || surfaces=changed
+          node --experimental-strip-types scripts/ci/pin-bump.ts route --repo "$GITHUB_REPOSITORY" --tag "$TAG" --direct "$DIRECT" --surfaces "$surfaces" --branch "$BRANCH" --supersede "$SUPERSEDE" >> "$GITHUB_OUTPUT"
       - id: app
         if: steps.plan.outputs.bump == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -217,12 +264,12 @@ jobs:
       # The commit is made through the git-data API with the App token, never with
       # local git: GitHub then records the App's bot as author and committer and
       # signs it (verified), and the push needs only the App's contents write.
-      - if: steps.plan.outputs.bump == 'true'
-        name: Commit and push the branch (App-signed, through the API)
+      - id: commit
+        if: steps.plan.outputs.bump == 'true' && (steps.route.outputs.route == 'direct' || steps.route.outputs.pr == 'true')
+        name: Commit the pin (App-signed, through the API)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
           REPO: ${{ github.repository }}
           BASE: ${{ github.sha }}
         run: |
@@ -238,6 +285,18 @@ jobs:
           tree=$(gh api "repos/$REPO/git/trees" --input "$RUNNER_TEMP/tree.json" --jq .sha)
           jq -n --arg m "chore(pin): bump PUBLIC_PIN to $TAG" --arg t "$tree" --arg p "$BASE" '{message: $m, tree: $t, parents: [$p]}' > "$RUNNER_TEMP/commit.json"
           commit=$(gh api "repos/$REPO/git/commits" --input "$RUNNER_TEMP/commit.json" --jq .sha)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "committed $commit on $BASE"
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
+        name: Push the branch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ steps.route.outputs.branch }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          set -euo pipefail
+          commit="$COMMIT"
           # plan found no PR, open or closed, for this branch, so a leftover
           # branch from a run that died before opening one is safe to replace.
           if gh api "repos/$REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
@@ -246,18 +305,62 @@ jobs:
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" > /dev/null
           fi
           echo "pushed $BRANCH at $commit"
-      - if: steps.plan.outputs.bump == 'true'
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
         name: Open the PR (never armed)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
           SHA: ${{ steps.plan.outputs.sha }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
-          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
+          BRANCH: ${{ steps.route.outputs.branch }}
+          SUPERSEDE: ${{ steps.route.outputs.supersede }}
         run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH" --supersede "$SUPERSEDE"
+      # Direct mode: the commit goes to pin-land/<tag> for CI; main does not move here.
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.route == 'direct'
+        name: Stage the pin for CI (direct mode)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ github.sha }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo "$GITHUB_REPOSITORY" --base "$BASE" --commit "$COMMIT" --tag "$TAG" --sha "$SHA"
+
+  # Direct mode: main moves to a staged pin only once a full CI push run passed on that exact sha.
+  land:
+    if: github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on'
+    runs-on: ubuntu-latest
+    # Its own App and Environment: the bypass actor on main's ruleset is used here only.
+    environment: pin-land
+    timeout-minutes: 10
+    # actions: read lets land read ci.yml's push run and jobs on the staged sha.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PIN_LAND_APP_ID }}
+          private-key: ${{ secrets.PIN_LAND_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Land every staged pin that CI passed
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          READ_TOKEN: ${{ github.token }}
+          LAND_BOT: ${{ steps.app.outputs.app-slug }}[bot]
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts land --repo "$GITHUB_REPOSITORY"
 
   report:
-    needs: [prepare, open]
+    needs: [prepare, open, land]
     if: ${{ always() && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -268,7 +371,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          RESULT: ${{ (needs.prepare.result != 'success' || needs.open.result == 'failure' || needs.open.result == 'cancelled') && 'failure' || 'success' }}
+          RESULT: ${{ (needs.prepare.result == 'failure' || needs.prepare.result == 'cancelled' || needs.open.result == 'failure' || needs.open.result == 'cancelled' || needs.land.result == 'failure' || needs.land.result == 'cancelled') && 'failure' || 'success' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail

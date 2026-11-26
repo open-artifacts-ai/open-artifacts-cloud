@@ -605,8 +605,16 @@ case "$target" in
     # The Worker and what it depends on, the admin SPA among them (@oa/admin
     # is a devDependency). Its vite build writes apps/provisioning/dist-assets
     # (ASSETS) itself, nothing is copied, and the wrapper refuses a deploy
-    # without its index.html.
-    if [ -z "$VERIFY_ONLY" ]; then (cd "$root" && pnpm --filter "@oa/provisioning..." build); fi
+    # without its index.html. PROVISIONING_BUILT=1: deploy-hosted-platform.yml
+    # already ran this exact build, beside the migrations (#264 step 6), and
+    # every other bundling target waited for it.
+    if [ -z "$VERIFY_ONLY" ]; then
+      if [ "${PROVISIONING_BUILT:-}" = 1 ]; then
+        echo "provisioning: built earlier in this run (PROVISIONING_BUILT)"
+      else
+        (cd "$root" && pnpm --filter "@oa/provisioning..." build)
+      fi
+    fi
     # The OAuth KV namespace: check first, create only when absent.
     ns="oa-$P-provisioning-oauth"
     kvs="$(list_all "/storage/kv/namespaces?" "list KV namespaces")"

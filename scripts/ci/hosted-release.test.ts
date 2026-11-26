@@ -354,6 +354,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
   const JOBS = [
     "mirror",
     "hosted-guard",
+    "hosted-built",
     "hosted-build",
     "hosted-check",
     "hosted-sign-staging",
@@ -368,6 +369,20 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
 
   it("has exactly the mirror and the moved hosted jobs", () => {
     expect(Object.keys(jobs)).toEqual(JOBS);
+  });
+
+  // #459: the release gate and hosted-publish read the built commit from this
+  // job's name; it must carry guard's tag and sha and run only for a real run.
+  it("hosted-built is named by hosted-guard's tag and commit, for a real run whose guard passed", () => {
+    expect(jobs["hosted-built"].name).toBe(
+      "hosted-built ${{ needs.hosted-guard.outputs.tag }} ${{ needs.hosted-guard.outputs.sha }}",
+    );
+    expect(needsOf("hosted-built")).toEqual(["hosted-guard"]);
+    expect(jobs["hosted-built"].if).toContain("!inputs.dry_run");
+    expect(jobs["hosted-built"].if).toContain(
+      "needs.hosted-guard.result == 'success'",
+    );
+    expect(jobs["hosted-built"].permissions).toEqual({});
   });
 
   it("runs on a push to main that changes PUBLIC_PIN, and on dispatch with dry_run defaulting to true", () => {
@@ -434,7 +449,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       "hosted-attach-$env",
     ])
       expect(gate).toContain(j);
-    for (const j of JOBS) expect(jobs[j].name).toBeUndefined();
+    for (const j of JOBS)
+      if (j !== "hosted-built") expect(jobs[j].name).toBeUndefined();
   });
 
   it("chains guard to build to check to sign to attach, behind the mirror", () => {
@@ -1006,6 +1022,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
   it("every hosted job after the guard needs it and checks out exactly its SHA, no credentials kept", () => {
     for (const name of JOBS.slice(2)) {
       expect(needsOf(name), name).toContain("hosted-guard");
+      // hosted-built only names the commit (#459); it checks nothing out.
+      if (name === "hosted-built") continue;
       const co = allSteps(name).filter((x) =>
         String(x.uses ?? "").startsWith("actions/checkout"),
       );

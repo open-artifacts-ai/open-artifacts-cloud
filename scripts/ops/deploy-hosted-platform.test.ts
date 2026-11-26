@@ -2897,6 +2897,37 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.out).toContain("prod provisioning: deployed and verified");
       clean(r);
     });
+    // #264 step 6: the workflow builds provisioning beside the migrations and
+    // says so with PROVISIONING_BUILT=1 (only once that build passed); then the
+    // target skips its own build and deploys the same way. Any other value
+    // builds as before.
+    it("PROVISIONING_BUILT=1 skips the build and still deploys; anything else builds", () => {
+      const built = setup({ exists: brokers }).run("provisioning", {
+        PROVISIONING_BUILT: "1",
+      });
+      expect(built.err).toBe("");
+      expect(built.code).toBe(0);
+      expect(built.log.filter((l) => l.startsWith("pnpm --filter"))).toEqual(
+        [],
+      );
+      expect(built.out).toContain(
+        "provisioning: built earlier in this run (PROVISIONING_BUILT)",
+      );
+      expect(
+        built.log.some((l) => l.startsWith("wrapper provisioning prod ")),
+      ).toBe(true);
+      expect(built.out).toContain("prod provisioning: deployed and verified");
+      for (const v of ["", "0", "yes", "1 "]) {
+        const r = setup({ exists: brokers }).run("provisioning", {
+          PROVISIONING_BUILT: v,
+        });
+        expect(r.code, v).toBe(0);
+        expect(
+          r.log.filter((l) => l.startsWith("pnpm --filter")),
+          v,
+        ).toEqual(["pnpm --filter @oa/provisioning... build"]);
+      }
+    });
     it("prod sign-up steps are off by default: PROD_SIGNUP_DEPLOY unset, empty or anything but exactly on leaves no entry, key or sitekey (#40)", () => {
       for (const extra of [
         {},
