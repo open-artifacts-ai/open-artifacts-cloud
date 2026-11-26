@@ -340,6 +340,9 @@ describe("upgrade and rollback (5.4)", () => {
       ),
     ).toBe(true);
     expect(msg).toContain("BusHub");
+    // The install id is a request value: redacted.
+    expect(msg).not.toContain(s.installId);
+    expect(msg).toContain("Reason: install [value]");
     expect(msg.length).toBeLessThanOrEqual(ERROR_MESSAGE_MAX);
     expect(w.fake.writes().length).toBe(writes);
     expect(w.install(s.installId)).toMatchObject({ version: V1, lease: null });

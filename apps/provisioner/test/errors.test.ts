@@ -257,6 +257,9 @@ describe("do_step_required (#1343): the one structured value", () => {
 describe("refusalDetail (#461): only a refusal has a reason", () => {
   it("a StepRefusal's detail, an OwnerVarsRefusal's why, a terminal ProvisionRefused's message", () => {
     expect(refusalDetail(refused("why"))).toBe("why");
+    // A StepRefusal carries its detail whatever its code.
+    expect(refusalDetail(new StepRefusal("internal", "x"))).toBe("x");
+    expect(refusalDetail(new StepRefusal("cf_error", "y"))).toBe("y");
     expect(
       refusalDetail(
         new ProvisionRefused("no release", "release_not_published"),
@@ -279,7 +282,6 @@ describe("refusalDetail (#461): only a refusal has a reason", () => {
     expect(refusalDetail(new ProvisionRetry("held", "lease_held"))).toBeNull();
     expect(refusalDetail(new ProvisionRefused("x", "cf_error"))).toBeNull();
     expect(refusalDetail(new ProvisionRefused("x", "internal"))).toBeNull();
-    expect(refusalDetail(new StepRefusal("internal", "x"))).toBeNull();
     expect(refusalDetail(new CfError("GET", "/x", 500, "boom"))).toBeNull();
     expect(refusalDetail(new NonRetryableError("invalid_state"))).toBeNull();
     expect(refusalDetail(new Error("invalid_state: x"))).toBeNull();

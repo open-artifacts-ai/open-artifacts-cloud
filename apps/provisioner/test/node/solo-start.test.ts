@@ -3,6 +3,7 @@
 // before done (ready) and notify (welcome).
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_PUBKEY } from "../../../../packages/provision/test/fixtures/release.js";
+import { JOB_ERROR_TEXT } from "../../src/errors.js";
 import {
   type BillingProvisionerRpc,
   runCreate,
@@ -169,8 +170,11 @@ describe("ProvisionInstall: solo_start", () => {
       status: "failed",
       error_code: "internal",
     });
-    // billing's error text is not stored on the job row
-    expect(JSON.stringify(w.job(s.jobId))).not.toContain("plan_conflict");
+    // #461: the StepRefusal's detail (billing's code, sanitized) is the
+    // stored reason after internal's fixed text.
+    expect(w.job(s.jobId)?.error_message).toBe(
+      `${JOB_ERROR_TEXT.internal} Reason: solo_start refused: plan_conflict`,
+    );
     expect(signup(s.signupId)).toMatchObject({
       status: "failed",
       solo_started_at: null,

@@ -197,9 +197,9 @@ const parsed = (raw: unknown): unknown => {
 };
 
 /**
- * The request-provided values of a job (best effort): its args, the
- * signup's slug, vars and owner, the owner's email, the install's slug and
- * vars. They are redacted from the failure log line and a stored reason.
+ * The request-provided values of a job (best effort): its install id and
+ * args, the signup's slug, vars and owner, the owner's email, the install's
+ * slug and vars. They are redacted from the failure log line and a stored reason.
  * `complete` is false when any read threw (a missing row is not a failure):
  * then the values may miss one, and no reason is stored (#461).
  */
@@ -230,6 +230,8 @@ async function requestValues(
     install_id: string;
   }>("SELECT args, signup_id, install_id FROM jobs WHERE id = ?", jobId);
   if (!job) return { values: out, complete };
+  // The install id: a do_step_required refusal names it (#461).
+  out.push(job.install_id);
   scalars(parsed(job.args), out);
   if (job.signup_id) {
     const su = await one<Record<string, unknown>>(

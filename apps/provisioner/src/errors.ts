@@ -9,8 +9,9 @@
 // (refusalDetail: a StepRefusal, an OwnerVarsRefusal or a non-retry
 // ProvisionRefused), " Reason: " and the refusal's own text through
 // redactDetail, the whole capped at ERROR_MESSAGE_MAX (storedMessage).
-// Retryable, cf_error and internal failures store their text alone: a
-// Cloudflare or D1 message can quote input that redactDetail doesn't know.
+// Retryable, cf_error and internal failures store their text alone (a
+// Cloudflare or D1 message can quote input that redactDetail doesn't know),
+// except a StepRefusal, whose detail the provisioner writes itself.
 // So does any failure whose request values could not all be read (steps.ts
 // requestValues), since a value missed would go unredacted.
 import { NonRetryableError } from "cloudflare:workflows";
@@ -217,22 +218,24 @@ export function detailOf(e: unknown): string {
   return String(e);
 }
 
-/** Codes whose stored text never takes a reason (#461): not refusals. */
+/**
+ * Codes whose stored text never takes a reason (#461): not refusals. A
+ * StepRefusal is exempt: it always carries its detail, whatever its code.
+ */
 const NO_REASON: ReadonlySet<ProvisionErrorCode> = new Set([
   "cf_error",
   "internal",
 ]);
 
 /**
- * A refusal's own text (#461): a StepRefusal's detail, an OwnerVarsRefusal's
- * `why`, or the message of a ProvisionRefused that is not a ProvisionRetry,
- * for a code outside NO_REASON. Null for anything else (a Cloudflare or D1
+ * A refusal's own text (#461): a StepRefusal's detail (any code), or, for a
+ * code outside NO_REASON, an OwnerVarsRefusal's `why` or the message of a
+ * ProvisionRefused that is not a ProvisionRetry. Null for anything else (a Cloudflare or D1
  * error, a bare NonRetryableError, a retry). Stored only when the step's
  * failure is terminal (noteFailure). Raw: redact before storing.
  */
 export function refusalDetail(e: unknown): string | null {
-  if (e instanceof StepRefusal)
-    return NO_REASON.has(codeOf(e)) ? null : e.detail;
+  if (e instanceof StepRefusal) return e.detail;
   if (e instanceof OwnerVarsRefusal)
     return NO_REASON.has(e.code) ? null : e.why;
   if (e instanceof ProvisionRefused && !classify(e).retryable)
