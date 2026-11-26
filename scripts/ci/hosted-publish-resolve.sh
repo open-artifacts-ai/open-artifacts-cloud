@@ -14,10 +14,12 @@
 #     prod alone needs the tag's staging publish first, see staged) or
 #     FLOOR_RUN_ID (a hosted-floor.yml run id; DEPLOY_ENV required).
 # Read-only (`gh api`); an API error is exit 1, never "no release".
-#     The built commit is the one named by the run's "hosted-built <tag> <sha>"
+#     The built release is the one named by the run's "hosted-built <tag> <sha>"
 #     job (hosted-release.yml, #459): a dispatch on main's head that rebuilt an
-#     older tag's commit has a different head_sha. A run without that job (a
-#     failed guard, an older run) falls back to its head_sha.
+#     older tag's commit has a different head_sha. The tag must be a published
+#     release whose commit is still <sha>, or the run refuses. A run without
+#     that job (a failed guard, an older run) falls back to the release whose
+#     tag is at its head_sha, read across every page of tags and releases.
 # Env: EVENT, HEAD_SHA, RUN_ID, HEAD_BRANCH, CONCLUSION (workflow_run); TAG,
 # DEPLOY_ENV, FLOOR_RUN_ID (dispatch); GH_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT.
 set -euo pipefail
@@ -87,25 +89,42 @@ case "${EVENT:-}" in
     fi
     [[ "${HEAD_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "HEAD_SHA is not a commit sha" >&2; exit 1; }
     : "${GH_TOKEN:?GH_TOKEN is required}"
-    built="$HEAD_SHA"
+    found=""
     if [ -n "${RUN_ID:-}" ]; then
       [[ "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo "RUN_ID is not a run id" >&2; exit 1; }
       rjobs="$(gh api -X GET "$R/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" 2> /dev/null)" || { echo "reading run $RUN_ID's jobs failed" >&2; exit 1; }
       names="$(jq -r '.jobs | if type == "array" then . else error("no jobs") end | .[] | select(.conclusion == "success") | .name' <<< "$rjobs" 2> /dev/null)" ||
         { echo "reading run $RUN_ID's jobs failed: unparsable" >&2; exit 1; }
-      bsha="$(sed -n 's/^hosted-built v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]* \([0-9a-f]\{40\}\)$/\1/p' <<< "$names" | head -n 1)"
-      if [ -n "$bsha" ]; then built="$bsha"; fi
+      marker="$(grep -m 1 -E '^hosted-built v[0-9]+\.[0-9]+\.[0-9]+ [0-9a-f]{40}$' <<< "$names" || true)"
     fi
-    rels="$(gh api -X GET "$R/releases?per_page=20" 2> /dev/null)" || { echo "listing releases failed" >&2; exit 1; }
-    tags="$(jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' <<< "$rels")" ||
-      { echo "listing releases failed: unparsable" >&2; exit 1; }
-    found=""
-    while IFS= read -r t; do
-      [[ "$t" =~ $stable ]] || continue
-      sha="$(gh api -X GET "$R/commits/$t" 2> /dev/null | jq -r '.sha // ""')" || { echo "reading $t's commit failed" >&2; exit 1; }
-      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "reading $t's commit failed" >&2; exit 1; }
-      if [ "$sha" = "$built" ]; then found="$t"; break; fi
-    done <<< "$tags"
+    if [ -n "${marker:-}" ]; then
+      # The run names the tag and commit it built: both must hold now, or
+      # refuse (never fall back to head_sha, which is main's newer commit).
+      read -r _ mtag msha <<< "$marker"
+      rel="$(gh api -X GET "$R/releases/tags/$mtag" 2> /dev/null)" || { echo "run $RUN_ID built $mtag, but reading its release failed" >&2; exit 1; }
+      [ "$(jq -r '(.draft == false and .prerelease == false and (.published_at // "") != "") | tostring' <<< "$rel" 2> /dev/null)" = true ] ||
+        { echo "run $RUN_ID built $mtag, but it is not a published release" >&2; exit 1; }
+      sha="$(gh api -X GET "$R/commits/$mtag" 2> /dev/null | jq -r '.sha // ""')" || { echo "reading $mtag's commit failed" >&2; exit 1; }
+      [ "$sha" = "$msha" ] || { echo "run $RUN_ID built $mtag at $msha, but $mtag is at ${sha:-nothing}; refusing" >&2; exit 1; }
+      found="$mtag"
+      built="$msha"
+    else
+      # No hosted-built job (a failed guard, a run from before #459): the
+      # release whose tag is at the run's head. Every tag and release is read,
+      # page by page, so an old release is found too.
+      built="$HEAD_SHA"
+      tags="$(gh api -X GET --paginate "$R/tags?per_page=100" 2> /dev/null)" || { echo "listing tags failed" >&2; exit 1; }
+      at="$(jq -r --arg b "$built" '.[] | select(.commit.sha == $b) | .name' <<< "$tags" 2> /dev/null)" || { echo "listing tags failed: unparsable" >&2; exit 1; }
+      if [ -n "$at" ]; then
+        rels="$(gh api -X GET --paginate "$R/releases?per_page=100" 2> /dev/null)" || { echo "listing releases failed" >&2; exit 1; }
+        pub="$(jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' <<< "$rels" 2> /dev/null)" ||
+          { echo "listing releases failed: unparsable" >&2; exit 1; }
+        while IFS= read -r t; do
+          [[ "$t" =~ $stable ]] || continue
+          if grep -qxF -- "$t" <<< "$pub"; then found="$t"; break; fi
+        done <<< "$at"
+      fi
+    fi
     if [ -z "$found" ]; then
       echo "no release at $built; nothing to publish"
       out none "" "" false false

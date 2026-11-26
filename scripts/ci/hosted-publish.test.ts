@@ -17,6 +17,8 @@ p="\${@: -1}"; p="\${p#repos/$GITHUB_REPOSITORY/}"
 [ -f "$STATE/fail" ] && exit 1
 case "$p" in
   releases\\?*) cat "$STATE/releases.json" ;;
+  releases/tags/*) t="\${p#releases/tags/}"; jq -e --arg t "$t" '.[] | select(.tag_name == $t)' "$STATE/releases.json" || exit 1 ;;
+  tags\\?*) cat "$STATE/tags.json" ;;
   actions/workflows/hosted-publish.yml/runs\\?*) cat "$STATE/runs.json" 2> /dev/null || echo '{"workflow_runs":[]}' ;;
   compare/main...*) [ -f "$STATE/fail-compare" ] && exit 1; echo "{\\"status\\":\\"$(cat "$STATE/compare" 2> /dev/null || echo behind)\\"}" ;;
   actions/runs/*/jobs\\?*) id="\${p#actions/runs/}"; id="\${id%%/*}"; cat "$STATE/jobs-$id.json" ;;
@@ -27,6 +29,7 @@ esac`;
     tag_name: tag,
     draft: false,
     prerelease: false,
+    published_at: "2026-10-30T00:00:00Z",
     ...over,
   });
   const resolve = (
@@ -35,6 +38,8 @@ esac`;
       releases?: unknown[];
       commits?: Record<string, string>;
       fail?: boolean;
+      /** The tags list errors. */
+      failTags?: boolean;
       /** hosted-publish.yml runs: id -> its jobs (name, conclusion). */
       runs?: Record<string, { name: string; conclusion: string }[]>;
       runsRaw?: string;
@@ -68,6 +73,17 @@ esac`;
     );
     for (const [t, s] of Object.entries(state.commits ?? {}))
       writeFileSync(join(sb.dir, `commit-${t}`), s);
+    // The tags list: every tag in commits, with its commit.
+    if (!state.failTags)
+      writeFileSync(
+        join(sb.dir, "tags.json"),
+        JSON.stringify(
+          Object.entries(state.commits ?? {}).map(([name, sha]) => ({
+            name,
+            commit: { sha },
+          })),
+        ),
+      );
     if (state.fail) writeFileSync(join(sb.dir, "fail"), "");
     const ghOut = join(sb.dir, "out");
     writeFileSync(ghOut, "");
@@ -232,8 +248,84 @@ esac`;
   });
   it("an API error fails, never reads as no release", () => {
     expect(resolve(run, { fail: true }).code).toBe(1);
-    // A tag whose commit can't be read.
-    expect(resolve(run, { releases: [release("v0.80.0")] }).code).toBe(1);
+    // The tags list can't be read.
+    const r = resolve(run, {
+      releases: [release("v0.80.0")],
+      commits: { "v0.80.0": SHA },
+      failTags: true,
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/listing tags failed/);
+  });
+  // #459: the hosted-built job's tag and commit are read together and must
+  // still hold; any mismatch refuses, never falls back to the run's head.
+  const rebuiltRun = (tag: string, sha: string) => ({
+    "77": [
+      { name: "hosted-guard", conclusion: "success" },
+      { name: `hosted-built ${tag} ${sha}`, conclusion: "success" },
+    ],
+  });
+  it("a hosted-built tag that now points at another commit refuses", () => {
+    const r = resolve(
+      { ...run, HEAD_SHA: OTHER, RUN_ID: "77" },
+      {
+        releases: [release("v0.80.0")],
+        commits: { "v0.80.0": OTHER },
+        runs: rebuiltRun("v0.80.0", SHA),
+      },
+    );
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(
+      /built v0\.80\.0 at a+, but v0\.80\.0 is at b+; refusing/,
+    );
+  });
+  it("a hosted-built tag that is not a published release refuses", () => {
+    for (const rels of [
+      [],
+      [release("v0.80.0", { draft: true })],
+      [release("v0.80.0", { prerelease: true })],
+      [release("v0.80.0", { published_at: null })],
+    ]) {
+      const r = resolve(
+        { ...run, HEAD_SHA: OTHER, RUN_ID: "77" },
+        {
+          releases: rels,
+          commits: { "v0.80.0": SHA },
+          runs: rebuiltRun("v0.80.0", SHA),
+        },
+      );
+      expect(r.code, JSON.stringify(rels)).toBe(1);
+      expect(r.err).toMatch(/run 77 built v0\.80\.0, but/);
+    }
+  });
+  it("a hosted-built release older than the newest 20 is still found (v0.205.0 was 21st)", () => {
+    const releases = Array.from({ length: 30 }, (_, i) =>
+      release(`v0.${130 - i}.0`),
+    );
+    const commits = Object.fromEntries(
+      releases.map((x, i) => [
+        x.tag_name,
+        i === 29 ? SHA : `${i}`.padStart(40, "e"),
+      ]),
+    );
+    const marker = resolve(
+      { ...run, HEAD_SHA: OTHER, RUN_ID: "77" },
+      { releases, commits, runs: rebuiltRun("v0.101.0", SHA) },
+    );
+    expect(marker.code, marker.err).toBe(0);
+    expect(marker.o.tag).toBe("v0.101.0");
+    // No hosted-built job: the head's tag is found across every page too.
+    const head = resolve(run, { releases, commits });
+    expect(head.code, head.err).toBe(0);
+    expect(head.o.tag).toBe("v0.101.0");
+  });
+  it("a tag at the head with no published release is none", () => {
+    const r = resolve(run, {
+      releases: [release("v0.80.0", { draft: true })],
+      commits: { "v0.80.0": SHA },
+    });
+    expect(r.code, r.err).toBe(0);
+    expect(r.o.kind).toBe("none");
   });
   it("dispatch with a tag: both envs, or the one named", () => {
     const d = { EVENT: "workflow_dispatch" };

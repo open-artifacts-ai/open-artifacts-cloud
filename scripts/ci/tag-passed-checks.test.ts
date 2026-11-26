@@ -774,6 +774,25 @@ cat "$STATE/$k.json"`;
     expect(r.code).toBe(1);
     expect(r.err).toMatch(/job hosted-build: failure/);
   });
+  it("a rebuild on a later page of dispatch runs is found, and the list starts at the tag's own run", () => {
+    const s = redThenRebuilt();
+    const [own, re] = runsIn(s).workflow_runs;
+    // gh --paginate prints one JSON object per page.
+    s["cloud-runs"] =
+      JSON.stringify({ workflow_runs: [own] }) +
+      JSON.stringify({ workflow_runs: [re] });
+    const r = runTwo(s);
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain("run 77");
+    expect(
+      r.calls.some((c) =>
+        c.includes(
+          "event=workflow_dispatch&status=completed&per_page=100&created=%3E%3D2026-10-30T00:00:00Z",
+        ),
+      ),
+    ).toBe(true);
+    expect(r.calls.some((c) => c.includes("--paginate"))).toBe(true);
+  });
   it("an API error reading a rebuild's jobs fails closed", () => {
     const s = redThenRebuilt();
     s["cloud-jobs-77.err"] = "gh: Server Error (HTTP 500)";

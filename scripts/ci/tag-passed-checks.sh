@@ -54,6 +54,14 @@ api() {
   jq -e . > /dev/null 2>&1 <<< "$body" || fail "$1: unparsable response"
   printf '%s' "$body"
 }
+# api_pages <check> <path>: every page of a workflow-runs listing, merged into
+# one {workflow_runs: [...]}, or fail naming the check.
+api_pages() {
+  local body
+  body="$(gh api -X GET --paginate "$2" 2> /dev/null)" || fail "$1: GitHub API error"
+  jq -s -e '{workflow_runs: (map(.workflow_runs | if type == "array" then . else error("no runs") end) | add // [])}' 2> /dev/null <<< "$body" ||
+    fail "$1: unparsable response"
+}
 # raw <check> <path>: the raw text of a file, or fail naming the check.
 raw() {
   gh api -X GET -H "Accept: application/vnd.github.raw+json" "$2" 2> /dev/null || fail "$1: GitHub API error"
@@ -99,8 +107,15 @@ check_hosted_run() {
   local s="$1" wf=hosted-release.yml head others cand id jobs hit="" skip='["push","workflow_dispatch"]'
   head="$(api "hosted-release run" "$C/actions/workflows/$wf/runs?branch=main&head_sha=$s&per_page=100" |
     jq -c --arg s "$s" --argjson ev "$skip" '[.workflow_runs[] | select(.head_sha == $s and (.event as $e | $ev | index($e))) | select((.display_title // "") | contains("(dry run)") | not) | {id, created_at}] | sort_by(.created_at) | last // empty')"
-  others="$(api "hosted-release runs" "$C/actions/workflows/$wf/runs?branch=main&event=workflow_dispatch&per_page=100" |
-    jq -r --arg s "$s" '[.workflow_runs[] | select(.head_sha != $s and .event == "workflow_dispatch" and .status == "completed") | select((.display_title // "") | contains("(dry run)") | not)] | sort_by(.created_at) | reverse | .[] | "\(.id) \(.created_at)"')"
+  # Only a rebuild newer than the commit's own run can win (see below), so the
+  # dispatch list starts there; every page of it is read.
+  since=""
+  if [ -n "$head" ]; then
+    since="$(jq -r '.created_at' <<< "$head")"
+    [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] || fail "hosted-release run: bad created_at"
+  fi
+  others="$(api_pages "hosted-release runs" "$C/actions/workflows/$wf/runs?branch=main&event=workflow_dispatch&status=completed&per_page=100${since:+&created=%3E%3D$since}" |
+    jq -r --arg s "$s" --arg since "$since" '[.workflow_runs[] | select(.head_sha != $s and .event == "workflow_dispatch" and .status == "completed" and .created_at >= $since) | select((.display_title // "") | contains("(dry run)") | not)] | sort_by(.created_at) | reverse | .[] | "\(.id) \(.created_at)"')"
   # Newest first: the first run whose hosted-built job names this tag and commit.
   while read -r id cand; do
     [ -n "$id" ] || continue
