@@ -20,6 +20,8 @@ import {
   issueBody,
   issuePlan,
   type Job,
+  LATE_FLEET_RE,
+  lateFleetDone,
   limitOf,
   loadConfig,
   mergeHistory,
@@ -1236,6 +1238,147 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     expect(summary(r.current)).toContain(
       "| v0.248.2 | 77.9 | every install | 57.9 over |",
     );
+  });
+
+  // cloud #474 at 5d39fecb: a fleet that finished after its own deploy's
+  // 10 min wait is recorded by the next prod deploy, in a step named
+  //   Fleet done of the release before (${{ steps.prev_fleet.outputs.tag }} at ${{ steps.prev_fleet.outputs.at }})
+  // where `at` is platform-db.ts fleet-done's `new Date(at).toISOString()`.
+  const lateName = (tag: string, at: string) =>
+    `Fleet done of the release before (${tag} at ${new Date(at).toISOString()})`;
+  const nextDeploy = (name: string, conclusion = "success", id = 6): Run =>
+    base("deploy-hosted-platform.yml", {
+      id,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform prod v0.248.3 [c6-1]",
+      createdAt: D("06:10:00"),
+      updatedAt: D("06:20:00"),
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [
+            stepOf(
+              "Read the fleet finish of the release before",
+              D("06:10:30"),
+              D("06:10:31"),
+            ),
+            stepOf(name, D("06:10:32"), D("06:10:32"), conclusion),
+          ],
+        },
+      ],
+    });
+
+  it("reads the late finish from the next prod deploy's step name, exactly as #474 writes it", () => {
+    const name = lateName("v0.248.2", D("05:39:39"));
+    expect(name).toBe(
+      "Fleet done of the release before (v0.248.2 at 2026-11-26T05:39:39.000Z)",
+    );
+    expect(LATE_FLEET_RE.exec(name)?.slice(1, 3)).toEqual([
+      "v0.248.2",
+      "2026-11-26T05:39:39.000Z",
+    ]);
+    expect(lateFleetDone([nextDeploy(name)], "v0.248.2")).toEqual({
+      at: D("05:39:39"),
+      url: `${RUNS}6`,
+    });
+    // Only a successful step, only that tag, only the exact shape.
+    expect(lateFleetDone([nextDeploy(name, "skipped")], "v0.248.2")).toBe(
+      undefined,
+    );
+    expect(lateFleetDone([nextDeploy(name, "failure")], "v0.248.2")).toBe(
+      undefined,
+    );
+    expect(lateFleetDone([nextDeploy(name)], "v0.248.1")).toBe(undefined);
+    expect(
+      lateFleetDone(
+        [nextDeploy("Fleet done of the release before ( at )")],
+        "v0.248.2",
+      ),
+    ).toBe(undefined);
+    // Two records: the earliest.
+    expect(
+      lateFleetDone(
+        [
+          nextDeploy(lateName("v0.248.2", D("05:50:00")), "success", 7),
+          nextDeploy(name),
+        ],
+        "v0.248.2",
+      )?.at,
+    ).toBe(D("05:39:39"));
+  });
+
+  it("a wait that ran out, then the next deploy's record: the release runs to every install at the recorded time", () => {
+    const now = D("06:30:00");
+    const prod = [
+      ...prodRuns(undefined).slice(0, 2),
+      ranOutRun(),
+      nextDeploy(lateName("v0.248.2", D("05:39:39"))),
+    ];
+    const t = tl2(chain({ prod }), now);
+    expect(row(t, "fleet")).toMatchObject({
+      state: "done",
+      startedAt: D("05:01:00"),
+      endedAt: D("05:39:39"),
+      minutes: 38.7,
+      url: `${RUNS}6`,
+    });
+    expect(t.e2eTo).toBe("every install");
+    expect(t.doneAt).toBe(D("05:39:39"));
+    // The earliest of all sources: a same-run "Fleet done" before the record wins.
+    const both = [...prod, laterRun(4, "05:20:00", "05:25:00")];
+    expect(row(tl2(chain({ prod: both }), now), "fleet")?.endedAt).toBe(
+      D("05:25:00"),
+    );
+    // And a record before a later same-run success wins over it.
+    const recFirst = [...prod, laterRun(4, "05:45:00", "05:50:00")];
+    expect(row(tl2(chain({ prod: recFirst }), now), "fleet")?.endedAt).toBe(
+      D("05:39:39"),
+    );
+  });
+
+  it("a release in history to the prod deploy takes the next deploy's record; with no fleet steps of its own the fleet is untimed", () => {
+    const recorded: HistoryEntry = {
+      tag: "v0.248.2",
+      mode: "pr",
+      mergedAt: D("04:21:47"),
+      publishedAt: D("04:25:40"),
+      doneAt: D("05:01:00"),
+      e2e: 39.2,
+      e2eTo: "prod deploy (fleet not yet measured)",
+      stages: { prod_deploy: 4.8 },
+    };
+    const rec = nextDeploy(lateName("v0.248.2", D("05:39:39")));
+    expect(upgradeFleet(recorded, [ranOutRun(), rec])).toEqual({
+      ...recorded,
+      doneAt: D("05:39:39"),
+      e2e: 77.9,
+      e2eTo: "every install",
+      stages: { prod_deploy: 4.8, fleet: 38.7 },
+    });
+    // Its own deploy had no fleet steps (before #474): finish known, start not.
+    const own = prodRuns(undefined)[2] as Run;
+    expect(upgradeFleet(recorded, [own, rec])).toEqual({
+      ...recorded,
+      doneAt: D("05:39:39"),
+      e2e: 77.9,
+      e2eTo: "every install",
+    });
+    const now = D("06:30:00");
+    const r = compute({
+      ...world2(
+        chain({ prod: [...prodRuns(undefined).slice(0, 2), ranOutRun(), rec] }),
+        now,
+      ),
+      history: [recorded],
+      config,
+      now,
+    });
+    expect(r.history[0]).toMatchObject({
+      tag: "v0.248.2",
+      e2eTo: "every install",
+      doneAt: D("05:39:39"),
+    });
   });
 });
 

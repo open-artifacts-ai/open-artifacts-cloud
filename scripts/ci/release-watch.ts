@@ -304,6 +304,44 @@ const jobOf = (r: Run, re: RegExp, tag: string) =>
 export const FLEET_WAKE_STEP = "Wake the fleet";
 export const FLEET_WAIT_STEP = "Wait for the fleet to reach every install";
 export const FLEET_DONE_STEP = "Fleet done";
+/**
+ * A fleet that finished after its own deploy's 10 min wait: the next prod
+ * deploy reads the scheduler's mark and records it in a step named
+ * `Fleet done of the release before (<tag> at <ISO time>)` (cloud #474).
+ */
+export const LATE_FLEET_RE = new RegExp(
+  `^Fleet done of the release before \\(${TAG_IN} at (\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(?:\\.\\d{1,3})?Z)\\)$`,
+);
+
+/**
+ * Pure: the earliest late fleet finish of `tag` that any prod deploy run (of
+ * any release) recorded in a successful "Fleet done of the release before"
+ * step, with the time its name carries.
+ */
+export function lateFleetDone(
+  runs: Run[],
+  tag: string,
+): { at: string; url: string } | undefined {
+  let best: { at: string; url: string } | undefined;
+  for (const r of runs) {
+    if (
+      file(r) !== "deploy-hosted-platform.yml" ||
+      !r.title.startsWith("deploy-hosted-platform prod ")
+    )
+      continue;
+    for (const j of r.jobs ?? [])
+      for (const x of j.steps ?? []) {
+        if (x.conclusion !== "success") continue;
+        const m = LATE_FLEET_RE.exec(x.name);
+        if (!m || m[1] !== tag) continue;
+        const t = Date.parse(m[2] as string);
+        if (Number.isNaN(t)) continue;
+        const at = new Date(t).toISOString().replace(/\.000Z$/, "Z");
+        if (!best || t < ms(best.at)) best = { at, url: r.url };
+      }
+  }
+  return best;
+}
 const ran = (x: JobStep | undefined): x is JobStep =>
   !!x && x.conclusion !== "skipped" && !!x.startedAt;
 
@@ -316,11 +354,16 @@ const ran = (x: JobStep | undefined): x is JobStep =>
  * successful "Fleet done" across them, so an earlier wait that ran out never
  * hides a later success. The fleet starts at the earliest wake (or wait) of
  * any run, and `deployEnd` is that same moment: the deploy's own work ended
- * there. With no success: running while any wait is still going, else none
+ * there. `late` is a finish a later prod deploy recorded ("Fleet done of
+ * the release before", lateFleetDone): the earliest of all counts. With no
+ * success: running while any wait is still going, else none
  * (no such steps: a run before #474, or jobs not read; or every wait ran
  * out), and the fleet is not measured for that release.
  */
-export function fleetStep(prodRuns: Run[]): {
+export function fleetStep(
+  prodRuns: Run[],
+  late?: { at: string; url: string },
+): {
   fleet: Step;
   deployEnd?: string;
 } {
@@ -349,7 +392,12 @@ export function fleetStep(prodRuns: Run[]): {
       )
         going = going ?? r.url;
     }
-  if (!deployEnd) return { fleet: { state: "none" } };
+  // A finish the next deploy recorded counts the same; the earliest wins.
+  if (late && (!done || ms(late.at) < ms(done.at))) done = late;
+  if (!deployEnd)
+    return done
+      ? { fleet: { state: "done", doneAt: done.at, url: done.url } }
+      : { fleet: { state: "none" } };
   if (done)
     return {
       deployEnd,
@@ -385,14 +433,22 @@ const prodDeploys = (runs: Run[], tag: string) =>
  */
 export function upgradeFleet(h: HistoryEntry, runs: Run[]): HistoryEntry {
   if (h.supersededBy || h.e2eTo === "every install") return h;
-  const { fleet } = fleetStep(prodDeploys(runs, h.tag));
-  if (fleet.state !== "done" || !fleet.doneAt || !fleet.startedAt) return h;
+  const { fleet } = fleetStep(
+    prodDeploys(runs, h.tag),
+    lateFleetDone(runs, h.tag),
+  );
+  if (fleet.state !== "done" || !fleet.doneAt) return h;
   return {
     ...h,
     doneAt: fleet.doneAt,
     e2e: h.mergedAt ? mins(h.mergedAt, fleet.doneAt) : h.e2e,
     e2eTo: "every install",
-    stages: { ...h.stages, fleet: mins(fleet.startedAt, fleet.doneAt) },
+    stages: {
+      ...h.stages,
+      ...(fleet.startedAt
+        ? { fleet: mins(fleet.startedAt, fleet.doneAt) }
+        : {}),
+    },
   };
 }
 
@@ -419,7 +475,7 @@ export function steps(
     staging_deploy: step(after("staging_deploy")),
     redline: step(after("redline")),
     prod_publish: step(after("prod_publish")),
-    ...prodSteps(after("prod_deploy")),
+    ...prodSteps(after("prod_deploy"), lateFleetDone(runs, tag)),
   };
 }
 
@@ -470,9 +526,12 @@ function groups(tag: string, runs: Run[]): Record<string, Run[]> {
  * #474), the deploy's own work is done (every step before it succeeded), so
  * the deploy ends there even while the run waits for the fleet.
  */
-function prodSteps(prodRuns: Run[]): { prod_deploy: Step; fleet: Step } {
+function prodSteps(
+  prodRuns: Run[],
+  late?: { at: string; url: string },
+): { prod_deploy: Step; fleet: Step } {
   const base = step(prodRuns);
-  const { fleet, deployEnd } = fleetStep(prodRuns);
+  const { fleet, deployEnd } = fleetStep(prodRuns, late);
   if (!deployEnd) return { prod_deploy: base, fleet };
   const doneAt =
     base.state === "done" && base.doneAt && ms(base.doneAt) < ms(deployEnd)
