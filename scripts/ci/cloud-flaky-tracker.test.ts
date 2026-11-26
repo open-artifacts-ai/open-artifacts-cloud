@@ -39,6 +39,7 @@ import {
   parseStore,
   parseVitest,
   pendingRuns,
+  pendingTries,
   plan,
   QUIET_DAYS,
   RECONCILE_CALLS,
@@ -61,6 +62,8 @@ import {
   titleText,
   track,
   twiceInWindow,
+  UNREADABLE_TRIES,
+  unreadableRuns,
 } from "./cloud-flaky-tracker.ts";
 import type { Exec } from "./gh-retry.ts";
 
@@ -1326,7 +1329,13 @@ describe("reconcile", () => {
   it("lists the watched workflows' recent runs with small reads", () => {
     const g = fakeGh({ listed: {} });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
-    expect(r).toEqual({ tracked: [], notes: [], failed: 0, left: 0 });
+    expect(r).toEqual({
+      tracked: [],
+      notes: [],
+      failed: 0,
+      left: 0,
+      dropped: [],
+    });
     const lists = g.calls.map((c) => c.args.join(" "));
     // Created in the last 60 days and 26 hours (a rerun up to 30 days after
     // creation, up to 30 quiet days after it, and 26 hours of slack); one
@@ -2651,10 +2660,12 @@ describe("a pending list while daily events go on", () => {
 
   it("is still worked on day 63 after every run failed daily since day 0 and left the listing", () => {
     const g = make();
+    // Each run fails daily, but not as unreadable (the read works and its
+    // answer is garbage), so none is dropped.
     let broken = true;
     const exec: Exec = (cmd, args) =>
       broken && /\/runs\/\d+\/attempts\/2$/.test(args.join(" "))
-        ? { code: 1, stdout: "", stderr: "HTTP 404: Not Found" }
+        ? { code: 0, stdout: "<html>", stderr: "" }
         : g.exec(cmd, args);
     let last = { left: -1, failed: -1 };
     for (let d = 0; d < 63; d++)
@@ -2700,3 +2711,154 @@ function ci1(id: number, at = NOW - HOUR): Listed {
     display_title: "a commit",
   };
 }
+
+describe("runs whose logs can't be read", () => {
+  // The Prover's case: 32 CI runs, the oldest 25 with a job log that answers
+  // 404, the newest 7 readable. Default budgets.
+  const ids = Array.from({ length: 32 }, (_, i) => 4000 + i);
+  const bad = new Set(ids.slice(0, 25));
+  const setup = () => {
+    const g = liveGh({
+      listed: {
+        "ci.yml": ids.map((id, i) => ci1(id, NOW - (40 - i) * HOUR)),
+      },
+      jobAt: Object.fromEntries(
+        ids.map((id, i) => [id, NOW - (40 - i) * HOUR]),
+      ),
+      log: CI_LOG,
+    });
+    // Which run's jobs were listed last: its job log is read next.
+    let current = 0;
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      const m = /\/runs\/(\d+)\/attempts\/1\/jobs/.exec(a);
+      if (m) current = Number(m[1]);
+      if (bad.has(current) && /\/actions\/jobs\/10\/logs/.test(a))
+        return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+      return g.exec(cmd, args);
+    };
+    return { g, exec };
+  };
+  const comments = (g: ReturnType<typeof liveGh>) =>
+    g.state().stores.flatMap((st) => st.comments);
+  const marks = (g: ReturnType<typeof liveGh>) =>
+    [...storedRuns(comments(g))].sort();
+  const at = (g: ReturnType<typeof liveGh>, ms: number) => {
+    g.clock.now = ms;
+    return ms;
+  };
+
+  it("never starve the readable ones: all 7 are tracked on the first completion", () => {
+    const { g, exec } = setup();
+    const r = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW) });
+    expect(r.tracked.map((t) => t.run.runId)).toEqual(ids.slice(25));
+    expect(r.failed).toBe(25);
+    expect(backlogLine(r.left, r.failed)).toBe(
+      "backlog: 0 new, 25 to retry (the next completion's reconcile carries on)",
+    );
+    expect(marks(g)).toEqual(
+      ids
+        .slice(25)
+        .map((id) => `${id}/2`)
+        .sort(),
+    );
+    expect(pendingTries(comments(g))).toEqual(
+      Object.fromEntries(ids.slice(0, 25).map((id) => [`${id}/2`, 1])),
+    );
+  });
+
+  it("are tried after the runs not yet tried", () => {
+    const { g, exec } = setup();
+    // First completion: only the 25 unreadable ones exist yet.
+    const first = reconcile({
+      exec,
+      repo: "o/cloud",
+      nowMs: at(g, NOW - 17 * HOUR),
+    });
+    expect(first.tracked).toEqual([]);
+    expect(first.failed).toBe(25);
+    // Next: the 7 readable ones are new, so they go first.
+    const order: string[] = [];
+    reconcile({
+      exec,
+      repo: "o/cloud",
+      nowMs: at(g, NOW),
+      onRun: (l) => order.push(l[0] ?? ""),
+    });
+    expect(order.slice(0, 7)).toEqual(
+      ids
+        .slice(25)
+        .map(
+          (id) =>
+            `Flaky tracker, CI at abcdef0, run ${id} (passed on attempt 2):`,
+        ),
+    );
+  });
+
+  it(`are dropped visibly after ${UNREADABLE_TRIES} reconciles could not read them, and then skipped`, () => {
+    const { g, exec } = setup();
+    const seen: { failed: number; dropped: number }[] = [];
+    let last = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW) });
+    seen.push({ failed: last.failed, dropped: last.dropped.length });
+    for (let e = 1; e < UNREADABLE_TRIES; e++) {
+      last = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW + e * HOUR) });
+      seen.push({ failed: last.failed, dropped: last.dropped.length });
+    }
+    expect(seen).toEqual([
+      { failed: 25, dropped: 0 },
+      { failed: 25, dropped: 0 },
+      { failed: 0, dropped: 25 },
+    ]);
+    expect([...unreadableRuns(comments(g))].sort()).toEqual(
+      [...bad].map((id) => `${id}/2`).sort(),
+    );
+    // The summary names each one it drops.
+    expect(last.notes).toContainEqual(
+      expect.stringMatching(
+        new RegExp(
+          `^run 4000/2: unreadable: could not be read on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store`,
+        ),
+      ),
+    );
+    expect(backlogLine(last.left, last.failed)).toBe(
+      "backlog: 0 new, 0 to retry",
+    );
+    expect(pendingRuns(comments(g))).toEqual([]);
+    // Later, they are skipped like marked runs, and nothing is written.
+    const before = JSON.stringify(g.state());
+    const later = reconcile({
+      exec,
+      repo: "o/cloud",
+      nowMs: at(g, NOW + 10 * HOUR),
+    });
+    expect(later.tracked).toEqual([]);
+    expect(later.failed + later.dropped.length).toBe(0);
+    expect(JSON.stringify(g.state())).toBe(before);
+  });
+
+  it("a failure that is not a read of the run never drops it", () => {
+    const g = liveGh({
+      listed: { "ci.yml": [ci1(900)] },
+      jobAt: { 900: NOW - HOUR },
+      log: CI_LOG,
+    });
+    // Every store comment write for the run's sightings fails.
+    const exec: Exec = (cmd, args) =>
+      args[0] === "issue" &&
+      args[1] === "comment" &&
+      !(args[args.indexOf("--body") + 1] ?? "").includes("kind: pending")
+        ? { code: 1, stdout: "", stderr: "HTTP 422: Validation Failed" }
+        : g.exec(cmd, args);
+    for (let e = 0; e <= UNREADABLE_TRIES; e++) {
+      const r = reconcile({
+        exec,
+        repo: "o/cloud",
+        nowMs: at(g, NOW + e * HOUR),
+      });
+      expect(r.failed).toBe(1);
+      expect(r.dropped).toEqual([]);
+    }
+    expect([...unreadableRuns(comments(g))]).toEqual([]);
+    expect(pendingRuns(comments(g))).toEqual(["900/2"]);
+  });
+});

@@ -1621,19 +1621,29 @@ export function reconcile(o: {
 }): {
   tracked: { run: RunInfo; done: Done[]; notes: string[] }[];
   notes: string[];
+  /** Runs that failed this time and stay on the pending list to retry. */
   failed: number;
   /** Runs not started this time (the budget ran out): the backlog. */
   left: number;
+  /** Runs dropped this time: no reconcile could read them UNREADABLE_TRIES times. */
+  dropped: string[];
 } {
   const { repo, nowMs } = o;
   const clock = o.clock ?? Date.now;
   const start = clock();
   const spent = { calls: 0, logs: 0 };
+  // The last failed gh call, while no later one has worked: a run whose
+  // failure is reading its own run, attempts, jobs or logs counts toward
+  // UNREADABLE_TRIES.
+  let lastFail: string[] | null = null;
   const exec: Exec = (cmd, args) => {
     spent.calls++;
     if (args.some((a) => /\/actions\/jobs\/\d+\/logs$/.test(a))) spent.logs++;
-    return o.exec(cmd, args);
+    const r = o.exec(cmd, args);
+    lastFail = r.code === 0 ? null : args;
+    return r;
   };
+  const RUN_READ = /^repos\/[^/]+\/[^/]+\/actions\/(runs\/\d+|jobs\/\d+\/logs)/;
   const notes: string[] = [];
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
   // Oldest first (run ids grow with creation), as their events would have
@@ -1644,50 +1654,62 @@ export function reconcile(o: {
   const from = reconcileFrom(nowMs);
   const { read } = storeIssues(exec, repo, nowMs, from);
   const stored = storeCommentsIn(exec, repo, read, nowMs, from);
-  const have = storedRuns(stored);
+  const marked = storedRuns(stored);
+  const unreadable = unreadableRuns(stored);
+  const have = { has: (k: string) => marked.has(k) || unreadable.has(k) };
   // The pending list too, whatever the listing's range: a run found by an
   // earlier reconcile and not finished stays a candidate until it is marked.
   // One the listing no longer shows is read from the runs API when its turn
   // comes.
   const pending = pendingRuns(stored);
+  const tries = pendingTries(stored);
   const byId = new Map<number, ListedRun | { id: number; attempt: number }>();
   for (const p of pending) {
     const [id, attempt] = p.split("/").map(Number) as [number, number];
     byId.set(id, { id, attempt });
   }
   for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
-  const runs = [...byId.values()].sort((a, b) => a.id - b.id);
-  if (!runs.length) return { tracked: [], notes, failed: 0, left: 0 };
+  const key = (r: { id: number; attempt: number }) => `${r.id}/${r.attempt}`;
+  // Runs never tried first, oldest first, then the retries, oldest first: a
+  // run that keeps failing never takes the turn of one not yet tried.
+  const runs = [...byId.values()].sort(
+    (a, b) =>
+      Number((tries[key(a)] ?? 0) > 0) - Number((tries[key(b)] ?? 0) > 0) ||
+      a.id - b.id,
+  );
+  if (!runs.length)
+    return { tracked: [], notes, failed: 0, left: 0, dropped: [] };
   // The pending list is saved first, when it changed: the whole list of runs
   // not yet marked, before any run starts, so a job killed at any point after
   // loses none of them. At the end, what is still not marked is written
   // again, as a fresh comment, whenever any is left, even unchanged: the
   // store is read only over the reconcile's range, so a list never rewritten
   // would age out of it while its runs still wait.
-  let saved = pending.join(" ");
-  const savePending = (list: string[], fresh = false) => {
-    if (list.join(" ") === saved && !(fresh && list.length)) return;
+  const listText = (list: string[]) =>
+    [...list]
+      .sort()
+      .map((k) => `${k} ${tries[k] ?? 0}`)
+      .join(" ");
+  let saved = listText(pending);
+  const post = (body: string) => {
     const store = openStore(exec, repo, nowMs);
     notes.push(...store.notes);
     gh(
       exec,
-      [
-        "issue",
-        "comment",
-        String(store.write),
-        "--repo",
-        repo,
-        "--body",
-        pendingComment(list, nowMs),
-      ],
+      ["issue", "comment", String(store.write), "--repo", repo, "--body", body],
       { write: true },
     );
-    saved = list.join(" ");
+  };
+  const savePending = (list: string[], fresh = false) => {
+    if (listText(list) === saved && !(fresh && list.length)) return;
+    post(pendingComment(list, nowMs, tries));
+    saved = listText(list);
   };
   savePending(
     runs.map((r) => `${r.id}/${r.attempt}`).filter((k) => !have.has(k)),
   );
   const unfinished: string[] = [];
+  const dropped: string[] = [];
   const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
   let failed = 0;
   let left = 0;
@@ -1710,6 +1732,9 @@ export function reconcile(o: {
       continue;
     }
     started++;
+    const before = { ...spent };
+    lastFail = null;
+    const k = key(r);
     try {
       const l = "name" in r ? r : listedRun(exec, repo, r.id, r.attempt);
       const run = runInfo({
@@ -1722,12 +1747,32 @@ export function reconcile(o: {
       });
       const t = { run, ...track({ exec, run, nowMs }) };
       tracked.push(t);
+      delete tries[k];
       o.onRun?.(runLines(t.run, t.done, t.notes));
     } catch (e) {
-      // One run's failure never stops the others; the job still fails.
+      // One run's failure never stops the others; the job still fails. A
+      // failed run costs the budget nothing but its time: the calls and logs
+      // it spent are given back, so runs that keep failing can't use up a
+      // reconcile and starve the others.
+      spent.calls = before.calls;
+      spent.logs = before.logs;
+      const why = (e as Error).message;
+      const failedCall = lastFail as string[] | null;
+      const unread = !!failedCall?.some((a) => RUN_READ.test(a));
+      const n = (tries[k] ?? 0) + (unread ? 1 : 0);
+      if (unread && n >= UNREADABLE_TRIES) {
+        post(unreadableComment(repo, k, why));
+        delete tries[k];
+        dropped.push(k);
+        const note = `run ${k}: unreadable: could not be read on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store (${why})`;
+        notes.push(note);
+        o.onRun?.([`  note: ${note}`]);
+        continue;
+      }
+      if (unread) tries[k] = n;
       failed++;
-      unfinished.push(`${r.id}/${r.attempt}`);
-      const note = `run ${r.id}/${r.attempt}: ${(e as Error).message}`;
+      unfinished.push(k);
+      const note = `run ${k}: ${why}${unread ? ` (could not read it, try ${n} of ${UNREADABLE_TRIES})` : ""}`;
       notes.push(note);
       o.onRun?.([`  note: ${note}`]);
     }
@@ -1735,7 +1780,7 @@ export function reconcile(o: {
   // What is still not marked (left, or failed) is the new pending list. A
   // run leaves it only once it is marked.
   savePending(unfinished, true);
-  return { tracked, notes, failed, left };
+  return { tracked, notes, failed, left, dropped };
 }
 
 /**
@@ -1746,7 +1791,11 @@ export function reconcile(o: {
  * range, so a run that leaves the range while it waits is still tracked. A
  * run leaves the list only once the store marks it.
  */
-export const pendingComment = (runs: string[], nowMs: number) =>
+export const pendingComment = (
+  runs: string[],
+  nowMs: number,
+  tries: Record<string, number> = {},
+) =>
   [
     runs.length
       ? `The flaky tracker's reconcile has ${runs.length} runs left to track; the next one carries on.`
@@ -1755,9 +1804,64 @@ export const pendingComment = (runs: string[], nowMs: number) =>
     markerBlock([
       ["kind", "pending"],
       ["at", new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z")],
-      ...runs.map((r): [string, string] => ["run", r]),
+      ...runs.map((r): [string, string] => [
+        "run",
+        tries[r] ? `${r} ${tries[r]}` : r,
+      ]),
     ]),
   ].join("\n");
+
+/** A pending run is dropped once this many reconciles could not read it. */
+export const UNREADABLE_TRIES = 3;
+
+/**
+ * The store comment that drops a run no reconcile could read (the run, its
+ * attempts, jobs or logs) on UNREADABLE_TRIES reconciles: `kind:
+ * unreadable`, `run: <id>/<attempt>`, which every reconcile then skips like a
+ * marked run, so it leaves the pending list visibly.
+ */
+export const unreadableComment = (repo: string, key: string, why: string) =>
+  [
+    `Run https://github.com/${repo}/actions/runs/${key.split("/")[0]} (passed on attempt ${key.split("/")[1]}) could not be read on ${UNREADABLE_TRIES} reconciles, so the flaky tracker drops it. Last error: ${codeSpan(inert(why))}`,
+    "",
+    markerBlock([
+      ["kind", "unreadable"],
+      ["run", key],
+    ]),
+  ].join("\n");
+
+/** The runs dropped as unreadable, from the bot's comments only. */
+export function unreadableRuns(comments: StoreComment[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "unreadable") continue;
+    const r = m.get("run")?.[0] ?? "";
+    if (/^\d{1,20}\/\d{1,4}$/.test(r)) out.add(r);
+  }
+  return out;
+}
+
+/** The newest pending list's tries: how many reconciles could not read each run. */
+export function pendingTries(comments: StoreComment[]): Record<string, number> {
+  let at = "";
+  let out: Record<string, number> = {};
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = {};
+    for (const v of m.get("run") ?? []) {
+      const x = /^(\d{1,20}\/\d{1,4}) (\d{1,3})$/.exec(v);
+      if (x) out[x[1] as string] = Number(x[2]);
+    }
+  }
+  return out;
+}
 
 /** The newest pending list in the store, from the bot's comments only. */
 export function pendingRuns(comments: StoreComment[]): string[] {
@@ -1770,7 +1874,9 @@ export function pendingRuns(comments: StoreComment[]): string[] {
     const when = m.get("at")?.[0] ?? "";
     if (when < at) continue;
     at = when;
-    out = (m.get("run") ?? []).filter((r) => /^\d{1,20}\/\d{1,4}$/.test(r));
+    out = (m.get("run") ?? [])
+      .map((r) => r.split(" ")[0] ?? "")
+      .filter((r) => /^\d{1,20}\/\d{1,4}$/.test(r));
   }
   return out;
 }
@@ -1851,7 +1957,8 @@ function main(argv: string[]) {
       nowMs: Date.now(),
       onRun: (l) => console.log(l.map(inert).join("\n")),
     });
-    failed = r.failed;
+    // A run dropped as unreadable fails the job once, so it is seen.
+    failed = r.failed + r.dropped.length;
     lines = [
       `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS + QUIET_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
