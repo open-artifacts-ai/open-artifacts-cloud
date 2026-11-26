@@ -1803,6 +1803,52 @@ describe("WfpProvisioner.create", () => {
     expect(new Set(sa.values()).size).toBe(sa.size);
   });
 
+  // Red-line port (guard.test.ts and surfaces.test.ts isolation cases: "a
+  // setup mistake that wires two installs to one database" or shares a
+  // secret). Each install's upload binds its own D1 and OAuth KV, by id, and
+  // carries its own SESSION_SECRET and CONTENT_SIGNING_KEY.
+  it("two installs each get their own D1 and OAuth KV ids and fresh SESSION_SECRET and CONTENT_SIGNING_KEY", async () => {
+    const s = setup();
+    const a = await s.p.create(input("alpha"));
+    const b = await s.p.create(input("beta"));
+    type B = { type: string; name: string; id?: string; namespace_id?: string };
+    const bindingsOf = (id: string) => {
+      const up = uploads(s.fake).filter((u) =>
+        u.path.endsWith(`/scripts/oa-s-${id}`),
+      );
+      expect(up).toHaveLength(1);
+      return metaOf(up[0]?.body as string).bindings as B[];
+    };
+    const rowOf = (id: string) => s.rows().find((r) => r.id === id);
+    const of = (id: string) => {
+      const bs = bindingsOf(id);
+      const d1 = bs.filter((x) => x.type === "d1");
+      const kv = bs.filter((x) => x.type === "kv_namespace");
+      expect(d1.map((x) => x.name)).toEqual(["DB"]);
+      expect(kv.map((x) => x.name)).toEqual(["OAUTH_KV"]);
+      const sec = s.scriptOf(id)?.secrets as Map<string, string>;
+      return {
+        d1: d1[0]?.id,
+        kv: kv[0]?.namespace_id,
+        session: sec.get("SESSION_SECRET"),
+        signing: sec.get("CONTENT_SIGNING_KEY"),
+      };
+    };
+    const [x, y] = [of(a.id), of(b.id)];
+    // Bound to the resources made for that install, by its own row.
+    expect(x.d1).toBe(rowOf(a.id)?.d1_id);
+    expect(y.d1).toBe(rowOf(b.id)?.d1_id);
+    expect(x.kv).toBe(rowOf(a.id)?.kv_id);
+    expect(y.kv).toBe(rowOf(b.id)?.kv_id);
+    for (const k of ["d1", "kv", "session", "signing"] as const) {
+      expect(x[k], k).toBeTruthy();
+      expect(y[k], k).toBeTruthy();
+      expect(x[k], k).not.toBe(y[k]);
+    }
+    // No value of one install is any value of the other.
+    expect(new Set([...Object.values(x), ...Object.values(y)]).size).toBe(8);
+  });
+
   it("a rerun/resume of the same install does not mint a new SESSION_SECRET, even when it uploads", async () => {
     const s = setup();
     await failAtHealth(s);
