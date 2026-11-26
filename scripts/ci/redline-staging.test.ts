@@ -83,7 +83,12 @@ describe("redline-staging.yml", () => {
     });
     expect(w.on.workflow_dispatch.inputs.tag.required).toBe(true);
     expect(w.permissions).toEqual({ contents: "read" });
-    expect(Object.keys(w.jobs)).toEqual(["platform-tags", "t19", "redline"]);
+    expect(Object.keys(w.jobs)).toEqual([
+      "platform-tags",
+      "t19",
+      "redline",
+      "rl-agents",
+    ]);
     expect(job.environment).toBe("redline-staging");
     // `actions: read` is for the t19 hand-off (this run's artifacts and jobs).
     expect(job.permissions).toEqual({
@@ -385,7 +390,6 @@ describe("redline-staging.yml", () => {
       "t19-recipient",
       "t19-seal",
       "t19-open",
-      "rl-agents-upgrade",
     ];
     const called = [
       ...text.matchAll(/pnpm --filter @oa\/redline provisioning ([a-z0-9-]+)/g),
@@ -560,14 +564,12 @@ describe("redline-staging.yml", () => {
       for (const s of t19Steps) expect(s["continue-on-error"]).toBeUndefined();
       // The soft steps of the workflow are the redline job's seal and its two
       // uploads; a missing key fails the t19 job (its wait step) AND the redline
-      // job's last step, so the run still fails. The rl-agents upgrade and its
-      // report (cloud #264) never fail the gate.
+      // job's last step, so the run still fails.
       const soft = steps.filter((s) => s["continue-on-error"]);
       expect(soft.map((s) => s.id)).toEqual([
         "t19-key",
         "handoff-up",
         "marker-up",
-        "rl-agents",
       ]);
       const t19 = t19Named("t19");
       // T19 itself runs only after the key was opened: no key, no T19, and
@@ -1006,10 +1008,8 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       }
     });
 
-    it("the redline job's last gate step fails the job when the hand-off did not happen, after the revoke and the file removal", () => {
-      // Only the rl-agents upgrade (cloud #264), which can't fail the job, follows it.
-      expect(steps.at(-1)?.id).toBe("rl-agents");
-      const last = steps.at(-2) ?? {};
+    it("the redline job's last step fails the job when the hand-off did not happen, after the revoke and the file removal", () => {
+      const last = steps.at(-1) ?? {};
       expect(last.name).toBe("Fail when the t19 hand-off did not happen");
       expect(last.if).toBe(
         "always() && steps.staged.outcome == 'success' && steps.handoff-up.outcome != 'success'",
@@ -1403,20 +1403,18 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
-    // The gate ends with the revoke and the file removal, both always, then
-    // the check that the hand-off happened (so neither is skipped by its
-    // failure). After the verdict, the rl-agents upgrade, which can't fail it.
-    expect(steps.slice(-4).map((s) => s.name)).toEqual([
+    // The job ends with the revoke and the file removal, both always, then the
+    // check that the hand-off happened (so neither is skipped by its failure).
+    expect(steps.slice(-3).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
-      "Upgrade rl-agents to the tag once the gate passed (waits only for the 202)",
     ]);
-    expect(steps.at(-4)?.if).toBe(
+    expect(steps.at(-3)?.if).toBe(
       "always() && steps.mint.outcome == 'success'",
     );
-    expect(steps.at(-3)?.if).toBe("always()");
-    expect(steps.at(-3)?.run).toBe(
+    expect(steps.at(-2)?.if).toBe("always()");
+    expect(steps.at(-2)?.run).toBe(
       'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
     );
     expect(
@@ -2158,200 +2156,217 @@ echo "RUN $*" >> "$CALLS"
   });
 });
 
-// Cloud #264, public #3167: a gate run upgrades rl-agents, the agents'
-// staging install, to the tag under test, as the job's last step, once the
-// gate's verdict is final and green: every step of the redline job, the
-// hand-off and the t19 job. One R5 bounded at 30 s that waits only for the
-// 202, never for the upgrade; it can't fail the gate
-// (tests/redline/test/rl-agents.test.ts has the call itself).
-describe("the rl-agents upgrade (cloud #264)", () => {
-  const step = named("rl-agents");
-  const LOOPS = /\b(sleep|while|until|wait)\b/;
+// Cloud #264, public #3167: rl-agents, the agents' staging install, follows
+// staging's release. Its own job beside the gate: no needs, one deadline of
+// 30 s, one R5 that waits only for the 202, and it can't fail the run.
+describe("the rl-agents job (cloud #264)", () => {
+  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+  const rj: any = w.jobs["rl-agents"];
+  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+  const step: Record<string, any> = rj.steps[0];
   const GATE_REF =
     "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main";
 
-  it("is the job's last step, after the verdict, on a gate run only, only when every step passed and the hand-off was made, and never fails the gate", () => {
-    expect(steps.at(-1)).toBe(step);
-    expect(step.if).toBe(
-      `\${{ success() && steps.handoff-up.outcome == 'success' && github.workflow_ref == '${GATE_REF}' }}`,
+  it("runs beside the gate from the start, on a dispatched gate run on main only, and can't fail the run", () => {
+    expect(rj.needs).toBeUndefined();
+    // A called run (the nightly, the dry run) has the caller's workflow_ref.
+    expect(rj.if).toBe(
+      `github.event_name == 'workflow_dispatch' && github.workflow_ref == '${GATE_REF}'`,
     );
-    expect(step.if).not.toMatch(/always\(\)|cancelled\(\)|failure\(\)/);
-    expect(step["continue-on-error"]).toBe(true);
-    expect(step["timeout-minutes"]).toBe(1);
-    expect(step.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
-    expect(step.run).not.toMatch(LOOPS);
-    // One synchronous request, bounded at 30 s; nothing in the background.
-    expect(step.run).toContain(
-      'REDLINE_TARGETS="$targets" timeout 30 pnpm --filter @oa/redline provisioning rl-agents-upgrade "$f"',
-    );
-    expect(step.run).not.toMatch(/nohup|setsid|&\s*$/m);
-    expect(
-      steps.filter((s) => JSON.stringify(s).includes("rl-agents-upgrade")),
-    ).toEqual([step]);
+    expect(rj["continue-on-error"]).toBe(true);
+    expect(rj["timeout-minutes"]).toBe(1);
+    // Red-line's own JWT (this file, this Environment), so red-line's scope.
+    expect(rj.environment).toBe("redline-staging");
+    expect(rj.permissions).toEqual({ "id-token": "write" });
+    expect(rj.steps).toHaveLength(1);
+    expect(step.env).toEqual({ TAG: "${{ inputs.tag }}" });
+    expect(JSON.stringify(rj)).not.toContain("secrets.");
+    expect(step.run).not.toMatch(/\b(sleep|while|until|wait)\b/);
+    // Nothing other jobs wait for.
+    for (const j of Object.values(w.jobs) as { needs?: unknown }[])
+      expect(JSON.stringify(j.needs ?? "")).not.toContain("rl-agents");
   });
 
-  const ACCEPTED = {
-    kind: "started",
-    from: "0.145.0",
-    to: "0.250.0",
-    jobId: "j01ABCDEF",
-    line: "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 started, job j01ABCDEF. The gate does not wait for it.",
-  };
+  it("the redline job has no rl-agents step", () => {
+    expect(JSON.stringify(job)).not.toContain("rl-agents");
+  });
 
+  /**
+   * The step's bash with curl, gh-free: the OIDC mint, R2, R3 and R5 answer
+   * from `api`. `clock` is what each `date +%s` reads, in order (the last one
+   * repeats), so a slow request is a clock jump, not a wait.
+   */
   function sandbox(o: {
-    t19: string;
-    withCommand?: boolean;
-    /** What the fake command does: write this result, time out, or fail. */
-    act?: "accept" | "timeout" | "error" | "leak";
+    tag?: string;
+    version?: string;
+    state?: string;
+    activeJobId?: string | null;
+    testHooks?: boolean;
+    r5?: { status: number; body: unknown };
+    noInstall?: boolean;
+    clock?: number[];
   }) {
     const d = mkdtempSync(join(tmpdir(), "oa-rl-agents-"));
     const bin = join(d, "bin");
-    const tmp = join(d, "tmp");
     mkdirSync(bin);
-    mkdirSync(join(d, "tests/redline/scripts"), { recursive: true });
+    const r3 = {
+      id: "iagents",
+      slug: "rl-agents",
+      state: o.state ?? "active",
+      version: o.version ?? "0.145.0",
+      testHooks: o.testHooks ?? true,
+      activeJobId: o.activeJobId ?? null,
+    };
+    const answers: Record<string, { status: number; body: unknown }> = {
+      mint: { status: 200, body: { value: "minted.oidc.jwt" } },
+      r2: {
+        status: 200,
+        body: {
+          items: o.noInstall
+            ? []
+            : [{ id: "iagents", slug: "rl-agents", state: r3.state }],
+        },
+      },
+      r3: { status: 200, body: r3 },
+      r5: o.r5 ?? { status: 202, body: { job: { id: "j01ABCDEF" } } },
+    };
+    for (const [k, v] of Object.entries(answers)) {
+      writeFileSync(join(d, `${k}.json`), JSON.stringify(v.body));
+      writeFileSync(join(d, `${k}.status`), String(v.status));
+    }
+    writeFileSync(join(d, "clock"), (o.clock ?? [1000]).join("\n"));
+    // Each `date +%s` takes the next line of the clock; the last repeats.
     writeFileSync(
-      join(d, "tests/redline/scripts/provisioning.ts"),
-      o.withCommand === false
-        ? "// old tag\n"
-        : 'if (cmd === "rl-agents-upgrade") {}\n',
-    );
-    // The jobs API, as gh --jq prints it: this attempt's t19 conclusion.
-    writeFileSync(
-      join(bin, "gh"),
-      `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(o.t19)}\n`,
-      { mode: 0o755 },
-    );
-    // `timeout 30 pnpm ...` as GNU timeout answers a command that ran out of
-    // time (124), without the 30 s; anything else runs as is.
-    writeFileSync(
-      join(bin, "timeout"),
-      `#!/usr/bin/env bash\nshift\nif [ "$1" = pnpm ] && [ "$ACT" = timeout ]; then printf '%s\\n' "$*" >> "$CALLS"; exit 124; fi\nexec "$@"\n`,
-      { mode: 0o755 },
-    );
-    writeFileSync(join(d, "accepted.json"), JSON.stringify(ACCEPTED));
-    // The command: records its call and the secrets dir it got, mints its
-    // JWT there as the real one does, then answers as `ACT` says.
-    writeFileSync(
-      join(bin, "pnpm"),
+      join(bin, "date"),
       `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$CALLS"
-dir=$(jq -r .secretsDir <<< "$REDLINE_TARGETS")
-printf '%s\\n' "$dir" > "$GOT_DIR"
-ls -A "$dir" > "$GOT_LS"
-printf '%s' 'minted.oidc.jwt' > "$dir/REDLINE_PROVISIONING_OIDC"
-case "$ACT" in
-  accept) cp "$ACCEPTED" "\${@: -1}" ;;
-  leak) printf '%s\\n' '{"kind":"started","line":"rl-agents: minted.oidc.jwt"}' > "\${@: -1}" ;;
-  *) echo boom >&2; exit 1 ;;
+n=$(cat "$D/clock.n" 2> /dev/null || echo 1)
+v=$(sed -n "\${n}p" "$D/clock"); [ -n "$v" ] || v=$(tail -n 1 "$D/clock")
+echo $((n + 1)) > "$D/clock.n"
+echo "$v"
+`,
+      { mode: 0o755 },
+    );
+    // Records method, URL, --max-time, the auth header file's bearer kind and
+    // the body; answers from the files above.
+    writeFileSync(
+      join(bin, "curl"),
+      `#!/usr/bin/env bash
+out=""; method=GET; data=""; max=""; url=""; auth=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
+    --max-time) max="$2"; shift 2 ;;
+    -H) case "$2" in @*) auth=$(cat "\${2#@}") ;; esac; shift 2 ;;
+    -w) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  "$MINT_URL"*) k=mint ;;
+  */v1/installs\\?q=rl-agents) k=r2 ;;
+  */v1/installs/iagents) k=r3 ;;
+  */v1/installs/iagents/upgrade) k=r5 ;;
+  *) k=none ;;
 esac
+printf '%s %s max=%s auth=%s data=%s\\n' "$method" "$url" "$max" "\${auth%% *} \${auth##* }" "$data" >> "$D/calls"
+if [ "$k" = none ]; then exit 7; fi
+if [ -n "$out" ]; then cp "$D/$k.json" "$out"; printf '%s' "$(cat "$D/$k.status")"; else cat "$D/$k.json"; fi
 `,
       { mode: 0o755 },
     );
     const env = {
       PATH: `${bin}:${process.env.PATH}`,
-      RUNNER_TEMP: tmp,
-      ACT: o.act ?? "accept",
-      ACCEPTED: join(d, "accepted.json"),
-      CALLS: join(d, "calls"),
-      GOT_DIR: join(d, "got-dir"),
-      GOT_LS: join(d, "got-ls"),
+      D: d,
+      TAG: o.tag ?? "v0.250.0",
+      MINT_URL: "https://token.example/?x=1",
+      ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/?x=1",
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request.token",
       GITHUB_STEP_SUMMARY: join(d, "summary"),
-      GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
-      GITHUB_RUN_ID: "1",
+      GITHUB_RUN_ID: "77",
       GITHUB_RUN_ATTEMPT: "1",
-      REDLINE_RELEASE: "0.250.0",
-      REDLINE_TARGETS: JSON.stringify({
-        secretsDir: join(tmp, "redline-secrets"),
-        a: { name: "rl-a", installId: "ia", app: "https://rl-a.example" },
-        b: { name: "rl-b", installId: "ib", app: "https://rl-b.example" },
-      }),
     };
     const read = (f: string) => (existsSync(f) ? readFileSync(f, "utf8") : "");
-    const run = () => {
-      const r = runBash(step.run, env, d, 10_000);
-      return {
-        ...r,
-        summary: read(env.GITHUB_STEP_SUMMARY),
-        calls: read(env.CALLS).trim().split("\n").filter(Boolean),
-      };
+    const r = runBash(String(step.run), env, d, 10_000);
+    const out = {
+      ...r,
+      summary: read(env.GITHUB_STEP_SUMMARY),
+      calls: read(join(d, "calls")).trim().split("\n").filter(Boolean),
     };
-    return { d, env, run, read, priv: join(tmp, "rl-agents-upgrade/secrets") };
+    rmSync(d, { recursive: true, force: true });
+    return out;
   }
-  const inSandbox = (
-    o: Parameters<typeof sandbox>[0],
-    f: (sb: ReturnType<typeof sandbox>) => void,
-  ) => {
-    const sb = sandbox(o);
-    try {
-      f(sb);
-    } finally {
-      rmSync(sb.d, { recursive: true, force: true });
+  const posts = (calls: string[]) => calls.filter((c) => c.startsWith("POST "));
+
+  it("an older rl-agents: one R5 to the tag, with red-line's JWT, and the summary records the accepted job id", () => {
+    const r = sandbox({});
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.calls.map((c) => c.split(" ").slice(0, 2).join(" "))).toEqual([
+      "GET https://token.example/?x=1&audience=https://api.open-artifacts-staging.app",
+      "GET https://api.open-artifacts-staging.app/v1/installs?q=rl-agents",
+      "GET https://api.open-artifacts-staging.app/v1/installs/iagents",
+      "POST https://api.open-artifacts-staging.app/v1/installs/iagents/upgrade",
+    ]);
+    const post = posts(r.calls)[0] ?? "";
+    expect(post).toContain("auth=Authorization: minted.oidc.jwt");
+    expect(post).toContain(
+      'data={"requestId":"rl77-1-up-rl-agents","version":"0.250.0","nonAdditive":true}',
+    );
+    expect(r.summary).toContain(
+      "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 accepted, job j01ABCDEF.",
+    );
+    expect(r.stdout).not.toContain("::warning");
+    // The JWT only ever reaches the log as a mask.
+    for (const l of r.stdout.split("\n"))
+      if (l.includes("minted.oidc.jwt"))
+        expect(l).toBe("::add-mask::minted.oidc.jwt");
+    expect(r.summary).not.toContain("minted.oidc.jwt");
+    expect(r.stdout + r.stderr + r.summary).not.toContain("request.token");
+  });
+
+  it("a tag not newer than rl-agents, a busy or inactive install, or no install: no R5", () => {
+    for (const o of [
+      { version: "0.250.0" },
+      { version: "0.260.0" },
+      { activeJobId: "jbusy" },
+      { state: "suspended" },
+      { testHooks: false },
+      { noInstall: true },
+      { tag: "main" },
+    ]) {
+      const r = sandbox(o);
+      expect(r.status, `${JSON.stringify(o)} ${r.stderr}`).toBe(0);
+      expect(posts(r.calls), JSON.stringify(o)).toEqual([]);
     }
-  };
-
-  it("a failed T19 (the v0.247.0 replay, the suite passed) makes no request", () => {
-    for (const t19 of ["failure", "cancelled", "none", "unreadable", ""])
-      inSandbox({ t19 }, (sb) => {
-        const r = sb.run();
-        expect(r.status, r.stderr).toBe(0);
-        expect(r.calls, t19).toEqual([]);
-        expect(r.summary).toContain(
-          "rl-agents: not upgraded, the t19 job did not pass",
-        );
-      });
   });
 
-  it("an accepted 202 is recorded: the summary has its job id, from one call for the tag, in a fresh 0700 dir that is gone after", () => {
-    inSandbox({ t19: "success" }, (sb) => {
-      const r = sb.run();
-      expect(r.status, r.stderr).toBe(0);
-      expect(r.calls).toEqual([
-        `--filter @oa/redline provisioning rl-agents-upgrade ${join(sb.env.RUNNER_TEMP, "rl-agents-upgrade/result.json")}`,
-      ]);
-      expect(r.summary).toContain("started, job j01ABCDEF.");
-      expect(r.stdout).toContain("started, job j01ABCDEF.");
-      expect(r.stdout).not.toContain("::warning");
-      // Its own dir, with no JWT when it started (it mints its own), removed after.
-      expect(sb.read(sb.env.GOT_DIR).trim()).toBe(sb.priv);
-      // Only its own log, opened before it ran: no JWT handed in.
-      expect(sb.read(sb.env.GOT_LS).trim()).toBe("rl-agents-upgrade.log");
-      expect(existsSync(sb.priv)).toBe(false);
+  it("a refused R5 warns and never fails", () => {
+    const r = sandbox({
+      r5: { status: 409, body: { error: { code: "job_in_progress" } } },
     });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain(
+      "::warning title=rl-agents upgrade::rl-agents: the upgrade to 0.250.0 was not accepted, R5 answered 409, code job_in_progress.",
+    );
   });
 
-  it("a timeout or an error warns and never fails the step", () => {
-    for (const [act, want] of [
-      ["timeout", "the upgrade request had no answer within 30 s"],
-      ["error", "the upgrade request failed (exit 1)"],
-    ] as const)
-      inSandbox({ t19: "success", act }, (sb) => {
-        const r = sb.run();
-        expect(r.status, r.stderr).toBe(0);
-        expect(r.calls).toHaveLength(1);
-        expect(r.stdout).toContain(
-          `::warning title=rl-agents upgrade::rl-agents: ${want}`,
-        );
-        expect(r.summary).toContain(want);
-        expect(existsSync(sb.priv)).toBe(false);
-      });
-  });
-
-  it("a line holding its JWT is withheld; nothing secret reaches the summary or the output", () => {
-    inSandbox({ t19: "success", act: "leak" }, (sb) => {
-      const r = sb.run();
-      expect(r.status, r.stderr).toBe(0);
-      expect(r.summary).toContain("the result was withheld");
-      for (const o of [r.summary, r.stdout, r.stderr])
-        expect(o).not.toContain("minted.oidc.jwt");
-    });
-  });
-
-  it("a tag without the command is reported as skipped and makes no request", () => {
-    inSandbox({ t19: "success", withCommand: false }, (sb) => {
-      const r = sb.run();
-      expect(r.status, r.stderr).toBe(0);
-      expect(r.calls).toEqual([]);
-      expect(r.summary).toContain("this tag has no rl-agents upgrade");
-    });
+  it("one 30 s deadline: a slow lookup leaves less time for the upgrade, and none left sends nothing", () => {
+    // Start at 1000 (deadline 1030). The mint and R2 are quick; R3 takes 25 s.
+    const slow = sandbox({ clock: [1000, 1001, 1002, 1003, 1028] });
+    expect(slow.status, slow.stderr).toBe(0);
+    const max = slow.calls.map((c) => Number(/max=(\d+)/.exec(c)?.[1]));
+    expect(max).toEqual([29, 28, 27, 2]);
+    // Every request ends by the deadline: each one's start plus its bound.
+    const starts = [1001, 1002, 1003, 1028];
+    for (const [i, s] of starts.entries()) expect(s + (max[i] ?? 0)).toBe(1030);
+    // The clock passes the deadline before R5: nothing is sent, a warning.
+    const late = sandbox({ clock: [1000, 1001, 1002, 1003, 1031] });
+    expect(late.status, late.stderr).toBe(0);
+    expect(posts(late.calls)).toEqual([]);
+    expect(late.stdout).toContain(
+      "::warning title=rl-agents upgrade::rl-agents: not upgraded, the 30 s deadline passed.",
+    );
   });
 });
