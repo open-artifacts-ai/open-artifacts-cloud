@@ -710,6 +710,11 @@ cat "$STATE/$k.json"`;
     "hosted-attach-prod",
   ];
   // The tag's own push run (id 41, at CSHA) was red; the rebuild (id 77) is green.
+  // Typed views of a State's run and job lists, for the edits below.
+  const runsIn = (s: State) =>
+    s["cloud-runs"] as { workflow_runs: Record<string, unknown>[] };
+  const jobsIn = (s: State, key: string) =>
+    s[key] as { jobs: { conclusion: string }[] };
   const redThenRebuilt = (jobNames = names): State =>
     tweak((x) => {
       x["cloud-jobs"] = jobsOf(["mirror", "hosted-guard", "hosted-build"]);
@@ -751,20 +756,20 @@ cat "$STATE/$k.json"`;
       { event: "push" },
     ]) {
       const s = redThenRebuilt();
-      s["cloud-runs"].workflow_runs[1] = rebuilt(over);
+      runsIn(s).workflow_runs[1] = rebuilt(over);
       expect(runTwo(s).code, JSON.stringify(over)).toBe(1);
     }
     const s = redThenRebuilt();
-    s["cloud-jobs-77"].jobs[2].conclusion = "failure";
+    jobsIn(s, "cloud-jobs-77").jobs[2].conclusion = "failure";
     expect(runTwo(s).code).toBe(1);
   });
   it("the newest of two counting runs is read", () => {
     const s = redThenRebuilt();
-    s["cloud-runs"].workflow_runs.push(
+    runsIn(s).workflow_runs.push(
       rebuilt({ id: 88, created_at: "2026-10-31T05:00:00Z" }),
     );
     s["cloud-jobs-88"] = jobsOf(names);
-    s["cloud-jobs-88"].jobs[3].conclusion = "failure";
+    jobsIn(s, "cloud-jobs-88").jobs[3].conclusion = "failure";
     const r = runTwo(s);
     expect(r.code).toBe(1);
     expect(r.err).toMatch(/job hosted-build: failure/);
