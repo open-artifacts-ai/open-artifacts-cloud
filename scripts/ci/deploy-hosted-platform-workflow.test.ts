@@ -332,9 +332,9 @@ describe("deploy-hosted-platform.yml", () => {
     // The Email Sending check (#967) is the last gate before the deploy.
     // Between it and the ids: only the read-only late fleet finish (#264).
     expect(i("Resolve the resource ids")).toBe(
-      i("Read the fleet finish of the release before") - 1,
+      i("Read the fleet finish of earlier releases") - 1,
     );
-    expect(i("Read the fleet finish of the release before")).toBe(
+    expect(i("Read the fleet finish of earlier releases")).toBe(
       i("The senders' domain is onboarded in Email Sending") - 2,
     );
     expect(i("The senders' domain is onboarded in Email Sending")).toBe(
@@ -409,7 +409,7 @@ describe("deploy-hosted-platform.yml", () => {
       "The deploy token is the Environment's",
       "The tag is newer than prod's",
       "Resolve the resource ids",
-      "Read the fleet finish of the release before",
+      "Read the fleet finish of earlier releases",
       "The senders' domain is onboarded in Email Sending",
       "Deploy and verify",
       "Zones",
@@ -1063,17 +1063,17 @@ describe("deploy-hosted-platform.yml", () => {
     expect(JSON.stringify(dn)).not.toContain("secrets.");
   });
 
-  // The Prover's case: a rollout that finishes after the 10-minute wait. The
-  // next prod run, before it replaces that release, reads its mark once and
-  // records it with that release's tag and the mark's own time.
-  it("a late fleet finish: the next prod run reads the release before's mark, once, before deploying, and records it by name", () => {
-    const rd = named("Read the fleet finish of the release before");
+  // The Prover's case: a rollout that finishes after the 10-minute wait, even
+  // after the next run's read. Every prod run, before deploying, reads every
+  // mark still held, so the first run after the finish records it.
+  it("a late fleet finish: every prod run reads every fleet_done mark still held, before deploying, and records them by name", () => {
+    const rd = named("Read the fleet finish of earlier releases");
     const i = (n: string) => steps.indexOf(named(n));
     const rec = steps.find((st) =>
-      String(st.name).startsWith("Fleet done of the release before"),
+      String(st.name).startsWith("Fleet done of earlier releases"),
     ) as Record<string, any>;
     expect(rec.name).toBe(
-      "Fleet done of the release before (${{ steps.prev_fleet.outputs.tag }} at ${{ steps.prev_fleet.outputs.at }})",
+      "Fleet done of earlier releases (${{ steps.prev_fleet.outputs.list }})",
     );
     expect(rd.id).toBe("prev_fleet");
     expect(i(rd.name)).toBeGreaterThan(i("Resolve the resource ids"));
@@ -1084,16 +1084,15 @@ describe("deploy-hosted-platform.yml", () => {
     expect(rd.env).toEqual({
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
     });
+    // Every mark, not one tag's: no lookup of the release it replaces.
     expect(rd.run).toContain(
-      'prev="$(bash "$RUNNER_TEMP/main-ci/worker-tag.sh" prod scheduler)"',
+      "node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done-all prod",
     );
-    expect(rd.run).toContain(
-      'FLEET_DONE_WAIT_MIN=0 node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done prod "$prev"',
-    );
+    expect(rd.run).not.toContain("worker-tag.sh");
     expect(evalIf(rd, { env: "prod", targets: FULL })).toBe(true);
     expect(evalIf(rd, { env: "staging", targets: FULL })).toBe(false);
     expect(evalIf(rd, { env: "prod", targets: "zones" })).toBe(false);
-    expect(rec.if).toBe("${{ steps.prev_fleet.outputs.at != '' }}");
+    expect(rec.if).toBe("${{ steps.prev_fleet.outputs.list != '' }}");
     expect(JSON.stringify(rec)).not.toContain("secrets.");
   });
 

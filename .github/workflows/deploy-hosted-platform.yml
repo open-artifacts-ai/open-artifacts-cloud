@@ -349,14 +349,17 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/hosted-resource-ids.sh" "$DEPLOY_ENV"
-      # A rollout that finished after its own deploy's 10-minute wait (cloud
-      # #264, for release-watch #456): before this prod run replaces it, one
-      # read of the fleet_done mark of the release prod's scheduler runs now
-      # (reads only, the deploy's token). "Fleet done of the release before"
-      # runs only when the mark is there, and its name carries that release's
-      # tag and the mark's own time. Neither step can fail the run.
+      # Rollouts that finished after their own deploy's 10-minute wait (cloud
+      # #264, for release-watch #456): every prod run, before it deploys,
+      # reads every fleet_done mark the platform D1 still holds (reads only,
+      # the deploy's token; the scheduler keeps one a week after it is set),
+      # so a finish that lands after any one run's read is recorded by the
+      # next. "Fleet done of earlier releases" runs when there is any, its
+      # name listing each release's tag and its mark's own time. #456 takes
+      # the earliest per tag, so a release listed again is harmless. Neither
+      # step can fail the run.
       - id: prev_fleet
-        name: Read the fleet finish of the release before
+        name: Read the fleet finish of earlier releases
         if: ${{ inputs.env == 'prod' && contains(format(',{0},', inputs.targets), ',scheduler,') }}
         continue-on-error: true
         timeout-minutes: 2
@@ -364,20 +367,18 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -uo pipefail
-          prev="$(bash "$RUNNER_TEMP/main-ci/worker-tag.sh" prod scheduler)" ||
-            { echo "::warning::could not read prod's scheduler tag; no late fleet finish recorded"; exit 0; }
-          if out="$(FLEET_DONE_WAIT_MIN=0 node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done prod "$prev")"; then
+          if out="$(node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done-all prod)"; then
             printf '%s\n' "$out"
-            { echo "tag=$prev"; echo "at=$(sed -n 's/^fleet_done_at=//p' <<< "$out")"; } >> "$GITHUB_OUTPUT"
+            echo "list=$(sed -n 's/^fleet_done_list=//p' <<< "$out")" >> "$GITHUB_OUTPUT"
           else
             printf '%s\n' "$out"
+            echo "::warning::could not read the fleet_done marks; earlier releases' finishes wait for the next prod run"
           fi
-      - name: Fleet done of the release before (${{ steps.prev_fleet.outputs.tag }} at ${{ steps.prev_fleet.outputs.at }})
-        if: ${{ steps.prev_fleet.outputs.at != '' }}
+      - name: Fleet done of earlier releases (${{ steps.prev_fleet.outputs.list }})
+        if: ${{ steps.prev_fleet.outputs.list != '' }}
         env:
-          PREV: ${{ steps.prev_fleet.outputs.tag }}
-          AT: ${{ steps.prev_fleet.outputs.at }}
-        run: echo "The fleet reached every install it waits for on $PREV at $AT"
+          LIST: ${{ steps.prev_fleet.outputs.list }}
+        run: echo "The fleet reached every install it waits for on $LIST"
       # Read-only (GETs), before any target deploys, verify_only too (#967):
       # each sender's domain in <env>.json must be onboarded in Email Sending.
       - name: The senders' domain is onboarded in Email Sending
@@ -550,9 +551,8 @@ jobs:
       # to 10 min for the scheduler's fleet_done:<version> mark. "Fleet done"
       # runs only once the mark is there, so its conclusion and end time are
       # the signal, and it prints the mark's own time; neither step can fail
-      # the run. A finish after the wait is not lost: the next prod deploy
-      # reads the mark of the release it replaces ("Fleet done of the release
-      # before", above).
+      # the run. A finish after the wait is not lost: every later prod run
+      # reads every mark still held ("Fleet done of earlier releases", above).
       - id: fleet_done
         name: Wait for the fleet to reach every install
         if: ${{ success() && inputs.env == 'prod' && steps.mark_verified.outcome == 'success' }}

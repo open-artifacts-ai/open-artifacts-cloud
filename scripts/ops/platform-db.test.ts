@@ -12,6 +12,8 @@ import {
 } from "../../apps/scheduler/src/provapi/fleet.ts";
 import {
   d1,
+  FLEET_DONE_LIST_MAX,
+  fleetDoneAll,
   loadMigrations,
   markVerified,
   pinDrift,
@@ -856,6 +858,7 @@ describe("platform-db.ts", () => {
         ["unmark-verified", "dev"],
         ["fleet-done", "dev", "v1.2.3"],
         ["fleet-done", "prod"],
+        ["fleet-done-all", "dev"],
       ]) {
         const r = cli(args, ok);
         expect(r.status, args.join(" ")).toBe(2);
@@ -942,6 +945,58 @@ describe("platform-db.ts", () => {
         expect(f.sleeps).toEqual([15_000, 15_000, 15_000]);
         expect(log).toEqual(["fleet_done:1.2.3 at 1970-01-01T00:00:00.005Z"]);
       });
+      // The Prover's sequence (comment 7186985657): A's wait ends, B's
+      // pre-read finds no mark for A, A's mark lands, C's read must still
+      // record A, with A's own time.
+      it("fleetDoneAll: a finish that lands after the next run's read is recorded by a later run", async () => {
+        const f = stateDb();
+        const t0 = Date.parse("2026-11-26T05:10:00Z");
+        // Run A's own wait gave up at 05:10:00.
+        expect(
+          await waitFleetDone({
+            db: f.db,
+            tag: "v1.0.0",
+            now: () => t0,
+            sleep: async () => {},
+            log: () => {},
+            waitMs: 0,
+          }),
+        ).toBeNull();
+        // Run B's pre-read at 05:10:01: nothing yet.
+        expect(await fleetDoneAll({ db: f.db })).toEqual([]);
+        // A's scheduler marks it at 05:10:02; B's own release later too.
+        f.sqlite.exec(
+          `INSERT INTO platform_state VALUES ('fleet_done:1.0.0', ${t0 + 2_000}, ${t0 + 2_000})`,
+        );
+        f.sqlite.exec(
+          `INSERT INTO platform_state VALUES ('fleet_done:1.1.0', ${t0 + 600_000}, ${t0 + 600_000})`,
+        );
+        // Run C reads every mark still held: A is recorded, with its time.
+        expect(await fleetDoneAll({ db: f.db })).toEqual([
+          "v1.0.0 at 2026-11-26T05:10:02.000Z",
+          "v1.1.0 at 2026-11-26T05:20:00.000Z",
+        ]);
+        expect(keys(f.sqlite)).toHaveLength(2);
+      });
+
+      it("fleetDoneAll: other keys and malformed marks are skipped; at most the newest FLEET_DONE_LIST_MAX", async () => {
+        const f = stateDb();
+        f.sqlite.exec(
+          "INSERT INTO platform_state VALUES ('fleet_halt:1.0.0:x', 1, 1), ('fleet_done:bad', 2, 2), ('platform_verified:1.0.0', 3, 3)",
+        );
+        expect(await fleetDoneAll({ db: f.db })).toEqual([]);
+        for (let n = 0; n < FLEET_DONE_LIST_MAX + 5; n++)
+          f.sqlite.exec(
+            `INSERT INTO platform_state VALUES ('fleet_done:2.${n}.0', ${1_000 + n}, 1)`,
+          );
+        const list = await fleetDoneAll({ db: f.db });
+        expect(list).toHaveLength(FLEET_DONE_LIST_MAX);
+        expect(list[0]).toBe("v2.5.0 at 1970-01-01T00:00:01.005Z");
+        expect(list.at(-1)).toBe(
+          `v2.${FLEET_DONE_LIST_MAX + 4}.0 at 1970-01-01T00:00:01.0${FLEET_DONE_LIST_MAX + 4}Z`,
+        );
+      });
+
       it("gives up after the wait, reads only, and refuses a bad tag", async () => {
         const f = stateDb();
         const c = clocked(f);
