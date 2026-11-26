@@ -474,7 +474,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
           cd _cloud
           # actionlint 1.7.12 predates concurrency's `queue` key (GitHub docs:
-          # single or max); flaky-tracker.yml uses `queue: max`.
+          # single or max); cloud-flaky-tracker.yml uses `queue: max`.
           "$RUNNER_TEMP/actionlint/actionlint" -color \
             -ignore 'unexpected key "queue" for "concurrency" section' \
             .github/workflows/*.yml
