@@ -1650,6 +1650,32 @@ export function reconcile(o: {
   for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
   const runs = [...byId.values()].sort((a, b) => a.id - b.id);
   if (!runs.length) return { tracked: [], notes, failed: 0, left: 0 };
+  // The pending list is saved whenever it changes: first the whole list of
+  // runs not yet marked, before any run starts, so a job killed at any point
+  // after loses none of them; then, at the end, what is still not marked.
+  let saved = pending.join(" ");
+  const savePending = (list: string[]) => {
+    if (list.join(" ") === saved) return;
+    const store = openStore(exec, repo, nowMs);
+    notes.push(...store.notes);
+    gh(
+      exec,
+      [
+        "issue",
+        "comment",
+        String(store.write),
+        "--repo",
+        repo,
+        "--body",
+        pendingComment(list, nowMs),
+      ],
+      { write: true },
+    );
+    saved = list.join(" ");
+  };
+  savePending(
+    runs.map((r) => `${r.id}/${r.attempt}`).filter((k) => !have.has(k)),
+  );
   const unfinished: string[] = [];
   const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
   let failed = 0;
@@ -1695,25 +1721,9 @@ export function reconcile(o: {
       o.onRun?.([`  note: ${note}`]);
     }
   }
-  // What is still not marked (left, or failed) is the new pending list,
-  // written when it changed. A run leaves it only once it is marked.
-  if (unfinished.join(" ") !== pending.join(" ")) {
-    const store = openStore(exec, repo, nowMs);
-    notes.push(...store.notes);
-    gh(
-      exec,
-      [
-        "issue",
-        "comment",
-        String(store.write),
-        "--repo",
-        repo,
-        "--body",
-        pendingComment(unfinished, nowMs),
-      ],
-      { write: true },
-    );
-  }
+  // What is still not marked (left, or failed) is the new pending list. A
+  // run leaves it only once it is marked.
+  savePending(unfinished);
   return { tracked, notes, failed, left };
 }
 

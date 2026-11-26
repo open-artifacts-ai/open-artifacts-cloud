@@ -773,14 +773,19 @@ const storeWith = (...fs: Failure[]) => [
   },
 ];
 const LABELS = [LABEL, STORE_LABEL];
+const bodyOf = (c: Call | undefined) =>
+  c?.args[c.args.indexOf("--body") + 1] ?? "";
+/** A reconcile's pending list (its own tests check it). */
+const isPendingList = (c: Call) =>
+  readMarkers(bodyOf(c))?.get("kind")?.[0] === "pending";
+/** Every write but the reconcile's pending lists. */
 const writes = (g: { calls: Call[] }) =>
   g.calls.filter(
     (c) =>
-      (c.args[0] === "issue" && c.args[1] !== "list") ||
-      (c.args[0] === "label" && c.args[1] === "create"),
+      ((c.args[0] === "issue" && c.args[1] !== "list") ||
+        (c.args[0] === "label" && c.args[1] === "create")) &&
+      !(c.args[1] === "comment" && isPendingList(c)),
   );
-const bodyOf = (c: Call | undefined) =>
-  c?.args[c.args.indexOf("--body") + 1] ?? "";
 /** An open flaky issue's body: a line of text and the marker block. */
 const openBody = (id: string, seen: string) =>
   `Some text.\n${markerBlock([
@@ -2213,8 +2218,22 @@ describe("a late replay files like an immediate one", () => {
     const now = immediate().g;
     const late = delayed().g;
     const half = halfLate().g;
-    expect(late.state()).toEqual(now.state());
-    expect(half.state()).toEqual(now.state());
+    // The store and issues, but for the reconciles' pending lists (written
+    // at each one's own time).
+    const kept = (g: ReturnType<typeof make>) => {
+      const st = g.state();
+      return {
+        ...st,
+        stores: st.stores.map((x) => ({
+          ...x,
+          comments: x.comments.filter(
+            (c) => readMarkers(c.body)?.get("kind")?.[0] !== "pending",
+          ),
+        })),
+      };
+    };
+    expect(kept(late)).toEqual(kept(now));
+    expect(kept(half)).toEqual(kept(now));
     // Delivered again, nothing more is written.
     for (const g of [now, late, half]) {
       const before = JSON.stringify(g.state());
@@ -2482,6 +2501,47 @@ describe("a backlog run that leaves the listing's range while it waits", () => {
       );
     expect(left.at(-1)).toBe(0);
     expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+  });
+
+  it("a runner killed right after its first mark loses none: the next completion, 27 h later, does the other 31, each once", () => {
+    const g = make();
+    // The job dies as soon as the first run is marked: every later call fails.
+    let dead = false;
+    const dying: Exec = (cmd, args) => {
+      if (dead) return { code: 1, stdout: "", stderr: "killed" };
+      const r = g.exec(cmd, args);
+      if (marks(g).length) dead = true;
+      return r;
+    };
+    expect(() =>
+      reconcile({ exec: dying, repo: "o/cloud", nowMs: at(g, NOW) }),
+    ).toThrow("killed");
+    expect(marks(g)).toEqual(["2000/2"]);
+    // The whole list was saved before the first run started.
+    expect(lastPending(g)).toEqual(ids.map((id) => `${id}/2`));
+    const later = at(g, NOW + 27 * HOUR);
+    expect(listRuns(g.exec, "o/cloud", "CI", later)).toEqual([]);
+    const next = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: later,
+      logs: 100,
+      calls: 10_000,
+    });
+    expect(next.tracked.map((t) => t.run.runId)).toEqual(ids.slice(1));
+    expect(next.left).toBe(0);
+    expect(next.failed).toBe(0);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+    const runsSeen = [
+      ...parseStore(g.state().stores.flatMap((st) => st.comments)).values(),
+    ]
+      .flat()
+      .map((x) => x.run);
+    const per = parseVitest(CI_LOG).length;
+    expect(runsSeen.sort()).toEqual(
+      ids.flatMap((id) => Array.from({ length: per }, () => id)).sort(),
+    );
+    expect(lastPending(g)).toEqual([]);
   });
 
   it("keeps a failed run on the list until it is marked", () => {
