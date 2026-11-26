@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
+  backlogLine,
   bumpedBody,
   COMMENT_MAX,
   caseName,
@@ -39,6 +40,9 @@ import {
   parseVitest,
   plan,
   QUIET_DAYS,
+  RECONCILE_CALLS,
+  RECONCILE_LOGS,
+  RECONCILE_MS,
   RERUN_DAYS,
   type RunInfo,
   readMarkers,
@@ -701,8 +705,9 @@ function fakeGh(o: {
     if (log) return ok(jobs[Number(log[1]) - 10]?.log ?? "");
     if (a.startsWith("label list")) {
       const name = args[args.indexOf("--search") + 1];
+      // As gh does: no match prints nothing, not `[]`.
       return ok(
-        JSON.stringify((o.labels ?? []).includes(name ?? "") ? [{ name }] : []),
+        (o.labels ?? []).includes(name ?? "") ? JSON.stringify([{ name }]) : "",
       );
     }
     if (a.startsWith("issue list") && a.includes(`--label ${STORE_LABEL}`))
@@ -1305,7 +1310,7 @@ describe("reconcile", () => {
   it("lists the watched workflows' recent runs with small reads", () => {
     const g = fakeGh({ listed: {} });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
-    expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
+    expect(r).toEqual({ tracked: [], notes: [], failed: 0, left: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
     // Created in the last 60 days and 26 hours (a rerun up to 30 days after
     // creation, up to 30 quiet days after it, and 26 hours of slack); one
@@ -2009,7 +2014,8 @@ function liveGh(o: {
     if (/actions\/jobs\/10\/logs/.test(a)) return ok(o.log);
     if (a.startsWith("label list")) {
       const name = val(args, "--search");
-      return ok(JSON.stringify(labels.has(name) ? [{ name }] : []));
+      // As gh does: no match prints nothing, not `[]`.
+      return ok(labels.has(name) ? JSON.stringify([{ name }]) : "");
     }
     if (a.startsWith("label create")) {
       labels.add(args[2] ?? "");
@@ -2216,5 +2222,148 @@ describe("a late replay files like an immediate one", () => {
       [...tests, ...tests].map(() => "record"),
     );
     expect(g.state().flaky).toEqual([]);
+  });
+});
+
+describe("a backlog larger than one reconcile drains over the next events", () => {
+  // Twelve CI runs passed on a rerun, their failures 4 days apart, and no
+  // event tracked any of them. Each run reads 1 job log.
+  const ids = Array.from({ length: 12 }, (_, i) => 1000 + i);
+  const start = Date.parse("2026-11-01T10:00:00Z");
+  const ci = (id: number, at: number): Listed => ({
+    id,
+    run_attempt: 2,
+    conclusion: "success",
+    created_at: iso(at - HOUR),
+    updated_at: iso(at + 10 * 60 * 1000),
+    name: "CI",
+    event: "push",
+    head_branch: "main",
+    head_sha: SHA,
+    display_title: "a commit",
+  });
+  const make = () =>
+    liveGh({
+      listed: { "ci.yml": ids.map((id, i) => ci(id, start + i * 4 * DAY)) },
+      jobAt: Object.fromEntries(ids.map((id, i) => [id, start + i * 4 * DAY])),
+      log: CI_LOG,
+    });
+  const later = start + 12 * 4 * DAY;
+  const marks = (g: ReturnType<typeof make>) =>
+    g
+      .state()
+      .stores.flatMap((st) => [...storedRuns(st.comments)])
+      .sort();
+  const sightingRuns = (g: ReturnType<typeof make>) =>
+    [...parseStore(g.state().stores.flatMap((st) => st.comments)).values()]
+      .flat()
+      .map((x) => x.run);
+  const tests = parseVitest(CI_LOG).length;
+  const reconcileAt = (
+    g: ReturnType<typeof make>,
+    ms: number,
+    o: { logs?: number; calls?: number } = {},
+  ) => {
+    g.clock.now = ms;
+    return reconcile({ exec: g.exec, repo: "o/cloud", nowMs: ms, ...o });
+  };
+
+  it("caps one reconcile well inside the job's limit", () => {
+    expect(RECONCILE_MS).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(RECONCILE_CALLS).toBeLessThanOrEqual(150);
+    expect(RECONCILE_LOGS).toBeLessThanOrEqual(25);
+  });
+
+  it("stops starting runs once its log budget is spent, oldest first, and says how many are left", () => {
+    const g = make();
+    const r = reconcileAt(g, later, { logs: 5 });
+    expect(r.tracked.map((t) => t.run.runId)).toEqual(ids.slice(0, 5));
+    expect(r.left).toBe(7);
+    expect(backlogLine(r.left)).toBe(
+      "backlog: 7 left (the next completion's reconcile carries on)",
+    );
+    expect(marks(g)).toEqual(ids.slice(0, 5).map((id) => `${id}/2`));
+  });
+
+  it("stops on its call budget too, but always starts one run", () => {
+    const g = make();
+    const r = reconcileAt(g, later, { calls: 1 });
+    expect(r.tracked).toHaveLength(1);
+    expect(r.left).toBe(11);
+  });
+
+  it("stops on its time budget, on a fake clock: each gh call takes 2 s", () => {
+    const g = make();
+    let t = 0;
+    const slow: Exec = (cmd, args) => {
+      t += 2000;
+      return g.exec(cmd, args);
+    };
+    g.clock.now = later;
+    const r = reconcile({
+      exec: slow,
+      repo: "o/cloud",
+      nowMs: later,
+      ms: 60_000,
+      clock: () => t,
+    });
+    expect(r.tracked.length).toBeGreaterThan(0);
+    expect(r.left).toBe(ids.length - r.tracked.length);
+    expect(r.left).toBeGreaterThan(0);
+  });
+
+  it("drains over successive events with every run marked once, and no sighting twice", () => {
+    const g = make();
+    const left: number[] = [];
+    for (let e = 0; e < 6; e++)
+      left.push(reconcileAt(g, later + e * HOUR, { logs: 5 }).left);
+    expect(left).toEqual([7, 2, 0, 0, 0, 0]);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`));
+    expect(sightingRuns(g).sort()).toEqual(
+      ids.flatMap((id) => Array.from({ length: tests }, () => id)).sort(),
+    );
+    // Once drained, a reconcile only reads.
+    const before = JSON.stringify(g.state());
+    const r = reconcileAt(g, later + DAY);
+    expect(r.tracked).toEqual([]);
+    expect(r.left).toBe(0);
+    expect(JSON.stringify(g.state())).toBe(before);
+  });
+
+  it("a reconcile cut off mid-run keeps what it saved, and the next one finishes without a duplicate", () => {
+    const g = make();
+    let calls = 0;
+    const dying: Exec = (cmd, args) =>
+      ++calls > 60
+        ? { code: 1, stdout: "", stderr: "killed" }
+        : g.exec(cmd, args);
+    g.clock.now = later;
+    const cut = reconcile({ exec: dying, repo: "o/cloud", nowMs: later });
+    const saved = marks(g);
+    expect(saved.length).toBeGreaterThan(0);
+    expect(saved.length).toBeLessThan(ids.length);
+    expect(cut.failed).toBeGreaterThan(0);
+    for (let e = 1; e <= 4; e++) reconcileAt(g, later + e * HOUR, { logs: 5 });
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`));
+    expect(sightingRuns(g).sort()).toEqual(
+      ids.flatMap((id) => Array.from({ length: tests }, () => id)).sort(),
+    );
+  });
+
+  it("shows each run as it is worked on, before the reconcile ends", () => {
+    const g = make();
+    const seen: string[] = [];
+    g.clock.now = later;
+    reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: later,
+      logs: 2,
+      onRun: (l) => seen.push(l[0] ?? ""),
+    });
+    expect(seen).toEqual([
+      "Flaky tracker, CI at abcdef0, run 1000 (passed on attempt 2):",
+      "Flaky tracker, CI at abcdef0, run 1001 (passed on attempt 2):",
+    ]);
   });
 });
