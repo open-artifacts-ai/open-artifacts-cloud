@@ -1,6 +1,6 @@
 // The Provisioning API's scheduler duties (design v7 5.8), run on the */2
 // tick after the revoke tick and the directory sync. The fleet rollout is not
-// one of them (cloud #264): it runs only on the deploy's wake (wake.ts); the
+// one of them (cloud #264): it runs only on its events (wake.ts); the
 // tick keeps only its alert marks (fleetMarks, in the alerts duty).
 import { ALERT_KEYS } from "@oa/provisioning-contract/enum-values";
 import { trialRemindersDue } from "../trial-reminder.js";
@@ -25,7 +25,7 @@ export { SCHEDULER_TICK_KEY } from "@oa/provisioning-contract/state";
 export type { ProvapiEnv } from "./env.js";
 export { writeTick } from "./run.js";
 
-/** The tick's duties: every duty but the fleet, which only its wake runs. */
+/** The tick's duties: every duty but the fleet, which only its events run. */
 export type TickDutyName = Exclude<DutyName, "fleet">;
 
 /**
@@ -91,8 +91,8 @@ export interface ProvapiOptions extends SweepDeps {
 /**
  * Sweep, signups, trial reminders, purge, health, alerts, prune: in that
  * order, so the alerts read the tick's own sweep, purge and health writes.
- * No fleet duty (cloud #264): the fleet moves only on its wake (wake.ts) and
- * that message's queue retries. Never throws.
+ * No fleet duty (cloud #264): the fleet moves only on its events (wake.ts).
+ * Never throws.
  */
 export function provapiTick(
   env: ProvapiEnv,

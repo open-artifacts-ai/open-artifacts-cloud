@@ -28,7 +28,6 @@
 // The deploy's fleet wake (cloud #264): this Worker consumes
 // oa-<p>-fleet-wake, which the scheduler target creates when absent; the
 // platform deploy's last step posts one message to it (scripts/ci/fleet-wake.sh).
-// The fleet rollout runs only there, never on the */2 cron.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "compatibility_date": "2026-10-01",
@@ -103,11 +102,12 @@
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-s-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
-      // message once the release is verified, and the fleet runs at once.
-      // The only start of a fleet run (the */2 cron runs no fleet): a run
-      // that fails or leaves the rollout unsettled retries its message, 2
-      // minutes apart, up to max_retries (FLEET_WAKE_MAX_RETRIES, an hour:
-      // past the 45-minute rollout alerts). One batch at a time.
+      // message once the release is verified, and the provisioner one at
+      // every ManageInstall job's end; each batch is one fleet pass. One
+      // batch at a time, under the fleet lease; no tick runs the fleet. A
+      // pass only time can finish comes back with a backoff, up to
+      // max_retries (FLEET_WAKE_MAX_RETRIES, about 15 min); a passive soak's
+      // pass comes back when the soak ends.
       "queues": {
         "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }],
         "consumers": [
@@ -115,7 +115,7 @@
             "queue": "oa-s-fleet-wake",
             "max_batch_size": 10,
             "max_batch_timeout": 0,
-            "max_retries": 30,
+            "max_retries": 20,
             "max_concurrency": 1
           }
         ]
@@ -207,11 +207,12 @@
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-p-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
-      // message once the release is verified, and the fleet runs at once.
-      // The only start of a fleet run (the */2 cron runs no fleet): a run
-      // that fails or leaves the rollout unsettled retries its message, 2
-      // minutes apart, up to max_retries (FLEET_WAKE_MAX_RETRIES, an hour:
-      // past the 45-minute rollout alerts). One batch at a time.
+      // message once the release is verified, and the provisioner one at
+      // every ManageInstall job's end; each batch is one fleet pass. One
+      // batch at a time, under the fleet lease; no tick runs the fleet. A
+      // pass only time can finish comes back with a backoff, up to
+      // max_retries (FLEET_WAKE_MAX_RETRIES, about 15 min); a passive soak's
+      // pass comes back when the soak ends.
       "queues": {
         "producers": [{ "binding": "SIGNUPS", "queue": "oa-p-signups" }],
         "consumers": [
@@ -219,7 +220,7 @@
             "queue": "oa-p-fleet-wake",
             "max_batch_size": 10,
             "max_batch_timeout": 0,
-            "max_retries": 30,
+            "max_retries": 20,
             "max_concurrency": 1
           }
         ]

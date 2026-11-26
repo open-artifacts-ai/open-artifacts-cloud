@@ -371,6 +371,8 @@ const provisionerSettings = (p = "p", env: "staging" | "prod" = "prod") =>
       workflow_name: `oa-${p}-manage-install`,
       class_name: "ManageInstall",
     },
+    // cloud #264: every ManageInstall job's end wakes the fleet.
+    { type: "queue", name: "FLEET_WAKE", queue_name: `oa-${p}-fleet-wake` },
     ...varsOf("provisioner", env),
   ]);
 const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
@@ -1433,9 +1435,11 @@ describe("deploy-hosted-platform.sh", () => {
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.
+      // It predates FLEET_WAKE too (cloud #264).
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) =>
+            b.name !== "FLEET_WAKE" &&
             b.name !== "PROD_BUS_ALL" &&
             b.name !== "OAUTH_BORN_D1" &&
             b.name !== "OPTOUT_LIST",
@@ -1796,6 +1800,62 @@ describe("deploy-hosted-platform.sh", () => {
     expect(r.err).toContain("create queue oa-p-fleet-wake failed");
     expect(noDeploy(r.log)).toEqual([]);
     clean(r);
+  });
+  // cloud #264: the provisioner produces to oa-<p>-fleet-wake (FLEET_WAKE),
+  // so its target makes sure the queue exists before the deploy binds it.
+  const REAL_PROV = readFileSync(
+    join(root, "apps/provisioner/wrangler.jsonc"),
+    "utf8",
+  );
+  it("the provisioner creates oa-p-fleet-wake when absent, before its deploy, and reads FLEET_WAKE back", () => {
+    const r = setup({
+      queues: queueList(["oa-p-signups", "oa-p-signups-dlq"]),
+    }).run("provisioner");
+    expect(r.code, r.err).toBe(0);
+    const queueWrites = (w: string[]) =>
+      w.filter((l) => l.startsWith("WRITE POST /queues "));
+    expect(queueWrites(r.writes)).toEqual([WAKE_CREATE]);
+    const created = r.log.indexOf(WAKE_CREATE);
+    const deployed = r.log.findIndex((l) =>
+      l.startsWith("wrapper provisioner"),
+    );
+    expect(created).toBeGreaterThan(-1);
+    expect(created).toBeLessThan(deployed);
+    clean(r);
+    // A FLEET_WAKE bound to another queue fails the read-back.
+    const wrong = JSON.parse(NEXT["oa-p-provisioner"] as string);
+    for (const b of wrong.result.bindings)
+      if (b.name === "FLEET_WAKE") b.queue_name = "oa-s-fleet-wake";
+    const bad = setup({
+      next: { "oa-p-provisioner": JSON.stringify(wrong) },
+    }).run("provisioner");
+    expect(bad.code).toBe(1);
+    expect(bad.err).toContain("FLEET_WAKE: got");
+  });
+  it("the provisioner: a tag that produces nothing wants no FLEET_WAKE; any other producer refuses", () => {
+    const none = REAL_PROV.replace(/\n\s*"producers": \[[^\n]*\],/g, "");
+    expect(none).not.toContain('"producers"');
+    const old = JSON.parse(NEXT["oa-p-provisioner"] as string);
+    old.result.bindings = old.result.bindings.filter(
+      (b: { name: string }) => b.name !== "FLEET_WAKE",
+    );
+    const r = setup({
+      configs: { provisioner: none },
+      next: { "oa-p-provisioner": JSON.stringify(old) },
+      queues: queueList(["oa-p-signups", "oa-p-signups-dlq"]),
+    }).run("provisioner");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes.filter((l) => l.includes("fleet-wake"))).toEqual([]);
+    const other = REAL_PROV.replaceAll(
+      '"queue": "oa-p-fleet-wake"',
+      '"queue": "oa-p-signups"',
+    );
+    const o = setup({ configs: { provisioner: other } }).run("provisioner");
+    expect(o.code).toBe(1);
+    expect(o.err).toContain(
+      "the tag's prod provisioner produces to 'FLEET_WAKE oa-p-signups'; want none or FLEET_WAKE oa-p-fleet-wake; refusing",
+    );
+    expect(noDeploy(o.log)).toEqual([]);
   });
   it("the scheduler: a tag that consumes no queue lists and creates nothing; any other queue refuses", () => {
     const none = SCHED_CONFIG.replace(
@@ -2319,6 +2379,7 @@ describe("deploy-hosted-platform.sh", () => {
       "queues.json": JSON.stringify([
         { queue_name: "oa-p-signups" },
         { queue_name: "oa-p-signups-dlq" },
+        { queue_name: "oa-p-fleet-wake" },
       ]),
       "r2-oa-p-releases": "",
     };
@@ -2815,6 +2876,7 @@ describe("deploy-hosted-platform.sh", () => {
       "queues.json": JSON.stringify([
         { queue_name: "oa-p-signups" },
         { queue_name: "oa-p-signups-dlq" },
+        { queue_name: "oa-p-fleet-wake" },
       ]),
       "r2-oa-p-releases": "",
     };
@@ -2825,6 +2887,7 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.writes).toEqual([
         'WRITE POST /queues {"queue_name":"oa-p-signups"}',
         'WRITE POST /queues {"queue_name":"oa-p-signups-dlq"}',
+        'WRITE POST /queues {"queue_name":"oa-p-fleet-wake"}',
         'WRITE POST /r2/buckets {"name":"oa-p-releases"}',
       ]);
       const w = r.log.find((l) => l.startsWith("wrapper provisioner prod "));

@@ -853,9 +853,9 @@ export default {
     }
   },
   // oa-<p>-fleet-wake (cloud #264), its only queue: the platform deploy's
-  // last step posts one message, and the fleet runs at once (provapi/wake.ts)
-  // under the fleet lease. The only start of a fleet run: an unfinished
-  // rollout comes back through the queue's retries. Never throws.
+  // wake and every ManageInstall job's end; each batch is one fleet pass under
+  // the fleet lease (provapi/wake.ts). The only start of a fleet run: no tick
+  // runs it. Never throws.
   async queue(batch, env) {
     await fleetWake(batch, env, Date.now());
   },

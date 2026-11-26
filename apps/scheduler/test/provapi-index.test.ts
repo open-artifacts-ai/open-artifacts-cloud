@@ -209,8 +209,8 @@ describe("scheduled() and the provapi duties", () => {
     expect(lines.some((l) => l.startsWith("provapi"))).toBe(false);
   });
 
-  // cloud #264: the 2-minute tick runs no fleet; only the deploy's wake
-  // (queue()) does, so the tick never touches the fleet lease.
+  // cloud #264: the 2-minute tick runs no fleet; only queue() does, on the
+  // fleet's events, so the tick never touches the fleet lease.
   it("*/2: no fleet duty: the tick runs no fleet pass and leaves the fleet lease alone", async () => {
     const f = fakes();
     const lines = captureLogs(vi.spyOn);
@@ -254,7 +254,7 @@ describe("scheduled() and the provapi duties", () => {
     // The fleet ran (no target in this env) and gave its lease back.
     expect(lines).toEqual([
       "provapi fleet no_target",
-      "provapi fleet wake ok messages=2 retried=0 settled=1",
+      "provapi fleet wake ok messages=2 retried=0 again=0",
     ]);
     for (const l of lines) expect(l).toMatch(LINE);
     expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();

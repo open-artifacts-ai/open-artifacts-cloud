@@ -8,7 +8,7 @@ import { root, script } from "./stubs.ts";
 // fleet-wake-capable.sh (cloud #264): the deploy wakes the fleet and waits
 // for it only when the tag's scheduler consumes the env's fleet-wake queue.
 // An older tag (a recovery deploy of a release from before the wake) declares
-// none and never writes fleet_done: no wake and no 10-minute wait for it.
+// none and never writes fleet_done: no wake for it.
 const SCRIPT = script("fleet-wake-capable.sh");
 const REAL = readFileSync(join(root, "apps/scheduler/wrangler.jsonc"), "utf8");
 const ENV_TS = join(root, "scripts/ops/wrangler-env.ts");

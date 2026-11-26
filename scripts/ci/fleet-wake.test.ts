@@ -4,8 +4,10 @@ import { describe, expect, it } from "vitest";
 import { sandbox, script } from "./stubs.ts";
 
 // fleet-wake.sh (cloud #264): one message to the env's oa-<p>-fleet-wake once
-// the platform is marked verified. It is the fleet's only start, and still
-// every failure is one warning and exit 0, never a failed deploy.
+// the platform is marked verified. The wake is the rollout's first event, so
+// a wake not sent fails the step (exit 1, one ::error:: line); a failed
+// listing or post is retried with a backoff first (the Prover's #492 case:
+// a 503 must not exit 0).
 const SCRIPT = script("fleet-wake.sh");
 const TOK = "cfut_WAKE_token_never_printed_0123";
 const ACCT = "26ac346086d4405f7a976d48747a2a75";
@@ -16,6 +18,16 @@ const QID = "0123456789abcdef0123456789abcdef";
 const curl = `cfg="$(cat)"
 case "$cfg" in *"Bearer $TOK_EXPECT"*) ;; *) echo '{"success":false,"errors":[{"code":10000}]}'; exit 0 ;; esac
 [ -f "$STATE/net-fail" ] && exit 7
+# fail-n: the first n calls answer 503 (a failed call), then as usual.
+if [ -f "$STATE/fail-n" ]; then
+  n="$(cat "$STATE/fail-n")"
+  if [ "$n" -gt 0 ]; then
+    echo $((n - 1)) > "$STATE/fail-n"
+    echo "FAIL" >> "$STUB_LOG"
+    echo '{"success":false,"errors":[{"code":503,"message":"Service Unavailable"}]}'
+    exit 0
+  fi
+fi
 m=GET; body=""
 for ((i = 1; i <= $#; i++)); do
   case "\${!i}" in
@@ -52,6 +64,8 @@ const run = (
     pages?: readonly string[];
     post?: string;
     netFail?: boolean;
+    /** The first n calls answer a 503. */
+    failFirst?: number;
     args?: readonly string[];
     env?: Readonly<Record<string, string>>;
   } = {},
@@ -62,12 +76,15 @@ const run = (
     writeFileSync(join(sb.dir, `queues-${i + 1}.json`), p);
   if (o.post) writeFileSync(join(sb.dir, "post.json"), o.post);
   if (o.netFail) writeFileSync(join(sb.dir, "net-fail"), "");
+  if (o.failFirst) writeFileSync(join(sb.dir, "fail-n"), String(o.failFirst));
   const r = sb.run(["bash", SCRIPT, ...(o.args ?? ["prod", "v1.2.3"])], {
     env: {
       STATE: sb.dir,
       CLOUDFLARE_API_TOKEN: TOK,
       TOK_EXPECT: TOK,
       CLOUDFLARE_ACCOUNT_ID: ACCT,
+      // The backoff's base: no real wait in a test.
+      WAKE_RETRY_SLEEP: "0",
       ...o.env,
     },
   });
@@ -129,24 +146,40 @@ describe("fleet-wake.sh", () => {
   });
 
   const warned = (r: ReturnType<typeof run>, why: string) => {
-    expect(r.code, r.err).toBe(0);
-    expect(r.out).toContain("::warning::fleet wake not sent:");
+    expect(r.code, r.err).toBe(1);
+    expect(r.out).toContain("::error::fleet wake not sent:");
     expect(r.out).toContain(why);
-    expect(r.out).toContain(
-      "the fleet does not move until a later wake reaches the scheduler",
-    );
+    expect(r.out).not.toContain("fleet wake sent to");
   };
 
-  it("a failed post only warns, exit 0", () => {
+  it("a post that keeps failing is retried WAKE_TRIES times, then fails the step: never exit 0", () => {
     const r = run({
       post: '{"success":false,"errors":[{"code":10001,"message":"x"}]}',
     });
-    expect(r.posts).toHaveLength(1);
+    expect(r.posts).toHaveLength(5);
     warned(r, "posting to oa-p-fleet-wake failed");
+    expect(r.out).toContain("(try 5 of 5)");
     warned(run({ post: "not json" }), "unparsable response");
   });
 
-  it("no queue yet, two of them, a paged or failed listing, or no network: warns, posts nothing, exit 0", () => {
+  it("a 503 then a success: the backoff's retry sends it, exit 0 (the Prover's #492 case)", () => {
+    const r = run({ failFirst: 2 });
+    expect(r.code, r.err).toBe(0);
+    expect(r.log.filter((l) => l === "FAIL")).toHaveLength(2);
+    expect(r.posts).toHaveLength(1);
+    expect(r.out).toContain("try 2 of 5 in 0s");
+    expect(r.out).toContain("try 3 of 5 in 0s");
+    expect(r.out).toContain("fleet wake sent to oa-p-fleet-wake for v1.2.3");
+  });
+
+  it("a 503 on every call fails the step after its retries", () => {
+    const r = run({ failFirst: 99 });
+    expect(r.posts).toEqual([]);
+    warned(r, "listing the queues failed");
+    expect(r.out).toContain("(try 5 of 5)");
+  });
+
+  it("no queue yet, two of them, a paged or failed listing, or no network: posts nothing, fails the step", () => {
     for (const [o, why] of [
       [
         {
@@ -204,7 +237,7 @@ describe("fleet-wake.sh", () => {
     }
   });
 
-  it("bad inputs warn and exit 0 before any call", () => {
+  it("bad inputs fail the step before any call", () => {
     for (const [o, why] of [
       [{ args: ["dev", "v1.2.3"] }, "env must be staging or prod"],
       [{ args: ["prod", "1.2.3"] }, "the tag must be vX.Y.Z"],
@@ -212,6 +245,8 @@ describe("fleet-wake.sh", () => {
       [{ env: { CLOUDFLARE_ACCOUNT_ID: "nope" } }, "CLOUDFLARE_ACCOUNT_ID"],
       [{ env: { CLOUDFLARE_API_TOKEN: "" } }, "CLOUDFLARE_API_TOKEN"],
       [{ env: { CLOUDFLARE_API_TOKEN: 'a"b' } }, "CLOUDFLARE_API_TOKEN"],
+      [{ env: { WAKE_TRIES: "0" } }, "WAKE_TRIES"],
+      [{ env: { WAKE_RETRY_SLEEP: "1s" } }, "WAKE_RETRY_SLEEP"],
     ] as const) {
       const r = run(o);
       expect(

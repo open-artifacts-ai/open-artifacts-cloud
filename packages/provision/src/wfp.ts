@@ -69,10 +69,12 @@ import {
   ProvisionRetry,
 } from "./jobs.js";
 import {
+  assertNoHookBindings,
   assertSafeMigrations,
   assertUniqueBindings,
   epochBumpSql,
   googleNewlyEnabled,
+  isHookBinding,
   KNOWN_SECRETS,
   parseTemplate,
   scriptSubdomainSettings,
@@ -460,8 +462,9 @@ export function expectedSecretNames(o: {
  * 3. Non-secret bindings minus OWNER_EMAIL equal `sent`'s by (name, type);
  *    for plain_text and json, sha256 of the value equals the render's.
  * 4. Secret names equal expectedSecretNames(...) exactly, OPTIONAL_SECRETS aside.
- * 5. TEST_HOOK_KEY, TEST_HOOKS and TEST_DOMAIN absent unless testHooks
- *    (keyed on testHooks, not OA_ENV).
+ * 5. TEST_HOOK_KEY, TEST_HOOKS, TEST_DOMAIN and any name matching /hook/i
+ *    (public #3200's RL_HOOKS) absent unless testHooks (keyed on testHooks,
+ *    not OA_ENV).
  * 6. The release record's variant is `release` unless testHooks, and the
  *    install's do_migration_tag equals the template's last tag.
  */
@@ -518,7 +521,8 @@ export function verifyCleanProblems(
       other(`binding ${b.name} is a ${b.type} binding`);
   if (!v.testHooks)
     for (const n of [...live.secrets, ...live.bindings.map((b) => b.name)])
-      if (HOOK_NAMES.includes(n)) other(`${n} is set on a non-test install`);
+      if (HOOK_NAMES.includes(n) || isHookBinding(n))
+        other(`${n} is set on a non-test install`);
   const plain = (bs: readonly { name: string; type: string }[]) =>
     bs.filter((b) => !b.type.startsWith("secret") && b.name !== "OWNER_EMAIL");
   const key = (b: { name: string; type: string }) => `${b.name} (${b.type})`;
@@ -2300,9 +2304,11 @@ export class WfpProvisioner {
         rowKvId: row.kv_id,
         r2: names(id, this.env).r2,
         script,
-        planned: plannedBindings(o.template, row.rl_ns).filter(
-          (b) => o.kvId !== null || b.type !== "kv_namespace",
-        ),
+        planned: plannedBindings(
+          o.template,
+          row.rl_ns,
+          row.test_hooks === 1,
+        ).filter((b) => o.kvId !== null || b.type !== "kv_namespace"),
       });
       if (expired) return;
       await this.platform.audit(id, "verify_clean.binding_ids", {
@@ -2566,13 +2572,10 @@ export class WfpProvisioner {
     }
     // An update never drops the secrets already on the script.
     if (r.mode === "update") meta.keep_bindings = ["secret_text", "secret_key"];
-    if (
-      !m.testHooks &&
-      meta.bindings.some((x) =>
-        ["TEST_HOOKS", "TEST_HOOK_KEY", "TEST_DOMAIN"].includes(x.name),
-      )
-    )
-      throw new Error("hooks bindings on a non-test install");
+    // The production hook guard, on the full render: no binding named like a
+    // hook (TEST_HOOKS, TEST_HOOK_KEY, public #3200's RL_HOOKS) nor
+    // TEST_DOMAIN on a non-test install.
+    assertNoHookBindings(meta.bindings, m.testHooks);
     try {
       assertUniqueBindings(meta.bindings);
     } catch (e) {

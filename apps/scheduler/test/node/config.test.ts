@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { HOSTED_DOMAINS, NAMESPACES, platformNames } from "@oa/provision";
 import { describe, expect, it } from "vitest";
 import { HOSTED_BUS_LIFTED } from "../../../../tests/redline/src/bus-gate.ts";
-import { FLEET_WAKE_MAX_RETRIES } from "../../src/provapi/wake.js";
+import { FLEET_WAKE_MAX_RETRIES } from "../../src/provapi/wake.ts";
 
 const app = join(dirname(fileURLToPath(import.meta.url)), "../..");
 // Strip // and /* */ comments outside strings.
@@ -99,8 +99,7 @@ describe("wrangler.jsonc", () => {
       ]);
       // The signups duty's producer (src/provapi/signups.ts), this env's
       // queue only; and the consumer of this env's fleet wake (cloud #264,
-      // src/provapi/wake.ts): delivered at once, one batch at a time, and
-      // retried as many times as the wake counts on (the fleet's only start).
+      // src/provapi/wake.ts): delivered at once, one batch at a time.
       expect(e.queues).toEqual({
         producers: [{ binding: "SIGNUPS", queue: names.signups }],
         consumers: [
@@ -108,12 +107,12 @@ describe("wrangler.jsonc", () => {
             queue: names.fleetWake,
             max_batch_size: 10,
             max_batch_timeout: 0,
+            // The backoff's budget (wake.ts), pinned to the code's.
             max_retries: FLEET_WAKE_MAX_RETRIES,
             max_concurrency: 1,
           },
         ],
       });
-      expect(FLEET_WAKE_MAX_RETRIES).toBe(30);
       expect(names.fleetWake).toBe(
         env === "staging" ? "oa-s-fleet-wake" : "oa-p-fleet-wake",
       );

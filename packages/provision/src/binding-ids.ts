@@ -1,5 +1,5 @@
 import type { SettingsBinding } from "./cf.js";
-import type { Template } from "./metadata.js";
+import { isHookBinding, type Template } from "./metadata.js";
 
 // verify_clean compares bindings by name and type. This compares the real ids
 // a live script is bound to with values that don't come from the render being
@@ -31,8 +31,16 @@ export interface BindingIdExpect {
   planned: readonly PlannedBinding[];
 }
 
-/** The resource bindings a template declares, with this install's rl_ns. */
-export function plannedBindings(t: Template, rlNs: number): PlannedBinding[] {
+/**
+ * The resource bindings a template declares, with this install's rl_ns. A hook
+ * binding (RL_HOOKS) is planned only for a test-hook install, as rendered;
+ * the other ratelimits keep their rlNs + index slots either way.
+ */
+export function plannedBindings(
+  t: Template,
+  rlNs: number,
+  testHooks: boolean,
+): PlannedBinding[] {
   const names = (k: string, type: string) =>
     ((t[k] ?? []) as { binding: string }[]).map((e) => ({
       type,
@@ -57,7 +65,7 @@ export function plannedBindings(t: Template, rlNs: number): PlannedBinding[] {
       name: e.name,
       namespaceId: String(rlNs + k),
     })),
-  ];
+  ].filter((b) => testHooks || !isHookBinding(b.name));
 }
 
 /** Binding types that hold no reference to any resource. */
