@@ -79,15 +79,18 @@ const gateAnswer = (g: GateWorld = {}, path = "") => {
   if (path.includes("/commits?sha=main&path=PUBLIC_PIN&per_page=1"))
     return g.fail
       ? { code: 1, stdout: "", stderr: "HTTP 404" }
-      : { code: 0, stdout: `${PIN_COMMIT}\n`, stderr: "" };
-  const st = /\/actions\/workflows\/([^/]+)\/runs\?head_sha=(\w+)/.exec(path);
-  if (st) return out((g.stageRuns ?? {})[st[1] ?? ""] ?? []);
-  if (
-    /\/actions\/workflows\/deploy-hosted-platform\.yml\/runs\?event=workflow_dispatch&per_page=20/.test(
-      path,
-    )
-  )
-    return out([]);
+      : out({ sha: PIN_COMMIT, at: "2026-11-26T15:40:03Z" });
+  // The stages' "does this run's commit contain the pin" check, from the pin.
+  if (path.includes(`/compare/${PIN_COMMIT}...`))
+    return { code: 0, stdout: "ahead\n", stderr: "" };
+  const st = /\/actions\/workflows\/([^/]+)\/runs\?branch=main/.exec(path);
+  if (st) {
+    const r = ((g.stageRuns ?? {})[st[1] ?? ""] ?? []).map((x) => ({
+      h: PIN_COMMIT,
+      ...x,
+    }));
+    return out({ n: r.length, r });
+  }
   const m = /\/actions\/workflows\/([^/]+)\/runs\?status=([a-z_]+)/.exec(path);
   if (!m) return undefined;
   if (g.fail) return { code: 1, stdout: "", stderr: "HTTP 404" };
@@ -854,9 +857,16 @@ describe("pin-bump.yml", () => {
           // main's pin is not on prod, so the stages before the gate are read
           // (pin-bump-arm's stageSpent): none spent here.
           if (a.includes("commits?sha=main&path=PUBLIC_PIN"))
-            return { code: 0, stdout: `${"9".repeat(40)}\n`, stderr: "" };
-          if (a.includes("/runs?head_sha=") || a.includes("/runs?event="))
-            return { code: 0, stdout: "[]", stderr: "" };
+            return {
+              code: 0,
+              stdout: JSON.stringify({
+                sha: "9".repeat(40),
+                at: "2026-11-26T15:40:03Z",
+              }),
+              stderr: "",
+            };
+          if (a.includes("/runs?branch=main&"))
+            return { code: 0, stdout: '{"n":0,"r":[]}', stderr: "" };
           return { code: 1, stdout: "", stderr: `unexpected ${a}` };
         },
         "o/r",

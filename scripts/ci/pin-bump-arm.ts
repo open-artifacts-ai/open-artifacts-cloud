@@ -335,10 +335,10 @@ export function gateRejected(runs: GateRun[], tag: string): boolean {
  */
 export const RELEASE_RETRY_SPENT = 3;
 /**
- * The release-chain stages before the gate whose runs carry main's pin commit as
- * their head (a push to PUBLIC_PIN, then workflow_run): hosted-release builds and
+ * The release-chain stages before the gate, on main: hosted-release builds and
  * tags the release, hosted-publish publishes it, staging-release-chain dispatches
- * staging's deploy.
+ * staging's deploy. Their runs are matched to main's pin by the commit they built
+ * (one that contains the pin commit), not only the pin commit itself.
  */
 export const PRE_GATE_WORKFLOWS = [
   "hosted-release.yml",
@@ -721,50 +721,110 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
   };
 }
 
+/** Pages of 100 runs per stage to look through since main's pin landed (fail closed past it). */
+export const STAGE_PAGES = 10;
 const STAGE_JQ =
-  "[.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title}]";
+  "{n: (.workflow_runs | length), r: [.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title, h: .head_sha}]}";
+type ListedRun = StageRun & { h: string };
+const TAG_IN = /\bv\d+\.\d+\.\d+\b/;
+
+/**
+ * Every run of `wf` on main created since main's pin landed, newest first, through
+ * every page (up to STAGE_PAGES): a matching run can sit behind any number of
+ * unrelated ones. Throws on any error.
+ */
+function stageRuns(
+  exec: Exec,
+  repo: string,
+  wf: string,
+  since: string,
+  extra = "",
+): ListedRun[] {
+  const out: ListedRun[] = [];
+  for (let page = 1; page <= STAGE_PAGES; page++) {
+    const r = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/workflows/${wf}/runs?branch=main${extra}&created=%3E%3D${since}&per_page=100&page=${page}`,
+        "--jq",
+        STAGE_JQ,
+      ]),
+    ) as { n: number; r: ListedRun[] };
+    if (!Array.isArray(r.r) || !Number.isInteger(r.n))
+      throw new Error(`unreadable ${wf} runs`);
+    out.push(...r.r);
+    if (r.n < 100) return out;
+  }
+  throw new Error(`more than ${STAGE_PAGES} pages of ${wf} runs`);
+}
 
 /**
  * The first release-chain stage before the gate that is spent for main's pin
- * (stageSpent), or undefined. Small reads: the pin's commit, then one short list per
- * stage. Throws on any error.
+ * (stageSpent on its latest relevant run), or undefined. Relevant runs build what
+ * main's pin names, whatever commit started them: a run of a stage before the gate
+ * on main since the pin landed, at a commit that contains the pin commit (a hand
+ * dispatch from a later main builds the same tag, cloud #459), not a dry run, and
+ * naming no other tag; staging's deploy, by its title. Throws on any error.
  */
 function readDeadStage(
   exec: Exec,
   repo: string,
   tag: string,
 ): string | undefined {
-  const sha = gh(exec, [
-    "api",
-    `repos/${repo}/commits?sha=main&path=PUBLIC_PIN&per_page=1`,
-    "--jq",
-    ".[0].sha",
-  ]).trim();
-  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("no commit for main's pin");
-  for (const wf of PRE_GATE_WORKFLOWS) {
-    const runs = JSON.parse(
-      gh(exec, [
-        "api",
-        `repos/${repo}/actions/workflows/${wf}/runs?head_sha=${sha}&per_page=20`,
-        "--jq",
-        STAGE_JQ,
-      ]),
-    ) as StageRun[];
-    if (!Array.isArray(runs)) throw new Error(`unreadable ${wf} runs`);
-    if (stageSpent(runs)) return wf;
-  }
-  const title = stagingDeployTitle(tag);
-  const deploys = JSON.parse(
+  const pin = JSON.parse(
     gh(exec, [
       "api",
-      `repos/${repo}/actions/workflows/${PROD_DEPLOY_WORKFLOW}/runs?event=workflow_dispatch&per_page=20`,
+      `repos/${repo}/commits?sha=main&path=PUBLIC_PIN&per_page=1`,
       "--jq",
-      `[.workflow_runs[] | select(.display_title | startswith("${title}")) | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title}]`,
+      ".[0] | {sha: .sha, at: .commit.committer.date}",
     ]),
-  ) as StageRun[];
-  if (!Array.isArray(deploys))
-    throw new Error("unreadable staging deploy runs");
-  return stageSpent(deploys) ? "staging deploy" : undefined;
+  ) as { sha?: unknown; at?: unknown };
+  if (
+    typeof pin.sha !== "string" ||
+    !/^[0-9a-f]{40}$/.test(pin.sha) ||
+    typeof pin.at !== "string" ||
+    !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(pin.at)
+  )
+    throw new Error("no commit for main's pin");
+  const pinSha = pin.sha;
+  const since = pin.at;
+  // Whether a run's commit contains main's pin commit: one compare per commit.
+  const contains = new Map<string, boolean>([[pinSha, true]]);
+  const builds = (sha: string): boolean => {
+    const known = contains.get(sha);
+    if (known !== undefined) return known;
+    const status = gh(exec, [
+      "api",
+      `repos/${repo}/compare/${pinSha}...${sha}`,
+      "--jq",
+      ".status",
+    ]).trim();
+    if (!["identical", "ahead", "behind", "diverged"].includes(status))
+      throw new Error(`no comparison for ${sha}`);
+    const yes = status === "identical" || status === "ahead";
+    contains.set(sha, yes);
+    return yes;
+  };
+  for (const wf of PRE_GATE_WORKFLOWS) {
+    const latest = stageRuns(exec, repo, wf, since).find((r) => {
+      if (r.t.includes("(dry run)")) return false;
+      const named = TAG_IN.exec(r.t)?.[0];
+      if (named !== undefined && named !== tag) return false;
+      return /^[0-9a-f]{40}$/.test(r.h) && builds(r.h);
+    });
+    if (latest !== undefined && stageSpent([latest])) return wf;
+  }
+  const title = stagingDeployTitle(tag);
+  const deploy = stageRuns(
+    exec,
+    repo,
+    PROD_DEPLOY_WORKFLOW,
+    since,
+    "&event=workflow_dispatch",
+  ).find((r) => r.t.startsWith(title));
+  return deploy !== undefined && stageSpent([deploy])
+    ? "staging deploy"
+    : undefined;
 }
 
 const msg = (e: unknown) => String(e instanceof Error ? e.message : e);

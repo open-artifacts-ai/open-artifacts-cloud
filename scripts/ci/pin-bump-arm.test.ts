@@ -26,6 +26,7 @@ import {
   RELEASE_RETRY_SPENT,
   requiredChecks,
   run,
+  STAGE_PAGES,
   type StageRun,
   stageSpent,
 } from "./pin-bump-arm.ts";
@@ -37,6 +38,10 @@ const NEW = "a".repeat(40);
 const HEAD = "c".repeat(40);
 /** The main commit that set PUBLIC_PIN to v0.181.0. */
 const PIN_COMMIT = "9".repeat(40);
+/** When that commit landed: stage runs are read from then on. */
+const PIN_AT = "2026-11-26T15:40:03Z";
+/** A stage run as the fake lists it; h (its commit) defaults to PIN_COMMIT. */
+type Run = StageRun & { h?: string };
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
@@ -829,9 +834,11 @@ const fake = (
     /** The completed redline-staging runs, newest first. */
     gateRuns?: { t: string; c: string | null; a: number }[];
     /** Runs of each stage before the gate for main's pin commit, newest first. */
-    stageRuns?: Record<string, StageRun[]>;
+    stageRuns?: Record<string, Run[]>;
+    /** compare/<pin>...<sha> status per sha (default ahead: it contains the pin). */
+    compare?: Record<string, string>;
     /** Dispatched deploy runs titled as staging's chain deploy of main's pin. */
-    stagingDeploys?: StageRun[];
+    stagingDeploys?: Run[];
     tagSha?: string;
     queue?: QueueRun[];
     headAt?: string;
@@ -848,23 +855,30 @@ const fake = (
     if (o.notFound?.some((n) => a.includes(n)))
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
     if (a.includes("commits?sha=main&path=PUBLIC_PIN&per_page=1"))
-      return ok(o.junkCount ? "oops" : PIN_COMMIT);
-    const st =
-      /actions\/workflows\/([\w.-]+)\/runs\?head_sha=(\w+)&per_page=20/.exec(a);
-    if (st) {
-      expect(st[2]).toBe(PIN_COMMIT);
-      expect(a).toContain("--jq");
-      return ok(JSON.stringify(o.stageRuns?.[st[1] as string] ?? []));
-    }
-    if (
-      a.includes(
-        "deploy-hosted-platform.yml/runs?event=workflow_dispatch&per_page=20",
-      )
-    ) {
-      expect(a).toContain(
-        'startswith("deploy-hosted-platform staging v0.181.0 [sc")',
+      return ok(
+        o.junkCount ? "oops" : JSON.stringify({ sha: PIN_COMMIT, at: PIN_AT }),
       );
-      return ok(JSON.stringify(o.stagingDeploys ?? []));
+    const cmp = /\/compare\/(\w+)\.\.\.(\w+) /.exec(a);
+    if (cmp) {
+      expect(cmp[1]).toBe(PIN_COMMIT);
+      return ok(`${o.compare?.[cmp[2] as string] ?? "ahead"}\n`);
+    }
+    const st =
+      /actions\/workflows\/([\w.-]+)\/runs\?branch=main(&event=workflow_dispatch)?&created=%3E%3D(\S+)&per_page=100&page=(\d+)/.exec(
+        a,
+      );
+    if (st) {
+      expect(st[3]).toBe(PIN_AT);
+      expect(a).toContain("--jq");
+      const deploy = st[1] === "deploy-hosted-platform.yml";
+      expect(Boolean(st[2])).toBe(deploy);
+      const all =
+        (deploy ? o.stagingDeploys : o.stageRuns?.[st[1] as string]) ?? [];
+      const page = Number(st[4]);
+      const r = all
+        .slice((page - 1) * 100, page * 100)
+        .map((x) => ({ h: PIN_COMMIT, ...x }));
+      return ok(JSON.stringify({ n: r.length, r }));
     }
     const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
     if (wr) {
@@ -1589,6 +1603,103 @@ describe("the release gate in run", () => {
       }),
     );
     expect(r.armed).toEqual([]);
+  });
+  // The Prover's replay on #506 (cloud #459's v0.246.1 pattern): a hand dispatch
+  // of hosted-release from a later main builds the same tag. Its run, not the pin
+  // commit's, is the latest relevant one.
+  it("a newer hosted-release building the same tag from a later main commit, still running, keeps the hold", () => {
+    const later = "8".repeat(40);
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("in_progress", null, 1), h: later },
+            hr("completed", "failure", 3),
+          ],
+        },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    // ... and its own spent failure releases it.
+    const spent = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("completed", "failure", 3), h: later },
+          ],
+        },
+      }),
+    );
+    expect(spent.armed).toEqual([7]);
+  });
+  it("a run at a commit without main's pin (another tag's build) is not relevant", () => {
+    const old = "7".repeat(40);
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        compare: { [old]: "behind" },
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("in_progress", null, 1), h: old },
+            hr("completed", "failure", 3),
+          ],
+          "hosted-publish.yml": [
+            hr("in_progress", null, 1, "hosted-publish staging v0.180.0 [x1]"),
+          ],
+        },
+      }),
+    );
+    expect(r.armed).toEqual([7]);
+  });
+  // The Prover's other replay: the spent staging deploy sat at list position 21,
+  // behind unrelated dispatches. Every page since the pin landed is read.
+  it("a spent staging deploy behind 100 or more unrelated dispatches still releases the hold", () => {
+    const other = (i: number) =>
+      hr(
+        "completed",
+        "success",
+        1,
+        `deploy-hosted-platform prod v0.180.0 [c${i}-1]`,
+      );
+    for (const before of [19, 20, 100, 150]) {
+      const r = go(
+        "arm",
+        fake({
+          prodDone: false,
+          stagingDeploys: [
+            ...Array.from({ length: before }, (_, i) => other(i)),
+            hr(
+              "completed",
+              "failure",
+              3,
+              "deploy-hosted-platform staging v0.181.0 [sc45000000001-1]",
+            ),
+          ],
+        }),
+      );
+      expect(r.armed, String(before)).toEqual([7]);
+    }
+  });
+  it("past STAGE_PAGES pages of runs it fails closed: not arming", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": Array.from({ length: 100 * STAGE_PAGES }, () =>
+            hr("completed", "success", 1),
+          ),
+        },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/cannot read the release pipeline/);
   });
   it("an unreadable pin commit means not arming", () => {
     const r = go(
