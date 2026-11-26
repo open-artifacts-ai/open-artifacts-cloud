@@ -10,7 +10,8 @@
 // ledger, as before #3200: a wrong or absent hook key is still charged to
 // RL_ANON (30 a minute), and the guard's wrong-key probe and the R26 key poll
 // rely on that margin (live/guard.test.ts), as do the RL_ANON keys rl-anon.ts
-// paces and the hook audit log's newest-200 cap (test/t19-isolation.test.ts).
+// paces and the suite's share of the hook audit log's newest-200 read
+// (test/t19-isolation.test.ts).
 // The cap is the ledger's own `reserve`, so no wait is added here.
 //
 // TODO(public #3200): once PUBLIC_PIN is at or past the release with #3200,
@@ -60,9 +61,6 @@ if (HELD < 0)
 
 /** True for the pre-#3200 ledger: a full claim waits; from #3200 it throws at once. */
 export const ledgerWaits = L.RL_HOOKS_LIMIT === undefined;
-
-/** The ledger's own cap per HOOK_WINDOW_MS: T19 claims up to it (25 before #3200, 570 from it). */
-export const LEDGER_HOOK_LIMIT = L.HOOK_LIMIT;
 
 /** T19's spread before #3200 (one call per HOOK_GAP_MS); undefined from #3200, which dropped it. */
 export const T19_HOOK_GAP_MS: number | undefined = L.HOOK_GAP_MS;

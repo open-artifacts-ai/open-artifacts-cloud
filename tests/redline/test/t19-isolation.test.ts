@@ -2,7 +2,6 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  LEDGER_HOOK_LIMIT,
   SUITE_HOOK_LIMIT,
   T19_HOOK_GAP_MS,
 } from "../src/hook-ledger-compat.ts";
@@ -111,6 +110,20 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
       for (const f of readdirSync(join(root, dir, d)))
         if (f.endsWith(".ts")) out.push(join(dir, d, f));
     return out;
+  };
+  /** T19's one hook sender (rl-a/fixtures.ts post) sets its run tag on every call. */
+  const t19TagsItsRows = (): boolean => {
+    const fx = read(`${dir}/rl-a/fixtures.ts`);
+    const post = fx.slice(
+      fx.indexOf("const post = "),
+      fx.indexOf("export async function hookRes("),
+    );
+    return (
+      /\[TEST_RUN_HEADER\]: `t19-\$\{RUN\}`,/.test(post) &&
+      /return post\(path, body, \{ authorization: `Bearer \$\{KEY\}` \}\);/.test(
+        fx,
+      )
+    );
   };
 
   it("calls five hooks only: session, oauthClient (the p5-oauth member's grant, #2285), codeCapsReset (its own IP's caps), otpLatest and peoplePurge (t19- people only, #2680)", () => {
@@ -230,23 +243,81 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     );
     // Before public #3200, T19 paced every hook call to one per HOOK_GAP_MS
     // (hook-pace.ts): in the longest window a case can wait (the wait budget)
-    // it adds at most this many rows. From #3200 T19 has no spread, only the
-    // ledger's own cap (LEDGER_HOOK_LIMIT a minute). The suite's own rl-a
-    // calls are capped at SUITE_HOOK_LIMIT a minute (src/hook-ledger-compat.ts).
+    // it adds at most this many rows. From #3200 T19 has no spread, but tags
+    // every hook call (x-oa-test-run), and the suite's untagged read leaves
+    // tagged rows out (the next case pins how), so T19 adds none. The suite's
+    // own rl-a calls are capped at SUITE_HOOK_LIMIT a minute
+    // (src/hook-ledger-compat.ts).
     // TODO(public #3200): drop the HOOK_GAP_MS branch with the compat module.
     const windowS = (WAIT_BUDGET_MS + 60_000) / 1000;
     if (T19_HOOK_GAP_MS !== undefined)
       expect(T19_HOOK_GAP_MS).toBeGreaterThanOrEqual(2400);
+    else expect(t19TagsItsRows()).toBe(true);
     const t19Rows =
       T19_HOOK_GAP_MS !== undefined
         ? Math.ceil((windowS * 1000) / T19_HOOK_GAP_MS) + 1
-        : Math.ceil(windowS / 60) * LEDGER_HOOK_LIMIT;
+        : 0;
     const suiteRows = Math.ceil(windowS / 60) * SUITE_HOOK_LIMIT;
     expect(
       t19Rows + suiteRows,
       `T19 (${t19Rows}) and the suite (${suiteRows}) can write more hook audit rows in a case's window than the newest ${limit} a case reads`,
     ).toBeLessThan(limit);
   });
+
+  // From public #3200: T19's hook rows carry its run tag, and the suite's
+  // audit read (no `run`) returns only untagged rows. Before #3200 there is no
+  // tag and the spread above bounds T19's rows instead.
+  it.runIf(T19_HOOK_GAP_MS === undefined)(
+    "the hook audit log: T19 tags every hook call, and the suite's read leaves tagged rows out",
+    () => {
+      const shared = read("packages/shared/src/hosted/test-hooks.ts");
+      expect(shared).toMatch(/export const TEST_RUN_HEADER = "x-oa-test-run";/);
+      expect(shared).toMatch(
+        /export const TEST_RUN_TAG = \/\^\[A-Za-z0-9_-\]\{1,40\}\$\/;/,
+      );
+      // The server: a tag only from a call whose key verified, stored in the
+      // row's detail, and the read filters on it (null: untagged rows only).
+      const hooks = read("apps/server/src/test-hooks/index.ts");
+      expect(hooks).toMatch(
+        /const run = keyed && TEST_RUN_TAG\.test\(tag\) \? tag : undefined;/,
+      );
+      expect(hooks).toMatch(
+        /if \(o\.run !== undefined\) detail\.run = o\.run;/,
+      );
+      expect(hooks).toMatch(/and json_extract\(detail, '\$\.run'\) is \?3/);
+      expect(hooks).toMatch(/input\.data\.run \?\? null/);
+      // T19: its one hook sender sets the tag; RUN is 6 hex (so t19-<RUN>
+      // fits TEST_RUN_TAG); every hook it calls goes through that sender.
+      expect(t19TagsItsRows()).toBe(true);
+      const fx = read(`${dir}/rl-a/fixtures.ts`);
+      expect(fx).toMatch(
+        /process\.env\.T19_RUN \?\?= randomBytes\(3\)\.toString\("hex"\);/,
+      );
+      expect(read("apps/dashboard/playwright.staging.config.ts")).toMatch(
+        /process\.env\.T19_RUN \?\?= randomBytes\(3\)\.toString\("hex"\);/,
+      );
+      for (const f of t19Files()) {
+        const t = read(f);
+        // A hook name is only ever handed to hook()/hookRes() (fixtures.ts).
+        for (const m of t.matchAll(/(\w+)(?:<[^>]*>)?\(\s*TEST_HOOKS\.\w+/g))
+          expect(["hook", "hookRes"], `${f}: ${m[0]}`).toContain(m[1]);
+        // No T19 file but fixtures.ts sends a request to a /__test/ path.
+        if (!f.endsWith("rl-a/fixtures.ts"))
+          expect(t, f).not.toMatch(/fetch\([^)]*__test/);
+      }
+      // The suite reads untagged rows only (no `run`) and never tags its own.
+      for (const f of ["src/audit.ts", "src/capture.ts"])
+        expect(read(`tests/redline/${f}`), f).toMatch(
+          /call\(t, AUDIT_HOOK, \{ since \}\)/,
+        );
+      for (const d of ["src", "live"])
+        for (const f of readdirSync(join(root, "tests/redline", d)))
+          if (f.endsWith(".ts"))
+            expect(read(`tests/redline/${d}/${f}`), `${d}/${f}`).not.toMatch(
+              /x-oa-test-run|TEST_RUN_HEADER/,
+            );
+    },
+  );
 
   it("T19's own hook budget is its runner's: the ledger is per runner (tmpdir), so the suite's ledger never counts T19's calls (the two runners' IPs differing is an assumption: the guard's wrong-key case no longer relies on it)", () => {
     const ledger = read(`${dir}/hook-ledger.ts`);
