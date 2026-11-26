@@ -109,23 +109,59 @@ describe("release-stages.json", () => {
     expect(f?.todo).toMatch(/fleet/);
     expect(f?.todo).toMatch(/no admin reads/);
   });
-  it("e2eWorst is the sum of the measured PR-mode budgets", () => {
-    const sum = config.stages
-      .filter((s) => s.measured !== false && s.mode !== "direct")
-      .reduce((a, s) => a + s.budget, 0);
-    expect(config.e2eWorst).toBe(sum);
+  it("alerts past twice each stage's usual time; merge to every install only has a 20 min target", () => {
+    expect(config.alertFactor).toBe(2);
+    expect(config.e2eTarget).toBe(20);
+    expect(config).not.toHaveProperty("e2eWorst");
+    for (const s of config.stages) {
+      expect(s, s.name).not.toHaveProperty("budget");
+      if (s.measured !== false) expect(s.usual, s.name).toBeGreaterThan(0);
+    }
   });
-  it("refuses a stage with no budget", () => {
+  it("the usual times are the medians the note cites, release by release", () => {
+    const raw = JSON.parse(read(".github/hosted/release-stages.json")) as {
+      notes: string[];
+    };
+    const v: Record<string, number[]> = {};
+    for (const n of raw.notes.filter((x) => x.startsWith("Measured v")))
+      for (const m of n.matchAll(/(\w+) (\d+(?:\.\d+)?)(?: \(|,|\.$)/g)) {
+        const k = m[1] as string;
+        v[k] = [...(v[k] ?? []), Number(m[2])];
+      }
+    const median = (xs: number[]) => {
+      const s = [...xs].sort((a, b) => a - b);
+      const h = Math.floor(s.length / 2);
+      return s.length % 2
+        ? s[h]
+        : ((s[h - 1] as number) + (s[h] as number)) / 2;
+    };
+    expect(raw.notes.filter((x) => x.startsWith("Measured v"))).toHaveLength(
+      22,
+    );
+    for (const s of config.stages.filter(
+      (x) => x.measured !== false && x.name !== "direct_pin",
+    ))
+      expect(median(v[s.name] ?? []), s.name).toBeCloseTo(s.usual as number, 2);
+  });
+  it("refuses a measured stage with no usual time, and a missing alert factor", () => {
     expect(() =>
       loadConfig(
         JSON.stringify({ stages: [{ name: "x", from: "a", to: "b" }] }),
       ),
     ).toThrow(/bad stage/);
+    expect(() =>
+      loadConfig(
+        JSON.stringify({
+          e2eTarget: 20,
+          stages: [{ name: "x", from: "a", to: "b", usual: 1 }],
+        }),
+      ),
+    ).toThrow(/alertFactor/);
   });
 });
 
 describe("timeline on the recorded chain", () => {
-  it("v0.245.1, the full chain within budget: every stage timed, no issue", () => {
+  it("v0.245.1, the full chain within its usual times: every stage timed, no issue", () => {
     const now = T("19:50:00");
     const t = tl("v0.245.1", now);
     expect(t?.mode).toBe("pr");
@@ -150,7 +186,7 @@ describe("timeline on the recorded chain", () => {
     expect(issuePlan([], w.over, w.red)).toEqual({ action: "none" });
   });
 
-  it("staging_deploy over budget mid-flight opens the blocker naming the stage", () => {
+  it("staging_deploy past twice its usual time mid-flight opens the blocker naming the stage and release", () => {
     const now = T("19:30:00");
     const w = at(now);
     w.runs = w.runs
@@ -168,7 +204,8 @@ describe("timeline on the recorded chain", () => {
         kind: "in_flight",
         startedAt: T("19:20:12"),
         minutes: 9.8,
-        budget: 7,
+        usual: 4.75,
+        limit: 9.5,
         url: expect.stringContaining("/actions/runs/"),
       },
     ]);
@@ -177,13 +214,14 @@ describe("timeline on the recorded chain", () => {
       stage: "staging_deploy",
       state: "current",
       elapsed: 9.8,
-      budget: 7,
+      usual: 4.75,
+      limit: 9.5,
     });
     const a = issuePlan([], r.over, r.red);
     expect(a.action).toBe("create");
     if (a.action === "create")
       expect(a.body).toContain(
-        "- v0.245.1 staging_deploy: still going, budget 7 min, started 2026-11-25T19:20:12Z.",
+        "- v0.245.1 staging_deploy: still going past 9.5 min (usual 4.75 min), started 2026-11-25T19:20:12Z.",
       );
   });
 
@@ -195,7 +233,7 @@ describe("timeline on the recorded chain", () => {
     expect(r.over.map((o) => [o.tag, o.stage, o.minutes])).toEqual([
       ["v0.245.1", "pin_open", 4.5],
     ]);
-    // With the PR there, the release has moved on and is within budget.
+    // With the PR there, the release has moved on and nothing is stuck.
     expect(world(now).over).toEqual([]);
   });
 
@@ -221,9 +259,14 @@ describe("timeline on the recorded chain", () => {
         url: expect.stringContaining("/actions/runs/"),
       },
     ]);
-    // Not its stage and not its e2e (139 min since the merge): the red run's blocker covers it.
-    expect(r.over).toEqual([]);
-    expect(issuePlan([], r.over, r.red)).toEqual({ action: "none" });
+    // The red stage is no overrun: the red run's blocker covers it. Its
+    // finished stages past twice their usual time still are (93 min to tag,
+    // 37.6 min to merge the pin PR).
+    expect(r.over.map((o) => [o.stage, o.kind, o.minutes])).toEqual([
+      ["tag", "finished", 93],
+      ["pin_merge", "finished", 37.6],
+    ]);
+    expect(issuePlan([], [], r.red)).toEqual({ action: "none" });
     expect(issueBody(r.over, r.red)).toContain(
       "Red, covered by that run's own blocker issue:\n- v0.246.1 hosted_release: https://",
     );
@@ -429,8 +472,10 @@ describe("percentiles, history and ETA", () => {
   it("stats take the newest statsWindow releases by tag", () => {
     const h = Array.from({ length: 25 }, (_, i) => entry(i, i));
     const s = stats(h, config);
-    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, budget: 14 });
-    expect(s.stages.tag).toEqual({ p50: null, p90: null, n: 0, budget: 6 });
+    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, usual: 9.9 });
+    expect(s.stages.tag).toEqual({ p50: null, p90: null, n: 0, usual: 18.2 });
+    expect(s.e2e).not.toHaveProperty("worst");
+    expect(s.e2e.target).toBe(20);
     expect(s.e2e).toMatchObject({ p50: 140, p90: 220, n: 20 });
     expect(s.e2e.last20).toHaveLength(20);
   });
@@ -491,9 +536,9 @@ describe("percentiles, history and ETA", () => {
       p50: "2026-11-25T19:44:12.000Z",
       p90: "2026-11-25T19:44:12.000Z",
     });
-    // No samples: budgets. (7 - 2) + 2 + 14 + 5 + 8 = 34 min.
+    // No samples: usual times. (4.75 - 2) + 0.5 + 9.9 + 3 + 5.1 = 21.25 min.
     expect(eta(t as never, stats([], config).stages, now)?.p50).toBe(
-      "2026-11-25T19:56:12.000Z",
+      "2026-11-25T19:43:27.000Z",
     );
     // A current stage past its figure leaves nothing of it, never less.
     const late = T("19:40:12");
@@ -511,7 +556,7 @@ describe("percentiles, history and ETA", () => {
   });
 });
 
-describe("the over-budget issue", () => {
+describe("the stuck-stage issue", () => {
   const over = overruns(
     [
       {
@@ -521,7 +566,7 @@ describe("the over-budget issue", () => {
         stages: [
           {
             name: "tag",
-            budget: 6,
+            usual: 6,
             startedAt: T("09:58:00"),
             endedAt: T("10:00:00"),
             minutes: 2,
@@ -529,7 +574,7 @@ describe("the over-budget issue", () => {
           },
           {
             name: "pin_open",
-            budget: 4,
+            usual: 4,
             startedAt: T("10:00:00"),
             minutes: 9,
             state: "current",
@@ -538,9 +583,8 @@ describe("the over-budget issue", () => {
       },
     ],
     config,
-    T("10:09:00"),
   );
-  it("an in-flight stage past its budget is an overrun", () => {
+  it("an in-flight stage past twice its usual time is an overrun", () => {
     expect(over.over).toEqual([
       {
         tag: "v1.0.0",
@@ -548,12 +592,79 @@ describe("the over-budget issue", () => {
         kind: "in_flight",
         startedAt: T("10:00:00"),
         minutes: 9,
-        budget: 4,
+        usual: 4,
+        limit: 8,
         url: undefined,
       },
     ]);
   });
-  it("the newest finished release's overruns keep it open until a release is within budget", () => {
+  it("an in-flight stage at exactly twice its usual time is not stuck yet", () => {
+    const at8 = overruns(
+      [
+        {
+          tag: "v1.0.0",
+          mode: "pr",
+          publishedAt: T("10:00:00"),
+          stages: [
+            {
+              name: "pin_open",
+              usual: 4,
+              startedAt: T("10:00:00"),
+              minutes: 8,
+              state: "current",
+            },
+          ],
+        },
+      ],
+      config,
+    );
+    expect(at8.over).toEqual([]);
+  });
+  it("a finished stage past twice its usual time stays an overrun while its release is in flight", () => {
+    const r = overruns(
+      [
+        {
+          tag: "v1.0.0",
+          mode: "pr",
+          publishedAt: T("10:00:00"),
+          stages: [
+            {
+              name: "hosted_release",
+              usual: 3.2,
+              startedAt: T("10:00:00"),
+              endedAt: T("11:18:24"),
+              minutes: 78.4,
+              state: "done",
+            },
+            {
+              name: "staging_publish",
+              usual: 4.2,
+              startedAt: T("11:18:24"),
+              minutes: 1,
+              state: "current",
+            },
+          ],
+        },
+      ],
+      config,
+    );
+    expect(r.over).toEqual([
+      {
+        tag: "v1.0.0",
+        stage: "hosted_release",
+        kind: "finished",
+        startedAt: T("10:00:00"),
+        minutes: 78.4,
+        usual: 3.2,
+        limit: 6.4,
+        url: undefined,
+      },
+    ]);
+    expect(issueBody(r.over, [])).toContain(
+      "- v1.0.0 hosted_release: took 78.4 min (usual 3.2 min, limit 6.4 min).",
+    );
+  });
+  it("the newest finished release's overruns keep it open until a release completes with none; its total never alerts", () => {
     const done = {
       tag: "v1.0.0",
       mode: "pr" as const,
@@ -563,7 +674,7 @@ describe("the over-budget issue", () => {
       stages: [
         {
           name: "redline",
-          budget: 14,
+          usual: 14,
           startedAt: T("10:00:00"),
           endedAt: T("11:30:00"),
           minutes: 90,
@@ -571,26 +682,21 @@ describe("the over-budget issue", () => {
         },
       ],
     };
-    expect(
-      overruns([done], config, T("12:00:00")).over.map((o) => [
-        o.kind,
-        o.stage,
-      ]),
-    ).toEqual([
-      ["last_release", "redline"],
-      ["last_release", "e2e"],
-    ]);
+    expect(overruns([done], config).over.map((o) => [o.kind, o.stage])).toEqual(
+      [["finished", "redline"]],
+    );
     const newer = {
       ...done,
       tag: "v1.0.1",
       e2e: 30,
       stages: [{ ...done.stages[0], minutes: 10 }],
     };
+    // 300 min from merge, far past the 20 min target: reported, not alerted.
     expect(
-      overruns([done, newer as never], config, T("12:00:00")).over,
+      overruns([done, { ...newer, e2e: 300 } as never], config).over,
     ).toEqual([]);
   });
-  it("creates once, edits only on a change, closes when within budget", () => {
+  it("creates once, edits only on a change, closes when nothing is stuck", () => {
     const body = issueBody(over.over, []);
     expect(issuePlan([], over.over, [])).toEqual({ action: "create", body });
     const open = [
@@ -628,7 +734,7 @@ describe("the over-budget issue", () => {
           stages: [
             {
               name: "pin_open",
-              budget: 4,
+              usual: 4,
               startedAt: T("10:00:00"),
               minutes: 14,
               state: "current",
@@ -637,7 +743,6 @@ describe("the over-budget issue", () => {
         },
       ],
       config,
-      T("10:14:00"),
     );
     expect(issueBody(later.over, [])).toBe(issueBody(over.over, []));
   });
@@ -785,6 +890,13 @@ describe("tick reads", () => {
     expect(r.history.map((h) => h.tag)).toEqual(["v0.245.0", "v0.245.1"]);
     expect(r.history[1]?.e2e).toBe(45.8);
     expect(summary(r.current)).toContain("No release in flight.");
+    expect(summary(r.current)).toContain(
+      "### Merge to every install, target 20 min",
+    );
+    expect(summary(r.current)).toContain("| v0.245.1 | 45.8 | 25.8 over |");
+    expect(summary(r.current)).toContain(
+      "| staging_deploy | 5.1 | 5.1 | 1 | 4.75 | 9.5 |",
+    );
     expect(summary(r.current)).toContain("Not measured: fleet");
   });
 
@@ -852,7 +964,7 @@ describe("tick reads", () => {
       publishedAt: T("18:20:00"),
       doneAt: T("19:06:00"),
       e2e: 10,
-      stages: { tag: (tag?.budget ?? 0) + 5 },
+      stages: { tag: (tag?.usual ?? 0) * 2 + 5 },
     };
     const r = compute({
       releases: [{ tag: "v0.245.1", publishedAt: T("18:20:00") }],
@@ -864,7 +976,7 @@ describe("tick reads", () => {
       now: "2026-11-26T09:00:00Z",
     });
     expect(r.over.map((o) => [o.tag, o.stage, o.kind])).toEqual([
-      ["v0.245.1", "tag", "last_release"],
+      ["v0.245.1", "tag", "finished"],
     ]);
   });
 

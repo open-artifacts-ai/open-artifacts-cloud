@@ -1,7 +1,8 @@
 # Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
 # takes, stage by stage (.github/hosted/release-stages.json), and one `blocker`
-# issue "release over budget" while a release is over a stage's budget or past
-# e2eWorst. It gates nothing: it runs beside the chain, on workflow_run and a
+# issue "release stage stuck" while a stage runs past twice its usual time.
+# Merge to every install is reported against a 20 min target, never alerted
+# on. It gates nothing: it runs beside the chain, on workflow_run and a
 # schedule, so it is never a check on any PR and must never be made required.
 #
 # - Stateless: each run rebuilds every recent release's timeline from GitHub

@@ -1,6 +1,8 @@
 // Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
-// takes, stage by stage, against a budget, and one `blocker` issue while a
-// release is over budget. It gates nothing and is never a required check.
+// takes, stage by stage, against each stage's usual time, and one `blocker`
+// issue while a stage runs past twice its usual time (alertFactor). Merge to
+// every install is reported against e2eTarget, never alerted on. It gates
+// nothing and is never a required check.
 //
 // Stateless: each tick rebuilds every recent release's timeline from GitHub
 // timestamps, so a dropped or replaced tick loses nothing. The stages are data
@@ -32,7 +34,7 @@ import { pathToFileURL } from "node:url";
 import { type Exec, gh } from "./gh-retry.ts";
 import { BRANCH_PREFIX, compareTags, PUBLIC_REPO } from "./pin-bump.ts";
 
-export const ISSUE_TITLE = "release over budget";
+export const ISSUE_TITLE = "release stage stuck";
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const MIN = 60_000;
 
@@ -40,15 +42,18 @@ export type Stage = {
   name: string;
   from: string;
   to: string;
-  budget: number;
+  /** Minutes: the stage's median over the measured releases. Unset only when not measured. */
+  usual?: number;
   mode?: "pr" | "direct";
   measured?: boolean;
   todo?: string;
 };
 export type Config = {
   pinMode: "pr" | "direct";
+  /** A stage past alertFactor x its usual time opens the issue. */
+  alertFactor: number;
+  /** Merge to every install, minutes: reported, never alerted on. */
   e2eTarget: number;
-  e2eWorst: number;
   lookbackHours: number;
   statsWindow: number;
   historySize: number;
@@ -88,7 +93,7 @@ export type Step = {
 };
 export type StageRow = {
   name: string;
-  budget: number;
+  usual: number;
   startedAt?: string;
   endedAt?: string;
   minutes?: number;
@@ -121,11 +126,14 @@ export type HistoryEntry = {
 export type Overrun = {
   tag: string;
   stage: string;
-  kind: "in_flight" | "last_release";
+  /** in_flight: the stage is still going; finished: it ended past the limit. */
+  kind: "in_flight" | "finished";
   /** Unknown for a finished release read back from history. */
   startedAt?: string;
   minutes: number;
-  budget: number;
+  usual: number;
+  /** alertFactor x usual. */
+  limit: number;
   url?: string;
 };
 export type Red = { tag: string; stage: string; url?: string };
@@ -280,11 +288,11 @@ export function timeline(o: {
         ? (merged ?? pr[pr.length - 1])?.url
         : undefined);
     if (current) {
-      rows.push({ name: s.name, budget: s.budget, state: "pending" });
+      rows.push({ name: s.name, usual: s.usual as number, state: "pending" });
     } else if (from && to) {
       rows.push({
         name: s.name,
-        budget: s.budget,
+        usual: s.usual as number,
         startedAt: from,
         endedAt: to,
         minutes: mins(from, to),
@@ -295,7 +303,7 @@ export function timeline(o: {
       // Ended, start unknown (no previous tag to date the merge): done, untimed.
       rows.push({
         name: s.name,
-        budget: s.budget,
+        usual: s.usual as number,
         endedAt: to,
         state: "done",
         url,
@@ -304,7 +312,7 @@ export function timeline(o: {
       current = true;
       rows.push({
         name: s.name,
-        budget: s.budget,
+        usual: s.usual as number,
         startedAt: from,
         minutes: mins(from, o.now),
         state: owner?.state === "red" ? "red" : "current",
@@ -312,7 +320,7 @@ export function timeline(o: {
       });
     } else {
       current = true;
-      rows.push({ name: s.name, budget: s.budget, state: "pending" });
+      rows.push({ name: s.name, usual: s.usual as number, state: "pending" });
     }
   }
   const last = rows[rows.length - 1];
@@ -402,7 +410,7 @@ export function pct(values: number[], p: number): number | null {
 
 export type Stats = Record<
   string,
-  { p50: number | null; p90: number | null; n: number; budget: number }
+  { p50: number | null; p90: number | null; n: number; usual: number }
 >;
 /** Pure: p50/p90 per stage and e2e over the newest `statsWindow` finished releases. */
 export function stats(history: HistoryEntry[], config: Config) {
@@ -419,7 +427,7 @@ export function stats(history: HistoryEntry[], config: Config) {
       p50: pct(v, 50),
       p90: pct(v, 90),
       n: v.length,
-      budget: s.budget,
+      usual: s.usual as number,
     };
   }
   // A superseded release's e2e waited on a newer one: it is real wait, kept.
@@ -433,7 +441,6 @@ export function stats(history: HistoryEntry[], config: Config) {
       p90: pct(e, 90),
       n: e.length,
       target: config.e2eTarget,
-      worst: config.e2eWorst,
       last20: recent
         .filter((x) => typeof x.e2e === "number")
         .slice(-20)
@@ -445,7 +452,7 @@ export function stats(history: HistoryEntry[], config: Config) {
 /**
  * Pure: when an in-flight release should be done, at p50 and p90. The current
  * stage takes what is left of its own figure (never less than zero), each later
- * stage its whole figure; a stage with no samples yet uses its budget. A red
+ * stage its whole figure; a stage with no samples yet uses its usual time. A red
  * stage waits for a person: no ETA.
  */
 export function eta(
@@ -457,33 +464,56 @@ export function eta(
   if (i < 0) return null;
   const cur = t.stages[i] as StageRow;
   if (cur.state === "red") return null;
-  const fig = (name: string, k: "p50" | "p90", budget: number) =>
-    st[name]?.[k] ?? budget;
+  const fig = (name: string, k: "p50" | "p90", usual: number) =>
+    st[name]?.[k] ?? usual;
   const left = (k: "p50" | "p90") => {
     const elapsed = cur.state === "current" ? (cur.minutes ?? 0) : 0;
-    let m = Math.max(0, fig(cur.name, k, cur.budget) - elapsed);
-    for (const s of t.stages.slice(i + 1)) m += fig(s.name, k, s.budget);
+    let m = Math.max(0, fig(cur.name, k, cur.usual) - elapsed);
+    for (const s of t.stages.slice(i + 1)) m += fig(s.name, k, s.usual);
     return new Date(ms(now) + Math.round(m * MIN)).toISOString();
   };
   return { p50: left("p50"), p90: left("p90") };
 }
 
+/** alertFactor x usual, to a hundredth of a minute. */
+export const limitOf = (usual: number, config: Config) =>
+  Math.round(usual * config.alertFactor * 100) / 100;
+
 /**
- * Pure: what is over budget. An in-flight release (not superseded) over its
- * current stage's budget, or past e2eWorst since its merge; and the newest
- * finished release's own overruns, so the issue stays open until a release
- * completes within budget. A red stage is not an overrun: the red run's own
- * blocker covers it, and it is listed apart.
+ * Pure: which stages are stuck, past alertFactor x their usual time: any
+ * stage of a release in flight (not superseded), finished or still going, and
+ * the newest finished release's, so the issue stays open until a release
+ * completes with no stage past its limit. Merge to every install is never
+ * alerted on. A red stage is not an overrun: the red run's own blocker covers
+ * it, and it is listed apart.
  */
 export function overruns(
   tls: Timeline[],
   config: Config,
-  now: string,
 ): { over: Overrun[]; red: Red[] } {
   const over: Overrun[] = [];
   const red: Red[] = [];
+  const finishedOver = (t: Timeline) => {
+    for (const s of t.stages)
+      if (
+        s.state === "done" &&
+        s.minutes !== undefined &&
+        s.minutes > limitOf(s.usual, config)
+      )
+        over.push({
+          tag: t.tag,
+          stage: s.name,
+          kind: "finished",
+          startedAt: s.startedAt,
+          minutes: s.minutes,
+          usual: s.usual,
+          limit: limitOf(s.usual, config),
+          url: s.url,
+        });
+  };
   const live = tls.filter((t) => !t.doneAt && !t.supersededBy);
   for (const t of live) {
+    finishedOver(t);
     const cur = t.stages.find(
       (s) => s.state === "current" || s.state === "red",
     );
@@ -491,26 +521,16 @@ export function overruns(
       red.push({ tag: t.tag, stage: cur.name, url: cur.url });
       continue;
     }
-    if (cur?.startedAt && (cur.minutes ?? 0) > cur.budget)
+    if (cur?.startedAt && (cur.minutes ?? 0) > limitOf(cur.usual, config))
       over.push({
         tag: t.tag,
         stage: cur.name,
         kind: "in_flight",
         startedAt: cur.startedAt,
         minutes: cur.minutes ?? 0,
-        budget: cur.budget,
+        usual: cur.usual,
+        limit: limitOf(cur.usual, config),
         url: cur.url,
-      });
-    const start = t.mergedAt ?? t.publishedAt;
-    const e2e = mins(start, now);
-    if (e2e > config.e2eWorst)
-      over.push({
-        tag: t.tag,
-        stage: "e2e",
-        kind: "in_flight",
-        startedAt: start,
-        minutes: e2e,
-        budget: config.e2eWorst,
       });
   }
   const finished = tls
@@ -520,28 +540,7 @@ export function overruns(
   const newerLive = live.some(
     (t) => newest && compareTags(t.tag, newest.tag) > 0,
   );
-  if (newest && !newerLive) {
-    for (const s of newest.stages)
-      if (s.minutes !== undefined && s.minutes > s.budget)
-        over.push({
-          tag: newest.tag,
-          stage: s.name,
-          kind: "last_release",
-          startedAt: s.startedAt,
-          minutes: s.minutes,
-          budget: s.budget,
-          url: s.url,
-        });
-    if ((newest.e2e ?? 0) > config.e2eWorst)
-      over.push({
-        tag: newest.tag,
-        stage: "e2e",
-        kind: "last_release",
-        startedAt: newest.mergedAt ?? newest.publishedAt,
-        minutes: newest.e2e ?? 0,
-        budget: config.e2eWorst,
-      });
-  }
+  if (newest && !newerLive) finishedOver(newest);
   return { over, red };
 }
 
@@ -552,16 +551,16 @@ export function overruns(
  */
 export function issueBody(over: Overrun[], red: Red[]): string {
   const lines = [
-    "Release watch (cloud #264): a release stage is over its budget.",
-    "Budgets: `.github/hosted/release-stages.json`. This issue closes itself once no release is over budget and the newest release finished within budget.",
+    "Release watch (cloud #264): a release stage ran past twice its usual time.",
+    "Usual times: `.github/hosted/release-stages.json`. This issue closes itself once no stage of a release in flight, or of the newest finished release, is past twice its usual time.",
     "",
   ];
   for (const o of over) {
     const run = o.url ? ` Run: ${o.url}` : "";
     lines.push(
       o.kind === "in_flight"
-        ? `- ${o.tag} ${o.stage}: still going, budget ${o.budget} min, started ${o.startedAt}.${run}`
-        : `- ${o.tag} ${o.stage}: took ${o.minutes} min, budget ${o.budget} min.${run}`,
+        ? `- ${o.tag} ${o.stage}: still going past ${o.limit} min (usual ${o.usual} min), started ${o.startedAt}.${run}`
+        : `- ${o.tag} ${o.stage}: took ${o.minutes} min (usual ${o.usual} min, limit ${o.limit} min).${run}`,
     );
   }
   if (red.length > 0) {
@@ -593,7 +592,7 @@ export function issuePlan(
           action: "close",
           number: mine.number,
           comment:
-            "Within budget again: no release is over budget and the newest release finished within budget.",
+            "Unstuck: no stage of a release in flight, or of the newest finished release, is past twice its usual time.",
         }
       : { action: "none" };
   const body = issueBody(over, red);
@@ -610,7 +609,7 @@ export function issuePlan(
 export function fromHistory(h: HistoryEntry, config: Config): Timeline {
   const stages: StageRow[] = measured(config, h.mode).map((s) => ({
     name: s.name,
-    budget: s.budget,
+    usual: s.usual as number,
     state: "done",
     ...(h.stages[s.name] !== undefined ? { minutes: h.stages[s.name] } : {}),
   }));
@@ -660,7 +659,7 @@ export function compute(o: {
     o.config.historySize,
   );
   const s = stats(history, o.config);
-  const { over, red } = overruns(all, o.config, o.now);
+  const { over, red } = overruns(all, o.config);
   const inFlight = tls
     .filter((t) => !t.doneAt && !t.supersededBy)
     .map((t) => {
@@ -674,7 +673,8 @@ export function compute(o: {
         state: cur?.state,
         stageStartedAt: cur?.startedAt,
         elapsed: cur?.startedAt ? cur.minutes : undefined,
-        budget: cur?.budget,
+        usual: cur?.usual,
+        limit: cur ? limitOf(cur.usual, o.config) : undefined,
         etaP50: e?.p50,
         etaP90: e?.p90,
         runUrl: cur?.url,
@@ -687,6 +687,9 @@ export function compute(o: {
     generatedAt: o.now,
     inFlight,
     stages: s.stages,
+    limits: Object.fromEntries(
+      Object.entries(s.stages).map(([k, v]) => [k, limitOf(v.usual, o.config)]),
+    ),
     e2e: s.e2e,
     unmeasured,
     overruns: over,
@@ -703,25 +706,48 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
   if (c.inFlight.length === 0) out.push("No release in flight.", "");
   else {
     out.push(
-      "| Release | Stage | State | Started | Elapsed (min) | Budget | ETA p50 | ETA p90 |",
-      "|---|---|---|---|---|---|---|---|",
+      "| Release | Stage | State | Started | Elapsed (min) | Usual | Alert past | ETA p50 | ETA p90 |",
+      "|---|---|---|---|---|---|---|---|---|",
     );
     for (const r of c.inFlight)
       out.push(
-        `| ${r.tag} | ${r.stage ?? "-"} | ${r.state ?? "-"} | ${r.stageStartedAt ?? "-"} | ${f(r.elapsed)} | ${f(r.budget)} | ${r.etaP50 ?? "-"} | ${r.etaP90 ?? "-"} |`,
+        `| ${r.tag} | ${r.stage ?? "-"} | ${r.state ?? "-"} | ${r.stageStartedAt ?? "-"} | ${f(r.elapsed)} | ${f(r.usual)} | ${f(r.limit)} | ${r.etaP50 ?? "-"} | ${r.etaP90 ?? "-"} |`,
       );
     out.push("");
   }
-  out.push("| Stage | p50 | p90 | n | Budget |", "|---|---|---|---|---|");
-  for (const [k, v] of Object.entries(c.stages))
-    out.push(`| ${k} | ${f(v.p50)} | ${f(v.p90)} | ${v.n} | ${v.budget} |`);
   out.push(
-    `| e2e (merge to prod) | ${f(c.e2e.p50)} | ${f(c.e2e.p90)} | ${c.e2e.n} | target ${c.e2e.target}, worst ${c.e2e.worst} |`,
+    "| Stage | p50 | p90 | n | Usual | Alert past |",
+    "|---|---|---|---|---|---|",
+  );
+  for (const [k, v] of Object.entries(c.stages))
+    out.push(
+      `| ${k} | ${f(v.p50)} | ${f(v.p90)} | ${v.n} | ${v.usual} | ${f(c.limits[k])} |`,
+    );
+  out.push(
+    "",
+    `### Merge to every install, target ${c.e2e.target} min`,
+    "",
+    `Measured to the prod deploy until fleet is measured. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
     "",
   );
+  if (c.e2e.last20.length === 0) out.push("No finished release yet.", "");
+  else {
+    out.push(
+      `| Release | Minutes | Against ${c.e2e.target} min |`,
+      "|---|---|---|",
+    );
+    for (const r of c.e2e.last20) {
+      const d = Math.round((r.e2e - c.e2e.target) * 10) / 10;
+      out.push(`| ${r.tag} | ${r.e2e} | ${d > 0 ? `${d} over` : "within"} |`);
+    }
+    out.push("");
+  }
   for (const u of c.unmeasured) out.push(`Not measured: ${u.name}, ${u.todo}.`);
   if (c.overruns.length > 0)
-    out.push("", `Over budget: ${c.overruns.length}, see the blocker issue.`);
+    out.push(
+      "",
+      `Stuck: ${c.overruns.length} stage(s) past twice the usual time, see the blocker issue.`,
+    );
   return `${out.join("\n")}\n`;
 }
 
@@ -1003,8 +1029,15 @@ export function loadConfig(text: string): Config {
   if (!Array.isArray(c.stages) || c.stages.length === 0)
     throw new Error("release-stages.json: no stages");
   for (const s of c.stages)
-    if (!s.name || !s.from || !s.to || !(s.budget > 0))
+    if (
+      !s.name ||
+      !s.from ||
+      !s.to ||
+      (s.measured !== false && !((s.usual ?? 0) > 0))
+    )
       throw new Error(`release-stages.json: bad stage ${JSON.stringify(s)}`);
+  if (!(c.alertFactor > 1) || !(c.e2eTarget > 0))
+    throw new Error("release-stages.json: alertFactor > 1 and e2eTarget > 0");
   return c;
 }
 
