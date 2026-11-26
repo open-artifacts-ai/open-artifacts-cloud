@@ -12,6 +12,7 @@ import {
   decide,
   didNoWork,
   type Exec,
+  GATE_RETRY_SPENT,
   GATE_WORKFLOWS,
   GATING_JOBS,
   gateRefusal,
@@ -20,6 +21,7 @@ import {
   isChainProdDeploy,
   PRE_GATE_WORKFLOWS,
   parseView,
+  pinFate,
   type QueueRun,
   queueFailure,
   queueMarker,
@@ -27,6 +29,7 @@ import {
   queueVerdict,
   RELEASE_RETRY_SPENT,
   requiredChecks,
+  retryDue,
   run,
   STAGE_PAGES,
   type StageRun,
@@ -43,7 +46,7 @@ const PIN_COMMIT = "9".repeat(40);
 /** When that commit landed: stage runs are read from then on. */
 const PIN_AT = "2026-11-26T15:40:03Z";
 /** A stage run as the fake lists it; h (its commit) defaults to PIN_COMMIT. */
-type Run = StageRun & { h?: string };
+type Run = StageRun & { h?: string; e?: string };
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
@@ -885,9 +888,15 @@ const fake = (
       expect(st[3]).toBe(PIN_AT);
       expect(a).toContain("--jq");
       const deploy = st[1] === "deploy-hosted-platform.yml";
-      expect(Boolean(st[2])).toBe(deploy);
-      const all =
-        (deploy ? o.stagingDeploys : o.stageRuns?.[st[1] as string]) ?? [];
+      const gate = st[1] === "redline-staging.yml";
+      expect(Boolean(st[2])).toBe(deploy || gate);
+      const all: Run[] = gate
+        ? (o.gateRuns ?? []).map((g) => ({
+            s: "completed",
+            e: "workflow_dispatch",
+            ...g,
+          }))
+        : ((deploy ? o.stagingDeploys : o.stageRuns?.[st[1] as string]) ?? []);
       const page = Number(st[4]);
       const r = all
         .slice((page - 1) * 100, page * 100)
@@ -1828,6 +1837,143 @@ describe("the release gate in run", () => {
     expect(stageSpent(pair(hr("completed", "failure", 1)), no)).toBe(false);
     expect(stageSpent(pair(hr("completed", "cancelled", 1)), no)).toBe(false);
   });
+  // The Prover's four replays on #506 at 9db6e4e8.
+  const spentStagingDeploy = hr(
+    "completed",
+    "failure",
+    3,
+    "deploy-hosted-platform staging v0.181.0 [sc45000000001-1]",
+  );
+  it("a newer publish due its automatic retry holds over an older spent staging deploy (run 45721473041)", () => {
+    const publish = (a: number) =>
+      ({
+        ...hr("completed", "failure", a, "hosted-publish"),
+        e: "workflow_run",
+      }) as Run;
+    const due = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: { "hosted-publish.yml": [publish(1)] },
+        stagingDeploys: [spentStagingDeploy],
+      }),
+    );
+    expect(due.armed).toEqual([]);
+    expect(due.logs.join("\n")).toMatch(/no successful prod deploy/);
+    // Its retries spent too: dead, at the first spent stage.
+    const spent = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: { "hosted-publish.yml": [publish(3)] },
+        stagingDeploys: [spentStagingDeploy],
+      }),
+    );
+    expect(spent.armed).toEqual([7]);
+  });
+  it("a gate rejected on its rerun does not release the hold while a same-tag recovery is active (run 45740398112)", () => {
+    const rejected = [{ t: "redline-staging v0.181.0", c: "failure", a: 2 }];
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        gateRuns: rejected,
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("in_progress", null, 1), h: "8".repeat(40) },
+          ],
+        },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+    // With no recovery, the rejection releases it (#448).
+    expect(
+      go("arm", fake({ prodDone: false, gateRuns: rejected })).armed,
+    ).toEqual([7]);
+  });
+  it("a passed gate behind 20, 100 or 150 other gate runs still holds over an old staging failure (run 45731553873)", () => {
+    for (const before of [19, 20, 100, 150]) {
+      const r = go(
+        "arm",
+        fake({
+          prodDone: false,
+          gateRuns: [
+            ...Array.from({ length: before }, (_, i) => ({
+              t: `redline-staging v0.170.${i}`,
+              c: "success",
+              a: 1,
+            })),
+            { t: "redline-staging v0.181.0", c: "success", a: 1 },
+          ],
+          stagingDeploys: [spentStagingDeploy],
+        }),
+      );
+      expect(r.armed, String(before)).toEqual([]);
+    }
+  });
+  it("a signed-floor publish (hosted-publish <env> <floor run id>) is no release's evidence", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-publish.yml": [
+            hr("completed", "failure", 3, "hosted-publish staging 123456"),
+          ],
+        },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+  });
+  it("pinFate and retryDue: every stage, the gate included, holds while a run is active or due its retry", () => {
+    expect(GATE_RETRY_SPENT).toBe(2);
+    const f = (a: number, e = "workflow_run", t = "x") =>
+      ({ ...hr("completed", "failure", a, t), e }) as Run;
+    expect(retryDue(f(1))).toBe(true);
+    expect(retryDue(f(2))).toBe(true);
+    expect(retryDue(f(3))).toBe(false);
+    // A hand dispatch is never retried; a staging chain dispatch is.
+    expect(retryDue(f(1, "workflow_dispatch"))).toBe(false);
+    expect(
+      retryDue(
+        f(
+          1,
+          "workflow_dispatch",
+          "deploy-hosted-platform staging v1.0.0 [sc1-1]",
+        ),
+      ),
+    ).toBe(true);
+    expect(retryDue(f(1, "workflow_dispatch"), true)).toBe(true);
+    expect(retryDue(f(2, "workflow_dispatch"), true)).toBe(false);
+    const spentRun = f(3);
+    expect(pinFate([["a", [spentRun]]], [])).toEqual({ dead: "a" });
+    expect(
+      pinFate(
+        [
+          ["a", [spentRun]],
+          ["b", [f(1)]],
+        ],
+        [],
+      ),
+    ).toEqual({
+      recovering: true,
+    });
+    expect(
+      pinFate(
+        [["a", [spentRun]]],
+        [{ ...hr("completed", "success", 1), e: "workflow_dispatch" }],
+      ),
+    ).toEqual({});
+    expect(
+      pinFate(
+        [],
+        [{ ...hr("completed", "failure", 2), e: "workflow_dispatch" }],
+      ),
+    ).toEqual({ rejected: true });
+    expect(pinFate([], [hr("in_progress", null, 2)])).toEqual({
+      recovering: true,
+    });
+  });
   it("an unreadable pin commit means not arming", () => {
     const r = go(
       "arm",
@@ -1858,7 +2004,7 @@ describe("the release gate in run", () => {
     go("arm", f);
     expect(
       f.calls.some((c) =>
-        c.join(" ").includes("redline-staging.yml/runs?status=completed"),
+        c.join(" ").includes("redline-staging.yml/runs?branch=main"),
       ),
     ).toBe(false);
   });

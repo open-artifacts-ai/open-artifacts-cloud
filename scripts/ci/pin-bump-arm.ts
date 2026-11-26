@@ -316,8 +316,6 @@ export const PROD_TITLE = "deploy-hosted-platform prod ";
 /** Pages of 100 successful dispatched deploy runs to look through for the pin's prod deploy. */
 export const DEPLOY_PAGES = 5;
 export const GATE_WORKFLOW = "redline-staging.yml";
-/** The newest completed gate runs to look through for main's pin. */
-export const GATE_RUNS = 20;
 type GateRun = { t: string; c: string | null; a: number };
 /**
  * Pure: main's pin `tag` was rejected by the gate. The newest completed run titled
@@ -426,12 +424,17 @@ export type Gate = {
    * v0.253.0's hosted-release is the case: its public npm pack failed.
    */
   dead?: string;
+  /**
+   * A relevant run of main's pin is queued, running or due its automatic retry:
+   * a recovery is under way, so neither rejected nor dead releases the hold.
+   */
+  recovering?: boolean;
 };
 /** Pure: why a qualifying bump must wait (candidate open), or undefined. */
 export function gateRefusal(g: Gate): string | undefined {
   if (g.busy.length > 0)
     return `candidate open: ${g.busy.join(", ")} queued or in progress`;
-  if (!g.prodDeployed && !g.rejected && !g.dead)
+  if (!g.prodDeployed && (g.recovering || (!g.rejected && !g.dead)))
     return `candidate open: main's pin ${g.mainTag} has no successful prod deploy yet`;
   return undefined;
 }
@@ -716,39 +719,20 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
     prodDeployed = r.t.some((t) => isChainProdDeploy(t, mainTag));
     if (r.n < 100) break;
   }
-  let rejected = false;
-  let dead: string | undefined;
-  if (!prodDeployed) {
-    const runs = JSON.parse(
-      gh(exec, [
-        "api",
-        `repos/${repo}/actions/workflows/${GATE_WORKFLOW}/runs?status=completed&event=workflow_dispatch&per_page=${GATE_RUNS}`,
-        "--jq",
-        "[.workflow_runs[] | {t: .display_title, c: .conclusion, a: .run_attempt}]",
-      ]),
-    ) as GateRun[];
-    if (!Array.isArray(runs)) throw new Error("unreadable gate runs");
-    rejected = gateRejected(runs, mainTag);
-    const gatePassed = runs.some(
-      (r) => r.t === `redline-staging ${mainTag}` && r.c === "success",
-    );
-    if (!rejected && !gatePassed) dead = readDeadStage(exec, repo, mainTag);
-  }
-  return {
-    busy,
-    mainTag,
-    prodDeployed,
-    rejected,
-    ...(dead === undefined ? {} : { dead }),
-  };
+  const fate = prodDeployed ? {} : readPinFate(exec, repo, mainTag);
+  return { busy, mainTag, prodDeployed, ...fate };
 }
 
 /** Pages of 100 runs per stage to look through since main's pin landed (fail closed past it). */
 export const STAGE_PAGES = 10;
 const STAGE_JQ =
-  "{n: (.workflow_runs | length), r: [.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title, h: .head_sha, i: .id}]}";
-type ListedRun = StageRun & { h: string };
+  "{n: (.workflow_runs | length), r: [.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title, h: .head_sha, i: .id, e: .event}]}";
+type ListedRun = StageRun & { h: string; e?: string };
 const TAG_IN = /\bv\d+\.\d+\.\d+\b/;
+/** A signed-floor publish (`hosted-publish <env> <floor run id>`): no release's evidence. */
+const FLOOR_PUBLISH = /^hosted-publish \w+ \d+(\s|$)/;
+/** redline-retry reruns a failed gate once: attempt 2 or later is spent (#448). */
+export const GATE_RETRY_SPENT = 2;
 
 /**
  * Every run of `wf` on main created since main's pin landed, newest first, through
@@ -780,20 +764,74 @@ function stageRuns(
   throw new Error(`more than ${STAGE_PAGES} pages of ${wf} runs`);
 }
 
+/** What main's pin's runs say, when it has no prod deploy (Gate). */
+export type PinFate = {
+  rejected?: boolean;
+  dead?: string;
+  recovering?: boolean;
+};
+
 /**
- * The first release-chain stage before the gate that is spent for main's pin, or
- * undefined: none while any relevant run of any stage is queued or running, then
- * stageSpent on each stage's relevant runs, skipping passes that did no work. Relevant runs build what
- * main's pin names, whatever commit started them: a run of a stage before the gate
- * on main since the pin landed, at a commit that contains the pin commit (a hand
- * dispatch from a later main builds the same tag, cloud #459), not a dry run, and
- * naming no other tag; staging's deploy, by its title. Throws on any error.
+ * Pure: whether a completed failure is still due its automatic retry. release-retry
+ * reruns attempts below RELEASE_RETRY_SPENT of pushes, workflow_run events and
+ * staging chain dispatches (" [sc"); redline-retry reruns a dispatched gate's
+ * attempt 1. A hand dispatch is never retried.
  */
-function readDeadStage(
-  exec: Exec,
-  repo: string,
-  tag: string,
-): string | undefined {
+export function retryDue(r: StageRun & { e?: string }, gate = false): boolean {
+  if (r.s !== "completed" || r.c !== "failure") return false;
+  if (gate) return r.a < GATE_RETRY_SPENT && r.e === "workflow_dispatch";
+  return (
+    r.a < RELEASE_RETRY_SPENT &&
+    (r.e !== "workflow_dispatch" || r.t.includes(" [sc"))
+  );
+}
+
+/**
+ * Pure: main's pin's fate from its relevant runs per stage (newest first), the gate
+ * (redline-staging) last. The same rule for every stage, the gate included:
+ * - a relevant run queued or running, or the newest one with evidence due its
+ *   automatic retry, in any stage, is a recovery under way: recovering, which holds
+ *   whatever an older failure says;
+ * - else a passed gate means the pin is on its way to prod: nothing;
+ * - else a gate failed on its rerun is rejected (#448);
+ * - else the first stage before the gate whose newest run with evidence failed with
+ *   its retry spent is dead. A pass that did no work (`noWork`) is no evidence.
+ */
+export function pinFate(
+  stages: [string, (StageRun & { e?: string })[]][],
+  gate: (StageRun & { e?: string })[],
+  noWork: (r: StageRun) => boolean = () => false,
+): PinFate {
+  const evidence = (runs: StageRun[]) =>
+    runs.find(
+      (r) =>
+        !r.t.includes("(dry run)") &&
+        !(r.s === "completed" && r.c === "success" && noWork(r)),
+    );
+  for (const [, runs] of stages) {
+    if (anyActive(runs)) return { recovering: true };
+    const e = evidence(runs);
+    if (e && retryDue(e)) return { recovering: true };
+  }
+  if (anyActive(gate)) return { recovering: true };
+  const g = gate[0];
+  if (g && retryDue(g, true)) return { recovering: true };
+  if (g?.c === "success") return {};
+  if (g?.c === "failure" && g.a >= GATE_RETRY_SPENT) return { rejected: true };
+  for (const [name, runs] of stages)
+    if (stageSpent(runs, noWork)) return { dead: name };
+  return {};
+}
+
+/**
+ * main's pin's fate (pinFate) from its runs since it landed. Relevant runs build
+ * what main's pin names, whatever commit started them: a run on main since the pin
+ * landed, at a commit that contains the pin commit (a hand dispatch from a later
+ * main builds the same tag, cloud #459), not a dry run, naming no other tag and no
+ * signed floor; staging's deploy by its title; the gate by its title
+ * (`redline-staging <tag>`). Small reads, every page. Throws on any error.
+ */
+function readPinFate(exec: Exec, repo: string, tag: string): PinFate {
   const pin = JSON.parse(
     gh(exec, [
       "api",
@@ -828,17 +866,17 @@ function readDeadStage(
     contains.set(sha, yes);
     return yes;
   };
-  const relevant: [string, ListedRun[]][] = PRE_GATE_WORKFLOWS.map((wf) => [
+  const stages: [string, ListedRun[]][] = PRE_GATE_WORKFLOWS.map((wf) => [
     wf,
     stageRuns(exec, repo, wf, since).filter((r) => {
-      if (r.t.includes("(dry run)")) return false;
+      if (r.t.includes("(dry run)") || FLOOR_PUBLISH.test(r.t)) return false;
       const named = TAG_IN.exec(r.t)?.[0];
       if (named !== undefined && named !== tag) return false;
       return /^[0-9a-f]{40}$/.test(r.h) && builds(r.h);
     }),
   ]);
   const title = stagingDeployTitle(tag);
-  relevant.push([
+  stages.push([
     "staging deploy",
     stageRuns(
       exec,
@@ -848,11 +886,13 @@ function readDeadStage(
       "&event=workflow_dispatch",
     ).filter((r) => r.t.startsWith(title)),
   ]);
-  // The same rule for every stage: a relevant run still queued or running, in
-  // any stage, is a recovery under way and holds (the Prover's v0.246.1 replay:
-  // an older spent staging deploy never overrides a live hosted-release rerun).
-  if (relevant.some(([, runs]) => anyActive(runs))) return undefined;
-  // Only then does each stage's newest completed run with evidence decide.
+  const gate = stageRuns(
+    exec,
+    repo,
+    GATE_WORKFLOW,
+    since,
+    "&event=workflow_dispatch",
+  ).filter((r) => r.t === `redline-staging ${tag}`);
   const noWork = (r: StageRun): boolean => {
     if (!Number.isInteger(r.i)) return false;
     const jobs = JSON.parse(
@@ -866,9 +906,7 @@ function readDeadStage(
     if (!Array.isArray(jobs)) throw new Error(`unreadable jobs of run ${r.i}`);
     return didNoWork(jobs);
   };
-  for (const [name, runs] of relevant)
-    if (stageSpent(runs, noWork)) return name;
-  return undefined;
+  return pinFate(stages, gate, noWork);
 }
 
 const msg = (e: unknown) => String(e instanceof Error ? e.message : e);

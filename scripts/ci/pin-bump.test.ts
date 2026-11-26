@@ -85,10 +85,15 @@ const gateAnswer = (g: GateWorld = {}, path = "") => {
     return { code: 0, stdout: "ahead\n", stderr: "" };
   const st = /\/actions\/workflows\/([^/]+)\/runs\?branch=main/.exec(path);
   if (st) {
-    const r = ((g.stageRuns ?? {})[st[1] ?? ""] ?? []).map((x) => ({
-      h: PIN_COMMIT,
-      ...x,
-    }));
+    const runs =
+      st[1] === "redline-staging.yml"
+        ? (g.gateRuns ?? []).map((x) => ({
+            s: "completed",
+            e: "workflow_dispatch",
+            ...x,
+          }))
+        : ((g.stageRuns ?? {})[st[1] ?? ""] ?? []);
+    const r = runs.map((x) => ({ h: PIN_COMMIT, ...x }));
     return out({ n: r.length, r });
   }
   const m = /\/actions\/workflows\/([^/]+)\/runs\?status=([a-z_]+)/.exec(path);
