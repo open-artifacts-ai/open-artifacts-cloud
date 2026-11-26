@@ -4,12 +4,13 @@
 #   hosted-release -> THIS: deploy-hosted-platform (env staging, the
 #     workflow's default targets), beside the copy
 #   copy and deploy both green -> THIS: redline-staging (the gate)
-#     -> prod-release-chain.yml (unchanged)
+#     -> prod-release-chain.yml (prod copies, then deploys, each step on the
+#        previous step's event)
 # Step 4: the staging deploy starts beside the staging copy, not after it,
 # and the gate starts from whichever of the two ends last, only once both
 # succeeded for the tag. A failed copy or deploy never starts the gate, so
 # nothing reaches prod. Prod's own order (copy, then deploy) is
-# prod-release-chain's and stays as it was.
+# prod-release-chain's.
 # The only triggers are completed hosted-release, hosted-publish and
 # deploy-hosted-platform runs (workflow_run: main's copy of this file runs,
 # and the head branch is main). scripts/ci/staging-release-chain.ts decides,

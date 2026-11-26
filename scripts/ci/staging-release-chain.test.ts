@@ -292,6 +292,11 @@ describe("after the staging deploy: the gate", () => {
       ),
     );
     skipped(afterDeploy({}, { title: `${CHAIN_TITLE} x` }));
+    // cloud #264: the prod chain's own deploy, dispatched by the same App,
+    // never starts the staging gate.
+    skipped(
+      afterDeploy({}, { title: `deploy-hosted-platform prod ${TAG} [c77-1]` }),
+    );
   });
   it("skips a deploy not dispatched by the bot, or not a dispatch", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
@@ -952,20 +957,21 @@ describe("the workflow", () => {
       if (name !== "dispatch")
         expect((j as { environment?: unknown }).environment).toBeUndefined();
   });
-  it("leaves prod-release-chain's trigger and order as they were (prod copies, then deploys)", () => {
+  it("hands over to prod-release-chain, which keeps prod's order (copy, then deploy) on its own events", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));
-    expect(p.on.workflow_run.workflows).toEqual(["redline-staging"]);
-    expect(p.jobs.publish.needs).toBe("gate");
-    expect(p.jobs.deploy.needs).toEqual(["gate", "publish"]);
+    expect(p.on.workflow_run.workflows).toEqual([
+      "redline-staging",
+      "hosted-publish",
+      "deploy-hosted-platform",
+    ]);
+    expect(p.jobs.start.needs).toEqual(["plan", "gate"]);
+    expect(p.jobs.deploy.if).toBe("needs.plan.outputs.step == 'deploy'");
   });
 });
 
 describe("runs-list reads stay under spawnSync's 1 MiB buffer", () => {
-  for (const f of [
-    "chain-dispatch",
-    "staging-release-chain",
-    "prod-release-chain",
-  ]) {
+  // chain-dispatch.ts lists no runs (cloud #264: it dispatches and ends).
+  for (const f of ["staging-release-chain", "prod-release-chain"]) {
     it(`${f}: small page, --jq, maxBuffer backstop`, () => {
       const src = read(`scripts/ci/${f}.ts`);
       const lists = src.match(/actions\/workflows\/[^`]*\/runs\?[^`]*`/g) ?? [];
