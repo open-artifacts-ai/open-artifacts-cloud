@@ -287,6 +287,18 @@ describe("bringUp waits for the new hook key to take effect", () => {
       ).toBeLessThanOrEqual(SUITE_HOOK_LIMIT);
     });
 
+    it("a full wrong-key ledger: R26 waits for room, computed from it, then a valid key is accepted with one check", async () => {
+      const { f } = setup();
+      ledgerRoot();
+      await fill(f, claimCappedSlot, wrongKeyLedger(CONFIG.rlA.app));
+      const run = new Run(CONFIG, f.io);
+      const t0 = f.io.now();
+      await waitHookKey(run, CONFIG.rlA.app, "h".repeat(43));
+      expect(calls(f)).toHaveLength(1);
+      expect(f.io.now() - t0).toBeGreaterThanOrEqual(HOOK_WINDOW_MS);
+      expect(f.io.now() - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
+    });
+
     it("a full wrong-key ledger and a deadline shorter than its wait: fails at once, saying it waited 0 s and sent nothing", async () => {
       const { f } = setup();
       ledgerRoot();

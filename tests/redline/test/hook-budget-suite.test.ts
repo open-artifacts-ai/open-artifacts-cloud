@@ -21,6 +21,7 @@ import {
   wrongKeyLedger,
 } from "../src/hook-ledger-compat.ts";
 import { paceHook, paceWrongKeyHook } from "../src/http.ts";
+import { WAIT_BUDGET_MS } from "../src/rl-anon.ts";
 import { parseTargets } from "../src/targets.ts";
 import { secretDir } from "./fake.ts";
 
@@ -99,26 +100,15 @@ describe("guard's wrong-key probe", () => {
     const ledger = wrongKeyLedger(APP);
     for (let i = 0; i < SUITE_HOOK_LIMIT - 1; i++)
       await claimCappedSlot(ledger, { root, now: c.now });
-    const probe = () =>
-      paceWrongKeyHook({ app: APP } as never, {
-        root,
-        now: c.now,
-        sleep: c.sleep,
-        reserve: 1,
-      });
-    if (ledgerWaits) {
-      // Before public #3200: it waits for room rather than take the last slot.
-      const n = await probe();
-      expect(c.waits).toHaveLength(1);
-      expect(suiteHook404IsTheKeys(n)).toBe(true);
-    } else {
-      // From #3200: refused at once rather than take the last slot, no wait.
-      await expect(probe()).rejects.toBeInstanceOf(HookBudgetError);
-      expect(c.waits).toHaveLength(0);
-      expect(hookWindowCount(ledger, { root, now: c.now })).toBe(
-        SUITE_HOOK_LIMIT - 1,
-      );
-    }
+    const n = await paceWrongKeyHook({ app: APP } as never, {
+      root,
+      now: c.now,
+      sleep: c.sleep,
+      reserve: 1,
+    });
+    // It waited for room rather than take the last slot.
+    expect(c.waits).toHaveLength(1);
+    expect(suiteHook404IsTheKeys(n)).toBe(true);
   });
 
   it("the wrong-key ledger: before public #3200 the app's own; from it a separate one right-key calls never fill", async () => {
@@ -183,8 +173,33 @@ describe(`right-key hook claims (${ledgerWaits ? "pre-#3200" : "#3200"} ledger)`
   });
 });
 
-describe(`calls RL_ANON is charged for: ${SUITE_HOOK_LIMIT} a minute per ledger`, () => {
-  it("25 fit; the 26th waits (before #3200) or is refused at once (from #3200), never taken in the window", async () => {
+describe(`calls RL_ANON is charged for: ${SUITE_HOOK_LIMIT} a minute per ledger, waiting for room`, () => {
+  it("32 tok:ip claims in one lane all succeed, never more than 25 in any 60 s, each wait computed from the window", async () => {
+    const root = scratch();
+    const c = clock();
+    const t0 = c.now();
+    const at: number[] = [];
+    for (let i = 0; i < 32; i++) {
+      await claimCappedSlot("rl-anon/tok:ip", {
+        root,
+        now: c.now,
+        sleep: c.sleep,
+        deadline: t0 + WAIT_BUDGET_MS,
+      });
+      at.push(c.now());
+    }
+    expect(at.slice(0, SUITE_HOOK_LIMIT).every((t) => t === t0)).toBe(true);
+    for (const t of at)
+      expect(
+        at.filter((u) => u <= t && t - u < HOOK_WINDOW_MS).length,
+      ).toBeLessThanOrEqual(SUITE_HOOK_LIMIT);
+    // One wait, until the oldest call has left the window (plus the edge).
+    expect(c.waits).toHaveLength(1);
+    expect(at[SUITE_HOOK_LIMIT]).toBeGreaterThanOrEqual(t0 + HOOK_WINDOW_MS);
+    expect((at.at(-1) as number) - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
+  });
+
+  it("nothing past the deadline: a wait that would pass it is refused at once and takes no slot", async () => {
     const root = scratch();
     const c = clock();
     const ledger = wrongKeyLedger(APP);
@@ -196,12 +211,29 @@ describe(`calls RL_ANON is charged for: ${SUITE_HOOK_LIMIT} a minute per ledger`
       root,
       now: c.now,
       sleep: c.sleep,
-      deadline: c.now(),
+      deadline: c.now() + HOOK_WINDOW_MS / 2,
     });
     await expect(next).rejects.toBeInstanceOf(HookBudgetError);
     expect(c.waits).toHaveLength(0);
     expect(hookWindowCount(ledger, { root, now: c.now })).toBe(
       SUITE_HOOK_LIMIT,
     );
+  });
+
+  it("a wait that fits the deadline waits for room, then takes the slot", async () => {
+    const root = scratch();
+    const c = clock();
+    const t0 = c.now();
+    for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+      await claimCappedSlot("rl-anon/tok:ip", { root, now: c.now });
+    await claimCappedSlot("rl-anon/tok:ip", {
+      root,
+      now: c.now,
+      sleep: c.sleep,
+      deadline: t0 + 90_000,
+    });
+    expect(c.waits).toHaveLength(1);
+    expect(c.now() - t0).toBeGreaterThanOrEqual(HOOK_WINDOW_MS);
+    expect(c.now() - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
   });
 });

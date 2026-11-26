@@ -264,9 +264,8 @@ export const HOOK_KEY_WITHIN_MS = 90_000;
  * so RL_ANON is charged for it: each takes a slot of the install's
  * wrong-key ledger (`pace`, on the run's own clock; the app's whole ledger
  * before public #3200), at most 25 a minute; polls one per POLL_MS stay under
- * it. Before #3200 a full ledger waits, up to the deadline; from #3200 it is
- * refused at once. The InfraError says how long it waited and how many
- * checks it sent.
+ * it. A full ledger waits for room (computed from it), up to the deadline.
+ * The InfraError says how long it waited and how many checks it sent.
  */
 export async function waitHookKey(
   run: Run,
