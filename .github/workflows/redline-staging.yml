@@ -695,6 +695,30 @@ jobs:
           export REDLINE_REPORT="$RUNNER_TEMP/redline-report/report.json"
           mkdir -p "$RUNNER_TEMP/redline-report"
           pnpm --filter @oa/redline live
+      # Cloud #264, public #3167: the agents' staging install rl-agents follows
+      # the release under test, since the fleet skips installs with test hooks
+      # on. A gate run only (a workflow_dispatch of this file; in a called run
+      # workflow_ref is the caller's), once rl-a and rl-b report the tag. One
+      # R5 upgrade in a detached process (src/rl-agents.ts): it takes the 202
+      # as the answer and never waits for the job, so it never holds or fails
+      # the gate, and the next gate run tries again. Its log holds masks, so it
+      # goes to the secrets dir; only result.json is reported, below. A tag cut
+      # before this step has no such command and is reported as skipped.
+      - id: rl-agents
+        name: Start the rl-agents upgrade, without waiting
+        if: ${{ !cancelled() && steps.staged.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/rl-agents-upgrade"
+          mkdir -p "$out"
+          if ! grep -qF 'cmd === "rl-agents-upgrade"' tests/redline/scripts/provisioning.ts; then
+            printf '%s\n' '{"kind":"skipped","line":"rl-agents: not upgraded, this tag has no rl-agents upgrade (cloud #264)."}' > "$out/result.json"
+            exit 0
+          fi
+          setsid nohup pnpm --filter @oa/redline provisioning rl-agents-upgrade "$out/result.json" >> "$RUNNER_TEMP/redline-secrets/rl-agents-upgrade.log" 2>&1 < /dev/null &
+          echo "rl-agents upgrade: started"
       # Artifacts are not masked: a secret echoed into a report stops the upload.
       - id: scan-suite
         name: No secret in the red-line report
@@ -752,6 +776,32 @@ jobs:
       - name: Revoke this run's R26 credentials
         if: always() && steps.mint.outcome == 'success'
         run: pnpm --filter @oa/redline provisioning revoke
+      # Reads only what the detached upgrade wrote, never waits for it: no
+      # result yet is reported as such. The line is checked for every secret
+      # file before it reaches the summary. Never fails the gate.
+      - id: rl-agents-report
+        name: Report the rl-agents upgrade
+        if: always() && steps.rl-agents.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/rl-agents-upgrade/result.json"
+          if [ -s "$f" ]; then
+            line=$(jq -er '.line | select(type == "string")' "$f" 2> /dev/null) || line="rl-agents: the upgrade result could not be read."
+          else
+            line="rl-agents: the upgrade had not answered when this step ran. The next gate run tries again."
+          fi
+          re='^[A-Za-z0-9 .,:;()#_+/=@-]+$'
+          if ! [[ "$line" =~ $re ]] || [ "${#line}" -gt 400 ]; then line="rl-agents: the upgrade result was not plain text."; fi
+          d="$RUNNER_TEMP/redline-secrets"
+          for s in "$d"/*; do
+            [ -s "$s" ] || continue
+            case "$s" in *.log) continue ;; esac
+            if grep -qF -f "$s" <<< "$line"; then line="rl-agents: the result was withheld."; break; fi
+          done
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove the secret files
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"

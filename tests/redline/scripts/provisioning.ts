@@ -6,6 +6,7 @@
 //   node --experimental-strip-types scripts/provisioning.ts t19-recipient
 //   node --experimental-strip-types scripts/provisioning.ts t19-seal <pub> <out>
 //   node --experimental-strip-types scripts/provisioning.ts t19-open
+//   node --experimental-strip-types scripts/provisioning.ts rl-agents-upgrade <file>
 // mint-oidc writes one GitHub OIDC JWT per audience key (provisioning,
 // stagingInventory, prodInventory) into REDLINE_TARGETS.secretsDir as 0600
 // files. bringup upgrades rl-a and rl-b to REDLINE_RELEASE (R5) and writes
@@ -16,19 +17,29 @@
 // if: always() end: R26 revoke on both, and their PATs must then be 401.
 // t19-recipient, t19-seal and t19-open hand rl-a's hook key from the redline
 // job to the t19 job, sealed to a key only the t19 job holds (src/t19-seal.ts).
+// rl-agents-upgrade asks once for rl-agents on REDLINE_RELEASE (R5, never
+// awaited: src/rl-agents.ts) and writes its outcome and summary line to <file>.
 // Every value is masked (::add-mask::) before anything else could print it.
 
+import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AudienceKey } from "../src/oidc.ts";
 import { AUDIENCES } from "../src/oidc.ts";
 import {
   bringUp,
+  liveRun,
   mintFiles,
   rawTargets,
   revokeAll,
   runBusPair,
   writeStagedVersion,
 } from "../src/provisioning-live.ts";
+import {
+  RL_AGENTS_APP,
+  type RlAgentsOutcome,
+  rlAgentsLine,
+  upgradeRlAgents,
+} from "../src/rl-agents.ts";
 import {
   recipientDir,
   t19Open,
@@ -87,8 +98,31 @@ async function main(): Promise<number> {
     return 0;
   }
   if (cmd === "revoke") return revokeAll(env, t);
+  // Cloud #264: in the detached process the gate starts after its suite.
+  if (cmd === "rl-agents-upgrade") {
+    if (rest.length !== 1 || !rest[0])
+      throw new Error("rl-agents-upgrade: one output file");
+    // A setup error is an outcome too, so the report always has a line.
+    let o: RlAgentsOutcome;
+    try {
+      o = await upgradeRlAgents(liveRun(env, t));
+    } catch {
+      o = {
+        kind: "failed",
+        to: env.REDLINE_RELEASE ?? "the release",
+        reason: "the upgrade could not be set up",
+      };
+    }
+    const tmp = `${rest[0]}.tmp`;
+    writeFileSync(
+      tmp,
+      `${JSON.stringify({ ...o, line: rlAgentsLine(o, RL_AGENTS_APP) })}\n`,
+    );
+    renameSync(tmp, rest[0]);
+    return 0;
+  }
   throw new Error(
-    "usage: provisioning.ts mint-oidc <key>... | bringup | bus-pair | staged-version <file> | revoke | t19-recipient | t19-seal <pub> <out> | t19-open",
+    "usage: provisioning.ts mint-oidc <key>... | bringup | bus-pair | staged-version <file> | revoke | t19-recipient | t19-seal <pub> <out> | t19-open | rl-agents-upgrade <file>",
   );
 }
 
