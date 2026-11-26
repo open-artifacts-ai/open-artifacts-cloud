@@ -85,10 +85,13 @@ on:
     paths: [PUBLIC_PIN]
   # Direct mode only, from main's copy of this file and script; nothing from the
   # event is used: a release pipeline gate workflow ended, on any branch (the
-  # gate counts runs on every branch), so the gate may be open now.
+  # gate counts runs on every branch), so the gate may be open now. Also
+  # hosted-release: its end with the retry spent makes main's pin dead
+  # (pin-bump-arm's stageSpent), which opens the gate too.
   workflow_run:
     workflows:
       [
+        hosted-release,
         hosted-publish,
         staging-release-chain,
         deploy-hosted-platform,

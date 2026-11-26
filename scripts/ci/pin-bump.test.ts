@@ -32,7 +32,9 @@ import {
 import {
   PIN_FILES as ARM_PIN_FILES,
   GATE_WORKFLOWS,
+  PRE_GATE_WORKFLOWS,
   readGate,
+  type StageRun,
 } from "./pin-bump-arm.ts";
 
 // A faked 502 would otherwise sleep through the real backoff.
@@ -59,19 +61,37 @@ type GateWorld = {
   busy?: string[];
   deployed?: string[];
   gateRuns?: { t: string; c: string | null; a: number }[];
+  /** Runs of a stage before the gate for main's pin commit, newest first. */
+  stageRuns?: Record<string, StageRun[]>;
   fail?: boolean;
 };
+/** The main commit that set PUBLIC_PIN (the stages' head sha). */
+const PIN_COMMIT = "9".repeat(40);
 const ON_PROD = ["deploy-hosted-platform prod v0.136.1 [c1-1]"];
 const gateAnswer = (g: GateWorld = {}, path = "") => {
-  const m = /\/actions\/workflows\/([^/]+)\/runs\?status=([a-z_]+)/.exec(path);
-  if (!m) return undefined;
-  if (g.fail) return { code: 1, stdout: "", stderr: "HTTP 404" };
-  const [, wf, status] = m;
   const out = (v: unknown) => ({
     code: 0,
     stdout: JSON.stringify(v),
     stderr: "",
   });
+  // The stages before the gate (pin-bump-arm's stageSpent), read only when main's
+  // pin is not on prod and was not rejected.
+  if (path.includes("/commits?sha=main&path=PUBLIC_PIN&per_page=1"))
+    return g.fail
+      ? { code: 1, stdout: "", stderr: "HTTP 404" }
+      : { code: 0, stdout: `${PIN_COMMIT}\n`, stderr: "" };
+  const st = /\/actions\/workflows\/([^/]+)\/runs\?head_sha=(\w+)/.exec(path);
+  if (st) return out((g.stageRuns ?? {})[st[1] ?? ""] ?? []);
+  if (
+    /\/actions\/workflows\/deploy-hosted-platform\.yml\/runs\?event=workflow_dispatch&per_page=20/.test(
+      path,
+    )
+  )
+    return out([]);
+  const m = /\/actions\/workflows\/([^/]+)\/runs\?status=([a-z_]+)/.exec(path);
+  if (!m) return undefined;
+  if (g.fail) return { code: 1, stdout: "", stderr: "HTTP 404" };
+  const [, wf, status] = m;
   if (status === "queued" || status === "in_progress")
     return out((g.busy ?? []).includes(wf ?? "") ? 1 : 0);
   if (status === "success") {
@@ -586,9 +606,10 @@ describe("pin-bump.yml", () => {
     expect(text).not.toMatch(/\bcron:/);
     // a pin PR merging, or land moving main, changes PUBLIC_PIN on main
     expect(w.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
-    // a gate run on any branch: readGate counts them all (no branch filter)
+    // a gate run on any branch: readGate counts them all (no branch filter);
+    // and hosted-release, whose end with the retry spent makes main's pin dead
     expect(w.on.workflow_run).toEqual({
-      workflows: GATES,
+      workflows: ["hosted-release", ...GATES],
       types: ["completed"],
     });
     for (const j of ["prepare", "open", "report"])
@@ -607,7 +628,7 @@ describe("pin-bump.yml", () => {
     // no branch filter: a gate run on any branch wakes it; land's `if` takes
     // CI only on pin-land/*
     expect(lw.on.workflow_run).toEqual({
-      workflows: ["CI", ...GATES],
+      workflows: ["CI", "hosted-release", ...GATES],
       types: ["completed"],
     });
     expect(Object.keys(landJobs)).toEqual(["land", "report"]);
@@ -830,18 +851,26 @@ describe("pin-bump.yml", () => {
               return { code: 0, stdout: '{"n":0,"t":[]}', stderr: "" };
             return { code: 0, stdout: "[]", stderr: "" };
           }
+          // main's pin is not on prod, so the stages before the gate are read
+          // (pin-bump-arm's stageSpent): none spent here.
+          if (a.includes("commits?sha=main&path=PUBLIC_PIN"))
+            return { code: 0, stdout: `${"9".repeat(40)}\n`, stderr: "" };
+          if (a.includes("/runs?head_sha=") || a.includes("/runs?event="))
+            return { code: 0, stdout: "[]", stderr: "" };
           return { code: 1, stdout: "", stderr: `unexpected ${a}` };
         },
         "o/r",
         "tag=v1.2.3\nsha=" + "a".repeat(40) + "\n",
       );
       expect(gate.busy).toEqual(["redline-staging.yml"]);
+      expect(gate.dead).toBeUndefined();
       const counts = calls.filter((c) => c.includes("--jq .total_count"));
       expect(counts).toHaveLength(GATE_WORKFLOWS.length * 2);
       // no branch filter in the counts: a run on any branch holds the gate
       for (const c of counts) expect(c).not.toMatch(/[?&]branch=/);
-      // and every gate workflow wakes both, on any branch
-      for (const f of GATE_WORKFLOWS) {
+      // and every gate workflow, and every stage before the gate whose end can
+      // make main's pin dead, wakes both, on any branch
+      for (const f of [...GATE_WORKFLOWS, ...PRE_GATE_WORKFLOWS]) {
         const wf = f.replace(/\.yml$/, "");
         expect(w.on.workflow_run.workflows).toContain(wf);
         expect(lw.on.workflow_run.workflows).toContain(wf);
@@ -1641,6 +1670,32 @@ describe("planDirect", () => {
       expect(r).toMatchObject({ bump: true, tag: "v0.137.0", sha: NEW_SHA });
     });
 
+    it("main's pin dead before the gate (v0.253.0: hosted-release failed with its retry spent) does not hold the bump", () => {
+      const { r } = go({
+        gate: {
+          deployed: [],
+          stageRuns: {
+            "hosted-release.yml": [
+              { s: "completed", c: "failure", a: 3, t: "hosted-release" },
+            ],
+          },
+        },
+      });
+      expect(r).toMatchObject({ bump: true, tag: "v0.137.0", sha: NEW_SHA });
+    });
+
+    it("a hosted-release still running, or due its retry, keeps the hold", () => {
+      for (const run of [
+        { s: "in_progress", c: null, a: 3, t: "hosted-release" },
+        { s: "completed", c: "failure", a: 2, t: "hosted-release" },
+      ]) {
+        const { r } = go({
+          gate: { deployed: [], stageRuns: { "hosted-release.yml": [run] } },
+        });
+        expect(r, JSON.stringify(run)).toMatchObject({ bump: false });
+      }
+    });
+
     it("a first-attempt failure is no rejection: still waits", () => {
       const { r } = go({
         gate: {
@@ -2192,6 +2247,36 @@ describe("direct mode: stage, landBranch, land, route", () => {
         const w = landWorld({
           mains: [MAIN2],
           gate: { busy: ["hosted-publish.yml"] },
+        });
+        expect(w.one()).toMatchObject({ action: "waiting" });
+        expect(writes(w.calls)).toHaveLength(0);
+      });
+
+      it("main's pin dead before the gate (hosted-release failed with its retry spent) lands", () => {
+        const w = landWorld({
+          gate: {
+            deployed: [],
+            stageRuns: {
+              "hosted-release.yml": [
+                { s: "completed", c: "failure", a: 3, t: "hosted-release" },
+              ],
+            },
+          },
+        });
+        expect(w.one()).toEqual({ action: "landed", sha: COMMIT });
+        expect(mainMoves(w.calls)).toHaveLength(1);
+      });
+
+      it("a hosted-release still running for main's pin keeps the lander waiting", () => {
+        const w = landWorld({
+          gate: {
+            deployed: [],
+            stageRuns: {
+              "hosted-release.yml": [
+                { s: "in_progress", c: null, a: 1, t: "hosted-release" },
+              ],
+            },
+          },
         });
         expect(w.one()).toMatchObject({ action: "waiting" });
         expect(writes(w.calls)).toHaveLength(0);

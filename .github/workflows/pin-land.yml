@@ -41,11 +41,13 @@ on:
   workflow_dispatch:
   # From main's copy of this file and script; nothing from the event is used
   # but its workflow name and branch, in the jobs' `if`. No branch filter: a
-  # gate workflow wakes this on any branch, CI only on pin-land/*.
+  # gate workflow wakes this on any branch, CI only on pin-land/*. hosted-release
+  # too: its end with the retry spent makes main's pin dead, which opens the gate.
   workflow_run:
     workflows:
       [
         CI,
+        hosted-release,
         hosted-publish,
         staging-release-chain,
         deploy-hosted-platform,
