@@ -38,6 +38,7 @@ import {
   parseSeen,
   parseStore,
   parseVitest,
+  pendingFails,
   pendingRuns,
   pendingTries,
   plan,
@@ -2891,5 +2892,135 @@ describe("runs whose logs can't be read", () => {
     }
     expect([...unreadableRuns(comments(g))]).toEqual([]);
     expect(pendingRuns(comments(g))).toEqual(["900/2"]);
+  });
+});
+
+describe("a few runs that keep failing can't hide the rest", () => {
+  it("the Prover's case: 4 runs keep answering 503, and the 20 that recover drain in the events that follow", () => {
+    const sleep = sleeper.sleep;
+    sleeper.sleep = () => {};
+    onTestFinished(() => {
+      sleeper.sleep = sleep;
+    });
+    const ids = Array.from({ length: 24 }, (_, i) => 5000 + i);
+    const g = liveGh({
+      listed: { "ci.yml": ids.map((id, i) => ci1(id, NOW - (30 - i) * HOUR)) },
+      jobAt: Object.fromEntries(
+        ids.map((id, i) => [id, NOW - (30 - i) * HOUR]),
+      ),
+      log: CI_LOG,
+    });
+    const broken = new Set(ids);
+    let current = 0;
+    let logs = 0;
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      const m = /\/runs\/(\d+)\/attempts\/1\/jobs/.exec(a);
+      if (m) current = Number(m[1]);
+      const log = /\/actions\/jobs\/\d+\/logs/.test(a);
+      if (log) logs++;
+      if (log && broken.has(current))
+        return { code: 1, stdout: "", stderr: "HTTP 503: Service Unavailable" };
+      return g.exec(cmd, args);
+    };
+    const comments = () => g.state().stores.flatMap((st) => st.comments);
+    const completion = (e: number) => {
+      g.clock.now = NOW + e * HOUR;
+      logs = 0;
+      const r = reconcile({ exec, repo: "o/cloud", nowMs: g.clock.now });
+      expect(logs).toBeLessThanOrEqual(RECONCILE_LOGS);
+      return r;
+    };
+    // An outage: every run answers 503 until each has failed at least once.
+    let e = 0;
+    while (
+      Object.keys(pendingFails(comments())).filter(
+        (k) => (pendingFails(comments())[k] ?? 0) > 0,
+      ).length < ids.length &&
+      e < 20
+    )
+      completion(e++);
+    expect(e).toBeLessThan(20);
+    // The newest 20 recover; the oldest 4 keep answering 503.
+    for (const id of ids.slice(4)) broken.delete(id);
+    const want = ids.slice(4).map((id) => `${id}/2`);
+    const missing = () => want.filter((k) => !storedRuns(comments()).has(k));
+    let events = 0;
+    while (missing().length && events < 6) {
+      completion(e++);
+      events++;
+    }
+    expect(missing()).toEqual([]);
+    expect(events).toBeLessThanOrEqual(4);
+    // The 4 still wait, with no strike.
+    expect(pendingRuns(comments()).sort()).toEqual(
+      ids.slice(0, 4).map((id) => `${id}/2`),
+    );
+    expect(Object.values(pendingTries(comments()))).toEqual([0, 0, 0, 0]);
+  });
+});
+
+describe("a run with more job logs than one reconcile may read", () => {
+  // CI run 900's attempt 1 has 32 failed jobs, each failing its own test.
+  const JOBS = 32;
+  const logOf = (n: number) =>
+    [
+      "2026-11-19T20:59:55.6142298Z ##[group]test tests/redline",
+      vfail("test/big.test.ts", `case ${n}`),
+    ].join("\n");
+  it("takes 2 reconciles, never reads more than 25 logs in one, and loses no sighting", () => {
+    const g = liveGh({
+      listed: { "ci.yml": [ci1(900)] },
+      jobAt: { 900: NOW - HOUR },
+      log: CI_LOG,
+    });
+    let logs = 0;
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      if (/\/runs\/900\/attempts\/1\/jobs/.test(a))
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            jobs: Array.from({ length: JOBS }, (_, i) => ({
+              id: 100 + i,
+              name: `overlay (${i})`,
+              conclusion: "failure",
+              completed_at: new Date(NOW - HOUR).toISOString(),
+            })),
+          }),
+          stderr: "",
+        };
+      const m = /\/actions\/jobs\/(\d+)\/logs/.exec(a);
+      if (m) {
+        logs++;
+        return { code: 0, stdout: logOf(Number(m[1]) - 100), stderr: "" };
+      }
+      return g.exec(cmd, args);
+    };
+    const comments = () => g.state().stores.flatMap((st) => st.comments);
+    g.clock.now = NOW;
+    const first = reconcile({ exec, repo: "o/cloud", nowMs: NOW });
+    expect(logs).toBe(RECONCILE_LOGS);
+    expect(first.tracked).toEqual([]);
+    expect(first.left).toBe(1);
+    expect(first.notes).toContain(
+      `run 900/2: read ${RECONCILE_LOGS} job logs so far; the next reconcile reads the rest`,
+    );
+    // Nothing is recorded until the run is read whole.
+    expect(parseStore(comments()).size).toBe(0);
+    logs = 0;
+    g.clock.now = NOW + HOUR;
+    const second = reconcile({ exec, repo: "o/cloud", nowMs: NOW + HOUR });
+    expect(logs).toBe(JOBS - RECONCILE_LOGS);
+    expect(second.tracked.map((t) => t.run.runId)).toEqual([900]);
+    const seen = parseStore(comments());
+    expect(seen.size).toBe(JOBS);
+    expect([...seen.values()].every((x) => x.length === 1)).toBe(true);
+    expect([...storedRuns(comments())]).toEqual(["900/2"]);
+    // Done: a later reconcile reads none of its logs.
+    logs = 0;
+    g.clock.now = NOW + 2 * HOUR;
+    reconcile({ exec, repo: "o/cloud", nowMs: NOW + 2 * HOUR });
+    expect(logs).toBe(0);
   });
 });

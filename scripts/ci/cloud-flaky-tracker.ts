@@ -664,12 +664,22 @@ function jobLog(exec: Exec, repo: string, id: number): string {
 export function collect(
   exec: Exec,
   run: RunInfo,
-): { found: Found[]; notes: string[] } {
+  /** A run read in parts: the jobs already read and what they found. */
+  resume?: Progress,
+  /** False once no further job log may be read (the reconcile's budget). */
+  canRead: () => boolean = () => true,
+): {
+  found: Found[];
+  notes: string[];
+  /** Set when canRead stopped it: every job read so far, and what they found. */
+  partial?: Progress;
+} {
   const base = `repos/${run.repo}/actions/runs/${run.runId}`;
   const last = JSON.parse(
     gh(exec, ["api", `${base}/attempts/${run.attempt}`]),
   ) as Attempt;
-  const found: Found[] = [];
+  const found: Found[] = [...(resume?.found ?? [])];
+  const read = new Set(resume?.jobs ?? []);
   const notes: string[] = [];
   // A fork's run (a PR from another repo) counts too. Its logs are only read
   // as text: parseJob() takes test names from them, and inert() makes those
@@ -689,7 +699,15 @@ export function collect(
       ) as { jobs: Job[] }
     ).jobs.filter((j) => FAILED.has(j.conclusion ?? ""));
     for (const j of jobs) {
+      if (read.has(j.id)) continue;
+      if (!canRead())
+        return {
+          found,
+          notes,
+          partial: { jobs: [...read], found: [...found] },
+        };
       const fs = parseJob(run.workflow, j.name, jobLog(exec, run.repo, j.id));
+      read.add(j.id);
       if (!fs.length)
         notes.push(`attempt ${a}: job ${j.name} failed outside the tests`);
       const at = (j.completed_at ?? new Date().toISOString()).replace(
@@ -1175,12 +1193,23 @@ function markNoTest(
   return { done: [], notes };
 }
 
-export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
+export function track(o: {
+  exec: Exec;
+  run: RunInfo;
+  nowMs: number;
+  /** A run read in parts: carry on from here. */
+  resume?: Progress;
+  /** False once no further job log may be read (the reconcile's budget). */
+  canRead?: () => boolean;
+}): {
   done: Done[];
   notes: string[];
+  /** Stopped by canRead: nothing written yet; save this and resume later. */
+  partial?: Progress;
 } {
   const { exec, run } = o;
-  const { found, notes } = collect(exec, run);
+  const { found, notes, partial } = collect(exec, run, o.resume, o.canRead);
+  if (partial) return { done: [], notes, partial };
   if (!found.length) return markNoTest(exec, run, o.nowMs, notes);
   ensureLabel(
     exec,
@@ -1643,13 +1672,13 @@ export function reconcile(o: {
   let outOfLogs = false;
   const RUN_READ = /^repos\/[^/]+\/[^/]+\/actions\/(runs\/\d+|jobs\/\d+\/logs)/;
   const LOG = /\/actions\/jobs\/\d+\/logs$/;
-  // Every call counts, failed or not. A job log past the log budget is not
-  // read at all: the run it belongs to stops, and waits on the pending list.
-  // The first run started always finishes, so a run with more logs than the
-  // budget is still tracked.
+  // Every call counts, failed or not. A job log past the log budget is never
+  // read: collect() stops before it (canRead), and saves how far it got, so
+  // a run with more logs than the budget is read across reconciles. This
+  // refusal is only the backstop.
   const exec: Exec = (cmd, args) => {
     const log = args.some((a) => LOG.test(a));
-    if (log && spent.logs >= logCap && started > 1) {
+    if (log && spent.logs >= logCap) {
       outOfLogs = true;
       return {
         code: 1,
@@ -1684,6 +1713,10 @@ export function reconcile(o: {
   const pending = pendingRuns(stored);
   const tries = pendingTries(stored);
   const fails = pendingFails(stored);
+  const failedAt = pendingFailedAt(stored);
+  const progress = progressOf(stored);
+  const canRead = () => spent.logs < logCap;
+  const nowAt = new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z");
   const byId = new Map<number, ListedRun | { id: number; attempt: number }>();
   for (const p of pending) {
     const [id, attempt] = p.split("/").map(Number) as [number, number];
@@ -1692,12 +1725,14 @@ export function reconcile(o: {
   for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
   const key = (r: { id: number; attempt: number }) => `${r.id}/${r.attempt}`;
   const failedBefore = (k: string) => (fails[k] ?? 0) > 0;
-  // Runs that never failed first, oldest first, then the ones that did,
-  // oldest first: a run that keeps failing never takes the turn of one not
-  // yet tried.
+  // Runs that never failed first, oldest first. Then the ones that did,
+  // the longest since their last failure first: a run that just failed goes
+  // behind every other, so a few runs that keep failing take turns at the
+  // back and never hide the rest.
   const runs = [...byId.values()].sort(
     (a, b) =>
       Number(failedBefore(key(a))) - Number(failedBefore(key(b))) ||
+      (failedAt[key(a)] ?? "").localeCompare(failedAt[key(b)] ?? "") ||
       a.id - b.id,
   );
   if (!runs.length)
@@ -1711,7 +1746,7 @@ export function reconcile(o: {
   const listText = (list: string[]) =>
     [...list]
       .sort()
-      .map((k) => `${k} ${tries[k] ?? 0} ${fails[k] ?? 0}`)
+      .map((k) => `${k} ${tries[k] ?? 0} ${fails[k] ?? 0} ${failedAt[k] ?? ""}`)
       .join(" ");
   let saved = listText(pending);
   // The store writes outside the runs (the pending list, a drop) are outside
@@ -1727,7 +1762,7 @@ export function reconcile(o: {
   };
   const savePending = (list: string[], fresh = false) => {
     if (listText(list) === saved && !(fresh && list.length)) return;
-    post(pendingComment(list, nowMs, tries, fails));
+    post(pendingComment(list, nowMs, tries, fails, failedAt));
     saved = listText(list);
   };
   savePending(
@@ -1747,12 +1782,12 @@ export function reconcile(o: {
     // spends the budget still never stops the backlog.
     // Past the failed-read cap, only runs that never failed are started.
     if (
-      started > 0 &&
-      (outOfLogs ||
-        clock() - start >= (o.ms ?? RECONCILE_MS) ||
-        spent.calls >= callCap ||
-        spent.logs >= logCap ||
-        (spent.failedReads >= failCap && failedBefore(key(r))))
+      spent.logs >= logCap ||
+      outOfLogs ||
+      (started > 0 &&
+        (clock() - start >= (o.ms ?? RECONCILE_MS) ||
+          spent.calls >= callCap ||
+          (spent.failedReads >= failCap && failedBefore(key(r)))))
     ) {
       left++;
       unfinished.push(`${r.id}/${r.attempt}`);
@@ -1771,10 +1806,30 @@ export function reconcile(o: {
         headSha: l.sha,
         title: l.title,
       });
-      const t = { run, ...track({ exec, run, nowMs }) };
+      const done = track({
+        exec,
+        run,
+        nowMs,
+        resume: progress.get(k),
+        canRead,
+      });
+      if (done.partial) {
+        // Read in parts: save how far it got (outside the budget); the next
+        // reconcile resumes it.
+        post(progressComment(k, done.partial));
+        progress.set(k, done.partial);
+        left++;
+        unfinished.push(k);
+        const note = `run ${k}: read ${done.partial.jobs.length} job logs so far; the next reconcile reads the rest`;
+        notes.push(note);
+        o.onRun?.([`  note: ${note}`]);
+        continue;
+      }
+      const t = { run, done: done.done, notes: done.notes };
       tracked.push(t);
       delete tries[k];
       delete fails[k];
+      delete failedAt[k];
       o.onRun?.(runLines(t.run, t.done, t.notes));
     } catch (e) {
       // One run's failure never stops the others; the job still fails.
@@ -1786,6 +1841,7 @@ export function reconcile(o: {
         continue;
       }
       fails[k] = (fails[k] ?? 0) + 1;
+      failedAt[k] = nowAt;
       const failedCall = lastFail as { args: string[]; stderr: string } | null;
       // Only a run found gone (404 or 410) is a strike; a 5xx, timeout or
       // rate limit just waits.
@@ -1797,6 +1853,7 @@ export function reconcile(o: {
         post(unreadableComment(repo, k, why));
         delete tries[k];
         delete fails[k];
+        delete failedAt[k];
         dropped.push(k);
         const note = `run ${k}: unreadable: found gone (404 or 410) on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store (${why})`;
         notes.push(note);
@@ -1830,6 +1887,7 @@ export const pendingComment = (
   nowMs: number,
   tries: Record<string, number> = {},
   fails: Record<string, number> = {},
+  failedAt: Record<string, string> = {},
 ) =>
   [
     runs.length
@@ -1841,8 +1899,11 @@ export const pendingComment = (
       ["at", new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z")],
       ...runs.map((r): [string, string] => [
         "run",
-        // `<id>/<attempt> <strikes> <failures>`, or just the run when both are 0.
-        tries[r] || fails[r] ? `${r} ${tries[r] ?? 0} ${fails[r] ?? 0}` : r,
+        // `<id>/<attempt> <strikes> <failures> [last failure]`, or just the
+        // run when it never failed.
+        tries[r] || fails[r]
+          ? `${r} ${tries[r] ?? 0} ${fails[r] ?? 0}${failedAt[r] ? ` ${failedAt[r]}` : ""}`
+          : r,
       ]),
     ]),
   ].join("\n");
@@ -1901,7 +1962,10 @@ function pendingCounts(
     at = when;
     out = {};
     for (const v of m.get("run") ?? []) {
-      const x = /^(\d{1,20}\/\d{1,4}) (\d{1,3}) (\d{1,4})$/.exec(v);
+      const x =
+        /^(\d{1,20}\/\d{1,4}) (\d{1,3}) (\d{1,4})(?: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ))?$/.exec(
+          v,
+        );
       if (x) out[x[1] as string] = Number(x[2 + index]);
     }
   }
@@ -1922,6 +1986,106 @@ export function pendingRuns(comments: StoreComment[]): string[] {
     out = (m.get("run") ?? [])
       .map((r) => r.split(" ")[0] ?? "")
       .filter((r) => /^\d{1,20}\/\d{1,4}$/.test(r));
+  }
+  return out;
+}
+
+/** The newest pending list's last failure time of each run that failed. */
+export function pendingFailedAt(
+  comments: StoreComment[],
+): Record<string, string> {
+  let at = "";
+  let out: Record<string, string> = {};
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = {};
+    for (const v of m.get("run") ?? []) {
+      const x =
+        /^(\d{1,20}\/\d{1,4}) \d{1,3} \d{1,4} (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$/.exec(
+          v,
+        );
+      if (x) out[x[1] as string] = x[2] as string;
+    }
+  }
+  return out;
+}
+
+/** A run read in parts: the job logs already read, and what they found. */
+export type Progress = { jobs: number[]; found: Found[] };
+
+const hex = (s: string) => Buffer.from(s, "utf8").toString("hex");
+const unhex = (h: string) => Buffer.from(h, "hex").toString("utf8");
+const SUITES: readonly Suite[] = ["t19", "redline", "vitest", "e2e"];
+
+/**
+ * The store comment that saves a run read in parts, so the next reconcile
+ * resumes it: `kind: progress`, `run`, a `job` per job log read, and a
+ * `found` per test found (its JSON as hex, so no text from a log reaches a
+ * marker). The newest one for a run is read.
+ */
+export const progressComment = (key: string, p: Progress) =>
+  [
+    `The flaky tracker read ${p.jobs.length} job logs of run ${key} so far; the next reconcile reads the rest.`,
+    "",
+    markerBlock([
+      ["kind", "progress"],
+      ["run", key],
+      ...p.jobs.map((j): [string, string] => ["job", String(j)]),
+      ...p.found.map((x): [string, string] => [
+        "found",
+        hex(JSON.stringify(x)),
+      ]),
+    ]),
+  ].join("\n");
+
+/** The newest progress of each run read in parts, from the bot's comments only. */
+export function progressOf(comments: StoreComment[]): Map<string, Progress> {
+  const out = new Map<string, Progress>();
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "progress") continue;
+    const key = m.get("run")?.[0] ?? "";
+    if (!/^\d{1,20}\/\d{1,4}$/.test(key)) continue;
+    const p: Progress = { jobs: [], found: [] };
+    for (const j of m.get("job") ?? [])
+      if (/^\d{1,20}$/.test(j)) p.jobs.push(Number(j));
+    for (const h of m.get("found") ?? []) {
+      if (!/^[0-9a-f]{2,20000}$/.test(h)) continue;
+      try {
+        const x = JSON.parse(unhex(h)) as Found;
+        if (
+          SUITES.includes(x.f?.suite) &&
+          typeof x.f.id === "string" &&
+          typeof x.f.title === "string" &&
+          (x.f.file === undefined || typeof x.f.file === "string") &&
+          /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(x.sighting?.at ?? "") &&
+          Number.isSafeInteger(x.sighting.run) &&
+          Number.isSafeInteger(x.sighting.attempt)
+        )
+          p.found.push({
+            f: {
+              suite: x.f.suite,
+              id: x.f.id,
+              title: x.f.title,
+              ...(x.f.file === undefined ? {} : { file: x.f.file }),
+            },
+            sighting: {
+              at: x.sighting.at,
+              run: x.sighting.run,
+              attempt: x.sighting.attempt,
+            },
+          });
+      } catch {
+        // Not ours: skip it.
+      }
+    }
+    out.set(key, p);
   }
   return out;
 }
