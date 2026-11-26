@@ -40,6 +40,7 @@ import {
   smokePeoplePrefix,
   smokeRun,
   versionsIndexed,
+  versionsWaitSupported,
   wsUpgrade,
 } from "../src/smoke.ts";
 import {
@@ -310,17 +311,18 @@ describe("rl-a", () => {
       if (typeof id !== "string" || typeof version !== "number")
         throw new Error("MCP publish_artifact: no id or version");
       ids.push(id);
-      // Indexing can lag the publish. One held read of the versions list
-      // (?wait, public #3221) answers once the newest version is indexed,
-      // then one search must list it. A build without #3221 answers at once
-      // unindexed: then search is retried with backoff (the one wait Leo
-      // allows), the path read from the answer, never guessed.
+      // Indexing can lag the publish. A build with versions?wait (public
+      // #3221, detected from its own validation of `wait`, never from a
+      // timeout) gets one held read, then one search must list the page; a
+      // held read that ends unindexed fails the case. Only a build without
+      // it retries the search with backoff (the one wait Leo allows).
       const listed = async () => {
         const s = await okTool(A.app, p.pat, "search_artifacts", { q: marker });
         const items = (s.items as { id?: unknown }[] | undefined) ?? [];
         return items.some((x) => x.id === id) ? true : undefined;
       };
-      if ((await versionsIndexed(A.app, p.pat, id)) === "indexed") {
+      if (await versionsWaitSupported(A.app, p.pat, id)) {
+        await versionsIndexed(A.app, p.pat, id);
         if (!(await listed()))
           throw new Error(
             "the newest version is indexed, but search does not list it",

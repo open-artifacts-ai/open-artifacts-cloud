@@ -275,17 +275,44 @@ export async function heldOtp(
 export const VERSIONS_HOLD_MS = 25_000;
 
 /**
- * Whether the newest version is in the search index, from one held read of
- * `GET .../versions?wait=` (public #3221: it holds until the newest version
- * is textIndexed). "indexed" when it says so; "not-held" when the build
- * answered without it (no textIndexed true: an older build ignores `wait`),
- * so the caller falls back to the backoff retry.
+ * Whether this build holds `GET .../versions?wait=` (public #3221), from a
+ * definite signal, never a timeout: #3221 validates `wait`, so an invalid
+ * one answers 400 bad_request with details.path "wait"; a build without it
+ * ignores the parameter and answers 200. Anything else throws.
+ */
+export async function versionsWaitSupported(
+  app: string,
+  pat: string,
+  id: string,
+): Promise<boolean> {
+  const res = await req(
+    `${app}/api/v1/artifacts/${encodeURIComponent(id)}/versions?wait=invalid`,
+    { headers: bearer(pat) },
+  );
+  const text = await readBody(res);
+  if (res.status === 200) return false;
+  if (res.status === 400) {
+    let path: unknown;
+    try {
+      path = (JSON.parse(text) as { error?: { details?: { path?: unknown } } })
+        .error?.details?.path;
+    } catch {}
+    if (path === "wait") return true;
+  }
+  throw new Error(`versions?wait probe: ${describeRes(res, text)}`);
+}
+
+/**
+ * On a build that holds versions?wait: one held read, which answers once the
+ * newest version is in the search index. Still unindexed when it answers (the
+ * hold timed out or the index gave up) is a failure of the case, never a
+ * reason to retry.
  */
 export async function versionsIndexed(
   app: string,
   pat: string,
   id: string,
-): Promise<"indexed" | "not-held"> {
+): Promise<void> {
   const res = await req(
     `${app}/api/v1/artifacts/${encodeURIComponent(id)}/versions?wait=${VERSIONS_HOLD_MS}`,
     { headers: bearer(pat) },
@@ -305,7 +332,10 @@ export async function versionsIndexed(
   const newest = (items as { version?: number; textIndexed?: unknown }[])
     .slice()
     .sort((a, b) => (b.version ?? 0) - (a.version ?? 0))[0];
-  return newest?.textIndexed === true ? "indexed" : "not-held";
+  if (newest?.textIndexed !== true)
+    throw new Error(
+      `the held versions read answered with the newest version still unindexed (after up to ${VERSIONS_HOLD_MS / 1000} s)`,
+    );
 }
 
 // --- configuration ---------------------------------------------------------

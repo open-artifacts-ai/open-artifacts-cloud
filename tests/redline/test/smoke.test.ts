@@ -35,6 +35,7 @@ import {
   sweepWait,
   VERSIONS_HOLD_MS,
   versionsIndexed,
+  versionsWaitSupported,
 } from "../src/smoke.ts";
 import { parseTargets, secretsOf } from "../src/targets.ts";
 
@@ -208,42 +209,92 @@ describe("heldOtp: held asks, no client sleep", () => {
   });
 });
 
-describe("versionsIndexed: one held read picks the search path", () => {
-  const answer = (body: unknown, status = 200) =>
-    vi.fn(async () => new Response(JSON.stringify(body), { status }));
-  it("indexed when the newest version says textIndexed, asking with ?wait", async () => {
-    const f = answer([
-      { version: 2, textIndexed: true },
-      { version: 1, textIndexed: true },
-    ]);
-    vi.stubGlobal("fetch", f);
+describe("versions?wait: the search path from a definite signal, never a timeout", () => {
+  const reply = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status });
+  const withFetch = async (
+    answers: Response[],
+    fn: (calls: string[]) => Promise<void>,
+  ) => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (u: unknown) => {
+        calls.push(String(u));
+        const r = answers.shift();
+        if (!r) throw new Error("no more answers");
+        return r;
+      }),
+    );
     try {
-      expect(await versionsIndexed("https://a.example", "p", "art1")).toBe(
-        "indexed",
-      );
-      expect(String((f.mock.calls[0] as unknown[])[0])).toBe(
-        `https://a.example/api/v1/artifacts/art1/versions?wait=${VERSIONS_HOLD_MS}`,
-      );
+      await fn(calls);
     } finally {
       vi.unstubAllGlobals();
     }
+  };
+  const BAD_WAIT = {
+    error: {
+      code: "bad_request",
+      details: { path: "wait", reason: "invalid" },
+    },
+  };
+
+  it("supported: #3221 refuses an invalid wait (400, path wait); unsupported: the build ignores it (200)", async () => {
+    await withFetch([reply(400, BAD_WAIT)], async (calls) => {
+      expect(
+        await versionsWaitSupported("https://a.example", "p", "art1"),
+      ).toBe(true);
+      expect(calls).toEqual([
+        "https://a.example/api/v1/artifacts/art1/versions?wait=invalid",
+      ]);
+    });
+    await withFetch([reply(200, [{ version: 1 }])], async () => {
+      expect(
+        await versionsWaitSupported("https://a.example", "p", "art1"),
+      ).toBe(false);
+    });
+    // Any other answer is no signal at all: it throws, never guesses.
+    for (const r of [
+      reply(400, { error: { code: "bad_request" } }),
+      reply(500, {}),
+    ])
+      await withFetch([r], async () => {
+        await expect(
+          versionsWaitSupported("https://a.example", "p", "x"),
+        ).rejects.toThrow(/probe/);
+      });
   });
-  it("not-held when the build answers unindexed or without the field (no #3221)", async () => {
-    for (const body of [
-      [{ version: 1, textIndexed: false }],
-      [{ version: 1 }],
-      { items: [{ version: 3 }] },
-    ]) {
-      vi.stubGlobal("fetch", answer(body));
-      try {
-        expect(
-          await versionsIndexed("https://a.example", "p", "x"),
-          JSON.stringify(body),
-        ).toBe("not-held");
-      } finally {
-        vi.unstubAllGlobals();
-      }
-    }
+
+  it("a supported build's held read that answers indexed passes; one that ends unindexed fails, with no retry", async () => {
+    await withFetch(
+      [reply(200, [{ version: 2, textIndexed: true }])],
+      async (calls) => {
+        await versionsIndexed("https://a.example", "p", "art1");
+        expect(calls).toEqual([
+          `https://a.example/api/v1/artifacts/art1/versions?wait=${VERSIONS_HOLD_MS}`,
+        ]);
+      },
+    );
+    await withFetch(
+      [reply(200, [{ version: 2, textIndexed: false }])],
+      async (calls) => {
+        await expect(
+          versionsIndexed("https://a.example", "p", "art1"),
+        ).rejects.toThrow(/still unindexed/);
+        expect(calls).toHaveLength(1);
+      },
+    );
+  });
+
+  it("the standing track backs off only on an unsupported build", () => {
+    const st = readFileSync(join(pkg, "smoke/standing.test.ts"), "utf8");
+    const at = (s: string) => st.indexOf(s);
+    expect(at("if (await versionsWaitSupported(")).toBeGreaterThan(-1);
+    expect(at("await versionsIndexed(")).toBeGreaterThan(
+      at("if (await versionsWaitSupported("),
+    );
+    expect(at("retryWithBackoff(listed")).toBeGreaterThan(at("} else"));
+    expect((st.match(/retryWithBackoff\(/g) ?? []).length).toBe(1);
   });
 });
 
