@@ -250,15 +250,8 @@ const CASES: Retired[] = [
     "edge.test.ts",
     (k) =>
       `content host > ${k}: never serves app routes, with the install's own session or PAT`,
-    `${PR_CI}: routing is server code; the smoke's view reaches the content address through the real edge`,
-    [
-      CONTENT("the API and auth routes 404 on the content host"),
-      c(
-        "apps/dispatch/test/dispatch.test.ts",
-        "dispatch",
-        "app and content hosts of one install dispatch to the same script",
-      ),
-    ],
+    `${PR_CI}: routing is server code (and dispatch's own test sends both hosts of an install to one script); the smoke's view reaches the content address through the real edge`,
+    [CONTENT("the API and auth routes 404 on the content host")],
   ),
   ...both(
     "edge.test.ts",
@@ -284,15 +277,8 @@ const CASES: Retired[] = [
   one(
     "edge.test.ts",
     "unmapped host > A's host spelled differently (case, trailing dot, :443) never reaches another install",
-    `${PR_CI}: host normalizing is edge router and server code`,
-    [
-      HOSTS("normalizes case, a trailing dot and an explicit port"),
-      c(
-        "apps/dispatch/test/dispatch.test.ts",
-        "dispatch",
-        "uppercase, trailing dot and explicit port map to the same install",
-      ),
-    ],
+    `${PR_CI}: host normalizing is edge router and server code (dispatch's own test maps case, trailing dot and port to one install)`,
+    [HOSTS("normalizes case, a trailing dot and an explicit port")],
   ),
   one(
     "edge.test.ts",
@@ -361,12 +347,17 @@ const CASES: Retired[] = [
   one(
     "signin.test.ts",
     "sign-in: broker > a tampered install id at the broker callback is refused",
-    `${PR_CI}: the broker's signature check is code; a broken broker breaks the smoke's Google sign-in start`,
+    `${PR_CI}: the broker's signature check is code (the auth broker's own test: a broker state with the install swapped, or any tampering, is refused); a broken broker breaks the smoke's Google sign-in start`,
     [
       c(
-        "apps/auth-broker/test/broker.test.ts",
-        "callback",
-        "a broker state with the install swapped (or any tampering) is refused",
+        "apps/server/test/google-broker.test.ts",
+        "Google through the broker",
+        "a broker refusal (401) is a failed login",
+      ),
+      c(
+        "apps/server/test/google-broker.test.ts",
+        "Google through the broker",
+        "a token minted through install A with B's client nonce is refused at B (accepted at A)",
       ),
     ],
   ),
