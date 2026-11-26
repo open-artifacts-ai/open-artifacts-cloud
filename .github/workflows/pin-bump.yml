@@ -74,11 +74,14 @@
 # (GATE_WORKFLOWS in scripts/ci/pin-bump-arm.ts). The plan is the same
 # idempotent check whatever starts it, so an event with nothing newer does
 # nothing. A failure is red and files the blocker issue (report, below); no
-# timer retries it. Every job runs only on main of this repo, never on a fork;
-# land never runs on the push (it runs after CI on pin-land/*, when a gate
-# workflow ends, and on dispatch). An event no job takes (CI on main, or a gate
-# workflow ending outside direct mode) runs nothing, report included, so it
-# never closes the blocker issue.
+# timer retries it. Every job runs only on main of this repo, never on a fork.
+# Every run that has work does all of it: the plan (prepare, then open), and in
+# direct mode land too, whatever event started it. So a pending run that a later
+# event replaces in the shared group (GitHub keeps one pending run per group)
+# never takes work with it: a release dispatch replaced by CI ending on a staged
+# pin is still planned and opened by the run that replaced it. An event no job
+# takes (CI on main, or a workflow_run outside direct mode) runs nothing, report
+# included, so it never closes the blocker issue.
 name: pin-bump
 
 on:
@@ -89,9 +92,9 @@ on:
     paths: [PUBLIC_PIN]
   # Direct mode only, from main's copy of this file and script; nothing from the
   # event is used but its workflow name and branch, in the jobs' `if`.
-  # - CI finished on a staged pin (pin-land/*): only land runs.
-  # - A release pipeline gate workflow ended on main: the gate may be open now,
-  #   so the plan and land both run again.
+  # - CI finished on a staged pin (pin-land/*): land may take it now.
+  # - A release pipeline gate workflow ended on main: the gate may be open now.
+  # Either way the plan and land both run (Triggers above), as on dispatch.
   # CI also ends on main; no job takes that event.
   workflow_run:
     workflows:
@@ -108,17 +111,18 @@ on:
 
 permissions: {}
 
-# One run at a time, never cancelled. An event no job takes (CI on main, or a
-# workflow_run outside direct mode) gets a group of its own, so it can never
-# replace a pending run that has work to do. The test for this group is the
-# same as the jobs' `if`s below.
+# One run at a time, never cancelled. GitHub keeps one pending run per group,
+# and a newer event replaces it, so every run in this group does the same work
+# (Triggers above). An event no job takes (CI on main, or a workflow_run outside
+# direct mode) gets a group of its own, so it can never replace a pending run
+# that has work to do. The test for this group is the same as the jobs' `if`s.
 concurrency:
   group: ${{ (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/'))))) && 'pin-bump' || format('pin-bump-idle-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   prepare:
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main' && vars.PIN_BUMP_DIRECT == 'on'))
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/')))))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -214,7 +218,7 @@ jobs:
 
   open:
     needs: prepare
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main' && vars.PIN_BUMP_DIRECT == 'on')) && needs.prepare.outputs.bump == 'true'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/'))))) && needs.prepare.outputs.bump == 'true'
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 10
@@ -364,7 +368,7 @@ jobs:
 
   # Direct mode: main moves to a staged pin only once a full CI push run passed on that exact sha.
   land:
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event_name != 'push' && vars.PIN_BUMP_DIRECT == 'on' && (github.event_name != 'workflow_run' || (github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/')))
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/')))))
     runs-on: ubuntu-latest
     # Its own App and Environment: the bypass actor on main's ruleset is used here only.
     environment: pin-land

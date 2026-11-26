@@ -672,22 +672,32 @@ describe("pin-bump.yml", () => {
       ]);
     });
 
-    it("land never runs on the push, in direct mode or not", () => {
-      for (const direct of ["", "on"])
-        expect(runs("land", { event: "push", direct })).toBe(false);
-      expect(runs("land", { event: "workflow_dispatch", direct: "on" })).toBe(
-        true,
-      );
-      expect(jobsFor({ event: "push", direct: "on" })).toEqual([
-        "prepare",
-        "open",
-        "report",
-      ]);
+    it("in direct mode every run with work plans, opens and lands, whatever the event", () => {
+      const all = ["prepare", "open", "land", "report"];
+      for (const o of [
+        { event: "push", direct: "on" },
+        { event: "workflow_dispatch", direct: "on" },
+        {
+          event: "workflow_run",
+          wf: "CI",
+          branch: "pin-land/v1.2.3",
+          direct: "on",
+        },
+      ])
+        expect(jobsFor(o)).toEqual(all);
+      // not direct: land never runs, and the plan runs on dispatch and the push
+      for (const event of ["push", "workflow_dispatch"])
+        expect(runs("land", { event })).toBe(false);
     });
 
-    it("after CI on a staged pin, only land runs (direct mode)", () => {
+    it("after CI on a staged pin, the plan runs as well as land (direct mode)", () => {
       const ci = { event: "workflow_run", wf: "CI", branch: "pin-land/v1.2.3" };
-      expect(jobsFor({ ...ci, direct: "on" })).toEqual(["land", "report"]);
+      expect(jobsFor({ ...ci, direct: "on" })).toEqual([
+        "prepare",
+        "open",
+        "land",
+        "report",
+      ]);
       // not direct: nothing runs, and report does not close the blocker issue
       expect(jobsFor(ci)).toEqual([]);
     });
@@ -747,6 +757,61 @@ describe("pin-bump.yml", () => {
       for (const o of idle) {
         expect(jobsFor(o)).toEqual([]);
         expect(group(o)).toBe("pin-bump-idle-42");
+      }
+    });
+
+    // GitHub keeps one pending run per concurrency group: a newer event in the
+    // group replaces it (cancel-in-progress false cancels the pending one, not
+    // the running one). Replaying that slot must never drop an event's work.
+    const pendingSlot = (events: Ev[]) => {
+      let pending: Ev | undefined;
+      for (const e of events) if (group(e) === "pin-bump") pending = e; // replaces the pending one
+      return pending;
+    };
+    it("a release dispatch replaced by a pin-land CI event in the pending slot is still planned and opened (direct mode)", () => {
+      const dispatch: Ev = { event: "workflow_dispatch", direct: "on" };
+      const ci: Ev = {
+        event: "workflow_run",
+        wf: "CI",
+        branch: "pin-land/v1.2.2",
+        direct: "on",
+      };
+      const survivor = pendingSlot([dispatch, ci]) as Ev;
+      expect(survivor).toBe(ci);
+      expect(group(dispatch)).toBe(group(ci));
+      const ran = jobsFor(survivor);
+      expect(ran).toContain("prepare");
+      expect(ran).toContain("open");
+      expect(ran).toContain("land");
+      // the replaced dispatch's work is all in the survivor's
+      for (const j of jobsFor(dispatch)) expect(ran).toContain(j);
+    });
+    it("whichever event replaces another in the shared group does every job the replaced one would", () => {
+      for (const direct of ["", "on"]) {
+        const real: Ev[] = [
+          { event: "push", direct },
+          { event: "workflow_dispatch", direct },
+          {
+            event: "workflow_run",
+            wf: "CI",
+            branch: "pin-land/v1.2.3",
+            direct,
+          },
+          ...GATE_WORKFLOWS.map((f) =>
+            gateEnd(f.replace(/\.yml$/, ""), direct),
+          ),
+        ].filter((o) => group(o) === "pin-bump");
+        expect(real.length).toBeGreaterThanOrEqual(2);
+        for (const first of real)
+          for (const later of real) {
+            const survivor = pendingSlot([first, later]) as Ev;
+            expect(survivor).toBe(later);
+            for (const j of jobsFor(first))
+              expect(
+                jobsFor(survivor),
+                `${JSON.stringify(first)} then ${JSON.stringify(later)}`,
+              ).toContain(j);
+          }
       }
     });
 
@@ -1230,7 +1295,7 @@ describe("pin-bump.yml", () => {
       expect(result("success", "success", "success")).toBe("success");
       expect(result("success", "skipped", "failure")).toBe("failure");
       expect(result("success", "skipped", "cancelled")).toBe("failure");
-      // after CI on a staged pin, only land runs
+      // land's result counts on its own when prepare did not run
       expect(result("skipped", "skipped", "success")).toBe("success");
       expect(result("skipped", "skipped", "failure")).toBe("failure");
     });
