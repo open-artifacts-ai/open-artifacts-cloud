@@ -3,10 +3,11 @@
     "The release chain's stages in order, read by scripts/ci/release-watch.ts (cloud #264). Each stage runs from one event to the next, so the stages are contiguous and the hand-off gaps count in the stage they lead into.",
     "Events: merged (the oldest public PR merged into the release), published (the public release), pin_opened (the pin-bump/<tag> PR opened), pinned (the pin commit on cloud main: the PR's merge, or the direct pin commit), then <step>.started and <step>.done for the runs of hosted_release, staging_publish, staging_deploy, redline, prod_publish and prod_deploy.",
     "mode pr stages count only for a release pinned through a pin-bump PR, mode direct only for one pinned by a direct commit on main. pinMode is the mode a release with neither yet is waiting in.",
-    "usual is each stage's median in minutes over every measured release below where that stage finished green (a red stage is not counted). They are the 22 public releases v0.235.2 to v0.248.1, read by a read-only backfill tick (release-watch.ts tick --since 2026-11-20 --no-issue) at 2026-11-26T03:41Z. n per stage: tag 22, pin_open 17, pin_merge 15, hosted_release 13, staging_publish 12, staging_deploy 12, redline_queue 12, redline 7, prod_publish 7, prod_deploy 7.",
+    "usual is each stage's median in minutes over every measured release below where that stage finished green (a red stage is not counted). They are the 22 public releases v0.235.2 to v0.248.1, read by a read-only backfill tick (release-watch.ts tick --since 2026-11-20 --no-issue) at 2026-11-26T03:41Z; v0.246.1 re-read at 04:35Z once the staging publish matched recovery runs by the tag their job names (it reached prod at 01:07:55Z). n per stage: tag 22, pin_open 17, pin_merge 15, hosted_release 13, staging_publish 13, staging_deploy 13, redline_queue 13, redline 8, prod_publish 8, prod_deploy 8.",
     "direct_pin has no measured release yet: its usual 2.1 is an estimate, pin_open's median, since the same pin-bump run makes the pin commit instead of opening the PR. Measure it once releases pin directly.",
-    "The alert: one blocker issue while any stage of a release in flight, or of the newest finished release, runs past alertFactor x its usual time (in progress or finished). e2eTarget is merge to every install in minutes (to the prod deploy until fleet is measured): every release's total is reported against it in the summary, never alerted on.",
-    "fleet is not measured yet: it needs a public fleet done signal (the scheduler's fleet_done mark served at GET /api/v1/fleet on the signup hosts, Lane 5 PR2). The watcher never reads fleet state through admin tools.",
+    "The alert: one blocker issue while any stage of a release in flight, or of the newest finished release, runs past its limit (in progress or finished). The limit is max(alertFactor x usual, usual + alertFloor) minutes, so max(2 x usual, usual + 5 min): the floor keeps a stage that usually takes half a minute (redline_queue) from alerting on a one-minute wait. e2eTarget is merge to every install in minutes: every release's total is reported against it in the summary, never alerted on. Until fleet is measured, the total runs to the prod deploy and the summary says so: to prod deploy (fleet not yet measured).",
+    "A run belongs to a release by its verified identity, never by the sha it ran on alone: hosted-release by its hosted-built <tag> <sha> job (cloud #469) or else the pin commit it ran on; the staging publish by its publish-staging release <tag> job, so a recovery run on a later main commit counts (v0.246.1: run 45730519720 on fd2652f3); the rest by their run names. A release that reached its prod deploy is never superseded.",
+    "fleet is not measured yet: no source records it without admin access. The scheduler's fleet duty (apps/scheduler/src/provapi/fleet.ts) keeps its state in the platform D1 (platform_state fleet_* keys), served by no public route and recorded in no GitHub run, deployment or issue. It needs a public fleet done signal (such as GET /api/v1/fleet on the signup hosts, Lane 5 PR2). The watcher never reads fleet state through admin tools.",
     "Measured v0.235.2: tag 3.4.",
     "Measured v0.236.0: tag 8.8.",
     "Measured v0.237.0: tag 6.",
@@ -25,13 +26,14 @@
     "Measured v0.245.0: tag 3.5, pin_open 2.2 (PR #444), pin_merge 7.9 (PR #444), hosted_release 3.2 (run 45666080104), staging_publish 4.3 (run 45666652079), staging_deploy 4.6 (run 45667461443), redline_queue 0.4 (run 45668239179), redline 9.5 (run 45668239179), prod_publish 2.8 (run 45670045897), prod_deploy 5.6 (run 45670394327).",
     "Measured v0.245.1: tag 3.6, pin_open 1.8 (PR #445), pin_merge 10 (PR #445), hosted_release 2.9 (run 45683033665), staging_publish 4 (run 45683527190), staging_deploy 5.1 (run 45684245945), redline_queue 0.7 (run 45685128106), redline 9.9 (run 45685128106), prod_publish 3 (run 45686940934), prod_deploy 4.9 (run 45687331377).",
     "Measured v0.246.0: tag 3.5, pin_open 2.1 (PR #446), pin_merge 9.9 (PR #446), hosted_release 3.1 (run 45691936710), staging_publish 4.3 (run 45692437937), staging_deploy 4.8 (run 45693219953), redline_queue 0.4 (run 45693977251).",
-    "Measured v0.246.1: tag 93, pin_open 2 (PR #448), pin_merge 37.6 (PR #448), hosted_release 78.4 (run 45720938191).",
+    "Measured v0.246.1: tag 93, pin_open 2 (PR #448), pin_merge 37.6 (PR #448), hosted_release 78.4 (run 45720938191), staging_publish 3.8 (run 45730519720), staging_deploy 4.6 (run 45731023993), redline_queue 0.4 (run 45731553873), redline 9.7 (run 45731553873), prod_publish 3 (run 45732780132), prod_deploy 5.1 (run 45733048529).",
     "Measured v0.247.0: tag 159.3, pin_open 2 (PR #463), pin_merge 9.3 (PR #463), hosted_release 3.3 (run 45738985811), staging_publish 4 (run 45739326867), staging_deploy 5 (run 45739816583), redline_queue 0.5 (run 45740398112).",
     "Measured v0.248.0: tag 3, pin_open 1.8 (PR #464), pin_merge 31.6 (PR #464), hosted_release 3.2 (run 45743478814), staging_publish 4 (run 45743823906), staging_deploy 4 (run 45744292138), redline_queue 0.4 (run 45744729902).",
     "Measured v0.248.1: tag 16, pin_open 2.1 (PR #468), pin_merge 14.6 (PR #468), hosted_release 3.1 (run 45747521104), staging_publish 4.2 (run 45747860688), staging_deploy 4.4 (run 45748344410), redline_queue 0.5 (run 45748825604)."
   ],
   "pinMode": "pr",
   "alertFactor": 2,
+  "alertFloor": 5,
   "e2eTarget": 20,
   "lookbackHours": 6,
   "statsWindow": 20,
@@ -43,9 +45,9 @@
     { "name": "direct_pin", "from": "published", "to": "pinned", "usual": 2.1, "mode": "direct" },
     { "name": "hosted_release", "from": "pinned", "to": "hosted_release.done", "usual": 3.2 },
     { "name": "staging_publish", "from": "hosted_release.done", "to": "staging_publish.done", "usual": 4.2 },
-    { "name": "staging_deploy", "from": "staging_publish.done", "to": "staging_deploy.done", "usual": 4.75 },
+    { "name": "staging_deploy", "from": "staging_publish.done", "to": "staging_deploy.done", "usual": 4.7 },
     { "name": "redline_queue", "from": "staging_deploy.done", "to": "redline.started", "usual": 0.5 },
-    { "name": "redline", "from": "redline.started", "to": "redline.done", "usual": 9.9 },
+    { "name": "redline", "from": "redline.started", "to": "redline.done", "usual": 9.8 },
     { "name": "prod_publish", "from": "redline.done", "to": "prod_publish.done", "usual": 3 },
     { "name": "prod_deploy", "from": "prod_publish.done", "to": "prod_deploy.done", "usual": 5.1 },
     {
@@ -53,7 +55,7 @@
       "from": "prod_deploy.done",
       "to": "fleet.done",
       "measured": false,
-      "todo": "needs a public fleet done signal (GET /api/v1/fleet on the signup hosts, Lane 5 PR2); no admin reads"
+      "todo": "needs a public fleet done signal (no GitHub record or public endpoint has one yet; GET /api/v1/fleet on the signup hosts, Lane 5 PR2); no admin reads"
     }
   ]
 }

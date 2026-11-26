@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import type { Exec } from "./gh-retry.ts";
 import {
+  BUILT_RE,
   type Config,
   compute,
   eta,
@@ -14,15 +15,19 @@ import {
   ISSUE_TITLE,
   issueBody,
   issuePlan,
+  limitOf,
   loadConfig,
   mergeHistory,
+  namedTag,
   overruns,
+  PROD_RE,
   type Pr,
   parseHistory,
   pct,
   pinSubject,
   type Release,
   type Run,
+  STAGING_RE,
   stats,
   step,
   summary,
@@ -109,8 +114,9 @@ describe("release-stages.json", () => {
     expect(f?.todo).toMatch(/fleet/);
     expect(f?.todo).toMatch(/no admin reads/);
   });
-  it("alerts past twice each stage's usual time; merge to every install only has a 20 min target", () => {
+  it("alerts past max(2 x usual, usual + 5 min); merge to every install only has a 20 min target", () => {
     expect(config.alertFactor).toBe(2);
+    expect(config.alertFloor).toBe(5);
     expect(config.e2eTarget).toBe(20);
     expect(config).not.toHaveProperty("e2eWorst");
     for (const s of config.stages) {
@@ -143,7 +149,7 @@ describe("release-stages.json", () => {
     ))
       expect(median(v[s.name] ?? []), s.name).toBeCloseTo(s.usual as number, 2);
   });
-  it("refuses a measured stage with no usual time, and a missing alert factor", () => {
+  it("refuses a measured stage with no usual time, and a missing alert factor or floor", () => {
     expect(() =>
       loadConfig(
         JSON.stringify({ stages: [{ name: "x", from: "a", to: "b" }] }),
@@ -157,6 +163,15 @@ describe("release-stages.json", () => {
         }),
       ),
     ).toThrow(/alertFactor/);
+    expect(() =>
+      loadConfig(
+        JSON.stringify({
+          alertFactor: 2,
+          e2eTarget: 20,
+          stages: [{ name: "x", from: "a", to: "b", usual: 1 }],
+        }),
+      ),
+    ).toThrow(/alertFloor/);
   });
 });
 
@@ -183,10 +198,10 @@ describe("timeline on the recorded chain", () => {
     expect(t?.e2e).toBe(45.8);
     const w = world(now);
     expect(w.over).toEqual([]);
-    expect(issuePlan([], w.over, w.red)).toEqual({ action: "none" });
+    expect(issuePlan([], w.over, w.red, config)).toEqual({ action: "none" });
   });
 
-  it("staging_deploy past twice its usual time mid-flight opens the blocker naming the stage and release", () => {
+  it("staging_deploy past its limit mid-flight opens the blocker naming the stage and release", () => {
     const now = T("19:30:00");
     const w = at(now);
     w.runs = w.runs
@@ -204,8 +219,8 @@ describe("timeline on the recorded chain", () => {
         kind: "in_flight",
         startedAt: T("19:20:12"),
         minutes: 9.8,
-        usual: 4.75,
-        limit: 9.5,
+        usual: 4.7,
+        limit: 9.7,
         url: expect.stringContaining("/actions/runs/"),
       },
     ]);
@@ -214,25 +229,29 @@ describe("timeline on the recorded chain", () => {
       stage: "staging_deploy",
       state: "current",
       elapsed: 9.8,
-      usual: 4.75,
-      limit: 9.5,
+      usual: 4.7,
+      limit: 9.7,
     });
-    const a = issuePlan([], r.over, r.red);
+    const a = issuePlan([], r.over, r.red, config);
     expect(a.action).toBe("create");
     if (a.action === "create")
       expect(a.body).toContain(
-        "- v0.245.1 staging_deploy: still going past 9.5 min (usual 4.75 min), started 2026-11-25T19:20:12Z.",
+        "- v0.245.1 staging_deploy: still going past 9.7 min (usual 4.7 min), started 2026-11-25T19:20:12Z.",
       );
   });
 
-  it("no pin PR 4.5 minutes after the release is a pin_open stall", () => {
-    const now = T("19:06:00");
+  it("no pin PR 7.5 minutes after the release is a pin_open stall; 4.5 minutes is under the 5 min floor", () => {
+    const now = T("19:09:00");
     const w = at(now);
     w.prs = w.prs.filter((p) => p.ref !== "pin-bump/v0.245.1");
     const r = world(now, w);
-    expect(r.over.map((o) => [o.tag, o.stage, o.minutes])).toEqual([
-      ["v0.245.1", "pin_open", 4.5],
+    expect(r.over.map((o) => [o.tag, o.stage, o.minutes, o.limit])).toEqual([
+      ["v0.245.1", "pin_open", 7.5, 7.1],
     ]);
+    // Past twice its usual time (4.2 min), not past usual + 5 (7.1): no alert.
+    const early = at(T("19:06:00"));
+    early.prs = early.prs.filter((p) => p.ref !== "pin-bump/v0.245.1");
+    expect(world(T("19:06:00"), early).over).toEqual([]);
     // With the PR there, the release has moved on and nothing is stuck.
     expect(world(now).over).toEqual([]);
   });
@@ -266,8 +285,8 @@ describe("timeline on the recorded chain", () => {
       ["tag", "finished", 93],
       ["pin_merge", "finished", 37.6],
     ]);
-    expect(issuePlan([], [], r.red)).toEqual({ action: "none" });
-    expect(issueBody(r.over, r.red)).toContain(
+    expect(issuePlan([], [], r.red, config)).toEqual({ action: "none" });
+    expect(issueBody(r.over, r.red, config)).toContain(
       "Red, covered by that run's own blocker issue:\n- v0.246.1 hosted_release: https://",
     );
     expect(eta(tl("v0.246.1", now, w) as never, r.current.stages, now)).toBe(
@@ -450,6 +469,280 @@ describe("timeline on the recorded chain", () => {
   });
 });
 
+// cloud #456 review: v0.246.1's staging publish ran on main fd2652f3, a
+// recovery after the pin run's own publish failed, then staging deploy,
+// red-line, prod publish and prod deploy at 01:07:55Z. Recorded from runs
+// 45720938191, 45721473041, 45723885429, 45728845641, 45730519720,
+// 45731023993, 45731553873, 45732780132, 45733048529 and v0.247.0's pin
+// (PR #463, run 45738985811).
+describe("a release across recovery runs (v0.246.1)", () => {
+  const RUNS =
+    "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/";
+  const MAIN = "fd2652f3061fa30f9009eca5c4171dd6ec7e65a0";
+  const D = (hms: string) => `2026-11-26T${hms}Z`;
+  const ok = (name: string) => ({ name, conclusion: "success" });
+  const skipped = (name: string) => ({
+    name: `${name} \${{ needs.resolve.outputs.kind }} \${{ needs.resolve.outputs.tag }}`,
+    conclusion: "skipped",
+  });
+  const run = (
+    file: string,
+    o: Pick<Run, "id" | "event" | "title" | "createdAt" | "updatedAt"> &
+      Partial<Run>,
+  ): Run => ({
+    path: `.github/workflows/${file}`,
+    status: "completed",
+    conclusion: "success",
+    headSha: MAIN,
+    startedAt: o.createdAt,
+    attempt: 1,
+    url: `${RUNS}${o.id}`,
+    commitMessage:
+      "fix(hosted-release): a re-run accepts an existing tag on an earlier main commit pinning the same release (#457)",
+    commitAt: D("00:16:42"),
+    ...o,
+  });
+  const pinRun = fx.runs.find((r) => r.id === 45720938191) as Run;
+  const pinPublish = fx.runs.find((r) => r.id === 45721473041) as Run;
+  const recovery = (): Run[] => [
+    // The pin run went green on attempt 3.
+    {
+      ...pinRun,
+      status: "completed",
+      conclusion: "success",
+      attempt: 3,
+      startedAt: D("00:38:18"),
+      updatedAt: D("00:41:25"),
+    },
+    {
+      ...pinPublish,
+      jobs: [
+        ok("resolve"),
+        { name: "publish-staging release v0.246.1", conclusion: "failure" },
+      ],
+    },
+    run("hosted-publish.yml", {
+      id: 45723885429,
+      event: "workflow_run",
+      title: "hosted-publish",
+      headSha: "4f8bf1540cab011b0c731f668b92241788676162",
+      conclusion: "failure",
+      createdAt: T("23:46:22"),
+      updatedAt: T("23:47:26"),
+      jobs: [
+        ok("resolve"),
+        { name: "publish-staging release v0.246.1", conclusion: "failure" },
+      ],
+    }),
+    // A run on the same main commit that published nothing.
+    run("hosted-publish.yml", {
+      id: 45728845641,
+      event: "workflow_run",
+      title: "hosted-publish",
+      createdAt: D("00:27:17"),
+      updatedAt: D("00:27:31"),
+      jobs: [
+        ok("resolve"),
+        skipped("publish-staging"),
+        skipped("publish-prod"),
+      ],
+    }),
+    run("hosted-publish.yml", {
+      id: 45730519720,
+      event: "workflow_run",
+      title: "hosted-publish",
+      createdAt: D("00:41:28"),
+      updatedAt: D("00:45:10"),
+      jobs: [
+        ok("resolve"),
+        ok("publish-staging release v0.246.1"),
+        ok("stage-prod release v0.246.1"),
+        skipped("publish-prod"),
+      ],
+    }),
+    run("deploy-hosted-platform.yml", {
+      id: 45731023993,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform staging v0.246.1 [sc45730978252-1]",
+      createdAt: D("00:45:37"),
+      updatedAt: D("00:49:46"),
+    }),
+    run("redline-staging.yml", {
+      id: 45731553873,
+      event: "workflow_dispatch",
+      title: "redline-staging v0.246.1",
+      createdAt: D("00:50:09"),
+      updatedAt: D("00:59:53"),
+    }),
+    run("hosted-publish.yml", {
+      id: 45732780132,
+      event: "workflow_dispatch",
+      title: "hosted-publish prod v0.246.1 [p45732669445-1]",
+      createdAt: D("01:00:49"),
+      updatedAt: D("01:02:50"),
+      jobs: [
+        ok("resolve"),
+        ok("publish-prod release v0.246.1"),
+        skipped("stage-prod"),
+        skipped("publish-staging"),
+      ],
+    }),
+    run("deploy-hosted-platform.yml", {
+      id: 45733048529,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform prod v0.246.1 [c45732669445-1]",
+      createdAt: D("01:03:05"),
+      updatedAt: D("01:07:55"),
+    }),
+    // v0.247.0 pinned after: before the fix, this superseded v0.246.1.
+    run("hosted-release.yml", {
+      id: 45738985811,
+      event: "push",
+      title: "hosted-release",
+      headSha: "4575a96be56acb8b60cac1c29d55e81adb7f8104",
+      commitMessage: "chore(pin): bump PUBLIC_PIN to v0.247.0 (#463)",
+      commitAt: D("01:47:47"),
+      createdAt: D("01:55:32"),
+      updatedAt: D("01:58:47"),
+    }),
+  ];
+  const now = D("02:00:00");
+  const w = (runs: Run[]) => ({
+    releases: [...fx.releases, { tag: "v0.247.0", publishedAt: D("01:44:15") }],
+    prs: [
+      ...fx.prs,
+      {
+        number: 463,
+        ref: "pin-bump/v0.247.0",
+        createdAt: D("01:46:15"),
+        mergedAt: D("01:55:30"),
+        url: "https://github.com/open-artifacts-ai/open-artifacts-cloud/pull/463",
+      },
+    ],
+    runs: [
+      ...fx.runs.filter((r) => r.id !== pinRun.id && r.id !== pinPublish.id),
+      ...runs,
+    ],
+    merges: fx.merges,
+  });
+
+  it("the job names a run's release: the tag, nothing for a run that published nothing, unknown when unread", () => {
+    const [, failed, , noop, publish, , , prod] = recovery();
+    expect(namedTag(publish as Run, STAGING_RE)).toBe("v0.246.1");
+    expect(namedTag(failed as Run, STAGING_RE)).toBe("v0.246.1");
+    expect(namedTag(failed as Run, STAGING_RE, true)).toBe(null);
+    expect(namedTag(noop as Run, STAGING_RE)).toBe(null);
+    expect(namedTag(prod as Run, PROD_RE)).toBe("v0.246.1");
+    expect(namedTag(prod as Run, STAGING_RE)).toBe(null);
+    expect(namedTag({ ...(publish as Run), jobs: undefined }, STAGING_RE)).toBe(
+      undefined,
+    );
+    expect(namedTag({ ...(publish as Run), jobs: [] }, STAGING_RE)).toBe(
+      undefined,
+    );
+  });
+
+  it("a staging publish on a later main commit that names the tag counts: the release reached prod and is done, not superseded", () => {
+    const x = w(recovery());
+    const t = tl("v0.246.1", now, x);
+    expect(row(t, "staging_publish")).toMatchObject({
+      state: "done",
+      minutes: 3.8,
+      url: `${RUNS}45730519720`,
+    });
+    expect(
+      Object.fromEntries((t?.stages ?? []).map((s) => [s.name, s.minutes])),
+    ).toMatchObject({
+      hosted_release: 78.4,
+      staging_publish: 3.8,
+      staging_deploy: 4.6,
+      redline_queue: 0.4,
+      redline: 9.7,
+      prod_publish: 3,
+      prod_deploy: 5.1,
+    });
+    expect(t?.prodAt).toBe(D("01:07:55"));
+    expect(t?.doneAt).toBe(D("01:07:55"));
+    expect(t?.supersededBy).toBeUndefined();
+    expect(t?.e2e).toBe(237.5);
+    const r = world(now, x);
+    const h = r.history.find((e) => e.tag === "v0.246.1");
+    expect(h).toMatchObject({ doneAt: D("01:07:55"), e2e: 237.5 });
+    expect(h).not.toHaveProperty("supersededBy");
+    expect(h?.stages.staging_publish).toBe(3.8);
+    // v0.246.0 never reached prod: superseded, closed by v0.246.1's prod deploy.
+    expect(r.history.find((e) => e.tag === "v0.246.0")).toMatchObject({
+      supersededBy: "v0.246.1",
+      doneAt: D("01:07:55"),
+    });
+    expect(r.current.inFlight.map((f) => f.tag)).toEqual(["v0.247.0"]);
+  });
+
+  it("a release that reached its prod deploy is never superseded, even with a stage unmatched", () => {
+    // No jobs read: the recovery publish is not matched by sha, but the
+    // prod deploy ran, so every stage before it happened.
+    const x = w(recovery().map((r) => ({ ...r, jobs: undefined })));
+    const t = tl("v0.246.1", now, x);
+    expect(row(t, "staging_publish")?.state).toBe("done");
+    expect(row(t, "staging_publish")?.minutes).toBeUndefined();
+    expect(row(t, "staging_deploy")?.minutes).toBeUndefined();
+    expect(row(t, "redline")?.minutes).toBe(9.7);
+    expect(t?.supersededBy).toBeUndefined();
+    expect(t?.doneAt).toBe(D("01:07:55"));
+  });
+
+  it("a release that never reached prod is superseded once a newer one is pinned", () => {
+    const x = w(
+      recovery().filter(
+        (r) => ![45731553873, 45732780132, 45733048529].includes(r.id),
+      ),
+    );
+    const t = tl("v0.246.1", now, x);
+    expect(row(t, "redline_queue")?.state).toBe("current");
+    expect(t?.prodAt).toBeUndefined();
+    expect(t?.supersededBy).toBe("v0.247.0");
+    expect(t?.closedAt).toBeUndefined();
+    const r = world(now, x);
+    expect(r.current.inFlight.map((f) => f.tag)).toEqual(["v0.247.0"]);
+    expect(r.history.map((e) => e.tag)).not.toContain("v0.246.1");
+  });
+
+  it("a hosted-release dispatch on main's head counts by its hosted-built job (cloud #469), not its sha", () => {
+    const built = (tag: string, conclusion = "success") =>
+      run("hosted-release.yml", {
+        id: 45728492094,
+        event: "workflow_dispatch",
+        title: "hosted-release",
+        createdAt: D("00:24:20"),
+        updatedAt: D("00:27:15"),
+        jobs: [
+          ok("hosted-guard"),
+          { name: `hosted-built ${tag} ${pinRun.headSha}`, conclusion },
+        ],
+      });
+    // The pin run red on its first attempt; the dispatch rebuilt its commit.
+    const red = {
+      ...pinRun,
+      status: "completed",
+      conclusion: "failure",
+      attempt: 1,
+      startedAt: pinRun.createdAt,
+      updatedAt: T("23:27:09"),
+    };
+    // Nothing later ran, so no later stage marks this one done.
+    const hr = (b: Run) =>
+      row(tl("v0.246.1", now, w([red, b])), "hosted_release");
+    expect(hr(built("v0.246.1"))).toMatchObject({
+      state: "done",
+      endedAt: D("00:27:15"),
+    });
+    expect(namedTag(built("v0.246.1"), BUILT_RE, true)).toBe("v0.246.1");
+    // Another tag's build, or a hosted-built job that did not pass, is not this release's.
+    expect(hr(built("v0.245.1"))?.state).toBe("red");
+    expect(hr(built("v0.246.1", "failure"))?.state).toBe("red");
+  });
+});
+
 describe("percentiles, history and ETA", () => {
   it("pct with n=0, 1 and 20", () => {
     expect(pct([], 50)).toBe(null);
@@ -472,7 +765,7 @@ describe("percentiles, history and ETA", () => {
   it("stats take the newest statsWindow releases by tag", () => {
     const h = Array.from({ length: 25 }, (_, i) => entry(i, i));
     const s = stats(h, config);
-    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, usual: 9.9 });
+    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, usual: 9.8 });
     expect(s.stages.tag).toEqual({ p50: null, p90: null, n: 0, usual: 18.2 });
     expect(s.e2e).not.toHaveProperty("worst");
     expect(s.e2e.target).toBe(20);
@@ -536,9 +829,9 @@ describe("percentiles, history and ETA", () => {
       p50: "2026-11-25T19:44:12.000Z",
       p90: "2026-11-25T19:44:12.000Z",
     });
-    // No samples: usual times. (4.75 - 2) + 0.5 + 9.9 + 3 + 5.1 = 21.25 min.
+    // No samples: usual times. (4.7 - 2) + 0.5 + 9.8 + 3 + 5.1 = 21.1 min.
     expect(eta(t as never, stats([], config).stages, now)?.p50).toBe(
-      "2026-11-25T19:43:27.000Z",
+      "2026-11-25T19:43:18.000Z",
     );
     // A current stage past its figure leaves nothing of it, never less.
     const late = T("19:40:12");
@@ -576,7 +869,7 @@ describe("the stuck-stage issue", () => {
             name: "pin_open",
             usual: 4,
             startedAt: T("10:00:00"),
-            minutes: 9,
+            minutes: 9.5,
             state: "current",
           },
         ],
@@ -584,21 +877,53 @@ describe("the stuck-stage issue", () => {
     ],
     config,
   );
-  it("an in-flight stage past twice its usual time is an overrun", () => {
+  it("an in-flight stage past its limit is an overrun", () => {
     expect(over.over).toEqual([
       {
         tag: "v1.0.0",
         stage: "pin_open",
         kind: "in_flight",
         startedAt: T("10:00:00"),
-        minutes: 9,
+        minutes: 9.5,
         usual: 4,
-        limit: 8,
+        limit: 9,
         url: undefined,
       },
     ]);
   });
-  it("an in-flight stage at exactly twice its usual time is not stuck yet", () => {
+  it("the limit is the larger of twice the usual time and the usual time plus 5 min", () => {
+    // redline_queue's 0.5 min usual would alert on a 1.1 min wait at 2x alone.
+    expect(limitOf(0.5, config)).toBe(5.5);
+    expect(limitOf(4, config)).toBe(9);
+    // At 5 min the two agree; above it, twice the usual time is the larger.
+    expect(limitOf(5, config)).toBe(10);
+    expect(limitOf(9.8, config)).toBe(19.6);
+    expect(limitOf(18.2, config)).toBe(36.4);
+    const q = (minutes: number) =>
+      overruns(
+        [
+          {
+            tag: "v1.0.0",
+            mode: "pr",
+            publishedAt: T("10:00:00"),
+            stages: [
+              {
+                name: "redline_queue",
+                usual: 0.5,
+                startedAt: T("10:00:00"),
+                minutes,
+                state: "current",
+              },
+            ],
+          },
+        ],
+        config,
+      ).over.map((o) => [o.stage, o.minutes, o.limit]);
+    expect(q(1.1)).toEqual([]);
+    expect(q(5.5)).toEqual([]);
+    expect(q(5.6)).toEqual([["redline_queue", 5.6, 5.5]]);
+  });
+  it("an in-flight stage at exactly its limit is not stuck yet", () => {
     const at8 = overruns(
       [
         {
@@ -610,7 +935,7 @@ describe("the stuck-stage issue", () => {
               name: "pin_open",
               usual: 4,
               startedAt: T("10:00:00"),
-              minutes: 8,
+              minutes: 9,
               state: "current",
             },
           ],
@@ -620,7 +945,7 @@ describe("the stuck-stage issue", () => {
     );
     expect(at8.over).toEqual([]);
   });
-  it("a finished stage past twice its usual time stays an overrun while its release is in flight", () => {
+  it("a finished stage past its limit stays an overrun while its release is in flight", () => {
     const r = overruns(
       [
         {
@@ -656,12 +981,15 @@ describe("the stuck-stage issue", () => {
         startedAt: T("10:00:00"),
         minutes: 78.4,
         usual: 3.2,
-        limit: 6.4,
+        limit: 8.2,
         url: undefined,
       },
     ]);
-    expect(issueBody(r.over, [])).toContain(
-      "- v1.0.0 hosted_release: took 78.4 min (usual 3.2 min, limit 6.4 min).",
+    expect(issueBody(r.over, [], config)).toContain(
+      "- v1.0.0 hosted_release: took 78.4 min (usual 3.2 min, limit 8.2 min).",
+    );
+    expect(issueBody(r.over, [], config)).toContain(
+      "ran past its limit, the larger of 2 x its usual time and its usual time plus 5 min.",
     );
   });
   it("the newest finished release's overruns keep it open until a release completes with none; its total never alerts", () => {
@@ -697,18 +1025,22 @@ describe("the stuck-stage issue", () => {
     ).toEqual([]);
   });
   it("creates once, edits only on a change, closes when nothing is stuck", () => {
-    const body = issueBody(over.over, []);
-    expect(issuePlan([], over.over, [])).toEqual({ action: "create", body });
+    const body = issueBody(over.over, [], config);
+    expect(issuePlan([], over.over, [], config)).toEqual({
+      action: "create",
+      body,
+    });
     const open = [
       { number: 5, title: ISSUE_TITLE, body },
       { number: 3, title: "hosted-release failed", body: "" },
     ];
-    expect(issuePlan(open, over.over, [])).toEqual({ action: "none" });
+    expect(issuePlan(open, over.over, [], config)).toEqual({ action: "none" });
     expect(
       issuePlan(
         [{ number: 5, title: ISSUE_TITLE, body: `${body}\n` }],
         over.over,
         [],
+        config,
       ),
     ).toEqual({ action: "none" });
     expect(
@@ -716,13 +1048,16 @@ describe("the stuck-stage issue", () => {
         [{ number: 5, title: ISSUE_TITLE, body: "old" }],
         over.over,
         [],
+        config,
       ),
     ).toEqual({ action: "edit", number: 5, body });
-    expect(issuePlan(open, [], [])).toMatchObject({
+    expect(issuePlan(open, [], [], config)).toMatchObject({
       action: "close",
       number: 5,
     });
-    expect(issuePlan(open.slice(1), [], [])).toEqual({ action: "none" });
+    expect(issuePlan(open.slice(1), [], [], config)).toEqual({
+      action: "none",
+    });
   });
   it("the body holds no moving clock: the same state twice gives the same body", () => {
     const later = overruns(
@@ -744,7 +1079,9 @@ describe("the stuck-stage issue", () => {
       ],
       config,
     );
-    expect(issueBody(later.over, [])).toBe(issueBody(over.over, []));
+    expect(issueBody(later.over, [], config)).toBe(
+      issueBody(over.over, [], config),
+    );
   });
 
   const stub = (issues: unknown[]) => {
@@ -758,9 +1095,9 @@ describe("the stuck-stage issue", () => {
     return { exec, calls };
   };
   it("syncIssue lists blocker issues once and writes nothing when unchanged", () => {
-    const body = issueBody(over.over, []);
+    const body = issueBody(over.over, [], config);
     const s = stub([{ number: 5, title: ISSUE_TITLE, body }]);
-    expect(syncIssue(s.exec, "o/r", over.over, []).action).toBe("none");
+    expect(syncIssue(s.exec, "o/r", over.over, [], config).action).toBe("none");
     expect(s.calls).toEqual([
       [
         "issue",
@@ -780,7 +1117,7 @@ describe("the stuck-stage issue", () => {
   });
   it("syncIssue opens the issue with the blocker label", () => {
     const s = stub([]);
-    syncIssue(s.exec, "o/r", over.over, []);
+    syncIssue(s.exec, "o/r", over.over, [], config);
     expect(s.calls[1]?.slice(0, 7)).toEqual([
       "issue",
       "create",
@@ -794,7 +1131,7 @@ describe("the stuck-stage issue", () => {
   });
   it("syncIssue closes with a comment", () => {
     const s = stub([{ number: 5, title: ISSUE_TITLE, body: "x" }]);
-    syncIssue(s.exec, "o/r", [], []);
+    syncIssue(s.exec, "o/r", [], [], config);
     expect(s.calls[1]?.slice(0, 5)).toEqual([
       "issue",
       "close",
@@ -893,11 +1230,99 @@ describe("tick reads", () => {
     expect(summary(r.current)).toContain(
       "### Merge to every install, target 20 min",
     );
+    // Fleet has no source without admin access yet: the total says plainly where it ends.
+    expect(r.current.e2e.to).toBe("prod deploy (fleet not yet measured)");
+    expect(summary(r.current)).toContain(
+      "Measured from the merge to prod deploy (fleet not yet measured).",
+    );
+    expect(summary(r.current)).toContain(
+      "| Release | Minutes, to prod deploy (fleet not yet measured) | Against 20 min |",
+    );
     expect(summary(r.current)).toContain("| v0.245.1 | 45.8 | 25.8 over |");
     expect(summary(r.current)).toContain(
-      "| staging_deploy | 5.1 | 5.1 | 1 | 4.75 | 9.5 |",
+      "| staging_deploy | 5.1 | 5.1 | 1 | 4.7 | 9.7 |",
     );
     expect(summary(r.current)).toContain("Not measured: fleet");
+  });
+
+  it("reads jobs only of hosted-release and hosted-publish runs since the oldest release not in history, and matches the staging publish by them", () => {
+    const now = T("19:50:00");
+    const f = fake(now);
+    const publish = at(now).runs.find(
+      (r) =>
+        r.path.endsWith("hosted-publish.yml") &&
+        r.event === "workflow_run" &&
+        ms(r.createdAt) >= ms(T("19:01:32")),
+    ) as Run;
+    // A recovery shape: the run is on another main commit and names the tag in its job.
+    const exec: Exec = (cmd, args) => {
+      const path = args[args.length - 1] ?? "";
+      if (path.includes("/actions/workflows/hosted-publish.yml/"))
+        return {
+          code: 0,
+          stdout: at(now)
+            .runs.filter((r) => r.path.endsWith("/hosted-publish.yml"))
+            .map((r) =>
+              JSON.stringify(
+                r.id === publish.id ? { ...r, headSha: "b".repeat(40) } : r,
+              ),
+            )
+            .join("\n"),
+          stderr: "",
+        };
+      if (
+        path ===
+        `repos/o/c/actions/runs/${publish.id}/jobs?filter=latest&per_page=100`
+      ) {
+        f.calls.push(path);
+        return {
+          code: 0,
+          stdout: [
+            { name: "resolve", conclusion: "success" },
+            { name: "publish-staging release v0.245.1", conclusion: "success" },
+          ]
+            .map((j) => JSON.stringify(j))
+            .join("\n"),
+          stderr: "",
+        };
+      }
+      return f.exec(cmd, args);
+    };
+    const r = tick({
+      exec,
+      repo: "o/c",
+      publicRepo: "o/p",
+      config,
+      history: [
+        {
+          tag: "v0.245.0",
+          mode: "pr",
+          publishedAt: T("17:23:42"),
+          doneAt: T("18:04:15"),
+          stages: {},
+        },
+      ],
+      now,
+      issue: false,
+    });
+    const want = at(now)
+      .runs.filter(
+        (x) =>
+          /\/hosted-(release|publish)\.yml$/.test(x.path) &&
+          ms(x.createdAt) >= ms(T("19:01:32")),
+      )
+      .map(
+        (x) => `repos/o/c/actions/runs/${x.id}/jobs?filter=latest&per_page=100`,
+      );
+    expect(want.length).toBe(3);
+    expect([...f.calls.filter((c) => c.includes("/jobs?"))].sort()).toEqual(
+      [...want].sort(),
+    );
+    const t = r.current.releases.find((x) => x.tag === "v0.245.1");
+    expect(t?.stages.find((x) => x.name === "staging_publish")).toMatchObject({
+      state: "done",
+      minutes: 4,
+    });
   });
 
   it("an old release's pin PR off the newest-100 page is still found by its head branch", () => {
@@ -948,6 +1373,8 @@ describe("tick reads", () => {
       issue: true,
     });
     expect(f.calls.filter((c) => c.includes("/pulls?"))).toEqual([]);
+    // Nothing in flight: no run's jobs are read.
+    expect(f.calls.filter((c) => c.includes("/jobs?"))).toEqual([]);
     expect(r.over).toEqual([]);
     expect(r.current.inFlight).toEqual([]);
     expect(r.history).toEqual([h]);
@@ -1053,6 +1480,15 @@ describe("run-name contract", () => {
     expect(read(".github/workflows/hosted-publish.yml")).toContain(
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       "run-name: hosted-publish${{ inputs.env && format(' {0} {1}', inputs.env, inputs.tag || inputs.floor_run_id) || '' }}${{ inputs.chain_id && format(' [{0}]', inputs.chain_id) || '' }}",
+    );
+    // The staging and prod publish jobs name the tag their resolve job verified.
+    expect(read(".github/workflows/hosted-publish.yml")).toContain(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "name: publish-staging ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
+    );
+    expect(read(".github/workflows/hosted-publish.yml")).toContain(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      "name: publish-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
     );
     expect(read(".github/workflows/hosted-release.yml")).toMatch(
       /^on:\n {2}push:\n {4}branches: \[main\]\n {4}paths: \[PUBLIC_PIN\]$/m,
