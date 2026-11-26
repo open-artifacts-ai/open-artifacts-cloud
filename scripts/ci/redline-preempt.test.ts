@@ -1,16 +1,17 @@
 // A gate preempts the nightly: it cancels only busy nightly runs on main of
 // this repository, and waits for them to end before it touches rl-a.
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  CANCEL_WAIT_MS,
+  cancelNightly,
+  checkPreempted,
   type Exec,
-  FORCE_WAIT_MS,
   type Job,
   NIGHTLY_PATH,
   needsReset,
   nightlyToCancel,
-  POLL_MS,
-  preempt,
   type Run,
 } from "./redline-preempt.ts";
 
@@ -54,18 +55,13 @@ describe("nightlyToCancel", () => {
   });
 });
 
-/** A fake gh: the run list, cancels and force-cancels, each run's status by call, and its jobs. */
+/** A fake gh: the run list, cancels, and each run's jobs. It has no clock: nothing here waits. */
 const world = (o: {
   runs: Run[];
-  statuses?: Record<number, string[]>;
-  /** After a force-cancel, the run reads completed at once. */
-  forceEnds?: boolean;
   cancelFails?: number[];
   jobs?: Record<number, Job[]>;
 }) => {
   const calls: string[][] = [];
-  const seen: Record<number, number> = {};
-  const forced = new Set<number>();
   const exec: Exec = (_c, args) => {
     calls.push(args);
     const json = (v: unknown) => ({
@@ -78,26 +74,13 @@ const world = (o: {
       path.includes("/actions/workflows/redline-nightly.yml/runs?branch=main")
     )
       return json({ workflow_runs: o.runs });
-    const post = /\/actions\/runs\/(\d+)\/(cancel|force-cancel)$/.exec(path);
-    if (post) {
-      const id = Number(post[1]);
-      if (post[2] === "force-cancel") forced.add(id);
-      return o.cancelFails?.includes(id)
+    const post = /\/actions\/runs\/(\d+)\/cancel$/.exec(path);
+    if (post)
+      return o.cancelFails?.includes(Number(post[1]))
         ? { code: 1, stdout: "", stderr: "HTTP 409" }
         : json({});
-    }
     const jobs = /\/actions\/runs\/(\d+)\/jobs\?per_page=100$/.exec(path);
     if (jobs) return json({ jobs: o.jobs?.[Number(jobs[1])] ?? [] });
-    const one = /\/actions\/runs\/(\d+)$/.exec(path);
-    if (one) {
-      const id = Number(one[1]);
-      if (forced.has(id) && o.forceEnds)
-        return json({ id, status: "completed" });
-      const list = o.statuses?.[id] ?? ["completed"];
-      const i = Math.min(seen[id] ?? 0, list.length - 1);
-      seen[id] = (seen[id] ?? 0) + 1;
-      return json({ id, status: list[i] });
-    }
     throw new Error(`unexpected ${args.join(" ")}`);
   };
   return { exec, calls };
@@ -159,34 +142,45 @@ describe("needsReset", () => {
   });
 });
 
-describe("preempt", () => {
-  const clock = () => {
-    let t = 0;
-    return {
-      now: () => t,
-      wait: async (ms: number) => {
-        t += ms;
-      },
-      at: () => t,
-    };
-  };
+describe("cancelNightly and checkPreempted (no waits: GitHub's rl-a group does it)", () => {
   const quiet = { log: () => {} };
 
-  it("does nothing when no nightly is going", async () => {
-    const w = world({ runs: [nightly(1, { status: "completed" })] });
-    expect(
-      await preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
-    ).toEqual({ cancelled: [], reset: false });
-    expect(w.calls.some((a) => a.includes("POST"))).toBe(false);
-  });
-
-  it("cancels the running nightly, waits for it, and needs no reset after a clean revoke", async () => {
+  it("cancels each busy nightly with one request, and returns their ids", () => {
     const w = world({
       runs: [
         nightly(1),
         nightly(2, { path: ".github/workflows/redline-staging.yml" }),
+        nightly(3, { status: "completed" }),
       ],
-      statuses: { 1: ["in_progress", "in_progress", "completed"] },
+    });
+    expect(
+      cancelNightly({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
+    ).toEqual([1]);
+    expect(w.calls.filter((a) => a.includes("POST"))).toEqual([
+      ["api", "-X", "POST", `repos/${REPO}/actions/runs/1/cancel`],
+    ]);
+    // One list, one cancel: no status read, no loop.
+    expect(w.calls).toHaveLength(2);
+  });
+
+  it("a run that takes no cancel (it just ended) is still returned, for the check", () => {
+    const w = world({ runs: [nightly(1)], cancelFails: [1] });
+    expect(
+      cancelNightly({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
+    ).toEqual([1]);
+  });
+
+  it("does nothing when no nightly is going", () => {
+    const w = world({ runs: [] });
+    expect(
+      cancelNightly({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
+    ).toEqual([]);
+    expect(w.calls.some((a) => a.includes("POST"))).toBe(false);
+  });
+
+  it("the check reads each preempted run's jobs once: reset after a failed revoke, none after a clean one", () => {
+    const w = world({
+      runs: [],
       jobs: {
         1: [
           redlineJob([
@@ -194,23 +188,7 @@ describe("preempt", () => {
             [REVOKE, "completed", "success"],
           ]),
         ],
-      },
-    });
-    const c = clock();
-    expect(
-      await preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...c, ...quiet }),
-    ).toEqual({ cancelled: [1], reset: false });
-    expect(w.calls.filter((a) => a.includes("POST"))).toEqual([
-      ["api", "-X", "POST", `repos/${REPO}/actions/runs/1/cancel`],
-    ]);
-    expect(c.at()).toBe(2 * POLL_MS);
-  });
-
-  it("a nightly that ended with a failed revoke asks for a reset of rl-a", async () => {
-    const w = world({
-      runs: [nightly(1)],
-      jobs: {
-        1: [
+        2: [
           redlineJob([
             [UP, "completed", "success"],
             [REVOKE, "completed", "failure"],
@@ -219,65 +197,26 @@ describe("preempt", () => {
       },
     });
     expect(
-      await preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
-    ).toEqual({ cancelled: [1], reset: true });
+      checkPreempted({ exec: w.exec, repo: REPO, runs: [1], ...quiet }),
+    ).toBe(false);
+    expect(
+      checkPreempted({ exec: w.exec, repo: REPO, runs: [1, 2], ...quiet }),
+    ).toBe(true);
+    expect(
+      checkPreempted({ exec: w.exec, repo: REPO, runs: [], ...quiet }),
+    ).toBe(false);
+    expect(w.calls).toHaveLength(3);
   });
 
-  it("one that won't end is force-cancelled after a few minutes; its revoke never ran, so rl-a is reset", async () => {
-    const w = world({
-      runs: [nightly(1)],
-      statuses: { 1: ["in_progress"] },
-      forceEnds: true,
-      jobs: {
-        1: [
-          redlineJob([
-            [UP, "completed", "success"],
-            [REVOKE, "completed", "cancelled"],
-          ]),
-        ],
-      },
-    });
-    const c = clock();
-    expect(
-      await preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...c, ...quiet }),
-    ).toEqual({ cancelled: [1], reset: true });
-    expect(
-      w.calls.filter((a) => a.includes("POST")).map((a) => a.at(-1)),
-    ).toEqual([
-      `repos/${REPO}/actions/runs/1/cancel`,
-      `repos/${REPO}/actions/runs/1/force-cancel`,
-    ]);
-    expect(c.at()).toBeLessThanOrEqual(CANCEL_WAIT_MS + POLL_MS);
-  });
-
-  it("one still going after the force-cancel fails the gate, within a few minutes in all", async () => {
-    const w = world({ runs: [nightly(1)], statuses: { 1: ["in_progress"] } });
-    const c = clock();
-    await expect(
-      preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...c, ...quiet }),
-    ).rejects.toThrow(/still going after a force-cancel/);
-    expect(c.at()).toBeLessThanOrEqual(
-      CANCEL_WAIT_MS + FORCE_WAIT_MS + 2 * POLL_MS,
+  it("the script has no sleep, poll or wait at all (comments aside)", () => {
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "redline-preempt.ts"),
+      "utf8",
+    )
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1");
+    expect(src).not.toMatch(
+      /setTimeout|timers\/promises|delay\(|sleep|for \(;;\)|while \(/,
     );
-    expect(CANCEL_WAIT_MS + FORCE_WAIT_MS).toBeLessThanOrEqual(5 * 60_000);
-  });
-
-  it("a nightly that ended before the cancel reached it is fine", async () => {
-    const w = world({ runs: [nightly(1)], cancelFails: [1] });
-    expect(
-      (await preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }))
-        .cancelled,
-    ).toEqual([1]);
-  });
-
-  it("a cancel that fails on a run still going fails the gate", async () => {
-    const w = world({
-      runs: [nightly(1)],
-      cancelFails: [1],
-      statuses: { 1: ["in_progress"] },
-    });
-    await expect(
-      preempt({ exec: w.exec, repo: REPO, ownRun: 9, ...quiet }),
-    ).rejects.toThrow(/could not cancel nightly run 1/);
   });
 });

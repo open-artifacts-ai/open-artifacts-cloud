@@ -2,7 +2,6 @@
 //   node --experimental-strip-types scripts/smoke.ts             the two tracks
 //   node --experimental-strip-types scripts/smoke.ts purge       (detached) the purge
 //   node --experimental-strip-types scripts/smoke.ts purge-report what they logged so far, no wait
-//   node --experimental-strip-types scripts/smoke.ts purge-wait  the purge's and sweep's result (by hand)
 //   node --experimental-strip-types scripts/smoke.ts sweep-start the leftover sweep, detached
 //   node --experimental-strip-types scripts/smoke.ts sweep       (detached) the sweep
 // The first runs vitest once on vitest.smoke.config.ts (track 1 and track 2
@@ -54,23 +53,14 @@ async function main(): Promise<number> {
   // the job ends; whatever they leave, the next run's sweep removes.
   if (cmd === "purge-report") {
     const dir = smokeDir(env);
-    await purgeWait(dir, { within: 0 });
+    await purgeWait(dir);
     // A sweep that ended failed (a page it couldn't read, say) is loud: an
     // annotation on the run, still never a gate failure.
-    if (
-      !(await sweepWait(dir, { within: 0 })) &&
-      existsSync(join(dir, SWEEP_DONE))
-    )
+    if (!(await sweepWait(dir)) && existsSync(join(dir, SWEEP_DONE)))
       console.log(
         "::warning title=red-line sweep::the sweep of leftover rl-n installs failed; its log above says why",
       );
     return 0;
-  }
-  if (cmd === "purge-wait") {
-    const dir = smokeDir(env);
-    const purged = await purgeWait(dir);
-    const swept = await sweepWait(dir);
-    return purged && swept ? 0 : 1;
   }
   if (cmd !== undefined) {
     console.error(`smoke: unknown command ${cmd}`);

@@ -85,6 +85,7 @@ describe("redline-staging.yml", () => {
     expect(w.permissions).toEqual({ contents: "read" });
     expect(Object.keys(w.jobs)).toEqual([
       "preempt",
+      "rl-a-check",
       "platform-tags",
       "t19",
       "redline",
@@ -108,7 +109,7 @@ describe("redline-staging.yml", () => {
 
   it("refuses to start on a stale Worker: platform-tags (main's script, the staging deploy token) runs first (#1040)", () => {
     const pt = w.jobs["platform-tags"];
-    expect(job.needs).toEqual(["preempt", "platform-tags"]);
+    expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
     expect(t19Job.needs).toBe("platform-tags");
     expect(pt["runs-on"]).toBe("ubuntu-latest");
     expect(pt.environment).toBe("hosted-staging-deploy");
@@ -645,10 +646,10 @@ describe("redline-staging.yml", () => {
         );
       const cancel = pick(
         pj().steps,
-        "Cancel a running nightly and wait for it to end",
+        "Cancel a running nightly (waits for nothing)",
       );
       expect(cancel.run).toBe(
-        'node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"',
+        'node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts cancel --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"',
       );
       expect(cancel.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
       expect(gateStep().env).toEqual({
@@ -687,17 +688,44 @@ describe("redline-staging.yml", () => {
 
     it("platform-tags, and so everything else, starts only after it", () => {
       expect(w.jobs["platform-tags"].needs).toBe("preempt");
-      expect(job.needs).toEqual(["preempt", "platform-tags"]);
+      expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
       expect(t19Job.needs).toBe("platform-tags");
     });
 
-    it("is bounded to minutes, and a preempted nightly's unrevoked rl-a is revoked before the bring-up", () => {
-      expect(pj()["timeout-minutes"]).toBeLessThanOrEqual(10);
-      expect(pj().outputs).toEqual({
-        reset: "${{ steps.preempt-run.outputs.reset }}",
+    it("GitHub does the waiting: rl-a-check and redline share the rl-a job group, a gate's entry cancels the nightly's", () => {
+      const group = {
+        group: "rl-a",
+        "cancel-in-progress": "${{ inputs.suite != 'full' }}",
+      };
+      const check = w.jobs["rl-a-check"];
+      expect(check.concurrency).toEqual(group);
+      expect(job.concurrency).toEqual(group);
+      // Gates queue on the workflow's own group, so a gate's cancel in rl-a
+      // can only meet a nightly (its call sits in another workflow group).
+      expect(w.concurrency.group).toContain("'redline'");
+      expect(check.needs).toBe("preempt");
+      expect(check.permissions).toEqual({ contents: "read", actions: "read" });
+      expect(check.outputs).toEqual({
+        reset: "${{ steps.check.outputs.reset }}",
       });
+      const c = pick(check.steps, "check");
+      expect(c.run).toBe(
+        'node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts check --repo "$GITHUB_REPOSITORY" --runs "$RUNS"',
+      );
+      expect(c.env.RUNS).toBe("${{ needs.preempt.outputs.runs }}");
+      for (const st of check.steps as Record<string, any>[])
+        expect(st.if).toBe("needs.preempt.outputs.runs != ''");
+      expect(pj().outputs).toEqual({
+        runs: "${{ steps.preempt-run.outputs.runs }}",
+      });
+      expect(pj()["timeout-minutes"]).toBeLessThanOrEqual(5);
+      // Nothing in the workflow waits on the nightly with a loop of its own.
+      expect(JSON.stringify(pj())).not.toMatch(/sleep|until /);
+    });
+
+    it("a preempted nightly's unrevoked rl-a is revoked before the bring-up", () => {
       const r = named("reset-rl-a");
-      expect(r.if).toBe("needs.preempt.outputs.reset == 'true'");
+      expect(r.if).toBe("needs.rl-a-check.outputs.reset == 'true'");
       expect(r.run).toBe("pnpm --filter @oa/redline provisioning revoke");
       expect(r.env).toEqual({ REDLINE_SIDES: "a" });
       expect(steps.indexOf(r)).toBeGreaterThan(steps.indexOf(named("mint")));
@@ -763,7 +791,7 @@ describe("redline-staging.yml", () => {
       );
       // Neither job waits for the other through `needs`: they overlap.
       expect(t19Job.needs).toBe("platform-tags");
-      expect(job.needs).toEqual(["preempt", "platform-tags"]);
+      expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
       // The workflow no longer records a deviation from 4.4, and T19's shell
       // has nothing to unset.
       expect(text).not.toContain("Deviation from 4.4");
@@ -1585,7 +1613,13 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       });
       // A called job's permissions can't exceed its caller's.
       const rank = (v: unknown) => ["none", "read", "write"].indexOf(String(v));
-      for (const j of [w.jobs.preempt, w.jobs["platform-tags"], job, t19Job])
+      for (const j of [
+        w.jobs.preempt,
+        w.jobs["rl-a-check"],
+        w.jobs["platform-tags"],
+        job,
+        t19Job,
+      ])
         for (const [k, v] of Object.entries(j.permissions as object))
           expect(
             rank(nw.jobs.redline.permissions[k]),

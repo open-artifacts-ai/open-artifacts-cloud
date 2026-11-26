@@ -142,30 +142,33 @@ jobs:
   # every staging platform Worker runs the tag (its "workers/tag" annotation,
   # scripts/ci/platform-tags.sh). Read-only, with main's script and constants
   # and the staging deploy Environment's token; no other job sees it.
-  # A release gate never waits behind the nightly (cloud #264 step 2). In a
-  # gate run (a workflow_dispatch of this file on main, in this repository)
-  # this job cancels every red-line nightly run still going and waits until
-  # each has ended, its always() steps (the R26 revoke of rl-a) included, so
-  # the two never share rl-a. scripts/ci/redline-preempt.ts selects only
-  # redline-nightly.yml runs on main of this repository: never a gate, a dry
-  # run, another branch or a fork. In a called run (the nightly, the dry run)
-  # every step after the first is skipped; the job still runs, so the jobs
-  # after it never see a skipped dependency. Its `actions: write` is why the
-  # callers grant it (a called job can't hold more than its caller gives).
+  # A release gate never waits behind the nightly (cloud #264 step 2), and no
+  # code of ours sleeps or polls for it (Leo, 2026-11-26 11:45Z: "the code
+  # itself should have no sleeps or polls"). GitHub's own concurrency does
+  # the waiting: the rl-a-check and redline jobs of every run share the job
+  # concurrency group `rl-a`, and a gate's (suite not full) enters it with
+  # cancel-in-progress, so it cancels the nightly's job that holds rl-a and
+  # starts only once that job has ended, its always() R26 revoke included.
+  # It can't cancel another gate there: gates queue one at a time on this
+  # workflow's `redline` group, so no two gates are ever in `rl-a` at once.
   #
-  # Bounded to a few minutes (scripts/ci/redline-preempt.ts): a cancelled
-  # nightly gets 2 min to end, then a force-cancel and 1 min more, else the
-  # gate fails. When the nightly had issued credentials and its R26 revoke did
-  # not succeed, `reset` is true and the redline job revokes rl-a itself
-  # before its bring-up: rl-a is never used in an unknown state.
+  # In a gate run (a workflow_dispatch of this file on main, in this
+  # repository) this job also cancels the whole nightly run, one request per
+  # run and no wait, so its T19 job stops too; it outputs the ids. It
+  # selects only redline-nightly.yml runs on main of this repository: never
+  # a gate, a dry run, another branch or a fork (scripts/ci/redline-preempt.ts).
+  # In a called run (the nightly, the dry run) every step after the first is
+  # skipped; the job still runs, so the jobs after it never see a skipped
+  # dependency. Its `actions: write` is why the callers grant it (a called
+  # job can't hold more than its caller gives).
   preempt:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 10
+    timeout-minutes: 5
     outputs:
-      reset: ${{ steps.preempt-run.outputs.reset }}
+      runs: ${{ steps.preempt-run.outputs.runs }}
     steps:
       - id: gate
         name: Is this a release gate
@@ -196,11 +199,46 @@ jobs:
         with:
           node-version-file: .nvmrc
       - id: preempt-run
-        name: Cancel a running nightly and wait for it to end
+        name: Cancel a running nightly (waits for nothing)
         if: steps.gate.outputs.gate == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"
+        run: node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts cancel --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"
+  # Holds rl-a first (the job group above). Once it runs, the preempted
+  # nightly's redline job has ended: one read of its jobs says whether it
+  # issued credentials and its R26 revoke did not succeed (reset=true). Then
+  # the redline job revokes rl-a before its bring-up: rl-a is never used in
+  # an unknown state.
+  rl-a-check:
+    needs: preempt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: rl-a
+      cancel-in-progress: ${{ inputs.suite != 'full' }}
+    timeout-minutes: 5
+    outputs:
+      reset: ${{ steps.check.outputs.reset }}
+    steps:
+      - if: needs.preempt.outputs.runs != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - if: needs.preempt.outputs.runs != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: check
+        name: Did the preempted nightly leave rl-a unrevoked
+        if: needs.preempt.outputs.runs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ needs.preempt.outputs.runs }}
+        run: node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts check --repo "$GITHUB_REPOSITORY" --runs "$RUNS"
   platform-tags:
     needs: preempt
     runs-on: ubuntu-latest
@@ -540,7 +578,12 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/t19-recipient" "$RUNNER_TEMP/t19-sealed"
   redline:
-    needs: [preempt, platform-tags]
+    needs: [rl-a-check, platform-tags]
+    # rl-a, one job at a time (see the preempt job): a gate's entry cancels
+    # the nightly's job in progress; the nightly's waits.
+    concurrency:
+      group: rl-a
+      cancel-in-progress: ${{ inputs.suite != 'full' }}
     runs-on: ubuntu-latest
     environment: redline-staging
     # The OIDC principal (4.4): this job only, never the workflow. `actions:
@@ -679,7 +722,7 @@ jobs:
       # bring-up below starts from a known rl-a.
       - id: reset-rl-a
         name: Revoke rl-a after a preempted nightly left it unrevoked
-        if: needs.preempt.outputs.reset == 'true'
+        if: needs.rl-a-check.outputs.reset == 'true'
         env:
           REDLINE_SIDES: a
         run: pnpm --filter @oa/redline provisioning revoke

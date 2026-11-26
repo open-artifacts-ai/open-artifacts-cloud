@@ -11,6 +11,7 @@ import {
   freshEmail,
   googleProblems,
   healthProblems,
+  OTP_BACKOFF_MS,
   PURGE_DONE,
   PURGE_LOG,
   parseSetCookie,
@@ -18,6 +19,7 @@ import {
   purgeWait,
   refusalProblem,
   req,
+  retryWithBackoff,
   SMOKE_ADDED,
   SMOKE_CASES,
   SMOKE_ROWS,
@@ -85,6 +87,46 @@ describe("the smoke's cases", () => {
         "claimSuiteSlot",
       ])
         expect(src, `${f} uses ${banned}`).not.toContain(banned);
+    }
+  });
+});
+
+describe("retryWithBackoff (the one wait the smoke allows)", () => {
+  it("tries once, then once after each backoff while not ready, on the given clock", async () => {
+    const waits: number[] = [];
+    let n = 0;
+    const got = await retryWithBackoff(
+      async () => (++n === 3 ? "code" : undefined),
+      {
+        backoffMs: [250, 500, 1000],
+        wait: async (ms) => {
+          waits.push(ms);
+        },
+        notReady: "no code",
+      },
+    );
+    expect(got).toBe("code");
+    expect(waits).toEqual([250, 500]);
+  });
+
+  it("gives up after the last backoff, naming what never got ready", async () => {
+    const waits: number[] = [];
+    await expect(
+      retryWithBackoff(async () => undefined, {
+        backoffMs: OTP_BACKOFF_MS,
+        wait: async (ms) => {
+          waits.push(ms);
+        },
+        notReady: "no code was sent",
+      }),
+    ).rejects.toThrow("no code was sent");
+    expect(waits).toEqual([...OTP_BACKOFF_MS]);
+  });
+
+  it("the tracks use nothing else that waits: no run.within, no setTimeout", () => {
+    for (const f of ["smoke/standing.test.ts", "smoke/fresh.test.ts"]) {
+      const src = readFileSync(join(pkg, f), "utf8");
+      expect(src, f).not.toMatch(/run\.within\(|setTimeout|sleep\(/);
     }
   });
 });
@@ -279,48 +321,18 @@ describe("the background purge", () => {
     expect(out.join("")).toContain("purge failed: no fresh slug recorded");
   });
 
-  it("the gate's report waits for nothing: within 0 reads what is there and returns", async () => {
-    const d = tmp();
-    writeFileSync(join(d, FRESH_FILE), '{"slug":"rl-n-9-1"}');
-    const wait = vi.fn(async () => {});
-    const out: string[] = [];
-    expect(
-      await purgeWait(d, { within: 0, wait, write: (s) => out.push(s) }),
-    ).toBe(false);
-    expect(wait).not.toHaveBeenCalled();
-    expect(out.join("")).toContain("has not ended");
-  });
-
-  it("purge-wait prints the log without workflow commands, and gives up at its bound", async () => {
+  it("the report reads once and waits for nothing: the log so far, without workflow commands", async () => {
     const d = tmp();
     const out: string[] = [];
     expect(await purgeWait(d, { write: (s) => out.push(s) })).toBe(true);
     writeFileSync(join(d, FRESH_FILE), '{"slug":"rl-n-9-1"}');
-    writeFileSync(
-      join(d, PURGE_LOG),
-      "::add-mask::x\nrl-n-9-1: deleted and purged\n",
-    );
-    let t = 0;
-    const clock = {
-      now: () => t,
-      wait: async (ms: number) => {
-        t += ms;
-      },
-    };
-    expect(
-      await purgeWait(d, {
-        within: 10_000,
-        ...clock,
-        write: (s) => out.push(s),
-      }),
-    ).toBe(false);
-    expect(t).toBeGreaterThanOrEqual(10_000);
+    writeFileSync(join(d, PURGE_LOG), "::add-mask::x\nrl-n-9-1: deleted\n");
+    expect(await purgeWait(d, { write: (s) => out.push(s) })).toBe(false);
+    expect(out.join("")).toContain("has not ended");
     expect(out.join("")).not.toContain("add-mask");
     writeFileSync(join(d, PURGE_DONE), "ok\n");
-    expect(await purgeWait(d, { ...clock, write: (s) => out.push(s) })).toBe(
-      true,
-    );
-    expect(out.join("")).toContain("rl-n-9-1: deleted and purged");
+    expect(await purgeWait(d, { write: (s) => out.push(s) })).toBe(true);
+    expect(out.join("")).toContain("rl-n-9-1: deleted");
   });
 });
 

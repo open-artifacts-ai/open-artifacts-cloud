@@ -25,11 +25,14 @@ import {
   hookCall,
   hookSession,
   mintPat,
+  OTP_BACKOFF_MS,
   okTool,
   parseSetCookie,
   probe,
   refusalProblem,
   req,
+  retryWithBackoff,
+  SEARCH_BACKOFF_MS,
   SESSION_COOKIE,
   type SetCookie,
   SMOKE_CASES,
@@ -51,9 +54,6 @@ import {
 // case shares a person, an artifact or a rate-limit bucket with another.
 
 const C = SMOKE_CASES["smoke/standing.test.ts"];
-/** Bounds of the two readiness polls (run.within polls every POLL_MS on the run's clock). */
-const OTP_WITHIN_MS = 15_000;
-const SEARCH_WITHIN_MS = 30_000;
 const name = (i: number) => (C[i] as string).slice("rl-a > ".length);
 const env = process.env;
 let T: Targets;
@@ -240,21 +240,29 @@ describe("rl-a", () => {
       throw new Error(
         `code request: status ${r.status}, ${pending.length} pending cookie(s)`,
       );
-    // Delivery runs after the response: the otp hook says when the code is
-    // there (no_code until then), polled on the run's own clock (run.within).
-    let code: string | undefined;
-    await run.within(OTP_WITHIN_MS, "the code delivery", async () => {
-      try {
-        const out = (await hookCall(A.app, key, "/__test/otp/latest", {
-          email: p.email,
-        })) as { code?: unknown };
-        if (typeof out?.code === "string" && out.code) code = out.code;
-        return code !== undefined;
-      } catch (e) {
-        if (!(e instanceof HookRefused) || e.reason !== "no_code") throw e;
-        return false;
-      }
-    });
+    // Delivery runs after the response: the otp hook answers no_code until
+    // the code is there. Retried with backoff (the one wait allowed), until
+    // the hook can hold its answer until the code exists (see the PR).
+    const code = await retryWithBackoff(
+      async () => {
+        try {
+          const out = (await hookCall(A.app, key, "/__test/otp/latest", {
+            email: p.email,
+          })) as { code?: unknown };
+          return typeof out?.code === "string" && out.code
+            ? out.code
+            : undefined;
+        } catch (e) {
+          if (!(e instanceof HookRefused) || e.reason !== "no_code") throw e;
+          return undefined;
+        }
+      },
+      {
+        backoffMs: OTP_BACKOFF_MS,
+        wait: run.io.wait,
+        notReady: "no code was sent",
+      },
+    );
     const headers = new Headers(codeRequestReq(A, p.email).headers);
     headers.set("cookie", pending.join("; "));
     const v = take(
@@ -304,18 +312,21 @@ describe("rl-a", () => {
       if (typeof id !== "string" || typeof version !== "number")
         throw new Error("MCP publish_artifact: no id or version");
       ids.push(id);
-      // Indexing can lag the publish: search until it lists the page, on the
-      // run's own clock (run.within).
-      await run.within(
-        SEARCH_WITHIN_MS,
-        "search finds the MCP publish",
+      // Indexing can lag the publish: retried with backoff (the one wait
+      // allowed) until search lists the page, until a hook can hold its
+      // answer until the index has it (see the PR).
+      await retryWithBackoff(
         async () => {
           const s = await okTool(A.app, p.pat, "search_artifacts", {
             q: marker,
           });
-          return ((s.items as { id?: unknown }[] | undefined) ?? []).some(
-            (x) => x.id === id,
-          );
+          const items = (s.items as { id?: unknown }[] | undefined) ?? [];
+          return items.some((x) => x.id === id) ? true : undefined;
+        },
+        {
+          backoffMs: SEARCH_BACKOFF_MS,
+          wait: run.io.wait,
+          notReady: "search did not list the MCP publish",
         },
       );
       // A signed upload from the app address, published as the next version.

@@ -10,7 +10,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import type { InstallDetail } from "@oa/provisioning-contract";
 import { getDomain } from "tldts";
@@ -18,18 +17,16 @@ import { InfraError } from "./fetch-timeout.ts";
 import { describeRes, readBody } from "./http.ts";
 import { mask, writeSecretFile } from "./oidc.ts";
 import {
-  HOSTS_SETTLE_MS,
   mintCreds,
   oidcCreate,
   ownDetail,
-  PAGE_WITHIN_MS,
   PROBES,
   ProbeFail,
   type ProbeId,
   type Run,
   removeInstall,
 } from "./provisioning.ts";
-import { liveRun, rawTargets, waitHookKey } from "./provisioning-live.ts";
+import { liveRun, rawTargets } from "./provisioning-live.ts";
 import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 import { secretFileName } from "./targets.ts";
 import { rawRequest } from "./ws.ts";
@@ -204,6 +201,38 @@ export const SMOKE_ADDED: readonly SmokeRow[] = [
     where: fc[2],
   },
 ];
+
+// --- retries ------------------------------------------------------------------
+
+/**
+ * The one wait the smoke allows (Leo, 2026-11-26 11:45Z: "the code itself
+ * should have no sleeps or polls"; a backoff before a retry is the only
+ * wait): `attempt` once, and again after each backoff while it answers
+ * undefined (not ready), up to the last; then `notReady`. `wait` is the
+ * Run's clock (fake in tests). The code delivery and search use it until the
+ * public test hooks hold their answer until ready (see the PR).
+ */
+export async function retryWithBackoff<T>(
+  attempt: () => Promise<T | undefined>,
+  o: {
+    backoffMs: readonly number[];
+    wait: (ms: number) => Promise<unknown>;
+    notReady: string;
+  },
+): Promise<T> {
+  for (let i = 0; ; i++) {
+    const got = await attempt();
+    if (got !== undefined) return got;
+    const ms = o.backoffMs[i];
+    if (ms === undefined) throw new Error(o.notReady);
+    await o.wait(ms);
+  }
+}
+
+/** Code delivery: about 16 s of backoff in all. */
+export const OTP_BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000] as const;
+/** Search indexing: about 32 s of backoff in all. */
+export const SEARCH_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 16000] as const;
 
 // --- configuration ---------------------------------------------------------
 
@@ -693,30 +722,46 @@ export async function createFresh(run: Run, dir: string): Promise<Fresh> {
     `${JSON.stringify({ slug, id: fresh.id })}\n`,
     { mode: 0o600 },
   );
-  // Dispatch's HOSTS cache (60 s) can still miss the new host: poll.
-  await run.within(PAGE_WITHIN_MS, "smoke create /healthz", async () => {
-    const h = await run.page(i.appHost);
-    return h.status === 200;
-  });
+  // Dispatch's HOSTS cache (60 s) can still miss the new host: retried with
+  // backoff (about 127 s in all), the one wait allowed.
+  await retryWithBackoff(
+    async () => ((await run.page(i.appHost)).status === 200 ? true : undefined),
+    {
+      backoffMs: CACHE_BACKOFF_MS,
+      wait: run.io.wait,
+      notReady: "smoke create: /healthz does not answer on the new app address",
+    },
+  );
   return fresh;
 }
 
-/** The inventory maps both of the fresh install's addresses to its id (it settles within HOSTS_SETTLE_MS). */
+/** The edge caches (dispatch's and the inventory's HOSTS reads): backoff before each retry, about 127 s in all. */
+export const CACHE_BACKOFF_MS = [
+  1000, 2000, 4000, 8000, 16000, 32000, 64000,
+] as const;
+
+/** The inventory maps both of the fresh install's addresses to its id (another colo's read can lag: retried with backoff). */
 export async function checkFreshMapped(run: Run, f: Fresh): Promise<void> {
   for (const o of [f.app, f.content]) {
     const host = new URL(o).hostname;
     let got: string | null = null;
-    try {
-      await run.within(HOSTS_SETTLE_MS, `inventory ${host}`, async () => {
+    await retryWithBackoff(
+      async () => {
         got = (await run.hostMode(host)).installId;
-        return got === f.id;
-      });
-    } catch (e) {
-      if (!(e instanceof ProbeFail)) throw e;
+        return got === f.id ? true : undefined;
+      },
+      {
+        backoffMs: CACHE_BACKOFF_MS,
+        wait: run.io.wait,
+        notReady: `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`,
+      },
+    ).catch((e: Error) => {
       throw new ProbeFail(
-        `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`,
+        e.message.startsWith("the inventory")
+          ? `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`
+          : e.message,
       );
-    }
+    });
   }
 }
 
@@ -750,7 +795,7 @@ export async function freshCreds(
   const dir = rawTargets(env.REDLINE_TARGETS).secretsDir;
   writeSecretFile(join(dir, secretFileName(f.slug, "PAT")), c.pat);
   writeSecretFile(join(dir, secretFileName(f.slug, "HOOK_KEY")), c.hookKey);
-  await waitHookKey(run, f.app, c.hookKey, async () => {});
+  // No key check here: the R26 job proves the new key live before it seals it.
   return c;
 }
 
@@ -795,13 +840,10 @@ export async function canary(
 
 // --- the background purge ---------------------------------------------------------
 
-/** How long the workflow's purge step waits for the purge to end. */
-export const PURGE_WAIT_MS = 10 * 60_000;
-
 /**
  * Starts the fresh install's delete and purge in a detached process, and
  * returns at once: the purge never holds or fails the gate. Its log and its
- * done file go to `dir`; scripts/smoke.ts purge-wait reads them later.
+ * done file go to `dir`; scripts/smoke.ts purge-report reads them once.
  */
 export function spawnPurge(
   dir: string,
@@ -850,9 +892,6 @@ export async function purgeFresh(
 }
 
 interface Waited {
-  within?: number;
-  now?: () => number;
-  wait?: (ms: number) => Promise<unknown>;
   write?: (s: string) => void;
 }
 
@@ -863,10 +902,7 @@ async function waitDone(
   o: Waited,
 ): Promise<boolean> {
   const write = o.write ?? ((s: string) => process.stdout.write(s));
-  const now = o.now ?? Date.now;
-  const wait = o.wait ?? ((ms: number) => delay(ms));
-  const end = now() + (o.within ?? PURGE_WAIT_MS);
-  while (!existsSync(join(dir, f.done)) && now() < end) await wait(2_000);
+  // One read, no wait: the gate never waits for its cleanup.
   const log = existsSync(join(dir, f.log))
     ? readFileSync(join(dir, f.log), "utf8")
     : "";
@@ -882,8 +918,8 @@ async function waitDone(
 }
 
 /**
- * Waits for the done file up to `within`, prints the purge's log (without
- * workflow command lines) and returns whether the purge succeeded. True when
+ * Reads the purge's done file once, prints its log so far (without workflow
+ * command lines) and returns whether the purge has succeeded. True when
  * no fresh install was ever recorded (nothing to purge).
  */
 export async function purgeWait(dir: string, o: Waited = {}): Promise<boolean> {
