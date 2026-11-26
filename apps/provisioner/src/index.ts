@@ -3,6 +3,7 @@ import type { ManageEnv } from "./manage.js";
 import type { RpcEnv } from "./rpc.js";
 import type { WorkflowEnv } from "./workflow.js";
 
+export { JobWait } from "./job-wait.js";
 export { ManageInstall } from "./manage.js";
 export { ProvisionerRpc } from "./rpc.js";
 export { ProvisionInstall } from "./workflow.js";

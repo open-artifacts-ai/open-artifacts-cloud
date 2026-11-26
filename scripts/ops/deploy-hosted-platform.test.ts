@@ -371,6 +371,12 @@ const provisionerSettings = (p = "p", env: "staging" | "prod" = "prod") =>
       workflow_name: `oa-${p}-manage-install`,
       class_name: "ManageInstall",
     },
+    // cloud #264: R15's held read; the tag declares it.
+    {
+      type: "durable_object_namespace",
+      name: "JOB_WAIT",
+      class_name: "JobWait",
+    },
     ...varsOf("provisioner", env),
   ]);
 const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
@@ -398,6 +404,13 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   },
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
+  // cloud #264: R15's held read waits on the provisioner's JobWait.
+  {
+    type: "durable_object_namespace",
+    name: "JOB_WAIT",
+    class_name: "JobWait",
+    script_name: `oa-${p}-provisioner`,
+  },
   // The approval email (#2096): the provisioner's sender.
   { type: "send_email", name: "WELCOME_EMAIL" },
   ...[
@@ -1408,12 +1421,13 @@ describe("deploy-hosted-platform.sh", () => {
       "oa-p-provisioner",
       "oa-p-provisioning",
     ];
-    // v0.154.0 predates prod's BILLING binding: its live Workers have none.
+    // v0.154.0 predates prod's BILLING binding and JOB_WAIT (cloud #264):
+    // its live Workers have neither.
     const live = (key: string) => {
       const next = JSON.parse(NEXT[key] as string);
       next.result.observability = { enabled: false };
       next.result.bindings = next.result.bindings.filter(
-        (b: { name: string }) => b.name !== "BILLING",
+        (b: { name: string }) => b.name !== "BILLING" && b.name !== "JOB_WAIT",
       );
       return JSON.stringify(next);
     };
@@ -1477,6 +1491,78 @@ describe("deploy-hosted-platform.sh", () => {
         expect(r.err).toBe("");
         expect(r.code).toBe(0);
         expect(r.out).toContain(`prod ${target}: deployed and verified`);
+      });
+    }
+  });
+
+  // cloud #264: R15's held read. The provisioner hosts JobWait and the API
+  // binds it; main's scripts deploy a tag with or without it.
+  describe("the JOB_WAIT binding follows the tag's own wrangler (cloud #264)", () => {
+    const withoutJobWait = (app: "provisioner" | "provisioning") =>
+      readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8")
+        .replace(/"durable_objects":\s*\{[\s\S]*?\]\s*\},/g, "")
+        .replace(/"migrations":\s*\[[^\]]*\]\s*\}\],/g, "");
+    const liveWithout = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "JOB_WAIT",
+      );
+      return JSON.stringify(next);
+    };
+    const liveWrong = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.map(
+        (x: { name: string; class_name?: string }) =>
+          x.name === "JOB_WAIT" ? { ...x, class_name: "Other" } : x,
+      );
+      return JSON.stringify(next);
+    };
+    const DEPS = {
+      provisioner: ["oa-s-billing"],
+      provisioning: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
+    } as const;
+    for (const app of ["provisioner", "provisioning"] as const) {
+      const key = `oa-s-${app}`;
+      it(`${app}: the repo's config declares it; deployed with it, verified`, () => {
+        expect(
+          readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8"),
+        ).toMatch(/"name": "JOB_WAIT"/);
+        const ok = setup({ exists: DEPS[app] }).run(app, {}, "staging");
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+      });
+
+      it(`${app}: a tag that declares it fails the read-back without it, or with another class`, () => {
+        const none = setup({
+          exists: DEPS[app],
+          next: { [key]: liveWithout(key) },
+        }).run(app, {}, "staging");
+        expect(none.code, app).toBe(1);
+        expect(none.err, app).toContain("JOB_WAIT");
+        const wrong = setup({
+          exists: DEPS[app],
+          next: { [key]: liveWrong(key) },
+        }).run(app, {}, "staging");
+        expect(wrong.code, app).toBe(1);
+        expect(wrong.err, app).toContain("JOB_WAIT");
+      });
+
+      it(`${app}: an older tag without it deploys without it; a live one it did not declare fails`, () => {
+        const config = withoutJobWait(app);
+        expect(config).not.toMatch(/"JOB_WAIT"|"JobWait"/);
+        const old = setup({
+          configs: { [app]: config },
+          exists: DEPS[app],
+          next: { [key]: liveWithout(key) },
+        }).run(app, {}, "staging");
+        expect(old.err, app).toBe("");
+        expect(old.code, app).toBe(0);
+        const extra = setup({
+          configs: { [app]: config },
+          exists: DEPS[app],
+        }).run(app, {}, "staging");
+        expect(extra.code, app).toBe(1);
+        expect(extra.err, app).toContain("bindings: got");
       });
     }
   });

@@ -39,6 +39,7 @@ import {
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
 import { codeOf } from "./errors.js";
+import { jobEnded } from "./job-wait.js";
 import { checkLoginJob, isLoginJob, loginRedeploy } from "./login-change.js";
 import {
   checkAuthProviders,
@@ -216,6 +217,8 @@ export async function runManage(
         throw new Error(codeOf(x));
       }
     });
+    // The job is failed now: its held reads answer before any lease wait.
+    await jobEnded(ctx.env, step, jobId);
     // An upgrade or rollback left upgrading under its lease: wait it out,
     // then release it without force (5.4 fail).
     if (f.leaseUntil !== null) {
@@ -231,6 +234,7 @@ export async function runManage(
     }
     throw e;
   }
+  await jobEnded(ctx.env, step, jobId);
 }
 
 /**
@@ -1101,6 +1105,8 @@ async function cleanup(
     );
     return { settled: parentId };
   });
+  // The parent ended in that settle (or before, at a cancel).
+  await jobEnded(ctx.env, step, parentId, "parent_end");
   if (released !== null) throw released;
   if (keyLeft !== null) throw keyLeft;
   await s("done", undefined, () =>

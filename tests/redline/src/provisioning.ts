@@ -177,6 +177,13 @@ export const BUS_CLOSE_WITHIN_MS = 360_000;
 /** HOSTS is KV: a write takes up to 60 s to show everywhere. Two periods. */
 export const HOSTS_SETTLE_MS = 120_000;
 export const JOB_WITHIN_MS = 20 * 60_000;
+/**
+ * R15's held read (cloud #264): the API's longest hold, under the live
+ * suite's 30 s per-request bound (fetch-timeout.ts FETCH_TIMEOUT_MS).
+ */
+export const JOB_HOLD_MS = 25_000;
+/** Held R15 reads whose connection drops this many times in a row fail. */
+export const JOB_HOLD_DROPS = 3;
 /** A case's vitest timeout: its slowest wait plus margin. */
 export const PROBE_TIMEOUT_MS = JOB_WITHIN_MS + 5 * 60_000;
 /** The run's cleanup: one install can wait on a live job, a delete and a purge. */
@@ -317,7 +324,39 @@ export class Run {
       .replace(/-+$/, "");
   }
 
-  /** Polls R15 until the job is done or failed (or `until` holds). */
+  /**
+   * Whether the API holds R15 reads (cloud #264, GET /jobs/:jobId?wait=):
+   * asked once per run, see probeJobWait.
+   */
+  private jobWaitHeld?: boolean;
+
+  /**
+   * The capability probe: `?wait=invalid` is a 400 invalid_input on an API
+   * that holds R15 reads (the schema step runs before the handler, so any
+   * job id will do), and a plain 200 on one that drops the key. Any other
+   * answer fails, as a plain read's would.
+   */
+  async probeJobWait(
+    jobId: string,
+    testUser?: "a" | "b" | "c",
+  ): Promise<boolean> {
+    if (this.jobWaitHeld !== undefined) return this.jobWaitHeld;
+    const r = await this.v1(`/jobs/${jobId}?wait=invalid`, { testUser });
+    if (r.status === 400 && errCode(r) === "invalid_input")
+      this.jobWaitHeld = true;
+    else if (r.status === 200) this.jobWaitHeld = false;
+    else throw new ProbeFail(`R15 ${jobId} wait probe: ${desc(r)}`);
+    return this.jobWaitHeld;
+  }
+
+  /**
+   * R15 until the job is done or failed (or `until` holds). On an API that
+   * holds reads (probeJobWait) and with no `until`, each read is held until
+   * the job's end is pushed to it or JOB_HOLD_MS passes, and is sent again
+   * only when it comes back unfinished: no timer but the request's own
+   * bound. `until` (a state before the end) and an API without held reads
+   * read every POLL_MS.
+   */
   async waitJob(
     jobId: string,
     o: {
@@ -326,19 +365,37 @@ export class Run {
       within?: number;
     } = {},
   ): Promise<Job> {
-    const end = this.io.now() + (o.within ?? JOB_WITHIN_MS);
+    const within = o.within ?? JOB_WITHIN_MS;
+    const end = this.io.now() + within;
+    const secs = Math.round(within / 1000);
+    // Held: unknown until the probe answers, then the API's capability.
+    let held: boolean | undefined = o.until ? false : this.jobWaitHeld;
+    let drops = 0;
     for (;;) {
       let r: Res;
       try {
-        r = await this.v1(`/jobs/${jobId}`, { testUser: o.testUser });
-      } catch {
-        // A dropped connection says nothing about the job: keep polling. Only
+        if (held === undefined)
+          held = await this.probeJobWait(jobId, o.testUser);
+        const wait = Math.min(JOB_HOLD_MS, Math.max(1, end - this.io.now()));
+        r = await this.v1(`/jobs/${jobId}${held ? `?wait=${wait}` : ""}`, {
+          testUser: o.testUser,
+        });
+        drops = 0;
+      } catch (e) {
+        if (e instanceof ProbeFail) throw e;
+        // A dropped connection says nothing about the job: ask again. Only
         // the network throws here: an answer, however bad, fails below.
         if (this.io.now() >= end)
+          throw new ProbeFail(`R15 ${jobId}: no answer for ${secs} s`);
+        if (held === false) {
+          await this.io.wait(POLL_MS);
+          continue;
+        }
+        // Held (or not yet known): sent again at once, a few times only.
+        if (++drops >= JOB_HOLD_DROPS)
           throw new ProbeFail(
-            `R15 ${jobId}: no answer for ${Math.round((o.within ?? JOB_WITHIN_MS) / 1000)} s`,
+            `R15 ${jobId}: no answer (${drops} dropped connections in a row)`,
           );
-        await this.io.wait(POLL_MS);
         continue;
       }
       if (r.status !== 200) throw new ProbeFail(`R15 ${jobId}: ${desc(r)}`);
@@ -347,9 +404,9 @@ export class Run {
         return j;
       if (this.io.now() >= end)
         throw new ProbeFail(
-          `R15 ${jobId}: still ${j.status} at ${j.step ?? "?"} after ${Math.round((o.within ?? JOB_WITHIN_MS) / 1000)} s`,
+          `R15 ${jobId}: still ${j.status} at ${j.step ?? "?"} after ${secs} s`,
         );
-      await this.io.wait(POLL_MS);
+      if (!held) await this.io.wait(POLL_MS);
     }
   }
 

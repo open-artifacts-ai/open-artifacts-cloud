@@ -121,6 +121,19 @@ describe("wrangler.jsonc", () => {
         ]);
       });
 
+      it("binds JobWait on oa-<p>-provisioner (cloud #264, R15's held read); no class of its own", () => {
+        expect(e.durable_objects).toEqual({
+          bindings: [
+            {
+              name: "JOB_WAIT",
+              class_name: "JobWait",
+              script_name: `${p}provisioner`,
+            },
+          ],
+        });
+        expect(e.migrations).toBeUndefined();
+      });
+
       it("produces to oa-<p>-signups and consumes nothing", () => {
         expect(e.queues).toEqual({
           producers: [{ binding: "SIGNUPS", queue: `${p}signups` }],
@@ -235,6 +248,8 @@ describe("wrangler.jsonc", () => {
           [
             "assets",
             "d1_databases",
+            // JobWait on the provisioner (cloud #264), checked above.
+            "durable_objects",
             "kv_namespaces",
             "main",
             "name",

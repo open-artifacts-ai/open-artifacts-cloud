@@ -46,6 +46,7 @@ import type {
   SoloStartResult,
 } from "../../../packages/billing-core/src/solo-start.js";
 import { codeOf, StepRefusal } from "./errors.js";
+import { type JobWait, jobEnded } from "./job-wait.js";
 import {
   appHostOf,
   cfFor,
@@ -102,6 +103,12 @@ export interface WorkflowEnv extends OpsEnv {
   WELCOME_FROM: string;
   /** A prod_dirty create's purge job starts here (5.2 fail). */
   MANAGE_INSTALL: Workflow<WorkflowParams>;
+  /**
+   * JobWait (cloud #264, job-wait.ts), this Worker's own class: every job's
+   * end releases R15's held reads of it. Unbound (a config from before it),
+   * no step.
+   */
+  JOB_WAIT?: DurableObjectNamespace<JobWait>;
 }
 
 /** The rechecked create job (2.5): what the later steps read. */
@@ -246,8 +253,10 @@ export async function runCreate(
         throw new Error(codeOf(f));
       }
     });
+    await jobEnded(ctx.env, step, jobId);
     throw e;
   }
+  await jobEnded(ctx.env, step, jobId);
 }
 
 /** The owner's email (the API wrote it); null once done has deleted it. */

@@ -1181,23 +1181,29 @@ describe("each probe fails on the behaviour it guards", () => {
       throw new TypeError("fetch failed");
     };
 
-    it("waitJob retries a dropped connection, then carries on", async () => {
+    /** A build without held R15 reads: the probe's `wait` is dropped. */
+    const oldApi = (u: string) =>
+      u.includes("/jobs/j1?wait=invalid") ? job("running") : undefined;
+
+    it("waitJob retries a dropped connection, then carries on (no held reads)", async () => {
       let n = 0;
-      const { run, f } = runWith((u) =>
-        u.includes("/jobs/j1")
-          ? ++n <= 2
-            ? dropped()
-            : job("done")
-          : undefined,
+      const { run, f } = runWith(
+        (u) =>
+          oldApi(u) ??
+          (u.includes("/jobs/j1")
+            ? ++n <= 2
+              ? dropped()
+              : job("done")
+            : undefined),
       );
       const t0 = f.clock.t;
       expect((await run.waitJob("j1")).status).toBe("done");
       expect(f.clock.t - t0).toBe(2 * POLL);
     });
 
-    it("waitJob gives up at its bound, naming the job and no detail", async () => {
-      const { run, f } = runWith((u) =>
-        u.includes("/jobs/j1") ? dropped() : undefined,
+    it("waitJob gives up at its bound, naming the job and no detail (no held reads)", async () => {
+      const { run, f } = runWith(
+        (u) => oldApi(u) ?? (u.includes("/jobs/j1") ? dropped() : undefined),
       );
       const t0 = f.clock.t;
       await expect(run.waitJob("j1", { within: 30_000 })).rejects.toThrow(
@@ -1213,8 +1219,179 @@ describe("each probe fails on the behaviour it guards", () => {
           : undefined,
       );
       const t0 = f.clock.t;
-      await expect(run.waitJob("j1")).rejects.toThrow("R15 j1: status 500");
+      await expect(run.waitJob("j1")).rejects.toThrow(
+        /^R15 j1 wait probe: status 500/,
+      );
       expect(f.clock.t - t0).toBe(0);
+      const old = runWith(
+        (u) =>
+          oldApi(u) ??
+          (u.includes("/jobs/j1")
+            ? Response.json({ error: { code: "x" } }, { status: 500 })
+            : undefined),
+      );
+      await expect(old.run.waitJob("j1")).rejects.toThrow(
+        /^R15 j1: status 500/,
+      );
+    });
+
+    // cloud #264, Leo: "Everything should be event-based, push, never PULL
+    // (no waits, sleeps, polls)". An API with held R15 reads pushes the
+    // job's end to the open request: waitJob never waits on a clock.
+    describe("held R15 reads (cloud #264)", () => {
+      const invalid = () =>
+        Response.json(
+          {
+            error: {
+              code: "invalid_input",
+              details: { fields: ["query.wait"] },
+            },
+          },
+          { status: 400 },
+        );
+      /** The held API: the probe's 400, then `reads` in order. */
+      const heldApi = (reads: (() => Response)[], onRead?: () => void) => {
+        let i = 0;
+        return (u: string) => {
+          if (!u.includes("/jobs/j1")) return undefined;
+          if (u.includes("wait=invalid")) return invalid();
+          onRead?.();
+          const r = reads[Math.min(i++, reads.length - 1)] as () => Response;
+          return r();
+        };
+      };
+      const counted = (run: Run) => {
+        const waits: number[] = [];
+        const io = run.io as { wait: (ms: number) => Promise<void> };
+        const inner = io.wait;
+        io.wait = (ms) => {
+          waits.push(ms);
+          return inner(ms);
+        };
+        return waits;
+      };
+      const reads = (seen: string[]) =>
+        seen
+          .filter((l) => l.includes("/jobs/j1"))
+          .map((l) => l.split("/v1")[1]);
+
+      it("probes once, then holds; re-sent only when a held read comes back unfinished; no wait", async () => {
+        const { run, f, seen } = runWith(
+          heldApi([
+            () => job("running"),
+            () => job("running"),
+            () => job("done"),
+          ]),
+        );
+        const waits = counted(run);
+        const t0 = f.clock.t;
+        expect((await run.waitJob("j1")).status).toBe("done");
+        expect(reads(seen)).toEqual([
+          "/jobs/j1?wait=invalid",
+          "/jobs/j1?wait=25000",
+          "/jobs/j1?wait=25000",
+          "/jobs/j1?wait=25000",
+        ]);
+        expect(waits).toEqual([]);
+        expect(f.clock.t).toBe(t0);
+        // The probe's answer is kept for the run.
+        expect((await run.waitJob("j1")).status).toBe("done");
+        expect(reads(seen).filter((r) => r.includes("invalid"))).toHaveLength(
+          1,
+        );
+      });
+
+      it("the last hold is cut to what is left of `within`, then it fails at the bound", async () => {
+        const { run, f, seen } = runWith(
+          // Each held read runs out: the server answers after its wait.
+          heldApi([() => job("running")], () => {
+            f.clock.t += 25_000;
+          }),
+        );
+        const waits = counted(run);
+        await expect(run.waitJob("j1", { within: 30_000 })).rejects.toThrow(
+          "R15 j1: still running at x after 30 s",
+        );
+        expect(reads(seen).slice(1)).toEqual([
+          "/jobs/j1?wait=25000",
+          "/jobs/j1?wait=5000",
+        ]);
+        expect(waits).toEqual([]);
+      });
+
+      it("a dropped held read is sent again at once; three in a row fail", async () => {
+        const ok = runWith(heldApi([dropped, () => job("done")]));
+        const waits = counted(ok.run);
+        expect((await ok.run.waitJob("j1")).status).toBe("done");
+        expect(waits).toEqual([]);
+        const down = runWith(heldApi([dropped]));
+        await expect(down.run.waitJob("j1")).rejects.toThrow(
+          "R15 j1: no answer (3 dropped connections in a row)",
+        );
+        expect(reads(down.seen)).toHaveLength(4);
+      });
+
+      it("`until` (a state before the end) reads plainly, without the probe", async () => {
+        const { run, seen } = runWith(
+          heldApi([
+            () => job("running"),
+            () =>
+              Response.json({ id: "j1", status: "running", step: "upload" }),
+          ]),
+        );
+        const j = await run.waitJob("j1", {
+          until: (x) => x.step === "upload",
+        });
+        expect(j.step).toBe("upload");
+        expect(reads(seen)).toEqual(["/jobs/j1", "/jobs/j1"]);
+      });
+
+      it("on the fake API: run.done holds, and the job's end answers it", async () => {
+        const f = fakeApi();
+        f.heldReads.on = true;
+        // The first hold runs out with the job unmoved; the second gets its end.
+        f.heldReads.runOut = 1;
+        const seen: string[] = [];
+        const run = new Run(CONFIG, {
+          ...f.io,
+          fetch: (async (u: string, i?: RequestInit) => {
+            seen.push(String(u));
+            return f.io.fetch(u, i);
+          }) as typeof fetch,
+        });
+        const waits = counted(run);
+        const id = "01JE0000000000000000000099";
+        const steps = ["recheck", "pause", "record", "done"];
+        f.jobs.set(id, {
+          id,
+          kind: "suspend",
+          installId: CONFIG.rlA.id,
+          status: "running",
+          steps,
+          stepIndex: 0,
+          owner: "oidc",
+          args: {},
+          sealed: null,
+          sealedRead: false,
+          createdAt: f.clock.t,
+          finishedAt: null,
+        } as Parameters<typeof f.jobs.set>[1]);
+        const t0 = f.clock.t;
+        const j = await run.done(id, "held suspend");
+        expect(j.status).toBe("done");
+        expect(f.heldReads.held).toBe(2);
+        expect(
+          seen
+            .filter((l) => l.includes(`/jobs/${id}`))
+            .map((l) => l.replace(/^.*\/jobs\//, "")),
+        ).toEqual([
+          `${id}?wait=invalid`,
+          `${id}?wait=25000`,
+          `${id}?wait=25000`,
+        ]);
+        expect(waits).toEqual([]);
+        expect(f.clock.t).toBe(t0);
+      });
     });
 
     const busy = () =>

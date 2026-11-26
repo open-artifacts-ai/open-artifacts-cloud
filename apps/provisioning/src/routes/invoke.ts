@@ -16,6 +16,7 @@ import { ApiError } from "../errors.js";
 import { limitRoute } from "../limits.js";
 import type { Principal } from "../principal.js";
 import { countRateLimited } from "../refuse.js";
+import { R15_QUERY } from "../services/job-wait.js";
 import { HANDLERS } from "./handlers.js";
 import { onAuthenticated } from "./hooks.js";
 
@@ -57,6 +58,15 @@ type Parsed = { ok: true; input: RouteInput } | { ok: false; fields: string[] };
 export const bodyKeys = (def: RouteDef): ReadonlySet<string> =>
   new Set(bodyVariants(def).flatMap((v) => Object.keys(v.shape)));
 
+/**
+ * Query keys this Worker takes beside the contract's, parsed in the same
+ * schema step (after the rate limit and authz): R15's `wait` (cloud #264,
+ * services/job-wait.ts).
+ */
+const CLOUD_QUERY: Partial<Record<ApiRouteId, typeof R15_QUERY>> = {
+  R15: R15_QUERY,
+};
+
 export function parseInput(def: RouteDef, input: RouteInput): Parsed {
   const fields: string[] = [];
   const one = (where: string, schema: RouteDef["body"], v: unknown) => {
@@ -67,7 +77,12 @@ export function parseInput(def: RouteDef, input: RouteInput): Parsed {
     return undefined;
   };
   const params = one("params", def.params, input.params ?? {});
-  const query = one("query", def.query, input.query ?? {});
+  const extra = CLOUD_QUERY[def.id as ApiRouteId];
+  const query = one(
+    "query",
+    extra ? def.query.extend(extra.shape) : def.query,
+    input.query ?? {},
+  );
   // A route without body fields takes none; a write with fields needs one.
   const body =
     def.method === "GET"

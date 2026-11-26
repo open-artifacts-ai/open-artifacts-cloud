@@ -4,6 +4,7 @@ import type {
   Tier,
   WorkflowLike,
 } from "@oa/provisioning-contract";
+import type { JobWaitNamespace } from "./services/job-wait.js";
 
 /**
  * Billing's operator entrypoint (BillingOperatorRpc, #66), as this Worker
@@ -58,6 +59,11 @@ export interface Env {
   /** Workflows on oa-<p>-provisioner (script_name). */
   PROVISION_INSTALL: WorkflowLike;
   MANAGE_INSTALL: WorkflowLike;
+  /**
+   * JobWait on oa-<p>-provisioner (cloud #264, services/job-wait.ts): R15's
+   * held read waits on it. Unbound, `?wait=` answers at once.
+   */
+  JOB_WAIT?: JobWaitNamespace;
   /** Entrypoint ProvisionerRpc: exactly three read-only methods (2.6). */
   PROVISIONER: ProvisionerRpc;
   /**
