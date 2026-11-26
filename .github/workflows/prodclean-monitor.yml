@@ -1,4 +1,4 @@
-# The hourly prod-clean monitor (design v7 6): red-line's prodClean against
+# The prod-clean monitor (design v7 6): red-line's prodClean against
 # prod, the scheduler's dead-man tick and the red-line prod tokens' expiry.
 # It reads the prod inventory with a GitHub OIDC token (no stored key). The
 # repo is public, so the log shows only `prod-clean: pass` or
@@ -6,8 +6,8 @@
 # /prodclean), and the scheduler alerts and emails from there. A failed run
 # is the alert here: no issue is opened (that needs issues: write).
 #
-# Two jobs, so no installer or build tool runs where an OIDC token can be
-# minted:
+# Two jobs that check, so no installer or build tool runs where an OIDC
+# token can be minted (and a relay that starts them, below):
 # - build: contents: read only, no environment, no secrets. It installs,
 #   builds and bundles the monitor script into one self-contained ESM file,
 #   smoke-runs it, and uploads it. Nothing here can mint a JWT, but the
@@ -19,23 +19,61 @@
 #   Environment, as 0600 files under RUNNER_TEMP, never as argv.
 name: prodclean-monitor
 
-# The hourly schedule ("17 * * * *") runs from this repo since the cut-over
-# (#1056): prod inventory trusts this repo, and the public repo's monitor is
-# disabled, so there is one monitor. Dispatch by hand works too.
+# Runs from this repo since the cut-over (#1056): prod inventory trusts this
+# repo, and the public repo's monitor is disabled, so there is one monitor.
+# No clock (cloud #264): it checks after the events that can change prod's
+# state, and on dispatch. The token-expiry check runs with it.
+# - A prod deploy-hosted-platform run on main completes (a person's dispatch),
+#   or prod-release-chain completes (it dispatches the prod deploy with the
+#   default token, and a run that token starts raises no workflow_run event:
+#   staging-release-chain.yml says why it uses the App's token instead).
+# - A redline-staging run on main completes.
+# Any conclusion: a failed deploy may have changed prod too. The prod
+# inventory admits a monitor token only from a schedule or workflow_dispatch
+# run (@oa/gh-oidc GITHUB_OIDC_EVENT_NAMES, fixed for every caller), so on
+# workflow_run only the relay job runs: it dispatches this workflow on main,
+# and build and monitor run in that dispatched run. Each check only reads prod
+# and posts one report, so an extra run changes nothing.
 on:
-  schedule:
-    - cron: "17 * * * *"
+  workflow_run:
+    workflows: [deploy-hosted-platform, prod-release-chain, redline-staging]
+    types: [completed]
   workflow_dispatch:
 
 permissions: {}
 
-concurrency:
-  group: prodclean-monitor
-  cancel-in-progress: false
-
 jobs:
+  # workflow_run always runs the default branch, so the run that completed
+  # must be this repo's, on main. A staging deploy (its run-name names the
+  # env) is skipped. Workflows are matched by file, never workflow_run.name.
+  # It passes nothing from the event to the dispatch.
+  relay:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.repository == 'open-artifacts-ai/open-artifacts-cloud' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' ||
+      github.event.workflow_run.path == '.github/workflows/prod-release-chain.yml' ||
+      (github.event.workflow_run.path == '.github/workflows/deploy-hosted-platform.yml' &&
+      startsWith(github.event.workflow_run.display_title, 'deploy-hosted-platform prod ')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # actions: write is this job's alone: it dispatches the monitor.
+    permissions:
+      actions: write
+    steps:
+      - name: Start the monitor on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run prodclean-monitor.yml --repo "$GITHUB_REPOSITORY" --ref main
+
   build:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'open-artifacts-ai/open-artifacts-cloud' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -75,7 +113,16 @@ jobs:
 
   monitor:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'open-artifacts-ai/open-artifacts-cloud' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    # One check at a time. On the job, not the workflow: a relay run joins no
+    # group, so it can't displace a pending check. A newer pending check may
+    # replace an older one; it reads the newer state.
+    concurrency:
+      group: prodclean-monitor
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: redline-staging
     timeout-minutes: 15

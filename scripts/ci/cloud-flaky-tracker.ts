@@ -70,7 +70,8 @@
 //
 // Reconcile: GitHub keeps a bounded queue of pending runs per concurrency
 // group, and a dropped tracker run would lose its sightings. So the same
-// workflow also runs hourly with --reconcile (see reconcile()): it tracks
+// job runs --reconcile right after every tracker run, on each completion of a
+// watched workflow and on dispatch, never on a clock (see reconcile()): it tracks
 // every run updated in the last RECONCILE_HOURS hours (created within
 // RERUN_DAYS plus RECONCILE_HOURS; GitHub allows a rerun for RERUN_DAYS)
 // that passed after a failed
@@ -1150,7 +1151,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   // The run marker says "this run is fully handled": the reconcile skips a
   // marked run. With nothing to file it rides on the last store part. With
   // filings it is written last (finish), so a failed create or bump leaves the
-  // run unmarked and the hourly reconcile tracks it again; its sightings are
+  // run unmarked and the next run's reconcile tracks it again; its sightings are
   // already stored, so nothing is stored twice, and plan() sees them.
   const post = (body: string) =>
     gh(
@@ -1351,7 +1352,7 @@ export const runFromArgs = (argv: string[]): RunInfo =>
 
 // ---- The reconcile ----
 
-/** The hourly reconcile tracks the runs updated in the last this many hours. */
+/** The reconcile tracks the runs updated in the last this many hours. */
 export const RECONCILE_HOURS = 26;
 /** GitHub lets a run be rerun for this many days after it was created. */
 export const RERUN_DAYS = 30;
@@ -1490,7 +1491,7 @@ export function listRuns(
 }
 
 /**
- * The hourly reconcile: a tracker run GitHub dropped (its queue full, or the
+ * The reconcile, after every tracker run: a tracker run GitHub dropped (its queue full, or the
  * runner gone) leaves a run unrecorded. This lists the watched workflows'
  * runs created in the last RERUN_DAYS days plus RECONCILE_HOURS and updated in the last
  * RECONCILE_HOURS hours whose latest attempt passed after an earlier one
@@ -1498,8 +1499,8 @@ export function listRuns(
  * doesn't hold yet (by run id and the attempt that passed) with the same code
  * as the event. A run the
  * store holds adds nothing and bumps nothing. A run that found no test (it
- * failed outside the tests) writes nothing, so it is read again each hour
- * until it leaves the window: reads only.
+ * failed outside the tests) writes nothing, so it is read again by each
+ * tracker run until it leaves the window: reads only.
  */
 export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
   tracked: { run: RunInfo; done: Done[]; notes: string[] }[];

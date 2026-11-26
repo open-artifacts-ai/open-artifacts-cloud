@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { GITHUB_OIDC_EVENT_NAMES } from "@oa/gh-oidc";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { MONITOR_WORKFLOW } from "../src/prodclean.ts";
@@ -15,6 +16,7 @@ const wf = parse(raw) as {
       if?: string;
       needs?: unknown;
       environment?: string;
+      concurrency?: unknown;
       permissions?: unknown;
       "timeout-minutes"?: number;
       steps: {
@@ -23,6 +25,7 @@ const wf = parse(raw) as {
         env?: Record<string, string>;
         with?: Record<string, unknown>;
         if?: string;
+        name?: string;
       }[];
     }
   >;
@@ -39,6 +42,9 @@ const steps = job.steps;
 const buildJob = wf.jobs.build;
 if (!buildJob) throw new Error("no build job");
 const buildSteps = buildJob.steps;
+const relay = wf.jobs.relay;
+if (!relay) throw new Error("no relay job");
+const flat = (x: unknown) => String(x).replace(/\s+/g, " ").trim();
 const allSteps = [...buildSteps, ...steps];
 const pkg = JSON.parse(
   readFileSync(join(ROOT, "apps/inventory/package.json"), "utf8"),
@@ -51,27 +57,76 @@ const UPLOAD =
   "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 
 describe("prodclean-monitor.yml", () => {
-  it("runs hourly and on dispatch only", () => {
-    expect(Object.keys(wf.on).sort()).toEqual([
-      "schedule",
-      "workflow_dispatch",
-    ]);
-    const s = wf.on.schedule as { cron: string }[];
-    expect(s).toHaveLength(1);
-    expect(s[0]?.cron).toBe("17 * * * *");
+  it("runs on events only, never on a clock: the prod deploy, the release chain, the red-line, and dispatch", () => {
+    // cloud #264: no schedule.
+    expect(wf.on).toEqual({
+      workflow_run: {
+        workflows: [
+          "deploy-hosted-platform",
+          "prod-release-chain",
+          "redline-staging",
+        ],
+        types: ["completed"],
+      },
+      workflow_dispatch: null,
+    });
+    expect(raw).not.toMatch(/^\s*schedule:|cron:/m);
   });
 
-  it("two jobs: build has contents: read only, monitor has id-token: write only", () => {
+  it("three jobs: relay has actions: write only, build contents: read only, monitor id-token: write only", () => {
     expect(wf.permissions).toEqual({});
-    expect(Object.keys(wf.jobs)).toEqual(["build", "monitor"]);
+    expect(Object.keys(wf.jobs)).toEqual(["relay", "build", "monitor"]);
+    expect(relay.permissions).toEqual({ actions: "write" });
     expect(buildJob.permissions).toEqual({ contents: "read" });
     expect(job.permissions).toEqual({ "id-token": "write" });
+    // build and monitor run only in a dispatched run on this repo's main:
+    // the prod inventory admits a token from schedule or workflow_dispatch
+    // only (@oa/gh-oidc), and workflow_run has no schedule left.
     for (const j of [buildJob, job]) {
-      expect(j.if).toBe("github.ref == 'refs/heads/main'");
+      expect(flat(j.if)).toBe(
+        "github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'",
+      );
       expect(j["timeout-minutes"]).toBeGreaterThan(0);
     }
+    expect(GITHUB_OIDC_EVENT_NAMES).toContain("workflow_dispatch");
+    expect(GITHUB_OIDC_EVENT_NAMES).not.toContain("workflow_run");
     expect(job.needs).toBe("build");
     expect(buildJob.needs).toBeUndefined();
+    expect(relay.needs).toBeUndefined();
+  });
+
+  it("relay: only a completed prod deploy, release chain or red-line run of this repo's main starts a check", () => {
+    expect(flat(relay.if)).toBe(
+      "github.event_name == 'workflow_run' && github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' || github.event.workflow_run.path == '.github/workflows/prod-release-chain.yml' || (github.event.workflow_run.path == '.github/workflows/deploy-hosted-platform.yml' && startsWith(github.event.workflow_run.display_title, 'deploy-hosted-platform prod ')))",
+    );
+    // The prod deploy's run-name starts with its env (staging is skipped).
+    const deploy = readFileSync(
+      join(ROOT, ".github/workflows/deploy-hosted-platform.yml"),
+      "utf8",
+    );
+    expect(deploy).toMatch(
+      /^run-name: deploy-hosted-platform \$\{\{ inputs\.env \}\} /m,
+    );
+    expect(relay.environment).toBeUndefined();
+    expect(JSON.stringify(relay)).not.toMatch(/secrets\.|id-token/);
+    // One step: dispatch this workflow on main, nothing from the event.
+    expect(relay.steps).toEqual([
+      {
+        name: "Start the monitor on main",
+        env: { GH_TOKEN: "${{ github.token }}" },
+        run: 'gh workflow run prodclean-monitor.yml --repo "$GITHUB_REPOSITORY" --ref main',
+      },
+    ]);
+    expect(MONITOR_WORKFLOW).toBe(".github/workflows/prodclean-monitor.yml");
+  });
+
+  it("one check at a time, on the job, so a relay run never displaces a pending check", () => {
+    expect((wf as { concurrency?: unknown }).concurrency).toBeUndefined();
+    expect(job.concurrency).toEqual({
+      group: "prodclean-monitor",
+      "cancel-in-progress": false,
+    });
+    expect(relay.concurrency).toBeUndefined();
   });
 
   it("build: no environment, no secrets, no id-token; bundles and uploads the script", () => {

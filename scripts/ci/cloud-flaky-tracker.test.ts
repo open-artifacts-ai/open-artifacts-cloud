@@ -1697,22 +1697,25 @@ describe("cloud-flaky-tracker.yml", () => {
     ),
   );
 
-  it("runs after CI and redline-staging, only for a run that passed on a later attempt, and hourly to reconcile", () => {
+  it("runs after every CI and redline-staging completion and on dispatch, never on a clock", () => {
+    // cloud #264: event-only. The reconcile rides on each completion, so a
+    // dropped tracker event is caught by the next CI completion.
     expect(wf.on).toEqual({
       workflow_run: {
         workflows: ["CI", "redline-staging"],
         types: ["completed"],
       },
-      schedule: [{ cron: "17 * * * *" }],
+      workflow_dispatch: null,
     });
+    expect(wf.on.schedule).toBeUndefined();
     expect(wf.permissions).toEqual({});
-    const cond = String(wf.jobs.track.if).replace(/\s+/g, " ");
+    const cond = String(wf.jobs.track.if).replace(/\s+/g, " ").trim();
     expect(cond).toBe(
-      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && (github.event.workflow_run.path == '.github/workflows/ci.yml' || (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
+      "github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped'))",
     );
   });
 
-  it("tracks the event's run on workflow_run and reconciles on the schedule", () => {
+  it("records the event's run only when it passed on a later attempt, then reconciles on every run", () => {
     const steps = wf.jobs.track.steps as {
       name?: string;
       if?: string;
@@ -1722,8 +1725,14 @@ describe("cloud-flaky-tracker.yml", () => {
     const recon = steps.find(
       (s) => s.name === "Reconcile runs the tracker missed",
     );
-    expect(record?.if).toBe("github.event_name == 'workflow_run'");
-    expect(recon?.if).toBe("github.event_name == 'schedule'");
+    expect(String(record?.if).replace(/\s+/g, " ").trim()).toBe(
+      "github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && (github.event.workflow_run.path == '.github/workflows/ci.yml' || (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main'))",
+    );
+    // No condition: it runs whenever the job does, after the record step.
+    expect(recon?.if).toBeUndefined();
+    expect(steps.indexOf(recon as (typeof steps)[number])).toBe(
+      steps.indexOf(record as (typeof steps)[number]) + 1,
+    );
     expect(recon?.run).toBe(
       'node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile',
     );

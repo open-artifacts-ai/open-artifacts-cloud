@@ -16,7 +16,7 @@ import {
   prodSecretsOf,
 } from "../../../tests/redline/src/targets.ts";
 
-// The hourly prod-clean monitor (design v7 6, 5.8), run by
+// The prod-clean monitor (design v7 6, 5.8), run by
 // .github/workflows/prodclean-monitor.yml. The repo is public: stdout is one
 // line, `prod-clean: pass` or `prod-clean: fail (<code>)`, after at most the
 // one fixed NO_END_DATE_WARNING line, and nothing goes to stderr. The detail goes only to inventory's POST /prodclean, which the

@@ -2,7 +2,7 @@ import { ProdcleanReportSchema } from "@oa/provisioning-contract";
 import type { Authed } from "./auth.ts";
 import { badRequest, type D1Like, notFound } from "./http.ts";
 
-// POST /prodclean: the hourly monitor's result (design v7 6), stored for the
+// POST /prodclean: the monitor's result (design v7 6), stored for the
 // scheduler's prodclean_failed alert (@oa/shared alerts.ts). The only D1
 // write this Worker makes.
 
