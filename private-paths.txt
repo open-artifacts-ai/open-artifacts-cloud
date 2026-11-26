@@ -70,8 +70,6 @@ scripts/ci/provapi-spikes.test.ts
 scripts/ci/provapi-token-verify.sh
 scripts/ci/redline-nightly.test.ts
 scripts/ci/redline-nightly.ts
-scripts/ci/redline-preempt.test.ts
-scripts/ci/redline-preempt.ts
 scripts/ci/redline-staging.test.ts
 scripts/ci/release-artifact.mjs
 scripts/ci/release-pubkeys.mjs

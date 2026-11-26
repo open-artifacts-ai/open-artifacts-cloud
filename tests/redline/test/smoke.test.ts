@@ -73,6 +73,9 @@ describe("the smoke's cases", () => {
       "smoke/setup.ts",
     ]) {
       const src = readFileSync(join(pkg, f), "utf8");
+      // The tracks sleep nowhere: their polls run on the Run's clock.
+      if (f.startsWith("smoke/"))
+        expect(src, `${f} sleeps`).not.toMatch(/setTimeout|sleep\(|delay\(/);
       for (const banned of [
         "rl-anon",
         "locks.ts",
@@ -274,6 +277,18 @@ describe("the background purge", () => {
     expect(await purgeFresh(run, d, (s) => out.push(s))).toBe(false);
     expect(readFileSync(join(d, PURGE_DONE), "utf8")).toBe("failed\n");
     expect(out.join("")).toContain("purge failed: no fresh slug recorded");
+  });
+
+  it("the gate's report waits for nothing: within 0 reads what is there and returns", async () => {
+    const d = tmp();
+    writeFileSync(join(d, FRESH_FILE), '{"slug":"rl-n-9-1"}');
+    const wait = vi.fn(async () => {});
+    const out: string[] = [];
+    expect(
+      await purgeWait(d, { within: 0, wait, write: (s) => out.push(s) }),
+    ).toBe(false);
+    expect(wait).not.toHaveBeenCalled();
+    expect(out.join("")).toContain("has not ended");
   });
 
   it("purge-wait prints the log without workflow commands, and gives up at its bound", async () => {

@@ -108,7 +108,7 @@ describe("redline-staging.yml", () => {
 
   it("refuses to start on a stale Worker: platform-tags (main's script, the staging deploy token) runs first (#1040)", () => {
     const pt = w.jobs["platform-tags"];
-    expect(job.needs).toBe("platform-tags");
+    expect(job.needs).toEqual(["preempt", "platform-tags"]);
     expect(t19Job.needs).toBe("platform-tags");
     expect(pt["runs-on"]).toBe("ubuntu-latest");
     expect(pt.environment).toBe("hosted-staging-deploy");
@@ -590,7 +590,10 @@ describe("redline-staging.yml", () => {
       const p = named("smoke-purge");
       expect(p["continue-on-error"]).toBe(true);
       expect(p.if).toBe("always() && steps.mint.outcome == 'success'");
-      expect(p.run).toContain("pnpm --filter @oa/redline smoke purge-wait");
+      // It waits for nothing: the purge and sweep never hold the gate.
+      expect(p.run).toContain("pnpm --filter @oa/redline smoke purge-report");
+      expect(p.run).not.toContain("purge-wait");
+      expect(p["timeout-minutes"]).toBeLessThanOrEqual(2);
       expect(p.run).toContain('if [ -d "$REDLINE_SMOKE_DIR" ]');
       expect(p.env.REDLINE_SMOKE_DIR).toBe(suite().env.REDLINE_SMOKE_DIR);
       expect(named("Remove the secret files").run).toContain(
@@ -684,8 +687,21 @@ describe("redline-staging.yml", () => {
 
     it("platform-tags, and so everything else, starts only after it", () => {
       expect(w.jobs["platform-tags"].needs).toBe("preempt");
-      expect(job.needs).toBe("platform-tags");
+      expect(job.needs).toEqual(["preempt", "platform-tags"]);
       expect(t19Job.needs).toBe("platform-tags");
+    });
+
+    it("is bounded to minutes, and a preempted nightly's unrevoked rl-a is revoked before the bring-up", () => {
+      expect(pj()["timeout-minutes"]).toBeLessThanOrEqual(10);
+      expect(pj().outputs).toEqual({
+        reset: "${{ steps.preempt-run.outputs.reset }}",
+      });
+      const r = named("reset-rl-a");
+      expect(r.if).toBe("needs.preempt.outputs.reset == 'true'");
+      expect(r.run).toBe("pnpm --filter @oa/redline provisioning revoke");
+      expect(r.env).toEqual({ REDLINE_SIDES: "a" });
+      expect(steps.indexOf(r)).toBeGreaterThan(steps.indexOf(named("mint")));
+      expect(steps.indexOf(r)).toBe(steps.indexOf(named("bringup")) - 1);
     });
   });
 
@@ -747,7 +763,7 @@ describe("redline-staging.yml", () => {
       );
       // Neither job waits for the other through `needs`: they overlap.
       expect(t19Job.needs).toBe("platform-tags");
-      expect(job.needs).toBe("platform-tags");
+      expect(job.needs).toEqual(["preempt", "platform-tags"]);
       // The workflow no longer records a deviation from 4.4, and T19's shell
       // has nothing to unset.
       expect(text).not.toContain("Deviation from 4.4");
@@ -1599,6 +1615,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       at((s) => s.name === "Set the targets"),
       at((s) => s.id === "mint"),
       at((s) => s.id === "smoke-sweep"),
+      at((s) => s.id === "reset-rl-a"),
       at((s) => s.id === "bringup"),
       at((s) => s.id === "staged"),
       at((s) => s.id === "t19-key"),
@@ -1608,7 +1625,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       at((s) => s.id === "scan-suite"),
       at((s) => s.with?.name === "redline-report"),
       at((s) => s.id === "t19-done"),
-      at((s) => (s.run ?? "").includes("provisioning revoke")),
+      at((s) => s.name === "Revoke this run's R26 credentials"),
       at((s) => s.id === "smoke-purge"),
       at((s) => s.name === "Remove the secret files"),
     ];
@@ -1620,7 +1637,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     // failure).
     expect(steps.slice(-4).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
-      "The smoke's fresh install is purged, and leftovers swept (never fails the gate)",
+      "The smoke's background purge and sweep, as far as they got (waits for nothing)",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
     ]);

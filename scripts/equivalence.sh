@@ -131,6 +131,9 @@ ALLOW=(
   scripts/ci/cloud-flaky-tracker.test.ts
   .github/workflows/release-retry.yml
   scripts/ci/release-retry.test.ts
+  # A release gate preempts the red-line nightly (#264 step 2): its script and test.
+  scripts/ci/redline-preempt.ts
+  scripts/ci/redline-preempt.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

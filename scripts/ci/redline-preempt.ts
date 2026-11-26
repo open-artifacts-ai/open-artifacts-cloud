@@ -1,14 +1,17 @@
 // A release gate never waits behind the nightly (cloud #264 step 2): the
 // gate run's first job (redline-staging.yml `preempt`, a workflow_dispatch on
 // main only) cancels every red-line nightly run still going, then waits for
-// each to end, its always() steps included (the R26 revoke rotates rl-a's
-// hook key), so the two never touch rl-a at the same time. Only runs of
+// a few minutes for each to end (force-cancelling one that won't), then
+// checks its R26 revoke: if it issued credentials and the revoke did not
+// succeed, the gate revokes rl-a itself before its bring-up, so rl-a is never
+// used in an unknown state, and the two never touch it at the same time. Only runs of
 // .github/workflows/redline-nightly.yml on main in this repository, started
 // by its cron or a dispatch, are ever selected: never a gate, a dry run, a
 // fork's run or another branch's. The nightly's report job logs the
 // preemption, and the release runs again on its next cron.
 //   node --experimental-strip-types scripts/ci/redline-preempt.ts --repo owner/name --run <own run id>
 import { execFileSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
@@ -16,9 +19,37 @@ export const NIGHTLY_FILE = "redline-nightly.yml";
 export const NIGHTLY_PATH = `.github/workflows/${NIGHTLY_FILE}`;
 const BUSY = ["queued", "in_progress", "waiting", "requested", "pending"];
 const EVENTS = ["schedule", "workflow_dispatch"];
-/** The nightly's cleanup after a cancel (the R26 revoke, up to 40 min) fits in this. */
-export const PREEMPT_WAIT_MS = 45 * 60_000;
-export const POLL_MS = 10_000;
+/** How long a cancelled nightly gets to end on its own (its always() steps). */
+export const CANCEL_WAIT_MS = 2 * 60_000;
+/** Then a force-cancel (no always() steps) gets this long; past it the gate fails. */
+export const FORCE_WAIT_MS = 60_000;
+export const POLL_MS = 5_000;
+
+export type Step = {
+  name: string;
+  status?: string;
+  conclusion?: string | null;
+};
+export type Job = { name: string; steps?: Step[] };
+
+/**
+ * Whether rl-a may be in an unknown state after a nightly ended: its redline
+ * job issued credentials (its bring-up step started) and its R26 revoke did
+ * not succeed (failed, skipped, cut off by a force-cancel, or never ran).
+ * Then the gate revokes rl-a itself before its own bring-up.
+ */
+export function needsReset(jobs: readonly Job[]): boolean {
+  const j = jobs.find((x) => /(^| \/ )redline$/.test(x.name));
+  if (!j) return false;
+  const step = (re: RegExp) => (j.steps ?? []).find((x) => re.test(x.name));
+  const up = step(/^Upgrade rl-a/);
+  const issued =
+    up !== undefined &&
+    up.conclusion !== "skipped" &&
+    (up.status === "completed" || up.status === "in_progress");
+  if (!issued) return false;
+  return step(/^Revoke this run's R26 credentials$/)?.conclusion !== "success";
+}
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
@@ -62,9 +93,11 @@ const statusOf = (exec: Exec, repo: string, id: number): string =>
     .status;
 
 /**
- * Cancels every nightly run nightlyToCancel selects and waits until each has
- * completed, up to `within`. A run that ends before the cancel reaches it is
- * fine; one still going at the bound fails the gate: it would share rl-a.
+ * Cancels every nightly run nightlyToCancel selects, and waits a few minutes
+ * at most: CANCEL_WAIT_MS for each to end on its own, then a force-cancel and
+ * FORCE_WAIT_MS more; one still going then fails the gate (it would share
+ * rl-a). Then reads each ended run's jobs: `reset` is true when one issued
+ * credentials and its R26 revoke did not succeed (needsReset).
  */
 export async function preempt(o: {
   exec: Exec;
@@ -72,9 +105,8 @@ export async function preempt(o: {
   ownRun: number;
   now?: () => number;
   wait?: (ms: number) => Promise<unknown>;
-  within?: number;
   log?: (s: string) => void;
-}): Promise<number[]> {
+}): Promise<{ cancelled: number[]; reset: boolean }> {
   const now = o.now ?? Date.now;
   const wait = o.wait ?? ((ms: number) => delay(ms));
   const log = o.log ?? ((s: string) => console.log(s));
@@ -89,35 +121,64 @@ export async function preempt(o: {
   const targets = nightlyToCancel(runs, o);
   if (!targets.length) {
     log("preempt: no red-line nightly is going");
-    return [];
+    return { cancelled: [], reset: false };
   }
-  for (const t of targets) {
+  const post = (id: number, what: "cancel" | "force-cancel") => {
     const r = o.exec("gh", [
       "api",
       "-X",
       "POST",
-      `repos/${o.repo}/actions/runs/${t.id}/cancel`,
+      `repos/${o.repo}/actions/runs/${id}/${what}`,
     ]);
     // 409: the run ended before the cancel reached it.
-    if (r.code !== 0 && statusOf(o.exec, o.repo, t.id) !== "completed")
+    if (r.code !== 0 && statusOf(o.exec, o.repo, id) !== "completed")
       throw new Error(
-        `preempt: could not cancel nightly run ${t.id}: ${r.stderr.trim() || `exit ${r.code}`}`,
+        `preempt: could not ${what} nightly run ${id}: ${r.stderr.trim() || `exit ${r.code}`}`,
       );
-    log(`preempt: cancelled nightly run ${t.id} (${t.status})`);
-  }
-  const end = now() + (o.within ?? PREEMPT_WAIT_MS);
-  for (const t of targets) {
+  };
+  const ended = async (id: number, within: number): Promise<boolean> => {
+    const end = now() + within;
     for (;;) {
-      if (statusOf(o.exec, o.repo, t.id) === "completed") break;
-      if (now() >= end)
-        throw new Error(
-          `preempt: nightly run ${t.id} is still going ${Math.round((o.within ?? PREEMPT_WAIT_MS) / 60_000)} min after the cancel; not starting beside it on rl-a`,
-        );
+      if (statusOf(o.exec, o.repo, id) === "completed") return true;
+      if (now() >= end) return false;
       await wait(POLL_MS);
     }
-    log(`preempt: nightly run ${t.id} has ended`);
+  };
+  for (const t of targets) {
+    post(t.id, "cancel");
+    log(`preempt: cancelled nightly run ${t.id} (${t.status})`);
   }
-  return targets.map((t) => t.id);
+  let reset = false;
+  for (const t of targets) {
+    if (!(await ended(t.id, CANCEL_WAIT_MS))) {
+      post(t.id, "force-cancel");
+      log(
+        `preempt: nightly run ${t.id} still going after ${CANCEL_WAIT_MS / 60_000} min: force-cancelled`,
+      );
+      if (!(await ended(t.id, FORCE_WAIT_MS)))
+        throw new Error(
+          `preempt: nightly run ${t.id} is still going after a force-cancel; not starting beside it on rl-a`,
+        );
+    }
+    const jobs = (
+      JSON.parse(
+        gh(o.exec, [
+          "api",
+          `repos/${o.repo}/actions/runs/${t.id}/jobs?per_page=100`,
+        ]),
+      ) as { jobs: Job[] }
+    ).jobs;
+    if (needsReset(jobs)) {
+      reset = true;
+      log(
+        `preempt: nightly run ${t.id} issued credentials and its rl-a revoke did not succeed: the gate revokes rl-a first`,
+      );
+    } else
+      log(
+        `preempt: nightly run ${t.id} has ended, rl-a revoked or never touched`,
+      );
+  }
+  return { cancelled: targets.map((t) => t.id), reset };
 }
 
 const realExec: Exec = (cmd, args) => {
@@ -148,5 +209,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const ownRun = Number(flag(argv, "run"));
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isInteger(ownRun))
     throw new Error("usage: redline-preempt.ts --repo owner/name --run <id>");
-  await preempt({ exec: realExec, repo, ownRun });
+  const r = await preempt({ exec: realExec, repo, ownRun });
+  // The redline job reads it: a reset revokes rl-a before its bring-up.
+  if (process.env.GITHUB_OUTPUT)
+    appendFileSync(process.env.GITHUB_OUTPUT, `reset=${r.reset}\n`);
 }

@@ -51,6 +51,9 @@ import {
 // case shares a person, an artifact or a rate-limit bucket with another.
 
 const C = SMOKE_CASES["smoke/standing.test.ts"];
+/** Bounds of the two readiness polls (run.within polls every POLL_MS on the run's clock). */
+const OTP_WITHIN_MS = 15_000;
+const SEARCH_WITHIN_MS = 30_000;
 const name = (i: number) => (C[i] as string).slice("rl-a > ".length);
 const env = process.env;
 let T: Targets;
@@ -237,20 +240,21 @@ describe("rl-a", () => {
       throw new Error(
         `code request: status ${r.status}, ${pending.length} pending cookie(s)`,
       );
-    // Delivery runs after the response: poll the code for up to 10 s.
+    // Delivery runs after the response: the otp hook says when the code is
+    // there (no_code until then), polled on the run's own clock (run.within).
     let code: string | undefined;
-    for (let i = 0; i < 10 && !code; i++) {
+    await run.within(OTP_WITHIN_MS, "the code delivery", async () => {
       try {
         const out = (await hookCall(A.app, key, "/__test/otp/latest", {
           email: p.email,
         })) as { code?: unknown };
         if (typeof out?.code === "string" && out.code) code = out.code;
+        return code !== undefined;
       } catch (e) {
         if (!(e instanceof HookRefused) || e.reason !== "no_code") throw e;
-        await new Promise((res) => setTimeout(res, 1_000));
+        return false;
       }
-    }
-    if (!code) throw new Error("no code was sent within 10 s");
+    });
     const headers = new Headers(codeRequestReq(A, p.email).headers);
     headers.set("cookie", pending.join("; "));
     const v = take(
@@ -300,16 +304,20 @@ describe("rl-a", () => {
       if (typeof id !== "string" || typeof version !== "number")
         throw new Error("MCP publish_artifact: no id or version");
       ids.push(id);
-      let found = false;
-      for (let i = 0; i < 15 && !found; i++) {
-        const s = await okTool(A.app, p.pat, "search_artifacts", { q: marker });
-        found = ((s.items as { id?: unknown }[] | undefined) ?? []).some(
-          (x) => x.id === id,
-        );
-        if (!found) await new Promise((r) => setTimeout(r, 2_000));
-      }
-      if (!found)
-        throw new Error("search did not find the MCP publish within 30 s");
+      // Indexing can lag the publish: search until it lists the page, on the
+      // run's own clock (run.within).
+      await run.within(
+        SEARCH_WITHIN_MS,
+        "search finds the MCP publish",
+        async () => {
+          const s = await okTool(A.app, p.pat, "search_artifacts", {
+            q: marker,
+          });
+          return ((s.items as { id?: unknown }[] | undefined) ?? []).some(
+            (x) => x.id === id,
+          );
+        },
+      );
       // A signed upload from the app address, published as the next version.
       const path = "upload.md";
       const bytes = new TextEncoder().encode(`# ${marker}\n`);

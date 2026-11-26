@@ -152,12 +152,20 @@ jobs:
   # every step after the first is skipped; the job still runs, so the jobs
   # after it never see a skipped dependency. Its `actions: write` is why the
   # callers grant it (a called job can't hold more than its caller gives).
+  #
+  # Bounded to a few minutes (scripts/ci/redline-preempt.ts): a cancelled
+  # nightly gets 2 min to end, then a force-cancel and 1 min more, else the
+  # gate fails. When the nightly had issued credentials and its R26 revoke did
+  # not succeed, `reset` is true and the redline job revokes rl-a itself
+  # before its bring-up: rl-a is never used in an unknown state.
   preempt:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 50
+    timeout-minutes: 10
+    outputs:
+      reset: ${{ steps.preempt-run.outputs.reset }}
     steps:
       - id: gate
         name: Is this a release gate
@@ -187,7 +195,8 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
-      - name: Cancel a running nightly and wait for it to end
+      - id: preempt-run
+        name: Cancel a running nightly and wait for it to end
         if: steps.gate.outputs.gate == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -531,7 +540,7 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/t19-recipient" "$RUNNER_TEMP/t19-sealed"
   redline:
-    needs: platform-tags
+    needs: [preempt, platform-tags]
     runs-on: ubuntu-latest
     environment: redline-staging
     # The OIDC principal (4.4): this job only, never the workflow. `actions:
@@ -665,6 +674,15 @@ jobs:
           if jq -e '.scripts.smoke' tests/redline/package.json > /dev/null; then
             pnpm --filter @oa/redline smoke sweep-start
           fi
+      # After a preempted nightly whose R26 revoke did not succeed: revoke
+      # rl-a first (rotates its hook key, revokes every red-line PAT), so the
+      # bring-up below starts from a known rl-a.
+      - id: reset-rl-a
+        name: Revoke rl-a after a preempted nightly left it unrevoked
+        if: needs.preempt.outputs.reset == 'true'
+        env:
+          REDLINE_SIDES: a
+        run: pnpm --filter @oa/redline provisioning revoke
       - id: bringup
         name: Upgrade rl-a (and rl-b in the nightly) to the tag (R5) and take this run's credentials (R26)
         env:
@@ -867,21 +885,22 @@ jobs:
           # As at bring-up.
           REDLINE_SIDES: ${{ inputs.suite == 'full' && 'ab' || 'a' }}
         run: pnpm --filter @oa/redline provisioning revoke
-      # The smoke's fresh install was purged in the background since the
-      # suite ended (src/smoke.ts spawnPurge); this prints how that went.
-      # Never fails the gate. A purge that failed or is still running leaves
-      # rl-n-<run> for a person to remove (its log says which).
+      # The smoke's fresh install is purged, and leftovers swept, in detached
+      # processes (src/smoke.ts spawnPurge, spawnSweep). The gate never waits
+      # for them: this prints what they have logged so far, waits for
+      # nothing and never fails. If the job's end cuts one off, the next gate
+      # or nightly run's sweep removes what it left (rl-n-* older than 2 h).
       - id: smoke-purge
-        name: The smoke's fresh install is purged, and leftovers swept (never fails the gate)
+        name: The smoke's background purge and sweep, as far as they got (waits for nothing)
         if: always() && steps.mint.outcome == 'success'
         continue-on-error: true
-        timeout-minutes: 12
+        timeout-minutes: 2
         env:
           REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
         run: |
           set -euo pipefail
           if [ -d "$REDLINE_SMOKE_DIR" ]; then
-            pnpm --filter @oa/redline smoke purge-wait
+            pnpm --filter @oa/redline smoke purge-report
           fi
       - name: Remove the secret files
         if: always()

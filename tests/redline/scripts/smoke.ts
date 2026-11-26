@@ -1,7 +1,8 @@
 // The red-line smoke, the blocking release check (src/smoke.ts):
 //   node --experimental-strip-types scripts/smoke.ts             the two tracks
 //   node --experimental-strip-types scripts/smoke.ts purge       (detached) the purge
-//   node --experimental-strip-types scripts/smoke.ts purge-wait  the purge's and sweep's result
+//   node --experimental-strip-types scripts/smoke.ts purge-report what they logged so far, no wait
+//   node --experimental-strip-types scripts/smoke.ts purge-wait  the purge's and sweep's result (by hand)
 //   node --experimental-strip-types scripts/smoke.ts sweep-start the leftover sweep, detached
 //   node --experimental-strip-types scripts/smoke.ts sweep       (detached) the sweep
 // The first runs vitest once on vitest.smoke.config.ts (track 1 and track 2
@@ -10,9 +11,10 @@
 // detached process and exits with vitest's code: the purge never holds or
 // fails the gate. sweep-start (the workflow's step after the OIDC mint, in
 // every gate and nightly run) starts the delete and purge of rl-n-* installs
-// older than 2 h the same way, so a failed purge never piles up. purge-wait
-// (the step before the secret files go) waits for both, prints their logs,
-// and exits 1 only when one did not end well.
+// older than 2 h the same way, so a failed purge never piles up. The gate
+// never waits for either: purge-report (the step before the secret files go)
+// prints what they logged so far and exits 0. Cut off by the job's end, a
+// purge leaves its install to the next run's sweep.
 // Needs REDLINE_TARGETS, REDLINE_RELEASE, REDLINE_RUN_ID and REDLINE_SMOKE_DIR.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -43,6 +45,15 @@ async function main(): Promise<number> {
     console.log(
       "smoke: the sweep of leftover rl-n installs started in the background",
     );
+    return 0;
+  }
+  // The gate's report: what the detached purge and sweep have logged so far,
+  // waiting for nothing and never failing. They run on past this step until
+  // the job ends; whatever they leave, the next run's sweep removes.
+  if (cmd === "purge-report") {
+    const dir = smokeDir(env);
+    await purgeWait(dir, { within: 0 });
+    await sweepWait(dir, { within: 0 });
     return 0;
   }
   if (cmd === "purge-wait") {
