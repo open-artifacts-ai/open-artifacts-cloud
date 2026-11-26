@@ -258,9 +258,8 @@ const abortableSleep =
 /**
  * The public ledger claim for one key, one ledger per key (#24: a claim told
  * to stop while it waits never takes the slot it was waiting for). The
- * options are a test seam (ledger root, clock, sleep). From public #3200 the
- * ledger never waits (a full key throws HookBudgetError at once), so `sleep`
- * is read only before it (src/hook-ledger-compat.ts).
+ * options are a test seam (ledger root, clock, sleep). The wait for room is
+ * computed from the key's window (src/hook-ledger-compat.ts claimSuiteSlot).
  */
 export const ledgerClaimWith =
   (o: Pick<ClaimOpts, "root" | "now" | "sleep"> = {}): Claim =>

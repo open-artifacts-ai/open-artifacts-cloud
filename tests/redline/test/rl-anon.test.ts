@@ -14,9 +14,7 @@ import { InfraError } from "../src/fetch-timeout.ts";
 import {
   claimSuiteSlot,
   HOOK_WINDOW_MS,
-  HookBudgetError,
   hookWindowCount,
-  ledgerWaits,
   SUITE_HOOK_LIMIT,
 } from "../src/hook-ledger-compat.ts";
 import { LOCK_DIR_ENV, withLock } from "../src/locks.ts";
@@ -481,142 +479,79 @@ describe("wait budget follow-ups (cloud #24)", () => {
       expect(taken).toEqual([]);
     });
 
-    it.runIf(ledgerWaits)(
-      "the ledger claim stops waiting on abort and leaves the ledger as it was",
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
-        try {
-          let now = 1_000_000;
-          // The ledger for tok:ip is full: a new claim has to sleep.
-          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
-            await claimSuiteSlot("rl-anon/tok:ip", { root, now: () => now });
-          expect(
-            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-          ).toBe(SUITE_HOOK_LIMIT);
-          let wake: () => void = () => {};
-          const claim = ledgerClaimWith({
-            root,
-            now: () => now,
-            sleep: () => new Promise<void>((r) => (wake = r)),
-          });
-          const c = new AbortController();
-          const pending = claim("tok:ip", c.signal);
-          c.abort();
-          await expect(pending).rejects.toThrow(
-            /aborted before a slot was taken/,
-          );
-          // The window passes and the underlying sleep ends: a claim that kept
-          // going would now take a slot for the request that was never sent.
-          now += HOOK_WINDOW_MS + 1_000;
-          wake();
-          await new Promise((r) => setImmediate(r));
-          expect(
-            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-          ).toBe(0);
-          // An already aborted signal never claims at all.
-          await expect(claim("tok:ip", c.signal)).rejects.toThrow(
-            /aborted before a slot was taken/,
-          );
-          expect(
-            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-          ).toBe(0);
-          // And without a signal it claims as before.
-          await claim("tok:ip");
-          expect(
-            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-          ).toBe(1);
-        } finally {
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-    );
-
-    // From public #3200 the ledger never waits: a full key is refused at
-    // once, takes no slot, and an abort still stops a claim before it starts.
-    it.runIf(!ledgerWaits)(
-      "a full key's ledger claim is refused at once and leaves the ledger as it was",
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
-        try {
-          let now = 1_000_000;
-          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
-            await claimSuiteSlot("rl-anon/tok:ip", { root, now: () => now });
-          const count = () =>
-            hookWindowCount("rl-anon/tok:ip", { root, now: () => now });
-          expect(count()).toBe(SUITE_HOOK_LIMIT);
-          let slept = 0;
-          const claim = ledgerClaimWith({
-            root,
-            now: () => now,
-            sleep: async () => void slept++,
-          });
-          await expect(claim("tok:ip")).rejects.toBeInstanceOf(HookBudgetError);
-          expect(slept).toBe(0);
-          expect(count()).toBe(SUITE_HOOK_LIMIT);
-          // An already aborted signal never claims at all.
-          const c = new AbortController();
-          c.abort();
-          now += HOOK_WINDOW_MS + 1_000;
-          await expect(claim("tok:ip", c.signal)).rejects.toThrow(
-            /aborted before a slot was taken/,
-          );
-          expect(count()).toBe(0);
-          // And once the window has passed it claims as before.
-          await claim("tok:ip");
-          expect(count()).toBe(1);
-        } finally {
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-    );
+    it("the ledger claim stops waiting on abort and leaves the ledger as it was", async () => {
+      const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
+      try {
+        let now = 1_000_000;
+        // The ledger for tok:ip is full: a new claim has to sleep.
+        for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+          await claimSuiteSlot("rl-anon/tok:ip", { root, now: () => now });
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(SUITE_HOOK_LIMIT);
+        let wake: () => void = () => {};
+        const claim = ledgerClaimWith({
+          root,
+          now: () => now,
+          sleep: () => new Promise<void>((r) => (wake = r)),
+        });
+        const c = new AbortController();
+        const pending = claim("tok:ip", c.signal);
+        c.abort();
+        await expect(pending).rejects.toThrow(
+          /aborted before a slot was taken/,
+        );
+        // The window passes and the underlying sleep ends: a claim that kept
+        // going would now take a slot for the request that was never sent.
+        now += HOOK_WINDOW_MS + 1_000;
+        wake();
+        await new Promise((r) => setImmediate(r));
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
+        // An already aborted signal never claims at all.
+        await expect(claim("tok:ip", c.signal)).rejects.toThrow(
+          /aborted before a slot was taken/,
+        );
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(0);
+        // And without a signal it claims as before.
+        await claim("tok:ip");
+        expect(
+          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+        ).toBe(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("1b. an aborted claim leaves no timer armed", () => {
-    it.runIf(ledgerWaits)(
-      "the claim's own sleep timer is cleared on abort",
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
-        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-        try {
-          const now = () => 1_000_000;
-          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
-            await claimSuiteSlot("rl-anon/tok:ip", { root, now });
-          // No sleep seam: the default timer, which has to be cleared.
-          const claim = ledgerClaimWith({ root, now });
-          const c = new AbortController();
-          const pending = claim("tok:ip", c.signal);
-          expect(vi.getTimerCount()).toBe(1);
-          c.abort();
-          await expect(pending).rejects.toThrow(/aborted before a slot/);
-          expect(vi.getTimerCount()).toBe(0);
-        } finally {
-          vi.useRealTimers();
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-    );
-
-    it.runIf(!ledgerWaits)(
-      "a full key's claim arms no timer at all",
-      async () => {
-        const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
-        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-        try {
-          const now = () => 1_000_000;
-          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
-            await claimSuiteSlot("rl-anon/tok:ip", { root, now });
-          const claim = ledgerClaimWith({ root, now });
-          const c = new AbortController();
-          await expect(claim("tok:ip", c.signal)).rejects.toBeInstanceOf(
-            HookBudgetError,
-          );
-          expect(vi.getTimerCount()).toBe(0);
-        } finally {
-          vi.useRealTimers();
-          rmSync(root, { recursive: true, force: true });
-        }
-      },
-    );
+    it("the claim's own sleep timer is cleared on abort", async () => {
+      const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const now = () => 1_000_000;
+        for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+          await claimSuiteSlot("rl-anon/tok:ip", { root, now });
+        // No sleep seam: the default timer, which has to be cleared.
+        const claim = ledgerClaimWith({ root, now });
+        const c = new AbortController();
+        const pending = claim("tok:ip", c.signal);
+        // The wait's timer is armed once the full ledger is read (from public
+        // #3200 that is a turn of the microtask queue later): no clock passes.
+        for (let i = 0; i < 100 && vi.getTimerCount() === 0; i++)
+          await Promise.resolve();
+        expect(vi.getTimerCount()).toBe(1);
+        c.abort();
+        await expect(pending).rejects.toThrow(/aborted before a slot/);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("2. hooks get a budget per phase, not one per file", () => {

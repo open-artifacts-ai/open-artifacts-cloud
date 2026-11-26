@@ -257,34 +257,47 @@ export const HOOK_KEY_WITHIN_MS = 90_000;
  * user, session or state touched), and a wrong key gets the bare 404 (audit
  * "denied", under "unknown", so the guard's session denied-row count is
  * unaffected). Each call takes a slot of the install's hook ledger
- * (`pace`), so the polls count against the same budget as the suite's.
+ * (`pace`, on the run's own clock), so the polls count against the same
+ * budget as the suite's; a full budget waits for room, up to the deadline.
+ * The InfraError says how long it waited and how many checks it sent.
  */
 export async function waitHookKey(
   run: Run,
   app: string,
   key: string,
   pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
-    claimSuiteSlot(a, { deadline }),
+    claimSuiteSlot(a, {
+      deadline,
+      now: () => run.io.now(),
+      sleep: (ms) => run.io.wait(ms),
+    }),
   within: number = HOOK_KEY_WITHIN_MS,
 ): Promise<void> {
   // One deadline for the whole wait: a ledger claim gives up at it, and each
   // request is cut off at it, so the total never runs past `within`.
-  const deadline = run.io.now() + within;
-  const fail = () =>
+  const t0 = run.io.now();
+  const deadline = t0 + within;
+  let sends = 0;
+  const fail = (why = "hooks answer 404 on a key mismatch") =>
     new InfraError(
-      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 (hooks answer 404 on a key mismatch)`,
+      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 ` +
+        `(${why}; waited ${((run.io.now() - t0) / 1000).toFixed(1)} s, ${sends} key check${sends === 1 ? "" : "s"} sent)`,
     );
   for (;;) {
     if (deadline - run.io.now() <= 0) throw fail();
     try {
       await pace(app, deadline);
     } catch (e) {
-      if (e instanceof HookBudgetError) throw fail();
+      if (e instanceof HookBudgetError)
+        throw fail(
+          `the hook budget had no room before the deadline: ${e.message}`,
+        );
       throw e;
     }
     const left = deadline - run.io.now();
     if (left <= 0) throw fail();
     try {
+      sends++;
       const res = await run.io.fetch(`${app}/__test/key_check`, {
         method: "POST",
         redirect: "manual",
