@@ -56,6 +56,39 @@ export function cloudPackages(root: string, dirs: string[]): string[] {
   return dirs.filter((d) => !tracked.has(`${d}/package.json`)).sort();
 }
 
+const UNTIL = /#.*\buntil (v\d+\.\d+\.\d+)\b/;
+/** Known lines that carry "# until vX.Y.Z", with that tag. */
+export function untilLines(text: string): { entry: string; until: string }[] {
+  return text.split("\n").flatMap((l) => {
+    const m = UNTIL.exec(l);
+    const entry = l.split("#")[0].trim();
+    return m && entry ? [{ entry, until: m[1] }] : [];
+  });
+}
+/**
+ * The public release in the overlay tree: the root package.json version (the
+ * overlay keeps public's root package.json; PUBLIC_PIN is not copied), as
+ * vX.Y.Z, or undefined.
+ */
+function pinTag(root: string): string | undefined {
+  try {
+    const v = JSON.parse(readFileSync(join(root, "package.json"), "utf8"))
+      .version as unknown;
+    return typeof v === "string" && /^\d+\.\d+\.\d+$/.test(v)
+      ? `v${v}`
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+/** a >= b for vX.Y.Z tags. */
+export function newerOrSame(a: string, b: string): boolean {
+  const n = (t: string) => t.slice(1).split(".").map(Number);
+  const [x, y] = [n(a), n(b)];
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return true;
+}
+
 export function check(root: string): {
   log: string[];
   lines: string[];
@@ -67,7 +100,20 @@ export function check(root: string): {
   const publicKnown = parseKnown(
     readFileSync(join(root, PUBLIC_KNOWN), "utf8"),
   );
-  const cloudKnown = parseKnown(readFileSync(join(root, CLOUD_KNOWN), "utf8"));
+  const cloudText = readFileSync(join(root, CLOUD_KNOWN), "utf8");
+  // A line ending "# until vX.Y.Z" is needed only while the tree's public
+  // release (the root package.json version) is older than
+  // that release (public changed the read in it). From that pin on it is
+  // dropped from the baseline with a warning to delete it, so the same file
+  // holds across the pin transition (pin-bump/* is protected; no hand port).
+  // Every other stale line still exits 1 (#135).
+  const pin = pinTag(root);
+  const retired = untilLines(cloudText).filter(
+    (u) => pin !== undefined && newerOrSame(pin, u.until),
+  );
+  const cloudKnown = parseKnown(cloudText).filter(
+    (l) => !retired.some((u) => u.entry === l),
+  );
   const known = [...publicKnown, ...cloudKnown];
   const out = report(findings, known, false);
   // report() words every stale line around public's file; name the cloud one.
@@ -89,6 +135,10 @@ export function check(root: string): {
     log: [
       `workspace-reads (overlay): ${files.length} source files, ${pkgs.length} packages, ${findings.length} cross-package read(s), ${known.length} known`,
       `checked cloud packages: ${cloud.filter((d) => seen.has(d)).join(" ")}`,
+      ...retired.map(
+        (u) =>
+          `::warning file=${CLOUD_KNOWN}::"${u.entry}" is retired at ${u.until} (pin ${pin}); delete the line`,
+      ),
     ],
     lines,
     code: out.code,
