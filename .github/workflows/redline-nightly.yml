@@ -1,4 +1,4 @@
-# The nightly red-line run (#1137): the latest release's own suite, once per
+# The nightly red-line run (#1137): the latest release's own long suite, once per
 # release, so idle nights use nothing. It skips while any red-line run is going
 # and until staging runs the release. A run's result is the workflow's own
 # record: no session watches it. Red keeps one `blocker` issue open, and green
@@ -75,6 +75,9 @@ jobs:
     with:
       tag: ${{ needs.pick.outputs.tag }}
       t19_full: true
+      # The long red-line suite: since cloud #264 step 2 the gate runs the
+      # smoke, and the checks the red-line page moved to nightly run here.
+      suite: full
     # By name, never inherit: only the four secrets the callee declares
     # (on.workflow_call.secrets). Undeclared, a called run's jobs got none
     # (t19-dry-run 43183209806); the t19 job references none of them.

@@ -399,7 +399,7 @@ describe("redline-staging.yml", () => {
       readFileSync(join(root, "tests/redline/package.json"), "utf8"),
     ).scripts;
     expect(Object.keys(scripts)).toEqual(
-      expect.arrayContaining(["live", "provisioning"]),
+      expect.arrayContaining(["live", "provisioning", "smoke"]),
     );
     expect(text).toContain("playwright test -c playwright.staging.config.ts");
     expect(
@@ -483,6 +483,81 @@ describe("redline-staging.yml", () => {
     expect(t2.prod).toBeUndefined();
   });
 
+  describe("the gate runs the smoke, the nightly the long suite (cloud #264 step 2)", () => {
+    const suite = () => named("Run the suite");
+    // Runs the step with a stub pnpm that prints its arguments, in a dir
+    // holding the tag's tests/redline/package.json (with or without smoke).
+    const go = (SUITE: string, scripts: Record<string, string>) => {
+      const d = mkdtempSync(join(tmpdir(), "rl-suite-"));
+      mkdirSync(join(d, "bin"));
+      mkdirSync(join(d, "tests/redline"), { recursive: true });
+      writeFileSync(
+        join(d, "tests/redline/package.json"),
+        JSON.stringify({ scripts }),
+      );
+      writeFileSync(join(d, "bin/pnpm"), '#!/bin/sh\necho "pnpm $*"\n', {
+        mode: 0o755,
+      });
+      const r = spawnSync("bash", ["-c", String(suite().run)], {
+        cwd: d,
+        env: {
+          PATH: `${join(d, "bin")}:${process.env.PATH}`,
+          RUNNER_TEMP: d,
+          SUITE,
+        },
+        encoding: "utf8",
+      });
+      rmSync(d, { recursive: true, force: true });
+      return r;
+    };
+    const both = { live: "x", smoke: "y" };
+
+    it("a gate run (no suite input) runs the smoke; the nightly's full runs the long suite", () => {
+      expect(suite().env.SUITE).toBe("${{ inputs.suite }}");
+      expect(w.on.workflow_call.inputs.suite).toEqual({
+        type: "string",
+        required: false,
+        default: "smoke",
+      });
+      // A gate dispatch can't pick the suite.
+      expect(w.on.workflow_dispatch.inputs.suite).toBeUndefined();
+      expect(go("", both).stdout.trim()).toBe("pnpm --filter @oa/redline smoke");
+      expect(go("smoke", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline smoke",
+      );
+      expect(go("full", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline live",
+      );
+    });
+
+    it("a tag cut before the smoke runs its own long suite as the gate, with a warning", () => {
+      const r = go("", { live: "x" });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("::warning title=red-line smoke::");
+      expect(r.stdout.trim().split("\n").at(-1)).toBe(
+        "pnpm --filter @oa/redline live",
+      );
+    });
+
+    it("any other suite fails before anything runs", () => {
+      const r = go("everything", both);
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain("suite must be smoke or full");
+      expect(r.stdout).not.toContain("pnpm");
+    });
+
+    it("the smoke's purge report runs always after the revoke, never fails the run, and its dir is removed", () => {
+      const p = named("smoke-purge");
+      expect(p["continue-on-error"]).toBe(true);
+      expect(p.if).toBe("always() && steps.mint.outcome == 'success'");
+      expect(p.run).toContain("pnpm --filter @oa/redline smoke purge-wait");
+      expect(p.env.REDLINE_SMOKE_DIR).toBe(suite().env.REDLINE_SMOKE_DIR);
+      expect(named("Remove the secret files").run).toContain(
+        '"$RUNNER_TEMP/redline-smoke"',
+      );
+    });
+  });
+
   it("mints the staging audiences, brings rl-a and rl-b up, mints prod's after bring-up, then the suite", () => {
     expect(named("mint").run).toBe(
       "pnpm --filter @oa/redline provisioning mint-oidc provisioning stagingInventory",
@@ -559,12 +634,14 @@ describe("redline-staging.yml", () => {
       for (const s of t19Steps) expect(s["continue-on-error"]).toBeUndefined();
       // The soft steps of the workflow are the redline job's seal and its two
       // uploads; a missing key fails the t19 job (its wait step) AND the redline
-      // job's last step, so the run still fails.
+      // job's last step, so the run still fails. The smoke's purge report is
+      // soft too: cleanup never fails the gate (cloud #264 step 2).
       const soft = steps.filter((s) => s["continue-on-error"]);
       expect(soft.map((s) => s.id)).toEqual([
         "t19-key",
         "handoff-up",
         "marker-up",
+        "smoke-purge",
       ]);
       const t19 = t19Named("t19");
       // T19 itself runs only after the key was opened: no key, no T19, and
@@ -1394,23 +1471,27 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       at((s) => s.with?.name === "redline-report"),
       at((s) => s.id === "t19-done"),
       at((s) => (s.run ?? "").includes("provisioning revoke")),
+      at((s) => s.id === "smoke-purge"),
       at((s) => s.name === "Remove the secret files"),
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
-    // The job ends with the revoke and the file removal, both always, then the
-    // check that the hand-off happened (so neither is skipped by its failure).
-    expect(steps.slice(-3).map((s) => s.name)).toEqual([
+    // The job ends with the revoke, the smoke's purge report (it needs the
+    // OIDC file, so before the removal) and the file removal, all always,
+    // then the check that the hand-off happened (so none is skipped by its
+    // failure).
+    expect(steps.slice(-4).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
+      "The smoke's fresh install is purged (never fails the gate)",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
     ]);
-    expect(steps.at(-3)?.if).toBe(
+    expect(steps.at(-4)?.if).toBe(
       "always() && steps.mint.outcome == 'success'",
     );
     expect(steps.at(-2)?.if).toBe("always()");
     expect(steps.at(-2)?.run).toBe(
-      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
+      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-smoke" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
     );
     expect(
       steps.filter((s) => (s.run ?? "").includes("@oa/provision build")),

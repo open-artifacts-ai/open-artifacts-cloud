@@ -1,5 +1,14 @@
-# The red-line suite (P5) and the provisioning probes (design v7 12.2) against
-# staging, on demand, for one release tag. The redline job mints GitHub OIDC
+# The red-line release gate against staging, on demand, for one release tag.
+# A gate run (workflow_dispatch, as the staging release chain starts it) runs
+# the red-line smoke (cloud #264 step 2, tests/redline/src/smoke.ts): a
+# brand-new install at the tag beside rl-a after its upgrade, about twelve
+# cases with no locks, pacing or lanes, plus T19's @gate set. The long suite
+# (P5) and the provisioning probes (design v7 12.2) run only in the nightly
+# (redline-nightly.yml calls this file with suite: full); they never block a
+# release. A tag cut before the smoke has no smoke script and runs its own
+# long suite as the gate, as before.
+#
+# The redline job mints GitHub OIDC
 # JWTs (the staging Provisioning API's and both inventories' audiences, 4.4 and
 # 6.3) into 0600 files under RUNNER_TEMP, upgrades rl-a and rl-b to the tag
 # through the staging API (R5) at the same time and takes this run's rl-a and
@@ -87,6 +96,13 @@ on:
         type: string
         required: false
         default: ""
+      # The nightly passes full: the long red-line suite instead of the smoke.
+      # Unset (a gate dispatch can't set it, workflow_dispatch has no such
+      # input) or smoke: the smoke, the release gate. Anything else fails.
+      suite:
+        type: string
+        required: false
+        default: smoke
       # The nightly and the dry run pass true: T19 runs every spec. Unset (a gate
       # dispatch can't set it, workflow_dispatch has no such input) it runs only
       # the specs tagged @gate, the short happy path that blocks a release.
@@ -677,6 +693,10 @@ jobs:
           fi
       - name: Run the suite
         env:
+          # The smoke for a gate run, the long suite for the nightly (above).
+          SUITE: ${{ inputs.suite }}
+          # The smoke's fresh install and its background purge (src/smoke.ts).
+          REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
           REDLINE_STG_INVENTORY_URL: ${{ vars.REDLINE_STG_INVENTORY_URL }}
           REDLINE_DELETED_HOSTS: ${{ vars.REDLINE_DELETED_HOSTS }}
           REDLINE_PROD_ACCOUNT_ID: ${{ vars.REDLINE_PROD_ACCOUNT_ID }}
@@ -694,7 +714,18 @@ jobs:
           set -euo pipefail
           export REDLINE_REPORT="$RUNNER_TEMP/redline-report/report.json"
           mkdir -p "$RUNNER_TEMP/redline-report"
-          pnpm --filter @oa/redline live
+          case "${SUITE:-smoke}" in
+            full) pnpm --filter @oa/redline live ;;
+            smoke)
+              if jq -e '.scripts.smoke' tests/redline/package.json > /dev/null; then
+                pnpm --filter @oa/redline smoke
+              else
+                echo "::warning title=red-line smoke::this tag has no smoke: its long suite is the gate"
+                pnpm --filter @oa/redline live
+              fi
+              ;;
+            *) echo "suite must be smoke or full"; exit 1 ;;
+          esac
       # Artifacts are not masked: a secret echoed into a report stops the upload.
       - id: scan-suite
         name: No secret in the red-line report
@@ -752,9 +783,25 @@ jobs:
       - name: Revoke this run's R26 credentials
         if: always() && steps.mint.outcome == 'success'
         run: pnpm --filter @oa/redline provisioning revoke
+      # The smoke's fresh install was purged in the background since the
+      # suite ended (src/smoke.ts spawnPurge); this prints how that went.
+      # Never fails the gate. A purge that failed or is still running leaves
+      # rl-n-<run> for a person to remove (its log says which).
+      - id: smoke-purge
+        name: The smoke's fresh install is purged (never fails the gate)
+        if: always() && steps.mint.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 12
+        env:
+          REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
+        run: |
+          set -euo pipefail
+          if [ -f "$REDLINE_SMOKE_DIR/fresh.json" ]; then
+            pnpm --filter @oa/redline smoke purge-wait
+          fi
       - name: Remove the secret files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
+        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-smoke" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
       # The last step, so the revoke and the file removal above have run. A run
       # whose key was never handed over (a partial re-run of only this job, a
       # seal or upload that failed) has no T19 result: it is never green.

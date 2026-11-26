@@ -263,6 +263,8 @@ describe("redline-nightly.yml", () => {
       tag: "${{ needs.pick.outputs.tag }}",
       // The nightly runs every dashboard spec; a gate run only the @gate ones.
       t19_full: true,
+      // The long red-line suite: a gate run runs the smoke (cloud #264 step 2).
+      suite: "full",
     });
     expect(j.permissions).toEqual({
       contents: "read",
