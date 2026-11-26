@@ -94,8 +94,7 @@ const world = (o: World = {}) => {
       return json({ tag_name: o.latest ?? TAG });
     if (path.includes("/commits/")) return json({ sha: o.tagSha ?? SHA });
     const jobsOf = /\/actions\/runs\/(\d+)\/jobs/.exec(path);
-    if (jobsOf?.[1] === "122")
-      return json({ jobs: o.releaseJobs ?? [GUARD] });
+    if (jobsOf?.[1] === "122") return json({ jobs: o.releaseJobs ?? [GUARD] });
     if (jobsOf) {
       const r = publishRuns.find((p) => String(p.id) === jobsOf[1]);
       if (!r) throw new Error(`no run ${jobsOf[1]}`);
@@ -346,13 +345,18 @@ describe("after hosted-release: the staging deploy starts beside the copy", () =
     // after #469: its hosted-built job names v0.98.0
     skipped(
       afterRelease({
-        releaseJobs: [GUARD, { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" }],
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" },
+        ],
       }),
     );
   });
   it("skips a run whose guard did not pass (it built nothing)", () => {
     skipped(
-      afterRelease({ releaseJobs: [{ name: "hosted-guard", conclusion: "skipped" }] }),
+      afterRelease({
+        releaseJobs: [{ name: "hosted-guard", conclusion: "skipped" }],
+      }),
     );
   });
   // The v0.246.1 recovery (run 45728492094): a dispatch on main's newer head
@@ -388,7 +392,9 @@ describe("after hosted-release: the staging deploy starts beside the copy", () =
     );
     expect(
       r.calls.some((c) =>
-        c.includes(`repos/${REPO}/actions/runs/122/jobs?filter=latest&per_page=100`),
+        c.includes(
+          `repos/${REPO}/actions/runs/122/jobs?filter=latest&per_page=100`,
+        ),
       ),
     ).toBe(true);
   });
@@ -403,7 +409,10 @@ describe("after hosted-release: the staging deploy starts beside the copy", () =
     expect(() =>
       afterRelease({
         tagSha: OLD,
-        releaseJobs: [GUARD, { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" }],
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" },
+        ],
       }),
     ).toThrow(/built v0\.99\.0 at a+, but v0\.99\.0 is at b+/);
     // two markers
@@ -425,7 +434,10 @@ describe("after hosted-release: the staging deploy starts beside the copy", () =
   it("a failed hosted-built job names nothing: the guard's rule decides", () => {
     expect(
       afterRelease({
-        releaseJobs: [GUARD, { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "failure" }],
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "failure" },
+        ],
       }),
     ).toEqual({ go: true, next: "deploy", tag: TAG });
   });
@@ -548,6 +560,36 @@ describe("after the staging deploy: the gate waits for the staging copy", () => 
         ],
       }),
     );
+  });
+  it("the newest copy decides: a newer failed copy keeps the gate shut over an older success", () => {
+    for (const conclusion of ["failure", "cancelled"]) {
+      const p = afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      });
+      skipped(p);
+      expect(JSON.stringify(p), conclusion).toContain("staging copy");
+    }
+    // a newer success after an older failure opens it
+    expect(
+      afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [COPIED] },
+          { id: 123, jobs: [{ ...COPIED, conclusion: "failure" }] },
+        ],
+      }).go,
+    ).toBe(true);
+    // a newer run that skipped the copy is passed over
+    expect(
+      afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion: "skipped" }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      }).go,
+    ).toBe(true);
   });
   it("a manual publish's copy does not count", () => {
     skipped(

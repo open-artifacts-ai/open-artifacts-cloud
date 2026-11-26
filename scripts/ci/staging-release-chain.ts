@@ -36,8 +36,9 @@
 //     the release App's bot as actor). A manual deploy, a verify_only run, a
 //     partial-target run or a prod run has no `sc` chain id and never starts
 //     the gate; this chain's deploy takes the workflow's default targets. It
-//     starts the gate once a hosted-publish run (event workflow_run, on main)
-//     has a successful `publish-staging release <tag>` job;
+//     starts the gate once the newest hosted-publish run (event
+//     workflow_run, on main) that ran `publish-staging release <tag>` ran it
+//     successfully: a newer failed copy keeps it shut over an older success;
 //   - the tag is the newest release (releases/latest);
 //   - never twice: no run of the target workflow for that tag exists, in any
 //     state (a failed one waits for a person), checked in `plan` and again in
@@ -194,11 +195,13 @@ export function chainDeployGreen(o: {
 }
 
 /**
- * The staging copy of the tag succeeded: a hosted-publish run started by
- * hosted-release (event workflow_run, on main) has a successful
- * `publish-staging release <tag>` job. That run may still be going (stage-prod
- * follows the copy). Newest run first; a copy job for the tag that has not
- * finished stops the scan, since its run's end is the next event.
+ * The staging copy of the tag succeeded: the newest hosted-publish run started
+ * by hosted-release (event workflow_run, on main) that ran the
+ * `publish-staging release <tag>` job decides. Its job succeeded: copied (the
+ * run may still be going, stage-prod follows the copy). It failed or was
+ * cancelled: not copied, whatever an older run did, so a newer failed copy
+ * keeps the gate shut. It has not finished: not yet, since its run's end is
+ * the next event. A run that skipped the job, or has none, is passed over.
  */
 export function stagingCopied(o: {
   exec: Exec;
@@ -231,13 +234,16 @@ export function stagingCopied(o: {
         "api",
         "-X",
         "GET",
-        `repos/${o.repo}/actions/runs/${r.id}/jobs?per_page=100`,
+        `repos/${o.repo}/actions/runs/${r.id}/jobs?filter=latest&per_page=100`,
       ]),
     ) as { jobs?: { name?: string; conclusion?: string | null }[] };
     if (!Array.isArray(jobs.jobs)) throw new Error("unparsable run jobs");
-    const mine = jobs.jobs.filter((j) => j.name === name);
-    if (mine.some((j) => j.conclusion === "success")) return true;
-    if (mine.some((j) => j.conclusion == null)) return false;
+    const ran = jobs.jobs.filter(
+      (j) => j.name === name && j.conclusion !== "skipped",
+    );
+    if (ran.length === 0) continue;
+    // The newest run that ran the copy decides: every attempt there green.
+    return ran.every((j) => j.conclusion === "success");
   }
   return false;
 }
@@ -376,7 +382,9 @@ export function plan(o: {
     if (!built) return skip("the run built no release: no release cut");
     const latest = latestRelease(o.exec, o.repo, o.sleep);
     if (built.tag !== latest)
-      return skip(`the run built ${built.tag}, not the newest release ${latest}`);
+      return skip(
+        `the run built ${built.tag}, not the newest release ${latest}`,
+      );
     next = "deploy";
     tag = latest;
   } else if (file === WORKFLOW_DIR + "hosted-publish.yml") {
