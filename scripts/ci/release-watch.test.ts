@@ -1818,13 +1818,18 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
     startedAt: D(a),
     completedAt: D(b),
   });
-  const run = (wake: "success" | "failure" | "cancelled" | "skipped"): Run => ({
+  const run = (
+    wake: "success" | "failure" | "cancelled" | "skipped",
+    job: "success" | "failure" = wake === "success" || wake === "skipped"
+      ? "success"
+      : "failure",
+  ): Run => ({
     id: RUN,
     path: ".github/workflows/deploy-hosted-platform.yml",
     event: "workflow_dispatch",
     title: "deploy-hosted-platform prod v0.251.0 [c45820247442-1]",
     status: "completed",
-    conclusion: wake === "skipped" ? "failure" : wake,
+    conclusion: wake === "cancelled" ? "cancelled" : job,
     headSha: "c".repeat(40),
     createdAt: D("12:33:28"),
     startedAt: D("12:33:28"),
@@ -1836,7 +1841,7 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
     jobs: [
       {
         name: "deploy",
-        conclusion: wake === "skipped" ? "failure" : wake,
+        conclusion: wake === "cancelled" ? "cancelled" : job,
         steps: [
           st(
             "Read the fleet finish of earlier releases",
@@ -1848,7 +1853,7 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
             "The tag's scheduler takes the fleet wake",
             "12:37:16",
             "12:37:17",
-            wake === "skipped" ? "failure" : "success",
+            wake === "skipped" ? "skipped" : "success",
           ),
           st(FLEET_WAKE_STEP, "12:37:17", "12:37:17", wake),
         ],
@@ -1891,7 +1896,7 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
     expect(notifyOf(run("success"))).toEqual([]);
   });
 
-  for (const wake of ["failure", "cancelled", "skipped"] as const)
+  for (const wake of ["failure", "cancelled"] as const)
     it(`a ${wake} wake fails the deploy, anchors no fleet start, and is a failed-stage comment with --failed`, () => {
       expect(fleetStep([run(wake)])).toEqual({
         wakeFailed: run(wake),
@@ -1914,6 +1919,46 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
         `- Run: [${RUN}](https://github.com/o/c/actions/runs/${RUN}), failed. It is a release workflow, so rerun only its failed jobs (AGENTS.md): open the run and choose "Re-run failed jobs", or \`gh run rerun ${RUN} --failed -R o/c\`.`,
       );
     });
+
+  it("a wake skipped on purpose on a green deploy (an older tag, a partial target list): done at the run's end, no alert", () => {
+    // Without the old wait, the run ends right after the skipped wake.
+    const r = { ...run("skipped", "success"), updatedAt: D("12:37:20") };
+    expect(fleetStep([r])).toEqual({ fleet: { state: "none" } });
+    const t = tlOf(r);
+    expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+      state: "done",
+      endedAt: D("12:37:20"),
+      minutes: 3.9,
+    });
+    expect(t.stages.find((x) => x.name === "fleet")?.state).toBe("unmeasured");
+    expect(t.e2eTo).toBe(NO_FLEET);
+    // No failed-stage alert, and no rerun advice: there is no failed job.
+    expect(notifyOf(r)).toEqual([]);
+    // The same skip on the replay's 12.1 min run: only a finished-past-limit
+    // note ("finished green, nothing to rerun"), never a failed stage.
+    const slow = notifyOf(run("skipped", "success"));
+    expect(slow.map((o) => o.kind)).toEqual(["finished"]);
+    expect(commentBody(slow[0] as Overrun, "o/c", config)).toContain(
+      "finished green, nothing to rerun.",
+    );
+  });
+
+  it("a wake skipped because the job failed before it: the run's own failure is the one alert", () => {
+    const r = run("skipped", "failure");
+    expect(fleetStep([r]).wakeFailed).toBeUndefined();
+    const t = tlOf(r);
+    expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+      state: "red",
+      url: URL,
+    });
+    const alerts = notifyOf(r);
+    expect(alerts.map((o) => [o.stage, o.kind, o.runId])).toEqual([
+      ["prod_deploy", "failed", RUN],
+    ]);
+    expect(commentBody(alerts[0] as Overrun, "o/c", config)).toContain(
+      `\`gh run rerun ${RUN} --failed -R o/c\``,
+    );
+  });
 
   it("a later run of the tag that woke the fleet wins over an earlier failed wake", () => {
     const failed = run("failure");

@@ -435,7 +435,7 @@ export function fleetStep(
 ): {
   fleet: Step;
   deployEnd?: string;
-  /** A run whose "Wake the fleet" failed, was cancelled or was skipped, when none woke it. */
+  /** A run whose "Wake the fleet" failed or was cancelled, when none woke it. */
   wakeFailed?: Run;
 } {
   let deployEnd: string | undefined;
@@ -446,18 +446,18 @@ export function fleetStep(
     for (const j of r.jobs ?? []) {
       const by = (n: string) => j.steps?.find((x) => x.name === n);
       // A successful "Wake the fleet" anchors the fleet's start and the
-      // deploy's end. One that failed, was cancelled or was skipped fails
-      // the deploy (cloud #495) and anchors nothing. The wait and "Fleet
-      // done" steps are only in runs before #495; the wait anchors only a
-      // run with no wake step at all.
+      // deploy's end. One that failed or was cancelled fails the deploy
+      // (cloud #495) and anchors nothing. One skipped on purpose (an older
+      // tag with no queue consumer, a partial target list) anchors nothing
+      // and raises nothing on its own: if the job failed before it, the
+      // run's own failure says so. The wait and "Fleet done" steps are only
+      // in runs before #495; the wait anchors only a run with no wake step.
       const wake = by(FLEET_WAKE_STEP);
       const wait = by(FLEET_WAIT_STEP);
       const fin = by(FLEET_DONE_STEP);
       if (
         wake &&
-        (wake.conclusion === "failure" ||
-          wake.conclusion === "cancelled" ||
-          wake.conclusion === "skipped")
+        (wake.conclusion === "failure" || wake.conclusion === "cancelled")
       ) {
         wakeFailed = wakeFailed ?? r;
         continue;
@@ -636,8 +636,8 @@ function groups(tag: string, runs: Run[]): Record<string, Run[]> {
  * Pure: the prod deploy and the fleet. Once a successful "Wake the fleet" has
  * started, the deploy's own work is done (every step before it succeeded), so
  * the deploy ends there; before cloud #495 the run then waited for the fleet.
- * A wake that failed, was cancelled or was skipped fails the deploy (#495),
- * unless another run of the tag woke the fleet.
+ * A wake that failed or was cancelled fails the deploy (#495), unless another
+ * run of the tag woke the fleet; a skipped one leaves the run's own state.
  */
 function prodSteps(
   prodRuns: Run[],
@@ -645,8 +645,8 @@ function prodSteps(
 ): { prod_deploy: Step; fleet: Step } {
   const base = step(prodRuns);
   const { fleet, deployEnd, wakeFailed } = fleetStep(prodRuns, late);
-  // The wake failed, was cancelled or was skipped, and no run woke the
-  // fleet: the deploy failed (a release workflow, rerun its failed jobs).
+  // The wake failed or was cancelled, and no run woke the fleet: the deploy
+  // failed (a release workflow, rerun its failed jobs).
   if (!deployEnd && wakeFailed)
     return {
       prod_deploy: {
