@@ -12,12 +12,16 @@
 //   - Red-line: the final `Red-line report (...)` block (src/report.ts
 //     formatReport) lists `  [fail] <name> (<reason>)` under `Not pass:`. The
 //     file comes from vitest's `FAIL  live/<file> > <name>` lines in the same
-//     log. Only `fail` and `infra` count: `blocked` follows another case.
+//     log. Only `fail` counts: `infra` is the environment, not the test, and
+//     `blocked` follows another case.
 // A failure outside the tests (bring-up, a hand-off, platform-tags) parses to
 // no test and is only listed in the step summary.
 //
-// One issue per test. The issue body carries `<!-- flaky-key: K -->` (K is a
-// hash of the test id) and `<!-- flaky-seen: ... -->`, one entry per sighting
+// One issue per test, keyed on the test's identity only (suite, file and
+// title), never on its error text. When more than MAX_ISSUES_PER_RUN tests
+// failed in one run, the attempt was broken rather than flaky: one summary
+// issue lists them instead. The issue body carries `<!-- flaky-key: K -->` (K
+// is a hash of the test id) and `<!-- flaky-seen: ... -->`, one entry per sighting
 // (time, run/attempt). A run already in the list is never noted twice. When
 // the test has failed in two different runs in the last 7 days, the issue and
 // the comment say "fails twice in 7 days". The owner is the last author of the
@@ -47,6 +51,10 @@ export const T19_PACKAGE = "apps/dashboard";
 export const REDLINE_DIR = "tests/redline";
 export const WINDOW_DAYS = 7;
 export const TWICE_NOTE = "fails twice in 7 days";
+/** More distinct tests than this in one run: one summary issue, no per-test ones. */
+export const MAX_ISSUES_PER_RUN = 5;
+/** Tests named in a summary issue; the rest are counted. */
+const SUMMARY_LIST_MAX = 50;
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const TITLE_RE = /^redline-staging (v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
 
@@ -92,19 +100,23 @@ export function parsePlaywright(log: string): Failure[] {
   return dedupe(out);
 }
 
-/** Drops ` (<reason>)` from a `Not pass:` entry: the last balanced group. */
-export function stripReason(rest: string): string {
-  if (!rest.endsWith(")")) return rest;
-  let depth = 0;
-  for (let i = rest.length - 1; i >= 0; i--) {
-    if (rest[i] === ")") depth++;
-    else if (rest[i] === "(" && --depth === 0)
-      return rest[i - 1] === " " ? rest.slice(0, i - 1) : rest;
-  }
-  return rest;
+/**
+ * The case name of a `Not pass:` entry (`<name> (<reason>)`) that vitest's FAIL
+ * lines don't name. The reason is redacted and cut (src/report.ts MAX_REASON),
+ * so its parens may not balance: never read it. A module error is
+ * `<file>: module error`; any other name is cut at the first ` (` after its
+ * last ` > `, so no error text can reach the test's key.
+ */
+export function caseName(rest: string): string {
+  const mod = /^(live\/\S+\.test\.ts): module error(?: \(|$)/.exec(rest);
+  if (mod) return `${mod[1]}: module error`;
+  const gt = rest.lastIndexOf(" > ");
+  const from = gt < 0 ? 0 : gt + 3;
+  const cut = rest.indexOf(" (", from);
+  return cut < 0 ? rest : rest.slice(0, cut);
 }
 
-/** The red-line cases the final report lists as fail or infra. */
+/** The red-line cases the final report lists as fail (never infra). */
 export function parseRedline(log: string): Failure[] {
   const lines = logLines(log).map((l) => l.replace(LANE, ""));
   const files = new Map<string, string>();
@@ -127,18 +139,18 @@ export function parseRedline(log: string): Failure[] {
       continue;
     }
     if (!inNotPass) continue;
-    const m = /^ {2}\[(fail|infra)\] (.+)$/.exec(l);
+    const m = /^ {2}\[fail\] (.+)$/.exec(l);
     if (!m) continue;
-    const rest = (m[2] as string).trimEnd();
+    const rest = (m[1] as string).trimEnd();
     const name =
       names.find((n) => rest === n || rest.startsWith(`${n} (`)) ??
-      stripReason(rest);
+      caseName(rest);
     const file =
       files.get(name) ??
       /^(live\/\S+\.test\.ts): module error$/.exec(name)?.[1];
     out.push({
       suite: "redline",
-      id: `redline:${name}`,
+      id: `redline:${file ?? ""}:${name}`,
       title: name,
       ...(file ? { file } : {}),
     });
@@ -206,6 +218,18 @@ export function issueTitle(f: Failure): string {
   return t.length > 240 ? `${t.slice(0, 237)}...` : t;
 }
 
+/**
+ * `s` as an inline code span no backtick in it can end early, so a mention or
+ * an issue ref in a test title stays inert text: the fence is one backtick
+ * longer than the longest run inside, padded when `s` starts or ends with one.
+ */
+export function codeSpan(s: string): string {
+  const longest = Math.max(0, ...(s.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
+  return `${fence}${pad}${s}${pad}${fence}`;
+}
+
 export function newIssueBody(o: {
   f: Failure;
   run: RunInfo;
@@ -225,8 +249,8 @@ export function newIssueBody(o: {
     `<!-- flaky-key: ${keyOf(f.id)} -->`,
     `A ${f.suite === "t19" ? "T19" : "red-line"} test failed on attempt ${s.attempt} of redline-staging ${run.tag} and the same run passed on attempt ${run.attempt}, with the same commit and tag. Nothing changed between the attempts, so the test is flaky.`,
     "",
-    `Test: \`${f.title}\``,
-    `File: \`${o.ownerPath}\``,
+    `Test: ${codeSpan(f.title)}`,
+    `File: ${codeSpan(o.ownerPath)}`,
     `Last author of the file at ${run.tag}: ${owner}`,
     "",
     `First failure: ${runLink(run, s.attempt)}`,
@@ -463,7 +487,47 @@ function ensureLabel(exec: Exec, repo: string) {
   );
 }
 
-export type Done = { action: Action["kind"]; id: string; issue?: number };
+export type Done = {
+  action: Action["kind"] | "summary";
+  id: string;
+  issue?: number;
+};
+
+/** The marker of a run's summary issue, so a rerun of the tracker opens one. */
+export const summaryMarker = (runId: number) =>
+  `<!-- flaky-summary: ${runId} -->`;
+
+/** One issue for a run whose earlier attempt failed too many tests to file. */
+export function summaryIssue(
+  run: RunInfo,
+  tests: { f: Failure; sighting: Sighting }[],
+): { title: string; body: string } {
+  const attempts = [...new Set(tests.map((t) => t.sighting.attempt))].sort(
+    (a, b) => a - b,
+  );
+  const list = tests
+    .slice(0, SUMMARY_LIST_MAX)
+    .map(
+      (t) =>
+        `- ${t.f.suite === "t19" ? "T19" : "red-line"}: ${codeSpan(t.f.title)}${t.f.file ? ` in ${codeSpan(t.f.file)}` : ""}`,
+    );
+  const more = tests.length - list.length;
+  return {
+    title: `Flaky: ${tests.length} tests failed on redline-staging ${run.tag} run ${run.runId}, then passed`,
+    body: [
+      summaryMarker(run.runId),
+      `${tests.length} tests failed on attempt ${attempts.join(", ")} of redline-staging ${run.tag} and the same run passed on attempt ${run.attempt}, with the same commit and tag. More than ${MAX_ISSUES_PER_RUN} at once usually means the attempt itself was broken (an outage, a bad bring-up), not that each test is flaky, so no issue was opened or bumped per test.`,
+      "",
+      ...attempts.map((a) => `Failed attempt: ${runLink(run, a)}`),
+      `Passed on: ${runLink(run, run.attempt)}`,
+      "",
+      ...list,
+      ...(more > 0 ? [`- and ${more} more`] : []),
+      "",
+      "Look at the failed attempt. If it was the environment, close this issue. If some of these tests are flaky on their own, they get their own issue the next time they flake in a smaller set.",
+    ].join("\n"),
+  };
+}
 
 function listOpen(exec: Exec, repo: string): Issue[] {
   return JSON.parse(
@@ -493,6 +557,40 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   if (!found.length) return { done: [], notes };
   ensureLabel(exec, run.repo);
   const done: Done[] = [];
+  const tests = plan(found, []).flatMap((a) =>
+    a.kind === "create" ? [{ f: a.f, sighting: a.seen[0] as Sighting }] : [],
+  );
+  if (tests.length > MAX_ISSUES_PER_RUN) {
+    const marker = summaryMarker(run.runId);
+    const had = listOpen(exec, run.repo).find((i) => i.body.includes(marker));
+    if (had) {
+      done.push({
+        action: "skip",
+        id: `summary:${run.runId}`,
+        issue: had.number,
+      });
+      return { done, notes };
+    }
+    const { title, body } = summaryIssue(run, tests);
+    gh(
+      exec,
+      [
+        "issue",
+        "create",
+        "--repo",
+        run.repo,
+        "--title",
+        title,
+        "--body",
+        body,
+        "--label",
+        LABEL,
+      ],
+      { write: true },
+    );
+    done.push({ action: "summary", id: `summary:${run.runId}` });
+    return { done, notes };
+  }
   // One sighting per test, then a fresh list of the open issues right before
   // each write. Tracker runs are not serialized (a shared concurrency group
   // would let a newer event cancel a pending one), so another run may have

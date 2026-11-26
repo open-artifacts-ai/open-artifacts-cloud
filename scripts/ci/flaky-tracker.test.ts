@@ -8,8 +8,11 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
   bumpedBody,
+  caseName,
+  codeSpan,
   type Failure,
   keyOf,
+  MAX_ISSUES_PER_RUN,
   newIssueBody,
   parsePlaywright,
   parseRedline,
@@ -17,7 +20,7 @@ import {
   plan,
   type RunInfo,
   type Sighting,
-  stripReason,
+  summaryMarker,
   TWICE_NOTE,
   track,
   twiceInWindow,
@@ -90,30 +93,25 @@ describe("parsePlaywright", () => {
 });
 
 describe("parseRedline", () => {
-  it("reads the final report's fail and infra cases, with the file from vitest's FAIL lines", () => {
+  it("reads the final report's fail cases, never infra, with the file from vitest's FAIL lines", () => {
     expect(parseRedline(RL_LOG)).toEqual([
       {
         suite: "redline",
-        id: "redline:surface probes (cross-install) > org GET /api/v1/me/push/key [session]",
+        id: "redline:live/surfaces.test.ts:surface probes (cross-install) > org GET /api/v1/me/push/key [session]",
         title:
           "surface probes (cross-install) > org GET /api/v1/me/push/key [session]",
         file: "live/surfaces.test.ts",
       },
       {
         suite: "redline",
-        id: "redline:surface probes (cross-install) > org GET /api/v1/me/push/key [pat]",
+        id: "redline:live/surfaces.test.ts:surface probes (cross-install) > org GET /api/v1/me/push/key [pat]",
         title:
           "surface probes (cross-install) > org GET /api/v1/me/push/key [pat]",
         file: "live/surfaces.test.ts",
       },
       {
         suite: "redline",
-        id: "redline:guard > hooks answer",
-        title: "guard > hooks answer",
-      },
-      {
-        suite: "redline",
-        id: "redline:live/edge.test.ts: module error",
+        id: "redline:live/edge.test.ts:live/edge.test.ts: module error",
         title: "live/edge.test.ts: module error",
         file: "live/edge.test.ts",
       },
@@ -125,9 +123,49 @@ describe("parseRedline", () => {
     expect(parseRedline(T19_LOG)).toEqual([]);
   });
 
-  it("strips only the trailing balanced reason", () => {
-    expect(stripReason("a (b) > c (why (nested))")).toBe("a (b) > c");
-    expect(stripReason("a > b [pat]")).toBe("a > b [pat]");
+  it("keys a case without a FAIL line on its name only, even when the cut reason's parens don't balance", () => {
+    expect(caseName("a (b) > c (why (nested))")).toBe("a (b) > c");
+    expect(caseName("a > b [pat]")).toBe("a > b [pat]");
+    expect(caseName("a (b) > c (status 500 (body sha256:12…")).toBe(
+      "a (b) > c",
+    );
+    expect(caseName("live/x.test.ts: module error (boom (")).toBe(
+      "live/x.test.ts: module error",
+    );
+    const report = (reason: string) =>
+      [
+        "Red-line report (staging): 1 cases",
+        "Not pass:",
+        `  [fail] guard > hooks answer (${reason}`,
+        "Gate: FAIL",
+      ].join("\n");
+    const a = parseRedline(report("status 500 (body sha256:aa)"));
+    const b = parseRedline(report("timeout after 30s (lane front; cut…"));
+    expect(a).toEqual([
+      {
+        suite: "redline",
+        id: "redline::guard > hooks answer",
+        title: "guard > hooks answer",
+      },
+    ]);
+    expect(b).toEqual(a);
+  });
+
+  it("keys a case with a FAIL line on its file and name, whatever the reason says", () => {
+    const report = (reason: string) =>
+      [
+        fail("org GET /x [pat]"),
+        "Red-line report (staging): 1 cases",
+        "Not pass:",
+        `  [fail] surface probes (cross-install) > org GET /x [pat] (${reason}`,
+        "Gate: FAIL",
+      ].join("\n");
+    const a = parseRedline(report("expected allowed (the probe))"));
+    const b = parseRedline(report("got 500 (cut"));
+    expect(a[0]?.id).toBe(
+      "redline:live/surfaces.test.ts:surface probes (cross-install) > org GET /x [pat]",
+    );
+    expect(b).toEqual(a);
   });
 });
 
@@ -204,6 +242,23 @@ describe("grouping and the 7-day note", () => {
     expect(parseSeen(b)).toEqual([at("2026-11-24T00:00:00Z", 1), s900]);
   });
 
+  it("puts a title with backticks, mentions and refs in a code span it can't leave", () => {
+    expect(codeSpan("plain @gate #12")).toBe("`plain @gate #12`");
+    expect(codeSpan("a ` @someone #1 `` b")).toBe("```a ` @someone #1 `` b```");
+    expect(codeSpan("`x`")).toBe("`` `x` ``");
+    const evil: Failure = { ...f, title: "x` @someone #1 `y" };
+    const b = newIssueBody({
+      f: evil,
+      run,
+      seen: [s900],
+      owner: null,
+      ownerPath: "apps/dashboard/e2e/a`b.spec.ts",
+      nowMs: NOW,
+    });
+    expect(b).toContain("Test: ``x` @someone #1 `y``");
+    expect(b).toContain("File: ``apps/dashboard/e2e/a`b.spec.ts``");
+  });
+
   it("names an owner it can't assign in plain text, never as a mention", () => {
     const b = bodyWith([s900]);
     expect(b).toContain("someone (named only");
@@ -219,6 +274,7 @@ function fakeGh(o: {
   assignable?: boolean;
   labelExists?: boolean;
   pinFails?: boolean;
+  log?: string;
 }) {
   let lists = 0;
   const calls: Call[] = [];
@@ -249,7 +305,7 @@ function fakeGh(o: {
           ],
         }),
       );
-    if (a.includes("actions/jobs/2/logs")) return ok(T19_LOG);
+    if (a.includes("actions/jobs/2/logs")) return ok(o.log ?? T19_LOG);
     if (a.startsWith("label list"))
       return ok(JSON.stringify(o.labelExists ? [{ name: "flaky" }] : []));
     if (a.startsWith("issue list"))
@@ -368,6 +424,77 @@ describe("track", () => {
       { action: "create", id: expect.stringContaining("joins.spec.ts") },
       { action: "bump", id: second.id, issue: 9 },
     ]);
+  });
+});
+
+describe("the per-run cap", () => {
+  const many = (n: number) =>
+    [
+      `  ${n} failed`,
+      ...Array.from(
+        { length: n },
+        (_, i) =>
+          `    [rl-a] › e2e/staging/rl-a/t${i}.spec.ts:1:1 › case ${i} @gate`,
+      ),
+    ].join("\n");
+
+  it(`opens one issue per test at ${MAX_ISSUES_PER_RUN}`, () => {
+    const g = fakeGh({ labelExists: true, log: many(MAX_ISSUES_PER_RUN) });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done.filter((d) => d.action === "create")).toHaveLength(
+      MAX_ISSUES_PER_RUN,
+    );
+  });
+
+  it("opens one summary issue, and no per-test issue or bump, past the cap", () => {
+    const g = fakeGh({
+      labelExists: true,
+      log: many(50),
+      open: [
+        {
+          number: 5,
+          body: `<!-- flaky-key: ${keyOf("t19:e2e/staging/rl-a/t0.spec.ts:case 0 @gate")} -->\n<!-- flaky-seen: 2026-11-22T00:00:00Z 700/1 -->`,
+        },
+      ],
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toEqual([{ action: "summary", id: "summary:900" }]);
+    const writes = g.calls.filter(
+      (c) => c.args[0] === "issue" && c.args[1] !== "list",
+    );
+    expect(writes).toHaveLength(1);
+    const body = writes[0]?.args[writes[0].args.indexOf("--body") + 1] ?? "";
+    expect(body).toContain(summaryMarker(900));
+    expect(body).toContain("50 tests failed on attempt 1");
+    expect(body).toContain("/runs/900/attempts/1");
+    expect(body).toContain("`case 49 @gate`");
+  });
+
+  it("opens the summary once, when a rerun of the tracker finds it open", () => {
+    const g = fakeGh({
+      labelExists: true,
+      log: many(6),
+      open: [{ number: 11, body: `${summaryMarker(900)}\nsix tests` }],
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toEqual([{ action: "skip", id: "summary:900", issue: 11 }]);
+    expect(g.calls.some((c) => c.args[1] === "create")).toBe(false);
+  });
+
+  it("never counts infra cases toward the cap or files them", () => {
+    const log = [
+      "Red-line report (staging): 9 cases",
+      "Not pass:",
+      ...Array.from(
+        { length: 8 },
+        (_, i) => `  [infra] bus > c${i} (no answer)`,
+      ),
+      "  [fail] guard > real (boom)",
+      "Gate: FAIL",
+    ].join("\n");
+    const g = fakeGh({ labelExists: true, log });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toEqual([{ action: "create", id: "redline::guard > real" }]);
   });
 });
 
