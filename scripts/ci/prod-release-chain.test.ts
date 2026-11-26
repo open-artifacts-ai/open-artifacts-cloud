@@ -977,7 +977,9 @@ describe("the gate's neutral skips", () => {
     expect(r.body).toContain("release_unpublished");
     // Creates with no version are refused too: the platform runs the tag.
     expect(r.body).toContain("new signups included");
-    expect(r.body).toContain("dispatch hosted-publish.yml on main with env prod");
+    expect(r.body).toContain(
+      "dispatch hosted-publish.yml on main with env prod",
+    );
     expect(r.body).toContain("Publish run: https://x/publish");
     expect(r.body).toContain("Publish step: the dispatched run failed");
     expect(r.body).toContain("Deploy run: https://x/deploy");
