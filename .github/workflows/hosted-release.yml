@@ -200,10 +200,12 @@ jobs:
             done
             echo "tag $TAG reads back at $SHA"
           fi
-          # Retry only the verify-tag "doesn't exist" error, and look for a
-          # release first each time so a partial success never duplicates one.
-          attempt=1
-          while :; do
+          # The tag read back above, but another API replica can still miss it
+          # (cloud #124), so retry the verify-tag "doesn't exist" error once, at
+          # once: no pause (cloud #264). Look for a release first each time so a
+          # partial success never duplicates one. A second miss fails the run;
+          # on a push run, release-retry reruns this job on that failure event.
+          for attempt in 1 2; do
             if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
               echo "release $TAG already exists"
               break
@@ -214,9 +216,7 @@ jobs:
               break
             fi
             echo "$out"
-            if [[ "$out" == *"doesn't exist"* ]] && [ "$attempt" -lt 5 ]; then
-              attempt=$((attempt + 1))
-              sleep $((attempt * 2))
+            if [[ "$out" == *"doesn't exist"* ]] && [ "$attempt" = 1 ]; then
               continue
             fi
             echo "::error::could not create release $TAG"

@@ -137,7 +137,7 @@ describe("release-retry", () => {
     expect(chain).toContain("Dispatch the prod publish and wait for its run");
   });
 
-  it("backs off, then reruns only the failed jobs with an App token narrowed to actions, and never checks out code", () => {
+  it("reruns only the failed jobs at once on the failure event, with an App token narrowed to actions, and never checks out code", () => {
     const job = wf.jobs.retry;
     expect(job.environment).toBe("release-app");
     expect(job.permissions).toEqual({ issues: "write" });
@@ -157,7 +157,8 @@ describe("release-retry", () => {
     expect(rerun?.run).toContain(
       'gh run rerun "$RUN_ID" --failed --repo "$REPO"',
     );
-    expect(rerun?.run).toMatch(/sleep 30; else sleep 120/);
+    // Event-driven (cloud #264): the failure event starts the rerun, no pause.
+    for (const s of steps) expect(s.run ?? "").not.toMatch(/\bsleep\b/);
     for (const s of steps) expect(s.run ?? "").not.toMatch(/--job/);
     expect(job["timeout-minutes"]).toBeGreaterThanOrEqual(3);
   });

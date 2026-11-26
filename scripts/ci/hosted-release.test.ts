@@ -713,17 +713,21 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       expect(total).toBeGreaterThanOrEqual(60);
       expect(total).toBeLessThan(75);
     });
-    it("release create retries on 'doesn't exist', then succeeds once", () => {
+    it("release create retries once, at once, on 'doesn't exist', then succeeds", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
         sha: X,
-        createFailsTimes: 2,
+        createFailsTimes: 1,
       });
       expect(r.status, r.out).toBe(0);
-      expect(r.calls.match(/^release create/gm)?.length).toBe(3);
+      expect(r.calls.match(/^release create/gm)?.length).toBe(2);
+      // No pause between the tries (cloud #264): the tag read back once, so
+      // nothing is slept after it.
+      const afterReadBack = r.calls.slice(r.calls.indexOf("release view"));
+      expect(afterReadBack).not.toMatch(/^sleep /m);
     });
-    it("release create gives up after a bounded number of tries", () => {
+    it("release create gives up after its one retry, and fails the run", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
@@ -731,7 +735,9 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         createFailsTimes: 99,
       });
       expect(r.status).toBe(1);
-      expect(r.calls.match(/^release create/gm)?.length).toBe(5);
+      expect(r.out).toContain("could not create release v1.2.3");
+      expect(r.calls.match(/^release create/gm)?.length).toBe(2);
+      expect(r.calls).not.toMatch(/^sleep /m);
     });
     it("a release that already exists is never created again", () => {
       const r = runCreate({

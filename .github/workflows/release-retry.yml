@@ -5,8 +5,10 @@
 # staging-release-chain, deploy-hosted-platform and prod-release-chain
 # (redline-staging has its own, redline-retry.yml, retried once).
 # A failed run on main gets its FAILED jobs rerun (gh run rerun --failed), at
-# most twice: after 30 s when attempt 1 fails, after 120 s when attempt 2
-# fails. Attempt 3 is never retried: red there waits for a person. Not a whole
+# most twice: at once on the failure event of attempt 1, and at once on the
+# failure event of attempt 2. No pause before a rerun: the failure event is
+# the trigger, never a clock. Attempt 3 is never retried: red there waits for
+# a person, and the #428 note below is the alert. Not a whole
 # rerun: these are release steps, not test runs (AGENTS.md's whole-rerun rule
 # is for CI, so a flake can't hide). A whole hosted-release rerun re-runs
 # hosted-attach-staging, which refuses ("the release already has staging
@@ -57,7 +59,7 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-actions: write
-      - name: Back off, then rerun the failed jobs
+      - name: Rerun the failed jobs
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
@@ -65,8 +67,6 @@ jobs:
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
-          # A pause before the rerun, not a test wait: outages last minutes.
-          if [ "$ATTEMPT" = 1 ]; then sleep 30; else sleep 120; fi
           gh run rerun "$RUN_ID" --failed --repo "$REPO"
           echo "reran the failed jobs of run $RUN_ID (attempt $((ATTEMPT + 1)))"
       - name: Note it on the tracking issue
