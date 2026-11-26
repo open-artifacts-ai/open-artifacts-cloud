@@ -48,6 +48,7 @@ interface Block {
   send_email?: { name?: string; destination_address?: string }[];
   observability?: { enabled?: boolean };
   services?: { binding?: string; service?: string; entrypoint?: string }[];
+  queues?: { consumers?: { queue?: unknown }[] };
   ratelimits?: {
     name: string;
     namespace_id: string | number;
@@ -123,6 +124,17 @@ export function committedSignups(
 ): string | null {
   const v = block(src, env).vars?.SIGNUPS_ENABLED;
   return v === undefined ? null : fillVar("SIGNUPS_ENABLED", v, env, values);
+}
+
+/**
+ * The queues the env block consumes, sorted (cloud #264: the scheduler's
+ * oa-<p>-fleet-wake). The deploy creates a declared one when absent, so the
+ * consumer has a queue to attach to; a tag that declares none wants none.
+ */
+export function committedConsumers(src: string, env: Env): string[] {
+  return (block(src, env).queues?.consumers ?? [])
+    .map((c) => String(c.queue ?? ""))
+    .sort();
 }
 
 /** The env block's rate limits, sorted by name, ids as strings. */
@@ -230,7 +242,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|observability|docs-preview",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|consumers|observability|docs-preview",
     );
     process.exit(2);
   }
@@ -247,6 +259,7 @@ if (
       out = false;
     } else if (what === "billing") out = committedBilling(src, env);
     else if (what === "login") out = committedLogin(src, env);
+    else if (what === "consumers") out = committedConsumers(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";
       else {

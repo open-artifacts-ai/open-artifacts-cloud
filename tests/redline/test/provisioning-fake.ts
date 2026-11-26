@@ -129,6 +129,7 @@ export type Fault =
   | "p16_late"
   | "p22_closed_404"
   | "p23_no_row"
+  | "p23_content_mapped"
   | "p23_slug_freed"
   | "p23_cooling"
   | "p44_unlisted_redirect"
@@ -270,6 +271,8 @@ export function fakeApi(): FakeApi {
   const log: string[] = [];
   const creates: Record<string, unknown>[] = [];
   const signupAccounts = new Set<string>();
+  /** Purged installs whose content host HOSTS keeps (fault p23_content_mapped). */
+  const contentMapped = new Set<string>();
   /** Purged rows inventory lost (fault p23_no_row). */
   const noRow = new Set<string>();
   /** Suspended installs whose content host still serves (p20_content_serving). */
@@ -845,6 +848,8 @@ export function fakeApi(): FakeApi {
             if (kind === "discard" || faults.has("p23_slug_freed"))
               i.discarded = true;
             if (faults.has("p23_no_row")) noRow.add(i.id);
+            if (faults.has("p23_content_mapped") && kind === "purge")
+              contentMapped.add(i.id);
           },
         });
         return ok({ job: jobView(j, false), install: summary(i) }, 202);
@@ -1209,7 +1214,9 @@ export function fakeApi(): FakeApi {
       if (url.pathname === "/hosts") {
         const h = url.searchParams.get("host");
         const i = [...installs.values()].find(
-          (x) => live(x) && (x.appHost === h || x.contentHost === h),
+          (x) =>
+            (live(x) && (x.appHost === h || x.contentHost === h)) ||
+            (contentMapped.has(x.id) && x.contentHost === h),
         );
         return ok({ host: h, installId: i?.id ?? null, mode: i?.mode ?? null });
       }
