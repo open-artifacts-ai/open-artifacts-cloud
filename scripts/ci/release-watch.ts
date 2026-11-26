@@ -317,7 +317,8 @@ export function timeline(o: {
   }
   const last = rows[rows.length - 1];
   const doneAt = last?.state === "done" ? last.endedAt : undefined;
-  const start = o.mergedAt ?? release.publishedAt;
+  // Merge to every install is measured from the code merge only. With no
+  // merge time it stays unknown: publishing is later, so it would undercount.
   return {
     tag,
     mode,
@@ -325,7 +326,7 @@ export function timeline(o: {
     publishedAt: release.publishedAt,
     stages: rows,
     doneAt,
-    e2e: doneAt ? mins(start, doneAt) : undefined,
+    e2e: doneAt && o.mergedAt ? mins(o.mergedAt, doneAt) : undefined,
   };
 }
 

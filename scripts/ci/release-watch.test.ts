@@ -383,13 +383,14 @@ describe("timeline on the recorded chain", () => {
     expect(d.stages[1]).toMatchObject({ name: "direct_pin", state: "current" });
   });
 
-  it("with no merge time the tag stage is done but untimed", () => {
+  it("with no merge time the tag stage is done but untimed, and merge to every install stays unknown", () => {
     const now = T("19:50:00");
     const w = { ...at(now), merges: {} };
     const t = tl("v0.245.1", now, w);
     expect(row(t, "tag")).toMatchObject({ state: "done" });
     expect(row(t, "tag")?.minutes).toBeUndefined();
-    expect(t?.e2e).toBe(42.2);
+    // Never timed from the publish: that would undercount merge to every install.
+    expect(t?.e2e).toBeUndefined();
   });
 
   it("the pin subject names exactly the tag", () => {
