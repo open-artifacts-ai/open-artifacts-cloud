@@ -38,6 +38,7 @@ import {
   parseStore,
   parseVitest,
   plan,
+  QUIET_DAYS,
   RERUN_DAYS,
   type RunInfo,
   readMarkers,
@@ -1330,12 +1331,12 @@ describe("reconcile", () => {
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
     expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
-    // Created in the last 30 days and 26 hours (a rerun up to 30 days after
-    // creation, and 26 hours to list it); one
+    // Created in the last 60 days and 26 hours (a rerun up to 30 days after
+    // creation, up to 30 quiet days after it, and 26 hours of slack); one
     // page each, as neither reaches 1,000 runs.
     expect(RERUN_DAYS).toBe(30);
     const range = encodeURIComponent(
-      "2026-10-26T10:00:00Z..2026-11-26T12:00:00Z",
+      "2026-09-26T10:00:00Z..2026-11-26T12:00:00Z",
     );
     expect(lists).toHaveLength(2);
     for (const [i, file] of ["ci.yml", "redline-staging.yml"].entries()) {
@@ -1366,10 +1367,10 @@ describe("reconcile", () => {
           ),
           // Created 25 days ago: still inside GitHub's 30-day rerun period.
           row({ ...ci, id: 902 }, { created: 25 * DAY, updated: 3 * HOUR }),
-          // Created 31 days and 3 hours ago: past 30 days plus 26 hours.
+          // Created 61 days and 3 hours ago: past 60 days plus 26 hours.
           row(
             { ...ci, id: 903 },
-            { created: 31 * DAY + 3 * HOUR, updated: 3 * HOUR },
+            { created: 61 * DAY + 3 * HOUR, updated: 3 * HOUR },
           ),
           // Updated 27 hours ago: still listed, as no update window applies.
           row({ ...ci, id: 904 }, { created: 2 * DAY, updated: 27 * HOUR }),
@@ -1443,9 +1444,11 @@ describe("reconcile", () => {
       listRuns(g.exec, "o/cloud", "redline-staging", NOW).map((r) => r.id),
     ).toEqual([900]);
     expect(ranges(g.calls)).toEqual([
-      "2026-10-26T10:00:00Z..2026-11-26T12:00:00Z",
-      "2026-10-26T10:00:00Z..2026-11-10T23:00:00Z",
-      "2026-11-10T23:00:01Z..2026-11-26T12:00:00Z",
+      "2026-09-26T10:00:00Z..2026-11-26T12:00:00Z",
+      "2026-09-26T10:00:00Z..2026-10-26T23:00:00Z",
+      "2026-10-26T23:00:01Z..2026-11-26T12:00:00Z",
+      "2026-10-26T23:00:01Z..2026-11-11T05:30:00Z",
+      "2026-11-11T05:30:01Z..2026-11-26T12:00:00Z",
     ]);
   });
 
@@ -1575,12 +1578,50 @@ describe("reconcile", () => {
       "record",
     ]);
     // The reconcile read the store from the start of the whole range.
-    const since = encodeURIComponent("2026-10-26T10:00:00.000Z");
+    const since = encodeURIComponent("2026-09-26T10:00:00.000Z");
     expect(
       g.calls.some((c) =>
         c.args.join(" ").includes(`issues/3/comments?since=${since}&`),
       ),
     ).toBe(true);
+  });
+
+  it("tracks a rerun on day 29 followed by 3 quiet days", () => {
+    // Gate run 900 was created 32 days 23 hours ago; attempt 1 failed and
+    // attempt 2 passed 29 days 23 hours after creation (inside GitHub's rerun
+    // period). Its event was dropped and nothing completed for 3 days.
+    const g = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [
+          row(gate, { created: 32 * DAY + 23 * HOUR, updated: 3 * DAY }),
+        ],
+      },
+      stores: [{ number: 3, comments: [] }],
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+    expect(r.tracked[0]?.done.map((d) => d.action)).toEqual([
+      "record",
+      "record",
+    ]);
+  });
+
+  it(`keeps a rerun on the last allowed day listed through ${QUIET_DAYS} days with no event`, () => {
+    const g = fakeGh({
+      listed: {
+        "redline-staging.yml": [
+          row(gate, {
+            created: (RERUN_DAYS + QUIET_DAYS) * DAY,
+            updated: QUIET_DAYS * DAY,
+          }),
+        ],
+      },
+    });
+    expect(
+      listRuns(g.exec, "o/cloud", "redline-staging", NOW).map((r) => r.id),
+    ).toEqual([900]);
   });
 
   it("marks a run with no failed test, so later reconciles skip it", () => {

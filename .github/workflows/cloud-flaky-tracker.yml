@@ -19,11 +19,12 @@
 # No clock (cloud #264): after every completed run of the watched workflows
 # (cancelled and skipped ones aside), and on dispatch, the same job
 # reconciles: it tracks every run of the watched workflows created in the
-# last 30 days and 26 hours (GitHub allows a rerun for 30 days; the 26 hours
-# keep a late rerun listed) that passed after a failed attempt and is not in
-# the store yet, however long ago it passed (same rules, same code), so a
-# tracker run GitHub dropped is tracked by the next completion whenever that
-# comes and loses no sighting. A listing of 1,000 runs or more (GitHub's limit for one
+# last 60 days and 26 hours (GitHub allows a rerun for 30 days, and the next
+# completion may come up to 30 quiet days after it; the 26 hours are slack)
+# that passed after a failed attempt and is not in the store yet, however
+# long ago it passed (same rules, same code), so a tracker run GitHub dropped
+# is tracked by the next completion and loses no sighting. Every handled run
+# is marked in the store, so the longer range costs only the listing. A listing of 1,000 runs or more (GitHub's limit for one
 # query) is split into smaller creation ranges, and the reconcile fails if
 # one second still has that many. A run already in the store adds nothing.
 # The default token only: it reads the run's jobs and logs and the commits of

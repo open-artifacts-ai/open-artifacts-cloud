@@ -72,8 +72,9 @@
 // group, and a dropped tracker run would lose its sightings. So the same
 // job runs --reconcile right after every tracker run, on each completion of a
 // watched workflow and on dispatch, never on a clock (see reconcile()): it tracks
-// every run created within RERUN_DAYS plus RECONCILE_HOURS (GitHub allows a
-// rerun for RERUN_DAYS) that passed after a failed attempt and that the store
+// every run created within RERUN_DAYS plus QUIET_DAYS plus RECONCILE_HOURS
+// (GitHub allows a rerun for RERUN_DAYS, and the next completion may come
+// QUIET_DAYS after it) that passed after a failed attempt and that the store
 // doesn't hold yet, however long ago it passed, by the same rules and code.
 // So a dropped event is caught by the next completion whenever it comes. A
 // run whose earlier attempts hold no failed test is marked in the store too,
@@ -1400,21 +1401,28 @@ export const runFromArgs = (argv: string[]): RunInfo =>
 
 // ---- The reconcile ----
 
-/**
- * The reconcile lists runs created up to RERUN_DAYS plus this many hours ago,
- * so a rerun that passed near the end of GitHub's rerun period stays listed.
- */
+/** Slack on top of RERUN_DAYS plus QUIET_DAYS in the reconcile's range. */
 export const RECONCILE_HOURS = 26;
 /** GitHub lets a run be rerun for this many days after it was created. */
 export const RERUN_DAYS = 30;
+/**
+ * The longest stretch with no event (so no reconcile) the reconcile still
+ * covers: a run rerun on its last allowed day and then QUIET_DAYS with no
+ * completion is still listed when the next completion comes. Every handled
+ * run is marked, so listing further back costs only the listing.
+ */
+export const QUIET_DAYS = 30;
 
 /**
  * The start of the reconcile's range, in whole seconds: RERUN_DAYS plus
- * RECONCILE_HOURS ago.
+ * QUIET_DAYS plus RECONCILE_HOURS ago. A run can be rerun up to RERUN_DAYS
+ * after it was created, and the next completion may come up to QUIET_DAYS
+ * after that rerun, so the range never depends on when the next event comes
+ * within that bound.
  */
 export const reconcileFrom = (nowMs: number) =>
   Math.floor(nowMs / 1000) * 1000 -
-  RERUN_DAYS * DAY_MS -
+  (RERUN_DAYS + QUIET_DAYS) * DAY_MS -
   RECONCILE_HOURS * 3600 * 1000;
 /** list-workflow-runs returns at most this many runs for one query. */
 export const LIST_MAX = 1000;
@@ -1507,10 +1515,11 @@ export function listCreated(
 
 /**
  * A watched workflow's runs created since reconcileFrom (a run can be rerun
- * up to RERUN_DAYS after it was created) whose latest attempt (2 or later)
- * passed, however long ago it passed. No update window: a run whose event was
- * dropped stays listed until the store marks it, so catching it never depends
- * on how soon the next event comes. Whether a failure counts toward "twice in
+ * up to RERUN_DAYS after it was created, and the next completion may come
+ * QUIET_DAYS after that) whose latest attempt (2 or later) passed, however
+ * long ago it passed. No update window: a run whose event was dropped stays
+ * listed until the store marks it, so catching it does not depend on how soon
+ * the next event comes (up to QUIET_DAYS). Whether a failure counts toward "twice in
  * 7 days" is decided later, by the failed job's completion time, never by the
  * run's creation.
  */
@@ -1611,7 +1620,7 @@ function main(argv: string[]) {
     const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
     failed = r.failed;
     lines = [
-      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
+      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS + QUIET_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
     ];
