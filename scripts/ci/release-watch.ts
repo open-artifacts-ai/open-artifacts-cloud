@@ -1483,7 +1483,7 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
     "",
     `### Merge to every install, target ${c.e2e.target} min`,
     "",
-    `Measured from the merge to every install where the prod deploy recorded the fleet finish (its "${FLEET_DONE_STEP}" step), else to ${NO_FLEET}; each release says which. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
+    `Measured from the merge to every install once a later prod deploy recorded the scheduler's fleet finish ("Fleet done of earlier releases"), else to ${NO_FLEET}; each release says which. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
     "",
   );
   if (c.e2e.last20.length === 0) out.push("No finished release yet.", "");
