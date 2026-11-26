@@ -50,9 +50,15 @@
 # meanwhile gets the same blobs on its head, pushed to the branch for CI to run
 # again, unless it moved on a lockfile-sensitive path (the branch is dropped and
 # the next run regenerates). A bump whose surfaces port is not empty is what
-# pin-bump-arm leaves for a person, so it goes the PR path below instead. It
-# needs the release App as a bypass actor on main's ruleset. Unset (or anything
-# but `on`), the PR path runs exactly as before.
+# pin-bump-arm leaves for a person, so it goes the PR path below instead. Both
+# plan-direct and land wait while pin-bump-arm's release pipeline gate is shut
+# (a gate workflow queued or running, or main's pin not yet on prod and not
+# rejected), so a direct bump lands no sooner than an armed PR would.
+# land writes with its own App, never the release App: its id and key are the
+# secrets PIN_LAND_APP_ID and PIN_LAND_APP_PRIVATE_KEY in the main-only
+# Environment `pin-land`, and that App is the only bypass actor main's ruleset
+# needs. The release App (minted unnarrowed elsewhere) never moves main. Unset
+# (or anything but `on`), the PR path runs exactly as before.
 name: pin-bump
 
 on:
@@ -322,7 +328,8 @@ jobs:
   land:
     if: github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on'
     runs-on: ubuntu-latest
-    environment: release-app
+    # Its own App and Environment: the bypass actor on main's ruleset is used here only.
+    environment: pin-land
     timeout-minutes: 10
     permissions:
       contents: read
@@ -339,13 +346,14 @@ jobs:
       - id: app
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.PIN_LAND_APP_ID }}
+          private-key: ${{ secrets.PIN_LAND_APP_PRIVATE_KEY }}
           permission-contents: write
       - name: Land every staged pin that CI passed
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           READ_TOKEN: ${{ github.token }}
+          LAND_BOT: ${{ steps.app.outputs.app-slug }}[bot]
         run: node --experimental-strip-types scripts/ci/pin-bump.ts land --repo "$GITHUB_REPOSITORY"
 
   report:

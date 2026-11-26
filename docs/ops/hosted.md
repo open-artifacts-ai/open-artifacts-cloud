@@ -543,7 +543,17 @@ security find-generic-password -s oa-hosted-prod -a open-artifacts -w |
 
 ## Release App key environment (#302)
 
-The release App's `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` live in the Environment `release-app`, deployment branches `main` only (a custom branch policy that is exactly `main`). Every job that mints the token (`actions/create-github-app-token`) declares `environment: release-app`, and no other job reads those secrets; `scripts/ci/release-app-environment.test.ts` enforces both. A run from another ref fails at the branch policy before it can reach the key (a `hosted-release` dry run from a non-main ref now fails at `mirror`). Once the Environment holds both secrets, delete the repo-level copies.
+The release App's `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` live in the Environment `release-app`, deployment branches `main` only (a custom branch policy that is exactly `main`). Every job that mints the token (`actions/create-github-app-token`) declares `environment: release-app`, and no other job reads those secrets; `scripts/ci/release-app-environment.test.ts` enforces both. A run from another ref fails at the branch policy before it can reach the key (a `hosted-release` dry run from a non-main ref now fails at `mirror`). Once the Environment holds both secrets, delete the repo-level copies. The one exception is `pin-bump.yml`'s `land` job, below.
+
+## Pin land App (cloud #264)
+
+Direct-mode pin bumps (`PIN_BUMP_DIRECT=on`) fast-forward `main` from the `land` job in `pin-bump.yml`. Main's ruleset needs a bypass actor for that push, and it must not be the release App: `hosted-release.yml` mints the release App's token with no narrowed permissions, so a bypass on that App would let every release job move main. The land job uses a separate App, made for this job only:
+
+- A GitHub App, installed on this repo only, with Contents read and write and Metadata read, and nothing else.
+- Its id and private key in the secrets `PIN_LAND_APP_ID` and `PIN_LAND_APP_PRIVATE_KEY` of the Environment `pin-land`: deployment branches `main` only (a custom branch policy that is exactly `main`), admin bypass off, no required reviewer. No other job and no other Environment holds them; `scripts/ci/release-app-environment.test.ts` enforces that.
+- Main's ruleset names this App, and only this App, as its bypass actor.
+
+The land job reads with the job token and writes with this App's token (contents only). When main moved on paths that cannot touch the lockfile, it rebuilds the staged commit on main's head with this App, so a `pin-land/*` head may be this App's verified commit as well as the release bot's (`LAND_BOT`, from the token step's `app-slug`). Before moving main it waits on the same release pipeline gate as `pin-bump-arm` (`readGate`, `gateRefusal`). Until the App, the Environment and the ruleset change exist, leave `PIN_BUMP_DIRECT` unset: the land job then does not run.
 
 ## Cloudflare token naming (#933, #934)
 

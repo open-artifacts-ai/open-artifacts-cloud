@@ -44,6 +44,36 @@ const PIN = `# The public open-artifacts release this repo builds on.
 tag=v0.136.1
 sha=${OLD_SHA}
 `;
+/**
+ * The release pipeline gate (pin-bump-arm's readGate): which gate workflows are
+ * busy, the successful prod deploy titles, and the newest red-line runs. By
+ * default the gate is open: nothing runs and main's pin v0.136.1 is on prod.
+ */
+type GateWorld = {
+  busy?: string[];
+  deployed?: string[];
+  gateRuns?: { t: string; c: string | null; a: number }[];
+  fail?: boolean;
+};
+const ON_PROD = ["deploy-hosted-platform prod v0.136.1 [c1-1]"];
+const gateAnswer = (g: GateWorld = {}, path = "") => {
+  const m = /\/actions\/workflows\/([^/]+)\/runs\?status=([a-z_]+)/.exec(path);
+  if (!m) return undefined;
+  if (g.fail) return { code: 1, stdout: "", stderr: "HTTP 404" };
+  const [, wf, status] = m;
+  const out = (v: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify(v),
+    stderr: "",
+  });
+  if (status === "queued" || status === "in_progress")
+    return out((g.busy ?? []).includes(wf ?? "") ? 1 : 0);
+  if (status === "success") {
+    const t = g.deployed ?? ON_PROD;
+    return out({ n: t.length, t });
+  }
+  return out(g.gateRuns ?? []);
+};
 type Rel = { tag_name: string; draft?: boolean; prerelease?: boolean };
 const rel = (tag_name: string, extra: Partial<Rel> = {}) => ({
   draft: false,
@@ -71,6 +101,7 @@ const world = (o: {
     autoMergeRequest?: unknown;
     statusCheckRollup?: { conclusion?: string; state?: string }[];
   };
+  gate?: GateWorld;
 }) => {
   const calls: string[][] = [];
   const exec: Exec = (_c, args) => {
@@ -78,6 +109,8 @@ const world = (o: {
     const line = args.join(" ");
     if (o.failApi && line.includes(o.failApi))
       return { code: 1, stdout: "", stderr: "HTTP 502" };
+    const g = args[0] === "api" ? gateAnswer(o.gate, args[1]) : undefined;
+    if (g) return g;
     const json = (v: unknown) => ({
       code: 0,
       stdout: JSON.stringify(v),
@@ -812,7 +845,17 @@ describe("pin-bump.yml", () => {
       expect(co).toHaveLength(1);
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       expect(co[0].with.ref).toBe("${{ github.sha }}");
-      expect(jobs.land.environment).toBe("release-app");
+      // Its own App in its own Environment: the bypass actor on main, never the release App.
+      expect(jobs.land.environment).toBe("pin-land");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(app.with["app-id"]).toBe("${{ secrets.PIN_LAND_APP_ID }}");
+      expect(app.with["private-key"]).toBe(
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+        "${{ secrets.PIN_LAND_APP_PRIVATE_KEY }}",
+      );
+      expect(JSON.stringify(jobs.land)).not.toContain("RELEASE_APP_");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(l.env.LAND_BOT).toBe("${{ steps.app.outputs.app-slug }}[bot]");
     });
 
     it("only open and land see the App token", () => {
@@ -1043,6 +1086,53 @@ describe("planDirect", () => {
     expect(r).toMatchObject({ bump: true, tag: "v0.137.0" });
   });
 
+  describe("the release pipeline gate (pin-bump-arm's gateRefusal)", () => {
+    it("a busy gate workflow stages nothing", () => {
+      const { r } = go({ gate: { busy: ["redline-staging.yml"] } });
+      expect(r).toMatchObject({ bump: false, tag: "", sha: "" });
+      expect(r.why).toContain("candidate open: redline-staging.yml");
+    });
+
+    it("main's pin not yet on prod stages nothing", () => {
+      const { r } = go({
+        gate: { deployed: ["deploy-hosted-platform prod v0.136.0 [c1-1]"] },
+      });
+      expect(r).toMatchObject({ bump: false, tag: "" });
+      expect(r.why).toContain(
+        "main's pin v0.136.1 has no successful prod deploy yet",
+      );
+    });
+
+    it("main's pin rejected by the gate after its retry (#449) does not hold the bump", () => {
+      const { r } = go({
+        gate: {
+          deployed: [],
+          gateRuns: [{ t: "redline-staging v0.136.1", c: "failure", a: 2 }],
+        },
+      });
+      expect(r).toMatchObject({ bump: true, tag: "v0.137.0", sha: NEW_SHA });
+    });
+
+    it("a first-attempt failure is no rejection: still waits", () => {
+      const { r } = go({
+        gate: {
+          deployed: [],
+          gateRuns: [{ t: "redline-staging v0.136.1", c: "failure", a: 1 }],
+        },
+      });
+      expect(r).toMatchObject({ bump: false });
+    });
+
+    it("a gate that cannot be read throws", () => {
+      expect(() => go({ gate: { fail: true } })).toThrow("404");
+    });
+
+    it("is not read when there is nothing to bump", () => {
+      const { w } = go({ releases: [rel("v0.136.1")], gate: { fail: true } });
+      expect(w.calls.some((c) => c[1]?.includes("/actions/"))).toBe(false);
+    });
+  });
+
   it("ignores drafts and prereleases", () => {
     const { r } = go({
       releases: [
@@ -1103,6 +1193,8 @@ describe("direct mode: stage, landBranch, land, route", () => {
     required?: string[];
     checks?: ReturnType<typeof green>[];
     refs?: string[];
+    gate?: GateWorld;
+    landBot?: string;
   };
   const landWorld = (o: LandWorld) => {
     const calls: { by: "read" | "write"; args: string[] }[] = [];
@@ -1126,6 +1218,8 @@ describe("direct mode: stage, landBranch, land, route", () => {
         return err ? fail(err) : ok({ object: { sha: "x" } });
       }
       if (method === "PATCH" || method === "DELETE") return ok("");
+      const g = method === "GET" ? gateAnswer(o.gate, path) : undefined;
+      if (g) return g;
       if (method === "POST" && path.endsWith("git/refs"))
         return o.createRef ? fail(o.createRef) : ok("");
       if (path.endsWith("git/matching-refs/heads/pin-land/"))
@@ -1210,7 +1304,14 @@ describe("direct mode: stage, landBranch, land, route", () => {
       return answer(args);
     };
     const one = () =>
-      landBranch({ exec, read, repo: REPO, publicRepo: PUB, branch: BRANCH });
+      landBranch({
+        exec,
+        read,
+        repo: REPO,
+        publicRepo: PUB,
+        branch: BRANCH,
+        landBot: o.landBot,
+      });
     const all = () => land({ exec, read, repo: REPO, publicRepo: PUB });
     const doStage = () =>
       stage({
@@ -1442,6 +1543,87 @@ describe("direct mode: stage, landBranch, land, route", () => {
       const w = landWorld(o);
       expect(() => w.one()).toThrow(msg);
       expect(writes(w.calls)).toHaveLength(0);
+    });
+
+    describe("the release pipeline gate (pin-bump-arm's gateRefusal)", () => {
+      it.each([
+        ["a gate workflow is busy", { busy: ["prod-release-chain.yml"] }],
+        ["main's pin is not on prod yet", { deployed: [] }],
+      ] as [string, GateWorld][])(
+        "waits when %s, green or not, and writes nothing",
+        (_n, gate) => {
+          const w = landWorld({ gate });
+          const r = w.one();
+          expect(r).toMatchObject({ action: "waiting" });
+          expect(r.action === "waiting" && r.why).toContain("candidate open");
+          expect(writes(w.calls)).toHaveLength(0);
+        },
+      );
+
+      it("a moved main is not rebuilt while the gate is shut", () => {
+        const w = landWorld({
+          mains: [MAIN2],
+          gate: { busy: ["hosted-publish.yml"] },
+        });
+        expect(w.one()).toMatchObject({ action: "waiting" });
+        expect(writes(w.calls)).toHaveLength(0);
+      });
+
+      it("main's pin rejected after its retry (#449) lands", () => {
+        const w = landWorld({
+          gate: {
+            deployed: [],
+            gateRuns: [{ t: "redline-staging v0.136.1", c: "failure", a: 2 }],
+          },
+        });
+        expect(w.one()).toEqual({ action: "landed", sha: COMMIT });
+        expect(mainMoves(w.calls)).toHaveLength(1);
+      });
+
+      it("reads the gate with the read token, on main's current pin", () => {
+        const w = landWorld({});
+        expect(w.one()).toMatchObject({ action: "landed" });
+        const gate = w.calls.filter((c) =>
+          c.args.some((a) => a.includes("/actions/workflows/")),
+        );
+        expect(gate.length).toBeGreaterThan(0);
+        for (const c of gate) expect(c.by).toBe("read");
+      });
+
+      it("a gate that cannot be read throws, and moves nothing", () => {
+        const w = landWorld({ gate: { fail: true } });
+        expect(() => w.one()).toThrow("404");
+        expect(writes(w.calls)).toHaveLength(0);
+      });
+    });
+
+    describe("a branch the land App rebuilt", () => {
+      const LAND_BOT = "oa-pin-land[bot]";
+      it("its own verified commit lands", () => {
+        const w = landWorld({ author: LAND_BOT, landBot: LAND_BOT });
+        expect(w.one()).toEqual({ action: "landed", sha: COMMIT });
+      });
+
+      it.each([
+        ["no land bot is named", { author: LAND_BOT }],
+        [
+          "the land bot is another",
+          { author: LAND_BOT, landBot: "other[bot]" },
+        ],
+        [
+          "it is unverified",
+          { author: LAND_BOT, landBot: LAND_BOT, verified: false },
+        ],
+        [
+          "another committer",
+          { author: LAND_BOT, landBot: LAND_BOT, committer: "someone" },
+        ],
+        ["the land bot is not a bot login", { author: "x", landBot: "x" }],
+      ] as [string, LandWorld][])("refuses it when %s", (_n, o) => {
+        const w = landWorld(o);
+        expect(() => w.one()).toThrow("verified commit");
+        expect(writes(w.calls)).toHaveLength(0);
+      });
     });
 
     it("main already at this pin or newer: drops the branch, moves nothing", () => {

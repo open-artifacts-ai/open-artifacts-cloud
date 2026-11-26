@@ -8,11 +8,14 @@
 // only when every required check of main's ruleset is green on it, the commit is
 // the bot's verified one and it changes only PUBLIC_PIN, SYNCED_FROM and the
 // lockfile. A bump that also ports surfaces goes to a PR for a person (`route`).
+// Both plan-direct and land wait on the release pipeline gate pin-bump-arm uses
+// (readGate, gateRefusal). land writes with its own App (PIN_LAND_APP_*), the
+// only bypass actor main's ruleset needs, never with the release App.
 // Usage: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo owner/name [--public owner/name]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts plan-direct --repo owner/name [--public owner/name]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts route --repo owner/name --tag vX.Y.Z --direct on|off --surfaces changed|same [--branch b --supersede n]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo owner/name --base <sha> --commit <sha> --tag vX.Y.Z --sha <sha>
-//        node --experimental-strip-types scripts/ci/pin-bump.ts land --repo owner/name [--public owner/name]   (READ_TOKEN reads, GH_TOKEN writes)
+//        node --experimental-strip-types scripts/ci/pin-bump.ts land --repo owner/name [--public owner/name]   (READ_TOKEN reads, GH_TOKEN writes, LAND_BOT is the land App's bot)
 //        node --experimental-strip-types scripts/ci/pin-bump.ts apply --tag vX.Y.Z --sha <40 hex> [--dir .]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo owner/name --tag vX.Y.Z --sha <sha> --branch pin-bump/vX.Y.Z
 // `plan` prints `bump=true|false`, `tag`, `sha`, `branch` for $GITHUB_OUTPUT.
@@ -24,7 +27,14 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { type Exec, type ExecResult, gh } from "./gh-retry.ts";
 // Used only inside functions: pin-bump-arm.ts imports this module too.
-import { BOT, commitOk, requiredChecks } from "./pin-bump-arm.ts";
+import {
+  BOT,
+  commitOk,
+  gateRefusal,
+  readGate,
+  requiredChecks,
+  WEB_FLOW,
+} from "./pin-bump-arm.ts";
 
 export const PUBLIC_REPO = "open-artifacts-ai/open-artifacts";
 /** Every bump branch starts with this; one open PR from such a branch is the limit. */
@@ -179,7 +189,10 @@ function resolveSha(exec: Exec, publicRepo: string, tag: string): string {
 /**
  * Direct mode's plan (cloud #264): a bump when the newest public release is
  * newer than PUBLIC_PIN and is not already staged on pin-land/<tag> (`land`
- * takes a staged one, or holds it red for a person). No PR is read.
+ * takes a staged one, or holds it red for a person). No PR is read. The release
+ * pipeline gate pin-bump-arm applies (gateRefusal) holds it too: while a gate
+ * workflow runs, or main's pin has no prod deploy and was not rejected, nothing
+ * is staged. A gate that cannot be read throws (a red run).
  */
 export function planDirect(o: {
   exec: Exec;
@@ -195,6 +208,8 @@ export function planDirect(o: {
     return none(`PUBLIC_PIN ${current} is the newest release (${newest})`);
   if (staged(o.exec, o.repo, newest))
     return none(`${landBranchOf(newest)} is already staged; land takes it`);
+  const wait = gateRefusal(readGate(o.exec, o.repo, o.pin));
+  if (wait) return none(`${newest} waits: ${wait}`);
   return {
     bump: true,
     tag: newest,
@@ -455,7 +470,12 @@ export function route(o: {
       why: string;
     } {
   if (!o.direct)
-    return { route: "pr", pr: true, ...o.planned, why: "PIN_BUMP_DIRECT is off" };
+    return {
+      route: "pr",
+      pr: true,
+      ...o.planned,
+      why: "PIN_BUMP_DIRECT is off",
+    };
   if (!o.surfacesChanged) return { route: "direct" };
   const p = o.prPlan();
   if (!p.bump || p.tag !== o.tag)
@@ -641,12 +661,34 @@ export type LandResult =
   | { action: "waiting"; why: string }
   | { action: "already"; why: string };
 
+/**
+ * Pure: a verified commit by the land App's own bot (its rebuild of a staged
+ * pin on a moved main), committer that bot or web-flow. Never the release bot's
+ * login, and never without a land bot.
+ */
+export function landBotOk(
+  c: { author: string; committer: string; verified: boolean },
+  landBot: string | undefined,
+): boolean {
+  if (!landBot || !/^[a-z0-9][a-z0-9-]{0,62}\[bot\]$/.test(landBot))
+    return false;
+  return (
+    c.verified &&
+    c.author === landBot &&
+    (c.committer === landBot || c.committer === WEB_FLOW)
+  );
+}
+
 /** Best effort: a branch left behind is deleted by the next run. */
 function dropBranch(exec: Exec, repo: string, branch: string) {
   try {
-    gh(exec, ["api", "-X", "DELETE", `repos/${repo}/git/refs/heads/${branch}`], {
-      write: true,
-    });
+    gh(
+      exec,
+      ["api", "-X", "DELETE", `repos/${repo}/git/refs/heads/${branch}`],
+      {
+        write: true,
+      },
+    );
   } catch (e) {
     console.error(`pin-bump: could not delete ${branch}: ${String(e)}`);
   }
@@ -662,7 +704,12 @@ function dropBranch(exec: Exec, repo: string, branch: string) {
  * the same blobs are committed on main's head and pushed to the branch, so CI
  * runs again on what would land; a lockfile-sensitive move drops the branch and
  * throws, so the next pin-bump run regenerates.
- * `exec` writes (the App token); `read` reads (the job token, checks: read).
+ * Before main moves (or the branch is rebuilt), the release pipeline gate
+ * (pin-bump-arm's gateRefusal, on main's current pin) must be open; a refusal
+ * waits, and the next run tries again.
+ * `exec` writes (the land App token); `read` reads (the job token, checks: read).
+ * `landBot` is the land App's bot login: a branch it rebuilt is its commit, not
+ * the release bot's, and is accepted as such.
  */
 export function landBranch(o: {
   exec: Exec;
@@ -670,13 +717,15 @@ export function landBranch(o: {
   repo: string;
   publicRepo: string;
   branch: string;
+  landBot?: string;
 }): LandResult {
   const m = /^pin-land\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/.exec(o.branch);
   if (!m?.[1]) throw new Error(`${o.branch} is not ${LAND_PREFIX}vX.Y.Z`);
   const tag = m[1];
   const r = reader(o.read, o.repo);
   let main = r.sha("git/ref/heads/main");
-  const mainTag = pinField(r.raw("PUBLIC_PIN", main), "tag");
+  const mainPin = r.raw("PUBLIC_PIN", main);
+  const mainTag = pinField(mainPin, "tag");
   if (compareTags(mainTag, tag) >= 0) {
     dropBranch(o.exec, o.repo, o.branch);
     return {
@@ -696,9 +745,9 @@ export function landBranch(o: {
     committer: hc.committer?.login ?? "",
     verified: hc.commit.verification?.verified === true,
   };
-  if (!commitOk(who))
+  if (!commitOk(who) && !landBotOk(who, o.landBot))
     throw new Error(
-      `${o.branch} at ${head} is not ${BOT}'s verified commit (${who.author}, ${who.committer}, verified ${who.verified}); left for a person`,
+      `${o.branch} at ${head} is not ${BOT}'s (or the land App's) verified commit (${who.author}, ${who.committer}, verified ${who.verified}); left for a person`,
     );
   const parent = hc.parents.length === 1 ? hc.parents[0]?.sha : undefined;
   if (!parent)
@@ -747,6 +796,9 @@ export function landBranch(o: {
       action: "waiting",
       why: `${pending.join(", ")} not done on ${head}`,
     };
+  // The same release pipeline gate a PR bump waits on before it is armed.
+  const wait = gateRefusal(readGate(o.read, o.repo, mainPin));
+  if (wait) return { action: "waiting", why: wait };
 
   if (main === parent) {
     try {
@@ -818,6 +870,7 @@ export function land(o: {
   read: Exec;
   repo: string;
   publicRepo: string;
+  landBot?: string;
 }): { branch: string; result?: LandResult; error?: string }[] {
   const refs = JSON.parse(
     gh(o.read, [
@@ -841,7 +894,10 @@ export function staged(exec: Exec, repo: string, tag: string): boolean {
   const want = `refs/heads/${landBranchOf(tag)}`;
   return (
     JSON.parse(
-      gh(exec, ["api", `repos/${repo}/git/matching-refs/heads/${landBranchOf(tag)}`]),
+      gh(exec, [
+        "api",
+        `repos/${repo}/git/matching-refs/heads/${landBranchOf(tag)}`,
+      ]),
     ) as { ref: string }[]
   ).some((x) => x.ref === want);
 }
@@ -971,6 +1027,7 @@ function main(argv: string[]) {
       },
       repo: flag(argv, "repo"),
       publicRepo: flag(argv, "public", PUBLIC_REPO),
+      landBot: process.env.LAND_BOT || undefined,
     });
     for (const x of results)
       console.error(
