@@ -2097,6 +2097,7 @@ export const PROBES: readonly Probe[] = [
         id: p.id,
         requestId: run.rid("p45-up"),
         version: run.c.version,
+        nonAdditive: true,
       });
       if (up.isError)
         throw new ProbeFail(`P45 upgrade_install: ${toolCode(up)}`);
