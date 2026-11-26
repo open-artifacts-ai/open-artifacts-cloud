@@ -9,7 +9,7 @@ import {
   type Cred,
   describeRes,
   fromContentApp,
-  paceHook,
+  paceWrongKeyHook,
   readBody,
   withCred,
 } from "../src/http.ts";
@@ -80,14 +80,15 @@ describe("hooks", () => {
       // RL_ANON answers the same bare 404 before the key is read, so this
       // 404 is the key check's only while the runner is under the limit.
       // What guarantees it is the margin: every /__test/* call this runner
-      // makes is paced to HOOK_LIMIT (25) a minute against RL_ANON's 30, and
-      // this probe keeps one more call free (24 at most, with it). A limited
-      // 404 here would take at least 6 unpaced calls inside the window; none exist
-      // (#1254). The audit row would prove it outright: a key-check 404
+      // makes that RL_ANON is charged for (before public #3200 every one;
+      // from it the wrong-key ones) is paced to SUITE_HOOK_LIMIT (25) a minute
+      // against RL_ANON's 30, and this probe keeps one more call free (24 at
+      // most, with it). A limited 404 here would take at least 6 unpaced
+      // calls inside the window; none exist (#1254). The audit row would prove it outright: a key-check 404
       // writes test_hook.session "denied", a limited one writes nothing.
       const since = Math.max(0, Date.now() - AUDIT_SINCE_SKEW_MS);
       const deniedBefore = await deniedSessionRows(t, since);
-      await paceHook(t, { reserve: 1 });
+      await paceWrongKeyHook(t, { reserve: 1 });
       const res = await fetch(`${t.app}/__test/session`, {
         method: "POST",
         redirect: "manual",
