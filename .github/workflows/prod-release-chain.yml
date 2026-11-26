@@ -5,40 +5,70 @@
 # Forward only: nothing here rolls back. docs/ops/hosted.md has the halts and
 # how one clears.
 #
-# Off until reviewed: the gate runs only with the repo variable
+# Off until reviewed: the chain runs only with the repo variable
 # PROD_RELEASE_CHAIN set to "on". The fleet has its own switch, prod's
 # FLEET_CANARY in apps/scheduler/wrangler.jsonc.
 #
-# The only trigger is a completed redline-staging run that concluded success
-# and was dispatched (the nightly calls it, so its runs never count). The tag
-# comes only from that run's display title (redline-staging.yml's run-name),
-# through env, never into a script. Then main's own scripts prove it again:
+# Event-driven (cloud #264): no step waits, sleeps or polls for a run. Each
+# step starts on a completed workflow_run event, starts the next workflow and
+# ends; that workflow's own completion is the next event:
+#   redline-staging green  -> gate, then dispatch hosted-publish (env prod)
+#                             or, when prod's bucket has the release, the deploy
+#   that publish completed -> deploy: check it, then dispatch the deploy
+#   that deploy completed  -> finish: check it; report keeps the blocker issue
+# The plan job classifies the event from its own fields through env, never
+# into a script (scripts/ci/prod-release-chain.ts plan): the switch is on, the
+# run is on main and this repository's, and either a green dispatched
+# redline-staging run (the nightly calls it, so its runs never count) or a
+# hosted-publish or deploy-hosted-platform run this chain dispatched: event
+# workflow_dispatch, the release App's bot, and the chain's run name for the
+# tag (`hosted-publish prod <tag> [p<run>-<n>]`, `deploy-hosted-platform prod
+# <tag> [c<run>-<n>]`). Every other event (a staging copy or deploy, a manual
+# run, a floor) starts nothing.
+#
+# The gate's tag comes only from the red-line run's display title
+# (redline-staging.yml's run-name). Then main's own scripts prove it again:
 # staging-first-gate.sh, staging-smoke-gate.sh (#1406: staging's post-deploy
 # smoke is green at or after the tag) and tag-passed-checks.sh prod (a
-# failure is red).
-# Then two checks that skip, green with a notice, without touching the
-# blocker issue: this event is the newest green run for the tag (else it is
-# stale), and the tag is newer than the release prod's scheduler runs (else
-# prod already has it). The deploy is deploy-hosted-platform.yml itself,
-# dispatched on main with env prod and every target (scripts/ci/chain-dispatch.ts
-# matches the one run it started and waits for it, failing closed), so all its
-# gates and the platform-tags.sh read-back run unchanged, every secret comes
-# from its own Environment, and its concurrency group serializes the chain
-# against a manual deploy; before it, the publish job dispatches
-# hosted-publish.yml for the tag (env prod) unless prod's bucket has the
-# release already (#1412: hosted-publish publishes staging alone after a
-# release; prod's bucket waits for this red-line); require_newer re-checks the tag against prod once
-# the run holds that group, so a manual deploy of a newer tag is never
-# downgraded. The scheduler deploys last there, so a run
-# that stops before the scheduler step never moves the fleet; once that step's
-# first deploy has run, the fleet follows even if the run goes red afterwards. A red chain run keeps one
-# `blocker` issue open; a green one closes it.
+# failure is red). Then two checks that skip, green with a notice, without
+# touching the blocker issue: this event is the newest green run for the tag
+# (else it is stale), and the tag is newer than the release prod's scheduler
+# runs (else prod already has it).
+#
+# The deploy is deploy-hosted-platform.yml itself, dispatched on main with env
+# prod and every target (scripts/ci/chain-dispatch.ts), so all its gates and
+# the platform-tags.sh read-back run unchanged, every secret comes from its
+# own Environment, and its concurrency group serializes it against a manual
+# deploy; require_newer re-checks the tag against prod once the run holds
+# that group, so a manual deploy of a newer tag is never downgraded. Before
+# it, the chain dispatches hosted-publish.yml for the tag (env prod) unless
+# prod's bucket has the release already (#1412: hosted-publish publishes
+# staging alone after a release; prod's bucket waits for this red-line). The
+# deploy starts only after the chain's publish of the tag ended green and
+# prod's bucket has its record (prod-release-chain.ts child, then start).
+# The scheduler deploys last there, so a run that stops before the scheduler
+# step never moves the fleet; once that step's first deploy has run, the fleet
+# follows even if the run goes red afterwards.
+#
+# Dispatches use the release App's installation token (actions: write, minted
+# in the main-only release-app Environment), never the default token: GitHub
+# raises no workflow_run event for a run the default token started, so the
+# chain's next step would never fire. Never twice: the start and deploy jobs
+# share a concurrency group keyed on the tag and start nothing while the
+# chain's publish or deploy of the tag is queued or running, or once its
+# deploy succeeded (prod-release-chain.ts start). A child's end is read again
+# by run id, so a rerun of it in progress starts nothing and reports nothing:
+# its own end is the next event. release-retry.yml reruns a failed child
+# itself.
+#
+# A red step keeps one `blocker` issue open; the deploy's green end closes it.
 name: prod-release-chain
 
 on:
   workflow_run:
-    workflows: [redline-staging]
+    workflows: [redline-staging, hosted-publish, deploy-hosted-platform]
     types: [completed]
+    branches: [main]
 
 # The public repo: the release and smoke gates read its releases, its tag
 # commit, its release-please run and its deploy-staging.yml smoke from here;
@@ -48,13 +78,54 @@ env:
 
 permissions: {}
 
-concurrency:
-  group: prod-release-chain
-  cancel-in-progress: false
+# No run-level concurrency group: GitHub keeps one pending run per group, so
+# an unrelated completion (a staging deploy) would replace a pending step and
+# its event would be lost. The jobs that start something hold the tag's group.
 
 jobs:
+  # What this event starts, from the event's own fields (no API call).
+  plan:
+    if: ${{ vars.PROD_RELEASE_CHAIN == 'on' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      step: ${{ steps.plan.outputs.step }}
+      tag: ${{ steps.plan.outputs.tag }}
+      child: ${{ steps.plan.outputs.child }}
+    steps:
+      # workflow_run runs on the default branch; refuse anything else.
+      - name: On main
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = refs/heads/main ] || { echo "the chain runs on main only"; exit 1; }'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: plan
+        name: What this event starts
+        env:
+          SWITCH: ${{ vars.PROD_RELEASE_CHAIN }}
+          # The file, not the name: a run-name replaces the name.
+          WORKFLOW: ${{ github.event.workflow_run.path }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --switch "$SWITCH" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --head-repo "$HEAD_REPO" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"
+
   gate:
-    if: ${{ vars.PROD_RELEASE_CHAIN == 'on' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}
+    needs: plan
+    if: needs.plan.outputs.step == 'gate'
     runs-on: ubuntu-latest
     # The prod deploy token, for one read: the scheduler's release tag.
     environment: hosted-prod-deploy
@@ -135,64 +206,28 @@ jobs:
           go="$(node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag "$TAG" --current "$current")"
           printf '%s\n' "$go" >> "$GITHUB_OUTPUT"
           [ "$go" = go=true ] || echo "::notice title=Release chain skipped::prod already runs $current; $TAG is not newer"
-  # Dispatches deploy-hosted-platform.yml (a plain run, so every secret comes
-  # from its own job's Environment, hosted-prod-deploy) and waits for the one
-  # run it started. A reusable-workflow call cannot do this: the caller must
-  # pass each secret by name or it resolves empty (run 42109047045), and a
-  # `uses:` job cannot set an Environment, so the caller's repo-level token
-  # would cross in. See chain-dispatch.ts.
-  # #1412: the release is published to prod's bucket only after this red-line
-  # (hosted-publish.yml publishes staging alone after a release and its
-  # publish-prod job re-checks the red-line). Before the deploy, so the fleet
-  # never targets a release prod cannot create from. Skipped inside the job
-  # when prod already has it (publishing is create-only).
-  publish:
-    needs: gate
+  # After the gate: dispatch hosted-publish.yml for the tag (env prod), or the
+  # deploy at once when prod's bucket has the release (publishing is
+  # create-only), and end. A plain dispatched run, not a reusable-workflow
+  # call: the caller must pass each secret by name or it resolves empty (run
+  # 42109047045), and a `uses:` job cannot set an Environment. See
+  # chain-dispatch.ts.
+  start:
+    needs: [plan, gate]
     if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
-    # actions: write is this job's alone: it dispatches the workflow.
+    # The release App key lives here (#302): main only.
+    environment: release-app
+    # The job's own token only reads; the App's token dispatches.
     permissions:
       contents: read
-      actions: write
-    timeout-minutes: 55
+      actions: read
+    concurrency:
+      group: prod-release-chain-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
+    timeout-minutes: 10
     outputs:
-      url: ${{ steps.dispatch.outputs.deploy_url }}
-      note: ${{ steps.dispatch.outputs.deploy_note }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.sha }}
-          sparse-checkout: scripts/ci
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version-file: .nvmrc
-      - id: published
-        name: Prod's bucket already has the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.gate.outputs.tag }}
-        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo "$GITHUB_REPOSITORY" --tag "$TAG" >> "$GITHUB_OUTPUT"
-      - id: dispatch
-        name: Dispatch the prod publish and wait for its run
-        if: steps.published.outputs.published != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.gate.outputs.tag }}
-          CHAIN_ID: p${{ github.run_id }}-${{ github.run_attempt }}
-        run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
-  deploy:
-    needs: [gate, publish]
-    if: needs.gate.outputs.go == 'true'
-    runs-on: ubuntu-latest
-    # actions: write is this job's alone: it dispatches the workflow.
-    permissions:
-      contents: read
-      actions: write
-    timeout-minutes: 60
-    outputs:
-      run: ${{ steps.dispatch.outputs.deploy_run }}
-      url: ${{ steps.dispatch.outputs.deploy_url }}
+      next: ${{ steps.start.outputs.next }}
       note: ${{ steps.dispatch.outputs.deploy_note }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -205,16 +240,130 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
-      - id: dispatch
-        name: Dispatch the prod deploy and wait for its run
+      - id: start
+        name: What the chain starts for the tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.gate.outputs.tag }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after gate --tag "$TAG"
+      - id: app
+        name: Mint the dispatch token
+        if: steps.start.outputs.go == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-actions: write
+      - id: dispatch
+        name: Dispatch the prod publish, or the deploy when prod's bucket has the release
+        if: steps.start.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          NEXT: ${{ steps.start.outputs.next }}
+          CHAIN_ID: ${{ steps.start.outputs.next == 'publish' && 'p' || 'c' }}${{ github.run_id }}-${{ github.run_attempt }}
+        run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow "$NEXT" --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
+  # After the chain's prod publish of a tag completed: it must have ended
+  # green, for that tag, as the chain's own run, and prod's bucket must have
+  # the release; then dispatch the deploy and end.
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.step == 'deploy'
+    runs-on: ubuntu-latest
+    environment: release-app
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: prod-release-chain-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
+    timeout-minutes: 10
+    outputs:
+      url: ${{ steps.child.outputs.url }}
+      note: ${{ steps.child.outputs.note || steps.dispatch.outputs.deploy_note }}
+    steps:
+      - name: On main
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = refs/heads/main ] || { echo "the chain runs on main only"; exit 1; }'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            scripts/ci
+            .github/hosted
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: child
+        name: The chain's prod publish of the tag ended green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          CHILD: ${{ needs.plan.outputs.child }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo "$GITHUB_REPOSITORY" --workflow publish --run-id "$CHILD" --tag "$TAG"
+      - id: start
+        name: What the chain starts for the tag
+        if: steps.child.outputs.state == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after publish --tag "$TAG"
+      - id: app
+        name: Mint the dispatch token
+        if: steps.start.outputs.go == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-actions: write
+      - id: dispatch
+        name: Dispatch the prod deploy
+        if: steps.start.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
           CHAIN_ID: c${{ github.run_id }}-${{ github.run_attempt }}
         run: node --experimental-strip-types scripts/ci/chain-dispatch.ts --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"
+  # After the chain's prod deploy of a tag completed: the chain's end.
+  finish:
+    needs: plan
+    if: needs.plan.outputs.step == 'report'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 10
+    outputs:
+      state: ${{ steps.child.outputs.state }}
+      url: ${{ steps.child.outputs.url }}
+      note: ${{ steps.child.outputs.note }}
+    steps:
+      - name: On main
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = refs/heads/main ] || { echo "the chain runs on main only"; exit 1; }'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: child
+        name: The chain's prod deploy of the tag ended green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          CHILD: ${{ needs.plan.outputs.child }}
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo "$GITHUB_REPOSITORY" --workflow deploy --run-id "$CHILD" --tag "$TAG"
   report:
-    needs: [gate, publish, deploy]
-    if: ${{ always() && vars.PROD_RELEASE_CHAIN == 'on' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}
+    needs: [plan, gate, start, deploy, finish]
+    # Every step the plan started reports, and a failed plan too: the chain
+    # never fails quietly. An event that starts nothing reports nothing.
+    if: ${{ always() && needs.plan.result != 'skipped' && (needs.plan.result != 'success' || needs.plan.outputs.step != 'none') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -232,13 +381,23 @@ jobs:
       - name: Keep the blocker issue in step
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.gate.outputs.tag }}
-          # A failed gate is reported too: the chain never fails quietly. A
-          # skip (go false) leaves deploy "skipped", which leaves the issue.
-          RESULT: ${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          # One result from the jobs (prod-release-chain.ts result): red opens
+          # or refreshes the issue, only the deploy's green end closes it, and
+          # a skip or a started next step leaves it.
+          STEP: ${{ needs.plan.outputs.step }}
+          PLAN: ${{ needs.plan.result }}
+          GATE: ${{ needs.gate.result }}
+          START: ${{ needs.start.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+          FINISH: ${{ needs.finish.result }}
+          STATE: ${{ needs.finish.outputs.state }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # The dispatched deploy run (empty when it never started).
-          DEPLOY_RUN: ${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}
-          # Why the dispatch step failed, e.g. that it cancelled the run.
-          DEPLOY_NOTE: ${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}
-        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"
+          # The run that ended: the deploy, or the publish (empty after the gate).
+          DEPLOY_RUN: ${{ needs.finish.outputs.url || needs.deploy.outputs.url }}
+          # Why it failed, e.g. the run's conclusion or a refused dispatch.
+          DEPLOY_NOTE: ${{ needs.finish.outputs.note || needs.deploy.outputs.note || needs.start.outputs.note }}
+        run: |
+          set -euo pipefail
+          result="$(node --experimental-strip-types scripts/ci/prod-release-chain.ts result --step "$STEP" --plan "$PLAN" --gate "$GATE" --start "$START" --deploy "$DEPLOY" --finish "$FINISH" --state "$STATE")"
+          node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$result" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"
