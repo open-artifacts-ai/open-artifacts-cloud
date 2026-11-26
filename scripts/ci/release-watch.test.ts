@@ -3138,7 +3138,7 @@ describe("tick reads", () => {
       "| Release | Minutes | To | Against 20 min |",
     );
     expect(summary(r.current)).toContain(
-      'Measured from the merge to every install once a later prod deploy recorded the scheduler\'s fleet finish ("Fleet done of earlier releases"), else to prod deploy (fleet not yet measured); each release says which.',
+      'Measured from the merge to one of three endpoints, and each release says which: "every install", exact, from a later prod deploy\'s record of the scheduler\'s fleet finish ("Fleet done of earlier releases"); "every install (upper bound: the Fleet done step\'s end)", from an older deploy\'s own "Fleet done" step; or "prod deploy (fleet not yet measured)". Reported, never alerted on.',
     );
     expect(summary(r.current)).toContain(
       "| v0.245.1 | 45.8 | prod deploy (fleet not yet measured) | 25.8 over |",
