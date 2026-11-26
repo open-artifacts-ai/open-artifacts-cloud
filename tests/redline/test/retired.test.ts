@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseManifest } from "../src/report.ts";
-import { RETIRED, retiredGaps } from "../src/retired.ts";
+import {
+  citedTestGaps,
+  HOSTED_MATRIX_CI,
+  RETIRED,
+  retiredGaps,
+} from "../src/retired.ts";
 import { SPLIT_RETIRED } from "../src/retired-split.ts";
 import { readRepoFile } from "../src/surfaces.ts";
 
@@ -160,5 +165,117 @@ describe("retired live cases (#1235)", () => {
       "loopback with a port and the exact MCP_REDIRECT_URIS entry are accepted",
       "refuses %s with invalid_redirect_uri, counted in oauth_register",
     ]);
+  });
+});
+
+describe("a skipped test is no replacement (cloud #264 step 2)", () => {
+  const file = "x.test.ts";
+  const gaps = (text: string, describe = "outer", test = "the case") =>
+    citedTestGaps("r", { file, describe, test }, text);
+
+  it("an enabled test under its describe resolves", () => {
+    expect(
+      gaps('describe("outer", () => {\n  it("the case", () => {});\n});\n'),
+    ).toEqual([]);
+  });
+
+  it("it.skip, it.todo, xit, skipIf and runIf on the test itself are no replacement", () => {
+    for (const head of [
+      'it.skip("the case"',
+      'it.todo("the case"',
+      'xit("the case"',
+      'it.skipIf(x)("the case"',
+      'it.runIf(CI)("the case"',
+      'it.concurrent.skip("the case"',
+    ])
+      expect(
+        gaps(`describe("outer", () => {\n  ${head}, () => {});\n});\n`),
+        head,
+      ).toEqual(['r: the cited test "the case" in x.test.ts is skipped']);
+  });
+
+  it("a skip anywhere up the describe chain is no replacement", () => {
+    const text = [
+      'describe.skip("outer", () => {',
+      '  describe("middle", () => {',
+      '    it("the case", () => {});',
+      "  });",
+      "});",
+      "",
+    ].join("\n");
+    expect(gaps(text)).toEqual([
+      'r: the cited test "the case" in x.test.ts is skipped',
+    ]);
+    expect(gaps(text.replace("describe.skip", "xdescribe"))).toHaveLength(1);
+    expect(gaps(text.replace("describe.skip", "describe"))).toEqual([]);
+  });
+
+  it("generated rows count: describe.each and it.each keep their template titles", () => {
+    const text = [
+      'describe("outer", () => {',
+      '  describe.each(ROWS.filter((s) => !off(s)).map((s) => ({ ...s })))("$name", (s) => {',
+      "    it.concurrent.each(CALLERS.map((c) => [c]))(",
+      '      "%s",',
+      "      async () => {},",
+      "    );",
+      "  });",
+      "});",
+      "",
+    ].join("\n");
+    expect(gaps(text, "outer", "%s")).toEqual([]);
+    expect(
+      gaps(
+        text.replace("describe.each(", "describe.skip.each("),
+        "outer",
+        "%s",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("a test under another describe, or none, is not the cited one", () => {
+    const text =
+      'describe("other", () => {\n  it("the case", () => {});\n});\nit("the case", () => {});\n';
+    expect(gaps(text)).toEqual([
+      'r: no test "the case" under "outer" in x.test.ts',
+    ]);
+  });
+
+  it("on the real files: P44's cited test, or its whole suite, skipped is a gap", () => {
+    const f = "apps/provisioning/test/oauth.test.ts";
+    const skip = (fn: (t: string) => string) =>
+      retiredGaps(manifest(), (p) =>
+        p === f ? fn(readRepoFile(p) ?? "") : readRepoFile(p),
+      );
+    const p44 = (g: string[]) =>
+      g.filter((x) => x.includes("P44") && x.includes("is skipped"));
+    expect(p44(skip((t) => t))).toEqual([]);
+    expect(
+      p44(
+        skip((t) => t.replace(/\bit(\(\s*"loopback with a port)/, "it.skip$1")),
+      ),
+    ).toHaveLength(1);
+    expect(
+      p44(
+        skip((t) =>
+          t.replace(
+            'describe("DCR (/oauth/register)"',
+            'describe.skip("DCR (/oauth/register)"',
+          ),
+        ),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("the matrix citations need the hosted run in public's CI, and an unreadable CI file is a gap", () => {
+    const without = (fn: (t: string | null) => string | null) =>
+      retiredGaps(manifest(), (p) =>
+        p === HOSTED_MATRIX_CI.file ? fn(readRepoFile(p)) : readRepoFile(p),
+      );
+    const msg = `${HOSTED_MATRIX_CI.file} runs no ${HOSTED_MATRIX_CI.text}: the matrix's hosted run is not in CI`;
+    expect(without((t) => t)).not.toContain(msg);
+    expect(
+      without((t) => (t ?? "").replaceAll(HOSTED_MATRIX_CI.text, "x")),
+    ).toContain(msg);
+    expect(without(() => null)).toContain(msg);
   });
 });

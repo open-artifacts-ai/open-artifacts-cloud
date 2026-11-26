@@ -178,6 +178,121 @@ export const RETIRED: readonly Retired[] = [
  * (by file and name), a duplicate, or a citation that doesn't resolve. Empty
  * when every retired case is out and accounted for.
  */
+/** One describe or test declaration of a test file, with whether it is enabled. */
+export interface Decl {
+  kind: "describe" | "test";
+  name: string;
+  /** Its own modifier skips it: .skip, .todo, .skipIf, .runIf, or an x- name. */
+  skipped: boolean;
+  indent: number;
+  parent: Decl | undefined;
+}
+
+/** Modifiers that disable a declaration, or make it run only sometimes. */
+const DISABLING = new Set(["skip", "todo", "skipIf", "runIf"]);
+
+/**
+ * The describe and test declarations of a vitest (or Playwright) file, nested
+ * by indentation, each with its literal title and whether its own modifiers
+ * disable it. `describe.each(rows)("$name", ...)` and similar keep their
+ * template title. Formatted source (biome) is assumed: one declaration per
+ * line start.
+ */
+export function declarations(text: string): Decl[] {
+  const out: Decl[] = [];
+  const stack: Decl[] = [];
+  const head = /^([ \t]*)(x?describe|x?it|test)\b/gm;
+  for (let m = head.exec(text); m; m = head.exec(text)) {
+    const indent = (m[1] as string).length;
+    const word = m[2] as string;
+    let i = m.index + m[0].length;
+    const mods: string[] = [];
+    let name: string | undefined;
+    // Modifiers (.skip, .each, .concurrent...), then argument groups, until
+    // the group whose first argument is the title string.
+    for (let guard = 0; guard < 20 && name === undefined; guard++) {
+      const dot = /^\.(\w+)/.exec(text.slice(i));
+      if (dot) {
+        mods.push(dot[1] as string);
+        i += dot[0].length;
+        continue;
+      }
+      if (text[i] !== "(") break;
+      const lit = /^\(\s*(["'`])/.exec(text.slice(i));
+      if (lit) {
+        const q = lit[1] as string;
+        const start = i + lit[0].length;
+        let j = start;
+        while (j < text.length && text[j] !== q) j += text[j] === "\\" ? 2 : 1;
+        name = text.slice(start, j).replace(/\\(["'`\\])/g, "$1");
+        break;
+      }
+      // A balanced argument group (each's rows, skipIf's condition).
+      let depth = 0;
+      let j = i;
+      for (; j < text.length; j++) {
+        const ch = text[j] as string;
+        if (ch === '"' || ch === "'" || ch === "`") {
+          j++;
+          while (j < text.length && text[j] !== ch)
+            j += text[j] === "\\" ? 2 : 1;
+          continue;
+        }
+        if (ch === "(") depth++;
+        else if (ch === ")" && --depth === 0) break;
+      }
+      i = j + 1;
+    }
+    if (name === undefined) continue;
+    while (stack.length && (stack.at(-1) as Decl).indent >= indent) stack.pop();
+    const d: Decl = {
+      kind: word.endsWith("describe") ? "describe" : "test",
+      name,
+      skipped: word.startsWith("x") || mods.some((x) => DISABLING.has(x)),
+      indent,
+      parent: stack.at(-1),
+    };
+    out.push(d);
+    if (d.kind === "describe") stack.push(d);
+  }
+  return out;
+}
+
+/** True when `d` or any describe above it is disabled. */
+const disabled = (d: Decl | undefined): boolean =>
+  d !== undefined && (d.skipped || disabled(d.parent));
+
+/**
+ * What's wrong with one citation's test in its file's text: it must be a
+ * declared test under a describe of that title (anywhere up its chain), and
+ * not disabled there or above (.skip, .todo, .skipIf, .runIf, x-). Empty when
+ * an enabled one exists.
+ */
+export function citedTestGaps(
+  who: string,
+  c: { file: string; describe: string; test?: string },
+  text: string,
+): string[] {
+  if (!c.test) return [];
+  const hits = declarations(text).filter((d) => {
+    if (d.kind !== "test" || d.name !== c.test) return false;
+    for (let p = d.parent; p; p = p.parent)
+      if (p.name === c.describe) return true;
+    return false;
+  });
+  if (hits.length === 0)
+    return [`${who}: no test "${c.test}" under "${c.describe}" in ${c.file}`];
+  if (hits.every((d) => disabled(d)))
+    return [`${who}: the cited test "${c.test}" in ${c.file} is skipped`];
+  return [];
+}
+
+/** The public CI that runs the matrix once more with hosted settings (#3158). */
+export const HOSTED_MATRIX_CI = {
+  file: ".github/workflows/ci.yml",
+  text: "test:authz:hosted",
+} as const;
+
 export function retiredGaps(
   manifest: readonly { file: string; name: string }[],
   read: (repoPath: string) => string | null,
@@ -204,7 +319,18 @@ export function retiredGaps(
         );
       const each = (c as Partial<SurfaceCite>).each;
       if (each) gaps.push(...surfaceCiteGaps(key(r), c as SurfaceCite));
+      // A skipped test is no replacement, nor one under a skipped describe.
+      const text = read(c.file);
+      if (text !== null) gaps.push(...citedTestGaps(key(r), c, text));
     }
+  // The hosted matrix run must still be in public's CI for its citations.
+  if (
+    RETIRED.some((r) => r.coveredBy.some((c) => c.file === MATRIX)) &&
+    !(read(HOSTED_MATRIX_CI.file) ?? "").includes(HOSTED_MATRIX_CI.text)
+  )
+    gaps.push(
+      `${HOSTED_MATRIX_CI.file} runs no ${HOSTED_MATRIX_CI.text}: the matrix's hosted run is not in CI`,
+    );
   return [
     ...gaps,
     ...resolveCitations(
