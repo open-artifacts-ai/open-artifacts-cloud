@@ -1,3 +1,4 @@
+import { parse as parseYaml } from "yaml";
 import {
   SPLIT_RETIRED,
   type SurfaceCite,
@@ -293,6 +294,76 @@ export const HOSTED_MATRIX_CI = {
   text: "test:authz:hosted",
 } as const;
 
+/** A condition GitHub can only read as false: the step or job never runs. */
+const neverRuns = (cond: unknown): boolean => {
+  if (cond === false || cond === 0) return true;
+  if (typeof cond !== "string") return false;
+  const c = cond
+    .trim()
+    .replace(/^\$\{\{([\s\S]*)\}\}$/, "$1")
+    .trim();
+  return /^(false|0|''|""|null)$/.test(c);
+};
+
+const truthy = (v: unknown) => v === true || v === "true";
+
+/** The workflow's events: `on` as a string, a list or a map. */
+function eventsOf(on: unknown): Set<string> {
+  if (typeof on === "string") return new Set([on]);
+  if (Array.isArray(on)) return new Set(on.map(String));
+  if (on && typeof on === "object") return new Set(Object.keys(on));
+  return new Set();
+}
+
+/** A run block's commands, with shell comments dropped. */
+const commandsOf = (run: string) =>
+  run
+    .split("\n")
+    .map((l) => l.replace(/(^|\s)#.*$/, "").trim())
+    .filter(Boolean);
+
+/**
+ * What keeps public's CI from running the hosted matrix as a blocking check
+ * on every PR, read as YAML: the workflow must run on pull_request and
+ * merge_group, and a job with no job-level condition and no
+ * continue-on-error must have a step whose run (comments aside) calls
+ * test:authz:hosted, with no condition that can only be false and no
+ * continue-on-error. Empty when one does.
+ */
+export function hostedMatrixCiGaps(text: string | null): string[] {
+  const why = (s: string) => [
+    `${HOSTED_MATRIX_CI.file}: ${s}: the matrix's hosted run is not a blocking PR check`,
+  ];
+  if (text === null) return why("unreadable");
+  let doc: Record<string, unknown>;
+  try {
+    doc = parseYaml(text) as Record<string, unknown>;
+  } catch {
+    return why("not YAML");
+  }
+  const events = eventsOf(doc?.on);
+  for (const e of ["pull_request", "merge_group"])
+    if (!events.has(e)) return why(`no ${e} trigger`);
+  const jobs = (doc.jobs ?? {}) as Record<string, Record<string, unknown>>;
+  for (const job of Object.values(jobs)) {
+    // A job-level condition can leave PRs out (an event check) or never run.
+    if (!job || job.if !== undefined || truthy(job["continue-on-error"]))
+      continue;
+    for (const st of (job.steps ?? []) as Record<string, unknown>[]) {
+      if (typeof st?.run !== "string") continue;
+      if (
+        !commandsOf(st.run).some((l) =>
+          /(^|\s)\S*test:authz:hosted(\s|$)/.test(l),
+        )
+      )
+        continue;
+      if (neverRuns(st.if) || truthy(st["continue-on-error"])) continue;
+      return [];
+    }
+  }
+  return why(`no blocking step runs ${HOSTED_MATRIX_CI.text}`);
+}
+
 export function retiredGaps(
   manifest: readonly { file: string; name: string }[],
   read: (repoPath: string) => string | null,
@@ -324,13 +395,8 @@ export function retiredGaps(
       if (text !== null) gaps.push(...citedTestGaps(key(r), c, text));
     }
   // The hosted matrix run must still be in public's CI for its citations.
-  if (
-    RETIRED.some((r) => r.coveredBy.some((c) => c.file === MATRIX)) &&
-    !(read(HOSTED_MATRIX_CI.file) ?? "").includes(HOSTED_MATRIX_CI.text)
-  )
-    gaps.push(
-      `${HOSTED_MATRIX_CI.file} runs no ${HOSTED_MATRIX_CI.text}: the matrix's hosted run is not in CI`,
-    );
+  if (RETIRED.some((r) => r.coveredBy.some((c) => c.file === MATRIX)))
+    gaps.push(...hostedMatrixCiGaps(read(HOSTED_MATRIX_CI.file)));
   return [
     ...gaps,
     ...resolveCitations(

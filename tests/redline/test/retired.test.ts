@@ -5,6 +5,7 @@ import { parseManifest } from "../src/report.ts";
 import {
   citedTestGaps,
   HOSTED_MATRIX_CI,
+  hostedMatrixCiGaps,
   RETIRED,
   retiredGaps,
 } from "../src/retired.ts";
@@ -266,16 +267,60 @@ describe("a skipped test is no replacement (cloud #264 step 2)", () => {
     ).toHaveLength(2);
   });
 
-  it("the matrix citations need the hosted run in public's CI, and an unreadable CI file is a gap", () => {
-    const without = (fn: (t: string | null) => string | null) =>
+  it("the matrix citations need the hosted run as a blocking PR step in public's CI", () => {
+    const real = readRepoFile(HOSTED_MATRIX_CI.file);
+    expect(hostedMatrixCiGaps(real)).toEqual([]);
+    const gapsWith = (fn: (t: string) => string) =>
       retiredGaps(manifest(), (p) =>
-        p === HOSTED_MATRIX_CI.file ? fn(readRepoFile(p)) : readRepoFile(p),
-      );
-    const msg = `${HOSTED_MATRIX_CI.file} runs no ${HOSTED_MATRIX_CI.text}: the matrix's hosted run is not in CI`;
-    expect(without((t) => t)).not.toContain(msg);
-    expect(
-      without((t) => (t ?? "").replaceAll(HOSTED_MATRIX_CI.text, "x")),
-    ).toContain(msg);
-    expect(without(() => null)).toContain(msg);
+        p === HOSTED_MATRIX_CI.file ? fn(real ?? "") : readRepoFile(p),
+      ).filter((g) => g.startsWith(HOSTED_MATRIX_CI.file));
+    expect(gapsWith((t) => t)).toEqual([]);
+    const step = "      - run: pnpm --filter @oa/server test:authz:hosted\n";
+    expect(real).toContain(step);
+    const cases: [string, (t: string) => string][] = [
+      [
+        "only in a comment",
+        (t) =>
+          t.replace(
+            step,
+            "      - run: echo nothing # pnpm --filter @oa/server test:authz:hosted\n",
+          ),
+      ],
+      ["if: false", (t) => t.replace(step, `${step}        if: false\n`)],
+      [
+        "if: ${{ false }}",
+        (t) => t.replace(step, `${step}        if: \${{ false }}\n`),
+      ],
+      [
+        "continue-on-error",
+        (t) => t.replace(step, `${step}        continue-on-error: true\n`),
+      ],
+      [
+        "a non-PR job",
+        (t) =>
+          t.replace(
+            "  authz-matrix:\n",
+            "  authz-matrix:\n    if: github.event_name == 'push'\n",
+          ),
+      ],
+      [
+        "no pull_request trigger",
+        (t) => t.replace(/^ {2}pull_request:.*\n/m, ""),
+      ],
+      [
+        "no merge_group trigger",
+        (t) => t.replace(/^ {2}merge_group:.*\n/m, ""),
+      ],
+      ["unreadable", () => "\u0000: ["],
+    ];
+    for (const [what, fn] of cases) {
+      const changed = fn(real ?? "");
+      if (what !== "unreadable") expect(changed, what).not.toBe(real);
+      expect(gapsWith(fn), what).toHaveLength(1);
+    }
+    expect(hostedMatrixCiGaps(null)).toHaveLength(1);
+    // A condition that can be true (the release-only skip) still counts.
+    const cond = "        if: ${{ steps.ro.outputs.release_only != 'true' }}\n";
+    expect(real).toContain(`${step}${cond}`);
   });
 });
