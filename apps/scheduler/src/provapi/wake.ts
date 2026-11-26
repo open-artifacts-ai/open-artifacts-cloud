@@ -1,27 +1,34 @@
 // The fleet wake (cloud #264): the platform deploy's last step, once it has
 // marked the release verified, posts one message to oa-<p>-fleet-wake, and
-// this Worker, its only consumer, runs the fleet at once instead of waiting
-// for the next 2-minute tick. The run is fleetTick, the same pass as the
-// tick's fleet duty, under the same lease, with a longer deadline, so one run
-// covers the canary's upgrade, its probe, its smoke, queueing the rest the
-// moment the smoke passes, and watching the rest settle until the rollout is
-// done (fleet_done:<version>, which the deploy reads). A canary upgrade takes
-// 60 to 75 s, an estimate from cloud #458; the rest upgrade at once. Every
+// this Worker, its only consumer, runs the fleet. It is the only thing that
+// starts a fleet run: the 2-minute cron no longer runs the fleet. The run is
+// fleetTick under the fleet lease, with a long deadline, so one run covers
+// the canary's upgrade, its probe, its smoke, queueing the rest the moment
+// the smoke passes, and watching the rest settle until the rollout is done
+// (fleet_done:<version>, which the deploy reads). A canary upgrade takes 60
+// to 75 s, an estimate from cloud #458; the rest upgrade at once. Every
 // safety check is the pass's own: the canary first, the verified mark, the
-// halts, the smoke. The tick stays the backup: a lost, late or duplicate
-// message changes nothing but when the next pass runs.
+// halts, the smoke.
+//
+// A run that fails, times out, finds the lease held, or ends with the
+// rollout still unsettled (fleetSettled) asks the queue to deliver the
+// message again, so the queue's retries carry the rollout on, not a timer.
+// The queue's max_retries (apps/scheduler/wrangler.jsonc) bounds them; a
+// rollout still stuck by then has its alert open already (fleet_halted's
+// canary_blocked or platform_unverified, 45 min; version_skew).
 //
 // The body is never read: the fleet's target is this Worker's own version
 // tag, so a message for an older release is just one more pass.
+import { within } from "./env.js";
 import type { FleetEnv, FleetOptions } from "./fleet.js";
-import { fleetTick } from "./fleet.js";
+import { fleetSettled, fleetTick } from "./fleet.js";
 import { type DutyOutcome, runDuties } from "./run.js";
 
 /**
  * The wake run's fleetFast deadline: room for the canary's upgrade (about 60
  * to 75 s, an estimate), its probe and smoke, then the rest's upgrades (about
  * as long again, all at once) and their probes, with margin. A rollout that
- * takes longer is finished by the 2-minute tick.
+ * takes longer carries on in the message's next delivery.
  */
 export const FLEET_WAKE_DEADLINE_MS = 280_000;
 /**
@@ -31,13 +38,26 @@ export const FLEET_WAKE_DEADLINE_MS = 280_000;
  */
 export const FLEET_WAKE_TIMEOUT_MS = 290_000;
 /**
- * A wake that finds the lease held (the tick's fleet duty, at most about
- * 25 s, or an earlier wake) asks for one redelivery this much later, up to
- * FLEET_WAKE_MAX_ATTEMPTS deliveries; after that it is acked, and the tick
- * carries on.
+ * A run that failed or left the rollout unsettled comes back this much later:
+ * the pace of the 2-minute tick it replaces, so the smoke-off soak (passes at
+ * most FLEET_SOAK_GAP_MS apart) and FLEET_FAIL_GAP_MS keep their meaning.
  */
-export const FLEET_WAKE_RETRY_S = 30;
-export const FLEET_WAKE_MAX_ATTEMPTS = 3;
+export const FLEET_WAKE_RETRY_S = 120;
+/**
+ * A wake that finds the lease held (an earlier delivery still running, or a
+ * killed run's lease, FLEET_LEASE_MS) comes back this much later.
+ */
+export const FLEET_WAKE_HELD_RETRY_S = 30;
+/**
+ * The queue's max_retries for oa-<p>-fleet-wake (wrangler.jsonc; a config
+ * test pins the two equal). At FLEET_WAKE_RETRY_S apart that is an hour of
+ * deliveries: past every rollout alert's window (FLEET_BLOCKED_MS and
+ * fleetBlockedMs, 45 min), so a rollout still unsettled by the last one is
+ * alerting already. The last delivery is acked, never retried.
+ */
+export const FLEET_WAKE_MAX_RETRIES = 30;
+/** The settled read after a run: one D1 query. */
+export const FLEET_WAKE_SETTLED_MS = 5_000;
 
 export interface WakeOptions {
   /** Tests only: the fleet pass's probe, clock, sleep and smoke. */
@@ -50,11 +70,13 @@ export interface WakeOptions {
 export type WakeOutcome = DutyOutcome | "held";
 
 /**
- * One batch of oa-<p>-fleet-wake: one fleet run for the whole batch, then
- * every message acked. Only when the lease was held does one message (with
- * deliveries left) ask to come back in FLEET_WAKE_RETRY_S; the rest are
- * acked, so duplicates collapse into one run. A failed or timed-out run is
- * acked too: the tick is the backup. Never throws; logs one fixed line.
+ * One batch of oa-<p>-fleet-wake: one fleet run for the whole batch. When
+ * the run ended well and the rollout is settled (fleetSettled), every message
+ * is acked. Otherwise (a failed or timed-out run, the lease held, the rollout
+ * not settled) the message with the fewest deliveries asks to come back, in
+ * FLEET_WAKE_HELD_RETRY_S when the lease was held and FLEET_WAKE_RETRY_S
+ * otherwise, and the rest are acked, so duplicates collapse into one chain.
+ * A message on its last delivery is acked. Never throws; logs one fixed line.
  */
 export async function fleetWake(
   batch: MessageBatch<unknown>,
@@ -77,18 +99,34 @@ export async function fleetWake(
     },
   ]);
   const outcome: WakeOutcome = held ? "held" : (out.fleet ?? "exception");
-  let retried = 0;
-  for (const m of batch.messages) {
-    if (held && retried === 0 && m.attempts < FLEET_WAKE_MAX_ATTEMPTS) {
-      m.retry({ delaySeconds: FLEET_WAKE_RETRY_S });
-      retried++;
-    } else m.ack();
-  }
+  // Read only after a run that ended well: a failed one (D1 down, a hang)
+  // is retried without another call. A failed read counts as unsettled.
+  const settled =
+    outcome === "ok" &&
+    (await within(fleetSettled(env), FLEET_WAKE_SETTLED_MS).catch(() => {
+      console.error("provapi fleet wake settled_unknown");
+      return false;
+    }));
+  let next: Message<unknown> | null = null;
+  if (!settled)
+    for (const m of batch.messages)
+      if (
+        m.attempts <= FLEET_WAKE_MAX_RETRIES &&
+        (next === null || m.attempts < next.attempts)
+      )
+        next = m;
+  for (const m of batch.messages)
+    if (m === next)
+      m.retry({
+        delaySeconds: held ? FLEET_WAKE_HELD_RETRY_S : FLEET_WAKE_RETRY_S,
+      });
+    else m.ack();
   console.log(
     "provapi fleet wake",
     outcome,
     `messages=${batch.messages.length}`,
-    `retried=${retried}`,
+    `retried=${next === null ? 0 : 1}`,
+    `settled=${settled ? 1 : 0}`,
   );
   return outcome;
 }

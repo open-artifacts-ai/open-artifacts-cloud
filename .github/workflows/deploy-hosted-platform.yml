@@ -19,8 +19,9 @@
 # run also reads back the token's own end date and opens an issue 30 days
 # ahead (scripts/ci/deploy-token-expiry.sh). Once a run marks the platform
 # verified, it wakes the fleet (cloud #264): one message to the env's
-# oa-<p>-fleet-wake queue, so the scheduler starts the upgrades at once; the
-# 2-minute tick is the backup, so a failed wake only warns.
+# oa-<p>-fleet-wake queue, so the scheduler starts the upgrades at once. The
+# wake is the fleet's only start (the 2-minute tick no longer runs the fleet),
+# and a failed wake still only warns.
 # One version everywhere (#1040): the default is every target, in order. Any
 # other list is break-glass: it needs a reason and opens an issue naming the
 # run (verify_only is a check, so it needs neither). `billing` (the Stripe
@@ -589,12 +590,14 @@ jobs:
         run: node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts mark-verified "$DEPLOY_ENV" "$TAG"
       # The fleet wake (cloud #264), only for a tag whose scheduler consumes
       # the env's oa-<p>-fleet-wake (an older tag, a recovery deploy say,
-      # skips the wake and the wait with one log line; the tick moves it).
+      # skips the wake and the wait with one log line; its own tick moves it).
       # Once the mark is written, one message to
       # the env's oa-<p>-fleet-wake queue, so the scheduler starts the
-      # upgrades at once instead of on its next 2-minute tick. The tick is the
-      # backup: the script turns every failure into a warning and exits 0, and
-      # the step can't fail the run either way. Main's copy, like the others.
+      # upgrades at once. It is the fleet's only start: the scheduler's
+      # 2-minute tick no longer runs the fleet, and an unfinished rollout
+      # carries on through the message's own queue retries. The script turns
+      # every failure into a warning and exits 0, and the step can't fail the
+      # run either way. Main's copy, like the others.
       - id: wake_capable
         name: The tag's scheduler takes the fleet wake
         if: ${{ success() && steps.mark_verified.outcome == 'success' }}
@@ -636,7 +639,7 @@ jobs:
             { echo "done=true"; echo "at=$(sed -n 's/^fleet_done_at=//p' <<< "$out")"; } >> "$GITHUB_OUTPUT"
           else
             printf '%s\n' "$out"
-            echo "::warning::the fleet did not report every install upgraded within 10 minutes; the 2-minute tick carries on"
+            echo "::warning::the fleet did not report every install upgraded within 10 minutes; the wake's queue retries carry on"
           fi
       - name: Fleet done
         if: ${{ steps.fleet_done.outputs.done == 'true' }}

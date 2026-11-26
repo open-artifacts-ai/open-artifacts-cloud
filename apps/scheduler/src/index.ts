@@ -817,7 +817,8 @@ export default {
         // directorySync's nightly() already logged a fixed line.
       }
       // The Provisioning API duties, after both, in their own try:
-      // provapiTick isolates each duty and never throws (defense only).
+      // provapiTick isolates each duty and never throws (defense only). The
+      // fleet is not one of them (cloud #264): only queue() below runs it.
       try {
         await provapiTick(env, event.scheduledTime);
       } catch {
@@ -853,7 +854,8 @@ export default {
   },
   // oa-<p>-fleet-wake (cloud #264), its only queue: the platform deploy's
   // last step posts one message, and the fleet runs at once (provapi/wake.ts)
-  // under the same lease as the 2-minute tick's fleet duty. Never throws.
+  // under the fleet lease. The only start of a fleet run: an unfinished
+  // rollout comes back through the queue's retries. Never throws.
   async queue(batch, env) {
     await fleetWake(batch, env, Date.now());
   },

@@ -4,6 +4,11 @@
 // Worker), so the fleet moves when the platform does: staging on the staging
 // deploy, prod on the prod deploy, which a green staging red-line gates.
 //
+// When (cloud #264): a fleet run starts only on the deploy's wake message and
+// on that message's own queue retries (wake.ts), never on the 2-minute cron.
+// A "tick" below is one pass of such a run. The cron keeps only the fleet's
+// alert marks (fleetMarks) and the alerts read off them.
+//
 // The canary (FLEET_CANARY) goes first, must answer one healthy probe, and
 // then must pass the canary smoke (smoke.ts, #1343): short active checks as a
 // dedicated smoke member. Then every other install that is behind moves at
@@ -86,19 +91,19 @@ export const FLEET_FAST_POLL_MS = 3_000;
  */
 export const FLEET_BATCH_POLL_MS = 15_000;
 /**
- * fleetFast's deadline from the duty's start on the 2-minute tick: the fleet
- * duty's 25 s budget less a 2 s margin. A pass starts only if a slow probe
- * and the smoke's cleanup still fit; the smoke gets only the time left
- * (smokeCanary). The deploy's wake run (wake.ts) passes a longer one.
+ * fleetFast's default deadline from its start: the old 2-minute tick's fleet
+ * budget, 25 s, less a 2 s margin (tests use it). A pass starts only if a
+ * slow probe and the smoke's cleanup still fit; the smoke gets only the time
+ * left (smokeCanary). The wake run (wake.ts) passes its own, longer one.
  */
 export const FLEET_FAST_DEADLINE_MS = 23_000;
 /**
  * The fleet run's lease (platform_state), ported from cloud #458: one run at
- * a time, the 2-minute tick's fleet duty and the deploy's wake run (wake.ts)
- * alike, so the two never act side by side. A run that never gives it back
- * (killed mid-run) holds it this long, longer than the longest run
- * (FLEET_WAKE_TIMEOUT_MS in wake.ts): the ticks in between skip the fleet,
- * and the first one after it takes it.
+ * a time (a wake and its duplicate, or a retry, never act side by side). A
+ * run that never gives it back (killed mid-run) holds it this long, longer
+ * than the longest run (FLEET_WAKE_TIMEOUT_MS in wake.ts): a wake in between
+ * finds it held and comes back later (FLEET_WAKE_HELD_RETRY_S), and the first
+ * one after it takes it.
  */
 export const FLEET_LEASE_KEY = "scheduler_fleet_lease";
 export const FLEET_LEASE_MS = 320_000;
@@ -536,7 +541,7 @@ export interface FleetOptions {
   deadlineMs?: number;
   /**
    * fleetFast: also re-check every FLEET_BATCH_POLL_MS while the rest's
-   * batch is open or settling (the deploy's wake run; the tick does not).
+   * batch is open or settling (the wake run does; default off).
    */
   pollBatch?: boolean;
   /** Tests only: the canary smoke (default smoke() over fetch). */
@@ -557,8 +562,7 @@ export type FleetPass = "canary" | "batch" | "idle";
 
 /**
  * One fleet run: fleetFast under the lease, so two runs never act at once
- * (the 2-minute tick beside the deploy's wake run, a late tick, a message
- * delivered twice). Without the lease the run does nothing, logs
+ * (a message delivered twice, a retry beside a run that outlived its bound). Without the lease the run does nothing, logs
  * `provapi fleet overlap` and returns false. The lease is given back only
  * once fleetFast has ended, even past the run's timeout.
  */
@@ -768,6 +772,40 @@ async function markDone(
   await d1(db.prepare(SET_ONCE).bind(key, now).run());
   st.rows.set(key, { key, value: now, updated_at: now });
   console.log("provapi fleet done", target);
+}
+
+/**
+ * Whether no later fleet run has anything left to do for this Worker's
+ * target, so a wake can be acked (wake.ts): no target or no canary (nothing
+ * to roll out; fleet_halted says so for a canary with no target), the target
+ * halted (fleet_halted), or its rollout finished (fleet_done). Anything else,
+ * the canary or the rest mid-way, the smoke-off soak, a blocked canary or an
+ * unverified target, wants another run.
+ */
+export async function fleetSettled(env: FleetEnv): Promise<boolean> {
+  const target = fleetTarget(env.CF_VERSION_METADATA);
+  if (target === null || fleetCanary(env.FLEET_CANARY) === null) return true;
+  const st = await fleetState(env.PLATFORM_DB);
+  return st.rows.has(`${FLEET_DONE_PREFIX}${target}`) || isHalted(st, target);
+}
+
+/**
+ * The fleet's alert marks, on every 2-minute tick (the alerts duty), now that
+ * the fleet itself runs only on its wake (cloud #264): `fleet_unverified:`
+ * (platform_unverified) while the target has no verified mark, and the
+ * `fleet_behind:` stamps (version_skew) once it has. The same writes, under
+ * the same conditions, as a fleet pass makes (fleetDue), so an install that
+ * falls behind or catches up between releases, and a deploy that never
+ * marked its release verified, alert as before. Moves nothing: no job, no
+ * probe, no lease.
+ */
+export async function fleetMarks(env: FleetEnv, now: number): Promise<void> {
+  const target = fleetTarget(env.CF_VERSION_METADATA);
+  if (target === null || fleetCanary(env.FLEET_CANARY) === null) return;
+  const db = env.PLATFORM_DB;
+  const st = await fleetState(db);
+  if (await verified(db, now, st, target))
+    await trackBehind(db, now, st, target);
 }
 
 /**

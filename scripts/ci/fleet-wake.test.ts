@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest";
 import { sandbox, script } from "./stubs.ts";
 
 // fleet-wake.sh (cloud #264): one message to the env's oa-<p>-fleet-wake once
-// the platform is marked verified. The 2-minute tick is the backup, so every
-// failure is one warning and exit 0, never a failed deploy.
+// the platform is marked verified. It is the fleet's only start, and still
+// every failure is one warning and exit 0, never a failed deploy.
 const SCRIPT = script("fleet-wake.sh");
 const TOK = "cfut_WAKE_token_never_printed_0123";
 const ACCT = "26ac346086d4405f7a976d48747a2a75";
@@ -133,7 +133,7 @@ describe("fleet-wake.sh", () => {
     expect(r.out).toContain("::warning::fleet wake not sent:");
     expect(r.out).toContain(why);
     expect(r.out).toContain(
-      "the scheduler's 2-minute tick starts the upgrades",
+      "the fleet does not move until a later wake reaches the scheduler",
     );
   };
 

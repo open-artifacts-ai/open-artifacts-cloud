@@ -2,10 +2,10 @@
 # The fleet wake (cloud #264): deploy-hosted-platform.yml's last deploy step,
 # right after "Mark the platform verified", posts one message to the env's
 # oa-<p>-fleet-wake queue. The scheduler, its only consumer, then runs the
-# fleet rollout at once (apps/scheduler/src/provapi/wake.ts) instead of on its
-# next 2-minute tick. The tick is the backup, so nothing here fails the
-# deploy: no queue yet (a tag from before the wake), a failed lookup or post,
-# or a bad input is one warning and exit 0. The body names the env and the
+# fleet rollout at once (apps/scheduler/src/provapi/wake.ts). The wake is the
+# fleet's only start (the 2-minute tick no longer runs the fleet), and still
+# nothing here fails the deploy: no queue yet (a tag from before the wake), a
+# failed lookup or post, or a bad input is one warning and exit 0. The body names the env and the
 # release only; the scheduler never reads it (its target is its own tag).
 # The token reaches curl on stdin (-K -), never argv, and is never printed.
 # Needs CLOUDFLARE_API_TOKEN (Queues Edit, the deploy's own) and
@@ -14,7 +14,7 @@
 set -uo pipefail
 
 warn() {
-  echo "::warning::fleet wake not sent: $1; the scheduler's 2-minute tick starts the upgrades instead"
+  echo "::warning::fleet wake not sent: $1; the fleet does not move until a later wake reaches the scheduler"
   exit 0
 }
 [ "$#" -eq 2 ] || warn "usage: fleet-wake.sh staging|prod vX.Y.Z"

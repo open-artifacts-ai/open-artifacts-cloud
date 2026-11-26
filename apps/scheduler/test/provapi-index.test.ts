@@ -209,13 +209,13 @@ describe("scheduled() and the provapi duties", () => {
     expect(lines.some((l) => l.startsWith("provapi"))).toBe(false);
   });
 
-  // cloud #264: the 2-minute tick's fleet duty and the deploy's wake share
-  // one lease, so they never act side by side.
-  it("*/2: the fleet duty takes the lease and gives it back; while a wake holds it, it only logs the overlap", async () => {
+  // cloud #264: the 2-minute tick runs no fleet; only the deploy's wake
+  // (queue()) does, so the tick never touches the fleet lease.
+  it("*/2: no fleet duty: the tick runs no fleet pass and leaves the fleet lease alone", async () => {
     const f = fakes();
     const lines = captureLogs(vi.spyOn);
-    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
-    expect(lines).toContain("provapi fleet no_target");
+    expect(await provapiTick(f.env, NOW)).not.toHaveProperty("fleet");
+    expect(lines).not.toContain("provapi fleet no_target");
     expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
     await insert("platform_state", {
       key: FLEET_LEASE_KEY,
@@ -223,9 +223,12 @@ describe("scheduled() and the provapi duties", () => {
       updated_at: NOW - 1_000,
     });
     lines.length = 0;
-    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
-    expect(lines).toContain("provapi fleet overlap");
-    expect(lines).not.toContain("provapi fleet no_target");
+    await scheduler.scheduled(
+      controller(REVOKE_CRON),
+      f.env,
+      createExecutionContext(),
+    );
+    expect(lines.filter((l) => l.startsWith("provapi fleet"))).toEqual([]);
     expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - 1_000);
   });
 
@@ -251,7 +254,7 @@ describe("scheduled() and the provapi duties", () => {
     // The fleet ran (no target in this env) and gave its lease back.
     expect(lines).toEqual([
       "provapi fleet no_target",
-      "provapi fleet wake ok messages=2 retried=0",
+      "provapi fleet wake ok messages=2 retried=0 settled=1",
     ]);
     for (const l of lines) expect(l).toMatch(LINE);
     expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
@@ -300,7 +303,6 @@ describe("scheduled() and the provapi duties", () => {
       reminders: "ok",
       purge: "ok",
       health: "ok",
-      fleet: "ok",
       alerts: "timeout",
       prune: "ok",
     });
