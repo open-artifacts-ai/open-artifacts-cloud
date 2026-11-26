@@ -29,7 +29,11 @@ import {
   SURFACES_FILES,
   stage,
 } from "./pin-bump.ts";
-import { PIN_FILES as ARM_PIN_FILES, GATE_WORKFLOWS } from "./pin-bump-arm.ts";
+import {
+  PIN_FILES as ARM_PIN_FILES,
+  GATE_WORKFLOWS,
+  readGate,
+} from "./pin-bump-arm.ts";
 
 // A faked 502 would otherwise sleep through the real backoff.
 beforeEach(() => {
@@ -582,10 +586,10 @@ describe("pin-bump.yml", () => {
     expect(text).not.toMatch(/\bcron:/);
     // a pin PR merging, or land moving main, changes PUBLIC_PIN on main
     expect(w.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
+    // a gate run on any branch: readGate counts them all (no branch filter)
     expect(w.on.workflow_run).toEqual({
       workflows: GATES,
       types: ["completed"],
-      branches: ["main"],
     });
     for (const j of ["prepare", "open", "report"])
       expect(jobs[j].if).toContain(MAIN);
@@ -600,10 +604,11 @@ describe("pin-bump.yml", () => {
     expect(lw.on.push).toBeUndefined();
     expect(lw.on.schedule).toBeUndefined();
     expect(landText).not.toMatch(/\bcron:/);
+    // no branch filter: a gate run on any branch wakes it; land's `if` takes
+    // CI only on pin-land/*
     expect(lw.on.workflow_run).toEqual({
       workflows: ["CI", ...GATES],
       types: ["completed"],
-      branches: ["main", "pin-land/**"],
     });
     expect(Object.keys(landJobs)).toEqual(["land", "report"]);
     expect(landJobs.report.needs).toEqual(["land"]);
@@ -692,6 +697,7 @@ describe("pin-bump.yml", () => {
       if (o.event === "push") return "push" in wf.on;
       const r = wf.on.workflow_run;
       if (!r || !r.workflows.includes(o.wf)) return false;
+      if (!r.branches) return true;
       return r.branches.some((b: string) =>
         b.endsWith("/**")
           ? (o.branch ?? "").startsWith(b.slice(0, -2))
@@ -779,18 +785,79 @@ describe("pin-bump.yml", () => {
         // the PR path does not wait on the gate (pin-bump-arm does): no job
         expect(jobsFor(gateEnd(wf, ""))).toEqual([]);
         expect(landFor(gateEnd(wf, ""))).toEqual([]);
-        // a gate run on another branch is not the release pipeline's
-        expect(jobsFor({ ...gateEnd(wf), branch: "feature" })).toEqual([]);
-        expect(landFor({ ...gateEnd(wf), branch: "feature" })).toEqual([]);
       }
     });
 
-    it("CI ending on main runs nothing, in direct mode or not", () => {
-      for (const direct of ["", "on"]) {
-        const ci = { event: "workflow_run", wf: "CI", branch: "main", direct };
-        expect(jobsFor(ci)).toEqual([]);
-        expect(landFor(ci)).toEqual([]);
+    it("a gate run ending off main wakes the plan and the lander too: the gate counts it, so its end may open the gate", () => {
+      for (const wf of GATES)
+        for (const branch of ["rehearsal/v0.251.0", "feature", "main"]) {
+          const o = { ...gateEnd(wf), branch };
+          expect(jobsFor(o), `${wf} on ${branch}`).toEqual([
+            "prepare",
+            "open",
+            "report",
+          ]);
+          expect(landFor(o), `${wf} on ${branch}`).toEqual(["land", "report"]);
+          expect(group(o)).toBe("pin-bump");
+          expect(groupIn(LAND, o)).toBe("pin-land");
+          // outside direct mode it still does nothing
+          expect(jobsFor({ ...o, direct: "" })).toEqual([]);
+          expect(landFor({ ...o, direct: "" })).toEqual([]);
+        }
+      // the branch is never trusted: the jobs read no event field in a step
+      // (tested above), run main's checkout, and the plan and land decide
+      // from readGate, which counts every branch's runs
+      expect(String(jobs.prepare.if)).not.toContain("head_branch");
+      expect(String(landJobs.land.if)).not.toContain("head_branch == 'main'");
+    });
+
+    it("readGate counts queued and running gate runs on every branch, so every one it counts must wake the plan and the lander", () => {
+      const calls: string[] = [];
+      const gate = readGate(
+        (_cmd, args) => {
+          const a = args.join(" ");
+          calls.push(a);
+          // one redline-staging run, off main, in progress
+          if (
+            a.includes("/runs?status=in_progress") &&
+            a.includes("redline-staging.yml")
+          )
+            return { code: 0, stdout: "1\n", stderr: "" };
+          if (a.includes("/runs?status=")) {
+            if (a.includes("--jq .total_count"))
+              return { code: 0, stdout: "0\n", stderr: "" };
+            if (a.includes("display_title | select"))
+              return { code: 0, stdout: '{"n":0,"t":[]}', stderr: "" };
+            return { code: 0, stdout: "[]", stderr: "" };
+          }
+          return { code: 1, stdout: "", stderr: `unexpected ${a}` };
+        },
+        "o/r",
+        "tag=v1.2.3\nsha=" + "a".repeat(40) + "\n",
+      );
+      expect(gate.busy).toEqual(["redline-staging.yml"]);
+      const counts = calls.filter((c) => c.includes("--jq .total_count"));
+      expect(counts).toHaveLength(GATE_WORKFLOWS.length * 2);
+      // no branch filter in the counts: a run on any branch holds the gate
+      for (const c of counts) expect(c).not.toMatch(/[?&]branch=/);
+      // and every gate workflow wakes both, on any branch
+      for (const f of GATE_WORKFLOWS) {
+        const wf = f.replace(/\.yml$/, "");
+        expect(w.on.workflow_run.workflows).toContain(wf);
+        expect(lw.on.workflow_run.workflows).toContain(wf);
       }
+      expect(w.on.workflow_run.branches).toBeUndefined();
+      expect(lw.on.workflow_run.branches).toBeUndefined();
+    });
+
+    it("CI ending anywhere but pin-land/* runs nothing, in direct mode or not", () => {
+      for (const direct of ["", "on"])
+        for (const branch of ["main", "feature", "pin-bump/v1.2.3"]) {
+          const ci = { event: "workflow_run", wf: "CI", branch, direct };
+          expect(jobsFor(ci)).toEqual([]);
+          expect(landFor(ci)).toEqual([]);
+          expect(groupIn(LAND, ci)).toBe("pin-land-idle-42");
+        }
     });
 
     // Every event either workflow may see, in both modes.
@@ -801,6 +868,8 @@ describe("pin-bump.yml", () => {
       { event: "workflow_run", wf: "CI", branch: "main", direct },
       ...GATES.map((wf) => gateEnd(wf, direct)),
       { ...gateEnd("prod-release-chain", direct), branch: "feature" },
+      { ...gateEnd("redline-staging", direct), branch: "rehearsal/v0.251.0" },
+      { event: "workflow_run", wf: "CI", branch: "feature", direct },
     ];
     // PIN_BUMP_DIRECT is one repo variable: two events in a row see the same mode.
     const MODES = ["", "on"];

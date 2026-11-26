@@ -20,8 +20,11 @@
 # Triggers (cloud #264). Event-only: there is no schedule, and no push trigger,
 # so a pin landing on main never starts the lander. land runs:
 # - after CI on a staged pin (pin-land/*): it may land now;
-# - when a release pipeline gate workflow ends on main (GATE_WORKFLOWS in
-#   scripts/ci/pin-bump-arm.ts): the gate may be open now;
+# - when a release pipeline gate workflow ends, on any branch (GATE_WORKFLOWS
+#   in scripts/ci/pin-bump-arm.ts): readGate counts their runs on every branch,
+#   since a run off main still uses the shared staging and prod environments,
+#   so the end of any run it counts may open the gate. The branch is never
+#   trusted: land runs main's checkout and decides from readGate itself;
 # - on dispatch, by hand.
 # It lands every staged pin that passed, whatever started it, so every run in
 # its concurrency group does the same work: a pending run replaced by a newer
@@ -29,15 +32,16 @@
 # their own, so a run that only lands never takes a release dispatch's pending
 # slot. A failure is red and keeps one blocker issue "pin-land failed" open
 # (report, below); no timer retries it. Every job runs only on main of this
-# repo, never on a fork. An event no job takes (CI on main, or a workflow_run
-# outside direct mode) runs nothing, report included, so it never closes the
+# repo, never on a fork. An event no job takes (CI on any branch but
+# pin-land/*, or a workflow_run outside direct mode) runs nothing, report included, so it never closes the
 # blocker issue.
 name: pin-land
 
 on:
   workflow_dispatch:
   # From main's copy of this file and script; nothing from the event is used
-  # but its workflow name and branch, in the jobs' `if`.
+  # but its workflow name and branch, in the jobs' `if`. No branch filter: a
+  # gate workflow wakes this on any branch, CI only on pin-land/*.
   workflow_run:
     workflows:
       [
@@ -49,7 +53,6 @@ on:
         prod-release-chain,
       ]
     types: [completed]
-    branches: [main, "pin-land/**"]
 
 permissions: {}
 
@@ -58,13 +61,13 @@ permissions: {}
 # takes gets a group of its own, so it can never replace a pending run that has
 # work to do. The test for this group is the same as land's `if`.
 concurrency:
-  group: ${{ (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/'))))) && 'pin-land' || format('pin-land-idle-{0}', github.run_id) }}
+  group: ${{ (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && (github.event.workflow_run.name != 'CI' || startsWith(github.event.workflow_run.head_branch, 'pin-land/')))) && 'pin-land' || format('pin-land-idle-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   # main moves to a staged pin only once a full CI push run passed on that exact sha.
   land:
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && ((github.event.workflow_run.name != 'CI' && github.event.workflow_run.head_branch == 'main') || (github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-land/')))))
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && (github.event.workflow_run.name != 'CI' || startsWith(github.event.workflow_run.head_branch, 'pin-land/'))))
     runs-on: ubuntu-latest
     # Its own App and Environment: the bypass actor on main's ruleset is used here only.
     environment: pin-land

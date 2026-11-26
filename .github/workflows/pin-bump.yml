@@ -58,7 +58,11 @@
 # land moves main), the push that changes PUBLIC_PIN runs the same plan again at
 # once: a release that waited behind the open bump is bumped then. In direct
 # mode, a release that waited on the release pipeline gate is planned when a
-# gate workflow ends on main (GATE_WORKFLOWS in scripts/ci/pin-bump-arm.ts). The
+# gate workflow ends, on any branch (GATE_WORKFLOWS in scripts/ci/pin-bump-arm.ts):
+# readGate counts their queued and running runs on every branch, since a run
+# off main still uses the shared staging and prod environments, so the end of
+# any run it counts can open the gate. The branch is never trusted: the job
+# runs main's checkout and the plan decides from readGate itself. The
 # plan is the same idempotent check whatever starts it, so an event with nothing
 # newer does nothing. A failure is red and files the blocker issue (report,
 # below); no timer retries it. Every job runs only on main of this repo, never
@@ -80,8 +84,8 @@ on:
     branches: [main]
     paths: [PUBLIC_PIN]
   # Direct mode only, from main's copy of this file and script; nothing from the
-  # event is used but its branch, in the jobs' `if`: a release pipeline gate
-  # workflow ended on main, so the gate may be open now.
+  # event is used: a release pipeline gate workflow ended, on any branch (the
+  # gate counts runs on every branch), so the gate may be open now.
   workflow_run:
     workflows:
       [
@@ -92,7 +96,6 @@ on:
         prod-release-chain,
       ]
     types: [completed]
-    branches: [main]
 
 permissions: {}
 
@@ -103,12 +106,12 @@ permissions: {}
 # pending run that has work to do. The test for this group is the same as the
 # jobs' `if`s.
 concurrency:
-  group: ${{ (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && github.event.workflow_run.head_branch == 'main')) && 'pin-bump' || format('pin-bump-idle-{0}', github.run_id) }}
+  group: ${{ (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on') && 'pin-bump' || format('pin-bump-idle-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   prepare:
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && github.event.workflow_run.head_branch == 'main'))
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -204,7 +207,7 @@ jobs:
 
   open:
     needs: prepare
-    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && github.event.workflow_run.head_branch == 'main')) && needs.prepare.outputs.bump == 'true'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on') && needs.prepare.outputs.bump == 'true'
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 10
