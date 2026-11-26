@@ -6,7 +6,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { parse } from "yaml";
 import {
   backlogLine,
@@ -65,7 +65,7 @@ import {
   UNREADABLE_TRIES,
   unreadableRuns,
 } from "./cloud-flaky-tracker.ts";
-import type { Exec } from "./gh-retry.ts";
+import { type Exec, sleeper } from "./gh-retry.ts";
 
 const E = "\u001b";
 const T19_LOG = [
@@ -2713,11 +2713,11 @@ function ci1(id: number, at = NOW - HOUR): Listed {
 }
 
 describe("runs whose logs can't be read", () => {
-  // The Prover's case: 32 CI runs, the oldest 25 with a job log that answers
-  // 404, the newest 7 readable. Default budgets.
+  // The Prover's case: 32 CI runs, the oldest 25 with a job log that fails,
+  // the newest 7 readable. Default budgets (25 logs).
   const ids = Array.from({ length: 32 }, (_, i) => 4000 + i);
   const bad = new Set(ids.slice(0, 25));
-  const setup = () => {
+  const setup = (error = "HTTP 404: Not Found") => {
     const g = liveGh({
       listed: {
         "ci.yml": ids.map((id, i) => ci1(id, NOW - (40 - i) * HOUR)),
@@ -2729,15 +2729,25 @@ describe("runs whose logs can't be read", () => {
     });
     // Which run's jobs were listed last: its job log is read next.
     let current = 0;
+    const state = { broken: true, logs: 0 };
     const exec: Exec = (cmd, args) => {
       const a = args.join(" ");
       const m = /\/runs\/(\d+)\/attempts\/1\/jobs/.exec(a);
       if (m) current = Number(m[1]);
-      if (bad.has(current) && /\/actions\/jobs\/10\/logs/.test(a))
-        return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+      const log = /\/actions\/jobs\/\d+\/logs/.test(a);
+      if (log) state.logs++;
+      if (state.broken && bad.has(current) && log)
+        return { code: 1, stdout: "", stderr: error };
       return g.exec(cmd, args);
     };
-    return { g, exec };
+    /** One completion an hour; the logs it read. */
+    const completion = (e: number) => {
+      g.clock.now = NOW + e * HOUR;
+      state.logs = 0;
+      const r = reconcile({ exec, repo: "o/cloud", nowMs: g.clock.now });
+      return { r, logs: state.logs };
+    };
+    return { g, exec, state, completion };
   };
   const comments = (g: ReturnType<typeof liveGh>) =>
     g.state().stores.flatMap((st) => st.comments);
@@ -2747,24 +2757,26 @@ describe("runs whose logs can't be read", () => {
     g.clock.now = ms;
     return ms;
   };
+  const good = ids
+    .slice(25)
+    .map((id) => `${id}/2`)
+    .sort();
 
-  it("never starve the readable ones: all 7 are tracked on the first completion", () => {
-    const { g, exec } = setup();
-    const r = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW) });
-    expect(r.tracked.map((t) => t.run.runId)).toEqual(ids.slice(25));
-    expect(r.failed).toBe(25);
-    expect(backlogLine(r.left, r.failed)).toBe(
-      "backlog: 0 new, 25 to retry (the next completion's reconcile carries on)",
-    );
-    expect(marks(g)).toEqual(
-      ids
-        .slice(25)
-        .map((id) => `${id}/2`)
-        .sort(),
-    );
-    expect(pendingTries(comments(g))).toEqual(
-      Object.fromEntries(ids.slice(0, 25).map((id) => [`${id}/2`, 1])),
-    );
+  it("never starve the readable ones, and no completion reads more than 25 logs", () => {
+    const { g, completion } = setup();
+    const logs: number[] = [];
+    const tracked: number[][] = [];
+    for (let e = 0; e < 3; e++) {
+      const { r, logs: n } = completion(e);
+      logs.push(n);
+      tracked.push(r.tracked.map((t) => t.run.runId));
+    }
+    expect(Math.max(...logs)).toBeLessThanOrEqual(RECONCILE_LOGS);
+    // The first spends its 25 logs on the 25 oldest; the next tracks all 7
+    // before any retry.
+    expect(tracked[0]).toEqual([]);
+    expect(tracked[1]).toEqual(ids.slice(25));
+    expect(marks(g)).toEqual(good);
   });
 
   it("are tried after the runs not yet tried", () => {
@@ -2795,45 +2807,64 @@ describe("runs whose logs can't be read", () => {
     );
   });
 
-  it(`are dropped visibly after ${UNREADABLE_TRIES} reconciles could not read them, and then skipped`, () => {
-    const { g, exec } = setup();
-    const seen: { failed: number; dropped: number }[] = [];
-    let last = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW) });
-    seen.push({ failed: last.failed, dropped: last.dropped.length });
-    for (let e = 1; e < UNREADABLE_TRIES; e++) {
-      last = reconcile({ exec, repo: "o/cloud", nowMs: at(g, NOW + e * HOUR) });
-      seen.push({ failed: last.failed, dropped: last.dropped.length });
+  it(`a run found gone (404) is dropped on its ${UNREADABLE_TRIES}rd strike, visibly, and then skipped`, () => {
+    const { g, completion } = setup();
+    const struck = new Map<string, number>();
+    const notes: string[] = [];
+    let all: string[] = [];
+    for (let e = 0; e < 20 && all.length < bad.size; e++) {
+      const { r, logs } = completion(e);
+      expect(logs).toBeLessThanOrEqual(RECONCILE_LOGS);
+      for (const n of r.notes) {
+        const m = /^run (\d+\/2): .*\(gone: strike (\d) of/.exec(n);
+        if (m) struck.set(m[1] as string, Number(m[2]));
+      }
+      notes.push(...r.notes);
+      all = [...unreadableRuns(comments(g))];
     }
-    expect(seen).toEqual([
-      { failed: 25, dropped: 0 },
-      { failed: 25, dropped: 0 },
-      { failed: 0, dropped: 25 },
-    ]);
-    expect([...unreadableRuns(comments(g))].sort()).toEqual(
-      [...bad].map((id) => `${id}/2`).sort(),
+    // Every one of the 25 is dropped, after strikes 1 and 2.
+    expect(all.sort()).toEqual([...bad].map((id) => `${id}/2`).sort());
+    expect([...struck.values()].every((n) => n === UNREADABLE_TRIES - 1)).toBe(
+      true,
     );
+    expect(struck.size).toBe(25);
+    expect(marks(g)).toEqual(good);
     // The summary names each one it drops.
-    expect(last.notes).toContainEqual(
+    expect(notes).toContainEqual(
       expect.stringMatching(
         new RegExp(
-          `^run 4000/2: unreadable: could not be read on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store`,
+          `^run 4000/2: unreadable: found gone \\(404 or 410\\) on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store`,
         ),
       ),
-    );
-    expect(backlogLine(last.left, last.failed)).toBe(
-      "backlog: 0 new, 0 to retry",
     );
     expect(pendingRuns(comments(g))).toEqual([]);
     // Later, they are skipped like marked runs, and nothing is written.
     const before = JSON.stringify(g.state());
-    const later = reconcile({
-      exec,
-      repo: "o/cloud",
-      nowMs: at(g, NOW + 10 * HOUR),
-    });
-    expect(later.tracked).toEqual([]);
-    expect(later.failed + later.dropped.length).toBe(0);
+    const { r } = completion(30);
+    expect(r.tracked).toEqual([]);
+    expect(r.failed + r.dropped.length).toBe(0);
     expect(JSON.stringify(g.state())).toBe(before);
+  });
+
+  it("a 503 is never a strike: the runs wait, and are tracked once GitHub answers again", () => {
+    // gh-retry backs off between its tries of a 5xx: no real waits here.
+    const sleep = sleeper.sleep;
+    sleeper.sleep = () => {};
+    onTestFinished(() => {
+      sleeper.sleep = sleep;
+    });
+    const { g, state, completion } = setup("HTTP 503: Service Unavailable");
+    for (let e = 0; e < 10; e++) {
+      const { r, logs } = completion(e);
+      expect(logs).toBeLessThanOrEqual(RECONCILE_LOGS);
+      expect(r.dropped).toEqual([]);
+    }
+    expect([...unreadableRuns(comments(g))]).toEqual([]);
+    expect(marks(g)).toEqual(good);
+    expect(Object.values(pendingTries(comments(g)))).toEqual(Array(25).fill(0));
+    state.broken = false;
+    for (let e = 10; e < 20; e++) completion(e);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
   });
 
   it("a failure that is not a read of the run never drops it", () => {
