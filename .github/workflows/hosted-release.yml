@@ -164,7 +164,23 @@ jobs:
         run: |
           set -euo pipefail
           main_sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
-          if existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> /dev/null); then
+          # Only a confirmed 404 means there is no tag yet. Any other failure
+          # (5xx, network) stops here, before anything is created: GitHub would
+          # put a new release on an existing tag whatever --target says, and
+          # skip the existing-tag checks below. release-retry reruns a failed run.
+          tag_err=$(mktemp)
+          tag=found
+          existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> "$tag_err") || tag=error
+          if [ "$tag" = error ]; then
+            if grep -q '(HTTP 404)' "$tag_err"; then
+              tag=missing
+            else
+              cat "$tag_err" >&2
+              echo "::error::could not read tag $TAG (not a 404); nothing was created"
+              exit 1
+            fi
+          fi
+          if [ "$tag" = found ]; then
             # A re-run: the tag's commit is on main and pins this same release.
             [ "$(jq -r .object.type <<< "$existing")" = commit ] || { echo "::error::tag $TAG is not a lightweight tag on a commit"; exit 1; }
             tsha=$(jq -r .object.sha <<< "$existing")

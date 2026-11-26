@@ -531,6 +531,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       compare: string;
       sha: string;
       createFailsTimes?: number; // release create fails this often
+      tagErr?: string; // the tag read fails with this, not a 404
+      tagRaw?: string; // the tag read succeeds with this body
       releaseExists?: boolean;
       pinAt?: string; // PUBLIC_PIN at the existing tag's commit
     }) {
@@ -543,7 +545,9 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         'case "$*" in',
         '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
         `  "api repos/o/r/git/ref/tags/"*)`,
-        '    [ -n "${TAG_AT:-}" ] || exit 1',
+        '    [ -z "${TAG_ERR:-}" ] || { echo "$TAG_ERR" >&2; exit 1; }',
+        '    [ -z "${TAG_RAW:-}" ] || { echo "$TAG_RAW"; exit 0; }',
+        '    [ -n "${TAG_AT:-}" ] || { echo \'{"message":"Not Found","status":"404"}\'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; }',
         `    echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
         '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
         '  *"repos/o/r/contents/PUBLIC_PIN?ref="*) printf "%s\\n" "$PIN_AT" ;;',
@@ -573,6 +577,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
           MAIN: o.main,
           COMPARE: o.compare,
           TAG_AT: o.tagAt ?? "",
+          TAG_ERR: o.tagErr ?? "",
+          TAG_RAW: o.tagRaw ?? "",
           CREATE_FAILS: String(o.createFailsTimes ?? 0),
           REL_EXISTS: o.releaseExists ? "1" : "",
           REPO: "o/r",
@@ -677,6 +683,51 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       expect(r.calls).not.toContain("--verify-tag");
       expect(r.out).toContain(`created tag v1.2.3 at ${X} with its release`);
       expect(r.outputs).toBe(`sha=${X}\n`);
+    });
+    it("the tag read: a 404 creates the tag with its release", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toMatch(
+        /^release create v1\.2\.3 --repo o\/r --target /m,
+      );
+    });
+    for (const err of [
+      "gh: Service Unavailable (HTTP 503)",
+      "gh: Bad Gateway (HTTP 502)",
+      "error connecting to api.github.com",
+    ])
+      it(`the tag read: "${err}" fails the step and creates nothing`, () => {
+        const r = runCreate({
+          main: X,
+          compare: "identical",
+          sha: X,
+          tagErr: err,
+        });
+        expect(r.status).toBe(1);
+        expect(r.out).toContain("could not read tag v1.2.3 (not a 404)");
+        expect(r.out).toContain(err);
+        expect(r.calls).not.toContain("release create");
+        expect(r.calls).not.toContain("release view");
+        expect(r.calls).not.toContain("-X POST");
+        expect(r.outputs).toBe("");
+      });
+    it("the tag read: a 200 takes the existing-tag path, with --verify-tag", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toMatch(
+        /^release create v1\.2\.3 --repo o\/r --verify-tag /m,
+      );
+      expect(r.calls).not.toContain("--target");
+    });
+    it("the tag read: an unparsable 200 fails before any release", () => {
+      const r = runCreate({
+        tagRaw: "<html>oops</html>",
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+      });
+      expect(r.status).toBe(1);
+      expect(r.calls).not.toContain("release create");
     });
     it("a new tag is never polled: one tag read (does it exist?), no sleep", () => {
       const r = runCreate({ main: X, compare: "identical", sha: X });
