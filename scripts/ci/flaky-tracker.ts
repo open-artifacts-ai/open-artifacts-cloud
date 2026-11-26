@@ -72,7 +72,7 @@
 // group, and a dropped tracker run would lose its sightings. So the same
 // workflow also runs hourly with --reconcile (see reconcile()): it tracks
 // every run updated in the last RECONCILE_HOURS hours (created within
-// WINDOW_DAYS) that passed after a failed
+// RERUN_DAYS, how long GitHub allows a rerun) that passed after a failed
 // attempt and that the store doesn't hold yet, by the same rules and code.
 //
 // Usage: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
@@ -1350,8 +1350,13 @@ export const runFromArgs = (argv: string[]): RunInfo =>
 
 // ---- The reconcile ----
 
-/** How far back the hourly reconcile looks, by the run's creation time. */
+/** The hourly reconcile tracks the runs updated in the last this many hours. */
 export const RECONCILE_HOURS = 26;
+/** GitHub lets a run be rerun for this many days after it was created. */
+export const RERUN_DAYS = 30;
+/** list-workflow-runs returns at most this many runs for one query. */
+export const LIST_MAX = 1000;
+const PER_PAGE = 100;
 /** The watched workflows' files, for the runs API. */
 export const WORKFLOW_FILES: Record<Workflow, string> = {
   CI: "ci.yml",
@@ -1382,54 +1387,112 @@ export const eligible = (r: ListedRun) =>
       r.event === "workflow_dispatch" &&
       r.branch === "main"));
 
-function listRuns(
+const isoSec = (ms: number) =>
+  new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+
+/** A run as the runs API lists it, with only the fields the reconcile reads. */
+type RunRow = {
+  id: number;
+  run_attempt: number;
+  conclusion: string | null;
+  updated_at: string;
+  event: string;
+  head_branch: string;
+  head_sha: string;
+  display_title: string;
+};
+
+/**
+ * Every run a list-workflow-runs query (`path`, with no created, page or
+ * per_page) finds created from `from` to `to` (ms, whole seconds, both ends
+ * included). GitHub returns at most LIST_MAX runs for one query, so a range
+ * whose total_count is LIST_MAX or more is halved and each half listed the
+ * same way. A one-second range that still has that many throws: the list
+ * would be incomplete.
+ */
+export function listCreated(
+  exec: Exec,
+  path: string,
+  from: number,
+  to: number,
+): RunRow[] {
+  const range = encodeURIComponent(`${isoSec(from)}..${isoSec(to)}`);
+  const page = (p: number) =>
+    JSON.parse(
+      gh(exec, [
+        "api",
+        `${path}&created=${range}&per_page=${PER_PAGE}&page=${p}`,
+        "--jq",
+        "{total_count, workflow_runs: [.workflow_runs[] | {id, run_attempt, conclusion, updated_at, event, head_branch, head_sha, display_title}]}",
+      ]),
+    ) as { total_count: number; workflow_runs: RunRow[] };
+  const first = page(1);
+  if (first.total_count >= LIST_MAX) {
+    if (to - from < 1000)
+      throw new Error(
+        `${first.total_count} runs created at ${isoSec(from)}: GitHub lists at most ${LIST_MAX} for one query, so the reconcile can't see them all`,
+      );
+    const mid = from + Math.floor((to - from) / 2000) * 1000;
+    return [
+      ...listCreated(exec, path, from, mid),
+      ...listCreated(exec, path, mid + 1000, to),
+    ];
+  }
+  const out = [...first.workflow_runs];
+  for (let p = 2; (p - 1) * PER_PAGE < first.total_count; p++)
+    out.push(...page(p).workflow_runs);
+  return out;
+}
+
+/**
+ * A watched workflow's runs created in the last RERUN_DAYS days (a run can be
+ * rerun that long after it was created) whose latest attempt passed and that
+ * were updated in the last RECONCILE_HOURS. Whether a failure counts toward
+ * "twice in 7 days" is decided later, by the failed job's completion time,
+ * never by the run's creation.
+ */
+export function listRuns(
   exec: Exec,
   repo: string,
   workflow: Workflow,
   nowMs: number,
 ): ListedRun[] {
-  // Created in the sighting window (WINDOW_DAYS: an older failure can't count
-  // toward "twice in 7 days"), and updated in the last RECONCILE_HOURS: a run
-  // rerun to green days after it was created is still found.
-  const from = new Date(nowMs - WINDOW_DAYS * DAY_MS)
-    .toISOString()
-    .replace(/\.\d+Z$/, "Z");
-  const touched = new Date(nowMs - RECONCILE_HOURS * 3600 * 1000)
-    .toISOString()
-    .replace(/\.\d+Z$/, "Z");
-  const out = gh(exec, [
-    "api",
-    "--paginate",
-    `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
-    "--jq",
-    `.workflow_runs[] | select(.run_attempt > 1 and .updated_at >= "${touched}") | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title] | @json`,
-  ]);
-  return out
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => {
-      const [id, attempt, , event, branch, sha, title] = JSON.parse(l) as [
-        number,
-        number,
-        string,
-        string,
-        string,
-        string,
-        string,
-      ];
-      // The API's .name is the run-name ("redline-staging v0.242.2"), not the
-      // workflow's name: use the workflow this list was read for.
-      return { id, attempt, name: workflow, event, branch, sha, title };
-    });
+  const to = Math.floor(nowMs / 1000) * 1000;
+  const from = to - RERUN_DAYS * DAY_MS;
+  const touched = nowMs - RECONCILE_HOURS * 3600 * 1000;
+  return listCreated(
+    exec,
+    `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true`,
+    from,
+    to,
+  )
+    .filter(
+      (r) =>
+        r.conclusion === "success" &&
+        r.run_attempt > 1 &&
+        Date.parse(r.updated_at) >= touched,
+    )
+    .map((r) => ({
+      id: r.id,
+      attempt: r.run_attempt,
+      // The API's .name is the run-name ("redline-staging v0.242.2"), not
+      // the workflow's name: use the workflow this list was read for.
+      name: workflow,
+      event: r.event,
+      branch: r.head_branch,
+      sha: r.head_sha,
+      title: r.display_title,
+    }));
 }
 
 /**
  * The hourly reconcile: a tracker run GitHub dropped (its queue full, or the
  * runner gone) leaves a run unrecorded. This lists the watched workflows'
- * runs created in the last WINDOW_DAYS days and updated in the last
- * RECONCILE_HOURS hours whose latest attempt passed
- * after an earlier one, and tracks each the store doesn't hold yet (by run id
- * and the attempt that passed) with the same code as the event. A run the
+ * runs created in the last RERUN_DAYS days and updated in the last
+ * RECONCILE_HOURS hours whose latest attempt passed after an earlier one
+ * (listCreated splits a listing at GitHub's limit), and tracks each the store
+ * doesn't hold yet (by run id and the attempt that passed) with the same code
+ * as the event. A run the
  * store holds adds nothing and bumps nothing. A run that found no test (it
  * failed outside the tests) writes nothing, so it is read again each hour
  * until it leaves the window: reads only.
@@ -1489,7 +1552,7 @@ function main(argv: string[]) {
     const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
     failed = r.failed;
     lines = [
-      `Flaky tracker reconcile, last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
+      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and updated in the last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
     ];

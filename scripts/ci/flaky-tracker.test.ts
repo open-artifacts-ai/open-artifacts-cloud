@@ -23,7 +23,9 @@ import {
   issueTitle,
   keyOf,
   LABEL,
+  LIST_MAX,
   type ListedRun,
+  listRuns,
   MAX_ISSUES_PER_RUN,
   MAX_STORE_COMMENTS,
   markerBlock,
@@ -37,6 +39,7 @@ import {
   parseVitest,
   plan,
   RECONCILE_HOURS,
+  RERUN_DAYS,
   type RunInfo,
   readMarkers,
   reconcile,
@@ -53,7 +56,6 @@ import {
   titleText,
   track,
   twiceInWindow,
-  WINDOW_DAYS,
 } from "./flaky-tracker.ts";
 import type { Exec } from "./gh-retry.ts";
 
@@ -579,6 +581,74 @@ describe("untrusted text can't forge a marker or escape a comment", () => {
   });
 });
 
+const HOUR = 3600 * 1000;
+const DAY = 24 * HOUR;
+const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+/** A run as the runs API lists it. */
+type Listed = {
+  id: number;
+  run_attempt: number;
+  conclusion: string;
+  created_at: string;
+  updated_at: string;
+  name: string;
+  event: string;
+  head_branch: string;
+  head_sha: string;
+  display_title: string;
+};
+/** A listed run, created and last updated so long before NOW (1 day, 1 hour). */
+const row = (
+  r: ListedRun,
+  o: { created?: number; updated?: number } = {},
+): Listed => ({
+  id: r.id,
+  run_attempt: r.attempt,
+  conclusion: "success",
+  created_at: iso(NOW - (o.created ?? DAY)),
+  updated_at: iso(NOW - (o.updated ?? HOUR)),
+  name: r.name,
+  event: r.event,
+  head_branch: r.branch,
+  head_sha: r.sha,
+  display_title: r.title,
+});
+/**
+ * list-workflow-runs, as GitHub answers it: the runs created in the query's
+ * range (both ends included), newest first, the full total_count, but only
+ * the first LIST_MAX of them reachable by page.
+ */
+function listPage(runs: Listed[], path: string): string {
+  const q = new URLSearchParams(path.slice(path.indexOf("?") + 1));
+  const [a, b] = (q.get("created") ?? "").split("..");
+  if (!a || !b) throw new Error(`no created range in ${path}`);
+  const per = Number(q.get("per_page"));
+  const page = Number(q.get("page"));
+  const hit = runs
+    .filter(
+      (r) =>
+        r.created_at >= a &&
+        r.created_at <= b &&
+        (q.get("status") !== "success" || r.conclusion === "success"),
+    )
+    .sort((x, y) => y.created_at.localeCompare(x.created_at));
+  return JSON.stringify({
+    total_count: hit.length,
+    workflow_runs: hit.slice(0, LIST_MAX).slice((page - 1) * per, page * per),
+  });
+}
+/** The created ranges listed, in order, once per range. */
+const ranges = (calls: Call[]) => [
+  ...new Set(
+    calls
+      .map((c) => c.args.find((x) => x.includes("/actions/workflows/")) ?? "")
+      .filter(Boolean)
+      .map((p) =>
+        new URLSearchParams(p.slice(p.indexOf("?") + 1)).get("created"),
+      ),
+  ),
+];
+
 type Call = { args: string[] };
 type Comment = { user: string; body: string };
 function fakeGh(o: {
@@ -601,8 +671,8 @@ function fakeGh(o: {
   // attempt 1's conclusion, and the run's head repository (a fork's or ours).
   attempt1?: string;
   headRepo?: string;
-  // The reconcile's listing, per workflow file.
-  listed?: Record<string, ListedRun[]>;
+  // The runs API's runs, per workflow file, for the reconcile's listing.
+  listed?: Record<string, Listed[]>;
 }) {
   let lists = 0;
   const calls: Call[] = [];
@@ -650,14 +720,7 @@ function fakeGh(o: {
       );
     const wf = /actions\/workflows\/([\w.-]+)\/runs\?/.exec(a);
     if (wf)
-      return ok(
-        (o.listed?.[wf[1] as string] ?? [])
-          .map(
-            (r) =>
-              `${JSON.stringify([r.id, r.attempt, r.name, r.event, r.branch, r.sha, r.title])}\n`,
-          )
-          .join(""),
-      );
+      return ok(listPage(o.listed?.[wf[1] as string] ?? [], args[1] ?? ""));
     const log = /actions\/jobs\/(\d+)\/logs/.exec(a);
     if (log) return ok(jobs[Number(log[1]) - 10]?.log ?? "");
     if (a.startsWith("label list")) {
@@ -1261,31 +1324,149 @@ describe("reconcile", () => {
     sha: SHA,
     title: "redline-staging v0.246.0",
   };
-  const listed = { "redline-staging.yml": [gate] };
+  const listed = { "redline-staging.yml": [row(gate)] };
 
   it("lists the watched workflows' recent runs with small reads", () => {
     const g = fakeGh({ listed: {} });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
     expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
-    // Created in the 7-day sighting window, updated in the last 26 hours:
-    // a run rerun to green days after it was created is still found.
-    const from = new Date(NOW - WINDOW_DAYS * 24 * 3600 * 1000)
-      .toISOString()
-      .replace(/\.\d+Z$/, "Z");
-    const touched = new Date(NOW - RECONCILE_HOURS * 3600 * 1000)
-      .toISOString()
-      .replace(/\.\d+Z$/, "Z");
+    // Created in the last 30 days, when GitHub still allows a rerun; one
+    // page each, as neither reaches 1,000 runs.
+    expect(RERUN_DAYS).toBe(30);
+    const range = encodeURIComponent(
+      "2026-10-27T12:00:00Z..2026-11-26T12:00:00Z",
+    );
     expect(lists).toHaveLength(2);
     for (const [i, file] of ["ci.yml", "redline-staging.yml"].entries()) {
       expect(lists[i]).toContain(
-        `repos/o/cloud/actions/workflows/${file}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
+        `repos/o/cloud/actions/workflows/${file}/runs?status=success&exclude_pull_requests=true&created=${range}&per_page=100&page=1`,
       );
       expect(lists[i]).toContain("--jq");
-      expect(lists[i]).toContain(`.updated_at >= "${touched}"`);
+      expect(lists[i]).toContain("total_count");
     }
     // Nothing to track: no store read, nothing written.
     expect(writes(g)).toEqual([]);
+  });
+
+  it(`finds a run created days ago that passed on a rerun in the last ${RECONCILE_HOURS} hours`, () => {
+    const ci: ListedRun = {
+      ...gate,
+      name: "CI",
+      event: "pull_request",
+      branch: "x",
+    };
+    const g = fakeGh({
+      listed: {
+        "ci.yml": [
+          // Created 4 days ago, passed on attempt 3 two hours ago.
+          row(
+            { ...ci, id: 901, attempt: 3 },
+            { created: 4 * DAY, updated: 2 * HOUR },
+          ),
+          // Created 25 days ago: still inside GitHub's 30-day rerun period.
+          row({ ...ci, id: 902 }, { created: 25 * DAY, updated: 3 * HOUR }),
+          // Created 31 days ago: GitHub can't rerun it any more.
+          row({ ...ci, id: 903 }, { created: 31 * DAY, updated: 3 * HOUR }),
+          // Updated 27 hours ago: an earlier reconcile had it.
+          row({ ...ci, id: 904 }, { created: 2 * DAY, updated: 27 * HOUR }),
+          // Passed on its first attempt: nothing to track.
+          row({ ...ci, id: 905, attempt: 1 }, { created: 2 * DAY }),
+        ],
+      },
+    });
+    expect(
+      listRuns(g.exec, "o/cloud", "CI", NOW).map((r) => [r.id, r.attempt]),
+    ).toEqual([
+      [901, 3],
+      [902, 2],
+    ]);
+  });
+
+  it("counts a 25-day-old run's failure by its job's completion time, not the run's creation", () => {
+    // Run 900 was created 25 days ago; attempt 1's job failed at
+    // 2026-11-26T11:00:00Z and attempt 2 passed an hour ago. With run 800's
+    // sighting two days earlier, that is twice in 7 days.
+    const g = fakeGh({
+      labels: LABELS,
+      listed: { "redline-staging.yml": [row(gate, { created: 25 * DAY })] },
+      stores: storeWith(joins),
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked[0]?.done).toContainEqual({
+      action: "create",
+      id: joins.id,
+    });
+    const posted = writes(g).filter((c) => c.args[1] === "comment");
+    expect(bodyOf(posted[0])).toContain(sightingLine(keyOf(joins.id), s900));
+  });
+
+  it("splits a range whose listing reaches 1,000 runs, so none is missed", () => {
+    // 999 runs that passed first time in the last day, and the oldest one, a
+    // rerun from 20 days ago: 1,000 in the 30 days, GitHub's limit.
+    const once = { ...gate, attempt: 1 };
+    const g = fakeGh({
+      listed: {
+        "redline-staging.yml": [
+          ...Array.from({ length: LIST_MAX - 1 }, (_, i) =>
+            row({ ...once, id: 10_000 + i }, { created: HOUR + i * 60_000 }),
+          ),
+          row(gate, { created: 20 * DAY }),
+        ],
+      },
+    });
+    expect(
+      listRuns(g.exec, "o/cloud", "redline-staging", NOW).map((r) => r.id),
+    ).toEqual([900]);
+    expect(ranges(g.calls)).toEqual([
+      "2026-10-27T12:00:00Z..2026-11-26T12:00:00Z",
+      "2026-10-27T12:00:00Z..2026-11-11T12:00:00Z",
+      "2026-11-11T12:00:01Z..2026-11-26T12:00:00Z",
+    ]);
+  });
+
+  it("finds the oldest of 1,145 runs, past the 1,000 one listing returns", () => {
+    // As public CI had for 9 to 15 November: one query reaches only the
+    // newest 1,000.
+    const once = { ...gate, attempt: 1 };
+    const g = fakeGh({
+      listed: {
+        "redline-staging.yml": [
+          ...Array.from({ length: 1144 }, (_, i) =>
+            row(
+              { ...once, id: 10_000 + i },
+              { created: 2 * DAY + i * 300_000 },
+            ),
+          ),
+          row({ ...gate, attempt: 3 }, { created: 8 * DAY, updated: 2 * HOUR }),
+        ],
+      },
+    });
+    expect(
+      listRuns(g.exec, "o/cloud", "redline-staging", NOW).map((r) => [
+        r.id,
+        r.attempt,
+      ]),
+    ).toEqual([[900, 3]]);
+    expect(ranges(g.calls).length).toBeGreaterThan(1);
+  });
+
+  it("fails loudly when one second holds 1,000 runs", () => {
+    const g = fakeGh({
+      listed: {
+        "ci.yml": Array.from({ length: LIST_MAX }, (_, i) =>
+          row({ ...gate, id: 10_000 + i }, { created: 5 * DAY }),
+        ),
+      },
+    });
+    const at = iso(NOW - 5 * DAY);
+    expect(() => listRuns(g.exec, "o/cloud", "CI", NOW)).toThrow(
+      `1000 runs created at ${at}: GitHub lists at most 1000 for one query`,
+    );
+    expect(() =>
+      reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW }),
+    ).toThrow(/1000 runs created at/);
   });
 
   it("records a run the tracker missed, with the same code as the event", () => {
@@ -1311,7 +1492,7 @@ describe("reconcile", () => {
     const named = { ...gate, name: "redline-staging v0.246.0" };
     const g = fakeGh({
       labels: LABELS,
-      listed: { "redline-staging.yml": [named] },
+      listed: { "redline-staging.yml": [row(named)] },
       stores: storeWith(joins),
     });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
@@ -1387,7 +1568,7 @@ describe("reconcile", () => {
     expect(eligible({ ...gate, name: "other" })).toBe(false);
     const g = fakeGh({
       labels: LABELS,
-      listed: { "redline-staging.yml": [{ ...gate, attempt: 1 }] },
+      listed: { "redline-staging.yml": [row({ ...gate, attempt: 1 })] },
     });
     expect(
       reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW }).tracked,
@@ -1401,7 +1582,7 @@ describe("reconcile", () => {
     const g = fakeGh({
       labels: LABELS,
       headRepo: "someone/fork",
-      listed: { "ci.yml": [fork] },
+      listed: { "ci.yml": [row(fork)] },
       stores: storeWith(joins),
     });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
@@ -1417,7 +1598,10 @@ describe("reconcile", () => {
     const g = fakeGh({
       labels: LABELS,
       listed: {
-        "redline-staging.yml": [{ ...gate, id: 901, title: "no tag" }, gate],
+        "redline-staging.yml": [
+          row({ ...gate, id: 901, title: "no tag" }),
+          row(gate),
+        ],
       },
     });
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
