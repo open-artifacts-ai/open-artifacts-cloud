@@ -701,7 +701,7 @@ describe("the over-budget issue", () => {
 
 describe("tick reads", () => {
   const lines = (xs: unknown[]) => xs.map((x) => JSON.stringify(x)).join("\n");
-  const fake = (now: string) => {
+  const fake = (now: string, page?: Pr[]) => {
     const w = at(now);
     const calls: string[] = [];
     const exec: Exec = (_cmd, args) => {
@@ -713,8 +713,13 @@ describe("tick reads", () => {
         out = lines(
           w.releases.map((r) => ({ tag: r.tag, publishedAt: r.publishedAt })),
         );
-      else if (path.includes("/pulls?")) out = lines(w.prs);
-      else if (path.includes("/compare/"))
+      else if (path.includes("/pulls?")) {
+        const head = /[?&]head=[^:&]+:([^&]+)/.exec(path)?.[1];
+        // The newest-100 page may have lost an old PR; the head lookup never does.
+        out = head
+          ? lines(w.prs.filter((p) => p.ref === head))
+          : lines(page ?? w.prs);
+      } else if (path.includes("/compare/"))
         out = JSON.stringify([
           { sha: "a".repeat(40), subject: "feat: x (#1)", date: T("09:00:00") },
         ]);
@@ -773,10 +778,93 @@ describe("tick reads", () => {
     expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
       "issue list",
     ]);
+    expect(f.calls.filter((c) => c.includes("/pulls?"))).toEqual([
+      "repos/o/c/pulls?state=all&head=o:pin-bump/v0.245.1&per_page=100",
+    ]);
     expect(r.history.map((h) => h.tag)).toEqual(["v0.245.0", "v0.245.1"]);
     expect(r.history[1]?.e2e).toBe(45.8);
     expect(summary(r.current)).toContain("No release in flight.");
     expect(summary(r.current)).toContain("Not measured: fleet");
+  });
+
+  it("an old release's pin PR off the newest-100 page is still found by its head branch", () => {
+    const now = "2026-11-26T09:00:00Z";
+    const f = fake(T("19:50:00"), []);
+    const r = tick({
+      exec: f.exec,
+      repo: "o/c",
+      publicRepo: "o/p",
+      config,
+      history: [],
+      now,
+      issue: true,
+    });
+    const t = r.current.releases.find((x) => x.tag === "v0.245.1");
+    expect(t?.stages.find((s) => s.name === "pin_open")?.state).toBe("done");
+    expect(r.over).toEqual([]);
+    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
+      "issue list",
+    ]);
+  });
+
+  it("a release finished in history is not rebuilt: no PR read, done even with nothing left to read", () => {
+    const now = "2026-11-26T09:00:00Z";
+    const f = fake(T("19:06:00"), []);
+    const exec: Exec = (cmd, args) => {
+      const path = args[args.length - 1] ?? "";
+      if (path.includes("/pulls?") || path.includes("/actions/workflows/"))
+        return { code: 0, stdout: "", stderr: "" };
+      return f.exec(cmd, args);
+    };
+    const h: HistoryEntry = {
+      tag: "v0.245.1",
+      mode: "pr",
+      mergedAt: fx.merges["v0.245.1"],
+      publishedAt: T("18:20:00"),
+      doneAt: T("19:06:00"),
+      e2e: 45.8,
+      stages: { tag: 3.6 },
+    };
+    const r = tick({
+      exec,
+      repo: "o/c",
+      publicRepo: "o/p",
+      config,
+      history: [h],
+      now,
+      issue: true,
+    });
+    expect(f.calls.filter((c) => c.includes("/pulls?"))).toEqual([]);
+    expect(r.over).toEqual([]);
+    expect(r.current.inFlight).toEqual([]);
+    expect(r.history).toEqual([h]);
+    expect(f.calls.filter((c) => c.startsWith("issue"))).toEqual([
+      "issue list",
+    ]);
+  });
+
+  it("the newest finished release in history still keeps its own overruns", () => {
+    const tag = config.stages.find((s) => s.name === "tag");
+    const h: HistoryEntry = {
+      tag: "v0.245.1",
+      mode: "pr",
+      publishedAt: T("18:20:00"),
+      doneAt: T("19:06:00"),
+      e2e: 10,
+      stages: { tag: (tag?.budget ?? 0) + 5 },
+    };
+    const r = compute({
+      releases: [{ tag: "v0.245.1", publishedAt: T("18:20:00") }],
+      runs: [],
+      prs: [],
+      merges: {},
+      history: [h],
+      config,
+      now: "2026-11-26T09:00:00Z",
+    });
+    expect(r.over.map((o) => [o.tag, o.stage, o.kind])).toEqual([
+      ["v0.245.1", "tag", "last_release"],
+    ]);
   });
 
   it("the newest release stays watched however old, and widens the runs window to it", () => {
@@ -934,6 +1022,11 @@ describe("release-watch.yml", () => {
     expect(up.with.name).toBe("release-stats");
     expect(up.with.path).toContain("out/current.json");
     expect(up.with.path).toContain("out/history.jsonl");
-    expect(raw).toContain("actions/artifacts?name=release-stats");
+    expect(raw).toContain(
+      "actions/workflows/release-watch.yml/runs?branch=main&status=success",
+    );
+    expect(raw).toContain("artifacts?name=release-stats");
+    expect(raw).not.toContain("repos/$REPO/actions/artifacts?");
+    expect(up.with["retention-days"]).toBe(7);
   });
 });

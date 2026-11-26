@@ -15,9 +15,10 @@
 // ignores --history (one run, about 2 reads per release). Without it the
 // window is the last lookbackHours plus the newest release, however old, so a
 // stalled release keeps being watched.
-// Reads: the runs of four workflows on main, public's releases, this repo's
-// pin-bump PRs, and per release not yet in history a compare and a commit's
-// PRs on public (its merge time). Writes: only the one issue, through gh().
+// Reads: the runs of four workflows on main, public's releases, and per
+// release not yet in history its pin-bump PRs (by head branch), a compare and
+// a commit's PRs on public (its merge time). A release in history is done and
+// not rebuilt. Writes: only the one issue, through gh().
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -121,7 +122,8 @@ export type Overrun = {
   tag: string;
   stage: string;
   kind: "in_flight" | "last_release";
-  startedAt: string;
+  /** Unknown for a finished release read back from history. */
+  startedAt?: string;
   minutes: number;
   budget: number;
   url?: string;
@@ -335,16 +337,18 @@ export function timeline(o: {
 export function supersede(tls: Timeline[]): Timeline[] {
   const byTag = [...tls].sort((a, b) => compareTags(a.tag, b.tag));
   return byTag.map((t, i) => {
-    if (t.doneAt) return t;
+    if (t.doneAt || t.closedAt) return t;
     const newer = byTag
       .slice(i + 1)
-      .find((n) =>
-        n.stages.some(
-          (s) =>
-            (s.name === "hosted_release" && s.startedAt) ||
-            (s.name === "pin_merge" && s.endedAt) ||
-            (s.name === "direct_pin" && s.endedAt),
-        ),
+      .find(
+        (n) =>
+          !!n.doneAt ||
+          n.stages.some(
+            (s) =>
+              (s.name === "hosted_release" && s.startedAt) ||
+              (s.name === "pin_merge" && s.endedAt) ||
+              (s.name === "direct_pin" && s.endedAt),
+          ),
       );
     if (!newer) return t;
     const closedAt = byTag.slice(i + 1).find((n) => n.doneAt)?.doneAt;
@@ -517,13 +521,13 @@ export function overruns(
   );
   if (newest && !newerLive) {
     for (const s of newest.stages)
-      if (s.startedAt && (s.minutes ?? 0) > s.budget)
+      if (s.minutes !== undefined && s.minutes > s.budget)
         over.push({
           tag: newest.tag,
           stage: s.name,
           kind: "last_release",
           startedAt: s.startedAt,
-          minutes: s.minutes ?? 0,
+          minutes: s.minutes,
           budget: s.budget,
           url: s.url,
         });
@@ -597,6 +601,31 @@ export function issuePlan(
   return { action: "edit", number: mine.number, body };
 }
 
+/**
+ * Pure: a release already finished in history, as a done timeline. It is not
+ * rebuilt from GitHub: its pin PR or runs may since have left what a tick
+ * reads, and rebuilding it then would show a finished release as stalled.
+ */
+export function fromHistory(h: HistoryEntry, config: Config): Timeline {
+  const stages: StageRow[] = measured(config, h.mode).map((s) => ({
+    name: s.name,
+    budget: s.budget,
+    state: "done",
+    ...(h.stages[s.name] !== undefined ? { minutes: h.stages[s.name] } : {}),
+  }));
+  return {
+    tag: h.tag,
+    mode: h.mode,
+    mergedAt: h.mergedAt,
+    publishedAt: h.publishedAt,
+    stages,
+    ...(h.supersededBy
+      ? { supersededBy: h.supersededBy, closedAt: h.doneAt }
+      : { doneAt: h.doneAt }),
+    e2e: h.e2e,
+  };
+}
+
 /** Pure: the whole tick from what was read. */
 export function compute(o: {
   releases: Release[];
@@ -607,25 +636,30 @@ export function compute(o: {
   config: Config;
   now: string;
 }) {
-  const tls = supersede(
-    o.releases.map((release) =>
-      timeline({
+  const known = new Map(o.history.map((h) => [h.tag, h]));
+  const all = supersede(
+    o.releases.map((release) => {
+      const h = known.get(release.tag);
+      if (h) return fromHistory(h, o.config);
+      return timeline({
         release,
         runs: o.runs,
         prs: o.prs,
         mergedAt: o.merges[release.tag],
         config: o.config,
         now: o.now,
-      }),
-    ),
+      });
+    }),
   );
+  // Rebuilt ones only: a finished release stays as history has it.
+  const tls = all.filter((t) => !known.has(t.tag));
   const history = mergeHistory(
     o.history,
     tls.map(historyEntry).filter((e): e is HistoryEntry => !!e),
     o.config.historySize,
   );
   const s = stats(history, o.config);
-  const { over, red } = overruns(tls, o.config, o.now);
+  const { over, red } = overruns(all, o.config, o.now);
   const inFlight = tls
     .filter((t) => !t.doneAt && !t.supersededBy)
     .map((t) => {
@@ -766,18 +800,43 @@ export function readReleases(
     .sort((a, b) => compareTags(a.tag, b.tag));
 }
 
-export function readPrs(exec: Exec, repo: string, all: boolean): Pr[] {
+const PR_JQ = `.[] | select(.head.ref | startswith("${BRANCH_PREFIX}")) | {number, ref: .head.ref, createdAt: .created_at, mergedAt: .merged_at, url: .html_url} | tojson`;
+
+/** Every pin-bump PR, all pages: for a backfill. */
+export function readPrs(exec: Exec, repo: string): Pr[] {
   return lines<Pr>(
     gh(exec, [
       "api",
-      ...(all ? ["--paginate"] : []),
+      "--paginate",
       "-X",
       "GET",
       "--jq",
-      `.[] | select(.head.ref | startswith("${BRANCH_PREFIX}")) | {number, ref: .head.ref, createdAt: .created_at, mergedAt: .merged_at, url: .html_url} | tojson`,
+      PR_JQ,
       `repos/${repo}/pulls?state=all&sort=created&direction=desc&per_page=100`,
     ]),
   );
+}
+
+/**
+ * Each tag's pin-bump PRs, looked up by head branch, so an old release's PR is
+ * found however many PRs are newer.
+ */
+export function readPinPrs(exec: Exec, repo: string, tags: string[]): Pr[] {
+  const owner = repo.split("/")[0] ?? "";
+  return tags
+    .filter((t) => TAG_RE.test(t))
+    .flatMap((t) =>
+      lines<Pr>(
+        gh(exec, [
+          "api",
+          "-X",
+          "GET",
+          "--jq",
+          PR_JQ,
+          `repos/${repo}/pulls?state=all&head=${owner}:${BRANCH_PREFIX}${t}&per_page=100`,
+        ]),
+      ).filter((p) => p.ref === `${BRANCH_PREFIX}${t}`),
+    );
 }
 
 /**
@@ -920,7 +979,13 @@ export function tick(o: {
   const out = compute({
     releases,
     runs: readRuns(o.exec, o.repo, since),
-    prs: readPrs(o.exec, o.repo, backfill),
+    prs: backfill
+      ? readPrs(o.exec, o.repo)
+      : readPinPrs(
+          o.exec,
+          o.repo,
+          releases.filter((r) => !known.has(r.tag)).map((r) => r.tag),
+        ),
     merges,
     history,
     config: o.config,

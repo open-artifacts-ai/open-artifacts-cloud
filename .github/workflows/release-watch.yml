@@ -6,9 +6,10 @@
 #
 # - Stateless: each run rebuilds every recent release's timeline from GitHub
 #   timestamps (scripts/ci/release-watch.ts). Finished releases go into
-#   history.jsonl, carried from the newest `release-stats` artifact to the
-#   next, with current.json beside it. A lost artifact only empties the
-#   p50/p90 until the next backfill.
+#   history.jsonl, carried from the `release-stats` artifact of this
+#   workflow's newest successful run on main (never one a branch or PR run
+#   uploaded) to the next, with current.json beside it. The artifact is kept
+#   7 days; a lost one only empties the p50/p90 until the next backfill.
 # - Backfill: dispatch with backfill_since (YYYY-MM-DD, such as 2026-11-20)
 #   reads every release since that day and starts the history afresh.
 # - The fleet stage is not measured yet: it needs a public fleet done signal
@@ -81,7 +82,11 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p prev
-          id=$(gh api -X GET "repos/$REPO/actions/artifacts?name=release-stats&per_page=1" --jq '.artifacts[0] | select(.expired | not) | .id' 2> /dev/null || true)
+          run=$(gh api -X GET "repos/$REPO/actions/workflows/release-watch.yml/runs?branch=main&status=success&per_page=20" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPO\" and (.event == \"schedule\" or .event == \"workflow_run\" or .event == \"workflow_dispatch\"))][0].id // empty" 2> /dev/null || true)
+          id=""
+          if [ -n "$run" ]; then
+            id=$(gh api -X GET "repos/$REPO/actions/runs/$run/artifacts?name=release-stats&per_page=1" --jq '.artifacts[0] | select(.expired | not) | .id' 2> /dev/null || true)
+          fi
           if [ -z "$id" ]; then
             echo "::notice title=Release watch::no previous release-stats artifact: history starts empty"
             exit 0
@@ -107,5 +112,5 @@ jobs:
           path: |
             out/current.json
             out/history.jsonl
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: error
