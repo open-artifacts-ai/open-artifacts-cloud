@@ -3961,6 +3961,38 @@ describe("fix round 4 (T8): every server precondition for hosted google", () => 
     expect(JSON.parse(regEntry(s, inst.id) as string).domains).toEqual([]);
   });
 
+  it("a google install with no AUTH_DOMAINS (mit-ai's shape) can change vars: email on, then off, no session cut", async () => {
+    const s = setup();
+    const inst = keep(
+      await s.p.create({
+        ...input("gmailowner", { vars: { AUTH_PROVIDERS: "google" } }),
+        googleWithoutDomains: true,
+      }),
+    );
+    keep(await s.p.updateVars(inst.id, { AUTH_PROVIDERS: "google,email" }));
+    expect(renderedEnv(s, inst.id).AUTH_PROVIDERS).toBe("google,email");
+    expect(JSON.parse(regEntry(s, inst.id) as string).domains).toEqual([]);
+    expect(s.row(inst.id).session_cut).toBeNull();
+    keep(await s.p.updateVars(inst.id, { AUTH_PROVIDERS: "google" }));
+    expect(renderedEnv(s, inst.id).AUTH_PROVIDERS).toBe("google");
+  });
+
+  it("an install with no google and no AUTH_DOMAINS still can't turn google on", async () => {
+    const s = setup();
+    const inst = keep(
+      await s.p.create({
+        ...input("codesonly", { vars: CODES }),
+        googleWithoutDomains: true,
+      }),
+    );
+    const w = s.fake.writes().length;
+    const e = await fails(
+      s.p.updateVars(inst.id, { AUTH_PROVIDERS: "email,google" }),
+    );
+    expect(e.message).toMatch(/google needs AUTH_DOMAINS/);
+    expect(s.fake.writes().length).toBe(w);
+  });
+
   it.each([
     [
       "keeps google and drops AUTH_DOMAINS",
