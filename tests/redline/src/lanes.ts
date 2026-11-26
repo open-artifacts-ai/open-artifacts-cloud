@@ -83,11 +83,13 @@ const installs = (): Claims["state"] => ({
 
 /**
  * The install-plane buckets, from apps/server (namespace ids are account-wide,
- * so a key without the install in it is shared by every staging install):
+ * and each install has its own block of them, packages/provision rlNs, so a
+ * key without the install in it is still per install):
  * - hooks: RL_ANON test:<install>:<ip>, 30 a minute; every spender claims the
  *   runner's hook ledger (src/http.ts paceHook), 25 a minute;
- * - rl-anon: every other RL_ANON key (reg:ip, tok:ip, sub:ip, ...), shared by
- *   rl-a and rl-b; src/rl-anon.ts claims one ledger per key, 25 a minute;
+ * - rl-anon: every other RL_ANON key (reg:ip, tok:ip, sub:ip, ...); each
+ *   install has its own ratelimit namespaces (packages/provision rlNs), so
+ *   src/rl-anon.ts claims one ledger per key and install, 25 a minute;
  * - codes: RL_AUTH <install>:<ip>, 20 a minute (one-time code requests); only
  *   signin and edge spend it, and they share a lane.
  */

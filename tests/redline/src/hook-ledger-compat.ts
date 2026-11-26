@@ -7,7 +7,7 @@
 // - from #3200 (RL_HOOKS_*): a call whose hook key checks out is charged to
 //   RL_HOOKS (600 a minute), and only a wrong or absent key to RL_ANON.
 //   HOOK_LIMIT is 570, and a claim past it throws HookBudgetError at once:
-//   the ledger never waits.
+//   the ledger never waits, and nothing here waits either (no sleeps, #3115).
 //
 // So the suite claims in one of two ways:
 // - claimSuiteSlot, a hook call with the install's right key: before #3200
@@ -18,18 +18,12 @@
 // - claimCappedSlot, anything RL_ANON is charged for: a hook call that may
 //   carry a wrong key (the guard's probe, R26's key poll; wrongKeyLedger)
 //   and the RL_ANON keys rl-anon.ts paces. At most SUITE_HOOK_LIMIT (25) a
-//   minute per ledger, RL_ANON's 30 less 5. A full ledger waits for room,
-//   exactly as the old ledger did: until the oldest call leaves the window,
-//   computed from the ledger (roomIn, plus EDGE_MS), never a fixed time, up
-//   to the caller's `deadline`; past it, HookBudgetError. Before #3200 the
-//   ledger waits itself; from #3200 claimCappedSlot does. (Decision on cloud
-//   #475: the server holds these keys to 30 a minute, the old pin waited here
-//   already, and the last 3 live runs waited 0.0 s, so a rare burst becomes a
-//   short wait, not a flaky failure. Right-key calls never wait.)
+//   minute per ledger, RL_ANON's 30 less 5. Before #3200 a full ledger waits
+//   (the old ledger's own wait); from #3200 it is refused at once.
 //
 // TODO(public #3200): once PUBLIC_PIN is at or past the release with #3200,
-// drop the pre-#3200 branch (ledgerWaits, HOOK_GAP_MS) and import the new
-// names directly.
+// drop the pre-#3200 branch (ledgerWaits, HOOK_GAP_MS, `sleep`) and import
+// the new names directly.
 import * as ledger from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 
 export {
@@ -39,15 +33,15 @@ export {
   hookWindowCount,
 } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 
-/** Claim options; `sleep` and `deadline` bound a capped claim's wait for room. */
+/** Claim options of either ledger; only the pre-#3200 one reads `sleep` and `deadline`. */
 export interface ClaimOpts {
   root?: string;
   reserve?: number;
   now?: () => number;
   afterScan?: () => Promise<void>;
-  /** How a capped claim waits the computed time for room (default a timer). */
+  /** Pre-#3200 only: how the ledger waits for room. */
   sleep?: (ms: number) => Promise<void>;
-  /** Epoch ms by which the call must be made; a longer wait is HookBudgetError. */
+  /** Pre-#3200 only: past it, the ledger's wait gives up (HookBudgetError). */
   deadline?: number;
 }
 
@@ -78,67 +72,16 @@ export const ledgerWaits = L.RL_HOOKS_LIMIT === undefined;
 /** T19's spread before #3200 (one call per HOOK_GAP_MS); undefined from #3200, which dropped it. */
 export const T19_HOOK_GAP_MS: number | undefined = L.HOOK_GAP_MS;
 
-/** Added to a computed wait, so the freed call is past the window's edge (the old ledger's EDGE_MS). */
-export const EDGE_MS = 100;
-
-/**
- * Ms from `t` until `app`'s window holds fewer than `room` calls, read from
- * the ledger itself: hookWindowCount at later times only falls, so the
- * smallest such time is found by bisection over one window.
- */
-export function roomIn(
-  app: string,
-  room: number,
-  t: number,
-  root?: string,
-): number {
-  const count = (x: number) =>
-    ledger.hookWindowCount(app, { root, now: () => t + x });
-  if (count(0) < room) return 0;
-  let lo = 0;
-  let hi = ledger.HOOK_WINDOW_MS;
-  while (hi - lo > 1) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (count(mid) < room) hi = mid;
-    else lo = mid;
-  }
-  return hi;
-}
-
-const timer = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 /**
  * A call RL_ANON is charged for: at most SUITE_HOOK_LIMIT (less `reserve`)
- * in `app`'s window. A full window waits for room, the time computed from
- * the ledger (roomIn plus EDGE_MS, as the old ledger's wait), up to
- * `deadline`; a longer wait is HookBudgetError. Before #3200 the ledger
- * waits itself. Returns the window's calls.
+ * in `app`'s window. Past it, before #3200 the ledger waits (to
+ * `deadline`); from #3200 HookBudgetError at once. Returns the window's calls.
  */
-export async function claimCappedSlot(
+export function claimCappedSlot(
   app: string,
   o: ClaimOpts = {},
 ): Promise<number> {
-  const reserve = HELD + (o.reserve ?? 0);
-  if (ledgerWaits) return L.claimHookSlot(app, { ...o, reserve });
-  const now = o.now ?? Date.now;
-  const sleep = o.sleep ?? timer;
-  const room = SUITE_HOOK_LIMIT - (o.reserve ?? 0);
-  const { root, afterScan } = o;
-  for (;;) {
-    try {
-      return await L.claimHookSlot(app, { root, now, afterScan, reserve });
-    } catch (e) {
-      if (!(e instanceof ledger.HookBudgetError)) throw e;
-    }
-    const t = now();
-    const wait = Math.max(1, roomIn(app, room, t, root) + EDGE_MS);
-    if (o.deadline !== undefined && t + wait > o.deadline)
-      throw new ledger.HookBudgetError(
-        `${ledger.hookWindowCount(app, { root, now: () => t })} of ${SUITE_HOOK_LIMIT} calls in the last ${ledger.HOOK_WINDOW_MS / 1000} s; ` +
-          `the next fits in ${Math.ceil(wait / 1000)} s, past this call's deadline`,
-      );
-    await sleep(wait);
-  }
+  return L.claimHookSlot(app, { ...o, reserve: HELD + (o.reserve ?? 0) });
 }
 
 /**
