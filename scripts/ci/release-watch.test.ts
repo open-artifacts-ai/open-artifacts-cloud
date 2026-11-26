@@ -9,6 +9,7 @@ import type { Exec } from "./gh-retry.ts";
 import {
   BUILT_RE,
   type Config,
+  carryMerges,
   commentBody,
   commentKey,
   commentPlan,
@@ -737,7 +738,13 @@ describe("a release across recovery runs (v0.246.1)", () => {
     expect(t?.e2e).toBe(237.5);
     const r = world(now, x);
     const h = r.history.find((e) => e.tag === "v0.246.1");
-    expect(h).toMatchObject({ doneAt: D("01:07:55"), e2e: 237.5 });
+    // Its deploy also carried v0.246.0's code: the total starts at that merge.
+    expect(h).toMatchObject({
+      doneAt: D("01:07:55"),
+      e2e: 315.7,
+      carries: ["v0.246.0"],
+      firstMergeAt: fx.merges["v0.246.0"],
+    });
     expect(h).not.toHaveProperty("supersededBy");
     expect(h?.stages.staging_publish).toBe(2.5);
     // v0.246.0 never reached prod: superseded, closed by v0.246.1's prod deploy.
@@ -2201,7 +2208,7 @@ describe("superseded releases have no total of their own", () => {
     expect(settleSuperseded(own)).toBe(own);
   });
 
-  it("a run carrying that history saves the corrected lines, and only the releases' own totals count", () => {
+  it("a run carrying that history saves the corrected lines; each deploy counts once, from the earliest merge it carries", () => {
     const h = parseHistory(saved);
     const r = compute({
       releases: [],
@@ -2217,25 +2224,62 @@ describe("superseded releases have no total of their own", () => {
       expect(x?.e2eTo, tag).toBe(`superseded by ${by[tag]}`);
       expect(x, tag).not.toHaveProperty("e2e");
     }
-    // Only v0.248.2 and v0.249.1 have totals of their own.
+    // Only v0.248.2 and v0.249.1 have totals, each from the earliest merge
+    // among it and the releases it carries: v0.247.0's 23:04:59 and
+    // v0.249.0's 04:51:17.
     expect(r.current.e2e.last20).toEqual([
       {
         tag: "v0.248.2",
-        e2e: 105.9,
+        e2e: 362.7,
         to: "prod deploy (fleet not yet measured)",
+        carries: ["v0.247.0", "v0.248.0", "v0.248.1"],
       },
       {
         tag: "v0.249.1",
-        e2e: 130.1,
+        e2e: 281.2,
         to: "prod deploy (fleet not yet measured)",
+        carries: ["v0.249.0"],
       },
     ]);
-    expect(r.current.e2e).toMatchObject({ n: 2, p50: 105.9, p90: 130.1 });
+    expect(r.current.e2e).toMatchObject({ n: 2, p50: 281.2, p90: 362.7 });
     const md = summary(r.current);
     expect(md).not.toContain("| v0.249.0 |");
     expect(md).toContain(
-      "Superseded, with no prod deploy or total of their own: v0.247.0 by v0.248.0, v0.248.0 by v0.248.1, v0.248.1 by v0.248.2, v0.249.0 by v0.249.1.",
+      "| v0.249.1 (carries v0.249.0) | 281.2 | prod deploy (fleet not yet measured) | 261.2 over |",
     );
+    expect(md).toContain(
+      "| v0.248.2 (carries v0.247.0, v0.248.0, v0.248.1) | 362.7 |",
+    );
+    expect(md).toContain(
+      "Superseded, with no prod deploy or total of their own (the release that carries them counts from their first merge): v0.247.0 by v0.248.0, v0.248.0 by v0.248.1, v0.248.1 by v0.248.2, v0.249.0 by v0.249.1.",
+    );
+  });
+
+  it("the Prover's example: v0.249.1's total starts at v0.249.0's first merge, and the deploy counts once", () => {
+    const h = carryMerges(parseHistory(saved).map(settleSuperseded));
+    const v1 = h.find((e) => e.tag === "v0.249.1");
+    expect(v1).toMatchObject({
+      firstMergeAt: "2026-11-26T04:51:17Z",
+      carries: ["v0.249.0"],
+      e2e: 281.2,
+      doneAt: "2026-11-26T09:32:30Z",
+    });
+    // 04:51:17 to 09:32:30: 281 min 13 s, of which 151 min 07 s waited before
+    // v0.249.1's own first merge (07:22:24).
+    expect(ms(v1?.doneAt ?? "") - ms(v1?.firstMergeAt ?? "")).toBe(
+      (281 * 60 + 13) * 1000,
+    );
+    expect(ms(v1?.mergedAt ?? "") - ms(v1?.firstMergeAt ?? "")).toBe(
+      (151 * 60 + 7) * 1000,
+    );
+    expect(h.find((e) => e.tag === "v0.249.0")).not.toHaveProperty("e2e");
+    // Idempotent, and kept once the carried line leaves the history.
+    expect(carryMerges(h)).toEqual(h);
+    const alone = carryMerges(h.filter((e) => e.tag !== "v0.249.0"));
+    expect(alone.find((e) => e.tag === "v0.249.1")).toMatchObject({
+      firstMergeAt: "2026-11-26T04:51:17Z",
+      e2e: 281.2,
+    });
   });
 
   it("a backfill rebuilding a superseded release gives it no total: v0.249.0 is not v0.249.1's 09:32:30 deploy", () => {
