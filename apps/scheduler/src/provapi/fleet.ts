@@ -24,18 +24,17 @@
 //
 // Settle (the "soaked" marks, so state carries over): every pass probes the
 // installs upgraded to the target. With the smoke required, one passing probe
-// settles an install (FLEET_SOAK_MS is 0). With the smoke off (staging), a
-// probe must pass again FLEET_SOAK_MIN after the first, with no failed probe
-// between; the pass that starts the soak names when it ends (FleetRun.dueAt),
-// and the wake asks its message back for then (wake.ts): a scheduled event,
-// not a tick. Passes further apart than the soak plus FLEET_SOAK_GAP_MS
-// restart the clock, as a failure does.
+// settles an install (FLEET_SOAK_MS is 0). With the smoke off (staging), its
+// probes must pass unbroken for FLEET_SOAK_MIN; a gap over FLEET_SOAK_GAP_MS
+// restarts that clock, as a failure does. That soak is a timer by design, so
+// where the smoke is off the 2-minute tick keeps its fleet duty
+// (provapi/index.ts tickRunsFleet) until Leo picks staging smoke.
 //
 // Every pass works from state, never from the message that started it: any
-// event (a job's end, a deploy's wake, a soak's due time) re-reads the whole
-// fleet, so one lost message is recovered by the next event of any kind. No
-// tick runs the fleet (cloud #264); the 2-minute cron keeps only its alert
-// marks (fleetMarks).
+// event (a job's end, a deploy's wake) re-reads the whole fleet, so one lost
+// message is recovered by the next event of any kind. Where the smoke is
+// required (prod) no tick runs the fleet (cloud #264); the 2-minute cron
+// keeps only its alert marks (fleetMarks).
 //
 // Smoke: once the canary has settled, smoke() runs in the same pass, then
 // once per pass until it passes (fleet_smoked). The canary answering wrongly
@@ -90,18 +89,18 @@ export const FLEET_SOAK_MS = 0;
  */
 export const FLEET_FAIL_GAP_MS = 60_000;
 /**
- * A pass's default deadline from its start (tests use it): the old 2-minute
- * fleet duty's 25 s budget less a 2 s margin. The smoke gets only the time
- * left, its cleanup aside (smokeCanary). A wake (wake.ts) passes its own.
+ * A pass's deadline from its start on the 2-minute tick (smoke off only):
+ * the fleet duty's 25 s budget less a 2 s margin. The smoke gets only the
+ * time left, its cleanup aside (smokeCanary). A wake (wake.ts) passes its own.
  */
 export const FLEET_TICK_DEADLINE_MS = 23_000;
 /**
  * The fleet run's lease (platform_state), ported from cloud #458: one run at
- * a time (a message delivered twice, a retry beside a run that outlived its
- * bound). A run that never gives it back (killed mid-run) holds it this long,
- * longer than the longest run (FLEET_WAKE_TIMEOUT_MS in wake.ts): a wake in
- * between finds it held and comes back with the backoff, and the first one
- * after it takes it.
+ * a time, the 2-minute tick's fleet duty and the deploy's wake run (wake.ts)
+ * alike, so the two never act side by side. A run that never gives it back
+ * (killed mid-run) holds it this long, longer than the longest run
+ * (FLEET_WAKE_TIMEOUT_MS in wake.ts): the ticks in between skip the fleet,
+ * and the first one after it takes it.
  */
 export const FLEET_LEASE_KEY = "scheduler_fleet_lease";
 export const FLEET_LEASE_MS = 320_000;
@@ -136,11 +135,7 @@ export function fleetSoakOffMs(v: string | undefined): number {
 export type SmokeMode = "required" | "off";
 export const fleetSmokeMode = (v: string | undefined): SmokeMode =>
   v?.trim() === "off" ? "off" : "required";
-/**
- * Passes further apart than the soak plus this aren't unbroken: the clock
- * restarts. The soak's own scheduled pass (FleetRun.dueAt) lands at the soak,
- * so the margin only covers its queue delay.
- */
+/** Passes further apart than this aren't unbroken: the clock restarts. */
 export const FLEET_SOAK_GAP_MS = 5 * 60_000;
 /** The canary isn't settled and smoked on the target this long: fleet_halted opens. */
 export const FLEET_BLOCKED_MS = 45 * 60_000;
@@ -566,16 +561,11 @@ export type FleetPass = "canary" | "batch" | "idle";
 export interface FleetRun {
   pass: FleetPass;
   again: boolean;
-  /**
-   * With the smoke off: when the earliest passive soak this pass started or
-   * continued is due (epoch ms). The wake asks its message back for then.
-   */
-  dueAt?: number;
 }
 
 /**
  * One fleet run: one pass under the lease, so two runs never act at once
- * (a message delivered twice, a retry beside a slow run). Without the
+ * (the 2-minute tick beside a wake, a message delivered twice). Without the
  * lease the run does nothing, logs `provapi fleet overlap` and returns null.
  * The lease is given back once the pass has ended, even past the run's
  * timeout. No waits: what is left is the next event's (FleetRun).
@@ -620,17 +610,12 @@ export async function fleetPass(
 ): Promise<FleetRun> {
   const need: Need = { again: false };
   const pass = await onePass(env, now, o, need);
-  return {
-    pass,
-    again: need.again,
-    ...(need.dueAt === undefined ? {} : { dueAt: need.dueAt }),
-  };
+  return { pass, again: need.again };
 }
 
-/** Set by a pass: what only time can finish, and when (FleetRun). */
+/** Set by a pass when only time can finish what it left (FleetRun). */
 interface Need {
   again: boolean;
-  dueAt?: number;
 }
 
 async function onePass(
@@ -806,13 +791,14 @@ async function markDone(
 }
 
 /**
- * The fleet's alert marks, on every 2-minute tick (the alerts duty), now that
- * the fleet itself runs only on its events (cloud #264): `fleet_unverified:`
- * (platform_unverified) while the target has no verified mark, and the
- * `fleet_behind:` stamps (version_skew) once it has. The same writes, under
- * the same conditions, as a fleet pass makes, so an install that falls behind
- * or catches up between releases, and a deploy that never marked its release
- * verified, alert as before. Moves nothing: no job, no probe, no lease.
+ * The fleet's alert marks, on every 2-minute tick (the alerts duty), so they
+ * stay current where no tick runs the fleet (cloud #264, smoke required):
+ * `fleet_unverified:` (platform_unverified) while the target has no verified
+ * mark, and the `fleet_behind:` stamps (version_skew) once it has. The same
+ * writes, under the same conditions, as a fleet pass makes, so an install
+ * that falls behind or catches up between releases, and a deploy that never
+ * marked its release verified, alert as before. Moves nothing: no job, no
+ * probe, no lease.
  */
 export async function fleetMarks(env: FleetEnv, now: number): Promise<void> {
   const target = fleetTarget(env.CF_VERSION_METADATA);
@@ -1225,7 +1211,7 @@ async function watch(
   for (const [i, r] of all.entries()) {
     try {
       const soaked = verdicts[i]
-        ? await passed(db, now, st, target, r.install_id, soakMs, need)
+        ? await passed(db, now, st, target, r.install_id, soakMs)
         : await failed(db, now, st, target, r.install_id);
       if (!soaked) hold = true;
       // A failed probe that didn't halt: probe again later. A passing one
@@ -1252,18 +1238,14 @@ async function passed(
   target: string,
   id: string,
   soakMs: number,
-  need: Need,
 ): Promise<boolean> {
   const key = passKey(target, id);
   const prev = st.rows.get(key);
-  const unbroken = prev && now - prev.updated_at <= soakMs + FLEET_SOAK_GAP_MS;
+  const unbroken = prev && now - prev.updated_at <= FLEET_SOAK_GAP_MS;
   const start = unbroken ? prev.value : now;
   if (now - start < soakMs) {
     await d1(db.prepare(SET_PASS).bind(key, start, now).run());
     st.rows.set(key, { key, value: start, updated_at: now });
-    // The soak's end is the next event for this install: scheduled, not polled.
-    const due = start + soakMs;
-    if (need.dueAt === undefined || due < need.dueAt) need.dueAt = due;
     return false;
   }
   const done = soakedKey(target, id);

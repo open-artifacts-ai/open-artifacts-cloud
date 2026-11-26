@@ -1,22 +1,24 @@
 // The Provisioning API's scheduler duties (design v7 5.8), run on the */2
-// tick after the revoke tick and the directory sync. The fleet rollout is not
-// one of them (cloud #264): it runs only on its events (wake.ts); the
-// tick keeps only its alert marks (fleetMarks, in the alerts duty).
+// tick after the revoke tick and the directory sync. The fleet rollout runs
+// on its events (cloud #264, wake.ts). Where the canary smoke is required
+// (prod) the tick runs no fleet and keeps only its alert marks (fleetMarks,
+// in the alerts duty). Where it is off (staging) the tick keeps its fleet
+// duty: the passive soak is a timer by design until Leo picks staging smoke.
 import { ALERT_KEYS } from "@oa/provisioning-contract/enum-values";
 import { trialRemindersDue } from "../trial-reminder.js";
 import { alertFor, factsOf, prodcleanReport, stepAlert } from "./alerts.js";
 import { alertConditions, signupDailyCap } from "./conditions.js";
 import type { ProvapiEnv } from "./env.js";
-import { fleetMarks } from "./fleet.js";
+import {
+  type FleetOptions,
+  fleetMarks,
+  fleetSmokeMode,
+  fleetTick,
+} from "./fleet.js";
 import { type HealthProbe, healthDue } from "./health.js";
 import { prune } from "./prune.js";
 import { purgeDue } from "./purge.js";
-import {
-  type DutyName,
-  type DutyOutcome,
-  dutyCategory,
-  runDuties,
-} from "./run.js";
+import { type Duty, type DutyOutcome, dutyCategory, runDuties } from "./run.js";
 import { signupsDue } from "./signups.js";
 import { soloStartMissingAlert } from "./solo-start.js";
 import { type SweepDeps, sweep } from "./sweep.js";
@@ -25,12 +27,10 @@ export { SCHEDULER_TICK_KEY } from "@oa/provisioning-contract/state";
 export type { ProvapiEnv } from "./env.js";
 export { writeTick } from "./run.js";
 
-/** The tick's duties: every duty but the fleet, which only its events run. */
-export type TickDutyName = Exclude<DutyName, "fleet">;
-
 /**
- * Each duty's budget: 94.5 s together, inside the 2 minutes. Ticks may still
- * overlap (a slow D1 call); every duty's writes are guarded for that.
+ * Each duty's budget: 115 s together, inside the 2 minutes (the fleet's 25 s
+ * only where the smoke is off). Ticks may still overlap (a slow D1 call);
+ * every duty's writes are guarded for that.
  */
 export const DUTY_TIMEOUT_MS = {
   sweep: 20_000,
@@ -38,14 +38,24 @@ export const DUTY_TIMEOUT_MS = {
   reminders: 4_500,
   purge: 10_000,
   health: 20_000,
+  fleet: 25_000,
   alerts: 30_000,
   prune: 5_000,
-} as const satisfies Record<TickDutyName, number>;
+} as const satisfies Record<Duty["name"], number>;
+
+/**
+ * Whether the tick runs the fleet duty: only where the canary smoke is off
+ * (staging, FLEET_SMOKE "off"), whose passive soak needs passes at most
+ * FLEET_SOAK_GAP_MS apart. Where it is required (prod) the fleet moves only
+ * on its events (wake.ts). When Leo picks staging smoke this goes: one line.
+ */
+export const tickRunsFleet = (env: Pick<ProvapiEnv, "FLEET_SMOKE">) =>
+  fleetSmokeMode(env.FLEET_SMOKE) === "off";
 
 /** The scheduler opens and clears every alert here, and only here. */
 export async function alertsTick(env: ProvapiEnv, now: number): Promise<void> {
-  // The fleet's alert marks first, so the conditions read this tick's: the
-  // fleet itself no longer runs here (cloud #264). A failure only logs; the
+  // The fleet's alert marks first, so the conditions read this tick's even
+  // where no fleet duty runs (cloud #264). A failure only logs; the
   // conditions read the marks as they are.
   try {
     await fleetMarks(env, now);
@@ -83,16 +93,17 @@ export async function alertsTick(env: ProvapiEnv, now: number): Promise<void> {
 
 export interface ProvapiOptions extends SweepDeps {
   /** Tests only: per-duty budgets. */
-  timeoutMs?: Partial<Record<TickDutyName, number>>;
+  timeoutMs?: Partial<Record<Duty["name"], number>>;
   /** Tests only: the /healthz request (default publicRouteProbe). */
   healthProbe?: HealthProbe;
+  /** Tests only: the fleet duty's probe and its timeout (smoke off). */
+  fleet?: FleetOptions;
 }
 
 /**
- * Sweep, signups, trial reminders, purge, health, alerts, prune: in that
- * order, so the alerts read the tick's own sweep, purge and health writes.
- * No fleet duty (cloud #264): the fleet moves only on its events (wake.ts).
- * Never throws.
+ * Sweep, signups, trial reminders, purge, health, fleet (smoke off only,
+ * tickRunsFleet), alerts, prune: in that order, so the alerts read the tick's
+ * own writes. Never throws.
  */
 export function provapiTick(
   env: ProvapiEnv,
@@ -130,6 +141,19 @@ export function provapiTick(
         });
       },
     },
+    ...(tickRunsFleet(env)
+      ? [
+          {
+            // Under the fleet lease (fleetTick): while a wake holds it, this
+            // pass logs `provapi fleet overlap` and ends.
+            name: "fleet" as const,
+            timeoutMs: t.fleet,
+            run: async () => {
+              await fleetTick(env, now, o.fleet);
+            },
+          },
+        ]
+      : []),
     { name: "alerts", timeoutMs: t.alerts, run: () => alertsTick(env, now) },
     { name: "prune", timeoutMs: t.prune, run: () => prune(env, now) },
   ]);

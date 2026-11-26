@@ -58,7 +58,6 @@ import { getState } from "../src/provapi/state.js";
 import {
   FLEET_WAKE_BACKOFF_MAX_S,
   FLEET_WAKE_DEADLINE_MS,
-  FLEET_WAKE_DUE_MAX_S,
   FLEET_WAKE_MAX_RETRIES,
   FLEET_WAKE_TIMEOUT_MS,
   fleetWake,
@@ -846,15 +845,12 @@ describe("soak", () => {
     );
   });
 
-  // cloud #264: the soak's end is one scheduled pass, so passes may be a
-  // whole soak apart; a gap over the soak plus FLEET_SOAK_GAP_MS still
-  // restarts the clock.
-  it("smoke off: a gap over the soak plus FLEET_SOAK_GAP_MS doesn't count: it restarts the clock", async () => {
+  it("smoke off: a gap in the ticks doesn't count: over FLEET_SOAK_GAP_MS restarts the clock", async () => {
     const { canary, id } = await upgraded();
     const f = fakes({ canary });
     passive(f);
     await fleetDue(f.env, NOW, f.opts);
-    const back = NOW + SOAK + FLEET_SOAK_GAP_MS + MIN;
+    const back = NOW + FLEET_SOAK_GAP_MS + MIN;
     await ticks(f, back, back + SOAK - 2 * MIN);
     expect(await stateKeys(FLEET_SOAKED_PREFIX)).not.toContain(
       `${FLEET_SOAKED_PREFIX}${TARGET}:${id}`,
@@ -2867,7 +2863,7 @@ describe("#433: no timers, leo with the rest", () => {
 
   // cloud #264: the 2-minute tick runs no fleet. It keeps only the fleet's
   // alert marks, so version_skew and platform_unverified alert as before.
-  it("*/2: the tick moves no install and takes no lease, even with the fleet behind; its alerts duty keeps fleet_behind", async () => {
+  it("*/2, smoke required (prod): the tick moves no install and takes no lease, even with the fleet behind; its alerts duty keeps fleet_behind", async () => {
     const canary = await on("0.92.0", { created: 0 });
     const rest = await on("0.92.0", { created: 5 });
     const f = fakes({ canary });
@@ -2938,79 +2934,56 @@ describe("#433: no timers, leo with the rest", () => {
     expect(await stateKeys("fleet_")).toEqual([]);
   });
 
-  // The Prover's staging finding on #492: with the smoke off, the canary's
-  // job end was acked and nothing came back for the soak. Now the pass that
-  // starts a soak names its end, and the message comes back then.
+  // Staging (smoke off) keeps the tick's fleet duty until Leo picks staging
+  // smoke: its passive soak needs passes at most FLEET_SOAK_GAP_MS apart, and
+  // the tick soaks exactly as on main.
   it(
-    "staging, smoke off: each soak's end is a scheduled wake; the canary, then the rest, soak and the rollout finishes, no tick",
+    "*/2, smoke off (staging): the tick runs the fleet duty and soaks with main's 5-min gap rule",
     async () => {
-      const canary = await on("0.92.0", { created: 0 });
+      const canary = await on(TARGET, { created: 0 });
+      await fleetJob(canary, { finished_at: NOW - MIN });
       const rest = await on("0.92.0", { created: 5 });
       const f = fakes({ canary });
       Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "15" });
-      const SOAK = 15 * MIN;
-      /** One delivery at `at`; what came back, and after how long. */
-      const deliver = async (at: number, attempts = 1) => {
-        const b = wakeBatch([attempts], at);
-        expect(
-          await fleetWake(b.batch, f.env, at, {
-            fleet: { ...f.opts, clock: () => at },
-          }),
-        ).toBe("ok");
-        return b.retried[0]?.delaySeconds;
-      };
-      // The deploy's wake queues the canary: its end is the next event.
-      expect(await deliver(NOW)).toBeUndefined();
-      const [c] = await fleetJobs();
-      const canaryEnd = NOW + 80_000;
-      await setVersion(canary, TARGET);
-      await finish(c?.id, "done", canaryEnd);
-      // Its end starts the soak and asks back for the soak's end.
-      const d1s = await deliver(canaryEnd);
-      expect(d1s).toBe(SOAK / 1_000 + 1);
+      const tick = (at: number) =>
+        provapiTick(f.env, at, {
+          timeoutMs: { sweep: 1_000, health: 1_000 },
+          healthProbe: f.opts.probe,
+          fleet: f.opts,
+        });
+      expect((await tick(NOW)).fleet).toBe("ok");
+      // Ticks 2 min apart for 14 min: still soaking, nothing queued.
+      for (let t = NOW + 2 * MIN; t < NOW + 15 * MIN; t += 2 * MIN)
+        await tick(t);
       expect(await queued()).toEqual([]);
-      // The scheduled delivery: soaked, and the rest go in that pass.
-      const soakEnd = canaryEnd + (d1s as number) * 1_000;
-      expect(await deliver(soakEnd, 2)).toBeUndefined();
+      // The tick at 16 min soaks it and queues the rest.
+      await tick(NOW + 16 * MIN);
       expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:`)).toEqual([
         `${FLEET_SOAKED_PREFIX}${TARGET}:${canary}`,
       ]);
-      const r = (await fleetJobs()).find((j) => j.install_id === rest);
-      expect(r?.created_at).toBe(soakEnd);
-      // The rest's end starts its soak; the scheduled pass finishes it.
-      const restEnd = soakEnd + 70_000;
-      await setVersion(rest, TARGET);
-      await finish(r?.id, "done", restEnd);
-      const d2s = await deliver(restEnd);
-      expect(d2s).toBe(SOAK / 1_000 + 1);
-      expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([]);
-      const done = restEnd + (d2s as number) * 1_000;
-      expect(await deliver(done, 2)).toBeUndefined();
-      expect(await getState(db, `${FLEET_DONE_PREFIX}${TARGET}`)).toBe(done);
+      expect(await queued()).toEqual([rest]);
       expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
-      expect(FLEET_WAKE_DUE_MAX_S).toBe(86_400);
     },
-    fleetTicksTimeout(10),
+    fleetTicksTimeout(20),
   );
 
-  it("a soak broken by a failed probe restarts, and the next pass names the new end", async () => {
+  it("smoke off: a tick gap over FLEET_SOAK_GAP_MS restarts the soak, as on main", async () => {
     const canary = await on(TARGET, { created: 0 });
     await fleetJob(canary, { finished_at: NOW - MIN });
+    await on("0.92.0", { created: 5 });
     const f = fakes({ canary });
     Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "15" });
-    expect((await fleetPass(f.env, NOW, f.opts)).dueAt).toBe(NOW + 15 * MIN);
-    f.answers.set(canary, "down");
-    expect(await fleetPass(f.env, NOW + 5 * MIN, f.opts)).toMatchObject({
-      again: true,
-    });
-    f.answers.delete(canary);
-    expect((await fleetPass(f.env, NOW + 6 * MIN, f.opts)).dueAt).toBe(
-      NOW + 21 * MIN,
-    );
-    // Passes further apart than the soak plus FLEET_SOAK_GAP_MS restart it.
-    const late = NOW + 6 * MIN + 15 * MIN + FLEET_SOAK_GAP_MS + 1;
-    expect((await fleetPass(f.env, late, f.opts)).dueAt).toBe(late + 15 * MIN);
+    const tick = (at: number) =>
+      provapiTick(f.env, at, {
+        timeoutMs: { sweep: 1_000, health: 1_000 },
+        healthProbe: f.opts.probe,
+        fleet: f.opts,
+      });
+    await tick(NOW);
+    // One delivery 15 min later is a gap over 5 min: no soak, the clock restarts.
+    await tick(NOW + 15 * MIN);
     expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:`)).toEqual([]);
+    expect(FLEET_SOAK_GAP_MS).toBe(5 * MIN);
   });
 
   // A lost job-end message (the provisioner's send ran out of retries): no

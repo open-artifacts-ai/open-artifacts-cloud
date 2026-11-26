@@ -14,18 +14,18 @@
 // passes; the last of the rest to end writes fleet_done:<version>, which the
 // next prod deploy records. Nothing waits: a pass that only time can finish
 // (a probe or smoke to repeat, the lease held, a failed run) asks its message
-// back with a backoff, the one wait allowed. With the smoke off (staging), the pass that
-// starts a passive soak names when it ends, and its message comes back then
-// (a scheduled event, FleetRun.dueAt). Every other message is acked: what is
-// left ends with a job, and that job's end is the next message.
+// back with a backoff, the one wait allowed. Every other message is acked:
+// what is left ends with a job, and that job's end is the next message.
 //
-// No tick runs the fleet (cloud #264). Every pass reads the whole fleet from
-// state, so a lost message (a job-end send that ran out of retries, a wake
-// out of deliveries) is recovered by the next event of any kind: another
-// job's end, the next deploy's wake, a soak's due time. Past that, a stuck
-// rollout is OA Manager L-2's to catch, the release watcher Leo named; the
-// alerts (canary_blocked, fleet_halted, version_skew) still open off the
-// tick's alert marks (fleetMarks). No timer is added for it.
+// Where the canary smoke is required (prod) no tick runs the fleet (cloud
+// #264). Every pass reads the whole fleet from state, so a lost message (a
+// job-end send that ran out of retries, a wake out of deliveries) is
+// recovered by the next event of any kind: another job's end, the next
+// deploy's wake. Past that, a stuck rollout is OA Manager L-2's to catch, the
+// release watcher Leo named; the alerts (canary_blocked, fleet_halted,
+// version_skew) still open off the tick's alert marks (fleetMarks). No timer
+// is added for it. Where the smoke is off (staging), the 2-minute tick keeps
+// its fleet duty for the passive soak (provapi/index.ts tickRunsFleet).
 //
 // The body is never read: the fleet's target is this Worker's own version
 // tag, so a message for an older release, or a job of any kind, is just one
@@ -57,12 +57,9 @@ export const FLEET_WAKE_BACKOFF_MAX_S = 60;
  * The queue's max_retries (apps/scheduler/wrangler.jsonc, both envs; the
  * config test pins them equal): 1 + 2 + ... + 32 s, then 14 retries at 60 s,
  * about 15 min, after which the message is acked; the next event of any kind
- * picks the fleet up from state.
+ * picks the fleet up from state (and, smoke off, the tick's fleet duty).
  */
 export const FLEET_WAKE_MAX_RETRIES = 20;
-
-/** A soak's scheduled pass waits at most this (the queue's 24 h limit). */
-export const FLEET_WAKE_DUE_MAX_S = 24 * 60 * 60;
 
 /** The delay before delivery `attempts + 1`, in seconds. */
 export const wakeBackoffS = (attempts: number): number =>
@@ -108,16 +105,8 @@ export async function fleetWake(
   const outcome: WakeOutcome =
     run === null ? "held" : (out.fleet ?? "exception");
   const again = outcome !== "ok" || run?.again === true;
-  // A passive soak due later: its message comes back then, one second past.
-  const dueS =
-    !again && run?.dueAt !== undefined
-      ? Math.min(
-          FLEET_WAKE_DUE_MAX_S,
-          Math.max(1, Math.ceil((run.dueAt - now) / 1_000) + 1),
-        )
-      : undefined;
   let back: Message<unknown> | undefined;
-  if (again || dueS !== undefined)
+  if (again)
     for (const m of batch.messages)
       if (
         m.attempts <= FLEET_WAKE_MAX_RETRIES &&
@@ -125,7 +114,7 @@ export async function fleetWake(
       )
         back = m;
   for (const m of batch.messages) {
-    if (m === back) m.retry({ delaySeconds: dueS ?? wakeBackoffS(m.attempts) });
+    if (m === back) m.retry({ delaySeconds: wakeBackoffS(m.attempts) });
     else m.ack();
   }
   console.log(
@@ -134,7 +123,6 @@ export async function fleetWake(
     `messages=${batch.messages.length}`,
     `retried=${back === undefined ? 0 : 1}`,
     `again=${again ? 1 : 0}`,
-    ...(dueS === undefined ? [] : [`due=${dueS}s`]),
   );
   return outcome;
 }
