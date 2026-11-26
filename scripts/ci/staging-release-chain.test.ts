@@ -710,6 +710,14 @@ describe("step 4 ordering: the gate starts once, after both, from whichever ends
 });
 
 describe("dispatch", () => {
+  const greenDeploy = {
+    title: CHAIN_TITLE,
+    status: "completed",
+    conclusion: "success",
+    actor: BOT,
+  };
+  /** The world the plan saw for the gate: deploy and copy green. */
+  const ready: World = { deployRuns: [greenDeploy] };
   const call = (o: World, next: "deploy" | "gate") => {
     const wd = world(o);
     const r = dispatch({
@@ -760,10 +768,10 @@ describe("dispatch", () => {
     expect(FULL_BILLING).toContain("directory-broker,billing,provision-token");
     expect(call({}, "deploy").started[0]?.join(" ")).not.toContain("targets=");
     // the gate never takes targets
-    expect(call({}, "gate").started[0]?.join(" ")).not.toContain("targets=");
+    expect(call(ready, "gate").started[0]?.join(" ")).not.toContain("targets=");
   });
   it("dispatches the gate with the tag only", () => {
-    const { started } = call({}, "gate");
+    const { started } = call(ready, "gate");
     expect(started[0]?.slice(2)).toEqual([
       "redline-staging.yml",
       "--repo",
@@ -780,6 +788,52 @@ describe("dispatch", () => {
       call({ gateRuns: [`redline-staging ${TAG}`] }, "gate").started,
     ).toEqual([]);
     expect(call({ latest: "v1.0.0" }, "deploy").r.started).toBe(false);
+  });
+  // Between the plan job and this one, a newer copy of the tag failed, was
+  // cancelled or started, or the deploy is not green: the gate isn't started.
+  it("re-checks the copy and the deploy right before the gate", () => {
+    for (const conclusion of ["failure", "cancelled", null]) {
+      const { r, started } = call(
+        {
+          ...ready,
+          publishRuns: [
+            { id: 200, jobs: [{ ...COPIED, conclusion }] },
+            { id: 123, jobs: [COPIED] },
+          ],
+        },
+        "gate",
+      );
+      expect(started, String(conclusion)).toEqual([]);
+      expect(r).toEqual({
+        started: false,
+        why: `the newest staging copy of ${TAG} is no longer green at dispatch: the gate is not started`,
+      });
+    }
+    const noDeploy = call({}, "gate");
+    expect(noDeploy.started).toEqual([]);
+    expect(noDeploy.r.why).toMatch(
+      /staging deploy of v0\.99\.0 is no longer green/,
+    );
+    // a newer successful copy: started
+    expect(
+      call(
+        {
+          ...ready,
+          publishRuns: [
+            { id: 200, jobs: [COPIED] },
+            { id: 123, jobs: [COPIED] },
+          ],
+        },
+        "gate",
+      ).r.started,
+    ).toBe(true);
+    // the deploy start never waits on the copy (it runs beside it)
+    expect(
+      call(
+        { publishRuns: [{ id: 123, jobs: [{ ...COPIED, conclusion: null }] }] },
+        "deploy",
+      ).r.started,
+    ).toBe(true);
   });
   it("refuses a bad tag or chain id", () => {
     const e = world().exec;

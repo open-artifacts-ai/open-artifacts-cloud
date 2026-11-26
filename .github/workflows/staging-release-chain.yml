@@ -24,7 +24,9 @@
 # release; and no run of the target workflow exists for the tag in any state
 # (a failed one waits for a person). After hosted-publish, if no deploy run
 # exists for the tag, it starts the deploy, as before step 4. The dispatch job
-# re-checks the tag and the runs under a concurrency group keyed on the tag.
+# re-checks the tag and the runs under a concurrency group keyed on the tag,
+# and before the gate also this chain's deploy and the newest copy: if either
+# is no longer green, it starts nothing and says why.
 # The deploy and the gate each hold their own gates (release gate, platform
 # tags, staging's Environment); this file only starts them, and waits for
 # nothing. Dispatches use the release App's installation token (actions:

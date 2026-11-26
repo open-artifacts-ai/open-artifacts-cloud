@@ -45,7 +45,9 @@
 //   - the tag is the newest release (releases/latest);
 //   - never twice: no run of the target workflow for that tag exists, in any
 //     state (a failed one waits for a person), checked in `plan` and again in
-//     `dispatch` under the concurrency group keyed on the tag.
+//     `dispatch` under the concurrency group keyed on the tag;
+//   - the gate's two halves (this chain's deploy green, the newest copy
+//     green) are checked again in `dispatch`, right before it starts the gate.
 // Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <path> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id> --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo o/n --next deploy|gate --tag vX.Y.Z --chain-id <id>
 import { spawnSync } from "node:child_process";
@@ -479,6 +481,22 @@ export function dispatch(o: {
     }).length > 0
   )
     return { started: false, why: `a run for ${o.tag} already exists` };
+  // The gate: both halves again, right before the dispatch. The copy or the
+  // deploy can change between the plan job and this one (a newer copy of the
+  // tag failed, was cancelled or started); then nothing starts.
+  if (o.next === "gate") {
+    const read = { exec: o.exec, sleep: o.sleep, repo: o.repo, tag: o.tag };
+    if (!chainDeployGreen(read))
+      return {
+        started: false,
+        why: `the staging deploy of ${o.tag} is no longer green at dispatch: the gate is not started`,
+      };
+    if (!stagingCopied(read))
+      return {
+        started: false,
+        why: `the newest staging copy of ${o.tag} is no longer green at dispatch: the gate is not started`,
+      };
+  }
   // Deploy: env, tag and the chain id, so every other input keeps the
   // workflow's default (no reason, not verify_only); the targets too, unless
   // billing is configured: then the full list with billing, the one-version
