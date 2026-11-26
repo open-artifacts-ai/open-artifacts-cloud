@@ -357,22 +357,44 @@ export type StageRun = {
   a: number;
   /** display_title */
   t: string;
+  /** the run id (to read its jobs) */
+  i?: number;
 };
+/** Jobs that only decide whether a run has work; the rest do the work. */
+export const GATING_JOBS = ["resolve", "plan"];
 /**
- * Pure: a release-chain stage's runs for main's pin (newest first) say it is spent:
- * the newest real run (dry runs aside) completed as a failure on attempt
- * RELEASE_RETRY_SPENT or later, so release-retry will not rerun it and the pin can
- * never reach prod. A run still queued, running or due a retry is not spent.
+ * Pure: a run's jobs (name, conclusion) show it did no work: every job but the
+ * gating ones (GATING_JOBS) skipped, as hosted-publish run 45853184538 did (resolve
+ * only, every publish job skipped). Such a run is no evidence either way.
  */
-export function stageSpent(runs: StageRun[]): boolean {
-  const run = runs.find((r) => !r.t.includes("(dry run)"));
-  return (
-    run !== undefined &&
-    run.s === "completed" &&
-    run.c === "failure" &&
-    run.a >= RELEASE_RETRY_SPENT
-  );
+export function didNoWork(jobs: { n: string; c: string | null }[]): boolean {
+  const work = jobs.filter((j) => !GATING_JOBS.includes(j.n));
+  return work.length > 0 && work.every((j) => j.c === "skipped");
 }
+/**
+ * Pure: a release-chain stage's runs for main's pin (newest first, dry runs aside)
+ * say it is spent. Its newest run with evidence completed as a failure on attempt
+ * RELEASE_RETRY_SPENT or later, so release-retry will not rerun it and the pin can
+ * never reach prod. A run still queued or running, a failure due a retry, a cancel,
+ * or a run that did work and passed: not spent. A run that passed having done no
+ * work (`noWork`) is skipped: the next older run decides.
+ */
+export function stageSpent(
+  runs: StageRun[],
+  noWork: (r: StageRun) => boolean = () => false,
+): boolean {
+  for (const r of runs) {
+    if (r.t.includes("(dry run)")) continue;
+    if (r.s !== "completed") return false;
+    if (r.c === "failure") return r.a >= RELEASE_RETRY_SPENT;
+    if (r.c === "success" && noWork(r)) continue;
+    return false;
+  }
+  return false;
+}
+/** Pure: any run in `runs` (dry runs aside) is queued or running. */
+export const anyActive = (runs: StageRun[]) =>
+  runs.some((r) => !r.t.includes("(dry run)") && r.s !== "completed");
 /**
  * A full prod deploy of `tag`: the chain's run (prod-release-chain dispatches the
  * full target list, verify_only false, and puts its id in the run-name):
@@ -724,7 +746,7 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
 /** Pages of 100 runs per stage to look through since main's pin landed (fail closed past it). */
 export const STAGE_PAGES = 10;
 const STAGE_JQ =
-  "{n: (.workflow_runs | length), r: [.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title, h: .head_sha}]}";
+  "{n: (.workflow_runs | length), r: [.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title, h: .head_sha, i: .id}]}";
 type ListedRun = StageRun & { h: string };
 const TAG_IN = /\bv\d+\.\d+\.\d+\b/;
 
@@ -759,8 +781,9 @@ function stageRuns(
 }
 
 /**
- * The first release-chain stage before the gate that is spent for main's pin
- * (stageSpent on its latest relevant run), or undefined. Relevant runs build what
+ * The first release-chain stage before the gate that is spent for main's pin, or
+ * undefined: none while any relevant run of any stage is queued or running, then
+ * stageSpent on each stage's relevant runs, skipping passes that did no work. Relevant runs build what
  * main's pin names, whatever commit started them: a run of a stage before the gate
  * on main since the pin landed, at a commit that contains the pin commit (a hand
  * dispatch from a later main builds the same tag, cloud #459), not a dry run, and
@@ -805,26 +828,47 @@ function readDeadStage(
     contains.set(sha, yes);
     return yes;
   };
-  for (const wf of PRE_GATE_WORKFLOWS) {
-    const latest = stageRuns(exec, repo, wf, since).find((r) => {
+  const relevant: [string, ListedRun[]][] = PRE_GATE_WORKFLOWS.map((wf) => [
+    wf,
+    stageRuns(exec, repo, wf, since).filter((r) => {
       if (r.t.includes("(dry run)")) return false;
       const named = TAG_IN.exec(r.t)?.[0];
       if (named !== undefined && named !== tag) return false;
       return /^[0-9a-f]{40}$/.test(r.h) && builds(r.h);
-    });
-    if (latest !== undefined && stageSpent([latest])) return wf;
-  }
+    }),
+  ]);
   const title = stagingDeployTitle(tag);
-  const deploy = stageRuns(
-    exec,
-    repo,
-    PROD_DEPLOY_WORKFLOW,
-    since,
-    "&event=workflow_dispatch",
-  ).find((r) => r.t.startsWith(title));
-  return deploy !== undefined && stageSpent([deploy])
-    ? "staging deploy"
-    : undefined;
+  relevant.push([
+    "staging deploy",
+    stageRuns(
+      exec,
+      repo,
+      PROD_DEPLOY_WORKFLOW,
+      since,
+      "&event=workflow_dispatch",
+    ).filter((r) => r.t.startsWith(title)),
+  ]);
+  // The same rule for every stage: a relevant run still queued or running, in
+  // any stage, is a recovery under way and holds (the Prover's v0.246.1 replay:
+  // an older spent staging deploy never overrides a live hosted-release rerun).
+  if (relevant.some(([, runs]) => anyActive(runs))) return undefined;
+  // Only then does each stage's newest completed run with evidence decide.
+  const noWork = (r: StageRun): boolean => {
+    if (!Number.isInteger(r.i)) return false;
+    const jobs = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/runs/${r.i}/jobs?per_page=100`,
+        "--jq",
+        "[.jobs[] | {n: .name, c: .conclusion}]",
+      ]),
+    ) as { n: string; c: string | null }[];
+    if (!Array.isArray(jobs)) throw new Error(`unreadable jobs of run ${r.i}`);
+    return didNoWork(jobs);
+  };
+  for (const [name, runs] of relevant)
+    if (stageSpent(runs, noWork)) return name;
+  return undefined;
 }
 
 const msg = (e: unknown) => String(e instanceof Error ? e.message : e);

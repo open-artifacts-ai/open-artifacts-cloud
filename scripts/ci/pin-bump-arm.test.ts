@@ -10,8 +10,10 @@ import {
   type Check,
   commitOk,
   decide,
+  didNoWork,
   type Exec,
   GATE_WORKFLOWS,
+  GATING_JOBS,
   gateRefusal,
   gateRejected,
   type Input,
@@ -837,6 +839,8 @@ const fake = (
     stageRuns?: Record<string, Run[]>;
     /** compare/<pin>...<sha> status per sha (default ahead: it contains the pin). */
     compare?: Record<string, string>;
+    /** A run's jobs by run id (default one job that did work). */
+    jobs?: Record<number, { name: string; conclusion: string | null }[]>;
     /** Dispatched deploy runs titled as staging's chain deploy of main's pin. */
     stagingDeploys?: Run[];
     tagSha?: string;
@@ -858,6 +862,16 @@ const fake = (
       return ok(
         o.junkCount ? "oops" : JSON.stringify({ sha: PIN_COMMIT, at: PIN_AT }),
       );
+    const jb = /actions\/runs\/(\d+)\/jobs\?per_page=100/.exec(a);
+    if (jb) {
+      expect(a).toContain("--jq");
+      const js = o.jobs?.[Number(jb[1])] ?? [
+        { name: "work", conclusion: "success" },
+      ];
+      return ok(
+        JSON.stringify(js.map((j) => ({ n: j.name, c: j.conclusion }))),
+      );
+    }
     const cmp = /\/compare\/(\w+)\.\.\.(\w+) /.exec(a);
     if (cmp) {
       expect(cmp[1]).toBe(PIN_COMMIT);
@@ -1700,6 +1714,119 @@ describe("the release gate in run", () => {
     );
     expect(r.armed).toEqual([]);
     expect(r.logs.join("\n")).toMatch(/cannot read the release pipeline/);
+  });
+  // The Prover's replays on #506 at b36c98bd.
+  it("an active recovery in any stage holds, even over an older spent staging deploy (v0.246.1's recovery)", () => {
+    const recovery = "8".repeat(40);
+    const spentDeploy = hr(
+      "completed",
+      "failure",
+      3,
+      "deploy-hosted-platform staging v0.181.0 [sc45000000001-1]",
+    );
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("in_progress", null, 1), h: recovery },
+          ],
+        },
+        stagingDeploys: [spentDeploy],
+      }),
+    );
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    // With the recovery done and nothing else active, the spent deploy decides.
+    const after = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": [
+            { ...hr("completed", "success", 1), h: recovery },
+          ],
+        },
+        stagingDeploys: [spentDeploy],
+      }),
+    );
+    expect(after.armed).toEqual([7]);
+  });
+  // Run 45853184538's real jobs: resolve passed, every publish job skipped.
+  const NO_WORK = [
+    { name: "resolve", conclusion: "success" },
+    { name: "publish-staging staging v0.181.0", conclusion: "skipped" },
+    { name: "publish-prod staging v0.181.0", conclusion: "skipped" },
+    { name: "stage-prod staging v0.181.0", conclusion: "skipped" },
+  ];
+  it("a later hosted-publish that did no work (every publish job skipped) does not mask a spent one", () => {
+    const spent = { ...hr("completed", "failure", 3, "hosted-publish"), i: 2 };
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-publish.yml": [
+            {
+              ...hr("completed", "success", 1, "hosted-publish"),
+              i: 45853184538,
+            },
+            spent,
+          ],
+        },
+        jobs: { 45853184538: NO_WORK },
+      }),
+    );
+    expect(r.armed).toEqual([7]);
+    expect(r.logs.join("\n")).toContain(
+      "hosted-publish.yml failed with its retry spent",
+    );
+    // A later pass that did publish is a recovery: the hold stays.
+    const did = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-publish.yml": [
+            { ...hr("completed", "success", 1, "hosted-publish"), i: 3 },
+            spent,
+          ],
+        },
+        jobs: {
+          3: [
+            { name: "resolve", conclusion: "success" },
+            { name: "publish-staging staging v0.181.0", conclusion: "success" },
+          ],
+        },
+      }),
+    );
+    expect(did.armed).toEqual([]);
+  });
+  it("didNoWork and stageSpent: gating jobs aside, all skipped is no work; a failure is always evidence", () => {
+    expect(GATING_JOBS).toEqual(["resolve", "plan"]);
+    expect(
+      didNoWork(NO_WORK.map((j) => ({ n: j.name, c: j.conclusion }))),
+    ).toBe(true);
+    expect(
+      didNoWork([
+        { n: "plan", c: "success" },
+        { n: "dispatch", c: "skipped" },
+      ]),
+    ).toBe(true);
+    expect(
+      didNoWork([
+        { n: "plan", c: "success" },
+        { n: "dispatch", c: "success" },
+      ]),
+    ).toBe(false);
+    expect(didNoWork([{ n: "resolve", c: "success" }])).toBe(false);
+    const no = () => true;
+    const pair = (first: StageRun) => [first, hr("completed", "failure", 3)];
+    expect(stageSpent(pair(hr("completed", "success", 1)), no)).toBe(true);
+    expect(stageSpent(pair(hr("completed", "success", 1)))).toBe(false);
+    expect(stageSpent(pair(hr("completed", "failure", 1)), no)).toBe(false);
+    expect(stageSpent(pair(hr("completed", "cancelled", 1)), no)).toBe(false);
   });
   it("an unreadable pin commit means not arming", () => {
     const r = go(
