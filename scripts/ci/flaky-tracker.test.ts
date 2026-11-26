@@ -598,7 +598,7 @@ function fakeGh(o: {
   labels?: string[];
   pinFails?: boolean;
   jobs?: { name: string; log: string; conclusion?: string }[];
-  // attempt 1's conclusion, and the run's head repository.
+  // attempt 1's conclusion, and the run's head repository (a fork's or ours).
   attempt1?: string;
   headRepo?: string;
   // The reconcile's listing, per workflow file.
@@ -654,7 +654,7 @@ function fakeGh(o: {
         (o.listed?.[wf[1] as string] ?? [])
           .map(
             (r) =>
-              `${JSON.stringify([r.id, r.attempt, r.name, r.event, r.branch, r.sha, r.title, r.head])}\n`,
+              `${JSON.stringify([r.id, r.attempt, r.name, r.event, r.branch, r.sha, r.title])}\n`,
           )
           .join(""),
       );
@@ -925,15 +925,21 @@ describe("track", () => {
     expect(track({ exec: cancelled.exec, run, nowMs: NOW }).done).toEqual([]);
   });
 
-  it("reads nothing from a fork's run: its logs are not this repo's", () => {
-    const g = fakeGh({ labels: LABELS, headRepo: "someone/fork" });
-    const r = track({ exec: g.exec, run, nowMs: NOW });
-    expect(r.done).toEqual([]);
-    expect(r.notes).toEqual([
-      "head repository someone/fork is not o/cloud: skipped",
-    ]);
-    expect(g.calls.some((c) => c.args.join(" ").includes("/jobs"))).toBe(false);
-    expect(writes(g)).toEqual([]);
+  it("counts a fork's CI run (a PR from another repo) like any other", () => {
+    const vitest = parseVitest(CI_LOG)[2] as Failure;
+    const o = {
+      labels: LABELS,
+      jobs: [{ name: "overlay (c)", log: CI_LOG }],
+      stores: storeWith(vitest),
+    };
+    const fork = fakeGh({ ...o, headRepo: "someone/fork" });
+    const ours = fakeGh(o);
+    const r = track({ exec: fork.exec, run: ciRun, nowMs: NOW });
+    expect(r).toEqual(track({ exec: ours.exec, run: ciRun, nowMs: NOW }));
+    expect(r.done).toContainEqual({ action: "create", id: vitest.id });
+    expect(writes(fork).map((c) => c.args)).toEqual(
+      writes(ours).map((c) => c.args),
+    );
   });
 
   it(`closes a store past ${MAX_STORE_COMMENTS} comments, opens a new one, and still reads the old`, () => {
@@ -1254,7 +1260,6 @@ describe("reconcile", () => {
     branch: "main",
     sha: SHA,
     title: "redline-staging v0.246.0",
-    head: "o/cloud",
   };
   const listed = { "redline-staging.yml": [gate] };
 
@@ -1370,27 +1375,42 @@ describe("reconcile", () => {
     expect(r.tracked).toHaveLength(1);
   });
 
-  it("keeps the event's rules: no fork, attempt 2 or later, a release gate only when dispatched on main", () => {
-    const repo = "o/cloud";
-    expect(eligible(gate, repo)).toBe(true);
+  it("keeps the event's rules: attempt 2 or later, a release gate only when dispatched on main", () => {
+    expect(eligible(gate)).toBe(true);
     expect(
-      eligible(
-        { ...gate, name: "CI", event: "pull_request", branch: "x" },
-        repo,
-      ),
+      eligible({ ...gate, name: "CI", event: "pull_request", branch: "x" }),
     ).toBe(true);
-    expect(eligible({ ...gate, head: "fork/cloud" }, repo)).toBe(false);
-    expect(eligible({ ...gate, attempt: 1 }, repo)).toBe(false);
-    expect(eligible({ ...gate, event: "workflow_call" }, repo)).toBe(false);
-    expect(eligible({ ...gate, event: "schedule" }, repo)).toBe(false);
-    expect(eligible({ ...gate, branch: "feature" }, repo)).toBe(false);
-    expect(eligible({ ...gate, name: "other" }, repo)).toBe(false);
+    expect(eligible({ ...gate, attempt: 1 })).toBe(false);
+    expect(eligible({ ...gate, event: "workflow_call" })).toBe(false);
+    expect(eligible({ ...gate, event: "schedule" })).toBe(false);
+    expect(eligible({ ...gate, branch: "feature" })).toBe(false);
+    expect(eligible({ ...gate, name: "other" })).toBe(false);
     const g = fakeGh({
       labels: LABELS,
-      listed: { "redline-staging.yml": [{ ...gate, head: "fork/cloud" }] },
+      listed: { "redline-staging.yml": [{ ...gate, attempt: 1 }] },
     });
-    expect(reconcile({ exec: g.exec, repo, nowMs: NOW }).tracked).toEqual([]);
+    expect(
+      reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW }).tracked,
+    ).toEqual([]);
     expect(g.calls).toHaveLength(2);
+  });
+
+  it("tracks a fork's run it lists, whatever its head repository", () => {
+    // The listing no longer reads the head repository at all.
+    const fork = { ...gate, name: "CI", event: "pull_request", branch: "x" };
+    const g = fakeGh({
+      labels: LABELS,
+      headRepo: "someone/fork",
+      listed: { "ci.yml": [fork] },
+      stores: storeWith(joins),
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+    const list = g.calls.find((c) =>
+      c.args.join(" ").includes("/workflows/ci.yml/runs"),
+    );
+    expect(list?.args.join(" ")).not.toContain("head_repository");
   });
 
   it("goes on past a run that fails to track, and counts it", () => {
@@ -1481,7 +1501,7 @@ describe("flaky-tracker.yml", () => {
     expect(wf.permissions).toEqual({});
     const cond = String(wf.jobs.track.if).replace(/\s+/g, " ");
     expect(cond).toBe(
-      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.path == '.github/workflows/ci.yml' || (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
+      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && (github.event.workflow_run.path == '.github/workflows/ci.yml' || (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
     );
   });
 
@@ -1515,10 +1535,25 @@ describe("flaky-tracker.yml", () => {
     expect(String(wf.jobs.track.concurrency.group)).not.toContain("${{");
   });
 
-  it("skips a fork's run (a PR from another repo)", () => {
-    expect(String(wf.jobs.track.if)).toContain(
-      "github.event.workflow_run.head_repository.full_name == github.repository",
+  it("counts a fork's run but runs only this repo's code: the default branch, scripts/ci, no kept token", () => {
+    expect(String(wf.jobs.track.if)).not.toContain("head_repository");
+    const steps = wf.jobs.track.steps as {
+      uses?: string;
+      with?: Record<string, unknown>;
+    }[];
+    const checkouts = steps.filter((s) =>
+      s.uses?.startsWith("actions/checkout@"),
     );
+    expect(checkouts).toEqual([
+      {
+        uses: expect.any(String),
+        with: {
+          ref: "${{ github.sha }}",
+          "sparse-checkout": "scripts/ci",
+          "persist-credentials": false,
+        },
+      },
+    ]);
   });
 
   it("uses the default token with read, read and issues, no secret, SHA-pinned actions, and values only through env", () => {

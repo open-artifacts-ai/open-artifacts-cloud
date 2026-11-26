@@ -10,8 +10,12 @@
 # when GitHub allows it, else named in plain text). The script says why the
 # store is an issue. Public's CI has its own copy in the public repo:
 # workflow_run can't see another repo's runs.
-# Runs from forks (a PR from another repo) are skipped: their logs are
-# written by code nobody here reviewed. The script checks it again.
+# Runs from forks (a PR from another repo) count too. This job still runs in
+# this repo with this repo's code: it checks out github.sha (the default
+# branch for workflow_run), never the fork's head, and runs nothing from the
+# run under test. What a fork's run gives it (its title, branch, logs and the
+# test names in them) is data: passed through env, never put in an
+# expression inside a script, and made inert before it is written to an issue.
 # Hourly, the same job reconciles: it tracks every run of the watched
 # workflows created in the last 7 days and updated in the last 26 hours that passed after a failed attempt and is
 # not in the store yet (same rules, same code), so a tracker run GitHub
@@ -37,7 +41,6 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.run_attempt > 1 &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
       (github.event.workflow_run.path == '.github/workflows/ci.yml' ||
       (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' &&
       github.event.workflow_run.event == 'workflow_dispatch' &&

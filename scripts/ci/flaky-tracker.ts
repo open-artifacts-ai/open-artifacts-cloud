@@ -623,7 +623,6 @@ export function ownerPath(f: Failure): string {
 type Attempt = {
   conclusion: string | null;
   head_sha: string;
-  head_repository?: { full_name?: string } | null;
 };
 type Job = {
   id: number;
@@ -655,15 +654,9 @@ export function collect(
   ) as Attempt;
   const found: Found[] = [];
   const notes: string[] = [];
-  // A fork's run (a PR from another repo) runs code and writes logs nobody
-  // here reviewed: never read them. flaky-tracker.yml skips them too.
-  const head = last.head_repository?.full_name ?? "";
-  if (head !== run.repo) {
-    notes.push(
-      `head repository ${head || "unknown"} is not ${run.repo}: skipped`,
-    );
-    return { found, notes };
-  }
+  // A fork's run (a PR from another repo) counts too. Its logs are only read
+  // as text: parseJob() takes test names from them, and inert() makes those
+  // safe before they are written anywhere. Nothing from the run is executed.
   for (let a = 1; a < run.attempt; a++) {
     const att = JSON.parse(
       gh(exec, ["api", `${base}/attempts/${a}`]),
@@ -814,7 +807,9 @@ export function storeComment(
     "",
     markerBlock([
       ["kind", "sightings"],
-      ...(last ? ([["run", `${run.runId}/${run.attempt}`]] as const) : []),
+      ...(last
+        ? [["run", `${run.runId}/${run.attempt}`] satisfies [string, string]]
+        : []),
       ...fresh.map(storeMark),
     ]),
   ].join("\n");
@@ -1372,18 +1367,16 @@ export type ListedRun = {
   branch: string;
   sha: string;
   title: string;
-  head: string;
 };
 
 /**
  * The workflow_run path's rules, for a listed run whose latest attempt
- * succeeded: attempt 2 or later, not from a fork, and redline-staging only
+ * succeeded: attempt 2 or later (a fork's run too), and redline-staging only
  * when dispatched on main (a release gate). collect() then reads only the
  * earlier attempts that failed or timed out on the same head sha.
  */
-export const eligible = (r: ListedRun, repo: string) =>
+export const eligible = (r: ListedRun) =>
   r.attempt > 1 &&
-  r.head === repo &&
   (r.name === "CI" ||
     (r.name === "redline-staging" &&
       r.event === "workflow_dispatch" &&
@@ -1409,18 +1402,24 @@ function listRuns(
     "--paginate",
     `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
     "--jq",
-    `.workflow_runs[] | select(.run_attempt > 1 and .updated_at >= "${touched}") | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title, (.head_repository.full_name // "")] | @json`,
+    `.workflow_runs[] | select(.run_attempt > 1 and .updated_at >= "${touched}") | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title] | @json`,
   ]);
   return out
     .split("\n")
     .filter((l) => l.trim())
     .map((l) => {
-      const [id, attempt, , event, branch, sha, title, head] = JSON.parse(
-        l,
-      ) as [number, number, string, string, string, string, string, string];
+      const [id, attempt, , event, branch, sha, title] = JSON.parse(l) as [
+        number,
+        number,
+        string,
+        string,
+        string,
+        string,
+        string,
+      ];
       // The API's .name is the run-name ("redline-staging v0.242.2"), not the
       // workflow's name: use the workflow this list was read for.
-      return { id, attempt, name: workflow, event, branch, sha, title, head };
+      return { id, attempt, name: workflow, event, branch, sha, title };
     });
 }
 
@@ -1443,7 +1442,7 @@ export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
   const { exec, repo, nowMs } = o;
   const notes: string[] = [];
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
-  const runs = listed.filter((r) => eligible(r, repo));
+  const runs = listed.filter((r) => eligible(r));
   if (!runs.length) return { tracked: [], notes, failed: 0 };
   // Reads only: a store is created only when a run below has a sighting.
   const { read } = storeIssues(exec, repo, nowMs);
