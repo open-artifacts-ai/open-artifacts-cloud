@@ -549,7 +549,7 @@ The release App's `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` live in the Env
 
 ## Pin land App (cloud #264)
 
-Direct-mode pin bumps (`PIN_BUMP_DIRECT=on`) fast-forward `main` from the `land` job in `pin-bump.yml`. Main's ruleset needs a bypass actor for that push, and it must not be the release App: `hosted-release.yml` mints the release App's token with no narrowed permissions, so a bypass on that App would let every release job move main. The land job uses a separate App, made for this job only:
+Direct-mode pin bumps (`PIN_BUMP_DIRECT=on`) fast-forward `main` from the `land` job in `pin-land.yml` (split from `pin-bump.yml`, which only plans and opens, so each has a concurrency group of its own and a push to main never starts the lander). Main's ruleset needs a bypass actor for that push, and it must not be the release App: `hosted-release.yml` mints the release App's token with no narrowed permissions, so a bypass on that App would let every release job move main. The land job uses a separate App, made for this job only:
 
 - A GitHub App, installed on this repo only, with Contents read and write and Metadata read, and nothing else.
 - Its id and private key in the secrets `PIN_LAND_APP_ID` and `PIN_LAND_APP_PRIVATE_KEY` of the Environment `pin-land`: deployment branches `main` only (a custom branch policy that is exactly `main`), admin bypass off, no required reviewer. No other job and no other Environment holds them; `scripts/ci/release-app-environment.test.ts` enforces that.

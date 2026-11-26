@@ -560,8 +560,18 @@ describe("pin-bump.yml", () => {
   const stepsOf = (j: string): Step[] => jobs[j].steps;
   const step = (j: string, id: string) => stepsOf(j).find((s) => s.id === id);
   const MAIN = "github.ref == 'refs/heads/main'";
+  // Direct mode's lander, split out so each workflow's group holds one kind of work.
+  const landText = readFileSync(
+    join(root, ".github/workflows/pin-land.yml"),
+    "utf8",
+  );
+  // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+  const lw: any = parse(landText);
+  const landJobs = lw.jobs;
+  const landSteps = (j: string): Step[] => landJobs[j].steps;
+  const GATES = GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, ""));
 
-  it("is event-only: by dispatch, when a pin lands on main, after CI on a staged pin and when a gate workflow ends, from main only", () => {
+  it("is event-only: by dispatch, when a pin lands on main and when a gate workflow ends, from main only", () => {
     // cloud #264: no schedule, no timer of any kind
     expect(Object.keys(w.on)).toEqual([
       "workflow_dispatch",
@@ -573,16 +583,47 @@ describe("pin-bump.yml", () => {
     // a pin PR merging, or land moving main, changes PUBLIC_PIN on main
     expect(w.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
     expect(w.on.workflow_run).toEqual({
-      workflows: ["CI", ...GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, ""))],
+      workflows: GATES,
       types: ["completed"],
-      branches: ["main", "pin-land/**"],
+      branches: ["main"],
     });
-    for (const j of ["prepare", "open", "land", "report"])
+    for (const j of ["prepare", "open", "report"])
       expect(jobs[j].if).toContain(MAIN);
     // the event's fields are read only in `if`s, never in a step
     for (const j of Object.keys(jobs))
       for (const st of stepsOf(j))
         expect(JSON.stringify(st)).not.toContain("github.event");
+  });
+
+  it("pin-land.yml is event-only too: by dispatch, after CI on a staged pin and when a gate workflow ends, never on a push, from main only", () => {
+    expect(Object.keys(lw.on)).toEqual(["workflow_dispatch", "workflow_run"]);
+    expect(lw.on.push).toBeUndefined();
+    expect(lw.on.schedule).toBeUndefined();
+    expect(landText).not.toMatch(/\bcron:/);
+    expect(lw.on.workflow_run).toEqual({
+      workflows: ["CI", ...GATES],
+      types: ["completed"],
+      branches: ["main", "pin-land/**"],
+    });
+    expect(Object.keys(landJobs)).toEqual(["land", "report"]);
+    expect(landJobs.report.needs).toEqual(["land"]);
+    for (const j of ["land", "report"]) expect(landJobs[j].if).toContain(MAIN);
+    for (const j of Object.keys(landJobs))
+      for (const st of landSteps(j))
+        expect(JSON.stringify(st)).not.toContain("github.event");
+    expect(lw.permissions).toEqual({});
+    expect(lw.concurrency["cancel-in-progress"]).toBe(false);
+    // the lander is only here: pin-bump.yml never moves main
+    expect(jobs.land).toBeUndefined();
+    expect(text).not.toContain("PIN_LAND_APP_");
+    expect(text).not.toContain("pin-bump.ts land");
+    const uses = Object.values(landJobs)
+      // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+      .flatMap((j: any) => j.steps)
+      .map((s: Step) => s.uses)
+      .filter(Boolean) as string[];
+    expect(uses.length).toBeGreaterThan(2);
+    for (const u of uses) expect(u).toMatch(/@[0-9a-f]{40}( |$)/);
   });
 
   it("each gate workflow named is the workflow that file declares", () => {
@@ -641,30 +682,64 @@ describe("pin-bump.yml", () => {
         (f: string, ...a: unknown[]) =>
           f.replace(/\{(\d+)\}/g, (_, i) => String(a[Number(i)])),
       );
-    const runs = (j: string, o: Ev): boolean =>
-      Boolean(evaluate(String(jobs[j].if), o));
+    // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+    type Wf = { name: string; on: any; jobs: any; concurrency: any };
+    const BUMP: Wf = w;
+    const LAND: Wf = lw;
+    // Whether the workflow runs at all for this event (its `on:` filters).
+    const triggers = (wf: Wf, o: Ev): boolean => {
+      if (o.event === "workflow_dispatch") return "workflow_dispatch" in wf.on;
+      if (o.event === "push") return "push" in wf.on;
+      const r = wf.on.workflow_run;
+      if (!r || !r.workflows.includes(o.wf)) return false;
+      return r.branches.some((b: string) =>
+        b.endsWith("/**")
+          ? (o.branch ?? "").startsWith(b.slice(0, -2))
+          : b === o.branch,
+      );
+    };
+    const runsIn = (wf: Wf, j: string, o: Ev): boolean =>
+      triggers(wf, o) && Boolean(evaluate(String(wf.jobs[j].if), o));
     // report's `if` reads which of prepare and land ran, so bind those first
-    const jobsFor = (o: Ev) => {
-      const ran = ["prepare", "open", "land"].filter((j) => runs(j, o));
+    const jobsIn = (wf: Wf, o: Ev): string[] => {
+      const ran = Object.keys(wf.jobs)
+        .filter((j) => j !== "report")
+        .filter((j) => runsIn(wf, j, o));
       const r = {
         prepare: ran.includes("prepare") ? "success" : "skipped",
         land: ran.includes("land") ? "success" : "skipped",
       };
-      return runs("report", { ...o, ran: r }) ? [...ran, "report"] : ran;
+      return runsIn(wf, "report", { ...o, ran: r }) ? [...ran, "report"] : ran;
     };
-    const group = (o: Ev) => evaluate(String(w.concurrency.group), o);
+    const jobsFor = (o: Ev) => jobsIn(BUMP, o);
+    const landFor = (o: Ev) => jobsIn(LAND, o);
+    const groupIn = (wf: Wf, o: Ev) =>
+      evaluate(String(wf.concurrency.group), o);
+    const group = (o: Ev) => groupIn(BUMP, o);
     const gateEnd = (wf: string, direct = "on") => ({
       event: "workflow_run",
       wf,
       branch: "main",
       direct,
     });
+    const ciOnPin = (direct = "on"): Ev => ({
+      event: "workflow_run",
+      wf: "CI",
+      branch: "pin-land/v1.2.3",
+      direct,
+    });
 
     it("a pin landing on main plans again at once, the same as a release dispatch", () => {
-      expect(jobsFor({ event: "push" })).toEqual(
-        jobsFor({ event: "workflow_dispatch" }),
-      );
-      expect(jobsFor({ event: "push" })).toEqual(["prepare", "open", "report"]);
+      for (const direct of ["", "on"]) {
+        expect(jobsFor({ event: "push", direct })).toEqual(
+          jobsFor({ event: "workflow_dispatch", direct }),
+        );
+        expect(jobsFor({ event: "push", direct })).toEqual([
+          "prepare",
+          "open",
+          "report",
+        ]);
+      }
       // nothing newer: prepare's plan says no bump, and open does not run
       expect(jobsFor({ event: "push", bump: "false" })).toEqual([
         "prepare",
@@ -672,172 +747,190 @@ describe("pin-bump.yml", () => {
       ]);
     });
 
-    it("in direct mode every run with work plans, opens and lands, whatever the event", () => {
-      const all = ["prepare", "open", "land", "report"];
-      for (const o of [
-        { event: "push", direct: "on" },
-        { event: "workflow_dispatch", direct: "on" },
-        {
-          event: "workflow_run",
-          wf: "CI",
-          branch: "pin-land/v1.2.3",
-          direct: "on",
-        },
-      ])
-        expect(jobsFor(o)).toEqual(all);
-      // not direct: land never runs, and the plan runs on dispatch and the push
-      for (const event of ["push", "workflow_dispatch"])
-        expect(runs("land", { event })).toBe(false);
-    });
-
-    it("after CI on a staged pin, the plan runs as well as land (direct mode)", () => {
-      const ci = { event: "workflow_run", wf: "CI", branch: "pin-land/v1.2.3" };
-      expect(jobsFor({ ...ci, direct: "on" })).toEqual([
-        "prepare",
-        "open",
+    it("the lander never runs on the push, in direct mode or not (#481)", () => {
+      for (const direct of ["", "on"]) {
+        expect(triggers(LAND, { event: "push", direct })).toBe(false);
+        expect(landFor({ event: "push", direct })).toEqual([]);
+      }
+      expect(landFor({ event: "workflow_dispatch", direct: "on" })).toEqual([
         "land",
         "report",
       ]);
+      // not direct: a dispatch of the lander does nothing
+      expect(landFor({ event: "workflow_dispatch" })).toEqual([]);
+    });
+
+    it("after CI on a staged pin, only the lander runs (direct mode)", () => {
+      expect(landFor(ciOnPin())).toEqual(["land", "report"]);
+      expect(triggers(BUMP, ciOnPin())).toBe(false);
+      expect(jobsFor(ciOnPin())).toEqual([]);
       // not direct: nothing runs, and report does not close the blocker issue
-      expect(jobsFor(ci)).toEqual([]);
+      expect(landFor(ciOnPin(""))).toEqual([]);
     });
 
     it("a gate workflow ending on main plans and lands again in direct mode, and does nothing otherwise", () => {
-      for (const f of GATE_WORKFLOWS) {
-        const wf = f.replace(/\.yml$/, "");
-        expect(jobsFor(gateEnd(wf))).toEqual([
-          "prepare",
-          "open",
-          "land",
-          "report",
-        ]);
+      for (const wf of GATES) {
+        expect(jobsFor(gateEnd(wf))).toEqual(["prepare", "open", "report"]);
         expect(jobsFor({ ...gateEnd(wf), bump: "false" })).toEqual([
           "prepare",
-          "land",
           "report",
         ]);
+        expect(landFor(gateEnd(wf))).toEqual(["land", "report"]);
         // the PR path does not wait on the gate (pin-bump-arm does): no job
         expect(jobsFor(gateEnd(wf, ""))).toEqual([]);
+        expect(landFor(gateEnd(wf, ""))).toEqual([]);
         // a gate run on another branch is not the release pipeline's
         expect(jobsFor({ ...gateEnd(wf), branch: "feature" })).toEqual([]);
+        expect(landFor({ ...gateEnd(wf), branch: "feature" })).toEqual([]);
       }
     });
 
     it("CI ending on main runs nothing, in direct mode or not", () => {
-      for (const direct of ["", "on"])
-        expect(
-          jobsFor({ event: "workflow_run", wf: "CI", branch: "main", direct }),
-        ).toEqual([]);
+      for (const direct of ["", "on"]) {
+        const ci = { event: "workflow_run", wf: "CI", branch: "main", direct };
+        expect(jobsFor(ci)).toEqual([]);
+        expect(landFor(ci)).toEqual([]);
+      }
     });
 
-    it("a run with work takes the one shared group; an event no job takes gets its own, so it never replaces a pending run", () => {
-      const real: Ev[] = [
-        { event: "push" },
-        { event: "workflow_dispatch" },
-        { event: "push", direct: "on" },
-        {
-          event: "workflow_run",
-          wf: "CI",
-          branch: "pin-land/v1.2.3",
-          direct: "on",
-        },
-        ...GATE_WORKFLOWS.map((f) => gateEnd(f.replace(/\.yml$/, ""))),
-      ];
-      for (const o of real) {
-        expect(jobsFor(o).length).toBeGreaterThan(0);
-        expect(group(o)).toBe("pin-bump");
-      }
-      const idle: Ev[] = [
-        { event: "workflow_run", wf: "CI", branch: "main" },
-        { event: "workflow_run", wf: "CI", branch: "main", direct: "on" },
-        { event: "workflow_run", wf: "CI", branch: "pin-land/v1.2.3" },
-        gateEnd("prod-release-chain", ""),
-        { ...gateEnd("prod-release-chain"), branch: "feature" },
-      ];
-      for (const o of idle) {
-        expect(jobsFor(o)).toEqual([]);
-        expect(group(o)).toBe("pin-bump-idle-42");
-      }
+    // Every event either workflow may see, in both modes.
+    const eventsIn = (direct: string): Ev[] => [
+      { event: "push", direct },
+      { event: "workflow_dispatch", direct },
+      ciOnPin(direct),
+      { event: "workflow_run", wf: "CI", branch: "main", direct },
+      ...GATES.map((wf) => gateEnd(wf, direct)),
+      { ...gateEnd("prod-release-chain", direct), branch: "feature" },
+    ];
+    // PIN_BUMP_DIRECT is one repo variable: two events in a row see the same mode.
+    const MODES = ["", "on"];
+    const EVENTS: Ev[] = MODES.flatMap(eventsIn);
+
+    it("a run with work takes its workflow's one group; an event no job takes gets its own, so it never replaces a pending run", () => {
+      for (const [wf, shared, idle] of [
+        [BUMP, "pin-bump", "pin-bump-idle-42"],
+        [LAND, "pin-land", "pin-land-idle-42"],
+      ] as const)
+        for (const o of EVENTS.filter((e) => triggers(wf, e))) {
+          const work = jobsIn(wf, o).length > 0;
+          if (work) expect(groupIn(wf, o), JSON.stringify(o)).toBe(shared);
+          else if (groupIn(wf, o) === shared)
+            // only a lander dispatch outside direct mode: no work, and every
+            // other run in the group has none either
+            expect(o).toEqual({ event: "workflow_dispatch", direct: "" });
+          else expect(groupIn(wf, o)).toBe(idle);
+        }
+      expect(groupIn(BUMP, { event: "push" })).not.toBe(
+        groupIn(LAND, ciOnPin()),
+      );
     });
 
     // GitHub keeps one pending run per concurrency group: a newer event in the
     // group replaces it (cancel-in-progress false cancels the pending one, not
     // the running one). Replaying that slot must never drop an event's work.
-    const pendingSlot = (events: Ev[]) => {
+    const pendingSlot = (wf: Wf, shared: string, events: Ev[]) => {
       let pending: Ev | undefined;
-      for (const e of events) if (group(e) === "pin-bump") pending = e; // replaces the pending one
+      for (const e of events)
+        if (triggers(wf, e) && groupIn(wf, e) === shared) pending = e;
       return pending;
     };
-    it("a release dispatch replaced by a pin-land CI event in the pending slot is still planned and opened (direct mode)", () => {
+    // All the work one event starts, across both workflows.
+    const work = (o: Ev) => [
+      ...jobsIn(BUMP, o).map((j) => `pin-bump:${j}`),
+      ...jobsIn(LAND, o).map((j) => `pin-land:${j}`),
+    ];
+
+    it("a release dispatch followed by a pin-land CI event: the release is still planned and opened, and the pin landed (direct mode)", () => {
       const dispatch: Ev = { event: "workflow_dispatch", direct: "on" };
-      const ci: Ev = {
-        event: "workflow_run",
-        wf: "CI",
-        branch: "pin-land/v1.2.2",
-        direct: "on",
-      };
-      const survivor = pendingSlot([dispatch, ci]) as Ev;
-      expect(survivor).toBe(ci);
-      expect(group(dispatch)).toBe(group(ci));
-      const ran = jobsFor(survivor);
-      expect(ran).toContain("prepare");
-      expect(ran).toContain("open");
-      expect(ran).toContain("land");
-      // the replaced dispatch's work is all in the survivor's
-      for (const j of jobsFor(dispatch)) expect(ran).toContain(j);
+      const ci: Ev = { ...ciOnPin(), branch: "pin-land/v1.2.2" };
+      // the CI event never takes the dispatch's pending slot
+      expect(pendingSlot(BUMP, "pin-bump", [dispatch, ci])).toBe(dispatch);
+      expect(jobsFor(dispatch)).toEqual(["prepare", "open", "report"]);
+      // and the lander's slot holds the CI event
+      expect(pendingSlot(LAND, "pin-land", [dispatch, ci])).toBe(ci);
+      expect(landFor(ci)).toEqual(["land", "report"]);
     });
-    it("whichever event replaces another in the shared group does every job the replaced one would", () => {
-      for (const direct of ["", "on"]) {
-        const real: Ev[] = [
-          { event: "push", direct },
-          { event: "workflow_dispatch", direct },
-          {
-            event: "workflow_run",
-            wf: "CI",
-            branch: "pin-land/v1.2.3",
-            direct,
-          },
-          ...GATE_WORKFLOWS.map((f) =>
-            gateEnd(f.replace(/\.yml$/, ""), direct),
-          ),
-        ].filter((o) => group(o) === "pin-bump");
-        expect(real.length).toBeGreaterThanOrEqual(2);
-        for (const first of real)
-          for (const later of real) {
-            const survivor = pendingSlot([first, later]) as Ev;
-            expect(survivor).toBe(later);
-            for (const j of jobsFor(first))
+
+    it("whichever event replaces another in a group does every job the replaced one would there, and no event crosses groups", () => {
+      for (const [wf, shared] of [
+        [BUMP, "pin-bump"],
+        [LAND, "pin-land"],
+      ] as const) {
+        for (const direct of MODES) {
+          const inGroup = eventsIn(direct).filter(
+            (o) => triggers(wf, o) && groupIn(wf, o) === shared,
+          );
+          // outside direct mode the lander's group holds only a dispatch, with no work
+          expect(inGroup.length).toBeGreaterThanOrEqual(
+            wf === LAND && direct === "" ? 1 : 2,
+          );
+          for (const first of inGroup)
+            for (const later of inGroup) {
+              const survivor = pendingSlot(wf, shared, [first, later]) as Ev;
+              expect(survivor).toBe(later);
+              const msg = `${wf.name}: ${JSON.stringify(first)} then ${JSON.stringify(later)}`;
+              for (const j of jobsIn(wf, first))
+                expect(jobsIn(wf, survivor), msg).toContain(j);
+            }
+        }
+      }
+      // each group holds one kind of work: plan/open there, land here
+      for (const o of EVENTS) {
+        for (const j of jobsIn(BUMP, o))
+          expect(["prepare", "open", "report"]).toContain(j);
+        for (const j of jobsIn(LAND, o))
+          expect(["land", "report"]).toContain(j);
+      }
+      // and no event's work is lost: every one with work keeps a pending slot
+      // in each workflow it has work in, whatever event comes after it
+      for (const direct of MODES)
+        for (const first of eventsIn(direct))
+          for (const later of eventsIn(direct)) {
+            const kept = [
+              ...(jobsIn(BUMP, first).length
+                ? jobsIn(
+                    BUMP,
+                    pendingSlot(BUMP, "pin-bump", [first, later]) as Ev,
+                  ).map((j) => `pin-bump:${j}`)
+                : []),
+              ...(jobsIn(LAND, first).length
+                ? jobsIn(
+                    LAND,
+                    pendingSlot(LAND, "pin-land", [first, later]) as Ev,
+                  ).map((j) => `pin-land:${j}`)
+                : []),
+            ];
+            for (const j of work(first))
               expect(
-                jobsFor(survivor),
+                kept,
                 `${JSON.stringify(first)} then ${JSON.stringify(later)}`,
               ).toContain(j);
           }
-      }
     });
 
     it("never runs on a fork or another branch, whatever the event", () => {
       const events: Ev[] = [
         { event: "push" },
         { event: "workflow_dispatch" },
-        { event: "workflow_run", wf: "CI", branch: "pin-land/v1.2.3" },
+        ciOnPin(),
         gateEnd("prod-release-chain"),
       ];
       for (const e of events) {
-        expect(
-          jobsFor({ ...e, repo: "someone/open-artifacts-cloud", direct: "on" }),
-        ).toEqual([]);
-        expect(
-          jobsFor({ ...e, ref: "refs/heads/feature", direct: "on" }),
-        ).toEqual([]);
+        for (const o of [
+          { ...e, repo: "someone/open-artifacts-cloud", direct: "on" },
+          { ...e, ref: "refs/heads/feature", direct: "on" },
+        ]) {
+          expect(jobsFor(o)).toEqual([]);
+          expect(landFor(o)).toEqual([]);
+        }
       }
     });
   });
 
-  it("is four jobs, in order", () => {
-    expect(Object.keys(jobs)).toEqual(["prepare", "open", "land", "report"]);
+  it("is three jobs, in order", () => {
+    expect(Object.keys(jobs)).toEqual(["prepare", "open", "report"]);
     expect(jobs.open.needs).toBe("prepare");
-    expect(jobs.land.needs).toBeUndefined();
-    expect(jobs.report.needs).toEqual(["prepare", "open", "land"]);
+    expect(jobs.report.needs).toEqual(["prepare", "open"]);
   });
 
   it("grants nothing wide, one run at a time", () => {
@@ -852,7 +945,8 @@ describe("pin-bump.yml", () => {
       });
     expect(jobs.report.permissions).toEqual({ issues: "write" });
     // actions read: land reads ci.yml's push run and its jobs (cloud #264).
-    expect(jobs.land.permissions).toEqual({
+    expect(landJobs.report.permissions).toEqual({ issues: "write" });
+    expect(landJobs.land.permissions).toEqual({
       contents: "read",
       actions: "read",
       checks: "read",
@@ -1078,7 +1172,7 @@ describe("pin-bump.yml", () => {
           expect(evalExpr(step(j, "plan").env.MODE, v)).toBe("plan");
         expect(evalExpr(step("open", "route").env.DIRECT, v)).toBe("off");
       }
-      expect(jobs.land.if).toContain("vars.PIN_BUMP_DIRECT == 'on'");
+      expect(landJobs.land.if).toContain("vars.PIN_BUMP_DIRECT == 'on'");
     });
 
     it("the PR route pushes the branch and opens the PR, and stages nothing", () => {
@@ -1159,7 +1253,7 @@ describe("pin-bump.yml", () => {
     });
 
     it("land reads with the job token, writes with a contents-only App token, from main's checkout", () => {
-      const steps = stepsOf("land");
+      const steps = landSteps("land");
       const app = steps.find((s) => s.id === "app");
       expect(app.with["permission-contents"]).toBe("write");
       expect(app.with["permission-pull-requests"]).toBeUndefined();
@@ -1173,24 +1267,31 @@ describe("pin-bump.yml", () => {
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       expect(co[0].with.ref).toBe("${{ github.sha }}");
       // Its own App in its own Environment: the bypass actor on main, never the release App.
-      expect(jobs.land.environment).toBe("pin-land");
+      expect(landJobs.land.environment).toBe("pin-land");
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       expect(app.with["app-id"]).toBe("${{ secrets.PIN_LAND_APP_ID }}");
       expect(app.with["private-key"]).toBe(
         // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
         "${{ secrets.PIN_LAND_APP_PRIVATE_KEY }}",
       );
-      expect(JSON.stringify(jobs.land)).not.toContain("RELEASE_APP_");
+      expect(JSON.stringify(landJobs.land)).not.toContain("RELEASE_APP_");
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       expect(l.env.LAND_BOT).toBe("${{ steps.app.outputs.app-slug }}[bot]");
     });
 
     it("only open and land see the App token", () => {
-      const tokened = Object.entries(jobs).filter(([, j]) =>
-        // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
-        JSON.stringify((j as any).steps).includes("steps.app.outputs.token"),
-      );
-      expect(tokened.map(([k]) => k)).toEqual(["open", "land"]);
+      // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+      const tokened = (js: any) =>
+        Object.entries(js)
+          .filter(([, j]) =>
+            // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+            JSON.stringify((j as any).steps).includes(
+              "steps.app.outputs.token",
+            ),
+          )
+          .map(([k]) => k);
+      expect(tokened(jobs)).toEqual(["open"]);
+      expect(tokened(landJobs)).toEqual(["land"]);
       expect(jobs.open.environment).toBe("release-app");
     });
 
@@ -1270,18 +1371,21 @@ describe("pin-bump.yml", () => {
     });
 
     // The RESULT expression is plain JS once the needs are bound.
-    const result = (prepare: string, open: string, land = "skipped") => {
-      const expr = String(rep[0].env.RESULT)
-        .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
-        .replaceAll("needs.prepare.result", "prepare")
-        .replaceAll("needs.open.result", "open")
-        .replaceAll("needs.land.result", "land");
-      return new Function("prepare", "open", "land", `return ${expr};`)(
-        prepare,
-        open,
-        land,
-      );
-    };
+    const resultOf =
+      (r: Step) =>
+      (prepare: string, open: string, land = "skipped") => {
+        const expr = String(r.env.RESULT)
+          .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+          .replaceAll("needs.prepare.result", "prepare")
+          .replaceAll("needs.open.result", "open")
+          .replaceAll("needs.land.result", "land");
+        return new Function("prepare", "open", "land", `return ${expr};`)(
+          prepare,
+          open,
+          land,
+        );
+      };
+    const result = resultOf(rep[0]);
 
     it("anything but success is red; an open skipped for no bump is green", () => {
       expect(result("success", "success")).toBe("success");
@@ -1291,13 +1395,32 @@ describe("pin-bump.yml", () => {
       expect(result("failure", "skipped")).toBe("failure");
       // a prepare past its timeout is reported cancelled, so it files an issue
       expect(result("cancelled", "skipped")).toBe("failure");
-      // direct mode: a staged pin that cannot land is red
-      expect(result("success", "success", "success")).toBe("success");
-      expect(result("success", "skipped", "failure")).toBe("failure");
-      expect(result("success", "skipped", "cancelled")).toBe("failure");
-      // land's result counts on its own when prepare did not run
-      expect(result("skipped", "skipped", "success")).toBe("success");
-      expect(result("skipped", "skipped", "failure")).toBe("failure");
+      // land is pin-land.yml's: it never colours this report
+      expect(rep[0].env.RESULT).not.toContain("needs.land");
+    });
+
+    it("pin-land.yml's report: a staged pin that cannot land is red, under its own title", () => {
+      const lrep = landSteps("report");
+      expect(lrep).toHaveLength(1);
+      expect(lrep[0].uses).toBeUndefined();
+      expect(landJobs.report.if).toContain("always()");
+      expect(landJobs.report.if).not.toContain("cancelled");
+      const lresult = resultOf(lrep[0]);
+      expect(lresult("skipped", "skipped", "success")).toBe("success");
+      expect(lresult("skipped", "skipped", "failure")).toBe("failure");
+      // past its timeout, land is reported cancelled: red
+      expect(lresult("skipped", "skipped", "cancelled")).toBe("failure");
+      expect(lrep[0].run).toContain('title="pin-land failed"');
+      // never the opener's issue: a green land must not close a red plan's
+      expect(lrep[0].run).not.toContain("pin-bump failed");
+      expect(lrep[0].run.replace('title="pin-land failed"', "")).toBe(
+        rep[0].run
+          .replace('title="pin-bump failed"', "")
+          .replace(
+            "The pin-bump workflow failed",
+            "The pin-land workflow failed",
+          ),
+      );
     });
 
     const bin = mkdtempSync(join(tmpdir(), "fake-gh-"));
