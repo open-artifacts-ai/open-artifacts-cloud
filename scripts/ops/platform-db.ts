@@ -42,14 +42,7 @@
 //     one read) for the scheduler's `fleet_done:<version>` (cloud #264: every
 //     install it waits for upgraded and settled); once it is there, prints
 //     `fleet_done_at=<ISO time it was set>` and exits 0, else exits 1. The
-//     deploy's "Fleet done" step follows it (release-watch, #456).
-//   node scripts/ops/platform-db.ts fleet-done-all staging|prod
-//     reads only: every `fleet_done:<version>` the platform D1 still holds
-//     (the scheduler prunes one a week after it is set, once superseded),
-//     oldest first, as `fleet_done_list=vX.Y.Z at <ISO>, ...` (at most
-//     FLEET_DONE_LIST_MAX, the newest). Every prod deploy records them, so a
-//     finish that lands after any one deploy's read is still recorded by the
-//     next one.
+//     deploy's "Fleet done" step follows it.
 //   The log names the mark and nothing else (no counts).
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -622,28 +615,6 @@ export async function waitFleetDone({
   }
 }
 
-/** fleet-done-all lists at most this many releases, the newest. */
-export const FLEET_DONE_LIST_MAX = 20;
-
-/**
- * Every release whose rollout the scheduler marked finished
- * (`fleet_done:<X.Y.Z>`), oldest first, at most FLEET_DONE_LIST_MAX (the
- * newest), as "vX.Y.Z at <ISO>" entries. Reads only; a key that isn't a
- * stable version or a value that isn't a time is skipped.
- */
-export async function fleetDoneAll({ db }: { db: Db }): Promise<string[]> {
-  const rows = await db.all(
-    "SELECT key, value FROM platform_state WHERE key GLOB 'fleet_done:*' ORDER BY value, key",
-  );
-  const out: string[] = [];
-  for (const r of rows) {
-    const v = String(r.key).slice("fleet_done:".length);
-    if (!/^\d+\.\d+\.\d+$/.test(v) || typeof r.value !== "number") continue;
-    out.push(`v${v} at ${new Date(r.value).toISOString()}`);
-  }
-  return out.slice(-FLEET_DONE_LIST_MAX);
-}
-
 /** D1 over the REST API: /query, the token in a header. */
 export function d1({
   token,
@@ -704,8 +675,7 @@ if (
   const mode =
     process.argv[2] === "mark-verified" ||
     process.argv[2] === "unmark-verified" ||
-    process.argv[2] === "fleet-done" ||
-    process.argv[2] === "fleet-done-all"
+    process.argv[2] === "fleet-done"
       ? process.argv[2]
       : null;
   const env = mode ? process.argv[3] : process.argv[2];
@@ -715,7 +685,7 @@ if (
   };
   if (env !== "staging" && env !== "prod")
     fail(
-      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | fleet-done staging|prod vX.Y.Z | fleet-done-all staging|prod | staging|prod]",
+      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | fleet-done staging|prod vX.Y.Z | staging|prod]",
       2,
     );
   if ((mode === "mark-verified" || mode === "fleet-done") && !process.argv[4])
@@ -746,12 +716,6 @@ if (
       });
       const log = (s: string) => console.log(`oa-${env?.[0]}-platform: ${s}`);
       const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-      if (mode === "fleet-done-all") {
-        const list = await fleetDoneAll({ db });
-        log(`${list.length} fleet_done mark(s)`);
-        console.log(`fleet_done_list=${list.join(", ")}`);
-        process.exit(0);
-      }
       if (mode === "fleet-done") {
         const at = await waitFleetDone({
           db,
