@@ -1,7 +1,8 @@
 # Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
 # takes, stage by stage (.github/hosted/release-stages.json), and one comment
 # per release and stage, on the one open issue "release stuck", when a stage
-# finished past its limit, max(2 x usual, usual + 5 min), or failed. Merge to
+# is seen still running past its limit, max(2 x usual, usual + 5 min),
+# finishes past it, or fails. Merge to
 # every install is reported against a 20 min target, never alerted on: to the
 # prod deploy's "Fleet done" step (cloud #474) where it ran, else to the prod
 # deploy, labelled "to prod deploy (fleet not yet measured)". Each stage is
@@ -34,7 +35,8 @@
 #   "Everything should be event-based, push, never PULL"): each completed run
 #   of every release workflow on main, a push to main that moves PUBLIC_PIN,
 #   and a dispatch. Each run refreshes the times and comments on any stage
-#   that finished past its limit or failed. A stage that never finishes
+#   it sees still running past its limit (once, marked "still running"),
+#   finished past it, or failed. A stage that never finishes
 #   raises no event: catching it is the release agent's (OA Manager L-2) job,
 #   with this run's summary and current.json as its picture.
 # - No secret but the default token: contents read (the checkout), actions

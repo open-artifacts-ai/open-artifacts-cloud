@@ -281,13 +281,15 @@ describe("timeline on the recorded chain", () => {
     const [o] = commentPlan([], r.over);
     const body = commentBody(o as never, "o/c", config);
     expect(body).toContain(
-      "**v0.245.1 staging_deploy** is past its limit: it has been going 9.4 min (since 2026-11-25T19:20:38Z); usual 4.3 min, limit 9.3 min",
+      "**v0.245.1 staging_deploy** is still running past its limit: it has been going 9.4 min (since 2026-11-25T19:20:38Z); usual 4.3 min, limit 9.3 min",
     );
     expect(body).toContain(
       '- Run: [45684245945](https://github.com/o/c/actions/runs/45684245945). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45684245945 --failed -R o/c`.',
     );
     expect(body).toContain("- Attempts: 1");
-    expect(body).toContain("<!-- release-watch v0.245.1 staging_deploy -->");
+    expect(body).toContain(
+      "<!-- release-watch v0.245.1 staging_deploy running -->",
+    );
   });
 
   it("no pin PR 7.5 minutes after the release is a pin_open stall; 4.5 minutes is under the 5 min floor", () => {
@@ -973,7 +975,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       ["staging_deploy", true],
     ]);
     expect(commentBody(r.over[0] as never, "o/c", config)).toContain(
-      "**v0.248.2 staging_deploy** is past its limit: it has not started 10 min after what it waits on ended (since 2026-11-26T04:39:06Z); usual 4.3 min, limit 9.3 min",
+      "**v0.248.2 staging_deploy** is still running past its limit: it has not started 10 min after what it waits on ended (since 2026-11-26T04:39:06Z); usual 4.3 min, limit 9.3 min",
     );
   });
 
@@ -1492,10 +1494,15 @@ describe("overlapping releases and the exact fleet finish (v0.251.0, v0.251.1)",
       [pr(490, "v0.251.1", "12:14:48", null)],
       [v0510],
     );
-    expect(both.notify.map((o) => [o.tag, o.stage])).toEqual([
-      ["v0.251.0", "tag"],
-      ["v0.251.0", "pin_merge"],
+    // v0.251.1's pin, seen still running past its limit: its own heads-up.
+    expect(both.notify.map((o) => [o.tag, o.stage, o.kind])).toEqual([
+      ["v0.251.0", "tag", "finished"],
+      ["v0.251.0", "pin_merge", "finished"],
+      ["v0.251.1", "pin_merge", "in_flight"],
     ]);
+    expect(commentKey(both.notify[2] as Overrun)).toBe(
+      "<!-- release-watch v0.251.1 pin_merge running -->",
+    );
     expect(both.over.map((o) => [o.tag, o.stage, o.kind])).toContainEqual([
       "v0.251.1",
       "pin_merge",
@@ -1880,7 +1887,7 @@ describe("the stuck-stage issue", () => {
       },
     ]);
     expect(commentBody(r.over[0] as Overrun, "o/r", config)).toContain(
-      "**v1.0.0 hosted_release** is past its limit: it took 78.4 min; usual 3.2 min, limit 8.2 min (the larger of 2 x its usual time and its usual time plus 5 min).",
+      "**v1.0.0 hosted_release** finished past its limit: it took 78.4 min; usual 3.2 min, limit 8.2 min (the larger of 2 x its usual time and its usual time plus 5 min).",
     );
   });
   it("the newest finished release's overruns keep it open until a release completes with none; its total never alerts", () => {
@@ -1917,7 +1924,13 @@ describe("the stuck-stage issue", () => {
   });
   it("comments once per release and stage: a key already said by the bot, or twice in one tick, is skipped", () => {
     const o = over.over[0] as Overrun;
-    expect(commentKey(o)).toBe("<!-- release-watch v1.0.0 pin_open -->");
+    // Still running: its own key; the finished one has the plain key.
+    expect(commentKey(o)).toBe(
+      "<!-- release-watch v1.0.0 pin_open running -->",
+    );
+    expect(commentKey({ ...o, kind: "finished" })).toBe(
+      "<!-- release-watch v1.0.0 pin_open -->",
+    );
     expect(commentPlan([], over.over)).toEqual(over.over);
     const said = {
       author: "github-actions[bot]",
@@ -1966,7 +1979,7 @@ describe("the stuck-stage issue", () => {
       "<!-- release-watch v0.248.2 redline -->",
     ]);
   });
-  it("a failed stage is commented on whatever its time; one still going is never, however long (no poll catches it)", () => {
+  it("a failed stage is a failed entry whatever its time; one still going past its limit is an in-flight overrun", () => {
     const t = (state: "red" | "current", minutes: number) =>
       overruns(
         [
@@ -2011,7 +2024,7 @@ describe("the stuck-stage issue", () => {
     expect(t("current", 25).over.map((o) => o.kind)).toEqual(["in_flight"]);
     expect(t("current", 25).failed).toEqual([]);
   });
-  it("a run comments on stages that finished past their limit or failed, never on one still going", () => {
+  it("a run comments on a stage seen still running past its limit, then on the same stage failed: two keys", () => {
     // v0.245.1 at 19:30 with its staging deploy still going past its limit.
     const now = T("19:30:00");
     const w = at(now);
@@ -2026,7 +2039,10 @@ describe("the stuck-stage issue", () => {
     expect(going.over.map((o) => [o.stage, o.kind])).toEqual([
       ["staging_deploy", "in_flight"],
     ]);
-    expect(going.notify).toEqual([]);
+    // Seen still running past its limit on this event: one heads-up.
+    expect(going.notify.map((o) => [o.stage, o.kind])).toEqual([
+      ["staging_deploy", "in_flight"],
+    ]);
     // The same deploy failed: a comment for it.
     w.runs = w.runs.map((r) =>
       r.title.startsWith("deploy-hosted-platform staging v0.245.1")
@@ -2038,9 +2054,18 @@ describe("the stuck-stage issue", () => {
           }
         : r,
     );
-    expect(world(now, w).notify.map((o) => [o.stage, o.kind])).toEqual([
+    const failedNow = world(now, w).notify;
+    expect(failedNow.map((o) => [o.stage, o.kind])).toEqual([
       ["staging_deploy", "failed"],
     ]);
+    // The heads-up already said does not silence the failed comment, and
+    // each is said once.
+    const said = going.notify.map((o) => ({
+      author: "github-actions[bot]",
+      body: commentKey(o),
+    }));
+    expect(commentPlan(said, failedNow)).toEqual(failedNow);
+    expect(commentPlan(said, going.notify)).toEqual([]);
     // At 23:30: v0.246.1's tag and pin merge finished past their limits, and
     // v0.246.0, superseded, failed its red-line: each release on its own runs.
     expect(
@@ -2111,7 +2136,9 @@ describe("the stuck-stage issue", () => {
       "--repo",
       "o/r",
     ]);
-    expect(s.calls[2]?.[6]).toContain("<!-- release-watch v1.0.0 pin_open -->");
+    expect(s.calls[2]?.[6]).toContain(
+      "<!-- release-watch v1.0.0 pin_open running -->",
+    );
   });
   it("reuses the open issue and says nothing already said: a refresh writes nothing", () => {
     const s = stub({

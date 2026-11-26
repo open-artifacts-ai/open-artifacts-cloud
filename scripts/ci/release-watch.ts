@@ -1,7 +1,8 @@
 // Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
 // takes, stage by stage, against each stage's usual time, and one comment, on
-// the one open issue "release stuck", when a stage finished past its limit or
-// failed (each release and stage once, never per refresh). It runs on events
+// the one open issue "release stuck", when a stage is seen still running past
+// its limit, finished past it, or failed (each once per release and stage,
+// never per refresh). It runs on events
 // only, never a schedule or a poll: a stage that never finishes raises no
 // event and is the release agent's to catch. The limit: the larger of alertFactor (2) x its
 // usual time and its usual time plus alertFloor (5) minutes, so a stage that
@@ -37,7 +38,7 @@
 // release in history is done and not rebuilt, but one whose total stopped at
 // the prod deploy has its prod deploys' jobs read in the window, and takes a
 // later "Fleet done" for its tag. Writes, through gh() and only when a stage
-// finished past its limit or failed: the issue (created once) and one comment
+// is past its limit or failed: the issue (created once) and one comment
 // per release and stage; for a failed stage, its run's jobs are read (never
 // its log).
 import { spawnSync } from "node:child_process";
@@ -1048,8 +1049,16 @@ export function overruns(
 }
 
 /** The hidden key that makes a comment once per release and stage. */
-export const commentKey = (o: { tag: string; stage: string }) =>
-  `<!-- release-watch ${o.tag} ${o.stage} -->`;
+export const commentKey = (o: {
+  tag: string;
+  stage: string;
+  kind?: Overrun["kind"];
+}) =>
+  o.kind === "in_flight"
+    ? // Still running past its limit: its own key, so the finished (or
+      // failed) comment can still follow.
+      `<!-- release-watch ${o.tag} ${o.stage} running -->`
+    : `<!-- release-watch ${o.tag} ${o.stage} -->`;
 
 /** What a failed stage's run says: its failed job and step, by name. */
 export type Failure = { job: string; step?: string };
@@ -1070,13 +1079,11 @@ export function commentBody(
   const head =
     o.kind === "failed"
       ? `**${o.tag} ${o.stage}** failed${o.startedAt ? ` ${o.minutes} min after it started (${o.startedAt})` : ""}; ${usual}.`
-      : `**${o.tag} ${o.stage}** is past its limit: it ${
-          o.kind === "finished"
-            ? `took ${o.minutes} min`
-            : o.waiting
-              ? `has not started ${o.minutes} min after what it waits on ended (since ${o.startedAt})`
-              : `has been going ${o.minutes} min (since ${o.startedAt})`
-        }; ${usual}.`;
+      : o.kind === "finished"
+        ? `**${o.tag} ${o.stage}** finished past its limit: it took ${o.minutes} min; ${usual}.`
+        : o.waiting
+          ? `**${o.tag} ${o.stage}** is still running past its limit: it has not started ${o.minutes} min after what it waits on ended (since ${o.startedAt}); ${usual}.`
+          : `**${o.tag} ${o.stage}** is still running past its limit: it has been going ${o.minutes} min (since ${o.startedAt}); ${usual}.`;
   const runUrl = o.runId
     ? `https://github.com/${repo}/actions/runs/${o.runId}`
     : undefined;
@@ -1112,7 +1119,9 @@ export function commentPlan(
   const said = new Set(
     existing
       .filter((c) => c.author.endsWith("[bot]"))
-      .flatMap((c) => [...c.body.matchAll(/<!-- release-watch \S+ \S+ -->/g)])
+      .flatMap((c) => [
+        ...c.body.matchAll(/<!-- release-watch \S+ \S+(?: running)? -->/g),
+      ])
       .map((m) => m[0]),
   );
   const out: Overrun[] = [];
@@ -1155,10 +1164,12 @@ export function fromHistory(h: HistoryEntry, config: Config): Timeline {
  * Pure: what a run comments on (events only, no poll): every stage that
  * finished past its limit, in every release this run sees (in flight, done,
  * superseded or read back from history), and every failed stage of a release
- * not done. Each release is judged on its own runs: a newer release in flight
- * never hides an older one's. One still going is in the summary only; one
- * that never finishes raises no event and is the release agent's to catch.
- * The comments dedupe by release and stage (commentPlan).
+ * not done, and every stage of a release in flight that this run sees still
+ * running past its limit (its own "still running" key, so the finished or
+ * failed comment can follow). Each release is judged on its own runs: a newer
+ * release in flight never hides an older one's. No poll looks again: a stage
+ * that never finishes and raises no later event is the release agent's to
+ * catch. The comments dedupe by release, stage and key (commentPlan).
  */
 export function stuck(
   tls: Timeline[],
@@ -1183,6 +1194,28 @@ export function stuck(
           startedAt: s.startedAt,
           ...ids,
           minutes: s.minutes,
+          usual: s.usual,
+          limit: limitOf(s.usual, config),
+          url: s.url,
+        });
+      else if (
+        s.state === "current" &&
+        !t.doneAt &&
+        !t.supersededBy &&
+        s.startedAt &&
+        s.usual !== undefined &&
+        (s.minutes ?? 0) > limitOf(s.usual, config)
+      )
+        // Seen still running past its limit on this event: an early heads-up
+        // for the release agent, said once; no poll looks again.
+        out.push({
+          tag: t.tag,
+          stage: s.name,
+          kind: "in_flight",
+          startedAt: s.startedAt,
+          ...(s.waiting ? { waiting: true } : {}),
+          ...ids,
+          minutes: s.minutes ?? 0,
           usual: s.usual,
           limit: limitOf(s.usual, config),
           url: s.url,
