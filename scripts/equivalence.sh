@@ -125,6 +125,8 @@ ALLOW=(
   # The one automatic rerun of a red release gate (#428): a workflow and its test.
   .github/workflows/redline-retry.yml
   scripts/ci/redline-retry.test.ts
+  .github/workflows/release-retry.yml
+  scripts/ci/release-retry.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
