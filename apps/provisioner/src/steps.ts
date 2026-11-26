@@ -200,22 +200,36 @@ const parsed = (raw: unknown): unknown => {
  * The request-provided values of a job (best effort): its args, the
  * signup's slug, vars and owner, the owner's email, the install's slug and
  * vars. They are redacted from the failure log line and a stored reason.
+ * `complete` is false when any read threw (a missing row is not a failure):
+ * then the values may miss one, and no reason is stored (#461).
  */
-async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
+async function requestValues(
+  ctx: StepCtx,
+  jobId: string,
+): Promise<{ values: string[]; complete: boolean }> {
   const out: string[] = [];
+  let complete = true;
+  const failed = () => {
+    complete = false;
+    return null;
+  };
   const db = ctx.env.PLATFORM_DB;
-  const one = <T>(sql: string, ...p: unknown[]) =>
-    db
-      .prepare(sql)
-      .bind(...p)
-      .first<T>()
-      .catch(() => null);
+  const one = async <T>(sql: string, ...p: unknown[]): Promise<T | null> => {
+    try {
+      return await db
+        .prepare(sql)
+        .bind(...p)
+        .first<T>();
+    } catch {
+      return failed();
+    }
+  };
   const job = await one<{
     args: string;
     signup_id: string | null;
     install_id: string;
   }>("SELECT args, signup_id, install_id FROM jobs WHERE id = ?", jobId);
-  if (!job) return out;
+  if (!job) return { values: out, complete };
   scalars(parsed(job.args), out);
   if (job.signup_id) {
     const su = await one<Record<string, unknown>>(
@@ -223,7 +237,7 @@ async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
       job.signup_id,
     );
     if (su) scalars([su.slug, parsed(su.vars), su.owner_sub], out);
-    const email = await ownerEmail(ctx, job.signup_id).catch(() => null);
+    const email = await ownerEmail(ctx, job.signup_id).catch(failed);
     if (email) out.push(email);
   }
   const ins = await one<Record<string, unknown>>(
@@ -231,14 +245,15 @@ async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
     job.install_id,
   );
   if (ins) scalars([ins.slug, parsed(ins.vars)], out);
-  return out;
+  return { values: out, complete };
 }
 
 /**
  * One console line per step failure: code, step, job id and the error's
  * detail with every request value, email, URL and IP redacted, capped.
  * Returns a terminal refusal's reason, redacted the same way, for
- * jobs.error_message (#461); null for any other failure.
+ * jobs.error_message (#461); null for any other failure, or when a read of
+ * the request values failed (so a value could go unredacted).
  */
 async function logFailure(
   ctx: StepCtx,
@@ -247,7 +262,10 @@ async function logFailure(
   code: string,
   e: unknown,
 ): Promise<string | null> {
-  const values = await requestValues(ctx, jobId).catch(() => []);
+  const { values, complete } = await requestValues(ctx, jobId).catch(() => ({
+    values: [] as string[],
+    complete: false,
+  }));
   const raw = refusalDetail(e);
   console.warn(
     JSON.stringify({
@@ -258,7 +276,7 @@ async function logFailure(
       detail: redactDetail(detailOf(e), values),
     }),
   );
-  return raw === null ? null : redactDetail(raw, values);
+  return raw === null || !complete ? null : redactDetail(raw, values);
 }
 
 /** 3.5: a Cloudflare token not active is retried every 15 min, up to 2 h. */

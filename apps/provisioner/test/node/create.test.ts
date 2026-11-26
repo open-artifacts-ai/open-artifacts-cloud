@@ -737,6 +737,44 @@ describe("ProvisionInstall: release gate and failures", () => {
     );
   });
 
+  for (const read of [
+    "SELECT args, signup_id, install_id FROM jobs",
+    "SELECT slug, vars, owner_sub FROM signups",
+    "SELECT owner_email AS email FROM signup_secret",
+    "SELECT slug, vars FROM installs",
+  ])
+    it(`#461: a request-values read that throws (${read.split(" FROM ")[1]}) stores the fixed text alone`, async () => {
+      const s = seedCreate(w, {
+        slug: "readfail",
+        vars: {
+          AUTH_PROVIDERS: "google",
+          AUTH_DOMAINS: "finqore.test",
+          TIER: "business",
+        },
+      });
+      const db = w.ctx.env.PLATFORM_DB;
+      const prepare = db.prepare.bind(db);
+      const spy = vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+        if (!sql.startsWith(read)) return prepare(sql);
+        const fail = () => Promise.reject(new Error("D1 read failed"));
+        const st = { bind: () => st, first: fail, all: fail, run: fail };
+        return st as unknown as D1PreparedStatement;
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { step } = stepRunner(w.clock);
+      await jobStep(w.ctx, step, s.jobId, "create", undefined, () =>
+        Promise.reject(
+          new ProvisionRefused(
+            `readfail on finqore.test for ${EMAIL}`,
+            "invalid_state",
+          ),
+        ),
+      ).catch(() => {});
+      spy.mockRestore();
+      warn.mockRestore();
+      expect(w.job(s.jobId)?.error_message).toBe(JOB_ERROR_TEXT.invalid_state);
+    });
+
   it("#461: a retryable or Cloudflare failure stores the fixed text alone", async () => {
     const s = seedCreate(w, { slug: "retryco" });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

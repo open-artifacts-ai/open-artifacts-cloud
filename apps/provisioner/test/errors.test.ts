@@ -2,6 +2,7 @@ import { NonRetryableError } from "cloudflare:workflows";
 import {
   CfError,
   DoStepRequired,
+  OwnerVarsRefusal,
   PROVISION_ERROR_CODES,
   ProvisionRefused,
   ProvisionRetry,
@@ -253,20 +254,28 @@ describe("do_step_required (#1343): the one structured value", () => {
   });
 });
 
-describe("refusalDetail (#461): only a terminal refusal has a reason", () => {
-  it("a StepRefusal's detail and a terminal ProvisionRefused's message", () => {
+describe("refusalDetail (#461): only a refusal has a reason", () => {
+  it("a StepRefusal's detail, an OwnerVarsRefusal's why, a terminal ProvisionRefused's message", () => {
     expect(refusalDetail(refused("why"))).toBe("why");
     expect(
       refusalDetail(
         new ProvisionRefused("no release", "release_not_published"),
       ),
     ).toBe("no release");
-  });
-
-  it("null for a retry, a Cloudflare or internal error, do_step_required, a bare NonRetryableError", () => {
     expect(
       refusalDetail(new DoStepRequired("install x: needs 0.2.0", "0.2.0")),
-    ).toBeNull();
+    ).toBe("install x: needs 0.2.0");
+    expect(
+      refusalDetail(
+        new OwnerVarsRefusal("invalid_state", "bad AUTH_PROVIDERS"),
+      ),
+    ).toBe("bad AUTH_PROVIDERS");
+    expect(
+      refusalDetail(new OwnerVarsRefusal("domain_codes_refused", "codes need")),
+    ).toBe("codes need");
+  });
+
+  it("null for a retry, a Cloudflare or internal error, a bare NonRetryableError", () => {
     expect(refusalDetail(new ProvisionRetry("held", "lease_held"))).toBeNull();
     expect(refusalDetail(new ProvisionRefused("x", "cf_error"))).toBeNull();
     expect(refusalDetail(new ProvisionRefused("x", "internal"))).toBeNull();

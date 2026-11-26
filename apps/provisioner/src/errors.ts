@@ -6,16 +6,19 @@
 // DoStepRequired.step, interpolated only when isReleaseVersion accepts it
 // (jobErrorText); otherwise the fixed text alone.
 // jobs.error_message (#461) is that text, then, for a terminal refusal only
-// (refusalDetail: a StepRefusal or a non-retry ProvisionRefused), " Reason: "
-// and the refusal's own text through redactDetail, the whole capped at
-// ERROR_MESSAGE_MAX (storedMessage). Retryable, cf_error, internal and
-// do_step_required failures store their text alone: a Cloudflare or D1
-// message can quote input that redactDetail doesn't know.
+// (refusalDetail: a StepRefusal, an OwnerVarsRefusal or a non-retry
+// ProvisionRefused), " Reason: " and the refusal's own text through
+// redactDetail, the whole capped at ERROR_MESSAGE_MAX (storedMessage).
+// Retryable, cf_error and internal failures store their text alone: a
+// Cloudflare or D1 message can quote input that redactDetail doesn't know.
+// So does any failure whose request values could not all be read (steps.ts
+// requestValues), since a value missed would go unredacted.
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   CfError,
   DoStepRequired,
   isReleaseVersion,
+  OwnerVarsRefusal,
   PROVISION_ERROR_CODES,
   type ProvisionErrorCode,
   ProvisionRefused,
@@ -214,24 +217,24 @@ export function detailOf(e: unknown): string {
   return String(e);
 }
 
-/** Codes whose stored text never takes a reason (#461). */
+/** Codes whose stored text never takes a reason (#461): not refusals. */
 const NO_REASON: ReadonlySet<ProvisionErrorCode> = new Set([
   "cf_error",
   "internal",
-  // Its text already names the step (#1343); the refusal's message names
-  // the install and its classes.
-  "do_step_required",
 ]);
 
 /**
- * A terminal refusal's own text (#461): a StepRefusal's detail, or the
- * message of a ProvisionRefused that is not a ProvisionRetry, for a code
- * outside NO_REASON. Null for anything else (a Cloudflare or D1 error, a
- * bare NonRetryableError, a retry). Raw: redact before storing.
+ * A refusal's own text (#461): a StepRefusal's detail, an OwnerVarsRefusal's
+ * `why`, or the message of a ProvisionRefused that is not a ProvisionRetry,
+ * for a code outside NO_REASON. Null for anything else (a Cloudflare or D1
+ * error, a bare NonRetryableError, a retry). Stored only when the step's
+ * failure is terminal (noteFailure). Raw: redact before storing.
  */
 export function refusalDetail(e: unknown): string | null {
   if (e instanceof StepRefusal)
     return NO_REASON.has(codeOf(e)) ? null : e.detail;
+  if (e instanceof OwnerVarsRefusal)
+    return NO_REASON.has(e.code) ? null : e.why;
   if (e instanceof ProvisionRefused && !classify(e).retryable)
     return NO_REASON.has(e.code) ? null : e.message;
   return null;
