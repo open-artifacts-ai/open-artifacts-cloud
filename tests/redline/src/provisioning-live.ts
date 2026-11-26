@@ -21,7 +21,11 @@ import {
   revokeMachines,
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
-import { claimSuiteSlot, HookBudgetError } from "./hook-ledger-compat.ts";
+import {
+  claimCappedSlot,
+  HookBudgetError,
+  wrongKeyLedger,
+} from "./hook-ledger-compat.ts";
 import {
   BUS_A,
   BUS_B,
@@ -256,17 +260,20 @@ export const HOOK_KEY_WITHIN_MS = 90_000;
  * (apps/server/src/test-hooks: audit row "refused" under hook "unknown", no
  * user, session or state touched), and a wrong key gets the bare 404 (audit
  * "denied", under "unknown", so the guard's session denied-row count is
- * unaffected). Each call takes a slot of the install's hook ledger
- * (`pace`, on the run's own clock), so the polls count against the same
- * budget as the suite's; a full budget waits for room, up to the deadline.
- * The InfraError says how long it waited and how many checks it sent.
+ * unaffected). Until the new key is served, each check carries a wrong key,
+ * so RL_ANON is charged for it: each takes a slot of the install's
+ * wrong-key ledger (`pace`, on the run's own clock; the app's whole ledger
+ * before public #3200), at most 25 a minute; polls one per POLL_MS stay under
+ * it. Before #3200 a full ledger waits, up to the deadline; from #3200 it is
+ * refused at once. The InfraError says how long it waited and how many
+ * checks it sent.
  */
 export async function waitHookKey(
   run: Run,
   app: string,
   key: string,
   pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
-    claimSuiteSlot(a, {
+    claimCappedSlot(wrongKeyLedger(a), {
       deadline,
       now: () => run.io.now(),
       sleep: (ms) => run.io.wait(ms),

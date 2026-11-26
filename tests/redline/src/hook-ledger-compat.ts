@@ -1,27 +1,29 @@
 // The suite's view of the public hook ledger (apps/dashboard/e2e/staging/
 // hook-ledger.ts), for both shapes public has had (public #3200):
 //
-// - before #3200 (RL_ANON_*): HOOK_LIMIT is 25 (RL_ANON's 30 less 5), and a
-//   claim past it waits for room (its `sleep`), up to `deadline`;
-// - from #3200 (RL_HOOKS_*): HOOK_LIMIT is 570 (RL_HOOKS' 600 less 30), and a
-//   claim past it throws HookBudgetError at once (no `sleep`, no `deadline`).
+// - before #3200 (RL_ANON_*): every /__test/* call is charged to RL_ANON
+//   (30 a minute per install and IP). HOOK_LIMIT is 25, and a claim past it
+//   waits for room (the ledger's own `sleep`), up to `deadline`.
+// - from #3200 (RL_HOOKS_*): a call whose hook key checks out is charged to
+//   RL_HOOKS (600 a minute), and only a wrong or absent key to RL_ANON.
+//   HOOK_LIMIT is 570, and a claim past it throws HookBudgetError at once:
+//   the ledger never waits, and nothing here waits either (no sleeps, #3115).
 //
-// The suite's claims wait for room either way (claimSuiteSlot): from #3200
-// the wait is computed here from the ledger's own window, exactly as the old
-// ledger computed it (the oldest call that must leave, plus EDGE_MS), never a
-// fixed sleep, and a claim whose wait would pass its `deadline` is refused.
-//
-// Either way the suite keeps its own cap at SUITE_HOOK_LIMIT (25) a minute per
-// ledger, as before #3200: a wrong or absent hook key is still charged to
-// RL_ANON (30 a minute), and the guard's wrong-key probe and the R26 key poll
-// rely on that margin (live/guard.test.ts), as do the RL_ANON keys rl-anon.ts
-// paces and the suite's share of the hook audit log's newest-200 read
-// (test/t19-isolation.test.ts).
-// The cap is the ledger's own `reserve`.
+// So the suite claims in one of two ways:
+// - claimSuiteSlot, a hook call with the install's right key: before #3200
+//   capped at SUITE_HOOK_LIMIT (25) in the app's ledger, as always; from
+//   #3200 RL_HOOKS', capped at SUITE_KEYED_LIMIT (60) a minute so the suite's
+//   own rows stay under the hook audit log's newest-200 read in a case's
+//   longest wait (test/t19-isolation.test.ts), far above a lane's use.
+// - claimCappedSlot, anything RL_ANON is charged for: a hook call that may
+//   carry a wrong key (the guard's probe, R26's key poll; wrongKeyLedger)
+//   and the RL_ANON keys rl-anon.ts paces. At most SUITE_HOOK_LIMIT (25) a
+//   minute per ledger, RL_ANON's 30 less 5. Before #3200 a full ledger waits
+//   (the old ledger's own wait); from #3200 it is refused at once.
 //
 // TODO(public #3200): once PUBLIC_PIN is at or past the release with #3200,
-// drop the pre-#3200 branch (HOOK_GAP_MS, ledgerWaits and the ledger's own
-// wait) and import the new names directly.
+// drop the pre-#3200 branch (ledgerWaits, HOOK_GAP_MS, `sleep`) and import
+// the new names directly.
 import * as ledger from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 
 export {
@@ -31,15 +33,15 @@ export {
   hookWindowCount,
 } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 
-/** Claim options; `sleep` and `deadline` bound the wait for room (claimSuiteSlot). */
+/** Claim options of either ledger; only the pre-#3200 one reads `sleep` and `deadline`. */
 export interface ClaimOpts {
   root?: string;
   reserve?: number;
   now?: () => number;
   afterScan?: () => Promise<void>;
-  /** How a claim waits the computed time for room (default a timer). */
+  /** Pre-#3200 only: how the ledger waits for room. */
   sleep?: (ms: number) => Promise<void>;
-  /** Epoch ms by which the call must be made; a longer wait is HookBudgetError. */
+  /** Pre-#3200 only: past it, the ledger's wait gives up (HookBudgetError). */
   deadline?: number;
 }
 
@@ -54,89 +56,69 @@ interface AnyLedger {
 }
 const L = ledger as unknown as AnyLedger;
 
-/** The suite's own calls per ledger per HOOK_WINDOW_MS: RL_ANON's 30 less 5. */
+/** Calls RL_ANON is charged for, per ledger per HOOK_WINDOW_MS: its 30 less 5. */
 export const SUITE_HOOK_LIMIT = 25;
 
-/** Kept back from the ledger's HOOK_LIMIT so the suite stops at its own cap (0 before #3200). */
+/** Kept back from the ledger's HOOK_LIMIT so a capped claim stops at 25 (0 before #3200). */
 const HELD = L.HOOK_LIMIT - SUITE_HOOK_LIMIT;
 if (HELD < 0)
   throw new Error(
     `hook ledger: HOOK_LIMIT ${L.HOOK_LIMIT} is below the suite's ${SUITE_HOOK_LIMIT}`,
   );
 
-/** True for the pre-#3200 ledger, which waits for room itself; from #3200 claimSuiteSlot does. */
+/** True for the pre-#3200 ledger: every hook call is RL_ANON's, and a full ledger waits. */
 export const ledgerWaits = L.RL_HOOKS_LIMIT === undefined;
 
 /** T19's spread before #3200 (one call per HOOK_GAP_MS); undefined from #3200, which dropped it. */
 export const T19_HOOK_GAP_MS: number | undefined = L.HOOK_GAP_MS;
 
-/** Added to a computed wait, so the freed call is past the window's edge (the old ledger's EDGE_MS). */
-export const EDGE_MS = 100;
-
 /**
- * Ms from `t` until `app`'s window holds fewer than `room` calls, read from
- * the ledger itself: hookWindowCount at later times only falls, so the
- * smallest such time is found by bisection over one window. At most one
- * window, when every call in it is the newest.
+ * A call RL_ANON is charged for: at most SUITE_HOOK_LIMIT (less `reserve`)
+ * in `app`'s window. Past it, before #3200 the ledger waits (to
+ * `deadline`); from #3200 HookBudgetError at once. Returns the window's calls.
  */
-export function roomIn(
-  app: string,
-  room: number,
-  t: number,
-  root?: string,
-): number {
-  const count = (x: number) =>
-    ledger.hookWindowCount(app, { root, now: () => t + x });
-  if (count(0) < room) return 0;
-  let lo = 0;
-  let hi = ledger.HOOK_WINDOW_MS;
-  while (hi - lo > 1) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (count(mid) < room) hi = mid;
-    else lo = mid;
-  }
-  return hi;
-}
-
-const timer = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-/**
- * Records a suite call in `app`'s ledger, at most SUITE_HOOK_LIMIT (less
- * `reserve`) in the window, waiting for room when it is full: before #3200
- * the ledger waits itself; from #3200 the wait is computed from the window
- * (roomIn, plus EDGE_MS), then the claim is tried again. A wait that would
- * pass `deadline` is HookBudgetError. Returns the calls in the window.
- */
-export async function claimSuiteSlot(
+export function claimCappedSlot(
   app: string,
   o: ClaimOpts = {},
 ): Promise<number> {
-  const reserve = HELD + (o.reserve ?? 0);
-  if (ledgerWaits) return L.claimHookSlot(app, { ...o, reserve });
-  const now = o.now ?? Date.now;
-  const sleep = o.sleep ?? timer;
-  const room = SUITE_HOOK_LIMIT - (o.reserve ?? 0);
-  const { root, afterScan } = o;
-  for (;;) {
-    try {
-      return await L.claimHookSlot(app, { root, now, afterScan, reserve });
-    } catch (e) {
-      if (!(e instanceof ledger.HookBudgetError)) throw e;
-    }
-    const t = now();
-    const wait = Math.max(1, roomIn(app, room, t, root) + EDGE_MS);
-    if (o.deadline !== undefined && t + wait > o.deadline)
-      throw new ledger.HookBudgetError(
-        `${ledger.hookWindowCount(app, { root, now: () => t })} of ${SUITE_HOOK_LIMIT} suite calls in the last ${ledger.HOOK_WINDOW_MS / 1000} s; ` +
-          `the next fits in ${Math.ceil(wait / 1000)} s, past this call's deadline`,
-      );
-    await sleep(wait);
-  }
+  return L.claimHookSlot(app, { ...o, reserve: HELD + (o.reserve ?? 0) });
 }
 
 /**
+ * The suite's right-key hook calls per app ledger per HOOK_WINDOW_MS: before
+ * #3200 RL_ANON's cap (every hook call is RL_ANON's); from #3200 60, so
+ * three windows (a case's longest wait, 120 s, plus one) hold under the
+ * audit read's 200 rows.
+ */
+export const SUITE_KEYED_LIMIT = ledgerWaits ? SUITE_HOOK_LIMIT : 60;
+
+/**
+ * A hook call with the install's right key. Before #3200 it is RL_ANON's
+ * like any other (claimCappedSlot, in the app's ledger, unchanged); from
+ * #3200 it is RL_HOOKS': at most SUITE_KEYED_LIMIT (less `reserve`) in the
+ * window, and it never waits: past it, HookBudgetError at once.
+ */
+export function claimSuiteSlot(
+  app: string,
+  o: ClaimOpts = {},
+): Promise<number> {
+  if (ledgerWaits) return claimCappedSlot(app, o);
+  const { root, now, afterScan } = o;
+  const reserve = L.HOOK_LIMIT - SUITE_KEYED_LIMIT + (o.reserve ?? 0);
+  return L.claimHookSlot(app, { root, now, afterScan, reserve });
+}
+
+/**
+ * The ledger for `app`'s hook calls that may carry a wrong key: before
+ * #3200 the app's own (one RL_ANON bucket for every hook call); from #3200
+ * its own, as RL_ANON is charged only for those.
+ */
+export const wrongKeyLedger = (app: string): string =>
+  ledgerWaits ? app : `rl-anon/test:${app}`;
+
+/**
  * Whether a bare hook 404 can be the key's rather than RL_ANON's: only while
- * the window holds fewer than the suite's cap (the old hook404IsTheKeys).
+ * the window of calls RL_ANON is charged for holds fewer than the cap.
  */
 export const suiteHook404IsTheKeys = (windowCount: number): boolean =>
   windowCount < SUITE_HOOK_LIMIT;

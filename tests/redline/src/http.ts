@@ -7,7 +7,12 @@ import {
   networkCode,
   setupFetch,
 } from "./fetch-timeout.ts";
-import { type ClaimOpts, claimSuiteSlot } from "./hook-ledger-compat.ts";
+import {
+  type ClaimOpts,
+  claimCappedSlot,
+  claimSuiteSlot,
+  wrongKeyLedger,
+} from "./hook-ledger-compat.ts";
 import { note } from "./notes.ts";
 import { countHook } from "./rl-anon.ts";
 import { secretsOf, setPat, type Target } from "./targets.ts";
@@ -193,15 +198,30 @@ export class HttpError extends Error {
 }
 
 /**
- * Records a hook call to `t` in the runner's hook budget (#1254,
- * apps/dashboard/e2e/staging/hook-ledger.ts, shared with T19), at most
- * SUITE_HOOK_LIMIT a minute (src/hook-ledger-compat.ts). Any request to a
- * /__test/* path counts (a wrong key is charged to RL_ANON), so a raw probe
- * there paces through this too. Returns the calls in the window.
+ * Records a hook call to `t` with its right key in the runner's hook budget
+ * (#1254, apps/dashboard/e2e/staging/hook-ledger.ts, shared with T19;
+ * src/hook-ledger-compat.ts claimSuiteSlot). Every request to a /__test/*
+ * path with the right key paces through this. Returns the calls in the window.
  */
 export async function paceHook(t: Target, o: ClaimOpts = {}): Promise<number> {
   const t0 = Date.now();
   const n = await claimSuiteSlot(t.app, o);
+  countHook(Date.now() - t0);
+  return n;
+}
+
+/**
+ * Records a /__test/* call to `t` that may carry a wrong key (the guard's
+ * probe): RL_ANON is charged for it, so at most SUITE_HOOK_LIMIT a minute in
+ * its own ledger from public #3200 (the app's before it). Returns the calls
+ * in that window.
+ */
+export async function paceWrongKeyHook(
+  t: Target,
+  o: ClaimOpts = {},
+): Promise<number> {
+  const t0 = Date.now();
+  const n = await claimCappedSlot(wrongKeyLedger(t.app), o);
   countHook(Date.now() - t0);
   return n;
 }

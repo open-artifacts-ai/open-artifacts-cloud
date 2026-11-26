@@ -3,11 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  claimCappedSlot,
   claimSuiteSlot,
   HOOK_WINDOW_MS,
   HookBudgetError,
   hookWindowCount,
+  ledgerWaits,
   SUITE_HOOK_LIMIT,
+  wrongKeyLedger,
 } from "../src/hook-ledger-compat.ts";
 import { Run } from "../src/provisioning.ts";
 import {
@@ -222,44 +225,49 @@ describe("bringUp waits for the new hook key to take effect", () => {
     expect(calls(f).length).toBeLessThanOrEqual(2);
   });
 
-  // R26's own pacing (the default `pace`): the install's ledger on the run's
-  // clock. A full window waits for room, computed from the ledger, within
-  // the 90 s; the failure says how long it waited and what it sent.
-  describe("with the suite's ledger full when R26 starts", () => {
-    const fullLedger = async (f: FakeApi) => {
+  // R26's own pacing (the default `pace`), on the run's clock. Its checks
+  // may carry a wrong key, so they go in the wrong-key ledger (RL_ANON's 25 a
+  // minute; before public #3200 the app's whole ledger). The failure says how
+  // long it waited and what it sent.
+  describe("R26's pacing", () => {
+    const ledgerRoot = () => {
       const root = mkdtempSync(join(tmpdir(), "oa-bringup-ledger-"));
       dirs.push(root);
       // The default pace's ledger root is os.tmpdir(): this test's own.
       vi.stubEnv("TMPDIR", root);
+    };
+    const fill = async (
+      f: FakeApi,
+      claim: (app: string, o: { now: () => number }) => Promise<number>,
+      app: string,
+    ) => {
       for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
-        await claimSuiteSlot(CONFIG.rlA.app, { now: f.io.now });
-      expect(hookWindowCount(CONFIG.rlA.app, { now: f.io.now })).toBe(
-        SUITE_HOOK_LIMIT,
-      );
+        await claim(app, { now: f.io.now });
+      expect(hookWindowCount(app, { now: f.io.now })).toBe(SUITE_HOOK_LIMIT);
     };
     afterEach(() => {
       vi.unstubAllEnvs();
     });
 
-    it("a valid key waits for room, then is accepted with one check, inside 90 s", async () => {
+    it("the suite's right-key calls never hold R26 back from #3200 (before it, it waits for room as always)", async () => {
       const { f } = setup();
-      await fullLedger(f);
+      ledgerRoot();
+      await fill(f, claimSuiteSlot, CONFIG.rlA.app);
       const run = new Run(CONFIG, f.io);
       const t0 = f.io.now();
       // The fake's fresh key (provisioning-fake.ts, /__test/key_check).
       await waitHookKey(run, CONFIG.rlA.app, "h".repeat(43));
       expect(calls(f)).toHaveLength(1);
-      expect(f.io.now() - t0).toBeGreaterThanOrEqual(HOOK_WINDOW_MS);
-      expect(f.io.now() - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
-      expect(
-        hookWindowCount(CONFIG.rlA.app, { now: f.io.now }),
-      ).toBeLessThanOrEqual(SUITE_HOOK_LIMIT);
+      if (ledgerWaits) {
+        expect(f.io.now() - t0).toBeGreaterThanOrEqual(HOOK_WINDOW_MS);
+        expect(f.io.now() - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
+      } else expect(f.io.now()).toBe(t0);
     });
 
-    it("a key never accepted fails at 90 s, saying the real time waited and the checks sent", async () => {
+    it("a key never accepted fails at 90 s, saying the real time waited and the checks sent; its polls stay within 25 a minute", async () => {
       const { f } = setup();
       f.faults.add("hook_key_never");
-      await fullLedger(f);
+      ledgerRoot();
       const run = new Run(CONFIG, f.io);
       const t0 = f.io.now();
       const err = await waitHookKey(run, CONFIG.rlA.app, "k").then(
@@ -268,24 +276,27 @@ describe("bringUp waits for the new hook key to take effect", () => {
       );
       const waited = f.io.now() - t0;
       expect(err?.name).toBe("InfraError");
-      expect(waited).toBeGreaterThan(HOOK_WINDOW_MS);
-      expect(waited).toBeLessThanOrEqual(90_000);
+      expect(waited).toBe(90_000);
       const sent = calls(f).length;
-      expect(sent).toBeGreaterThan(0);
+      expect(sent).toBeGreaterThan(SUITE_HOOK_LIMIT);
       expect(err?.message).toContain(
-        `waited ${(waited / 1000).toFixed(1)} s, ${sent} key check${sent === 1 ? "" : "s"} sent`,
+        `(hooks answer 404 on a key mismatch; waited 90.0 s, ${sent} key checks sent)`,
       );
+      expect(
+        hookWindowCount(wrongKeyLedger(CONFIG.rlA.app), { now: f.io.now }),
+      ).toBeLessThanOrEqual(SUITE_HOOK_LIMIT);
     });
 
-    it("a deadline shorter than the wait for room fails at once, saying it waited 0 s and sent nothing", async () => {
+    it("a full wrong-key ledger and a deadline shorter than its wait: fails at once, saying it waited 0 s and sent nothing", async () => {
       const { f } = setup();
-      await fullLedger(f);
+      ledgerRoot();
+      await fill(f, claimCappedSlot, wrongKeyLedger(CONFIG.rlA.app));
       const run = new Run(CONFIG, f.io);
       const t0 = f.io.now();
       const err = await waitHookKey(
         run,
         CONFIG.rlA.app,
-        "k",
+        "h".repeat(43),
         undefined,
         30_000,
       ).then(

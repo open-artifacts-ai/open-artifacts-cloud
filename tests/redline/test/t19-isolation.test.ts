@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  SUITE_HOOK_LIMIT,
+  SUITE_KEYED_LIMIT,
   T19_HOOK_GAP_MS,
 } from "../src/hook-ledger-compat.ts";
 import { KEY_TABLE, WAIT_BUDGET_MS } from "../src/rl-anon.ts";
@@ -246,7 +246,7 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     // it adds at most this many rows. From #3200 T19 has no spread, but tags
     // every hook call (x-oa-test-run), and the suite's untagged read leaves
     // tagged rows out (the next case pins how), so T19 adds none. The suite's
-    // own rl-a calls are capped at SUITE_HOOK_LIMIT a minute
+    // own rl-a calls are capped at SUITE_KEYED_LIMIT a minute
     // (src/hook-ledger-compat.ts).
     // TODO(public #3200): drop the HOOK_GAP_MS branch with the compat module.
     const windowS = (WAIT_BUDGET_MS + 60_000) / 1000;
@@ -257,7 +257,7 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
       T19_HOOK_GAP_MS !== undefined
         ? Math.ceil((windowS * 1000) / T19_HOOK_GAP_MS) + 1
         : 0;
-    const suiteRows = Math.ceil(windowS / 60) * SUITE_HOOK_LIMIT;
+    const suiteRows = Math.ceil(windowS / 60) * SUITE_KEYED_LIMIT;
     expect(
       t19Rows + suiteRows,
       `T19 (${t19Rows}) and the suite (${suiteRows}) can write more hook audit rows in a case's window than the newest ${limit} a case reads`,
