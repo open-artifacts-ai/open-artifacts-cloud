@@ -558,11 +558,9 @@ export const PRUNE_LIST_MAX = 200_000;
  *
  * The second listing narrows, but does not close, the gap before the deletes:
  * a stage-prod upload of the same version could still land in between. What
- * closes it is that prod's publishes run one at a time (the
- * hosted-publish-prod concurrency group, shared by hosted-publish.yml's
- * publish-prod and staging-release-chain.yml's stage-prod) and that only a
- * version below the one just published is pruned, which no later stage-prod
- * run uploads again.
+ * closes it is that prod's publishes run one at a time (hosted-publish.yml's
+ * hosted-publish-prod concurrency group) and that only a version below the one
+ * just published is pruned, which no later stage-prod run uploads again.
  */
 export async function pruneStaged(o: {
   cf: Cf;

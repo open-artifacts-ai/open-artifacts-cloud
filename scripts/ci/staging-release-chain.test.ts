@@ -130,19 +130,14 @@ describe("staging chain read retries", () => {
       actor: BOT,
       runId: "123",
     });
-    expect(p).toEqual({ go: true, next: "deploy", tag: TAG, stage: TAG });
+    expect(p).toEqual({ go: true, next: "deploy", tag: TAG });
     expect(sleeps).toEqual([2000]);
   });
 });
 
 describe("after hosted-publish: the staging deploy", () => {
   it("starts for a release published by hosted-release", () => {
-    expect(afterPublish()).toEqual({
-      go: true,
-      next: "deploy",
-      tag: TAG,
-      stage: TAG,
-    });
+    expect(afterPublish()).toEqual({ go: true, next: "deploy", tag: TAG });
   });
   it("skips a failed, cancelled or off-main run", () => {
     skipped(afterPublish({}, { conclusion: "failure" }));
@@ -200,103 +195,6 @@ describe("after hosted-publish: the staging deploy", () => {
         runId: "123",
       }),
     ).toThrow(/502/);
-  });
-});
-
-// #264 step 6: stage-prod moved here from hosted-publish.yml. Its rule is
-// hosted-publish's (kind release, staging published, prod not asked for), so
-// every path that copied before still copies, the ones the deploy skips too.
-describe("after hosted-publish: the copy to prod's bucket (stage-prod)", () => {
-  const stage = (o: World = {}, over: Record<string, string> = {}) =>
-    afterPublish(o, over).stage;
-  it("a release-please publish: copied, beside the deploy", () => {
-    expect(afterPublish()).toMatchObject({ go: true, stage: TAG });
-  });
-  it("a hand dispatch for staging alone: copied, though the deploy skips it", () => {
-    for (const title of [
-      `hosted-publish staging ${TAG}`,
-      `hosted-publish staging ${TAG} [p77-1]`,
-    ]) {
-      const p = afterPublish({}, { event: "workflow_dispatch", title });
-      expect(p.go, title).toBe(false);
-      expect(p.stage, title).toBe(TAG);
-    }
-  });
-  it("an older tag and a tag already deployed: copied, though the deploy skips them", () => {
-    const older = afterPublish({ latest: "v0.100.0" });
-    expect(older).toMatchObject({ go: false, stage: TAG });
-    const deployed = afterPublish({
-      deployRuns: [`deploy-hosted-platform staging ${TAG}`],
-    });
-    expect(deployed).toMatchObject({ go: false, stage: TAG });
-    // Both at once, by hand: still copied.
-    expect(
-      stage(
-        { latest: "v0.100.0", deployRuns: [CHAIN_TITLE] },
-        { event: "workflow_dispatch", title: `hosted-publish staging ${TAG}` },
-      ),
-    ).toBe(TAG);
-  });
-  it("a dispatch that published prod itself (env both), or for prod alone: not copied", () => {
-    expect(
-      stage(
-        {},
-        { event: "workflow_dispatch", title: `hosted-publish both ${TAG}` },
-      ),
-    ).toBeUndefined();
-    // env prod: no publish-staging job ran.
-    expect(
-      stage(
-        {
-          jobs: [
-            { name: `publish-staging release ${TAG}`, conclusion: "skipped" },
-            { name: `publish-prod release ${TAG}`, conclusion: "success" },
-          ],
-        },
-        {
-          event: "workflow_dispatch",
-          title: `hosted-publish prod ${TAG} [p77-1]`,
-        },
-      ),
-    ).toBeUndefined();
-    // A title for another tag, or none at all, on a dispatch: not copied.
-    for (const title of [
-      "hosted-publish staging v0.98.0",
-      "hosted-publish",
-      `hosted-publish staging ${TAG}x`,
-      `xhosted-publish staging ${TAG}`,
-    ])
-      expect(
-        stage({}, { event: "workflow_dispatch", title }),
-        title,
-      ).toBeUndefined();
-  });
-  it("no copy for a failed staging publish, a floor, a failed or off-main run, or no release", () => {
-    expect(
-      stage({
-        jobs: [
-          { name: `publish-staging release ${TAG}`, conclusion: "failure" },
-        ],
-      }),
-    ).toBeUndefined();
-    expect(
-      stage({
-        jobs: [{ name: "publish-staging floor ", conclusion: "success" }],
-      }),
-    ).toBeUndefined();
-    expect(
-      stage({
-        jobs: [{ name: "publish-staging none ", conclusion: "skipped" }],
-      }),
-    ).toBeUndefined();
-    expect(stage({}, { conclusion: "failure" })).toBeUndefined();
-    expect(stage({}, { conclusion: "cancelled" })).toBeUndefined();
-    expect(stage({}, { branch: "other" })).toBeUndefined();
-    expect(stage({}, { event: "push" })).toBeUndefined();
-  });
-  it("a deploy completing never copies", () => {
-    expect(afterDeploy().stage).toBeUndefined();
-    expect(afterDeploy({}, { conclusion: "failure" }).stage).toBeUndefined();
   });
 });
 
@@ -528,87 +426,11 @@ describe("the workflow", () => {
       "needs.plan.outputs.tag",
     );
     expect(w.jobs.dispatch.concurrency["cancel-in-progress"]).toBe(false);
-    // Only the job that mints the release App token has release-app (#302);
-    // stage-prod keeps the hosted-prod-deploy Environment it had in
-    // hosted-publish.yml; the plan has none.
+    // Only the job that mints the release App token has an environment (#302).
     expect(w.jobs.dispatch.environment).toBe("release-app");
-    expect(w.jobs["stage-prod"].environment).toBe("hosted-prod-deploy");
-    expect(Object.keys(w.jobs)).toEqual(["plan", "stage-prod", "dispatch"]);
-    expect(w.jobs.plan.environment).toBeUndefined();
-  });
-  it("stage-prod: hosted-publish's job, moved whole, on the plan's own stage decision", () => {
-    const j = w.jobs["stage-prod"];
-    expect(j.needs).toBe("plan");
-    expect(j.if).toBe("needs.plan.outputs.stage == 'true'");
-    expect(w.jobs.plan.outputs.stage).toBe("${{ steps.plan.outputs.stage }}");
-    expect(w.jobs.plan.outputs.stage_tag).toBe(
-      "${{ steps.plan.outputs.stage_tag }}",
-    );
-    // Beside the deploy's dispatch, never waiting for it, nor it for this.
-    expect(w.jobs.dispatch.needs).toBe("plan");
-    // Best effort: a failed copy leaves a green run; publish-prod uploads the rest.
-    expect(j["continue-on-error"]).toBe(true);
-    expect(j.name).toBe(
-      "stage-prod release ${{ needs.plan.outputs.stage_tag }}",
-    );
-    expect(j.permissions).toEqual({ contents: "read", actions: "read" });
-    expect(j["timeout-minutes"]).toBe(30);
-    // The same group as publish-prod, in the other file: the two never run at
-    // once on prod's bucket (pruneStaged relies on it).
-    expect(j.concurrency).toEqual({
-      group: "hosted-publish-prod",
-      "cancel-in-progress": false,
-    });
-    expect(publish.jobs["publish-prod"].concurrency).toEqual(j.concurrency);
-    // publish-prod keeps the record, after the red-line gate.
-    expect(JSON.stringify(publish.jobs["publish-prod"])).toContain(
-      "staging-first-gate.sh",
-    );
-    // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
-    const steps: any[] = j.steps;
-    const named = (n: string) => steps.find((s) => s.name === n);
-    const at = (n: string) => steps.indexOf(named(n));
-    expect(steps[0].run).toBe('test "$REF" = refs/heads/main');
-    expect(steps[0].env).toEqual({ REF: "${{ github.ref }}" });
-    expect(steps[1].with).toEqual({
-      ref: "${{ github.sha }}",
-      path: "_cloud",
-      "persist-credentials": false,
-    });
-    expect(steps[2].uses).toBe("./_cloud/.github/actions/overlay");
-    expect(named("Load the hosted constants").run).toBe(
-      "bash scripts/ci/hosted-constants.sh prod .github/hosted",
-    );
-    expect(named("Release gate").run).toBe(
-      'bash scripts/ci/tag-passed-checks.sh prod "$TAG"',
-    );
-    expect(named("Release gate").env.TAG).toBe(
-      "${{ needs.plan.outputs.stage_tag }}",
-    );
-    expect(at("Release gate")).toBeLessThan(at("Write the token files"));
-    const tok = named("Write the token files");
-    expect(tok.env).toEqual({
-      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
-    });
-    const st = named("Stage the files (no record)");
-    expect(st.run).toContain('--env prod --tag "$TAG" --stage-only');
-    expect(st.env.TAG).toBe("${{ needs.plan.outputs.stage_tag }}");
-    expect(st.env.OA_HOSTED_ENVIRONMENT).toBe("hosted-prod-deploy");
-    expect(JSON.stringify(j)).not.toContain("--env staging");
-    expect(JSON.stringify(j)).not.toContain("publish-floor");
-    expect(JSON.stringify(j)).not.toContain("needs.resolve");
-    // Only the token step sees a secret; the token files go whatever happened.
-    expect(
-      steps
-        .filter((s) => JSON.stringify(s).includes("secrets."))
-        .map((s) => s.name),
-    ).toEqual(["Write the token files"]);
-    expect(steps.at(-1).name).toBe("Remove the token files");
-    expect(steps.at(-1).if).toBe("${{ always() }}");
-    for (const s of steps.filter(
-      (s) => s.uses && s.uses !== "./_cloud/.github/actions/overlay",
-    ))
-      expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
+    for (const [name, j] of Object.entries(w.jobs))
+      if (name !== "dispatch")
+        expect((j as { environment?: unknown }).environment).toBeUndefined();
   });
   it("leaves prod-release-chain's trigger as it was", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));

@@ -7,10 +7,7 @@
 # red-line passed the tag (#1412): the publish-prod job runs
 # scripts/ci/staging-first-gate.sh for every release, and prod-release-chain.yml
 # dispatches env=prod for the tag once the red-line is green, before it
-# deploys. A release published to staging alone has its files copied to prod's
-# bucket (no record) by staging-release-chain.yml's stage-prod job, which
-# reads this run's publish-staging job once the run completes (#264 step 6).
-# By hand (workflow_dispatch on main): a tag (both envs, or the one
+# deploys. By hand (workflow_dispatch on main): a tag (both envs, or the one
 # named; prod fails closed without the red-line), or a hosted-floor.yml run id
 # with its env. A floor has no tag and no red-line: it is left as it was.
 # Each env's job runs in its deploy Environment (hosted-staging-deploy,
@@ -194,6 +191,86 @@ jobs:
           d="$RUNNER_TEMP/hosted-publish-secrets"
           rm -f "$d/r2" "$d/token"
           rm -rf "$d" "$RUNNER_TEMP/floor"
+          test ! -e "$d"
+
+  stage-prod:
+    # Uploads the release's files to prod's bucket while staging deploys and
+    # the red-line runs, so the prod publish after the gate writes only the
+    # record (publish-release --stage-only stops before it: with no record
+    # nothing can install the version). If the gate fails the files stay
+    # unused. Not named publish-prod: the chain's "published" check must not
+    # take it for the record. Only the release-please trigger (prod false);
+    # a dispatch that names prod publishes everything in publish-prod.
+    # Best effort: if it fails, publish-prod uploads what is missing.
+    name: stage-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}
+    needs: [resolve, publish-staging]
+    if: ${{ !cancelled() && needs.resolve.outputs.kind == 'release' && needs.resolve.outputs.staging == 'true' && needs.resolve.outputs.prod != 'true' && needs.publish-staging.result == 'success' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    environment: hosted-prod-deploy
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: hosted-publish-prod
+      cancel-in-progress: false
+    timeout-minutes: 30
+    steps:
+      - name: Runs only from main
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = refs/heads/main
+      # main, overlaid on the public tree at PUBLIC_PIN.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @oa/provision build
+      - name: Load the hosted constants
+        run: bash scripts/ci/hosted-constants.sh prod .github/hosted
+      - name: Release gate
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/tag-passed-checks.sh prod "$TAG"
+      # No staging-first gate: this writes no record, so no version becomes
+      # installable. publish-prod keeps that gate for the record.
+      - name: Write the token files
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/hosted-publish-secrets"
+          mkdir -m 700 "$dir"
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "CLOUDFLARE_API_TOKEN is not set in this Environment"; exit 1; }
+          printf '%s\n' "$CLOUDFLARE_API_TOKEN" > "$dir/token"
+          bash scripts/ci/hosted-r2-key.sh "$dir/r2"
+      - name: Stage the files (no record)
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          OA_HOSTED_TOKEN_FILE: ${{ runner.temp }}/hosted-publish-secrets/token
+          OA_HOSTED_R2_FILE: ${{ runner.temp }}/hosted-publish-secrets/r2
+          OA_HOSTED_ENVIRONMENT: hosted-prod-deploy
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pnpm -s --filter @oa/hosted start publish-release --env prod --tag "$TAG" --stage-only
+      - name: Remove the token files
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/hosted-publish-secrets"
+          rm -f "$d/r2" "$d/token"
+          rm -rf "$d"
           test ! -e "$d"
 
   publish-prod:

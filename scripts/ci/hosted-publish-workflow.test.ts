@@ -134,22 +134,30 @@ describe("hosted-publish.yml", () => {
     );
   });
 
-  // #264 step 6: the copy to prod's bucket moved to staging-release-chain.yml
-  // (staging-release-chain.test.ts), so this run completes when the staging
-  // publish does and staging's deploy no longer waits for the copy.
-  it("has no stage-prod job: the run is resolve, the staging publish and the prod publish", () => {
-    expect(Object.keys(w.jobs)).toEqual([
-      "resolve",
-      "publish-staging",
-      "publish-prod",
-    ]);
-    expect(text).not.toContain("--stage-only");
-    expect(text).not.toMatch(/^ {2}stage-prod:/m);
-    expect(text).toContain("staging-release-chain.yml's stage-prod job");
-    // The chain reads this run-name to tell a hand dispatch for staging alone.
-    expect(w["run-name"]).toBe(
-      "hosted-publish${{ inputs.env && format(' {0} {1}', inputs.env, inputs.tag || inputs.floor_run_id) || '' }}${{ inputs.chain_id && format(' [{0}]', inputs.chain_id) || '' }}",
+  it("stage-prod uploads prod's files during staging deploy and the gate, and writes no record", () => {
+    const j = w.jobs["stage-prod"];
+    expect(j.needs).toEqual(["resolve", "publish-staging"]);
+    // Best effort: a failed stage leaves a green run; publish-prod uploads the rest.
+    expect(j["continue-on-error"]).toBe(true);
+    // Only the release-please trigger (prod false), only after staging published.
+    expect(j.if).toContain("needs.resolve.outputs.prod != 'true'");
+    expect(j.if).toContain("needs.publish-staging.result == 'success'");
+    expect(j.if).toContain("needs.resolve.outputs.kind == 'release'");
+    // Not named publish-prod: the chain's "published" check reads that record.
+    expect(j.name).toBe(
+      "stage-prod ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
     );
+    expect(j.environment).toBe("hosted-prod-deploy");
+    // Serialized with publish-prod, so the two never race on one bucket.
+    expect(j.concurrency).toEqual(w.jobs["publish-prod"].concurrency);
+    const run = named("stage-prod", "Stage the files (no record)").run;
+    expect(run).toContain('--env prod --tag "$TAG" --stage-only');
+    expect(JSON.stringify(j)).not.toContain("--env staging");
+    expect(JSON.stringify(j)).not.toContain("publish-floor");
+    const i = (n: string) =>
+      steps("stage-prod").indexOf(named("stage-prod", n));
+    expect(i("Release gate")).toBeLessThan(i("Write the token files"));
+    expect(steps("stage-prod").at(-1)?.if).toBe("${{ always() }}");
   });
 
   it("publish-prod still runs the record after the red-line gate, with no stage-only flag", () => {
