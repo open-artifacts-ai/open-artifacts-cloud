@@ -521,7 +521,9 @@ describe("redline-staging.yml", () => {
       });
       // A gate dispatch can't pick the suite.
       expect(w.on.workflow_dispatch.inputs.suite).toBeUndefined();
-      expect(go("", both).stdout.trim()).toBe("pnpm --filter @oa/redline smoke");
+      expect(go("", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline smoke",
+      );
       expect(go("smoke", both).stdout.trim()).toBe(
         "pnpm --filter @oa/redline smoke",
       );
@@ -2092,7 +2094,7 @@ describe("t19 gate tier", () => {
 case "$*" in
   *--list*)
     if [[ "$*" == *--project* ]]; then n=${counts.guard}; kind=guard
-    elif [[ "$*" == *"--grep @gate(\\s|\$)"* ]]; then n=${counts.gate}; kind=gate
+    elif [[ "$*" == *"--grep @gate(\\s|$)"* ]]; then n=${counts.gate}; kind=gate
     else n=${counts.all}; kind=all; fi
     if [ "$kind" = "${broken}" ]; then echo "Error: browserType.launch crashed"; exit 2; fi
     if [ "$n" -eq 0 ]; then echo "Error: No tests found"; exit 1; fi
