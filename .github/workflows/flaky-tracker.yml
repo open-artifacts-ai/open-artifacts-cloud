@@ -1,12 +1,15 @@
 # The flaky tracker (cloud #447, #264). Tracking only: it reruns nothing and
-# changes nothing that blocks. When a release gate (a redline-staging run
-# dispatched on main) passes on attempt 2 or later, every test that failed on
-# an earlier attempt of that same run (same commit, same tag) failed and then
-# passed with nothing changed, so it is flaky. scripts/ci/flaky-tracker.ts
-# reads the earlier attempts' failed job logs, then opens or bumps one open
-# issue labelled `flaky` per test, with the run links, the last author of the
-# test file (assigned when GitHub allows it, else named in plain text), and a
-# "fails twice in 7 days" note when it failed in two runs within 7 days.
+# changes nothing that blocks. When a CI run, or a release gate (a
+# redline-staging run dispatched on main), passes on attempt 2 or later, every
+# test that failed on an earlier attempt of that same run (same head sha)
+# failed and then passed with nothing changed. scripts/ci/flaky-tracker.ts
+# reads the earlier attempts' failed job logs and records each such test, with
+# its run link, as a sighting in one `flaky-sightings` issue (the store). A
+# test seen in two runs within 7 days opens or bumps one open issue labelled
+# `flaky`, with the run links and the last author of the test file (assigned
+# when GitHub allows it, else named in plain text). The script says why the
+# store is an issue. Public's CI has its own copy in the public repo:
+# workflow_run can't see another repo's runs.
 # The default token only: it reads the run's jobs and logs and the commits of
 # the test files, and writes issues. No App, no secret, no Environment.
 #
@@ -17,7 +20,7 @@
 name: flaky-tracker
 on:
   workflow_run:
-    workflows: [redline-staging]
+    workflows: [CI, redline-staging]
     types: [completed]
 permissions: {}
 jobs:
@@ -25,8 +28,10 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.run_attempt > 1 &&
+      (github.event.workflow_run.name == 'CI' ||
+      (github.event.workflow_run.name == 'redline-staging' &&
       github.event.workflow_run.event == 'workflow_dispatch' &&
-      github.event.workflow_run.head_branch == 'main'
+      github.event.workflow_run.head_branch == 'main'))
     # Per event, and on the job so a skipped run joins no group. A shared
     # group would let a newer pending run cancel an older one, and that
     # event's flakes would never be recorded. The script re-lists the open
@@ -52,7 +57,9 @@ jobs:
       - name: Record the flaky tests
         env:
           GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           TITLE: ${{ github.event.workflow_run.display_title }}
-        run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --run-id "$RUN_ID" --attempt "$ATTEMPT" --title "$TITLE"
+        run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --run-id "$RUN_ID" --attempt "$ATTEMPT" --head-sha "$HEAD_SHA" --title "$TITLE"
