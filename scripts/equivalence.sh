@@ -136,6 +136,9 @@ ALLOW=(
   scripts/ci/fleet-wake.test.ts
   scripts/ci/fleet-wake-capable.sh
   scripts/ci/fleet-wake-capable.test.ts
+  # A release gate preempts the red-line nightly (#264 step 2): its script and test.
+  scripts/ci/redline-preempt.ts
+  scripts/ci/redline-preempt.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

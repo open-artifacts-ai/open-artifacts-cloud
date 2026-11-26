@@ -3316,6 +3316,18 @@ export async function p15Check(
 
 // --- Bring-up and teardown (the workflow's R5 and R26 steps) ---------------
 
+/** A standing red-line install: rl-a or rl-b. */
+export type Side = "a" | "b";
+
+/**
+ * Which standing installs this run brings up, checks and revokes (cloud #264
+ * step 2): REDLINE_SIDES=a for a smoke gate, which uses rl-a only; anything
+ * else (the nightly's long suite) both. A tag cut before this ignores the
+ * variable and does both, as its long suite needs.
+ */
+export const sidesOf = (env: Record<string, string | undefined>): Side[] =>
+  env.REDLINE_SIDES === "a" ? ["a"] : ["a", "b"];
+
 export interface CredsOut {
   pat: string;
   hookKey: string;
@@ -3364,11 +3376,15 @@ export async function bringUpgrade(
  * appHost, and /healthz there must name the same installId, so a wrong
  * variable cannot make the record vouch for another host.
  */
-export async function stagedVersion(run: Run): Promise<string> {
+export async function stagedVersion(
+  run: Run,
+  sides: readonly Side[] = ["a", "b"],
+): Promise<string> {
   for (const [slug, t] of [
     ["rl-a", run.c.rlA],
     ["rl-b", run.c.rlB],
   ] as const) {
+    if (!sides.includes(slug === "rl-a" ? "a" : "b")) continue;
     const d = await ownDetail(run, t.id);
     expect(d, 200, `R3 ${slug}`);
     const appHost = (d.json as { appHost?: unknown } | undefined)?.appHost;

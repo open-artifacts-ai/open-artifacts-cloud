@@ -11,9 +11,11 @@
     "src/**/*.ts",
     "test/**/*.ts",
     "live/**/*.ts",
+    "smoke/**/*.ts",
     "scripts/**/*.ts",
     "vitest.config.ts",
-    "vitest.live.config.ts"
+    "vitest.live.config.ts",
+    "vitest.smoke.config.ts"
   ],
   // Compiled by wrangler (esbuild) into fake-IdP builds only; it re-exports
   // @oa/auth-core's source, which this package's erasableSyntaxOnly rejects.

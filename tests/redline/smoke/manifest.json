@@ -1,0 +1,55 @@
+{
+  "cases": [
+    {
+      "file": "smoke/fresh.test.ts",
+      "name": "fresh install > create: the release under test is listed and installable, then a brand-new install reaches done at it"
+    },
+    {
+      "file": "smoke/fresh.test.ts",
+      "name": "fresh install > health: the shared health check, its content address is the content app's, and the inventory maps both addresses to it"
+    },
+    {
+      "file": "smoke/fresh.test.ts",
+      "name": "fresh install > isolation canary: its PAT and its test login session work there and are refused at rl-a"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > health: the shared health check"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > who am I: a fresh person sees the plan and exactly its features"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > prod-clean: the published prod releases are the signed customer build and no prod install shows test hooks"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > environments and services are kept apart: robot token audiences, staging on prod, the inventory, the OAuth metadata"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > anti-bot: a code request with no Turnstile token is 400 turnstile_required"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > code sign-in: a fresh person signs in by code, and every cookie is __Host-, Secure, Path=/, with no Domain"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > Google sign-in start: it reaches Google with a client id, the callback address and the broker state for rl-a"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > files and pages: an MCP publish is found by search, a signed upload becomes a version, one live-data value reads back"
+    },
+    {
+      "file": "smoke/standing.test.ts",
+      "name": "rl-a > viewing: a private view on the content address sets no cookie, a live-data socket opens, a public link stops once private"
+    }
+  ],
+  "notes": [
+    "The red-line smoke (src/smoke.ts SMOKE_CASES): the blocking release check of red-line page vZ2GyzVGZ2DCB7oW v3. Its other kept rows run in T19's @gate set, the public happy-path suite, or as setup (src/smoke.ts SMOKE_ROWS)."
+  ]
+}

@@ -1,5 +1,14 @@
-# The red-line suite (P5) and the provisioning probes (design v7 12.2) against
-# staging, on demand, for one release tag. The redline job mints GitHub OIDC
+# The red-line release gate against staging, on demand, for one release tag.
+# A gate run (workflow_dispatch, as the staging release chain starts it) runs
+# the red-line smoke (cloud #264 step 2, tests/redline/src/smoke.ts): a
+# brand-new install at the tag beside rl-a after its upgrade, about twelve
+# cases with no locks, pacing or lanes, plus T19's @gate set. The long suite
+# (P5) and the provisioning probes (design v7 12.2) run only in the nightly
+# (redline-nightly.yml calls this file with suite: full); they never block a
+# release. A tag cut before the smoke has no smoke script and runs its own
+# long suite as the gate, as before.
+#
+# The redline job mints GitHub OIDC
 # JWTs (the staging Provisioning API's and both inventories' audiences, 4.4 and
 # 6.3) into 0600 files under RUNNER_TEMP, upgrades rl-a and rl-b to the tag
 # through the staging API (R5) at the same time and takes this run's rl-a and
@@ -87,6 +96,13 @@ on:
         type: string
         required: false
         default: ""
+      # The nightly passes full: the long red-line suite instead of the smoke.
+      # Unset (a gate dispatch can't set it, workflow_dispatch has no such
+      # input) or smoke: the smoke, the release gate. Anything else fails.
+      suite:
+        type: string
+        required: false
+        default: smoke
       # The nightly and the dry run pass true: T19 runs every spec. Unset (a gate
       # dispatch can't set it, workflow_dispatch has no such input) it runs only
       # the specs tagged @gate, the short happy path that blocks a release.
@@ -112,8 +128,13 @@ on:
 permissions:
   contents: read
 
+# Gates (and the T19 dry run) queue on `redline`, one at a time. The
+# nightly's call (suite: full) has its own group, so a gate never waits behind
+# it: the gate's `preempt` job cancels a running nightly and waits for it to
+# end before anything touches rl-a. A nightly never starts beside a gate:
+# its pick skips while any red-line run is going (scripts/ci/redline-nightly.ts).
 concurrency:
-  group: redline
+  group: ${{ inputs.suite == 'full' && 'redline-nightly-suite' || 'redline' }}
   cancel-in-progress: false
 
 jobs:
@@ -121,7 +142,105 @@ jobs:
   # every staging platform Worker runs the tag (its "workers/tag" annotation,
   # scripts/ci/platform-tags.sh). Read-only, with main's script and constants
   # and the staging deploy Environment's token; no other job sees it.
+  # A release gate never waits behind the nightly (cloud #264 step 2), and no
+  # code of ours sleeps or polls for it (Leo, 2026-11-26 11:45Z: "the code
+  # itself should have no sleeps or polls"). GitHub's own concurrency does
+  # the waiting: the rl-a-check and redline jobs of every run share the job
+  # concurrency group `rl-a`, and a gate's (suite not full) enters it with
+  # cancel-in-progress, so it cancels the nightly's job that holds rl-a and
+  # starts only once that job has ended, its always() R26 revoke included.
+  # It can't cancel another gate there: gates queue one at a time on this
+  # workflow's `redline` group, so no two gates are ever in `rl-a` at once.
+  #
+  # In a gate run (a workflow_dispatch of this file on main, in this
+  # repository) this job also cancels the whole nightly run, one request per
+  # run and no wait, so its T19 job stops too; it outputs the ids. It
+  # selects only redline-nightly.yml runs on main of this repository: never
+  # a gate, a dry run, another branch or a fork (scripts/ci/redline-preempt.ts).
+  # In a called run (the nightly, the dry run) every step after the first is
+  # skipped; the job still runs, so the jobs after it never see a skipped
+  # dependency. Its `actions: write` is why the callers grant it (a called
+  # job can't hold more than its caller gives).
+  preempt:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    timeout-minutes: 5
+    outputs:
+      runs: ${{ steps.preempt-run.outputs.runs }}
+    steps:
+      - id: gate
+        name: Is this a release gate
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          # The caller's in a called run: redline-nightly.yml, t19-dry-run.yml.
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          gate=false
+          if [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ] &&
+            [ "$REPO" = open-artifacts-ai/open-artifacts-cloud ] &&
+            [ "$WORKFLOW_REF" = "$REPO/.github/workflows/redline-staging.yml@refs/heads/main" ]; then
+            gate=true
+          fi
+          echo "gate=$gate" >> "$GITHUB_OUTPUT"
+          echo "release gate: $gate"
+      - if: steps.gate.outputs.gate == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - if: steps.gate.outputs.gate == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: preempt-run
+        name: Cancel a running nightly (waits for nothing)
+        if: steps.gate.outputs.gate == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts cancel --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"
+  # Holds rl-a first (the job group above). Once it runs, the preempted
+  # nightly's redline job has ended: one read of its jobs says whether it
+  # issued credentials and its R26 revoke did not succeed (reset=true). Then
+  # the redline job revokes rl-a before its bring-up: rl-a is never used in
+  # an unknown state.
+  rl-a-check:
+    needs: preempt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: rl-a
+      cancel-in-progress: ${{ inputs.suite != 'full' }}
+    timeout-minutes: 5
+    outputs:
+      reset: ${{ steps.check.outputs.reset }}
+    steps:
+      - if: needs.preempt.outputs.runs != ''
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - if: needs.preempt.outputs.runs != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: check
+        name: Did the preempted nightly leave rl-a unrevoked
+        if: needs.preempt.outputs.runs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ needs.preempt.outputs.runs }}
+        run: node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts check --repo "$GITHUB_REPOSITORY" --runs "$RUNS"
   platform-tags:
+    needs: preempt
     runs-on: ubuntu-latest
     environment: hosted-staging-deploy
     permissions:
@@ -459,7 +578,12 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/t19-recipient" "$RUNNER_TEMP/t19-sealed"
   redline:
-    needs: platform-tags
+    needs: [rl-a-check, platform-tags]
+    # rl-a, one job at a time (see the preempt job): a gate's entry cancels
+    # the nightly's job in progress; the nightly's waits.
+    concurrency:
+      group: rl-a
+      cancel-in-progress: ${{ inputs.suite != 'full' }}
     runs-on: ubuntu-latest
     environment: redline-staging
     # The OIDC principal (4.4): this job only, never the workflow. `actions:
@@ -578,14 +702,48 @@ jobs:
       - id: mint
         name: Mint the OIDC JWTs as 0600 files
         run: pnpm --filter @oa/redline provisioning mint-oidc provisioning stagingInventory
+      # Every gate and nightly run starts the sweep of rl-n-* installs older
+      # than 2 h (a smoke's fresh install whose purge failed), in the
+      # background, with this run's OIDC token on the staging Provisioning API,
+      # the purge's own mechanism. It never fails or holds the run; the
+      # purge report step at the end prints how it went.
+      - id: smoke-sweep
+        name: Start the sweep of leftover rl-n installs (never fails the run)
+        continue-on-error: true
+        env:
+          REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
+        run: |
+          set -euo pipefail
+          if jq -e '.scripts.smoke' tests/redline/package.json > /dev/null; then
+            pnpm --filter @oa/redline smoke sweep-start
+          fi
+      # After a preempted nightly whose R26 revoke did not succeed: revoke
+      # rl-a first (rotates its hook key, revokes every red-line PAT), so the
+      # bring-up below starts from a known rl-a.
+      - id: reset-rl-a
+        name: Revoke rl-a after a preempted nightly left it unrevoked
+        if: needs.rl-a-check.outputs.reset == 'true'
+        env:
+          REDLINE_SIDES: a
+        run: pnpm --filter @oa/redline provisioning revoke
       - id: bringup
-        name: Upgrade rl-a and rl-b to the tag (R5) and take this run's credentials (R26)
+        name: Upgrade rl-a (and rl-b in the nightly) to the tag (R5) and take this run's credentials (R26)
+        env:
+          # The standing installs this run brings up, checks and revokes
+          # (cloud #264 step 2): a gate's smoke uses rl-a only; the nightly's
+          # long suite both, rl-b upgraded by this same step there
+          # (src/provisioning-live.ts bringUp). A tag cut before the smoke
+          # ignores it and does both.
+          REDLINE_SIDES: ${{ inputs.suite == 'full' && 'ab' || 'a' }}
         run: pnpm --filter @oa/redline provisioning bringup
       # The staging-first record (scripts/ci/staging-first-gate.sh): version.txt
       # = X.Y.Z, written only once rl-a's and rl-b's /healthz both report it.
       # The prod deploy gate also requires this run to succeed as a whole.
       - id: staged
-        name: Check rl-a and rl-b report the tag
+        name: Check rl-a (and rl-b in the nightly) report the tag
+        env:
+          # As at bring-up.
+          REDLINE_SIDES: ${{ inputs.suite == 'full' && 'ab' || 'a' }}
         run: pnpm --filter @oa/redline provisioning staged-version "$RUNNER_TEMP/redline-staged/version.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.staged.outcome == 'success'
@@ -677,6 +835,10 @@ jobs:
           fi
       - name: Run the suite
         env:
+          # The smoke for a gate run, the long suite for the nightly (above).
+          SUITE: ${{ inputs.suite }}
+          # The smoke's fresh install and its background purge (src/smoke.ts).
+          REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
           REDLINE_STG_INVENTORY_URL: ${{ vars.REDLINE_STG_INVENTORY_URL }}
           REDLINE_DELETED_HOSTS: ${{ vars.REDLINE_DELETED_HOSTS }}
           REDLINE_PROD_ACCOUNT_ID: ${{ vars.REDLINE_PROD_ACCOUNT_ID }}
@@ -694,7 +856,18 @@ jobs:
           set -euo pipefail
           export REDLINE_REPORT="$RUNNER_TEMP/redline-report/report.json"
           mkdir -p "$RUNNER_TEMP/redline-report"
-          pnpm --filter @oa/redline live
+          case "${SUITE:-smoke}" in
+            full) pnpm --filter @oa/redline live ;;
+            smoke)
+              if jq -e '.scripts.smoke' tests/redline/package.json > /dev/null; then
+                pnpm --filter @oa/redline smoke
+              else
+                echo "::warning title=red-line smoke::this tag has no smoke: its long suite is the gate"
+                pnpm --filter @oa/redline live
+              fi
+              ;;
+            *) echo "suite must be smoke or full"; exit 1 ;;
+          esac
       # Artifacts are not masked: a secret echoed into a report stops the upload.
       - id: scan-suite
         name: No secret in the red-line report
@@ -751,10 +924,30 @@ jobs:
       # 401 (P36's second half). Runs whatever happened above.
       - name: Revoke this run's R26 credentials
         if: always() && steps.mint.outcome == 'success'
+        env:
+          # As at bring-up.
+          REDLINE_SIDES: ${{ inputs.suite == 'full' && 'ab' || 'a' }}
         run: pnpm --filter @oa/redline provisioning revoke
+      # The smoke's fresh install is purged, and leftovers swept, in detached
+      # processes (src/smoke.ts spawnPurge, spawnSweep). The gate never waits
+      # for them: this prints what they have logged so far, waits for
+      # nothing and never fails. If the job's end cuts one off, the next gate
+      # or nightly run's sweep removes what it left (rl-n-* older than 2 h).
+      - id: smoke-purge
+        name: The smoke's background purge and sweep, as far as they got (waits for nothing)
+        if: always() && steps.mint.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          REDLINE_SMOKE_DIR: ${{ runner.temp }}/redline-smoke
+        run: |
+          set -euo pipefail
+          if [ -d "$REDLINE_SMOKE_DIR" ]; then
+            pnpm --filter @oa/redline smoke purge-report
+          fi
       - name: Remove the secret files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
+        run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-smoke" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
       # The last step, so the revoke and the file removal above have run. A run
       # whose key was never handed over (a partial re-run of only this job, a
       # seal or upload that failed) has no T19 result: it is never green.

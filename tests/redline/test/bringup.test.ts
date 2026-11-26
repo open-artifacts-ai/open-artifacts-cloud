@@ -12,11 +12,12 @@ import {
   SUITE_HOOK_LIMIT,
   wrongKeyLedger,
 } from "../src/hook-ledger-compat.ts";
-import { Run } from "../src/provisioning.ts";
+import { Run, sidesOf, stagedVersion } from "../src/provisioning.ts";
 import {
   bringUp,
   credFile,
   type RawTargets,
+  revokeAll,
   waitHookKey,
 } from "../src/provisioning-live.ts";
 import {
@@ -372,4 +373,78 @@ describe("bringUp checks the tier fixture (rl-a Team, rl-b Business)", () => {
       );
     },
   );
+});
+
+// Cloud #264 step 2: a smoke gate uses rl-a only (REDLINE_SIDES=a). The
+// nightly's long suite, with any other value, brings up both, as before.
+describe("a smoke gate brings up rl-a only (REDLINE_SIDES=a)", () => {
+  it("upgrades and mints rl-a alone, starts no bus pair, and writes no rl-b file", async () => {
+    const { f, t } = setup();
+    const out = quiet();
+    let pairs = 0;
+    await bringUp(
+      { REDLINE_SIDES: "a" },
+      t,
+      new Run(CONFIG, f.io),
+      noPace,
+      () => {
+        pairs++;
+      },
+    );
+    expect(
+      at(f.log, new RegExp(`/installs/${CONFIG.rlA.id}/upgrade$`)),
+    ).toBeGreaterThan(-1);
+    expect(at(f.log, new RegExp(`/installs/${CONFIG.rlB.id}/upgrade$`))).toBe(
+      -1,
+    );
+    expect(f.log.filter((l) => /\/redline-creds$/.test(l))).toHaveLength(1);
+    expect(existsSync(credFile(t, "a", "PAT"))).toBe(true);
+    expect(existsSync(credFile(t, "b", "PAT"))).toBe(false);
+    expect(existsSync(credFile(t, "b", "HOOK_KEY"))).toBe(false);
+    expect(pairs).toBe(0);
+    expect(out.mock.calls.map((c) => String(c[0])).join("")).not.toContain(
+      "rl-b",
+    );
+  });
+
+  it("any other value, or none, brings up both and starts the pair (the nightly)", async () => {
+    for (const env of [{}, { REDLINE_SIDES: "ab" }, { REDLINE_SIDES: "b" }]) {
+      const { f, t } = setup();
+      quiet();
+      let pairs = 0;
+      await bringUp(env, t, new Run(CONFIG, f.io), noPace, () => {
+        pairs++;
+      });
+      expect(
+        f.log.filter((l) => /\/redline-creds$/.test(l)),
+        JSON.stringify(env),
+      ).toHaveLength(2);
+      expect(pairs).toBe(1);
+    }
+  });
+
+  it("sidesOf reads only the exact value a", () => {
+    expect(sidesOf({ REDLINE_SIDES: "a" })).toEqual(["a"]);
+    for (const v of [undefined, "", "ab", "A", " a", "b"])
+      expect(sidesOf({ REDLINE_SIDES: v })).toEqual(["a", "b"]);
+  });
+
+  it("the staged-version check and the revoke follow it: rl-a only", async () => {
+    const { f, t } = setup();
+    quiet();
+    const run = new Run(CONFIG, f.io);
+    await bringUp({ REDLINE_SIDES: "a" }, t, run, noPace, noPair);
+    // rl-b still runs 0.81.0: checking it would fail.
+    expect(await stagedVersion(run, ["a"])).toBe("0.82.0");
+    await expect(stagedVersion(run)).rejects.toThrow(/rl-b/);
+    const out = quiet();
+    const before = f.log.filter((l) => /\/redline-creds$/.test(l)).length;
+    expect(await revokeAll({ REDLINE_SIDES: "a" }, t, { run })).toBe(0);
+    expect(
+      f.log.filter((l) => /\/redline-creds$/.test(l)).length - before,
+    ).toBe(1);
+    const text = out.mock.calls.map((c) => String(c[0])).join("");
+    expect(text).toContain("rl-a: R26 revoked");
+    expect(text).not.toContain("rl-b");
+  });
 });

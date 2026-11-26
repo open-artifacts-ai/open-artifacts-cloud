@@ -79,13 +79,8 @@ export async function plan(o: {
   );
   if (recent) return skip(`candidate run ${recent.id} started under 3 h ago`);
 
-  const seen = staging.find(
-    (r) =>
-      r.display_title === `redline-staging ${tag}` &&
-      r.conclusion !== "cancelled" &&
-      r.conclusion !== "skipped",
-  );
-  if (seen) return skip(`candidate run ${seen.id} already covered ${tag}`);
+  // A candidate run no longer covers a release's nightly: since cloud #264
+  // step 2 the gate runs the smoke, and the long suite runs only here.
 
   const ran = JSON.parse(
     gh(o.exec, [
@@ -102,6 +97,7 @@ export async function plan(o: {
 
 export type Report =
   | { action: "none" }
+  | { action: "preempted" }
   | { action: "closed"; issues: number[] }
   | { action: "refreshed"; issue: number }
   | { action: "opened" };
@@ -114,6 +110,10 @@ export function report(o: {
   result: string;
   run: string;
 }): Report {
+  // A release gate cancels a running nightly (scripts/ci/redline-preempt.ts):
+  // not a red result. The release is not recorded as run, so the next cron
+  // runs it again. No issue is opened or changed.
+  if (o.result === "cancelled") return { action: "preempted" };
   const open = (
     JSON.parse(
       gh(o.exec, [
@@ -258,6 +258,10 @@ async function main(argv: string[]) {
     result: flag(argv, "result"),
     run: flag(argv, "run"),
   });
+  if (r.action === "preempted")
+    console.log(
+      `::notice title=red-line nightly preempted::${flag(argv, "tag") || "the release"}'s nightly was cancelled (a release gate preempts the nightly, or a person cancelled it); it is not recorded as run and runs again on the next cron`,
+    );
   console.error(`redline-nightly: ${JSON.stringify(r)}`);
 }
 

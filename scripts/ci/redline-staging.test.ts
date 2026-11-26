@@ -83,7 +83,13 @@ describe("redline-staging.yml", () => {
     });
     expect(w.on.workflow_dispatch.inputs.tag.required).toBe(true);
     expect(w.permissions).toEqual({ contents: "read" });
-    expect(Object.keys(w.jobs)).toEqual(["platform-tags", "t19", "redline"]);
+    expect(Object.keys(w.jobs)).toEqual([
+      "preempt",
+      "rl-a-check",
+      "platform-tags",
+      "t19",
+      "redline",
+    ]);
     expect(job.environment).toBe("redline-staging");
     // `actions: read` is for the t19 hand-off (this run's artifacts and jobs).
     expect(job.permissions).toEqual({
@@ -92,20 +98,25 @@ describe("redline-staging.yml", () => {
       actions: "read",
     });
     expect(job["timeout-minutes"]).toBe(150);
+    // Gates queue on `redline`; the nightly's call (suite: full) has its own
+    // group, so a gate never waits behind it (cloud #264 step 2).
     expect(w.concurrency).toEqual({
-      group: "redline",
+      group:
+        "${{ inputs.suite == 'full' && 'redline-nightly-suite' || 'redline' }}",
       "cancel-in-progress": false,
     });
   });
 
   it("refuses to start on a stale Worker: platform-tags (main's script, the staging deploy token) runs first (#1040)", () => {
     const pt = w.jobs["platform-tags"];
-    expect(job.needs).toBe("platform-tags");
+    expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
     expect(t19Job.needs).toBe("platform-tags");
     expect(pt["runs-on"]).toBe("ubuntu-latest");
     expect(pt.environment).toBe("hosted-staging-deploy");
     expect(pt.permissions).toEqual({ contents: "read" });
-    expect(pt.needs).toBeUndefined();
+    // After the preempt job only (cloud #264 step 2), which always runs.
+    expect(pt.needs).toBe("preempt");
+    expect(pt.if).toBeUndefined();
     expect(pt["timeout-minutes"]).toBeLessThanOrEqual(10);
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
     const all: Record<string, any>[] = pt.steps;
@@ -399,7 +410,7 @@ describe("redline-staging.yml", () => {
       readFileSync(join(root, "tests/redline/package.json"), "utf8"),
     ).scripts;
     expect(Object.keys(scripts)).toEqual(
-      expect.arrayContaining(["live", "provisioning"]),
+      expect.arrayContaining(["live", "provisioning", "smoke"]),
     );
     expect(text).toContain("playwright test -c playwright.staging.config.ts");
     expect(
@@ -483,6 +494,245 @@ describe("redline-staging.yml", () => {
     expect(t2.prod).toBeUndefined();
   });
 
+  describe("the gate runs the smoke, the nightly the long suite (cloud #264 step 2)", () => {
+    const suite = () => named("Run the suite");
+    // Runs the step with a stub pnpm that prints its arguments, in a dir
+    // holding the tag's tests/redline/package.json (with or without smoke).
+    const go = (SUITE: string, scripts: Record<string, string>) => {
+      const d = mkdtempSync(join(tmpdir(), "rl-suite-"));
+      mkdirSync(join(d, "bin"));
+      mkdirSync(join(d, "tests/redline"), { recursive: true });
+      writeFileSync(
+        join(d, "tests/redline/package.json"),
+        JSON.stringify({ scripts }),
+      );
+      writeFileSync(join(d, "bin/pnpm"), '#!/bin/sh\necho "pnpm $*"\n', {
+        mode: 0o755,
+      });
+      const r = spawnSync("bash", ["-c", String(suite().run)], {
+        cwd: d,
+        env: {
+          PATH: `${join(d, "bin")}:${process.env.PATH}`,
+          RUNNER_TEMP: d,
+          SUITE,
+        },
+        encoding: "utf8",
+      });
+      rmSync(d, { recursive: true, force: true });
+      return r;
+    };
+    const both = { live: "x", smoke: "y" };
+
+    it("a gate run (no suite input) runs the smoke; the nightly's full runs the long suite", () => {
+      expect(suite().env.SUITE).toBe("${{ inputs.suite }}");
+      expect(w.on.workflow_call.inputs.suite).toEqual({
+        type: "string",
+        required: false,
+        default: "smoke",
+      });
+      // A gate dispatch can't pick the suite.
+      expect(w.on.workflow_dispatch.inputs.suite).toBeUndefined();
+      expect(go("", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline smoke",
+      );
+      expect(go("smoke", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline smoke",
+      );
+      expect(go("full", both).stdout.trim()).toBe(
+        "pnpm --filter @oa/redline live",
+      );
+    });
+
+    it("a tag cut before the smoke runs its own long suite as the gate, with a warning", () => {
+      const r = go("", { live: "x" });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("::warning title=red-line smoke::");
+      expect(r.stdout.trim().split("\n").at(-1)).toBe(
+        "pnpm --filter @oa/redline live",
+      );
+    });
+
+    it("any other suite fails before anything runs", () => {
+      const r = go("everything", both);
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain("suite must be smoke or full");
+      expect(r.stdout).not.toContain("pnpm");
+    });
+
+    it("a gate brings up, checks and revokes rl-a only; the nightly both (REDLINE_SIDES)", () => {
+      for (const id of ["bringup", "staged"])
+        expect(named(id).env.REDLINE_SIDES, id).toBe(
+          "${{ inputs.suite == 'full' && 'ab' || 'a' }}",
+        );
+      expect(named("Revoke this run's R26 credentials").env.REDLINE_SIDES).toBe(
+        "${{ inputs.suite == 'full' && 'ab' || 'a' }}",
+      );
+      // The run commands stay the tag contract's: an older tag ignores the
+      // variable and does both, as its long suite needs.
+      expect(named("bringup").run).toBe(
+        "pnpm --filter @oa/redline provisioning bringup",
+      );
+    });
+
+    it("every run starts the leftover sweep after the OIDC mint, in the background and never failing", () => {
+      const sw = named("smoke-sweep");
+      expect(sw["continue-on-error"]).toBe(true);
+      expect(sw.if).toBeUndefined();
+      expect(sw.run).toContain("pnpm --filter @oa/redline smoke sweep-start");
+      expect(sw.run).toContain(
+        "jq -e '.scripts.smoke' tests/redline/package.json",
+      );
+      expect(sw.env.REDLINE_SMOKE_DIR).toBe(suite().env.REDLINE_SMOKE_DIR);
+      expect(steps.indexOf(sw)).toBe(steps.indexOf(named("mint")) + 1);
+      expect(JSON.stringify(sw)).not.toContain("secrets.");
+    });
+
+    it("the smoke's purge report runs always after the revoke, never fails the run, and its dir is removed", () => {
+      const p = named("smoke-purge");
+      expect(p["continue-on-error"]).toBe(true);
+      expect(p.if).toBe("always() && steps.mint.outcome == 'success'");
+      // It waits for nothing: the purge and sweep never hold the gate.
+      expect(p.run).toContain("pnpm --filter @oa/redline smoke purge-report");
+      expect(p.run).not.toContain("purge-wait");
+      expect(p["timeout-minutes"]).toBeLessThanOrEqual(2);
+      expect(p.run).toContain('if [ -d "$REDLINE_SMOKE_DIR" ]');
+      expect(p.env.REDLINE_SMOKE_DIR).toBe(suite().env.REDLINE_SMOKE_DIR);
+      expect(named("Remove the secret files").run).toContain(
+        '"$RUNNER_TEMP/redline-smoke"',
+      );
+    });
+  });
+
+  describe("a gate preempts the nightly (cloud #264 step 2)", () => {
+    const pj = () => w.jobs.preempt;
+    const gateStep = () => pick(pj().steps, "gate");
+    const isGate = (env: Record<string, string>) => {
+      const d = mkdtempSync(join(tmpdir(), "rl-preempt-"));
+      const out = join(d, "out");
+      writeFileSync(out, "");
+      const r = runBash(String(gateStep().run), { ...env, GITHUB_OUTPUT: out });
+      const got = readFileSync(out, "utf8").trim();
+      rmSync(d, { recursive: true, force: true });
+      expect(r.status).toBe(0);
+      return got;
+    };
+    const REPO = "open-artifacts-ai/open-artifacts-cloud";
+    const gate = {
+      EVENT: "workflow_dispatch",
+      REF: "refs/heads/main",
+      REPO,
+      WORKFLOW_REF: `${REPO}/.github/workflows/redline-staging.yml@refs/heads/main`,
+    };
+
+    it("runs first, in every run, holding actions: write alone of this file's jobs", () => {
+      expect(Object.keys(w.jobs)[0]).toBe("preempt");
+      expect(pj().permissions).toEqual({ contents: "read", actions: "write" });
+      expect(pj().needs).toBeUndefined();
+      expect(pj().if).toBeUndefined();
+      expect(pj().environment).toBeUndefined();
+      expect(pj()["timeout-minutes"]).toBeLessThanOrEqual(50);
+      for (const [name, j] of Object.entries(w.jobs) as [string, any][])
+        if (name !== "preempt")
+          expect(j.permissions?.actions ?? "none", name).not.toBe("write");
+      expect(JSON.stringify(pj())).not.toContain("secrets.");
+    });
+
+    it("does anything only in a release gate: every step after the check is gated on it", () => {
+      const [first, ...after] = pj().steps as Record<string, any>[];
+      expect(first?.id).toBe("gate");
+      for (const st of after)
+        expect(st.if, st.name ?? st.uses).toBe(
+          "steps.gate.outputs.gate == 'true'",
+        );
+      const cancel = pick(
+        pj().steps,
+        "Cancel a running nightly (waits for nothing)",
+      );
+      expect(cancel.run).toBe(
+        'node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts cancel --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID"',
+      );
+      expect(cancel.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
+      expect(gateStep().env).toEqual({
+        EVENT: "${{ github.event_name }}",
+        REF: "${{ github.ref }}",
+        REPO: "${{ github.repository }}",
+        WORKFLOW_REF: "${{ github.workflow_ref }}",
+      });
+    });
+
+    it("a gate is a dispatch of this file on main in this repository; a called run, another branch or a fork is not", () => {
+      expect(isGate(gate)).toBe("gate=true");
+      for (const bad of [
+        // The nightly's call and the dry run's: github.workflow_ref is the caller's.
+        {
+          WORKFLOW_REF: `${REPO}/.github/workflows/redline-nightly.yml@refs/heads/main`,
+        },
+        {
+          WORKFLOW_REF: `${REPO}/.github/workflows/t19-dry-run.yml@refs/heads/main`,
+        },
+        { EVENT: "schedule" },
+        {
+          REF: "refs/heads/pl/x",
+          WORKFLOW_REF: `${REPO}/.github/workflows/redline-staging.yml@refs/heads/pl/x`,
+        },
+        {
+          REPO: "someone/open-artifacts-cloud",
+          WORKFLOW_REF:
+            "someone/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main",
+        },
+      ])
+        expect(isGate({ ...gate, ...bad }), JSON.stringify(bad)).toBe(
+          "gate=false",
+        );
+    });
+
+    it("platform-tags, and so everything else, starts only after it", () => {
+      expect(w.jobs["platform-tags"].needs).toBe("preempt");
+      expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
+      expect(t19Job.needs).toBe("platform-tags");
+    });
+
+    it("GitHub does the waiting: rl-a-check and redline share the rl-a job group, a gate's entry cancels the nightly's", () => {
+      const group = {
+        group: "rl-a",
+        "cancel-in-progress": "${{ inputs.suite != 'full' }}",
+      };
+      const check = w.jobs["rl-a-check"];
+      expect(check.concurrency).toEqual(group);
+      expect(job.concurrency).toEqual(group);
+      // Gates queue on the workflow's own group, so a gate's cancel in rl-a
+      // can only meet a nightly (its call sits in another workflow group).
+      expect(w.concurrency.group).toContain("'redline'");
+      expect(check.needs).toBe("preempt");
+      expect(check.permissions).toEqual({ contents: "read", actions: "read" });
+      expect(check.outputs).toEqual({
+        reset: "${{ steps.check.outputs.reset }}",
+      });
+      const c = pick(check.steps, "check");
+      expect(c.run).toBe(
+        'node --experimental-strip-types --no-warnings scripts/ci/redline-preempt.ts check --repo "$GITHUB_REPOSITORY" --runs "$RUNS"',
+      );
+      expect(c.env.RUNS).toBe("${{ needs.preempt.outputs.runs }}");
+      for (const st of check.steps as Record<string, any>[])
+        expect(st.if).toBe("needs.preempt.outputs.runs != ''");
+      expect(pj().outputs).toEqual({
+        runs: "${{ steps.preempt-run.outputs.runs }}",
+      });
+      expect(pj()["timeout-minutes"]).toBeLessThanOrEqual(5);
+      // Nothing in the workflow waits on the nightly with a loop of its own.
+      expect(JSON.stringify(pj())).not.toMatch(/sleep|until /);
+    });
+
+    it("a preempted nightly's unrevoked rl-a is revoked before the bring-up", () => {
+      const r = named("reset-rl-a");
+      expect(r.if).toBe("needs.rl-a-check.outputs.reset == 'true'");
+      expect(r.run).toBe("pnpm --filter @oa/redline provisioning revoke");
+      expect(r.env).toEqual({ REDLINE_SIDES: "a" });
+      expect(steps.indexOf(r)).toBeGreaterThan(steps.indexOf(named("mint")));
+      expect(steps.indexOf(r)).toBe(steps.indexOf(named("bringup")) - 1);
+    });
+  });
+
   it("mints the staging audiences, brings rl-a and rl-b up, mints prod's after bring-up, then the suite", () => {
     expect(named("mint").run).toBe(
       "pnpm --filter @oa/redline provisioning mint-oidc provisioning stagingInventory",
@@ -541,7 +791,7 @@ describe("redline-staging.yml", () => {
       );
       // Neither job waits for the other through `needs`: they overlap.
       expect(t19Job.needs).toBe("platform-tags");
-      expect(job.needs).toBe("platform-tags");
+      expect(job.needs).toEqual(["rl-a-check", "platform-tags"]);
       // The workflow no longer records a deviation from 4.4, and T19's shell
       // has nothing to unset.
       expect(text).not.toContain("Deviation from 4.4");
@@ -559,12 +809,15 @@ describe("redline-staging.yml", () => {
       for (const s of t19Steps) expect(s["continue-on-error"]).toBeUndefined();
       // The soft steps of the workflow are the redline job's seal and its two
       // uploads; a missing key fails the t19 job (its wait step) AND the redline
-      // job's last step, so the run still fails.
+      // job's last step, so the run still fails. The smoke's purge report is
+      // soft too: cleanup never fails the gate (cloud #264 step 2).
       const soft = steps.filter((s) => s["continue-on-error"]);
       expect(soft.map((s) => s.id)).toEqual([
+        "smoke-sweep",
         "t19-key",
         "handoff-up",
         "marker-up",
+        "smoke-purge",
       ]);
       const t19 = t19Named("t19");
       // T19 itself runs only after the key was opened: no key, no T19, and
@@ -1352,15 +1605,26 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
         "utf8",
       );
       const nw = parse(nightly) as Record<string, any>;
+      // actions: write only for the callee's preempt job (cloud #264 step 2).
       expect(nw.jobs.redline.permissions).toEqual({
         contents: "read",
         "id-token": "write",
-        actions: "read",
+        actions: "write",
       });
       // A called job's permissions can't exceed its caller's.
-      for (const j of [job, t19Job])
+      const rank = (v: unknown) => ["none", "read", "write"].indexOf(String(v));
+      for (const j of [
+        w.jobs.preempt,
+        w.jobs["rl-a-check"],
+        w.jobs["platform-tags"],
+        job,
+        t19Job,
+      ])
         for (const [k, v] of Object.entries(j.permissions as object))
-          expect(nw.jobs.redline.permissions[k], k).toBe(v);
+          expect(
+            rank(nw.jobs.redline.permissions[k]),
+            k,
+          ).toBeGreaterThanOrEqual(rank(v));
     });
   });
 
@@ -1384,6 +1648,8 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       at((s) => JSON.stringify(s).includes("secrets.")),
       at((s) => s.name === "Set the targets"),
       at((s) => s.id === "mint"),
+      at((s) => s.id === "smoke-sweep"),
+      at((s) => s.id === "reset-rl-a"),
       at((s) => s.id === "bringup"),
       at((s) => s.id === "staged"),
       at((s) => s.id === "t19-key"),
@@ -1393,24 +1659,28 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
       at((s) => s.id === "scan-suite"),
       at((s) => s.with?.name === "redline-report"),
       at((s) => s.id === "t19-done"),
-      at((s) => (s.run ?? "").includes("provisioning revoke")),
+      at((s) => s.name === "Revoke this run's R26 credentials"),
+      at((s) => s.id === "smoke-purge"),
       at((s) => s.name === "Remove the secret files"),
     ];
     expect(order.every((i) => i > -1)).toBe(true);
     expect(order).toEqual(order.slice().sort((x, y) => x - y));
-    // The job ends with the revoke and the file removal, both always, then the
-    // check that the hand-off happened (so neither is skipped by its failure).
-    expect(steps.slice(-3).map((s) => s.name)).toEqual([
+    // The job ends with the revoke, the smoke's purge report (it needs the
+    // OIDC file, so before the removal) and the file removal, all always,
+    // then the check that the hand-off happened (so none is skipped by its
+    // failure).
+    expect(steps.slice(-4).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
+      "The smoke's background purge and sweep, as far as they got (waits for nothing)",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
     ]);
-    expect(steps.at(-3)?.if).toBe(
+    expect(steps.at(-4)?.if).toBe(
       "always() && steps.mint.outcome == 'success'",
     );
     expect(steps.at(-2)?.if).toBe("always()");
     expect(steps.at(-2)?.run).toBe(
-      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
+      'rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-smoke" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"',
     );
     expect(
       steps.filter((s) => (s.run ?? "").includes("@oa/provision build")),
@@ -1766,7 +2036,7 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
     expect(j.permissions).toEqual({
       contents: "read",
       "id-token": "write",
-      actions: "read",
+      actions: "write",
     });
     expect(j.with).toEqual({
       tag: "${{ inputs.tag }}",
@@ -1979,13 +2249,12 @@ describe("t19 gate tier", () => {
       expect(src, f).not.toContain("redline-nightly");
       expect(src, f).not.toContain("t19_full");
     }
-    // It reports through its own blocker issue and shares the callee's
-    // `redline` concurrency group with a gate run, so they never overlap.
+    // It reports through its own blocker issue. Its call has its own
+    // concurrency group (suite: full), and a gate run cancels it first, so
+    // they never overlap on rl-a (cloud #264 step 2).
     expect(nightly.jobs.report).toBeDefined();
-    expect(w.concurrency).toEqual({
-      group: "redline",
-      "cancel-in-progress": false,
-    });
+    expect(nightly.jobs.redline.with.suite).toBe("full");
+    expect(w.concurrency.group).toContain("inputs.suite == 'full'");
   });
 
   it("keeps the secret handling: the scrub, the scan and the deep scan still run on every selection", () => {
@@ -2011,7 +2280,7 @@ describe("t19 gate tier", () => {
 case "$*" in
   *--list*)
     if [[ "$*" == *--project* ]]; then n=${counts.guard}; kind=guard
-    elif [[ "$*" == *"--grep @gate(\\s|\$)"* ]]; then n=${counts.gate}; kind=gate
+    elif [[ "$*" == *"--grep @gate(\\s|$)"* ]]; then n=${counts.gate}; kind=gate
     else n=${counts.all}; kind=all; fi
     if [ "$kind" = "${broken}" ]; then echo "Error: browserType.launch crashed"; exit 2; fi
     if [ "$n" -eq 0 ]; then echo "Error: No tests found"; exit 1; fi

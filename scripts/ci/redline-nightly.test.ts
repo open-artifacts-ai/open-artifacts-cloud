@@ -74,11 +74,11 @@ describe("plan", () => {
     expect(await go({ ran: 1 })).toMatchObject({ run: false });
   });
 
-  it("idle: a candidate run on the tag counts, green or red", async () => {
+  it("a candidate run on the tag no longer counts: the gate runs the smoke, the long suite runs only here (cloud #264 step 2)", async () => {
     for (const c of ["success", "failure"])
       expect(
         await go({ staging: [done(9, `redline-staging ${TAG}`, c)] }),
-      ).toMatchObject({ run: false });
+      ).toMatchObject({ run: true });
   });
 
   it("a cancelled run, or one on another tag, doesn't count", async () => {
@@ -203,11 +203,19 @@ describe("report", () => {
 
   it("red with one open refreshes it, no second issue", () => {
     const { exec, calls } = issues([MINE]);
-    expect(report({ ...base, exec, result: "cancelled" })).toEqual({
+    expect(report({ ...base, exec, result: "failure" })).toEqual({
       action: "refreshed",
       issue: 6,
     });
     expect(calls.some((c) => c[1] === "create")).toBe(false);
+  });
+
+  it("a cancelled nightly (a gate preempted it) opens, refreshes and closes nothing", () => {
+    const { exec, calls } = issues([MINE]);
+    expect(report({ ...base, exec, result: "cancelled" })).toEqual({
+      action: "preempted",
+    });
+    expect(calls).toEqual([]);
   });
 
   it("a failed pick still reports, with no tag", () => {
@@ -263,11 +271,15 @@ describe("redline-nightly.yml", () => {
       tag: "${{ needs.pick.outputs.tag }}",
       // The nightly runs every dashboard spec; a gate run only the @gate ones.
       t19_full: true,
+      // The long red-line suite: a gate run runs the smoke (cloud #264 step 2).
+      suite: "full",
     });
+    // actions: write only because the callee's preempt job asks for it; in a
+    // called run that job does nothing past its gate check.
     expect(j.permissions).toEqual({
       contents: "read",
       "id-token": "write",
-      actions: "read",
+      actions: "write",
     });
     // By name, exactly the callee's declared secrets; never inherit (43183209806).
     expect(j.secrets).toEqual({
@@ -279,13 +291,32 @@ describe("redline-nightly.yml", () => {
     });
   });
 
-  it("records the release before it runs", () => {
-    const up = w.jobs.pick.steps.find((s: { uses?: string }) =>
+  it("records the release after it ran green or red, never a cancelled (preempted) run", () => {
+    expect(
+      w.jobs.pick.steps.some((s: { uses?: string }) =>
+        s.uses?.startsWith("actions/upload-artifact@"),
+      ),
+    ).toBe(false);
+    const steps = w.jobs.report.steps as {
+      uses?: string;
+      if?: string;
+      with?: Record<string, string>;
+    }[];
+    const up = steps.find((s) =>
       s.uses?.startsWith("actions/upload-artifact@"),
     );
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-    expect(up.with.name).toBe("redline-nightly-${{ steps.plan.outputs.tag }}");
-    expect(up.if).toBe("steps.plan.outputs.run == 'true'");
+    expect(up?.with?.name).toBe(
+      "redline-nightly-${{ needs.pick.outputs.tag }}",
+    );
+    const when =
+      "needs.pick.outputs.run == 'true' && (needs.redline.result == 'success' || needs.redline.result == 'failure')";
+    expect(up?.if).toBe(when);
+    const rec = steps.find(
+      (s) => (s as { name?: string }).name === "Record the release as run",
+    );
+    expect(rec?.if).toBe(when);
+    expect(steps.indexOf(rec ?? {})).toBeLessThan(steps.indexOf(up ?? {}));
   });
 
   it("reports whatever happened, and a failed pick too", () => {
