@@ -5,8 +5,9 @@
 // by paceHook (src/http.ts) already; this paces the rest.
 //
 // anonKeys() maps a request to the keys it spends. Each key is paced with the
-// public hook ledger (apps/dashboard/e2e/staging/hook-ledger.ts), one ledger
-// per key, 25 per 60 s (HOOK_LIMIT: 5 kept back, as for hooks), shared by
+// public hook ledger (apps/dashboard/e2e/staging/hook-ledger.ts, through
+// src/hook-ledger-compat.ts), one ledger per key, 25 per 60 s
+// (SUITE_HOOK_LIMIT: 5 kept back, as for hooks), shared by
 // every process on the runner. The wrapper (live/setup.ts) paces outside
 // boundFetch, so a wait never counts against a request's timeout.
 //
@@ -14,11 +15,8 @@
 // is an InfraError naming the route, never a verdict: a key we do not pace is
 // being spent, and the table needs a row (test/rl-anon.test.ts also reads the
 // server's source for every key it limits on).
-import {
-  claimHookSlot,
-  type PaceOpts,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { InfraError } from "./fetch-timeout.ts";
+import { type ClaimOpts, claimSuiteSlot } from "./hook-ledger-compat.ts";
 import { holdsExclusive, withLock } from "./locks.ts";
 
 /** The lock name for rl-b's member list and its member-user (state key `rl-b/members+member-user`). */
@@ -260,13 +258,15 @@ const abortableSleep =
 /**
  * The public ledger claim for one key, one ledger per key (#24: a claim told
  * to stop while it waits never takes the slot it was waiting for). The
- * options are a test seam (ledger root, clock, sleep).
+ * options are a test seam (ledger root, clock, sleep). From public #3200 the
+ * ledger never waits (a full key throws HookBudgetError at once), so `sleep`
+ * is read only before it (src/hook-ledger-compat.ts).
  */
 export const ledgerClaimWith =
-  (o: Pick<PaceOpts, "root" | "now" | "sleep"> = {}): Claim =>
+  (o: Pick<ClaimOpts, "root" | "now" | "sleep"> = {}): Claim =>
   (key, signal) => {
     if (signal?.aborted) return Promise.reject(new PacingAborted());
-    return claimHookSlot(`rl-anon/${key}`, {
+    return claimSuiteSlot(`rl-anon/${key}`, {
       ...o,
       sleep: abortableSleep(o.sleep, signal),
     });

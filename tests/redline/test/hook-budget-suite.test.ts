@@ -6,13 +6,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { claimHookSlot } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import {
-  claimHookSlot,
-  HOOK_LIMIT,
-  hook404IsTheKeys,
+  claimSuiteSlot,
+  HookBudgetError,
   hookLedgerDir,
   hookWindowCount,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+  ledgerWaits,
+  SUITE_HOOK_LIMIT,
+  suiteHook404IsTheKeys,
+} from "../src/hook-ledger-compat.ts";
 import { paceHook } from "../src/http.ts";
 import { parseTargets } from "../src/targets.ts";
 import { secretDir } from "./fake.ts";
@@ -89,16 +92,46 @@ describe("guard's wrong-key probe", () => {
   it("paces with one call kept free, so its 404 is the key's", async () => {
     const root = scratch();
     const c = clock();
-    for (let i = 0; i < HOOK_LIMIT - 1; i++)
-      await claimHookSlot(APP, { root, now: c.now });
-    const n = await paceHook({ app: APP } as never, {
+    for (let i = 0; i < SUITE_HOOK_LIMIT - 1; i++)
+      await claimSuiteSlot(APP, { root, now: c.now });
+    const probe = () =>
+      paceHook({ app: APP } as never, {
+        root,
+        now: c.now,
+        sleep: c.sleep,
+        reserve: 1,
+      });
+    if (ledgerWaits) {
+      // Before public #3200: it waited for room rather than take the last slot.
+      const n = await probe();
+      expect(c.waits).toHaveLength(1);
+      expect(suiteHook404IsTheKeys(n)).toBe(true);
+    } else {
+      // From #3200: it refuses at once rather than take the last slot.
+      await expect(probe()).rejects.toBeInstanceOf(HookBudgetError);
+      expect(c.waits).toHaveLength(0);
+      expect(hookWindowCount(APP, { root, now: c.now })).toBe(
+        SUITE_HOOK_LIMIT - 1,
+      );
+    }
+  });
+
+  it("the suite's cap is 25 a minute whichever ledger public has", async () => {
+    const root = scratch();
+    const c = clock();
+    for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+      await claimSuiteSlot(APP, { root, now: c.now });
+    expect(suiteHook404IsTheKeys(SUITE_HOOK_LIMIT - 1)).toBe(true);
+    expect(suiteHook404IsTheKeys(SUITE_HOOK_LIMIT)).toBe(false);
+    // The next suite call waits (before #3200) or is refused (from #3200),
+    // never taken inside the window.
+    const next = claimSuiteSlot(APP, {
       root,
       now: c.now,
       sleep: c.sleep,
-      reserve: 1,
+      deadline: c.now(),
     });
-    // It waited for room rather than take the last slot.
-    expect(c.waits).toHaveLength(1);
-    expect(hook404IsTheKeys(n)).toBe(true);
+    await expect(next).rejects.toBeInstanceOf(HookBudgetError);
+    expect(hookWindowCount(APP, { root, now: c.now })).toBe(SUITE_HOOK_LIMIT);
   });
 });

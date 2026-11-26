@@ -13,10 +13,6 @@ import { fileURLToPath } from "node:url";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import type { InstallDetail } from "@oa/provisioning-contract";
 import {
-  claimHookSlot,
-  HookBudgetError,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
-import {
   BusError,
   busState,
   connectRequest,
@@ -25,6 +21,7 @@ import {
   revokeMachines,
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
+import { claimSuiteSlot, HookBudgetError } from "./hook-ledger-compat.ts";
 import {
   BUS_A,
   BUS_B,
@@ -267,7 +264,7 @@ export async function waitHookKey(
   app: string,
   key: string,
   pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
-    claimHookSlot(a, { deadline }),
+    claimSuiteSlot(a, { deadline }),
   within: number = HOOK_KEY_WITHIN_MS,
 ): Promise<void> {
   // One deadline for the whole wait: a ledger claim gives up at it, and each

@@ -2,9 +2,10 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  HOOK_GAP_MS,
-  HOOK_LIMIT,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+  LEDGER_HOOK_LIMIT,
+  SUITE_HOOK_LIMIT,
+  T19_HOOK_GAP_MS,
+} from "../src/hook-ledger-compat.ts";
 import { KEY_TABLE, WAIT_BUDGET_MS } from "../src/rl-anon.ts";
 
 // credentials' link cases compare rl-b's whole member list (and the member
@@ -138,8 +139,11 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
 
   it("the hook rate limit is per install and IP, and the caps reset deletes only the caller's IP's rows", () => {
     const hooks = read("apps/server/src/test-hooks/index.ts");
+    // Before public #3200 one limiter (RL_ANON) under that key; from #3200 the
+    // same key on RL_HOOKS for a right key, RL_ANON for a wrong one.
+    // TODO(public #3200): keep the second.
     expect(hooks).toMatch(
-      /rl\.limit\(\{ key: `test:\$\{authConfig\(env\)\.installKey\}:\$\{ip\}` \}\)/,
+      /rl\.limit\(\{ key: `test:\$\{authConfig\(env\)\.installKey\}:\$\{ip\}` \}\)|const key = `test:\$\{authConfig\(env\)\.installKey\}:\$\{ip\}`;[\s\S]{0,80}const limiter = keyed \? \(env\.RL_HOOKS \?\? anon\) : anon;\s*if \(!\(await limiter\.limit\(\{ key \}\)\)\.success\)/,
     );
     expect(hooks).toMatch(/const ik = await ipKey\(env, ip\);/);
     expect(hooks).toMatch(/code:ip:\$\{ik\}`, `code:fail:\$\{ik\}`/);
@@ -224,14 +228,24 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     expect(read("apps/server/src/test-hooks/index.ts")).toMatch(
       /order by at desc, id desc limit \?2/,
     );
-    // T19 paces every hook call to one per HOOK_GAP_MS (hook-pace.ts): in the
-    // longest window a case can wait (the wait budget) it adds at most this
-    // many rows. The suite's own rl-a calls are paced to HOOK_LIMIT a minute.
-    expect(HOOK_GAP_MS).toBeGreaterThanOrEqual(2400);
+    // Before public #3200, T19 paced every hook call to one per HOOK_GAP_MS
+    // (hook-pace.ts): in the longest window a case can wait (the wait budget)
+    // it adds at most this many rows. From #3200 T19 has no spread, only the
+    // ledger's own cap (LEDGER_HOOK_LIMIT a minute). The suite's own rl-a
+    // calls are capped at SUITE_HOOK_LIMIT a minute (src/hook-ledger-compat.ts).
+    // TODO(public #3200): drop the HOOK_GAP_MS branch with the compat module.
     const windowS = (WAIT_BUDGET_MS + 60_000) / 1000;
-    const t19Rows = Math.ceil((windowS * 1000) / HOOK_GAP_MS) + 1;
-    const suiteRows = Math.ceil(windowS / 60) * HOOK_LIMIT;
-    expect(t19Rows + suiteRows).toBeLessThan(limit);
+    if (T19_HOOK_GAP_MS !== undefined)
+      expect(T19_HOOK_GAP_MS).toBeGreaterThanOrEqual(2400);
+    const t19Rows =
+      T19_HOOK_GAP_MS !== undefined
+        ? Math.ceil((windowS * 1000) / T19_HOOK_GAP_MS) + 1
+        : Math.ceil(windowS / 60) * LEDGER_HOOK_LIMIT;
+    const suiteRows = Math.ceil(windowS / 60) * SUITE_HOOK_LIMIT;
+    expect(
+      t19Rows + suiteRows,
+      `T19 (${t19Rows}) and the suite (${suiteRows}) can write more hook audit rows in a case's window than the newest ${limit} a case reads`,
+    ).toBeLessThan(limit);
   });
 
   it("T19's own hook budget is its runner's: the ledger is per runner (tmpdir), so the suite's ledger never counts T19's calls (the two runners' IPs differing is an assumption: the guard's wrong-key case no longer relies on it)", () => {
@@ -240,6 +254,10 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
     expect(ledger).toMatch(/root: string = tmpdir\(\)/);
     // And rl-a's bucket is the server's, per IP: another runner is another
     // bucket only if its IP differs (assumed, not verified here).
-    expect(read(`${dir}/rl-a/guard.setup.ts`)).toMatch(/clearT19HookWindow/);
+    // Before public #3200 its setup waits the suite's calls out of the window;
+    // from #3200 it checks there is room in it. TODO(public #3200): keep the second.
+    expect(read(`${dir}/rl-a/guard.setup.ts`)).toMatch(
+      /clearT19HookWindow|hookWindowCount\(rlA\(\)\.app\)\)\.toBeLessThan\(HOOK_LIMIT\)/,
+    );
   });
 });

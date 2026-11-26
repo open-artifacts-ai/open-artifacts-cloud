@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HookBudgetError } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+import { HookBudgetError } from "../src/hook-ledger-compat.ts";
 import { Run } from "../src/provisioning.ts";
 import {
   bringUp,

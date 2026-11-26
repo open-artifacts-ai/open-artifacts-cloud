@@ -2,15 +2,12 @@ import { createHash, randomBytes } from "node:crypto";
 import { API_ERROR_CODES } from "@oa/provisioning-contract";
 import { ERROR_CODES } from "@oa/shared";
 import {
-  claimHookSlot,
-  type PaceOpts,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
-import {
   InfraError,
   isNetworkError,
   networkCode,
   setupFetch,
 } from "./fetch-timeout.ts";
+import { type ClaimOpts, claimSuiteSlot } from "./hook-ledger-compat.ts";
 import { note } from "./notes.ts";
 import { countHook } from "./rl-anon.ts";
 import { secretsOf, setPat, type Target } from "./targets.ts";
@@ -196,14 +193,15 @@ export class HttpError extends Error {
 }
 
 /**
- * Waits until a hook call to `t` fits the runner's hook budget (#1254,
- * apps/dashboard/e2e/staging/hook-ledger.ts, shared with T19), then records it. Any request to a
- * /__test/* path counts (the server charges the bucket before the key), so
- * a raw probe there paces through this too. Returns the calls in the window.
+ * Records a hook call to `t` in the runner's hook budget (#1254,
+ * apps/dashboard/e2e/staging/hook-ledger.ts, shared with T19), at most
+ * SUITE_HOOK_LIMIT a minute (src/hook-ledger-compat.ts). Any request to a
+ * /__test/* path counts (a wrong key is charged to RL_ANON), so a raw probe
+ * there paces through this too. Returns the calls in the window.
  */
-export async function paceHook(t: Target, o: PaceOpts = {}): Promise<number> {
+export async function paceHook(t: Target, o: ClaimOpts = {}): Promise<number> {
   const t0 = Date.now();
-  const n = await claimHookSlot(t.app, o);
+  const n = await claimSuiteSlot(t.app, o);
   countHook(Date.now() - t0);
   return n;
 }

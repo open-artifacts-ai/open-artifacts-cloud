@@ -80,7 +80,7 @@ describe("hooks", () => {
       // RL_ANON answers the same bare 404 before the key is read, so this
       // 404 is the key check's only while the runner is under the limit.
       // What guarantees it is the margin: every /__test/* call this runner
-      // makes is paced to HOOK_LIMIT (25) a minute against RL_ANON's 30, and
+      // makes is paced to SUITE_HOOK_LIMIT (25) a minute against RL_ANON's 30, and
       // this probe keeps one more call free (24 at most, with it). A limited
       // 404 here would take at least 6 unpaced calls inside the window; none exist
       // (#1254). The audit row would prove it outright: a key-check 404
