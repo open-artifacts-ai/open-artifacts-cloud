@@ -16,14 +16,18 @@ import {
   gateRejected,
   type Input,
   isChainProdDeploy,
+  PRE_GATE_WORKFLOWS,
   parseView,
   type QueueRun,
   queueFailure,
   queueMarker,
   queueNotice,
   queueVerdict,
+  RELEASE_RETRY_SPENT,
   requiredChecks,
   run,
+  type StageRun,
+  stageSpent,
 } from "./pin-bump-arm.ts";
 
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
@@ -31,6 +35,8 @@ const PUB = "open-artifacts-ai/open-artifacts";
 const OLD = "b".repeat(40);
 const NEW = "a".repeat(40);
 const HEAD = "c".repeat(40);
+/** The main commit that set PUBLIC_PIN to v0.181.0. */
+const PIN_COMMIT = "9".repeat(40);
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
@@ -822,6 +828,10 @@ const fake = (
     deepDeploy?: boolean;
     /** The completed redline-staging runs, newest first. */
     gateRuns?: { t: string; c: string | null; a: number }[];
+    /** Runs of each stage before the gate for main's pin commit, newest first. */
+    stageRuns?: Record<string, StageRun[]>;
+    /** Dispatched deploy runs titled as staging's chain deploy of main's pin. */
+    stagingDeploys?: StageRun[];
     tagSha?: string;
     queue?: QueueRun[];
     headAt?: string;
@@ -837,6 +847,25 @@ const fake = (
     const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
     if (o.notFound?.some((n) => a.includes(n)))
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+    if (a.includes("commits?sha=main&path=PUBLIC_PIN&per_page=1"))
+      return ok(o.junkCount ? "oops" : PIN_COMMIT);
+    const st =
+      /actions\/workflows\/([\w.-]+)\/runs\?head_sha=(\w+)&per_page=20/.exec(a);
+    if (st) {
+      expect(st[2]).toBe(PIN_COMMIT);
+      expect(a).toContain("--jq");
+      return ok(JSON.stringify(o.stageRuns?.[st[1] as string] ?? []));
+    }
+    if (
+      a.includes(
+        "deploy-hosted-platform.yml/runs?event=workflow_dispatch&per_page=20",
+      )
+    ) {
+      expect(a).toContain(
+        'startswith("deploy-hosted-platform staging v0.181.0 [sc")',
+      );
+      return ok(JSON.stringify(o.stagingDeploys ?? []));
+    }
     const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
     if (wr) {
       if (wr[1] === "redline-staging.yml" && wr[2] === "completed") {
@@ -1465,6 +1494,127 @@ describe("the release gate in run", () => {
       expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
     }
   });
+  // v0.253.0 (cloud #264): its public npm pack failed, so hosted-release failed
+  // on all three attempts and the pin could never reach prod; #505 (v0.253.1)
+  // was left with "main's pin v0.253.0 has no successful prod deploy yet".
+  const hr = (s: string, c: string | null, a: number, t = "hosted-release") =>
+    ({ s, c, a, t }) as StageRun;
+  it("v0.253.0: a hosted-release that failed with its retry spent lets the next pin arm", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: { "hosted-release.yml": [hr("completed", "failure", 3)] },
+      }),
+    );
+    expect(r.armed).toEqual([7]);
+    expect(r.logs.join("\n")).toContain(
+      "main's pin v0.181.0 can't reach prod: hosted-release.yml failed with its retry spent",
+    );
+  });
+  it("a hosted-release still running, or failed with a retry still due, keeps the hold", () => {
+    for (const run of [
+      hr("in_progress", null, 3),
+      hr("queued", null, 1),
+      hr("completed", "failure", 2),
+      hr("completed", "failure", 1),
+      hr("completed", "cancelled", 3),
+      // A dry run never counts.
+      hr("completed", "failure", 3, "hosted-release (dry run)"),
+    ]) {
+      const r = go(
+        "arm",
+        fake({
+          prodDone: false,
+          stageRuns: { "hosted-release.yml": [run] },
+        }),
+      );
+      expect(r.armed, JSON.stringify(run)).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    }
+  });
+  it("any other stage before the gate spent releases the hold: hosted-publish, staging-release-chain, staging's deploy", () => {
+    for (const wf of ["hosted-publish.yml", "staging-release-chain.yml"])
+      expect(
+        go(
+          "arm",
+          fake({
+            prodDone: false,
+            stageRuns: { [wf]: [hr("completed", "failure", 3, wf)] },
+          }),
+        ).armed,
+        wf,
+      ).toEqual([7]);
+    const d = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stagingDeploys: [
+          hr(
+            "completed",
+            "failure",
+            3,
+            "deploy-hosted-platform staging v0.181.0 [sc45000000001-1]",
+          ),
+        ],
+      }),
+    );
+    expect(d.armed).toEqual([7]);
+    expect(d.logs.join("\n")).toContain(
+      "staging deploy failed with its retry spent",
+    );
+  });
+  it("a stage spent for a pin whose gate then passed keeps the hold: the pin is on its way to prod", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        gateRuns: [{ t: "redline-staging v0.181.0", c: "success", a: 1 }],
+        stageRuns: { "hosted-release.yml": [hr("completed", "failure", 3)] },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+  });
+  it("a newer run of the stage after the spent one decides: a rerun in progress keeps the hold", () => {
+    const r = go(
+      "arm",
+      fake({
+        prodDone: false,
+        stageRuns: {
+          "hosted-release.yml": [
+            hr("in_progress", null, 1),
+            hr("completed", "failure", 3),
+          ],
+        },
+      }),
+    );
+    expect(r.armed).toEqual([]);
+  });
+  it("an unreadable pin commit means not arming", () => {
+    const r = go(
+      "arm",
+      fake({ prodDone: false, notFound: ["path=PUBLIC_PIN"] }),
+    );
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/cannot read the release pipeline/);
+  });
+  it("stageSpent: only a completed failure on attempt RELEASE_RETRY_SPENT or later, of the newest real run", () => {
+    expect(RELEASE_RETRY_SPENT).toBe(3);
+    expect(stageSpent([])).toBe(false);
+    expect(stageSpent([hr("completed", "failure", 3)])).toBe(true);
+    expect(stageSpent([hr("completed", "failure", 4)])).toBe(true);
+    expect(
+      stageSpent([
+        hr("completed", "success", 1),
+        hr("completed", "failure", 3),
+      ]),
+    ).toBe(false);
+    expect(PRE_GATE_WORKFLOWS).toEqual([
+      "hosted-release.yml",
+      "hosted-publish.yml",
+      "staging-release-chain.yml",
+    ]);
+  });
   it("does not read gate runs when main's pin is on prod", () => {
     const f = fake();
     go("arm", f);
@@ -1540,12 +1690,20 @@ describe("workflow", () => {
     expect(wf.on.workflow_dispatch ?? null).toBeNull();
     // The event filter lives on the plan job; arm only follows a plan that says write.
     expect(wf.jobs.arm.needs).toBe("plan");
-    // The gate opens only when one of its workflows ends, so each one's end re-plans.
+    // The gate opens only when one of its workflows ends, or main's pin is spent
+    // (hosted-release, the first stage, ends), so each one's end re-plans.
     expect(wf.on.workflow_run).toEqual({
-      workflows: ["CI", ...GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, ""))],
+      workflows: [
+        "CI",
+        "hosted-release",
+        ...GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, "")),
+      ],
       types: ["completed"],
     });
-    for (const f of GATE_WORKFLOWS) {
+    // Every stage before the gate ends with a planning event.
+    for (const f of PRE_GATE_WORKFLOWS)
+      expect(wf.on.workflow_run.workflows).toContain(f.replace(/\.yml$/, ""));
+    for (const f of [...GATE_WORKFLOWS, ...PRE_GATE_WORKFLOWS]) {
       const g = parse(
         readFileSync(join(dir, "../../.github/workflows", f), "utf8"),
       ) as { name: string };
@@ -1622,6 +1780,19 @@ describe("workflow", () => {
       expect(plans(wr("CI", q))).toBe(false);
       expect(plans(wr("CI", "main"))).toBe(false);
       expect(plans(wr("CI", "feature", "failure"))).toBe(false);
+    });
+
+    it("hosted-release ending plans: a spent one releases the hold on the next bump (v0.253.0)", () => {
+      for (const c of ["success", "failure"])
+        expect(plans(wr("hosted-release", "main", c))).toBe(true);
+      expect(wf.on.workflow_run.workflows).toContain("hosted-release");
+    });
+
+    it("the prod deploy's success plans, so it releases the hold on its own event", () => {
+      expect(plans(wr("deploy-hosted-platform", "main", "success"))).toBe(true);
+      expect(wf.on.workflow_run.workflows).toContain("deploy-hosted-platform");
+      // ... and that plan arms once the pin's prod deploy is there.
+      expect(go("arm", fake()).armed).toEqual([7]);
     });
 
     it("any gate workflow ending plans, green or red: the gate may be open now", () => {

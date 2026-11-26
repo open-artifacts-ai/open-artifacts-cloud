@@ -330,6 +330,50 @@ export function gateRejected(runs: GateRun[], tag: string): boolean {
   return run !== undefined && run.c === "failure" && run.a >= 2;
 }
 /**
+ * release-retry.yml reruns a failed release-chain run's failed jobs on attempts 1 and
+ * 2; a failure on this attempt or later is never retried, so the stage is spent.
+ */
+export const RELEASE_RETRY_SPENT = 3;
+/**
+ * The release-chain stages before the gate whose runs carry main's pin commit as
+ * their head (a push to PUBLIC_PIN, then workflow_run): hosted-release builds and
+ * tags the release, hosted-publish publishes it, staging-release-chain dispatches
+ * staging's deploy.
+ */
+export const PRE_GATE_WORKFLOWS = [
+  "hosted-release.yml",
+  "hosted-publish.yml",
+  "staging-release-chain.yml",
+];
+/** Staging's chain deploy of `tag` (staging-release-chain dispatches it). */
+export const stagingDeployTitle = (tag: string) =>
+  `deploy-hosted-platform staging ${tag} [sc`;
+export type StageRun = {
+  /** status */
+  s: string;
+  /** conclusion */
+  c: string | null;
+  /** run_attempt */
+  a: number;
+  /** display_title */
+  t: string;
+};
+/**
+ * Pure: a release-chain stage's runs for main's pin (newest first) say it is spent:
+ * the newest real run (dry runs aside) completed as a failure on attempt
+ * RELEASE_RETRY_SPENT or later, so release-retry will not rerun it and the pin can
+ * never reach prod. A run still queued, running or due a retry is not spent.
+ */
+export function stageSpent(runs: StageRun[]): boolean {
+  const run = runs.find((r) => !r.t.includes("(dry run)"));
+  return (
+    run !== undefined &&
+    run.s === "completed" &&
+    run.c === "failure" &&
+    run.a >= RELEASE_RETRY_SPENT
+  );
+}
+/**
  * A full prod deploy of `tag`: the chain's run (prod-release-chain dispatches the
  * full target list, verify_only false, and puts its id in the run-name):
  * `deploy-hosted-platform prod vX.Y.Z [c<digits>-<n>]`. A title without the chain id
@@ -354,12 +398,18 @@ export type Gate = {
    * retry is spent), so it never reaches prod and must not hold the next bump (#448).
    */
   rejected?: boolean;
+  /**
+   * main's pin can't reach prod: a release-chain stage before the gate (named here)
+   * failed with its retry spent (stageSpent), and no gate run of the pin passed.
+   * v0.253.0's hosted-release is the case: its public npm pack failed.
+   */
+  dead?: string;
 };
 /** Pure: why a qualifying bump must wait (candidate open), or undefined. */
 export function gateRefusal(g: Gate): string | undefined {
   if (g.busy.length > 0)
     return `candidate open: ${g.busy.join(", ")} queued or in progress`;
-  if (!g.prodDeployed && !g.rejected)
+  if (!g.prodDeployed && !g.rejected && !g.dead)
     return `candidate open: main's pin ${g.mainTag} has no successful prod deploy yet`;
   return undefined;
 }
@@ -645,6 +695,7 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
     if (r.n < 100) break;
   }
   let rejected = false;
+  let dead: string | undefined;
   if (!prodDeployed) {
     const runs = JSON.parse(
       gh(exec, [
@@ -656,13 +707,64 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
     ) as GateRun[];
     if (!Array.isArray(runs)) throw new Error("unreadable gate runs");
     rejected = gateRejected(runs, mainTag);
+    const gatePassed = runs.some(
+      (r) => r.t === `redline-staging ${mainTag}` && r.c === "success",
+    );
+    if (!rejected && !gatePassed) dead = readDeadStage(exec, repo, mainTag);
   }
   return {
     busy,
     mainTag,
     prodDeployed,
     rejected,
+    ...(dead === undefined ? {} : { dead }),
   };
+}
+
+const STAGE_JQ =
+  "[.workflow_runs[] | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title}]";
+
+/**
+ * The first release-chain stage before the gate that is spent for main's pin
+ * (stageSpent), or undefined. Small reads: the pin's commit, then one short list per
+ * stage. Throws on any error.
+ */
+function readDeadStage(
+  exec: Exec,
+  repo: string,
+  tag: string,
+): string | undefined {
+  const sha = gh(exec, [
+    "api",
+    `repos/${repo}/commits?sha=main&path=PUBLIC_PIN&per_page=1`,
+    "--jq",
+    ".[0].sha",
+  ]).trim();
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("no commit for main's pin");
+  for (const wf of PRE_GATE_WORKFLOWS) {
+    const runs = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/workflows/${wf}/runs?head_sha=${sha}&per_page=20`,
+        "--jq",
+        STAGE_JQ,
+      ]),
+    ) as StageRun[];
+    if (!Array.isArray(runs)) throw new Error(`unreadable ${wf} runs`);
+    if (stageSpent(runs)) return wf;
+  }
+  const title = stagingDeployTitle(tag);
+  const deploys = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/workflows/${PROD_DEPLOY_WORKFLOW}/runs?event=workflow_dispatch&per_page=20`,
+      "--jq",
+      `[.workflow_runs[] | select(.display_title | startswith("${title}")) | {s: .status, c: .conclusion, a: .run_attempt, t: .display_title}]`,
+    ]),
+  ) as StageRun[];
+  if (!Array.isArray(deploys))
+    throw new Error("unreadable staging deploy runs");
+  return stageSpent(deploys) ? "staging deploy" : undefined;
 }
 
 const msg = (e: unknown) => String(e instanceof Error ? e.message : e);
@@ -754,7 +856,12 @@ export function run(o: {
     if (d.arm && input) {
       let wait: string | undefined;
       try {
-        wait = gateRefusal(readGate(o.exec, o.repo, input.mainPin));
+        const g = readGate(o.exec, o.repo, input.mainPin);
+        if (g.dead)
+          o.log(
+            `#${p.number}: main's pin ${g.mainTag} can't reach prod: ${g.dead} failed with its retry spent`,
+          );
+        wait = gateRefusal(g);
       } catch (e) {
         wait = `cannot read the release pipeline, not arming: ${msg(e)}`;
       }

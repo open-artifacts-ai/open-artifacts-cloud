@@ -36,10 +36,16 @@ on:
   #   chain is the usual last one; the others cover a gate held by another run.
   #   The schedule this replaces was how a waiting bump got armed before, and
   #   GitHub skipped 7 h of it on 11-24.
+  # - hosted-release ending: a pin whose hosted-release failed with its retry
+  #   spent can never reach prod, so that run's end releases the hold on the
+  #   next bump (v0.253.0, whose public npm pack failed). The other stages
+  #   before the gate, and the prod deploy whose success releases it, are
+  #   already listed.
   workflow_run:
     workflows:
       [
         CI,
+        hosted-release,
         hosted-publish,
         staging-release-chain,
         deploy-hosted-platform,
