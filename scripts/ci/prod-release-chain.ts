@@ -47,6 +47,14 @@ const ISSUE = "Prod release chain";
  * copies this file alone to run require-newer.
  */
 export const APP_ACTOR = "open-artifacts-release[bot]";
+/**
+ * Who dispatched the previous chain's runs (it used the default token, run
+ * 45797335479). Its runs carry the same run names, so the duplicate check
+ * counts them as earlier dispatches of the tag; they never start a step
+ * (plan and child require APP_ACTOR).
+ */
+export const OLD_CHAIN_ACTOR = "github-actions[bot]";
+const DISPATCHERS: readonly string[] = [APP_ACTOR, OLD_CHAIN_ACTOR];
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
@@ -412,8 +420,9 @@ export function child(o: {
 }
 
 /**
- * The chain's own runs of a workflow for a tag (its chain run name): every
- * dispatched run on main since the tag's release, all pages (allRuns).
+ * The chain's runs of a workflow for a tag (its chain run name), this
+ * chain's (the release App's) or the previous chain's (OLD_CHAIN_ACTOR):
+ * every dispatched run on main since the tag's release, all pages (allRuns).
  */
 function chainRuns(
   exec: Exec,
@@ -433,7 +442,7 @@ function chainRuns(
       r.event === "workflow_dispatch" &&
       r.head_branch === "main" &&
       (r.head_repository?.full_name ?? "") === repo &&
-      r.actor?.login === APP_ACTOR &&
+      DISPATCHERS.includes(r.actor?.login ?? "") &&
       c.title.exec(r.display_title ?? "")?.[1] === tag,
   );
 }
@@ -447,7 +456,9 @@ export type Start = { go: true; next: Child } | { go: false; why: string };
  * bucket must have the release (else it throws: fail closed). Never twice:
  * nothing starts while the chain's publish or deploy of the tag is queued or
  * running (its end is the next event), or once the chain's deploy of the tag
- * succeeded. A failed earlier run does not block a new event. Every run
+ * succeeded. The previous chain's runs of the tag count the same way, so
+ * the first event after the switch never repeats its rollout. A failed
+ * earlier run does not block a new event. Every run
  * since the tag's release is read, all pages, so an earlier run on a later
  * page still counts; a read that is not complete throws and nothing is
  * dispatched. Called under the tag's concurrency group, right before the

@@ -18,6 +18,7 @@ import {
   type ExecResult,
   fresh,
   isNewer,
+  OLD_CHAIN_ACTOR,
   plan,
   published,
   report,
@@ -1006,6 +1007,60 @@ describe("start: what the chain dispatches next for the tag, never twice", () =>
         go("gate", { deploys: [chainRun("deploy", { ...going, ...over })] }).r,
         JSON.stringify(over),
       ).toEqual({ go: true, next: "publish" });
+  });
+  it("the previous chain's runs of the tag (github-actions[bot]) count too", () => {
+    const old = { actor: { login: OLD_CHAIN_ACTOR } };
+    expect(OLD_CHAIN_ACTOR).toBe("github-actions[bot]");
+    // Its green deploy of the tag (run 45797335479): no dispatch, after the
+    // gate or after a publish, and behind newer staging dispatches.
+    for (const newer of [0, 150]) {
+      expect(
+        go("gate", {
+          deploys: [chainRun("deploy", old)],
+          inBucket: true,
+          newer,
+        }).r,
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      expect(
+        go("publish", {
+          deploys: [chainRun("deploy", old)],
+          inBucket: true,
+          newer,
+        }).r,
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+    }
+    // Its deploy or publish still in flight: nothing.
+    const going = { ...old, status: "in_progress", conclusion: null };
+    expect(go("gate", { deploys: [chainRun("deploy", going)] }).r).toEqual({
+      go: false,
+      why: `the chain's deploy of ${TAG} is under way: its end is the next event`,
+    });
+    expect(go("gate", { publishes: [chainRun("publish", going)] }).r).toEqual({
+      go: false,
+      why: `the chain's publish of ${TAG} is under way: its end is the next event`,
+    });
+    // Its failed deploy does not block, as for this chain's own.
+    expect(
+      go("gate", {
+        deploys: [chainRun("deploy", { ...old, conclusion: "failure" })],
+        inBucket: true,
+      }).r,
+    ).toEqual({ go: true, next: "deploy" });
+    // But its run never starts a step: the event's trust check is the App.
+    expect(
+      plan({
+        repo: REPO,
+        switch: "on",
+        workflow: ".github/workflows/deploy-hosted-platform.yml",
+        conclusion: "success",
+        event: "workflow_dispatch",
+        branch: "main",
+        headRepo: REPO,
+        title: `deploy-hosted-platform prod ${TAG} [c45796848206-1]`,
+        actor: OLD_CHAIN_ACTOR,
+        runId: "45797335479",
+      }).step,
+    ).toBe("none");
   });
   it("an earlier success on a later page still counts: no second dispatch", () => {
     // The Prover's case: the chain's green deploy of the tag behind 20, then
