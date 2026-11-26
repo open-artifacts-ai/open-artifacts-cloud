@@ -1,18 +1,28 @@
-# The staging half of the release chain (cloud #264 step 1): no manual
-# dispatch between a published release and the red-line gate.
-#   hosted-release -> hosted-publish (staging) -> THIS: deploy-hosted-platform
-#   (env staging, the workflow's default targets) -> THIS: redline-staging (the
-#   gate) -> prod-release-chain.yml (unchanged).
-# The only triggers are completed hosted-publish and deploy-hosted-platform
-# runs (workflow_run: main's copy of this file runs, and the head branch is
-# main). scripts/ci/staging-release-chain.ts decides, from the event's own
-# fields passed through env: (never into a script), whether to act:
-# success only; a publish started by hosted-release (never a manual or prod
-# publish); a deploy this chain dispatched (its `sc` chain id in the run name,
-# so a manual, verify_only, partial-target or prod deploy never starts the
-# gate); the tag is the newest release; and no run of the target workflow
-# exists for the tag in any state (a failed one waits for a person). The
-# dispatch job re-checks all that under a concurrency group keyed on the tag.
+# The staging half of the release chain (cloud #264 steps 1 and 4): no
+# manual dispatch between a published release and the red-line gate.
+#   hosted-release -> hosted-publish (the staging copy)
+#   hosted-release -> THIS: deploy-hosted-platform (env staging, the
+#     workflow's default targets), beside the copy
+#   copy and deploy both green -> THIS: redline-staging (the gate)
+#     -> prod-release-chain.yml (unchanged)
+# Step 4: the staging deploy starts beside the staging copy, not after it,
+# and the gate starts from whichever of the two ends last, only once both
+# succeeded for the tag. A failed copy or deploy never starts the gate, so
+# nothing reaches prod. Prod's own order (copy, then deploy) is
+# prod-release-chain's and stays as it was.
+# The only triggers are completed hosted-release, hosted-publish and
+# deploy-hosted-platform runs (workflow_run: main's copy of this file runs,
+# and the head branch is main). scripts/ci/staging-release-chain.ts decides,
+# from the event's own fields passed through env: (never into a script),
+# whether to act: success only; a real hosted-release run (never a dry run)
+# whose commit is the newest release's tag; a publish started by
+# hosted-release (never a manual or prod publish); a deploy this chain
+# dispatched (its `sc` chain id in the run name, so a manual, verify_only,
+# partial-target or prod deploy never starts the gate); the tag is the newest
+# release; and no run of the target workflow exists for the tag in any state
+# (a failed one waits for a person). After hosted-publish, if no deploy run
+# exists for the tag, it starts the deploy, as before step 4. The dispatch job
+# re-checks the tag and the runs under a concurrency group keyed on the tag.
 # The deploy and the gate each hold their own gates (release gate, platform
 # tags, staging's Environment); this file only starts them, and waits for
 # nothing. Dispatches use the release App's installation token (actions:
@@ -28,7 +38,7 @@ name: staging-release-chain
 
 on:
   workflow_run:
-    workflows: [hosted-publish, deploy-hosted-platform]
+    workflows: [hosted-release, hosted-publish, deploy-hosted-platform]
     types: [completed]
     branches: [main]
 
@@ -70,7 +80,8 @@ jobs:
           TITLE: ${{ github.event.workflow_run.display_title }}
           ACTOR: ${{ github.event.workflow_run.actor.login }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID" --head-sha "$HEAD_SHA"
   dispatch:
     needs: plan
     if: needs.plan.outputs.go == 'true'

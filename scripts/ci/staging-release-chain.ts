@@ -1,8 +1,12 @@
-// The staging half of the release chain (cloud #264 step 1,
-// staging-release-chain.yml): once hosted-publish has published a release to
-// staging, deploy-hosted-platform.yml (env staging) starts on its own; once
-// that deploy succeeds, redline-staging.yml (the gate) starts on its own, for
-// the same tag. prod-release-chain.yml then follows the gate as before.
+// The staging half of the release chain (cloud #264 steps 1 and 4,
+// staging-release-chain.yml): once hosted-release has cut a release,
+// deploy-hosted-platform.yml (env staging) starts on its own, beside
+// hosted-publish's staging copy (both follow the same hosted-release run);
+// once the deploy and the staging copy both succeeded for the tag,
+// redline-staging.yml (the gate) starts on its own, for the same tag, from
+// whichever of the two ended last. prod-release-chain.yml then follows the
+// gate as before (prod still copies, then deploys). A failed copy or deploy
+// never starts the gate, so nothing reaches prod.
 //
 // `plan` decides from one workflow_run event whether to act and what comes
 // next; `dispatch` re-checks under the tag's concurrency group and starts the
@@ -12,20 +16,28 @@
 //
 // Guards, each one's own check:
 //   - the event's conclusion is success and its run is on main;
+//   - after hosted-release: a real run (run name exactly `hosted-release`,
+//     never a dry run), and the newest release's tag is that run's commit
+//     (the tag hosted-publish's staging copy resolves from the same run). It
+//     starts the deploy;
 //   - after hosted-publish: the run was started by hosted-release (event
 //     workflow_run, never a manual dispatch, which also carries prod and
 //     floor publishes), and its publish-staging job for a release succeeded;
-//     the tag is that job's name;
+//     the tag is that job's name. It starts the gate once this chain's deploy
+//     for the tag succeeded, or the deploy itself if no deploy run exists for
+//     the tag yet (the hosted-release event's start never ran);
 //   - after deploy-hosted-platform: the run is one this chain dispatched
 //     (display title `deploy-hosted-platform staging <tag> [sc<run>-<n>]`,
 //     the release App's bot as actor). A manual deploy, a verify_only run, a
 //     partial-target run or a prod run has no `sc` chain id and never starts
-//     the gate; this chain's deploy takes the workflow's default targets;
+//     the gate; this chain's deploy takes the workflow's default targets. It
+//     starts the gate once a hosted-publish run (event workflow_run, on main)
+//     has a successful `publish-staging release <tag>` job;
 //   - the tag is the newest release (releases/latest);
 //   - never twice: no run of the target workflow for that tag exists, in any
 //     state (a failed one waits for a person), checked in `plan` and again in
 //     `dispatch` under the concurrency group keyed on the tag.
-// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <path> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id>
+// Usage: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo o/n --workflow <path> --conclusion <c> --event <e> --branch <b> --title <t> --actor <a> --run-id <id> --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo o/n --next deploy|gate --tag vX.Y.Z --chain-id <id>
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
@@ -37,6 +49,7 @@ export type Exec = (cmd: string, args: string[]) => ExecResult;
 export type Next = "deploy" | "gate";
 
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
+const SHA_RE = /^[0-9a-f]{40}$/;
 const CHAIN_RE = /^sc[0-9]{1,20}-[0-9]{1,4}$/;
 /** The release App's public login: the actor of a run dispatched with its token. */
 const WORKFLOW_DIR = ".github/workflows/";
@@ -54,7 +67,13 @@ const TARGET: Record<Next, { file: string; title: (tag: string) => string }> = {
   gate: { file: "redline-staging.yml", title: (t) => `redline-staging ${t}` },
 };
 
-type Run = { id: number; display_title?: string };
+type Run = {
+  id: number;
+  display_title?: string;
+  status?: string;
+  conclusion?: string | null;
+  actor?: { login?: string };
+};
 
 type Sleep = (ms: number) => void;
 const realSleep: Sleep = (ms) =>
@@ -86,14 +105,34 @@ export function latestRelease(
   return tag;
 }
 
-/** Runs of `next`'s workflow for `tag`, in any state (this chain's carry ` [id]`). */
-export function existingRuns(o: {
+/** The commit a tag points at (through an annotated tag). */
+export function tagCommit(
+  exec: Exec,
+  repo: string,
+  tag: string,
+  sleep: Sleep = realSleep,
+): string {
+  const sha = (
+    JSON.parse(
+      ghRead({ exec, sleep }, [
+        "api",
+        "-X",
+        "GET",
+        `repos/${repo}/commits/${tag}`,
+      ]),
+    ) as { sha?: string }
+  ).sha;
+  if (!sha || !SHA_RE.test(sha)) throw new Error(`no commit for ${tag}`);
+  return sha;
+}
+
+function runsFor(o: {
   exec: Exec;
   sleep?: Sleep;
   repo: string;
   next: Next;
   tag: string;
-}): number[] {
+}): Run[] {
   const t = TARGET[o.next];
   const body = JSON.parse(
     ghRead({ exec: o.exec, sleep: o.sleep ?? realSleep }, [
@@ -108,12 +147,90 @@ export function existingRuns(o: {
   if (!Array.isArray(body.workflow_runs))
     throw new Error(`unparsable ${t.file} runs`);
   const title = t.title(o.tag);
-  return body.workflow_runs
-    .filter((r) => {
-      const d = r.display_title ?? "";
-      return d === title || d.startsWith(`${title} [`);
-    })
-    .map((r) => r.id);
+  return body.workflow_runs.filter((r) => {
+    const d = r.display_title ?? "";
+    return d === title || d.startsWith(`${title} [`);
+  });
+}
+
+/** Runs of `next`'s workflow for `tag`, in any state (this chain's carry ` [id]`). */
+export function existingRuns(o: {
+  exec: Exec;
+  sleep?: Sleep;
+  repo: string;
+  next: Next;
+  tag: string;
+}): number[] {
+  return runsFor(o).map((r) => r.id);
+}
+
+/**
+ * This chain's staging deploy of the tag succeeded: a deploy-hosted-platform
+ * run titled with the tag and an `sc` chain id, the release App's bot as its
+ * actor, completed with success.
+ */
+export function chainDeployGreen(o: {
+  exec: Exec;
+  sleep?: Sleep;
+  repo: string;
+  tag: string;
+}): boolean {
+  return runsFor({ ...o, next: "deploy" }).some(
+    (r) =>
+      DEPLOY_TITLE_RE.exec(r.display_title ?? "")?.[1] === o.tag &&
+      r.actor?.login === APP_ACTOR &&
+      r.status === "completed" &&
+      r.conclusion === "success",
+  );
+}
+
+/**
+ * The staging copy of the tag succeeded: a hosted-publish run started by
+ * hosted-release (event workflow_run, on main) has a successful
+ * `publish-staging release <tag>` job. That run may still be going (stage-prod
+ * follows the copy). Newest run first; a copy job for the tag that has not
+ * finished stops the scan, since its run's end is the next event.
+ */
+export function stagingCopied(o: {
+  exec: Exec;
+  sleep?: Sleep;
+  repo: string;
+  tag: string;
+}): boolean {
+  const read = { exec: o.exec, sleep: o.sleep ?? realSleep };
+  const body = JSON.parse(
+    ghRead(read, [
+      "api",
+      "-X",
+      "GET",
+      "--jq",
+      "{workflow_runs: [.workflow_runs[]? | {id, event, head_branch}]}",
+      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?event=workflow_run&branch=main&per_page=20`,
+    ]),
+  ) as {
+    workflow_runs?: { id?: number; event?: string; head_branch?: string }[];
+  };
+  if (!Array.isArray(body.workflow_runs))
+    throw new Error("unparsable hosted-publish.yml runs");
+  const name = `publish-staging release ${o.tag}`;
+  for (const r of body.workflow_runs) {
+    if (r.event !== "workflow_run" || r.head_branch !== "main") continue;
+    if (!Number.isSafeInteger(r.id) || (r.id as number) < 1)
+      throw new Error("a bad hosted-publish.yml run id");
+    const jobs = JSON.parse(
+      ghRead(read, [
+        "api",
+        "-X",
+        "GET",
+        `repos/${o.repo}/actions/runs/${r.id}/jobs?per_page=100`,
+      ]),
+    ) as { jobs?: { name?: string; conclusion?: string | null }[] };
+    if (!Array.isArray(jobs.jobs)) throw new Error("unparsable run jobs");
+    const mine = jobs.jobs.filter((j) => j.name === name);
+    if (mine.some((j) => j.conclusion === "success")) return true;
+    if (mine.some((j) => j.conclusion == null)) return false;
+  }
+  return false;
 }
 
 export type Plan =
@@ -132,6 +249,8 @@ export function plan(o: {
   title: string;
   actor: string;
   runId: string;
+  /** The event run's commit (workflow_run.head_sha); read after hosted-release only. */
+  headSha?: string;
 }): Plan {
   const skip = (why: string): Plan => ({ go: false, why });
   if (o.conclusion !== "success")
@@ -139,8 +258,22 @@ export function plan(o: {
   if (o.branch !== "main") return skip("the run is not on main");
   let next: Next;
   let tag: string;
+  const ctx = { exec: o.exec, sleep: o.sleep, repo: o.repo };
   const file = o.workflow.replace(/@.*$/, "");
-  if (file === WORKFLOW_DIR + "hosted-publish.yml") {
+  if (file === WORKFLOW_DIR + "hosted-release.yml") {
+    // Step 4: the deploy starts beside hosted-publish's staging copy, which
+    // the same hosted-release run starts.
+    if (o.title !== "hosted-release")
+      return skip("a hosted-release dry run does not start the chain");
+    if (o.event !== "push" && o.event !== "workflow_dispatch")
+      return skip(`a hosted-release ${o.event} run does not start the chain`);
+    if (!SHA_RE.test(o.headSha ?? "")) throw new Error("bad head sha");
+    const latest = latestRelease(o.exec, o.repo, o.sleep);
+    if (tagCommit(o.exec, o.repo, latest, o.sleep) !== o.headSha)
+      return skip(`the run's commit is not ${latest}'s: no release cut`);
+    next = "deploy";
+    tag = latest;
+  } else if (file === WORKFLOW_DIR + "hosted-publish.yml") {
     if (o.event !== "workflow_run")
       return skip("a manual publish does not start the chain");
     if (!/^[1-9][0-9]{0,19}$/.test(o.runId)) throw new Error("bad run id");
@@ -159,29 +292,39 @@ export function plan(o: {
       .filter((t): t is string => !!t);
     if (tags.length === 0) return skip("the run published no release");
     if (tags.length > 1) throw new Error("the run published several releases");
-    next = "deploy";
     tag = tags[0] as string;
+    const latest = latestRelease(o.exec, o.repo, o.sleep);
+    if (latest !== tag)
+      return skip(`${tag} is not the newest release (${latest})`);
+    // The deploy normally started beside the copy (after hosted-release); if
+    // no deploy run exists for the tag, start it now, as before step 4.
+    if (existingRuns({ ...ctx, next: "deploy", tag }).length === 0)
+      next = "deploy";
+    else if (chainDeployGreen({ ...ctx, tag })) next = "gate";
+    else
+      return skip(
+        `the staging deploy of ${tag} has not succeeded: its end starts the gate`,
+      );
   } else if (file === WORKFLOW_DIR + "deploy-hosted-platform.yml") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
     if (o.actor !== APP_ACTOR) return skip("not dispatched by this chain");
     const m = DEPLOY_TITLE_RE.exec(o.title);
     if (!m?.[1])
       return skip("not a staging deploy this chain dispatched (no chain id)");
-    next = "gate";
     tag = m[1];
+    const latest = latestRelease(o.exec, o.repo, o.sleep);
+    if (latest !== tag)
+      return skip(`${tag} is not the newest release (${latest})`);
+    // The gate needs the staging copy too: a failed copy never starts it.
+    if (!stagingCopied({ ...ctx, tag }))
+      return skip(
+        `the staging copy of ${tag} has not succeeded: its end starts the gate`,
+      );
+    next = "gate";
   } else {
     return skip(`unexpected workflow ${o.workflow}`);
   }
-  const latest = latestRelease(o.exec, o.repo, o.sleep);
-  if (latest !== tag)
-    return skip(`${tag} is not the newest release (${latest})`);
-  const have = existingRuns({
-    exec: o.exec,
-    sleep: o.sleep,
-    repo: o.repo,
-    next,
-    tag,
-  });
+  const have = existingRuns({ ...ctx, next, tag });
   if (have.length > 0)
     return skip(`a ${TARGET[next].file} run for ${tag} already exists`);
   return { go: true, next, tag };
@@ -288,6 +431,7 @@ function main(argv: string[]) {
       title: flag(argv, "title"),
       actor: flag(argv, "actor"),
       runId: flag(argv, "run-id"),
+      headSha: flag(argv, "head-sha"),
     });
     emit("go", String(p.go));
     if (p.go) {
