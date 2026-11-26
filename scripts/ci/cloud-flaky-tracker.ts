@@ -903,6 +903,14 @@ export const STORE_BODY = [
 ].join("\n");
 
 function createStore(exec: Exec, repo: string): number {
+  // The label first: GitHub refuses an issue with a label the repo lacks.
+  ensureLabel(
+    exec,
+    repo,
+    STORE_LABEL,
+    "EDEDED",
+    "The flaky tracker's record of tests that failed and then passed",
+  );
   const url = gh(
     exec,
     [
@@ -1650,12 +1658,15 @@ export function reconcile(o: {
   for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
   const runs = [...byId.values()].sort((a, b) => a.id - b.id);
   if (!runs.length) return { tracked: [], notes, failed: 0, left: 0 };
-  // The pending list is saved whenever it changes: first the whole list of
-  // runs not yet marked, before any run starts, so a job killed at any point
-  // after loses none of them; then, at the end, what is still not marked.
+  // The pending list is saved first, when it changed: the whole list of runs
+  // not yet marked, before any run starts, so a job killed at any point after
+  // loses none of them. At the end, what is still not marked is written
+  // again, as a fresh comment, whenever any is left, even unchanged: the
+  // store is read only over the reconcile's range, so a list never rewritten
+  // would age out of it while its runs still wait.
   let saved = pending.join(" ");
-  const savePending = (list: string[]) => {
-    if (list.join(" ") === saved) return;
+  const savePending = (list: string[], fresh = false) => {
+    if (list.join(" ") === saved && !(fresh && list.length)) return;
     const store = openStore(exec, repo, nowMs);
     notes.push(...store.notes);
     gh(
@@ -1723,7 +1734,7 @@ export function reconcile(o: {
   }
   // What is still not marked (left, or failed) is the new pending list. A
   // run leaves it only once it is marked.
-  savePending(unfinished);
+  savePending(unfinished, true);
   return { tracked, notes, failed, left };
 }
 

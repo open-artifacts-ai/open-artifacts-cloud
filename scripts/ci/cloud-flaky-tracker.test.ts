@@ -659,6 +659,8 @@ function fakeGh(o: {
   const calls: Call[] = [];
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
   const jobs = o.jobs ?? [{ name: "t19", log: T19_LOG }];
+  const labels = new Set(o.labels ?? []);
+  const val = (args: string[], k: string) => args[args.indexOf(k) + 1] ?? "";
   const stores = o.stores ?? [];
   const exec: Exec = (_cmd, args) => {
     calls.push({ args });
@@ -707,9 +709,7 @@ function fakeGh(o: {
     if (a.startsWith("label list")) {
       const name = args[args.indexOf("--search") + 1];
       // As gh does: no match prints nothing, not `[]`.
-      return ok(
-        (o.labels ?? []).includes(name ?? "") ? JSON.stringify([{ name }]) : "",
-      );
+      return ok(labels.has(name ?? "") ? JSON.stringify([{ name }]) : "");
     }
     if (a.startsWith("issue list") && a.includes(`--label ${STORE_LABEL}`))
       return ok(
@@ -746,10 +746,20 @@ function fakeGh(o: {
       return o.assignable
         ? ok("")
         : { code: 1, stdout: "", stderr: "HTTP 404" };
+    if (a.startsWith("label create")) {
+      labels.add(args[2] ?? "");
+      return ok("");
+    }
+    // As GitHub does: an issue can't take a label the repo doesn't have.
+    if (a.startsWith("issue create") && !labels.has(val(args, "--label")))
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `could not add label: '${val(args, "--label")}' not found`,
+      };
     if (a.startsWith("issue create") && a.includes(`--label ${STORE_LABEL}`))
       return ok("https://github.com/o/cloud/issues/77\n");
-    if (/^(issue (create|comment|edit|close)|label create)/.test(a))
-      return ok("");
+    if (/^issue (create|comment|edit|close)/.test(a)) return ok("");
     return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
   };
   return { exec, calls };
@@ -2082,6 +2092,12 @@ function liveGh(o: {
     if (a.includes("/commits?path="))
       return ok(JSON.stringify([{ author: { login: "writer" } }]));
     if (a.includes("/assignees/")) return ok("");
+    if (a.startsWith("issue create") && !labels.has(val(args, "--label")))
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `could not add label: '${val(args, "--label")}' not found`,
+      };
     if (a.startsWith("issue create")) {
       const n = next++;
       if (val(args, "--label") === STORE_LABEL) {
@@ -2570,3 +2586,107 @@ describe("a backlog run that leaves the listing's range while it waits", () => {
     expect(lastPending(g)).toEqual([]);
   });
 });
+
+describe("a first reconcile on a repo with no label and no store", () => {
+  it("creates the label, then the store, then saves its pending list and the run", () => {
+    const listed = { "ci.yml": [ci1(900)] };
+    const g = liveGh({ listed, jobAt: { 900: NOW - HOUR }, log: CI_LOG });
+    const calls: string[] = [];
+    const seen: Exec = (cmd, args) => {
+      calls.push(args.slice(0, 2).join(" "));
+      return g.exec(cmd, args);
+    };
+    const r = reconcile({ exec: seen, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+    const firstLabel = calls.indexOf("label create");
+    const firstIssue = calls.indexOf("issue create");
+    expect(firstLabel).toBeGreaterThanOrEqual(0);
+    expect(firstLabel).toBeLessThan(firstIssue);
+    expect(g.state().stores).toHaveLength(1);
+    const comments = g.state().stores[0]?.comments ?? [];
+    // The pending list (written before the run), then the run's sightings.
+    expect(readMarkers(comments[0]?.body ?? "")?.get("kind")).toEqual([
+      "pending",
+    ]);
+    expect([...storedRuns(comments)]).toEqual(["900/2"]);
+  });
+});
+
+describe("a pending list while daily events go on", () => {
+  // 32 CI runs created 2 days before day 0. Fake clock: one completion a day.
+  const ids = Array.from({ length: 32 }, (_, i) => 3000 + i);
+  const make = () =>
+    liveGh({
+      listed: { "ci.yml": ids.map((id) => ci1(id, NOW - 2 * DAY)) },
+      jobAt: Object.fromEntries(ids.map((id) => [id, NOW - 2 * DAY])),
+      log: CI_LOG,
+    });
+  const marks = (g: ReturnType<typeof make>) =>
+    g
+      .state()
+      .stores.flatMap((st) => [...storedRuns(st.comments)])
+      .sort();
+  const day = (g: ReturnType<typeof make>, d: number) => {
+    g.clock.now = NOW + d * DAY;
+    return g.clock.now;
+  };
+
+  it("survives 40 days of daily events that each finish only part of it", () => {
+    const g = make();
+    const left: number[] = [];
+    for (let d = 0; d < 40; d++)
+      left.push(
+        reconcile({ exec: g.exec, repo: "o/cloud", nowMs: day(g, d), logs: 1 })
+          .left,
+      );
+    // One run a day (the log budget is 1; one run always starts).
+    expect(left.slice(0, 3)).toEqual([31, 30, 29]);
+    expect(left.at(-1)).toBe(0);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+    expect(pendingRuns(g.state().stores.flatMap((st) => st.comments))).toEqual(
+      [],
+    );
+  });
+
+  it("is still worked on day 63 after every run failed daily since day 0 and left the listing", () => {
+    const g = make();
+    let broken = true;
+    const exec: Exec = (cmd, args) =>
+      broken && /\/runs\/\d+\/attempts\/2$/.test(args.join(" "))
+        ? { code: 1, stdout: "", stderr: "HTTP 404: Not Found" }
+        : g.exec(cmd, args);
+    for (let d = 0; d < 63; d++)
+      reconcile({ exec, repo: "o/cloud", nowMs: day(g, d), calls: 10_000 });
+    expect(marks(g)).toEqual([]);
+    broken = false;
+    const t = day(g, 63);
+    expect(listRuns(g.exec, "o/cloud", "CI", t)).toEqual([]);
+    const r = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: t,
+      logs: 1000,
+      calls: 10_000,
+    });
+    expect(r.tracked).toHaveLength(32);
+    expect(r.failed).toBe(0);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+  });
+});
+
+/** A CI run that passed on attempt 2, created at `at` (by default an hour before NOW). */
+function ci1(id: number, at = NOW - HOUR): Listed {
+  return {
+    id,
+    run_attempt: 2,
+    conclusion: "success",
+    created_at: iso(at - HOUR),
+    updated_at: iso(at),
+    name: "CI",
+    event: "push",
+    head_branch: "main",
+    head_sha: SHA,
+    display_title: "a commit",
+  };
+}
