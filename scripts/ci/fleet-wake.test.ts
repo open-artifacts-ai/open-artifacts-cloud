@@ -49,8 +49,8 @@ const run = (
     queues?: string;
     post?: string;
     netFail?: boolean;
-    args?: string[];
-    env?: Record<string, string>;
+    args?: readonly string[];
+    env?: Readonly<Record<string, string>>;
   } = {},
 ) => {
   const sb = sandbox({ curl });
