@@ -11,7 +11,8 @@
 // redactDetail, the whole capped at ERROR_MESSAGE_MAX (storedMessage).
 // Retryable, cf_error and internal failures store their text alone (a
 // Cloudflare or D1 message can quote input that redactDetail doesn't know),
-// except a StepRefusal, whose detail the provisioner writes itself.
+// except an internal StepRefusal, whose detail the provisioner writes
+// itself. cf_error never takes a reason, whatever the wrapper.
 // So does any failure whose request values could not all be read (steps.ts
 // requestValues), since a value missed would go unredacted.
 import { NonRetryableError } from "cloudflare:workflows";
@@ -220,7 +221,8 @@ export function detailOf(e: unknown): string {
 
 /**
  * Codes whose stored text never takes a reason (#461): not refusals. A
- * StepRefusal is exempt: it always carries its detail, whatever its code.
+ * StepRefusal is exempt from `internal` (its detail is the provisioner's
+ * own), never from cf_error: Cloudflare errors stay as before #461.
  */
 const NO_REASON: ReadonlySet<ProvisionErrorCode> = new Set([
   "cf_error",
@@ -228,14 +230,16 @@ const NO_REASON: ReadonlySet<ProvisionErrorCode> = new Set([
 ]);
 
 /**
- * A refusal's own text (#461): a StepRefusal's detail (any code), or, for a
- * code outside NO_REASON, an OwnerVarsRefusal's `why` or the message of a
- * ProvisionRefused that is not a ProvisionRetry. Null for anything else (a Cloudflare or D1
- * error, a bare NonRetryableError, a retry). Stored only when the step's
+ * A refusal's own text (#461): a StepRefusal's detail (any code but
+ * cf_error), or, for a code outside NO_REASON, an OwnerVarsRefusal's `why`
+ * or the message of a ProvisionRefused that is not a ProvisionRetry. Null
+ * for anything else (a cf_error of any kind, a D1 error, a bare
+ * NonRetryableError, a retry). Stored only when the step's
  * failure is terminal (noteFailure). Raw: redact before storing.
  */
 export function refusalDetail(e: unknown): string | null {
-  if (e instanceof StepRefusal) return e.detail;
+  if (e instanceof StepRefusal)
+    return codeOf(e) === "cf_error" ? null : e.detail;
   if (e instanceof OwnerVarsRefusal)
     return NO_REASON.has(e.code) ? null : e.why;
   if (e instanceof ProvisionRefused && !classify(e).retryable)

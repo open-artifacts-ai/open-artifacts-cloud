@@ -257,9 +257,9 @@ describe("do_step_required (#1343): the one structured value", () => {
 describe("refusalDetail (#461): only a refusal has a reason", () => {
   it("a StepRefusal's detail, an OwnerVarsRefusal's why, a terminal ProvisionRefused's message", () => {
     expect(refusalDetail(refused("why"))).toBe("why");
-    // A StepRefusal carries its detail whatever its code.
+    // A StepRefusal carries its detail, internal included; never cf_error.
     expect(refusalDetail(new StepRefusal("internal", "x"))).toBe("x");
-    expect(refusalDetail(new StepRefusal("cf_error", "y"))).toBe("y");
+    expect(refusalDetail(new StepRefusal("cf_error", "y"))).toBeNull();
     expect(
       refusalDetail(
         new ProvisionRefused("no release", "release_not_published"),
