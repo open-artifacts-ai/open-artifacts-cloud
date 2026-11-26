@@ -176,4 +176,87 @@ describe("release-retry", () => {
     for (const s of steps) expect(s.run ?? "").not.toMatch(/--job/);
     expect(job["timeout-minutes"]).toBeGreaterThanOrEqual(3);
   });
+
+  // Leo, 2026-11-26 18:44:02Z: "Yes, keep only 'gave up'". When the last
+  // allowed attempt fails, one comment on #428, on that event only.
+  it("attempt 3 failed: one 'gave up' comment on #428 with the default token, for the same runs the retry covers", () => {
+    const job = wf.jobs.gave_up;
+    const cond = String(job.if);
+    for (const c of [
+      "github.event.workflow_run.conclusion == 'failure'",
+      "github.event.workflow_run.run_attempt == 3",
+      "github.event.workflow_run.head_branch == 'main'",
+      "!contains(github.event.workflow_run.display_title, '(dry run)')",
+      "github.event.workflow_run.event != 'workflow_dispatch'",
+      "contains(github.event.workflow_run.display_title, ' [sc')",
+      "contains(github.event.workflow_run.display_title, ' [p')",
+      "contains(github.event.workflow_run.display_title, ' [c')",
+    ])
+      expect(cond).toContain(c);
+    expect(cond).not.toContain("run_attempt <= 2");
+    // The retry job never runs on attempt 3, so the two never both act.
+    expect(String(wf.jobs.retry.if)).toContain("run_attempt <= 2");
+    expect(job.permissions).toEqual({ issues: "write" });
+    expect(job).not.toHaveProperty("environment");
+    const steps = job.steps as Step[];
+    expect(steps).toHaveLength(1);
+    const s = steps[0] as Step;
+    expect(s.env?.GH_TOKEN).toBe("${{ github.token }}");
+    expect(s.run).toContain(
+      'gh issue comment 428 --repo "$REPO" --body "Gave up: $NAME ($TITLE) failed on attempt 3, $URL. Needs a person: find the cause in this run."',
+    );
+    // No rerun, no wait, no checkout: it only says so.
+    expect(s.run).not.toMatch(/gh run rerun|sleep/);
+    expect(s.uses).toBeUndefined();
+    // The event's own fields, through env, never interpolated into the script.
+    expect(s.env).toMatchObject({
+      URL: "${{ github.event.workflow_run.html_url }}",
+      NAME: "${{ github.event.workflow_run.name }}",
+      TITLE: "${{ github.event.workflow_run.display_title }}",
+    });
+    expect(s.run).not.toContain("${{");
+    // Which runs: the retry's own filter, at attempt 3.
+    const gaveUp = (r: {
+      conclusion: string;
+      attempt: number;
+      event: string;
+      title: string;
+      branch?: string;
+    }) =>
+      r.conclusion === "failure" &&
+      r.attempt === 3 &&
+      (r.branch ?? "main") === "main" &&
+      !r.title.toLowerCase().includes("(dry run)") &&
+      (r.event !== "workflow_dispatch" ||
+        [" [sc", " [p", " [c"].some((m) => r.title.toLowerCase().includes(m)));
+    const third = { conclusion: "failure", attempt: 3 };
+    expect(gaveUp({ ...third, event: "push", title: "hosted-release" })).toBe(
+      true,
+    );
+    expect(
+      gaveUp({
+        ...third,
+        event: "workflow_dispatch",
+        title: "deploy-hosted-platform prod v0.252.0 [c45839289083-1]",
+      }),
+    ).toBe(true);
+    expect(
+      gaveUp({ ...third, attempt: 2, event: "push", title: "hosted-release" }),
+    ).toBe(false);
+    expect(
+      gaveUp({
+        ...third,
+        conclusion: "success",
+        event: "push",
+        title: "hosted-release",
+      }),
+    ).toBe(false);
+    expect(
+      gaveUp({
+        ...third,
+        event: "workflow_dispatch",
+        title: "deploy-hosted-platform prod v0.252.0",
+      }),
+    ).toBe(false);
+  });
 });
