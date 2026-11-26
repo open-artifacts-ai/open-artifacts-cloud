@@ -121,6 +121,20 @@ describe("workspace-reads-overlay", () => {
     expect(stale[0]).not.toContain(PUBLIC_KNOWN);
   });
 
+  // Pin #478 (v0.249.1): public declared a read in its own package, cloud's
+  // line for it went stale, and only the pin bump (protected) could drop it.
+  it("warns, never fails, on a stale cloud line for a public package's read", () => {
+    const root = fixture({
+      cloud:
+        "apps/hosted/test/x.test.ts @oa/pub\npackages/pub/src/old.test.ts @oa/hosted\n",
+    });
+    const r = run(root);
+    expect(r.err).toBe("");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(
+      `::warning file=${CLOUD_KNOWN}::stale entry "packages/pub/src/old.test.ts @oa/hosted"`,
+    );
+  });
   it("exits 1 on a stale public line and keeps public's file name", () => {
     const root = fixture({
       pub: "packages/pub/src/gone.ts @oa/hosted\n",

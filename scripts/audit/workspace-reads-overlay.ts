@@ -68,7 +68,25 @@ export function check(root: string): {
     readFileSync(join(root, PUBLIC_KNOWN), "utf8"),
   );
   const cloudKnown = parseKnown(readFileSync(join(root, CLOUD_KNOWN), "utf8"));
-  const known = [...publicKnown, ...cloudKnown];
+  const cloud = cloudPackages(
+    root,
+    pkgs.map((p) => p.dir),
+  );
+  // A cloud line for a read inside a public package (cloud can't edit that
+  // package.json) goes stale the day public declares or drops the read, which
+  // first shows on a pin bump cloud can't edit (pin-bump/* is protected).
+  // So such a line, once stale, is a warning to delete it, never a failure,
+  // and the same baseline holds at the old pin and the new one.
+  const now = new Set(findings.map((r) => `${r.file} ${r.package}`));
+  const inCloud = (l: string) => cloud.some((d) => l.startsWith(`${d}/`));
+  const publicOwn = cloudKnown.filter(
+    (l) => !publicKnown.includes(l) && !inCloud(l),
+  );
+  const tolerated = publicOwn.filter((l) => !now.has(l));
+  const known = [
+    ...publicKnown,
+    ...cloudKnown.filter((l) => !tolerated.includes(l)),
+  ];
   const out = report(findings, known, false);
   // report() words every stale line around public's file; name the cloud one.
   const own = new Set(cloudKnown.filter((l) => !publicKnown.includes(l)));
@@ -78,10 +96,6 @@ export function check(root: string): {
       ? l.replaceAll("workspace-reads-known.txt", CLOUD_KNOWN)
       : l;
   });
-  const cloud = cloudPackages(
-    root,
-    pkgs.map((p) => p.dir),
-  );
   const seen = new Set(
     files.map((f) => f.path.split("/").slice(0, 2).join("/")),
   );
@@ -89,6 +103,10 @@ export function check(root: string): {
     log: [
       `workspace-reads (overlay): ${files.length} source files, ${pkgs.length} packages, ${findings.length} cross-package read(s), ${known.length} known`,
       `checked cloud packages: ${cloud.filter((d) => seen.has(d)).join(" ")}`,
+      ...tolerated.map(
+        (l) =>
+          `::warning file=${CLOUD_KNOWN}::stale entry "${l}" (a public package's read, no longer needed); delete the line once the pin includes the change`,
+      ),
     ],
     lines,
     code: out.code,
