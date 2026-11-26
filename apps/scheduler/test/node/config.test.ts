@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { HOSTED_DOMAINS, NAMESPACES, platformNames } from "@oa/provision";
 import { describe, expect, it } from "vitest";
 import { HOSTED_BUS_LIFTED } from "../../../../tests/redline/src/bus-gate.ts";
+import { FLEET_WAKE_MAX_RETRIES } from "../../src/provapi/wake.ts";
 
 const app = join(dirname(fileURLToPath(import.meta.url)), "../..");
 // Strip // and /* */ comments outside strings.
@@ -106,7 +107,8 @@ describe("wrangler.jsonc", () => {
             queue: names.fleetWake,
             max_batch_size: 10,
             max_batch_timeout: 0,
-            max_retries: 3,
+            // The backoff's budget (wake.ts), pinned to the code's.
+            max_retries: FLEET_WAKE_MAX_RETRIES,
             max_concurrency: 1,
           },
         ],

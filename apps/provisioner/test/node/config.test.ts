@@ -73,6 +73,8 @@ describe("wrangler.jsonc", () => {
       expect(e.compatibility_flags).toEqual(["nodejs_compat"]);
       expect(e.limits).toEqual({ cpu_ms: 300000 });
       expect(e.queues).toEqual({
+        // cloud #264: every ManageInstall job's end wakes the fleet.
+        producers: [{ binding: "FLEET_WAKE", queue: `oa-${p}-fleet-wake` }],
         consumers: [
           {
             queue: `oa-${p}-signups`,

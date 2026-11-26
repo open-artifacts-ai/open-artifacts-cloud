@@ -482,9 +482,20 @@ case "$target" in
     # Unbound it would silently skip the free month, so a tag that declares the
     # binding must not deploy without it (read back below).
     billing_pre provisioner BillingProvisionerRpc
+    # FLEET_WAKE (cloud #264, when the tag declares it): every ManageInstall
+    # job's end posts to the scheduler's oa-<p>-fleet-wake, so that queue
+    # must exist before this deploy binds it. A tag that produces nothing
+    # (from before it) wants nothing; any other producer refuses.
+    produces="$(committed provisioner producers | jq -r 'join(",")')" ||
+      { echo "can't read the provisioner's committed queue producers" >&2; exit 1; }
+    case "$produces" in
+      "") WAKE_DECLARED="" ;;
+      "FLEET_WAKE oa-$P-fleet-wake") WAKE_DECLARED=1 ;;
+      *) echo "the tag's $env provisioner produces to '$produces'; want none or FLEET_WAKE oa-$P-fleet-wake; refusing" >&2; exit 1 ;;
+    esac
     # Check first, create only when absent; a failed listing stops the run.
     queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
-    for q in "oa-$P-signups" "oa-$P-signups-dlq"; do
+    for q in "oa-$P-signups" "oa-$P-signups-dlq" ${WAKE_DECLARED:+"oa-$P-fleet-wake"}; do
       grep -qx "$q" <<< "$queues" && continue
       [ -z "$VERIFY_ONLY" ] || { echo "queue $q does not exist" >&2; exit 1; }
       cf_send POST /queues "$(jq -nc --arg n "$q" '{queue_name: $n}')" | must "create queue $q" > /dev/null
@@ -527,7 +538,10 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
     billing_bound "$S" provisioner BillingProvisionerRpc
-    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
+    if [ -n "$WAKE_DECLARED" ]; then
+      expect "$S" '.result.bindings[] | select(.name == "FLEET_WAKE") | "\(.type) \(.queue_name)"' "queue oa-$P-fleet-wake" "FLEET_WAKE"
+    fi
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,${WAKE_DECLARED:+FLEET_WAKE,}MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.

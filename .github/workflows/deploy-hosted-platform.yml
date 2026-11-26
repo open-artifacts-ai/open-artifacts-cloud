@@ -19,8 +19,8 @@
 # run also reads back the token's own end date and opens an issue 30 days
 # ahead (scripts/ci/deploy-token-expiry.sh). Once a run marks the platform
 # verified, it wakes the fleet (cloud #264): one message to the env's
-# oa-<p>-fleet-wake queue, so the scheduler starts the upgrades at once; the
-# 2-minute tick is the backup, so a failed wake only warns.
+# oa-<p>-fleet-wake queue, the rollout's first event; a wake not sent after
+# its retries fails the run.
 # One version everywhere (#1040): the default is every target, in order. Any
 # other list is break-glass: it needs a reason and opens an issue naming the
 # run (verify_only is a check, so it needs neither). `billing` (the Stripe
@@ -591,10 +591,11 @@ jobs:
       # the env's oa-<p>-fleet-wake (an older tag, a recovery deploy say,
       # skips the wake and the wait with one log line; the tick moves it).
       # Once the mark is written, one message to
-      # the env's oa-<p>-fleet-wake queue, so the scheduler starts the
-      # upgrades at once instead of on its next 2-minute tick. The tick is the
-      # backup: the script turns every failure into a warning and exits 0, and
-      # the step can't fail the run either way. Main's copy, like the others.
+      # the env's oa-<p>-fleet-wake queue: the rollout's first event (each
+      # ManageInstall job's end is the next). A wake not sent fails this step
+      # and the run (the script retries a failed listing or post with a
+      # backoff first; the Prover's #492 finding: a 503 must not exit 0), so
+      # the run's own rerun sends it. Main's copy, like the others.
       - id: wake_capable
         name: The tag's scheduler takes the fleet wake
         if: ${{ success() && steps.mark_verified.outcome == 'success' }}
@@ -605,8 +606,7 @@ jobs:
         run: bash "$RUNNER_TEMP/main-ci/fleet-wake-capable.sh" "$DEPLOY_ENV" apps/scheduler/wrangler.jsonc scripts/ops/wrangler-env.ts
       - name: Wake the fleet
         if: ${{ success() && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
-        continue-on-error: true
-        timeout-minutes: 2
+        timeout-minutes: 3
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}

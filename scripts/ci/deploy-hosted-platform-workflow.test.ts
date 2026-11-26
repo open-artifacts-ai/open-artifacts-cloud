@@ -1040,9 +1040,9 @@ describe("deploy-hosted-platform.yml", () => {
   });
 
   // cloud #264: one message to the env's oa-<p>-fleet-wake once the mark is
-  // written, so the scheduler starts the upgrades at once. The tick is the
-  // backup, so the step never fails the run.
-  it("wakes the fleet right after the mark, only when the mark ran green, and never fails the run", () => {
+  // written, the rollout's first event. A wake not sent fails the step and
+  // the run (the Prover's #492 finding: a 503 must not report success).
+  it("wakes the fleet right after the mark, only when the mark ran green, and a failed wake fails the run", () => {
     const wk = named("Wake the fleet");
     const i = (n: string) => steps.indexOf(named(n));
     expect(named("Mark the platform verified").id).toBe("mark_verified");
@@ -1059,8 +1059,9 @@ describe("deploy-hosted-platform.yml", () => {
       TAG: "${{ inputs.tag }}",
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
     });
-    expect(wk["continue-on-error"]).toBe(true);
-    expect(wk["timeout-minutes"]).toBeLessThanOrEqual(2);
+    expect(wk["continue-on-error"]).toBeUndefined();
+    // Five tries, 1 + 2 + 4 + 8 s of backoff, each call bounded at 20 s.
+    expect(wk["timeout-minutes"]).toBeLessThanOrEqual(3);
     const marked = { ...ran, mark_verified: "success" };
     const capable = { wake_capable: { capable: "true" } };
     for (const verify_only of [false, true])
