@@ -460,6 +460,38 @@ describe("after hosted-publish once the deploy started beside it", () => {
     conclusion: "success",
     actor: BOT,
   };
+  // A late completion event from an older publish run (123, its copy
+  // green) after a newer run (200) copied the same tag and did not succeed:
+  // the newest copy decides, never the event run's own job.
+  it("a late older run's event never opens the gate after a newer copy failed, was cancelled or still runs", () => {
+    for (const conclusion of ["failure", "cancelled", null]) {
+      const late = {
+        jobs: [COPIED],
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      };
+      const p = afterPublish({ ...late, deployRuns: [green] });
+      skipped(p);
+      expect(JSON.stringify(p), String(conclusion)).toContain(
+        "newest staging copy",
+      );
+      // nor starts the fallback deploy
+      skipped(afterPublish(late));
+    }
+    // a newer successful copy: the same late event may open it
+    expect(
+      afterPublish({
+        jobs: [COPIED],
+        deployRuns: [green],
+        publishRuns: [
+          { id: 200, jobs: [COPIED] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      }),
+    ).toEqual({ go: true, next: "gate", tag: TAG });
+  });
   it("starts the gate when this chain's deploy already succeeded", () => {
     expect(afterPublish({ deployRuns: [green] })).toEqual({
       go: true,

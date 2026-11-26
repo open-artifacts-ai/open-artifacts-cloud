@@ -28,9 +28,12 @@
 //   - after hosted-publish: the run was started by hosted-release (event
 //     workflow_run, never a manual dispatch, which also carries prod and
 //     floor publishes), and its publish-staging job for a release succeeded;
-//     the tag is that job's name. It starts the gate once this chain's deploy
-//     for the tag succeeded, or the deploy itself if no deploy run exists for
-//     the tag yet (the hosted-release event's start never ran);
+//     the tag is that job's name, and the newest copy of the tag decides as
+//     after the deploy (stagingCopied), never this run's job alone, so a late
+//     event from an older run can't open the gate after a newer copy failed.
+//     It starts the gate once this chain's deploy for the tag succeeded, or
+//     the deploy itself if no deploy run exists for the tag yet (the
+//     hosted-release event's start never ran);
 //   - after deploy-hosted-platform: the run is one this chain dispatched
 //     (display title `deploy-hosted-platform staging <tag> [sc<run>-<n>]`,
 //     the release App's bot as actor). A manual deploy, a verify_only run, a
@@ -410,6 +413,13 @@ export function plan(o: {
     const latest = latestRelease(o.exec, o.repo, o.sleep);
     if (latest !== tag)
       return skip(`${tag} is not the newest release (${latest})`);
+    // The same verdict as after the deploy, never this run's job alone: an
+    // older run's late event must not open the gate (or start the deploy)
+    // after a newer copy of the tag failed, was cancelled or still runs.
+    if (!stagingCopied({ ...ctx, tag }))
+      return skip(
+        `the newest staging copy of ${tag} has not succeeded: its end decides`,
+      );
     // The deploy normally started beside the copy (after hosted-release); if
     // no deploy run exists for the tag, start it now, as before step 4.
     if (existingRuns({ ...ctx, next: "deploy", tag }).length === 0)
