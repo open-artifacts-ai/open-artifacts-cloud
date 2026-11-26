@@ -22,10 +22,10 @@ import {
   freshEmail,
   googleProblems,
   HookRefused,
+  heldOtp,
   hookCall,
   hookSession,
   mintPat,
-  OTP_BACKOFF_MS,
   okTool,
   parseSetCookie,
   probe,
@@ -39,6 +39,7 @@ import {
   siteOf,
   smokePeoplePrefix,
   smokeRun,
+  versionsIndexed,
   wsUpgrade,
 } from "../src/smoke.ts";
 import {
@@ -240,28 +241,25 @@ describe("rl-a", () => {
       throw new Error(
         `code request: status ${r.status}, ${pending.length} pending cookie(s)`,
       );
-    // Delivery runs after the response: the otp hook answers no_code until
-    // the code is there. Retried with backoff (the one wait allowed), until
-    // the hook can hold its answer until the code exists (see the PR).
-    const code = await retryWithBackoff(
-      async () => {
+    // Delivery runs after the response. The otp hook holds each ask (wait,
+    // public #3194) while the send is pending; asked again at once until the
+    // deadline, with no client sleep (heldOtp).
+    const code = await heldOtp(
+      async (wait) => {
         try {
           const out = (await hookCall(A.app, key, "/__test/otp/latest", {
             email: p.email,
+            wait,
           })) as { code?: unknown };
-          return typeof out?.code === "string" && out.code
-            ? out.code
-            : undefined;
+          if (typeof out?.code === "string" && out.code)
+            return { code: out.code };
+          return { outcome: "no_code_in_body" };
         } catch (e) {
           if (!(e instanceof HookRefused) || e.reason !== "no_code") throw e;
-          return undefined;
+          return { outcome: e.outcome ?? "no_outcome" };
         }
       },
-      {
-        backoffMs: OTP_BACKOFF_MS,
-        wait: run.io.wait,
-        notReady: "no code was sent",
-      },
+      { now: run.io.now },
     );
     const headers = new Headers(codeRequestReq(A, p.email).headers);
     headers.set("cookie", pending.join("; "));
@@ -312,23 +310,27 @@ describe("rl-a", () => {
       if (typeof id !== "string" || typeof version !== "number")
         throw new Error("MCP publish_artifact: no id or version");
       ids.push(id);
-      // Indexing can lag the publish: retried with backoff (the one wait
-      // allowed) until search lists the page, until a hook can hold its
-      // answer until the index has it (see the PR).
-      await retryWithBackoff(
-        async () => {
-          const s = await okTool(A.app, p.pat, "search_artifacts", {
-            q: marker,
-          });
-          const items = (s.items as { id?: unknown }[] | undefined) ?? [];
-          return items.some((x) => x.id === id) ? true : undefined;
-        },
-        {
+      // Indexing can lag the publish. One held read of the versions list
+      // (?wait, public #3221) answers once the newest version is indexed,
+      // then one search must list it. A build without #3221 answers at once
+      // unindexed: then search is retried with backoff (the one wait Leo
+      // allows), the path read from the answer, never guessed.
+      const listed = async () => {
+        const s = await okTool(A.app, p.pat, "search_artifacts", { q: marker });
+        const items = (s.items as { id?: unknown }[] | undefined) ?? [];
+        return items.some((x) => x.id === id) ? true : undefined;
+      };
+      if ((await versionsIndexed(A.app, p.pat, id)) === "indexed") {
+        if (!(await listed()))
+          throw new Error(
+            "the newest version is indexed, but search does not list it",
+          );
+      } else
+        await retryWithBackoff(listed, {
           backoffMs: SEARCH_BACKOFF_MS,
           wait: run.io.wait,
           notReady: "search did not list the MCP publish",
-        },
-      );
+        });
       // A signed upload from the app address, published as the next version.
       const path = "upload.md";
       const bytes = new TextEncoder().encode(`# ${marker}\n`);

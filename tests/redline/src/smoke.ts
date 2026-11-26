@@ -229,10 +229,84 @@ export async function retryWithBackoff<T>(
   }
 }
 
-/** Code delivery: about 16 s of backoff in all. */
-export const OTP_BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000] as const;
-/** Search indexing: about 32 s of backoff in all. */
+/** Search indexing on a build without versions?wait (public #3221): about 32 s of backoff in all. */
 export const SEARCH_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 16000] as const;
+
+// --- held requests (the server waits, the client never sleeps) ------------------
+
+/** The otp hook holds one ask up to this (its cap, public #3194: OTP_WAIT_CAP_MS). */
+export const OTP_HOLD_MS = 8_000;
+/** The whole bound on the code's delivery: a few held asks. */
+export const OTP_DEADLINE_MS = 24_000;
+/** Quick pending answers in a row before the hook is judged not to hold. */
+export const QUICK_MAX = 2;
+
+export type OtpAnswer = { code: string } | { outcome: string };
+
+/**
+ * The emailed code, from held asks of the otp hook (`wait` ms each: it holds
+ * while the send is pending and wakes when its row changes), asked again
+ * straight away, with no client sleep, until OTP_DEADLINE_MS. A final
+ * outcome other than a code fails; so do QUICK_MAX quick pending answers in
+ * a row (a hook that doesn't hold).
+ */
+export async function heldOtp(
+  ask: (wait: number) => Promise<OtpAnswer>,
+  o: { now: () => number; deadlineMs?: number },
+): Promise<string> {
+  const end = o.now() + (o.deadlineMs ?? OTP_DEADLINE_MS);
+  let quick = 0;
+  for (;;) {
+    const left = end - o.now();
+    if (left <= 0) throw new Error("no code was sent before the deadline");
+    const hold = Math.min(left, OTP_HOLD_MS);
+    const asked = o.now();
+    const r = await ask(hold);
+    if ("code" in r) return r.code;
+    if (r.outcome !== "pending")
+      throw new Error(`no code was sent (${r.outcome})`);
+    quick = o.now() - asked < Math.min(hold, 1_000) ? quick + 1 : 0;
+    if (quick >= QUICK_MAX)
+      throw new Error("the otp hook answers pending without holding the ask");
+  }
+}
+
+/** The versions read holds up to this (public #3221's cap is 30 s; the fetch bound is 30 s). */
+export const VERSIONS_HOLD_MS = 25_000;
+
+/**
+ * Whether the newest version is in the search index, from one held read of
+ * `GET .../versions?wait=` (public #3221: it holds until the newest version
+ * is textIndexed). "indexed" when it says so; "not-held" when the build
+ * answered without it (no textIndexed true: an older build ignores `wait`),
+ * so the caller falls back to the backoff retry.
+ */
+export async function versionsIndexed(
+  app: string,
+  pat: string,
+  id: string,
+): Promise<"indexed" | "not-held"> {
+  const res = await req(
+    `${app}/api/v1/artifacts/${encodeURIComponent(id)}/versions?wait=${VERSIONS_HOLD_MS}`,
+    { headers: bearer(pat) },
+  );
+  const text = await readBody(res);
+  if (res.status !== 200)
+    throw new Error(`versions: ${describeRes(res, text)}`);
+  let list: unknown;
+  try {
+    list = JSON.parse(text);
+  } catch {
+    throw new Error(`versions: not JSON (${describeRes(res, text)})`);
+  }
+  const items = Array.isArray(list)
+    ? list
+    : ((list as { items?: unknown[] } | null)?.items ?? []);
+  const newest = (items as { version?: number; textIndexed?: unknown }[])
+    .slice()
+    .sort((a, b) => (b.version ?? 0) - (a.version ?? 0))[0];
+  return newest?.textIndexed === true ? "indexed" : "not-held";
+}
 
 // --- configuration ---------------------------------------------------------
 
@@ -379,10 +453,13 @@ export async function checkContentApp(
 export class HookRefused extends Error {
   readonly status: number;
   readonly reason: string;
-  constructor(path: string, status: number, reason: string) {
+  /** otp/latest's no_code only: the send's outcome (pending, sent, send_failed...). */
+  readonly outcome: string | undefined;
+  constructor(path: string, status: number, reason: string, outcome?: string) {
     super(`hook ${path}: ${status} (${reason})`);
     this.status = status;
     this.reason = reason;
+    this.outcome = outcome;
   }
 }
 
@@ -408,14 +485,16 @@ export async function hookCall(
     json = undefined;
   }
   if (res.status < 200 || res.status > 299) {
-    const reason = (json as { error?: { details?: { reason?: unknown } } })
-      ?.error?.details?.reason;
+    const details = (
+      json as { error?: { details?: { reason?: unknown; outcome?: unknown } } }
+    )?.error?.details;
+    const word = (v: unknown) =>
+      typeof v === "string" && /^[a-z_]{1,40}$/.test(v) ? v : undefined;
     throw new HookRefused(
       path,
       res.status,
-      typeof reason === "string" && /^[a-z_]{1,40}$/.test(reason)
-        ? reason
-        : "no_reason",
+      word(details?.reason) ?? "no_reason",
+      word(details?.outcome),
     );
   }
   return json;
@@ -722,46 +801,26 @@ export async function createFresh(run: Run, dir: string): Promise<Fresh> {
     `${JSON.stringify({ slug, id: fresh.id })}\n`,
     { mode: 0o600 },
   );
-  // Dispatch's HOSTS cache (60 s) can still miss the new host: retried with
-  // backoff (about 127 s in all), the one wait allowed.
-  await retryWithBackoff(
-    async () => ((await run.page(i.appHost)).status === 200 ? true : undefined),
-    {
-      backoffMs: CACHE_BACKOFF_MS,
-      wait: run.io.wait,
-      notReady: "smoke create: /healthz does not answer on the new app address",
-    },
-  );
+  // One read, on the create job's own completion signal: create writes
+  // HOSTS only after /healthz passes, then enables sign-in, then goes active
+  // (docs/ops/hosted.md), so a done job means the edge serves the install.
+  // A miss here is a failure, never retried into.
+  const h = await run.page(i.appHost);
+  if (h.status !== 200)
+    throw new ProbeFail(
+      `smoke create: the job is done but /healthz on the new app address is ${h.status}`,
+    );
   return fresh;
 }
 
-/** The edge caches (dispatch's and the inventory's HOSTS reads): backoff before each retry, about 127 s in all. */
-export const CACHE_BACKOFF_MS = [
-  1000, 2000, 4000, 8000, 16000, 32000, 64000,
-] as const;
-
-/** The inventory maps both of the fresh install's addresses to its id (another colo's read can lag: retried with backoff). */
+/** The inventory maps both of the fresh install's addresses to its id: one read each, after the create job is done. */
 export async function checkFreshMapped(run: Run, f: Fresh): Promise<void> {
   for (const o of [f.app, f.content]) {
-    const host = new URL(o).hostname;
-    let got: string | null = null;
-    await retryWithBackoff(
-      async () => {
-        got = (await run.hostMode(host)).installId;
-        return got === f.id ? true : undefined;
-      },
-      {
-        backoffMs: CACHE_BACKOFF_MS,
-        wait: run.io.wait,
-        notReady: `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`,
-      },
-    ).catch((e: Error) => {
+    const got = (await run.hostMode(new URL(o).hostname)).installId;
+    if (got !== f.id)
       throw new ProbeFail(
-        e.message.startsWith("the inventory")
-          ? `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`
-          : e.message,
+        `the inventory maps a ${f.slug} address to ${got === null ? "nothing" : "another install"}`,
       );
-    });
   }
 }
 

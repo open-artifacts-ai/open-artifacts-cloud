@@ -11,15 +11,18 @@ import {
   freshEmail,
   googleProblems,
   healthProblems,
-  OTP_BACKOFF_MS,
+  heldOtp,
+  OTP_HOLD_MS,
   PURGE_DONE,
   PURGE_LOG,
   parseSetCookie,
   purgeFresh,
   purgeWait,
+  QUICK_MAX,
   refusalProblem,
   req,
   retryWithBackoff,
+  SEARCH_BACKOFF_MS,
   SMOKE_ADDED,
   SMOKE_CASES,
   SMOKE_ROWS,
@@ -30,6 +33,8 @@ import {
   staleFresh,
   sweepFresh,
   sweepWait,
+  VERSIONS_HOLD_MS,
+  versionsIndexed,
 } from "../src/smoke.ts";
 import { parseTargets, secretsOf } from "../src/targets.ts";
 
@@ -113,20 +118,131 @@ describe("retryWithBackoff (the one wait the smoke allows)", () => {
     const waits: number[] = [];
     await expect(
       retryWithBackoff(async () => undefined, {
-        backoffMs: OTP_BACKOFF_MS,
+        backoffMs: SEARCH_BACKOFF_MS,
         wait: async (ms) => {
           waits.push(ms);
         },
         notReady: "no code was sent",
       }),
     ).rejects.toThrow("no code was sent");
-    expect(waits).toEqual([...OTP_BACKOFF_MS]);
+    expect(waits).toEqual([...SEARCH_BACKOFF_MS]);
+  });
+
+  it("the only waits are the search fallback's backoff; the code and the edge reads never sleep", () => {
+    const lib = readFileSync(join(pkg, "src/smoke.ts"), "utf8");
+    expect(lib).not.toMatch(/CACHE_BACKOFF_MS|OTP_BACKOFF_MS|run\.within\(/);
+    expect((lib.match(/retryWithBackoff\(/g) ?? []).length).toBe(0);
+    const st = readFileSync(join(pkg, "smoke/standing.test.ts"), "utf8");
+    expect((st.match(/retryWithBackoff\(/g) ?? []).length).toBe(1);
   });
 
   it("the tracks use nothing else that waits: no run.within, no setTimeout", () => {
     for (const f of ["smoke/standing.test.ts", "smoke/fresh.test.ts"]) {
       const src = readFileSync(join(pkg, f), "utf8");
       expect(src, f).not.toMatch(/run\.within\(|setTimeout|sleep\(/);
+    }
+  });
+});
+
+describe("heldOtp: held asks, no client sleep", () => {
+  const clock = (step: number) => {
+    let t = 0;
+    return {
+      now: () => t,
+      tick: () => {
+        t += step;
+      },
+    };
+  };
+
+  it("asks again at once after a held pending answer, until the code comes", async () => {
+    const c = clock(OTP_HOLD_MS);
+    const waits: number[] = [];
+    let n = 0;
+    const code = await heldOtp(
+      async (wait) => {
+        waits.push(wait);
+        c.tick();
+        return ++n === 3 ? { code: "123456" } : { outcome: "pending" };
+      },
+      { now: c.now },
+    );
+    expect(code).toBe("123456");
+    expect(waits).toEqual([OTP_HOLD_MS, OTP_HOLD_MS, OTP_HOLD_MS]);
+  });
+
+  it("never holds past its deadline: the last ask is for the time left", async () => {
+    const c = clock(OTP_HOLD_MS);
+    const waits: number[] = [];
+    await expect(
+      heldOtp(
+        async (wait) => {
+          waits.push(wait);
+          c.tick();
+          return { outcome: "pending" };
+        },
+        { now: c.now, deadlineMs: 20_000 },
+      ),
+    ).rejects.toThrow("before the deadline");
+    expect(waits).toEqual([8_000, 8_000, 4_000]);
+  });
+
+  it("a final outcome without a code, or a hook that doesn't hold, fails at once", async () => {
+    const c = clock(OTP_HOLD_MS);
+    await expect(
+      heldOtp(async () => ({ outcome: "send_failed" }), { now: c.now }),
+    ).rejects.toThrow("(send_failed)");
+    const q = clock(10);
+    let asks = 0;
+    await expect(
+      heldOtp(
+        async () => {
+          asks++;
+          q.tick();
+          return { outcome: "pending" };
+        },
+        { now: q.now },
+      ),
+    ).rejects.toThrow("without holding");
+    expect(asks).toBe(QUICK_MAX);
+  });
+});
+
+describe("versionsIndexed: one held read picks the search path", () => {
+  const answer = (body: unknown, status = 200) =>
+    vi.fn(async () => new Response(JSON.stringify(body), { status }));
+  it("indexed when the newest version says textIndexed, asking with ?wait", async () => {
+    const f = answer([
+      { version: 2, textIndexed: true },
+      { version: 1, textIndexed: true },
+    ]);
+    vi.stubGlobal("fetch", f);
+    try {
+      expect(await versionsIndexed("https://a.example", "p", "art1")).toBe(
+        "indexed",
+      );
+      expect(String((f.mock.calls[0] as unknown[])[0])).toBe(
+        `https://a.example/api/v1/artifacts/art1/versions?wait=${VERSIONS_HOLD_MS}`,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+  it("not-held when the build answers unindexed or without the field (no #3221)", async () => {
+    for (const body of [
+      [{ version: 1, textIndexed: false }],
+      [{ version: 1 }],
+      { items: [{ version: 3 }] },
+    ]) {
+      vi.stubGlobal("fetch", answer(body));
+      try {
+        expect(
+          await versionsIndexed("https://a.example", "p", "x"),
+          JSON.stringify(body),
+        ).toBe("not-held");
+      } finally {
+        vi.unstubAllGlobals();
+      }
     }
   });
 });
