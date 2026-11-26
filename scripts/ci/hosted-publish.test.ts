@@ -110,6 +110,64 @@ esac`;
     });
     expect(r.out).toContain("::notice title=Prod publish waits::");
   });
+  // #459: a dispatch on main's head (HEAD_SHA, no release) that rebuilt an
+  // older tag's commit names it in its hosted-built job.
+  it("a run that rebuilt an older tag's commit publishes that tag (#459)", () => {
+    const r = resolve(
+      { ...run, HEAD_SHA: OTHER, RUN_ID: "77" },
+      {
+        releases: [release("v0.81.0"), release("v0.80.0")],
+        commits: { "v0.81.0": OTHER.replace(/b/g, "c"), "v0.80.0": SHA },
+        runs: {
+          "77": [
+            { name: "hosted-guard", conclusion: "success" },
+            { name: `hosted-built v0.80.0 ${SHA}`, conclusion: "success" },
+          ],
+        },
+      },
+    );
+    expect(r.code, r.err).toBe(0);
+    expect(r.o.kind).toBe("release");
+    expect(r.o.tag).toBe("v0.80.0");
+    expect(r.o.staging).toBe("true");
+    expect(r.o.prod).toBe("false");
+  });
+  it("a run without a hosted-built job falls back to its head_sha", () => {
+    const r = resolve(
+      { ...run, RUN_ID: "77" },
+      {
+        releases: [release("v0.80.0")],
+        commits: { "v0.80.0": SHA },
+        runs: { "77": [{ name: "hosted-guard", conclusion: "success" }] },
+      },
+    );
+    expect(r.code, r.err).toBe(0);
+    expect(r.o.tag).toBe("v0.80.0");
+  });
+  it("a failed hosted-built job names nothing; a head with no release is none", () => {
+    const r = resolve(
+      { ...run, HEAD_SHA: OTHER, RUN_ID: "77" },
+      {
+        releases: [release("v0.80.0")],
+        commits: { "v0.80.0": SHA },
+        runs: {
+          "77": [
+            { name: `hosted-built v0.80.0 ${SHA}`, conclusion: "failure" },
+          ],
+        },
+      },
+    );
+    expect(r.code, r.err).toBe(0);
+    expect(r.o.kind).toBe("none");
+  });
+  it("an error reading the run's jobs fails closed", () => {
+    const r = resolve(
+      { ...run, RUN_ID: "77" },
+      { releases: [release("v0.80.0")], commits: { "v0.80.0": SHA } },
+    );
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/reading run 77's jobs failed/);
+  });
   it("a failed release-please run (v0.122.0, npm only) still resolves the release; the gate decides", () => {
     for (const CONCLUSION of ["failure", "timed_out", ""]) {
       const r = resolve(

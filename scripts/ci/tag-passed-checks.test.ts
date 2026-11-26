@@ -374,7 +374,7 @@ case "$p" in
   contents/PUBLIC_PIN\\?*) k=pin ;;
   actions/workflows/release-please.yml/runs\\?*) k=runs ;;
   actions/workflows/hosted-release.yml/runs\\?*) k=runs ;;
-  actions/runs/*/jobs\\?*) k=jobs ;;
+  actions/runs/*/jobs\\?*) k=jobs; id="\${p#actions/runs/}"; id="\${id%%/*}"; [ -f "$STATE/$side-jobs-$id.json" ] && k="jobs-$id" ;;
   *) exit 1 ;;
 esac
 k="$side-$k"
@@ -683,6 +683,98 @@ cat "$STATE/$k.json"`;
     const r = runTwo(s);
     expect(r.code, r.err).toBe(0);
     expect(r.out).toContain("run 41");
+  });
+
+  // #459: a dispatch on main's newer head (HEAD2) that rebuilt the tag's older
+  // commit (CSHA) is named by its hosted-built job, not by its head_sha.
+  const HEAD2 = "f".repeat(40);
+  const rebuilt = (over: Record<string, unknown> = {}) => ({
+    id: 77,
+    head_sha: HEAD2,
+    event: "workflow_dispatch",
+    display_title: "hosted-release",
+    status: "completed",
+    conclusion: "success",
+    created_at: "2026-10-31T00:00:00Z",
+    ...over,
+  });
+  const names = [
+    "mirror",
+    "hosted-guard",
+    `hosted-built ${TAG} ${CSHA}`,
+    "hosted-build",
+    "hosted-check",
+    "hosted-sign-staging",
+    "hosted-sign-prod",
+    "hosted-attach-staging",
+    "hosted-attach-prod",
+  ];
+  // The tag's own push run (id 41, at CSHA) was red; the rebuild (id 77) is green.
+  const redThenRebuilt = (jobNames = names): State =>
+    tweak((x) => {
+      x["cloud-jobs"] = jobsOf(["mirror", "hosted-guard", "hosted-build"]);
+      x["cloud-jobs"].jobs[2].conclusion = "failure";
+      x["cloud-runs"].workflow_runs.push(rebuilt());
+      x["cloud-jobs-77"] = jobsOf(jobNames);
+    });
+
+  it("counts a dispatch on main's head that built the tag's older commit (#459)", () => {
+    const r = runTwo(redThenRebuilt());
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain("run 77");
+    expect(r.out).toContain(`hosted commit ${CSHA}`);
+  });
+  it("the same rebuild without its hosted-built job does not count", () => {
+    const r = runTwo(
+      redThenRebuilt(names.filter((n) => !n.startsWith("hosted-built"))),
+    );
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/job hosted-build: failure/);
+  });
+  it("a rebuild of another tag or commit does not count for this one", () => {
+    for (const n of [
+      `hosted-built v0.79.0 ${CSHA}`,
+      `hosted-built ${TAG} ${HEAD2}`,
+    ]) {
+      const r = runTwo(
+        redThenRebuilt(
+          names.map((x) => (x.startsWith("hosted-built") ? n : x)),
+        ),
+      );
+      expect(r.code, n).toBe(1);
+      expect(r.err).toMatch(/job hosted-build: failure/);
+    }
+  });
+  it("a failed hosted-built job, a dry run or a push run of another head does not count", () => {
+    for (const over of [
+      { display_title: "hosted-release (dry run)" },
+      { event: "push" },
+    ]) {
+      const s = redThenRebuilt();
+      s["cloud-runs"].workflow_runs[1] = rebuilt(over);
+      expect(runTwo(s).code, JSON.stringify(over)).toBe(1);
+    }
+    const s = redThenRebuilt();
+    s["cloud-jobs-77"].jobs[2].conclusion = "failure";
+    expect(runTwo(s).code).toBe(1);
+  });
+  it("the newest of two counting runs is read", () => {
+    const s = redThenRebuilt();
+    s["cloud-runs"].workflow_runs.push(
+      rebuilt({ id: 88, created_at: "2026-10-31T05:00:00Z" }),
+    );
+    s["cloud-jobs-88"] = jobsOf(names);
+    s["cloud-jobs-88"].jobs[3].conclusion = "failure";
+    const r = runTwo(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/job hosted-build: failure/);
+  });
+  it("an API error reading a rebuild's jobs fails closed", () => {
+    const s = redThenRebuilt();
+    s["cloud-jobs-77.err"] = "gh: Server Error (HTTP 500)";
+    const r = runTwo(s);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/hosted-release jobs: GitHub API error/);
   });
 
   it("accepts a dispatched (non dry) hosted-release run", () => {

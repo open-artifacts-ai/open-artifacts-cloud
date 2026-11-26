@@ -287,6 +287,20 @@ jobs:
           [ "$(sed -n 's/^tag=//p' <<< "$pin")" = "$TAG" ] || { echo "PUBLIC_PIN at $sha is not $TAG"; exit 1; }
           [ "$(sed -n 's/^sha=//p' <<< "$pin")" = "$PUB_SHA" ] || { echo "PUBLIC_PIN at $sha is not public commit $PUB_SHA"; exit 1; }
           { echo "sha=$sha"; echo "public_sha=$PUB_SHA"; echo "tag=$TAG"; echo "version=${TAG#v}"; } >> "$GITHUB_OUTPUT"
+  # Names the commit this run built, for the release gate and hosted-publish
+  # (#459). A dispatch on main's head can build an older existing tag's commit
+  # (#457), so the run's head_sha is not the built commit. The job name carries
+  # hosted-guard's resolved tag and commit; the job runs only for a real run
+  # whose guard passed, and tag-passed-checks.sh and hosted-publish-resolve.sh
+  # read the name from the jobs API.
+  hosted-built:
+    name: hosted-built ${{ needs.hosted-guard.outputs.tag }} ${{ needs.hosted-guard.outputs.sha }}
+    needs: [hosted-guard]
+    if: ${{ !cancelled() && needs.hosted-guard.result == 'success' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "built ${{ needs.hosted-guard.outputs.tag }} at ${{ needs.hosted-guard.outputs.sha }}"
   hosted-build:
     needs: [hosted-guard]
     if: ${{ !cancelled() && needs.hosted-guard.result == 'success' }}

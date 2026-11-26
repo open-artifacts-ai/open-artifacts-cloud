@@ -3,7 +3,7 @@
 # which env's releases bucket, as GITHUB_OUTPUT lines kind (release, floor or
 # none), tag, floor_run_id, staging and prod (true or false).
 #   workflow_run (release-please on main, any conclusion but cancelled): the
-#     release whose tag's commit is the run's head_sha, to staging only: prod
+#     release whose tag's commit is the commit the run built, to staging only: prod
 #     waits for staging's red-line (#1412) and is published by
 #     prod-release-chain.yml, so this run never fails red on prod;
 #     none is kind=none (most pushes cut no release), exit 0. A failed run is
@@ -14,7 +14,11 @@
 #     prod alone needs the tag's staging publish first, see staged) or
 #     FLOOR_RUN_ID (a hosted-floor.yml run id; DEPLOY_ENV required).
 # Read-only (`gh api`); an API error is exit 1, never "no release".
-# Env: EVENT, HEAD_SHA, HEAD_BRANCH, CONCLUSION (workflow_run); TAG,
+#     The built commit is the one named by the run's "hosted-built <tag> <sha>"
+#     job (hosted-release.yml, #459): a dispatch on main's head that rebuilt an
+#     older tag's commit has a different head_sha. A run without that job (a
+#     failed guard, an older run) falls back to its head_sha.
+# Env: EVENT, HEAD_SHA, RUN_ID, HEAD_BRANCH, CONCLUSION (workflow_run); TAG,
 # DEPLOY_ENV, FLOOR_RUN_ID (dispatch); GH_TOKEN, GITHUB_REPOSITORY, GITHUB_OUTPUT.
 set -euo pipefail
 
@@ -83,6 +87,15 @@ case "${EVENT:-}" in
     fi
     [[ "${HEAD_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "HEAD_SHA is not a commit sha" >&2; exit 1; }
     : "${GH_TOKEN:?GH_TOKEN is required}"
+    built="$HEAD_SHA"
+    if [ -n "${RUN_ID:-}" ]; then
+      [[ "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo "RUN_ID is not a run id" >&2; exit 1; }
+      rjobs="$(gh api -X GET "$R/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" 2> /dev/null)" || { echo "reading run $RUN_ID's jobs failed" >&2; exit 1; }
+      names="$(jq -r '.jobs | if type == "array" then . else error("no jobs") end | .[] | select(.conclusion == "success") | .name' <<< "$rjobs" 2> /dev/null)" ||
+        { echo "reading run $RUN_ID's jobs failed: unparsable" >&2; exit 1; }
+      bsha="$(sed -n 's/^hosted-built v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]* \([0-9a-f]\{40\}\)$/\1/p' <<< "$names" | head -n 1)"
+      if [ -n "$bsha" ]; then built="$bsha"; fi
+    fi
     rels="$(gh api -X GET "$R/releases?per_page=20" 2> /dev/null)" || { echo "listing releases failed" >&2; exit 1; }
     tags="$(jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' <<< "$rels")" ||
       { echo "listing releases failed: unparsable" >&2; exit 1; }
@@ -91,10 +104,10 @@ case "${EVENT:-}" in
       [[ "$t" =~ $stable ]] || continue
       sha="$(gh api -X GET "$R/commits/$t" 2> /dev/null | jq -r '.sha // ""')" || { echo "reading $t's commit failed" >&2; exit 1; }
       [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "reading $t's commit failed" >&2; exit 1; }
-      if [ "$sha" = "$HEAD_SHA" ]; then found="$t"; break; fi
+      if [ "$sha" = "$built" ]; then found="$t"; break; fi
     done <<< "$tags"
     if [ -z "$found" ]; then
-      echo "no release at $HEAD_SHA; nothing to publish"
+      echo "no release at $built; nothing to publish"
       out none "" "" false false
       exit 0
     fi
