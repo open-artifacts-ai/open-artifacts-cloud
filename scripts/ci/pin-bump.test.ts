@@ -242,6 +242,80 @@ describe("plan", () => {
   });
 });
 
+// The push trigger (cloud #264): the bump for v0.136.1 just merged, so PUBLIC_PIN
+// on main is v0.136.1 and no pin-bump PR is open. A release that waited behind it
+// is bumped now; with nothing newer the run writes nothing.
+describe("plan again once a pin lands on main", () => {
+  const writes = (calls: string[][]) =>
+    calls.filter(
+      (c) =>
+        (c[0] === "pr" && ["create", "close", "merge"].includes(c[1] ?? "")) ||
+        c.includes("POST") ||
+        c.includes("PATCH"),
+    );
+
+  it("a newer release than the new pin exists, so bump", () => {
+    const { exec, calls } = world({
+      releases: [rel("v0.137.0"), rel("v0.136.1")],
+    });
+    expect(
+      plan({ exec, repo: REPO, publicRepo: PUB, pin: PIN, now: NOW }),
+    ).toMatchObject({
+      bump: true,
+      tag: "v0.137.0",
+      sha: NEW_SHA,
+      why: "v0.136.1 -> v0.137.0",
+    });
+    expect(writes(calls)).toEqual([]);
+  });
+
+  it("nothing newer, so do nothing, and read no PR for a tag", () => {
+    const { exec, calls } = world({
+      releases: [rel("v0.136.1"), rel("v0.136.0")],
+    });
+    const r = plan({ exec, repo: REPO, publicRepo: PUB, pin: PIN, now: NOW });
+    expect(r).toMatchObject({ bump: false });
+    expect(r.why).toContain("v0.136.1 is the newest release");
+    expect(calls.some((c) => c.includes("--head"))).toBe(false);
+    expect(calls.some((c) => c[1]?.includes("/commits/"))).toBe(false);
+    expect(writes(calls)).toEqual([]);
+  });
+
+  it("is idempotent: once the newer bump is open, a second run does nothing", () => {
+    const open = [
+      {
+        number: 9,
+        headRefName: branchOf("v0.137.0"),
+        url: "u9",
+        createdAt: hoursAgo(0),
+      },
+    ];
+    const r = go({ open });
+    expect(r).toMatchObject({ bump: false, tag: "v0.137.0" });
+    expect(r.why).toContain("u9");
+    expect(go({ taken: [{ number: 9, state: "OPEN" }] })).toMatchObject({
+      bump: false,
+    });
+  });
+
+  it("direct mode decides the same way", () => {
+    const run = (releases: Rel[]) =>
+      planDirect({
+        exec: world({ releases }).exec,
+        repo: REPO,
+        publicRepo: PUB,
+        pin: PIN,
+      });
+    expect(run([rel("v0.137.0"), rel("v0.136.1")])).toMatchObject({
+      bump: true,
+      tag: "v0.137.0",
+    });
+    expect(run([rel("v0.136.1"), rel("v0.136.0")])).toMatchObject({
+      bump: false,
+    });
+  });
+});
+
 describe("a stuck bump PR", () => {
   const stuck = (ms: number, extra: object = {}) => ({
     open: [
@@ -487,14 +561,18 @@ describe("pin-bump.yml", () => {
   const step = (j: string, id: string) => stepsOf(j).find((s) => s.id === id);
   const MAIN = "github.ref == 'refs/heads/main'";
 
-  it("runs on a schedule, by dispatch and after CI on a staged pin, from main only", () => {
+  it("runs on a schedule, by dispatch, when a pin lands on main and after CI on a staged pin, from main only", () => {
     expect(Object.keys(w.on)).toEqual([
       "schedule",
       "workflow_dispatch",
+      "push",
       "workflow_run",
     ]);
+    // the schedule stays as the backstop
     expect(w.on.schedule).toHaveLength(1);
     expect(w.on.schedule[0].cron).toMatch(/^\S+ \S+ \S+ \S+ \S+$/);
+    // a pin PR merging, or land moving main, changes PUBLIC_PIN on main
+    expect(w.on.push).toEqual({ branches: ["main"], paths: ["PUBLIC_PIN"] });
     expect(w.on.workflow_run).toEqual({
       workflows: ["CI"],
       types: ["completed"],
@@ -506,6 +584,84 @@ describe("pin-bump.yml", () => {
     for (const j of ["prepare", "open"])
       expect(jobs[j].if).toContain("github.event_name != 'workflow_run'");
     expect(JSON.stringify(jobs)).not.toContain("github.event.workflow_run");
+    expect(JSON.stringify(jobs)).not.toContain("github.event.push");
+  });
+
+  describe("which jobs run, by event (cloud #264)", () => {
+    const CLOUD = "open-artifacts-ai/open-artifacts-cloud";
+    // A job's `if` is plain JS once its contexts are bound.
+    const runs = (
+      j: string,
+      o: {
+        event: string;
+        repo?: string;
+        ref?: string;
+        direct?: string;
+        bump?: string;
+      },
+    ): boolean =>
+      new Function(
+        "github",
+        "vars",
+        "needs",
+        "always",
+        `return ${String(jobs[j].if).replace(/^\$\{\{\s*|\s*\}\}$/g, "")};`,
+      )(
+        {
+          event_name: o.event,
+          repository: o.repo ?? CLOUD,
+          ref: o.ref ?? "refs/heads/main",
+        },
+        { PIN_BUMP_DIRECT: o.direct ?? "" },
+        { prepare: { outputs: { bump: o.bump ?? "true" } } },
+        () => true,
+      );
+    const jobsFor = (o: Parameters<typeof runs>[1]) =>
+      ["prepare", "open", "land", "report"].filter((j) => runs(j, o));
+
+    it("a pin landing on main plans again at once, the same as a release dispatch", () => {
+      expect(jobsFor({ event: "push" })).toEqual(
+        jobsFor({ event: "workflow_dispatch" }),
+      );
+      expect(jobsFor({ event: "push" })).toEqual(["prepare", "open", "report"]);
+      // nothing newer: prepare's plan says no bump, and open does not run
+      expect(jobsFor({ event: "push", bump: "false" })).toEqual([
+        "prepare",
+        "report",
+      ]);
+    });
+
+    it("land never runs on the push, in direct mode or not", () => {
+      for (const direct of ["", "on"])
+        expect(runs("land", { event: "push", direct })).toBe(false);
+      for (const event of ["schedule", "workflow_dispatch", "workflow_run"])
+        expect(runs("land", { event, direct: "on" })).toBe(true);
+      expect(jobsFor({ event: "push", direct: "on" })).toEqual([
+        "prepare",
+        "open",
+        "report",
+      ]);
+    });
+
+    it("never runs on a fork or another branch, whatever the event", () => {
+      for (const event of [
+        "push",
+        "schedule",
+        "workflow_dispatch",
+        "workflow_run",
+      ]) {
+        expect(
+          jobsFor({
+            event,
+            repo: "someone/open-artifacts-cloud",
+            direct: "on",
+          }),
+        ).toEqual([]);
+        expect(
+          jobsFor({ event, ref: "refs/heads/feature", direct: "on" }),
+        ).toEqual([]);
+      }
+    });
   });
 
   it("is four jobs, in order", () => {
