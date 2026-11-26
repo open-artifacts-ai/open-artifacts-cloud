@@ -339,8 +339,12 @@ describe("track", () => {
     expect(r.done.map((d) => d.action)).toEqual(["create", "create"]);
     const creates = g.calls.filter((c) => c.args[1] === "create");
     expect(creates[0]?.args).not.toContain("--assignee");
-    expect(creates[0]?.args.join(" ")).toContain("unknown (no commit found, or the lookup failed)");
-    expect(r.notes.some((n) => n.includes("owner of") && n.includes("HTTP 404"))).toBe(true);
+    expect(creates[0]?.args.join(" ")).toContain(
+      "unknown (no commit found, or the lookup failed)",
+    );
+    expect(
+      r.notes.some((n) => n.includes("owner of") && n.includes("HTTP 404")),
+    ).toBe(true);
   });
 
   it("re-lists the open issues before each write, so an issue another run just opened is bumped", () => {
@@ -356,7 +360,9 @@ describe("track", () => {
       openAt: (n) => (n === 0 ? [] : [other]),
     });
     const r = track({ exec: g.exec, run, nowMs: NOW });
-    const lists = g.calls.filter((c) => c.args[0] === "issue" && c.args[1] === "list");
+    const lists = g.calls.filter(
+      (c) => c.args[0] === "issue" && c.args[1] === "list",
+    );
     expect(lists).toHaveLength(2);
     expect(r.done).toEqual([
       { action: "create", id: expect.stringContaining("joins.spec.ts") },
