@@ -1,4 +1,10 @@
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,10 +15,9 @@ import {
   parseProvisionerProbe,
   pollUntil,
   provisionerClient,
-  ULID_RE,
 } from "../src/provisioner.ts";
 import { parseManifest } from "../src/report.ts";
-import liveCfg from "../vitest.live.config.ts";
+import { RETIRED } from "../src/retired.ts";
 
 const root = join(import.meta.dirname, "..");
 const OK = {
@@ -24,54 +29,33 @@ const OK = {
 };
 const cfg = (v: unknown) => ({ REDLINE_STG_PROVISIONER: JSON.stringify(v) });
 
-describe("the provisioner cases are in the gate", () => {
-  const live = readFileSync(join(root, "live/provisioner.test.ts"), "utf8");
-  const src = readFileSync(join(root, "src/provisioner.ts"), "utf8");
+describe("the provisioner cases left the live run (cloud #264 step 2)", () => {
   const names = [
     "a replayed signup creates nothing new",
     "a signup for a taken slug fails cleanly",
   ];
 
-  it("the live suite runs live/provisioner.test.ts, and the manifest lists both cases once", () => {
-    expect(liveCfg.test?.include).toEqual(["live/**/*.test.ts"]);
+  it("live/provisioner.test.ts is gone, the manifest and plans name it nowhere, and both cases are retired", () => {
+    expect(existsSync(join(root, "live/provisioner.test.ts"))).toBe(false);
     const m = parseManifest(
       readFileSync(join(root, "live/manifest.json"), "utf8"),
     );
-    for (const n of names) {
-      expect(live).toContain(`"${n}"`);
-      expect(
-        m.cases.filter(
-          (c) =>
-            c.file === "live/provisioner.test.ts" &&
-            c.name === `provisioner > ${n}`,
-        ),
-      ).toHaveLength(1);
-    }
     expect(
       m.cases.filter((c) => c.file === "live/provisioner.test.ts"),
-    ).toHaveLength(names.length);
-  });
-
-  it("the file sits in exactly one lane of each plan", () => {
+    ).toEqual([]);
     for (const plan of [PLAN, PLAN_SERIAL])
       expect(
         plan.flat().filter((l) => l.files.includes("live/provisioner.test.ts")),
-      ).toHaveLength(1);
-  });
-
-  it("the taken-slug case goes through R4 and asserts slug_taken with nothing written", () => {
-    expect(live).toContain("createTaken(");
-    expect(src).toContain("/v1/installs");
-    expect(live).toContain('code: "slug_taken"');
-    expect(live).toContain("FROM jobs WHERE request_id");
-    // The old route: a hand-written signups row. Never again.
-    expect(live).not.toContain("INSERT INTO");
-    expect(src).not.toContain("INSERT INTO");
-  });
-
-  it("with no REDLINE_STG_PROVISIONER the cases are unproven-live, never pass", () => {
-    expect(live).toContain('proof(ctx, "unproven-live", NOT_CONFIGURED)');
-    expect(live).toContain('proof(ctx, "staging-only"');
+      ).toEqual([]);
+    for (const n of names)
+      expect(
+        RETIRED.some(
+          (r) =>
+            r.file === "live/provisioner.test.ts" &&
+            r.name === `provisioner > ${n}`,
+        ),
+        n,
+      ).toBe(true);
   });
 });
 

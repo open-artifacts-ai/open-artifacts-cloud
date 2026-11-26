@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { RECONNECT_AT_MS } from "../src/hosted-bus.ts";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
+import { SPLIT_RETIRED } from "../src/retired-split.ts";
 import { derive, inShard } from "../src/surfaces.ts";
 import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
@@ -171,9 +172,16 @@ describe("the recording (run 42402998826)", () => {
     );
     const mk = m.cases.map((c) => `${c.file} ${c.name}`);
     for (const k of added) expect(mk).toContain(k);
-    expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(mk.filter((k) => !added.has(k))),
-    );
+    // Cloud #264 step 2 retired cases the recording still holds: it is the
+    // manifest minus the additions, plus exactly those retired cases.
+    const retired = new Set(SPLIT_RETIRED.map((c) => `${c.file} ${c.name}`));
+    expect(
+      new Set(
+        fx.cases
+          .map((c) => `${c.file} ${c.name}`)
+          .filter((k) => !retired.has(k)),
+      ),
+    ).toEqual(new Set(mk.filter((k) => !added.has(k))));
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
     );
@@ -198,14 +206,13 @@ describe("the recording (run 42402998826)", () => {
 });
 
 describe("the provisioner file (#859, not in the recording)", () => {
-  it("has a lane of its own beside prov, and prov holds only provisioning", () => {
+  it("its lane left with it (cloud #264 step 2), and prov holds only provisioning", () => {
     const lanes = PLAN[0] ?? [];
     expect(lanes.find((x) => x.name === "prov")?.files).toEqual([
       "live/provisioning.test.ts",
     ]);
-    expect(lanes.find((x) => x.name === "provisioner")?.files).toEqual([
-      NEW_FILE,
-    ]);
+    expect(lanes.find((x) => x.name === "provisioner")).toBeUndefined();
+    expect(lanes.some((x) => x.files.includes(NEW_FILE))).toBe(false);
   });
 });
 
@@ -404,9 +411,14 @@ describe("the plan with the provisioner file in its own lane (run 42642922707)",
     m.mergeSec +
     m.revokeSec;
 
-  it("the simulated lanes are the plan's lanes", () => {
-    // The recording ran surfaces whole: #26's second shard is not in it.
-    expect(Object.keys(ends()).sort()).toEqual(
+  it("the simulated lanes are the plan's lanes, plus the provisioner lane it had then", () => {
+    // The recording ran surfaces whole: #26's second shard is not in it. The
+    // provisioner lane left with cloud #264 step 2.
+    expect(
+      Object.keys(ends())
+        .filter((n) => n !== "provisioner")
+        .sort(),
+    ).toEqual(
       (PLAN[0] ?? [])
         .filter((l) => l.shard !== "b")
         .map((l) => l.name)

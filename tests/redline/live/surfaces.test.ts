@@ -1,18 +1,16 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, it } from "vitest";
 import { hook } from "../src/http.ts";
 import { crossWrite, prepareSide, type Side } from "../src/refused.ts";
 import { proof } from "../src/report.ts";
+import { KEPT_SURFACES } from "../src/retired-split.ts";
 import {
   carries,
-  citationGaps,
   cleanup,
-  coverageGaps,
   dispose,
   hiddenToolGate,
   inShard,
   probeCases,
   probeCred,
-  readRepoFile,
   runRead,
   seedWorld,
   settle,
@@ -79,15 +77,18 @@ const side = (t: Target): Side => (t === T.a ? A : B);
 // two surfaces lanes); unset runs them all. The coverage case is shard a's.
 const shard = surfaceShard();
 
+// Cloud #264 step 2 (red-line page v3): the allow/deny table on every route
+// moved to PR CI (the in-server matrix, once more with hosted settings,
+// public #3158), and another install's login with no allowed leg is deleted.
+// What stays (nightly) is KEPT_SURFACES: one session and one PAT refusal at
+// the other install, its OAuth token at the other's MCP, the OAuth grant edit
+// and revoke on the real KV, and the upload reservation. The rest are in
+// src/retired-split.ts. The static coverage and citation checks already run
+// on every PR in test/surfaces.test.ts.
 describe("surface probes (cross-install)", () => {
-  if (shard !== "b")
-    it("every ROUTE_POLICY route, MCP tool and content route has a case", () => {
-      expect(coverageGaps()).toEqual([]);
-      // Every drop's covering tests exist (file, describe and test names).
-      expect(citationGaps(readRepoFile)).toEqual([]);
-    });
-
-  for (const c of probeCases().filter((c) => inShard(c.name, shard)))
+  for (const c of probeCases().filter(
+    (c) => KEPT_SURFACES.has(c.name) && inShard(c.name, shard),
+  ))
     it(
       c.name,
       async (ctx) => {

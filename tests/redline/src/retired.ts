@@ -1,3 +1,4 @@
+import { SPLIT_RETIRED } from "./retired-split.ts";
 import { type Citation, resolveCitations } from "./surfaces.ts";
 
 // #1235: live cases taken out of the red-line run, each with the failure it
@@ -37,11 +38,6 @@ const LIVE_PAT: Citation[] = [
     file: GUARD,
     describe: HARNESS,
     test: "A's admin PAT at B: /api/v1/me",
-  },
-  {
-    file: GUARD,
-    describe: HARNESS,
-    test: "A's admin PAT at B: the host's own marker artifact",
   },
 ];
 /** The fake that proves a kept crossCheck fails when B accepts A's credential. */
@@ -165,6 +161,8 @@ export const RETIRED: readonly Retired[] = [
   data("GET storage/:key"),
   data("PUT storage/:key: refused, and B's key is unchanged"),
   data("DELETE storage/:key: refused, and B's key is unchanged"),
+  // Cloud #264 step 2: the cases the red-line page moves to PR CI or deletes.
+  ...SPLIT_RETIRED,
 ];
 
 /**

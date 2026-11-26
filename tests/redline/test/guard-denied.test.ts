@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { assertKeyCheckDenied, deniedSessionRows } from "../src/audit.ts";
+import { RETIRED } from "../src/retired.ts";
 import type { Target } from "../src/targets.ts";
 
 // The guard's "a wrong hook key gets the 404" takes the audit row as proof that
@@ -67,30 +68,21 @@ describe("assertKeyCheckDenied", () => {
   });
 });
 
-describe("live/guard.test.ts uses it, around the bare 404", () => {
+describe("live/guard.test.ts no longer runs the wrong-key case (cloud #264 step 2)", () => {
   const src = readFileSync(
     join(import.meta.dirname, "../live/guard.test.ts"),
     "utf8",
   );
-  it("reads the denied rows before and after the wrong-key call and asserts the growth; name unchanged", () => {
-    expect(src).toContain("`${k}: a wrong hook key gets the 404`");
-    const before = src.indexOf(
-      "deniedBefore = await deniedSessionRows(t, since)",
-    );
-    const call = src.indexOf("/__test/session`, {");
-    const after = src.indexOf(
-      "deniedAfter = await deniedSessionRows(t, since)",
-    );
-    const assert = src.indexOf(
-      "assertKeyCheckDenied(t.name, deniedBefore, deniedAfter)",
-    );
-    expect(before).toBeGreaterThan(-1);
-    expect(call).toBeGreaterThan(before);
-    expect(after).toBeGreaterThan(call);
-    expect(assert).toBeGreaterThan(after);
-    // The 404 itself is still required.
-    expect(src).toMatch(
-      /if \(res\.status !== 404\)\s+throw new Error\(`wrong key/,
-    );
+  it("the case moved to PR CI and is retired with the test that guards it", () => {
+    expect(src).not.toContain("`${k}: a wrong hook key gets the 404`");
+    expect(src).not.toContain("deniedSessionRows");
+    for (const k of ["a", "b"])
+      expect(
+        RETIRED.some(
+          (r) =>
+            r.file === "live/guard.test.ts" &&
+            r.name === `hooks > ${k}: a wrong hook key gets the 404`,
+        ),
+      ).toBe(true);
   });
 });

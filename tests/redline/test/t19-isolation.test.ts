@@ -77,14 +77,13 @@ describe("surfaces' org-level read cases check a status, never a list body", () 
     expect(BODY_READ.test('r.code === "members_only"')).toBe(false);
   });
 
-  it("the member-list compare stays in credentials, under the exclusive lock", () => {
+  it("no live file compares a whole member list (credentials' link cases were deleted, cloud #264 step 2)", () => {
     const c = read("tests/redline/live/credentials.test.ts");
-    expect(c).toMatch(/const memberList = async/);
-    expect((c.match(/withLock\(MEMBERS_LOCK, "exclusive"/g) ?? []).length).toBe(
-      2,
-    );
-    // No other live file or surfaces helper compares rl-b's whole member list.
+    expect(c).not.toMatch(/const memberList = async/);
+    expect(c).not.toContain("withLock(");
+    // No live file or surfaces helper compares rl-b's whole member list.
     for (const f of [
+      "live/credentials.test.ts",
       "live/surfaces.test.ts",
       "live/edge.test.ts",
       "live/signin.test.ts",
@@ -201,7 +200,7 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
       }
   });
 
-  it("the suite's whole member-list reads: credentials' compare on rl-b, and surfaces' memberId, which .finds its own address on whichever side it is given (rl-a too)", () => {
+  it("the suite's whole member-list reads: surfaces' memberId, which .finds its own address on whichever side it is given (rl-a too)", () => {
     const hits: string[] = [];
     for (const d of ["src", "live"])
       for (const f of readdirSync(join(root, "tests/redline", d))) {
@@ -209,14 +208,9 @@ describe("T19 beside the suite: what it writes on rl-a, what it shares", () => {
         const t = read(`tests/redline/${d}/${f}`);
         if (/["'`]\/api\/v1\/members["'`]/.test(t)) hits.push(`${d}/${f}`);
       }
-    expect(hits.sort()).toEqual([
-      "live/credentials.test.ts",
-      "src/surfaces.ts",
-    ]);
-    // credentials compares the whole list, before and after: rl-b only.
-    const c = read("tests/redline/live/credentials.test.ts");
-    expect(c).toMatch(/getJson\(T\.b, "\/api\/v1\/members"/);
-    expect(c).not.toMatch(/getJson\(T\.a, "\/api\/v1\/members"/);
+    // credentials' whole-list compare on rl-b left with its link cases
+    // (cloud #264 step 2).
+    expect(hits.sort()).toEqual(["src/surfaces.ts"]);
     // surfaces reads the whole list of the side it is given (rl-a included),
     // but only to find its own redline-<who>@ address: members T19 adds
     // (t19-<run>-*) can't change what it finds.

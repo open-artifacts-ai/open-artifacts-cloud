@@ -87,7 +87,7 @@ describe("the lane plan", () => {
     }
   });
 
-  it("is one phase of eight lanes, with signin first in its lane and codes in one lane", () => {
+  it("is one phase of seven lanes, with signin first in its lane and codes in one lane", () => {
     expect(PLAN).toHaveLength(1);
     expect(PLAN[0]?.map((l) => l.name).sort()).toEqual([
       "busb",
@@ -95,7 +95,6 @@ describe("the lane plan", () => {
       "front",
       "guard",
       "prov",
-      "provisioner",
       "surfaces",
       "surfaces-b",
     ]);
@@ -117,7 +116,7 @@ describe("the lane plan", () => {
     expect(conflicts(PLAN_SERIAL)).toEqual([]);
   });
 
-  it("PLAN_SERIAL is the two-phase plan from before #1730, plus #859's provisioner file in a lane beside provisioning", () => {
+  it("PLAN_SERIAL is the two-phase plan from before #1730 (#859's provisioner file left with cloud #264 step 2)", () => {
     expect(PLAN_SERIAL.map((ph) => ph.map((l) => [...l.files]))).toEqual([
       [["live/signin.test.ts", "live/edge.test.ts"]],
       [
@@ -128,7 +127,6 @@ describe("the lane plan", () => {
           "live/surfaces.test.ts",
         ],
         ["live/provisioning.test.ts"],
-        ["live/provisioner.test.ts"],
       ],
     ]);
   });
@@ -397,23 +395,15 @@ describe("the claims match the code", () => {
     );
   });
 
-  it("credentials takes the members lock around both link cases", () => {
+  it("credentials takes no members lock: its link cases were deleted (cloud #264 step 2)", () => {
     const t = read("live/credentials.test.ts");
-    expect((t.match(/withLock\(MEMBERS_LOCK, "exclusive"/g) ?? []).length).toBe(
-      2,
-    );
+    expect(t).not.toContain("withLock(");
   });
 
-  it("signin marks broker-done when its broker describes end, before the rest of the file runs", () => {
+  it("signin marks broker-done at its end and spends no broker bucket (cloud #264 step 2: its broker cases left)", () => {
     const t = read("live/signin.test.ts");
-    const mark = t.indexOf('afterAll(() => mark("broker-done"))');
-    expect(mark).toBeGreaterThan(t.indexOf('describe("sign-in: broker"'));
-    expect(mark).toBeLessThan(t.indexOf('describe("sign-in: Turnstile"'));
-    // Every spender of the broker bucket (startGoogle, brokerState) is in the
-    // describes before Turnstile's: the afterAll of the last of them runs
-    // after all of them.
-    const after = t.slice(t.indexOf('describe("sign-in: Turnstile"'));
-    expect(after).not.toMatch(/brokerState\(|mustStart\(|startGoogle\(/);
+    expect(t).toMatch(/afterAll\(\(\) => \{\s+mark\("broker-done"\);/);
+    expect(t).not.toMatch(/brokerState\(|mustStart\(|startGoogle\(/);
   });
 
   it("the other writers of rl-b's members claim the lock shared", () => {
@@ -447,31 +437,9 @@ describe("the claims match the code", () => {
       /needs bucket rl-a\/codes exclusive/,
     ],
     [
-      "live/signin.test.ts",
-      {
-        ...(CLAIMS["live/signin.test.ts"] as Claims),
-        buckets: {
-          ...(CLAIMS["live/signin.test.ts"] as Claims).buckets,
-          "broker-ip": "exclusive",
-        },
-      },
-      /needs broker-ip ordered/,
-    ],
-    [
       "live/provisioning.test.ts",
       { state: {}, buckets: { "broker-ip": { ordered: "broker-done" } } },
       /needs provisioning-api[\s\S]*needs rl-a\/admin-pat/,
-    ],
-    [
-      "live/credentials.test.ts",
-      {
-        ...(CLAIMS["live/credentials.test.ts"] as Claims),
-        state: {
-          ...(CLAIMS["live/credentials.test.ts"] as Claims).state,
-          "rl-b/members+member-user": { guarded: "rl-b-members", as: "shared" },
-        },
-      },
-      /must claim it exclusive/,
     ],
   ] as [string, Claims, RegExp][])(
     "a missing claim fails: %s",

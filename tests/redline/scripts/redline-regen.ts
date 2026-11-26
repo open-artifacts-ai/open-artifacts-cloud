@@ -108,11 +108,13 @@ export async function computePlan(root = ROOT): Promise<{
   const d = s.derive();
   const gaps: string[] = s.coverageGaps(d);
   const cases = d.cases as { name: string; denyOnly?: boolean; legs: string }[];
+  // Cloud #264 step 2: only KEPT_SURFACES run live; the static coverage case
+  // and the rest moved to PR CI or were deleted (src/retired-split.ts). The
+  // counts still describe every derived case (test/surfaces.test.ts).
+  const rs = await import(join(root, "src/retired-split.ts"));
+  const kept: ReadonlySet<string> = rs.KEPT_SURFACES;
   const plan: Plan = {
-    names: [
-      "every ROUTE_POLICY route, MCP tool and content route has a case",
-      ...cases.map((c) => c.name),
-    ],
+    names: cases.map((c) => c.name).filter((n) => kept.has(n)),
     denyOnly: cases.filter((c) => c.denyOnly).length,
     atB: cases.filter((c) => c.legs === "atB").length,
   };

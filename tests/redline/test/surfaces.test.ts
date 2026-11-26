@@ -35,6 +35,7 @@ import {
   type Verdict,
 } from "../src/refused.ts";
 import { parseManifest } from "../src/report.ts";
+import { KEPT_SURFACES } from "../src/retired-split.ts";
 import {
   A_AT_A,
   citationGaps,
@@ -502,7 +503,7 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     expect(GRANT_CASE_TIMEOUT_MS).toBeGreaterThanOrEqual(3 * GRANT_LIST_MS);
   });
 
-  it("are all in the required-case manifest, and no drop is", () => {
+  it("the kept ones are in the required-case manifest, and no drop or retired case is", () => {
     const m = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
@@ -511,10 +512,12 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => c.file === "live/surfaces.test.ts")
         .map((c) => c.name),
     );
-    const want = [
-      "every ROUTE_POLICY route, MCP tool and content route has a case",
-      ...cases.map((c) => c.name),
-    ].map((n) => `surface probes (cross-install) > ${n}`);
+    // Cloud #264 step 2: only KEPT_SURFACES stay live (nightly); the rest
+    // moved to PR CI or were deleted (src/retired-split.ts).
+    const want = cases
+      .filter((c) => KEPT_SURFACES.has(c.name))
+      .map((c) => `surface probes (cross-install) > ${c.name}`);
+    expect(want).toHaveLength(KEPT_SURFACES.size);
     expect([...listed].sort()).toEqual([...want].sort());
   });
 });

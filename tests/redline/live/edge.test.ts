@@ -8,7 +8,6 @@ import {
   deleteThrowaways,
 } from "../src/fixtures.ts";
 import {
-  type Cred,
   describeRes,
   fromContentApp,
   send as httpSend,
@@ -17,25 +16,14 @@ import {
   sessionCred,
   withCred,
 } from "../src/http.ts";
-import {
-  allMarkers,
-  crossCheck,
-  expectRefused,
-  prepareSide,
-  type Side,
-} from "../src/refused.ts";
+import { allMarkers, prepareSide, type Side } from "../src/refused.ts";
 import { noInventoryReason, proof } from "../src/report.ts";
 import {
   labelTurnstileTestKey,
   ownCodeRequestReq,
   pendingCode,
 } from "../src/signin.ts";
-import {
-  inventoryBearer,
-  loadTargets,
-  type Target,
-  type Targets,
-} from "../src/targets.ts";
+import { inventoryBearer, loadTargets, type Targets } from "../src/targets.ts";
 import { rawRequest } from "../src/ws.ts";
 
 // P5 Task 5: the content host, and the dispatch edge. Cases that need the
@@ -59,43 +47,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   let bad = 0;
-  // csrfWrites' actors (W2): their throwaways go with their own PAT, then the
-  // PAT itself is revoked, with the cookie it was minted with.
-  for (const a of actors.values()) {
-    bad += await deleteThrowaways(a.t, a.pat, a.made);
-    try {
-      const r = await fetchT(
-        `${a.t.app}/api/v1/tokens/${encodeURIComponent(a.tokenId)}`,
-        withCred(a.cookie, {
-          method: "DELETE",
-          headers: { "x-oa-request": "1" },
-        }),
-      );
-      await readBody(r);
-      if (r.status < 200 || r.status > 299) bad++;
-    } catch {
-      bad++;
-    }
-  }
   for (const [s, ids] of made) bad += await deleteThrowaways(s.t, s.pat, ids);
   if (bad) throw new Error(`${bad} throwaway artifacts were not deleted`);
 });
-
-/**
- * What csrfWrites acts as (W2, #1730): a fixed member of its own,
- * redline-csrf@<testDomain>, so the whole-list snapshots it takes (the token
- * list above all) are of a user no other lane touches, instead of the admin's,
- * whose PAT every lane uses.
- */
-interface Actor {
-  t: Target;
-  cookie: Cred;
-  pat: Cred;
-  tokenId: string;
-  /** Artifacts it made: deleted in afterAll with its own PAT. */
-  made: string[];
-}
-const actors = new Map<Side, Actor>();
 
 /** Per-request bound: a timeout is a FAIL (an abort error), never a refusal. */
 const TIMEOUT_MS = 15_000;
@@ -104,126 +58,11 @@ const send = (r: Request) =>
 const fetchT = (url: string, init: RequestInit = {}) =>
   fetch(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) });
 
-/** The actor for `s`: its session (the hook), and a PAT minted with the cookie. */
-async function csrfActor(s: Side): Promise<Actor> {
-  const have = actors.get(s);
-  if (have) return have;
-  const t = s.t;
-  const cookie = await sessionCred(t, `redline-csrf@${t.testDomain}`, "member");
-  // PATs can't mint PATs: the member's session, as the app sends it.
-  const r = await send(
-    new Request(
-      `${t.app}/api/v1/tokens`,
-      withCred(cookie, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-oa-request": "1" },
-        body: JSON.stringify({ label: "redline-csrf-actor" }),
-      }),
-    ),
-  );
-  const text = await readBody(r);
-  if (r.status !== 201)
-    throw new Error(`${t.name} csrf actor PAT: ${describeRes(r, text)}`);
-  const v = parseJson(r, text, `${t.name} csrf actor PAT`) as {
-    id?: unknown;
-    token?: unknown;
-  };
-  if (typeof v.id !== "string" || typeof v.token !== "string" || !v.token)
-    throw new Error(`${t.name} csrf actor PAT: no id or token`);
-  const a: Actor = {
-    t,
-    cookie,
-    pat: { kind: "pat", token: v.token },
-    tokenId: v.id,
-    made: [],
-  };
-  actors.set(s, a);
-  return a;
-}
-
-const sideOf = (k: "a" | "b") => (k === "a" ? A : B);
-const hashOf = (s: string) =>
+const _sideOf = (k: "a" | "b") => (k === "a" ? A : B);
+const _hashOf = (s: string) =>
   createHash("sha256").update(s).digest("hex").slice(0, 16);
 const hostOf = (origin: string) => new URL(origin).host;
 const STAGING_ONLY = "needs the dispatch Worker and staging DNS";
-
-describe("content host", () => {
-  const APP_ROUTES = [
-    "/api/v1/me",
-    "/api/v1/artifacts",
-    "/api/v1/tokens",
-    "/api/v1/settings",
-    "/mcp",
-  ];
-  for (const k of ["a", "b"] as const) {
-    it(`${k}: never serves app routes, with the install's own session or PAT`, async () => {
-      const s = sideOf(k);
-      // Success leg: the same credential works on the app host.
-      for (const cred of [s.cookie, s.pat]) {
-        const r = await send(
-          new Request(`${s.t.app}/api/v1/me`, withCred(cred)),
-        );
-        const b = await readBody(r);
-        if (r.status !== 200)
-          throw new Error(`app host /api/v1/me: ${describeRes(r, b)}`);
-      }
-      for (const path of APP_ROUTES)
-        for (const cred of [s.cookie, s.pat]) {
-          const r = await send(
-            new Request(`${s.t.content}${path}`, withCred(cred)),
-          );
-          if (!fromContentApp(r))
-            throw new Error(
-              `content ${path}: not answered by the content app (status ${r.status})`,
-            );
-          await expectRefused(r, s.t);
-        }
-    });
-
-    it(`${k}: ignores cookies`, async () => {
-      const s = sideOf(k);
-      const other = k === "a" ? B : A;
-      // An html throwaway: served as stored, no renderer needed.
-      const w = await createThrowaway(s.t, s.pat);
-      made.set(s, [...(made.get(s) ?? []), w.id]);
-      const { res, text } = await call(
-        apiReq(
-          s.t,
-          s.pat,
-          "GET",
-          `/api/v1/artifacts/${encodeURIComponent(w.id)}/content-url`,
-        ),
-        `${s.t.name} content-url`,
-      );
-      const url = (parseJson(res, text, "content-url") as { url?: unknown })
-        .url;
-      const u = typeof url === "string" ? new URL(url) : null;
-      // Hostname only: under ENVIRONMENT=dev the server's content origin has no port.
-      if (!u || u.hostname !== new URL(s.t.content).hostname)
-        throw new Error(`${s.t.name} content-url: not on its content host`);
-      const signed = `${s.t.content}${u.pathname}${u.search}`;
-      for (const target of [signed, `${s.t.content}/robots.txt`]) {
-        const seen = new Set<string>();
-        let first = "";
-        for (const cred of [{ kind: "none" } as Cred, s.cookie, other.cookie]) {
-          const r = await send(new Request(target, withCred(cred)));
-          const b = await readBody(r);
-          if (r.headers.getSetCookie().length)
-            throw new Error("content host set a cookie");
-          if (r.status !== 200)
-            throw new Error(`content request: ${describeRes(r, b)}`);
-          const key = `${r.status} ${hashOf(b)}`;
-          if (!first) first = key;
-          seen.add(key);
-        }
-        if (seen.size !== 1)
-          throw new Error(
-            `a Cookie header changed the content response (${[...seen].join(" / ")})`,
-          );
-      }
-    });
-  }
-});
 
 /** The dispatch Worker's (and the server's foreign-host) generic 404. */
 async function expectGeneric404(r: Response, what: string): Promise<void> {
@@ -253,81 +92,6 @@ const healthzId = async (r: Response): Promise<unknown> => {
 };
 
 describe("mapping integrity", () => {
-  it("X-Forwarded-Host set to the other install is ignored", async () => {
-    const xfh = (t: Target) => hostOf((t === T.a ? T.b : T.a).app);
-    for (const t of [T.a, T.b]) {
-      const r = await fetchT(`${t.app}/healthz`, {
-        redirect: "manual",
-        headers: { "x-forwarded-host": xfh(t) },
-      });
-      if ((await healthzId(r)) !== t.installId)
-        throw new Error(
-          `${t.name} /healthz with X-Forwarded-Host: not its own installId`,
-        );
-    }
-    await crossCheck(
-      (cred, t) =>
-        new Request(
-          `${t.app}/api/v1/me`,
-          withCred(cred, { headers: { "x-forwarded-host": xfh(t) } }),
-        ),
-      { a: T.a, b: T.b, credA: A.cookie, credB: B.cookie },
-    );
-  });
-
-  it("a host that is neither APP_HOST nor CONTENT_HOST gets the server's own 404", async (ctx) => {
-    if (T.mode === "staging") {
-      // Platform's test mapping: HOSTS sends strayHost to an rl install that
-      // serves neither name. The inventory proves the request reaches that
-      // install, so the 404 is the server's, not the dispatch Worker's.
-      const stray = T.strayHost;
-      if (!stray || !T.inventory)
-        return proof(
-          ctx,
-          "unproven-live",
-          stray
-            ? noInventoryReason()
-            : "needs strayHost and the inventory in REDLINE_TARGETS",
-        );
-      const mapped = (await inventory(
-        `/hosts?host=${encodeURIComponent(stray)}`,
-      )) as { installId?: unknown };
-      const t = [T.a, T.b].find((x) => x.installId === mapped.installId);
-      if (!t)
-        throw new Error("strayHost: HOSTS doesn't map it to rl-a or rl-b");
-      const cred = t === T.a ? A.cookie : B.cookie;
-      for (const [path, c] of [
-        ["/healthz", null],
-        ["/api/v1/me", cred],
-      ] as const) {
-        const r = await fetchT(
-          `https://${stray}${path}`,
-          c ? withCred(c) : { redirect: "manual" },
-        );
-        await expectGeneric404(r, `${t.name} via strayHost ${path}`);
-      }
-      return;
-    }
-    // Local mode reaches each server directly: a stray name, and the other
-    // install's hosts, sent to this install's port.
-    for (const t of [T.a, T.b]) {
-      const o = t === T.a ? T.b : T.a;
-      const port = new URL(t.app).port;
-      for (const host of [
-        `redline-stray.app.localhost:${port}`,
-        hostOf(o.app),
-        hostOf(o.content),
-      ]) {
-        const r = await rawRequest({
-          url: `${t.app}/healthz`,
-          headers: new Headers(),
-          host,
-        });
-        await expectGeneric404(r, `${t.name} with a foreign Host`);
-      }
-    }
-  });
-
   it("HOSTS maps each install's hosts to its own id, and no host to two", async (ctx) => {
     if (T.mode !== "staging") return proof(ctx, "staging-only", STAGING_ONLY);
     for (const t of [T.a, T.b]) {
@@ -440,24 +204,6 @@ describe("unmapped host", () => {
         await edge(n, n, { "x-forwarded-host": hostOf(T.b.app) }),
         "unmapped with X-Forwarded-Host B",
       );
-    }
-  });
-
-  it("A's host spelled differently (case, trailing dot, :443) never reaches another install", async (ctx) => {
-    if (T.mode !== "staging") return proof(ctx, "staging-only", STAGING_ONLY);
-    // The dispatch Worker normalizes these to A's own host (hostOf in
-    // apps/dispatch), so A answering is allowed; B or a 5xx never is.
-    const h = hostOf(T.a.app);
-    for (const host of [h.toUpperCase(), `${h}.`, `${h}:443`]) {
-      const r = await edge(h, host);
-      if (r.status === 404) {
-        await expectGeneric404(r, `A as ${host}`);
-        continue;
-      }
-      if ((await healthzId(r)) !== T.a.installId)
-        throw new Error(
-          `A's host as a variant: answered by another install or failed (status ${r.status})`,
-        );
     }
   });
 
@@ -647,143 +393,4 @@ describe("cross-site isolation", () => {
       );
     if (notes.length) return proof(ctx, "unproven-live", notes.join("; "));
   });
-
-  it("state-changing app requests without X-OA-Request are refused, and accepted with it", async () => {
-    for (const s of [A, B]) {
-      const a = await csrfActor(s);
-      let failure: unknown = null;
-      try {
-        await csrfWrites(a);
-      } catch (e) {
-        failure = e;
-      }
-      // Always revoke the PAT minted by the tokens write; a live one left
-      // behind fails the case.
-      try {
-        await revokeTokens(a, "redline-csrf");
-      } catch (e) {
-        failure ??= e;
-      }
-      if (failure) throw failure;
-    }
-  });
 });
-
-async function csrfWrites(s: Actor): Promise<void> {
-  const t = s.t;
-  const w = await createThrowaway(t, s.pat, { capabilities: { db: true } });
-  s.made.push(w.id);
-  const art = `/api/v1/artifacts/${encodeURIComponent(w.id)}`;
-  const read = async (path: string) => {
-    const r = await send(apiReq(t, s.pat, "GET", path));
-    return `${r.status}\n${await readBody(r)}`;
-  };
-  const writes: {
-    method: string;
-    path: string;
-    body?: unknown;
-    state: string;
-  }[] = [
-    {
-      method: "POST",
-      path: "/api/v1/artifacts",
-      body: { title: "redline-csrf", format: "html", content: "<p>x</p>" },
-      state: "/api/v1/artifacts",
-    },
-    {
-      method: "PATCH",
-      path: art,
-      body: { title: "redline-csrf-patched" },
-      state: art,
-    },
-    {
-      method: "PUT",
-      path: `${art}/data/c/csrf`,
-      body: { v: 1 },
-      state: `${art}/data/c/csrf`,
-    },
-    {
-      method: "POST",
-      path: "/api/v1/tokens",
-      body: { label: "redline-csrf" },
-      state: "/api/v1/tokens",
-    },
-    { method: "DELETE", path: art, state: art },
-  ];
-  for (const wr of writes) {
-    const init = (csrf: boolean) => {
-      const headers: Record<string, string> = {};
-      if (csrf) headers["x-oa-request"] = "1";
-      if (wr.body !== undefined) headers["content-type"] = "application/json";
-      return new Request(
-        `${t.app}${wr.path}`,
-        withCred(s.cookie, {
-          method: wr.method,
-          headers,
-          ...(wr.body !== undefined ? { body: JSON.stringify(wr.body) } : {}),
-        }),
-      );
-    };
-    const before = await read(wr.state);
-    const r = await send(init(false));
-    const rb = await readBody(r);
-    let code: unknown;
-    try {
-      code = (JSON.parse(rb) as { error?: { code?: unknown } }).error?.code;
-    } catch {
-      code = undefined;
-    }
-    if (r.status !== 403 || code !== "csrf")
-      throw new Error(
-        `${t.name} ${wr.method} without X-OA-Request: ${describeRes(r, rb)}`,
-      );
-    if ((await read(wr.state)) !== before)
-      throw new Error(
-        `${t.name} ${wr.method} without X-OA-Request changed state`,
-      );
-    const ok = await send(init(true));
-    const ob = await readBody(ok);
-    if (ok.status < 200 || ok.status > 299)
-      throw new Error(
-        `${t.name} ${wr.method} with X-OA-Request: ${describeRes(ok, ob)}`,
-      );
-    if (wr.method === "POST" && wr.path === "/api/v1/artifacts") {
-      const id = (JSON.parse(ob) as { id?: unknown }).id;
-      if (typeof id === "string") s.made.push(id);
-    }
-  }
-}
-
-/** Revokes every token of `s`'s user labelled `label`; throws unless all are gone. */
-async function revokeTokens(
-  s: Pick<Side, "t" | "pat">,
-  label: string,
-): Promise<void> {
-  const t = s.t;
-  const list = async () => {
-    const r = await send(apiReq(t, s.pat, "GET", "/api/v1/tokens"));
-    const b = await readBody(r);
-    if (r.status !== 200)
-      throw new Error(`${t.name} list tokens: ${describeRes(r, b)}`);
-    const raw = parseJson(r, b, `${t.name} list tokens`);
-    const all = Array.isArray(raw)
-      ? raw
-      : (raw as { tokens?: unknown } | null)?.tokens;
-    if (!Array.isArray(all)) throw new Error(`${t.name} list tokens: no list`);
-    return (all as { id?: unknown; label?: unknown }[]).filter(
-      (tk) => tk.label === label,
-    );
-  };
-  for (const tk of await list()) {
-    if (typeof tk.id !== "string")
-      throw new Error(`${t.name}: a ${label} token has no id`);
-    const r = await send(
-      apiReq(t, s.pat, "DELETE", `/api/v1/tokens/${encodeURIComponent(tk.id)}`),
-    );
-    const b = await readBody(r);
-    if (r.status < 200 || r.status > 299)
-      throw new Error(`${t.name} revoke ${label}: ${describeRes(r, b)}`);
-  }
-  if ((await list()).length)
-    throw new Error(`${t.name}: a ${label} token is still live`);
-}
