@@ -1171,11 +1171,12 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
 
   it("an earlier wait that ran out never hides a later Fleet done for the same tag: the earliest success is the finish", () => {
     const later = laterRun(4, "05:30:00", "05:39:39");
+    // The fleet's start is the newest successful wake.
     const done = {
-      deployEnd: D("05:01:00"),
+      deployEnd: D("05:30:00"),
       fleet: {
         state: "done",
-        startedAt: D("05:01:00"),
+        startedAt: D("05:30:00"),
         doneAt: D("05:39:39"),
         url: `${RUNS}4`,
         exact: false,
@@ -1196,7 +1197,8 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       state: "done",
       endedAt: D("05:39:39"),
     });
-    expect(row(t, "prod_deploy")?.endedAt).toBe(D("05:01:00"));
+    // The newest run decides the deploy: done at its wake.
+    expect(row(t, "prod_deploy")?.endedAt).toBe(D("05:30:00"));
     expect(t.e2eTo).toBe(FLEET_UPPER);
     expect(t.doneAt).toBe(D("05:39:39"));
     // A backfill rebuilds from the runs, so it takes the later success too.
@@ -1235,7 +1237,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       doneAt: D("05:39:39"),
       e2e: 77.9,
       e2eTo: FLEET_UPPER,
-      stages: { prod_deploy: 4.8, fleet: 38.7 },
+      stages: { prod_deploy: 4.8, fleet: 9.7 },
     });
     // History from before e2eTo also ran to the prod deploy.
     const { e2eTo: _, ...old } = recorded;
@@ -1898,10 +1900,7 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
 
   for (const wake of ["failure", "cancelled"] as const)
     it(`a ${wake} wake fails the deploy, anchors no fleet start, and is a failed-stage comment with --failed`, () => {
-      expect(fleetStep([run(wake)])).toEqual({
-        wakeFailed: run(wake),
-        fleet: { state: "none" },
-      });
+      expect(fleetStep([run(wake)])).toEqual({ fleet: { state: "none" } });
       const t = tlOf(run(wake));
       expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
         state: "red",
@@ -1945,7 +1944,7 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
 
   it("a wake skipped because the job failed before it: the run's own failure is the one alert", () => {
     const r = run("skipped", "failure");
-    expect(fleetStep([r]).wakeFailed).toBeUndefined();
+    expect(fleetStep([r])).toEqual({ fleet: { state: "none" } });
     const t = tlOf(r);
     expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
       state: "red",
@@ -1969,7 +1968,112 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
       url: `${URL}1`,
     };
     expect(fleetStep([failed, ok]).deployEnd).toBe(D("12:37:17"));
-    expect(fleetStep([failed, ok]).wakeFailed).toBeUndefined();
+  });
+
+  // The Prover's recovery cases (comment 7194336736): two prod deploys of the
+  // tag, the first one's wake failed. The newest run decides.
+  const second = (o: Partial<Run>, wake?: "success" | "skipped"): Run => ({
+    ...run(wake ?? "success", "success"),
+    id: RUN + 1,
+    createdAt: D("12:55:00"),
+    startedAt: D("12:55:00"),
+    updatedAt: D("12:59:20"),
+    url: `${URL}1`,
+    ...(wake
+      ? {}
+      : {
+          jobs: [
+            {
+              name: "deploy",
+              status: "in_progress",
+              conclusion: null,
+              steps: [
+                st(
+                  "Read the fleet finish of earlier releases",
+                  "12:56:00",
+                  "12:56:01",
+                ),
+              ],
+            },
+          ],
+        }),
+    ...o,
+  });
+  const prodRow = (rs: Run[]) =>
+    timeline({
+      release: { tag: "v0.251.0", publishedAt: D("11:12:34") },
+      runs: [publish, ...rs],
+      prs: [],
+      mergedAt: D("10:03:10"),
+      config,
+      now: D("13:00:00"),
+    }).stages.find((x) => x.name === "prod_deploy");
+  const alerts = (rs: Run[]) =>
+    stuck(
+      [
+        timeline({
+          release: { tag: "v0.251.0", publishedAt: D("11:12:34") },
+          runs: [publish, ...rs],
+          prs: [],
+          mergedAt: D("10:03:10"),
+          config,
+          now: D("13:00:00"),
+        }),
+      ],
+      config,
+    ).filter((o) => o.stage === "prod_deploy" && o.kind === "failed");
+
+  it("a newer run still in progress after a failed wake is running, not failed", () => {
+    const rs = [
+      run("failure"),
+      second({ status: "in_progress", conclusion: null }),
+    ];
+    expect(prodRow(rs)).toMatchObject({
+      state: "current",
+      runId: RUN + 1,
+      url: `${URL}1`,
+      startedAt: D("12:33:28"),
+    });
+    expect(alerts(rs)).toEqual([]);
+  });
+
+  it("a newer green run with its wake skipped on purpose after a failed wake is done, not failed", () => {
+    const rs = [run("failure"), second({}, "skipped")];
+    expect(prodRow(rs)).toMatchObject({
+      state: "done",
+      runId: RUN + 1,
+      endedAt: D("12:59:20"),
+    });
+    expect(alerts(rs)).toEqual([]);
+  });
+
+  it("a newer run that woke the fleet clears an older failed wake: done at its own wake", () => {
+    const woke = {
+      ...second({}, "success"),
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [st(FLEET_WAKE_STEP, "12:58:00", "12:58:01")],
+        },
+      ],
+    };
+    expect(prodRow([run("failure"), woke])).toMatchObject({
+      state: "done",
+      runId: RUN + 1,
+      endedAt: D("12:58:00"),
+    });
+    expect(fleetStep([run("failure"), woke]).deployEnd).toBe(D("12:58:00"));
+    expect(alerts([run("failure"), woke])).toEqual([]);
+  });
+
+  it("a newer failed run after an older green one is failed, with the newer run's id", () => {
+    const rs = [
+      run("success"),
+      second({ status: "completed", conclusion: "failure" }, "skipped"),
+    ];
+    expect(prodRow(rs)).toMatchObject({ state: "red", runId: RUN + 1 });
+    expect(alerts(rs).map((o) => o.runId)).toEqual([RUN + 1]);
   });
 });
 
