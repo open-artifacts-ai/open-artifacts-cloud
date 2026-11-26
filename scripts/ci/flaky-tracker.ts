@@ -27,8 +27,10 @@
 // with sightings in two or more different runs within the last 7 days,
 // counting this one. The sightings live in one open issue per repo labelled
 // `flaky-sightings` (the store): each tracker run that finds new sightings
-// adds one comment with a readable list and, last, the bot's marker block
-// holding one `sighting: <time> <key> <run>/<attempt>` line per test. The
+// adds one comment (more when one would pass COMMENT_MAX characters) with a
+// readable list and, last, the bot's marker block holding the run
+// (`run: <id>/<attempt that passed>`) and one
+// `sighting: <time> <key> <run>/<attempt>` line per test. The
 // store is read with `since` = 7 days ago, so a read is a page or two however
 // old the issue gets, and only comments by github-actions[bot] count, so a
 // person's comment can't add a sighting. Past MAX_STORE_COMMENTS comments the
@@ -66,7 +68,14 @@
 // flaky-tracker.yml's workflows and read its jobs (named `<caller job> /
 // t19`, `<caller job> / redline`) the same way. Not built yet.
 //
+// Reconcile: GitHub keeps a bounded queue of pending runs per concurrency
+// group, and a dropped tracker run would lose its sightings. So the same
+// workflow also runs hourly with --reconcile (see reconcile()): it tracks
+// every run of the last RECONCILE_HOURS hours that passed after a failed
+// attempt and that the store doesn't hold yet, by the same rules and code.
+//
 // Usage: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
+//        node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --reconcile
 // Needs GH_TOKEN (actions: read, contents: read, issues: write).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -88,6 +97,10 @@ export const TWICE_NOTE = "fails twice in 7 days";
 export const MAX_ISSUES_PER_RUN = 5;
 /** A store with more comments than this is closed and a new one opened. */
 export const MAX_STORE_COMMENTS = 2000;
+/** The longest store comment written: GitHub refuses one over 65536. */
+export const COMMENT_MAX = 60000;
+/** The longest test title or file shown in a store comment. */
+const STORE_TEXT_MAX = 1000;
 /** Job and attempt conclusions that count as a failed attempt. */
 const FAILED = new Set(["failure", "timed_out"]);
 /** Tests named in a summary issue; the rest are counted. */
@@ -768,34 +781,66 @@ const SIGHTING_RE =
 const testLine = (f: Failure) =>
   `${SUITE_NAME[f.suite]}: ${codeSpan(inert(f.title))}${f.file ? ` in ${codeSpan(inert(f.file))}` : ""}`;
 
-/** The store comment for this run's new sightings. */
+/** Untrusted text cut to `n` characters, after it was made inert. */
+const clip = (s: string, n: number) =>
+  s.length > n ? `${s.slice(0, n - 3)}...` : s;
+
+const storeTestLine = (f: Failure) =>
+  `${SUITE_NAME[f.suite]}: ${codeSpan(clip(inert(f.title), STORE_TEXT_MAX))}${f.file ? ` in ${codeSpan(clip(inert(f.file), STORE_TEXT_MAX))}` : ""}`;
+
+const storeRow = (run: RunInfo, x: Found) =>
+  `- ${storeTestLine(x.f)}, failed on ${runLink(run, x.sighting.attempt)}`;
+const storeMark = (x: Found): [string, string] => [
+  "sighting",
+  sightingLine(keyOf(x.f.id), x.sighting).slice("sighting: ".length),
+];
+
+/** One store comment for these of this run's new sightings. */
 export function storeComment(run: RunInfo, fresh: Found[]): string {
   return [
     `${runLabel(run)}, run ${run.runId}: failed, then passed on attempt ${run.attempt} (${runLink(run, run.attempt)}).`,
     "",
-    ...fresh.map(
-      (x) =>
-        `- ${testLine(x.f)}, failed on ${runLink(run, x.sighting.attempt)}`,
-    ),
+    ...fresh.map((x) => storeRow(run, x)),
     "",
     markerBlock([
       ["kind", "sightings"],
       ["run", `${run.runId}/${run.attempt}`],
-      ...fresh.map((x): [string, string] => [
-        "sighting",
-        sightingLine(keyOf(x.f.id), x.sighting).slice("sighting: ".length),
-      ]),
+      ...fresh.map(storeMark),
     ]),
   ].join("\n");
+}
+
+/**
+ * The store comments for this run's new sightings, split so each stays under
+ * COMMENT_MAX characters (GitHub refuses a comment over 65536). Each is a
+ * whole comment with its own marker block, so each is read on its own.
+ */
+export function storeComments(run: RunInfo, fresh: Found[]): string[] {
+  const base = storeComment(run, []).length;
+  const out: string[] = [];
+  let part: Found[] = [];
+  let size = base;
+  for (const x of fresh) {
+    // A row and its marker line, each with its newline.
+    const add =
+      storeRow(run, x).length + 1 + storeMark(x).join(": ").length + 1;
+    if (part.length && size + add >= COMMENT_MAX) {
+      out.push(storeComment(run, part));
+      part = [];
+      size = base;
+    }
+    part.push(x);
+    size += add;
+  }
+  if (part.length) out.push(storeComment(run, part));
+  return out;
 }
 
 /**
  * The sightings per test key in the store comments: only comments by the
  * bot, and only their trailing marker block.
  */
-export function parseStore(
-  comments: { user: string; body: string }[],
-): Map<string, Sighting[]> {
+export function parseStore(comments: StoreComment[]): Map<string, Sighting[]> {
   const out = new Map<string, Sighting[]>();
   for (const c of comments) {
     if (c.user !== STORE_AUTHOR) continue;
@@ -853,11 +898,17 @@ function createStore(exec: Exec, repo: string): number {
  * comments is closed with a note pointing at a new one, which is then written;
  * the old one is still read.
  */
-export function openStore(
+type StoreIssue = Issue & { state: string; closedAt?: string | null };
+
+/**
+ * The store issues, oldest first, and the ones to read: open, or closed
+ * within the window. Reads only.
+ */
+function storeIssues(
   exec: Exec,
   repo: string,
   nowMs: number,
-): { write: number; read: number[]; notes: string[] } {
+): { all: StoreIssue[]; read: number[] } {
   const since = nowMs - WINDOW_DAYS * DAY_MS;
   const all = (
     JSON.parse(
@@ -875,13 +926,22 @@ export function openStore(
         "--limit",
         "50",
       ]),
-    ) as (Issue & { state: string; closedAt?: string | null })[]
+    ) as StoreIssue[]
   )
     .filter((i) => kindOf(i.body) === "store")
     .sort((a, b) => a.number - b.number);
   const read = all
     .filter((i) => i.state === "OPEN" || Date.parse(i.closedAt ?? "") >= since)
     .map((i) => i.number);
+  return { all, read };
+}
+
+export function openStore(
+  exec: Exec,
+  repo: string,
+  nowMs: number,
+): { write: number; read: number[]; notes: string[] } {
+  const { all, read } = storeIssues(exec, repo, nowMs);
   const open = all.filter((i) => i.state === "OPEN").pop();
   if (!open) {
     const n = createStore(exec, repo);
@@ -920,12 +980,15 @@ export function openStore(
   };
 }
 
-function readStore(
+type StoreComment = { user: string; body: string };
+
+/** The store's comments within the window, by anyone (callers filter). */
+function storeCommentsIn(
   exec: Exec,
   repo: string,
   issues: number[],
   nowMs: number,
-): Map<string, Sighting[]> {
+): StoreComment[] {
   const since = new Date(nowMs - WINDOW_DAYS * DAY_MS).toISOString();
   const comments: { user: string; body: string }[] = [];
   for (const n of issues) {
@@ -942,7 +1005,23 @@ function readStore(
       comments.push({ user, body });
     }
   }
-  return parseStore(comments);
+  return comments;
+}
+
+/**
+ * The runs the store already holds, as `<run id>/<attempt>` (the attempt that
+ * passed), from the bot's sightings comments' marker blocks only.
+ */
+export function storedRuns(comments: StoreComment[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "sightings") continue;
+    const r = m.get("run")?.[0] ?? "";
+    if (/^\d{1,20}\/\d{1,4}$/.test(r)) out.add(r);
+  }
+  return out;
 }
 
 export type Done = {
@@ -1039,12 +1118,14 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   // nothing.
   const store = openStore(exec, run.repo, o.nowMs);
   notes.push(...store.notes);
-  const stored = readStore(exec, run.repo, store.read, o.nowMs);
+  const stored = parseStore(
+    storeCommentsIn(exec, run.repo, store.read, o.nowMs),
+  );
   const fresh = tests.filter(
     (t) =>
       !(stored.get(keyOf(t.f.id)) ?? []).some((s) => s.run === t.sighting.run),
   );
-  if (fresh.length)
+  for (const body of storeComments(run, fresh))
     gh(
       exec,
       [
@@ -1054,7 +1135,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
         "--repo",
         run.repo,
         "--body",
-        storeComment(run, fresh),
+        body,
       ],
       { write: true },
     );
@@ -1196,25 +1277,32 @@ const realExec: Exec = (cmd, args) => {
   };
 };
 
-/** The run the tracker was started for, from its arguments. */
-export function runFromArgs(argv: string[]): RunInfo {
-  const repo = flag(argv, "repo");
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("bad --repo");
-  const workflow = flag(argv, "workflow") as Workflow;
+const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
+
+/** A run to track, checked: the same rules for an event and a reconcile. */
+export function runInfo(o: {
+  repo: string;
+  workflow: string;
+  runId: number;
+  attempt: number;
+  headSha: string;
+  title: string;
+}): RunInfo {
+  const { repo, runId, attempt } = o;
+  if (!REPO_RE.test(repo)) throw new Error("bad --repo");
+  const workflow = o.workflow as Workflow;
   if (!WORKFLOWS.includes(workflow)) throw new Error("bad --workflow");
-  const runId = Number(flag(argv, "run-id"));
-  const attempt = Number(flag(argv, "attempt"));
   if (!Number.isSafeInteger(runId) || runId < 1)
     throw new Error("bad --run-id");
   if (!Number.isSafeInteger(attempt) || attempt < 2)
     throw new Error("bad --attempt: the tracker needs attempt 2 or later");
   let ref: string;
   if (workflow === "redline-staging") {
-    ref = TITLE_RE.exec(flag(argv, "title"))?.[1] ?? "";
+    ref = TITLE_RE.exec(o.title)?.[1] ?? "";
     if (!TAG_RE.test(ref))
       throw new Error("the run's title names no release tag");
   } else {
-    ref = flag(argv, "head-sha");
+    ref = o.headSha;
     if (!SHA_RE.test(ref)) throw new Error("bad --head-sha");
   }
   return {
@@ -1227,15 +1315,154 @@ export function runFromArgs(argv: string[]): RunInfo {
   };
 }
 
+/** The run the tracker was started for, from its arguments. */
+export const runFromArgs = (argv: string[]): RunInfo =>
+  runInfo({
+    repo: flag(argv, "repo"),
+    workflow: flag(argv, "workflow"),
+    runId: Number(flag(argv, "run-id")),
+    attempt: Number(flag(argv, "attempt")),
+    headSha: flag(argv, "head-sha"),
+    title: flag(argv, "title"),
+  });
+
+// ---- The reconcile ----
+
+/** How far back the hourly reconcile looks, by the run's creation time. */
+export const RECONCILE_HOURS = 26;
+/** The watched workflows' files, for the runs API. */
+export const WORKFLOW_FILES: Record<Workflow, string> = {
+  CI: "ci.yml",
+  "redline-staging": "redline-staging.yml",
+};
+
+/** A watched workflow's run, as the reconcile lists it. */
+export type ListedRun = {
+  id: number;
+  attempt: number;
+  name: string;
+  event: string;
+  branch: string;
+  sha: string;
+  title: string;
+  head: string;
+};
+
+/**
+ * The workflow_run path's rules, for a listed run whose latest attempt
+ * succeeded: attempt 2 or later, not from a fork, and redline-staging only
+ * when dispatched on main (a release gate). collect() then reads only the
+ * earlier attempts that failed or timed out on the same head sha.
+ */
+export const eligible = (r: ListedRun, repo: string) =>
+  r.attempt > 1 &&
+  r.head === repo &&
+  (r.name === "CI" ||
+    (r.name === "redline-staging" &&
+      r.event === "workflow_dispatch" &&
+      r.branch === "main"));
+
+function listRuns(
+  exec: Exec,
+  repo: string,
+  workflow: Workflow,
+  nowMs: number,
+): ListedRun[] {
+  const from = new Date(nowMs - RECONCILE_HOURS * 3600 * 1000)
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z");
+  const out = gh(exec, [
+    "api",
+    "--paginate",
+    `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
+    "--jq",
+    '.workflow_runs[] | select(.run_attempt > 1) | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title, (.head_repository.full_name // "")] | @json',
+  ]);
+  return out
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => {
+      const [id, attempt, name, event, branch, sha, title, head] = JSON.parse(
+        l,
+      ) as [number, number, string, string, string, string, string, string];
+      return { id, attempt, name, event, branch, sha, title, head };
+    });
+}
+
+/**
+ * The hourly reconcile: a tracker run GitHub dropped (its queue full, or the
+ * runner gone) leaves a run unrecorded. This lists the watched workflows'
+ * runs created in the last RECONCILE_HOURS hours whose latest attempt passed
+ * after an earlier one, and tracks each the store doesn't hold yet (by run id
+ * and the attempt that passed) with the same code as the event. A run the
+ * store holds adds nothing and bumps nothing. A run that found no test (it
+ * failed outside the tests) writes nothing, so it is read again each hour
+ * until it leaves the window: reads only.
+ */
+export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
+  tracked: { run: RunInfo; done: Done[]; notes: string[] }[];
+  notes: string[];
+  failed: number;
+} {
+  const { exec, repo, nowMs } = o;
+  const notes: string[] = [];
+  const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
+  const runs = listed.filter((r) => eligible(r, repo));
+  if (!runs.length) return { tracked: [], notes, failed: 0 };
+  // Reads only: a store is created only when a run below has a sighting.
+  const { read } = storeIssues(exec, repo, nowMs);
+  const have = storedRuns(storeCommentsIn(exec, repo, read, nowMs));
+  const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
+  let failed = 0;
+  for (const r of runs) {
+    if (have.has(`${r.id}/${r.attempt}`)) {
+      notes.push(`run ${r.id}/${r.attempt}: in the store already`);
+      continue;
+    }
+    try {
+      const run = runInfo({
+        repo,
+        workflow: r.name,
+        runId: r.id,
+        attempt: r.attempt,
+        headSha: r.sha,
+        title: r.title,
+      });
+      tracked.push({ run, ...track({ exec, run, nowMs }) });
+    } catch (e) {
+      // One run's failure never stops the others; the job still fails.
+      failed++;
+      notes.push(`run ${r.id}/${r.attempt}: ${(e as Error).message}`);
+    }
+  }
+  return { tracked, notes, failed };
+}
+
+const runLines = (run: RunInfo, done: Done[], notes: string[]) => [
+  `Flaky tracker, ${runLabel(run)}, run ${run.runId} (passed on attempt ${run.attempt}):`,
+  ...(done.length ? [] : ["  no failed test found in the earlier attempts"]),
+  ...done.map((d) => `  ${d.action} ${d.issue ? `#${d.issue} ` : ""}${d.id}`),
+  ...notes.map((n) => `  note: ${n}`),
+];
+
 function main(argv: string[]) {
-  const run = runFromArgs(argv);
-  const { done, notes } = track({ exec: realExec, run, nowMs: Date.now() });
-  const lines = [
-    `Flaky tracker, ${runLabel(run)}, run ${run.runId} (passed on attempt ${run.attempt}):`,
-    ...(done.length ? [] : ["  no failed test found in the earlier attempts"]),
-    ...done.map((d) => `  ${d.action} ${d.issue ? `#${d.issue} ` : ""}${d.id}`),
-    ...notes.map((n) => `  note: ${n}`),
-  ];
+  let lines: string[];
+  let failed = 0;
+  if (argv.includes("--reconcile")) {
+    const repo = flag(argv, "repo");
+    if (!REPO_RE.test(repo)) throw new Error("bad --repo");
+    const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
+    failed = r.failed;
+    lines = [
+      `Flaky tracker reconcile, last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
+      ...r.notes.map((n) => `  note: ${n}`),
+      ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
+    ];
+  } else {
+    const run = runFromArgs(argv);
+    const { done, notes } = track({ exec: realExec, run, nowMs: Date.now() });
+    lines = runLines(run, done, notes);
+  }
   console.log(lines.join("\n"));
   const summary = process.env.GITHUB_STEP_SUMMARY;
   // The step summary is markdown and the ids are untrusted: a fence longer
@@ -1245,6 +1472,8 @@ function main(argv: string[]) {
     Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)),
   );
   if (summary) appendFileSync(summary, `${fence}\n${text}\n${fence}\n`);
+  if (failed)
+    throw new Error(`${failed} run(s) failed to track; see the notes`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

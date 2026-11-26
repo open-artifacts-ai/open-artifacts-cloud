@@ -12,6 +12,10 @@
 # workflow_run can't see another repo's runs.
 # Runs from forks (a PR from another repo) are skipped: their logs are
 # written by code nobody here reviewed. The script checks it again.
+# Hourly, the same job reconciles: it tracks every run of the watched
+# workflows from the last 26 hours that passed after a failed attempt and is
+# not in the store yet (same rules, same code), so a tracker run GitHub
+# dropped loses no sighting. A run already in the store adds nothing.
 # The default token only: it reads the run's jobs and logs and the commits of
 # the test files, and writes issues. No App, no secret, no Environment.
 #
@@ -24,27 +28,31 @@ on:
   workflow_run:
     workflows: [CI, redline-staging]
     types: [completed]
+  schedule:
+    - cron: "17 * * * *"
 permissions: {}
 jobs:
   track:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.run_attempt > 1 &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       (github.event.workflow_run.name == 'CI' ||
       (github.event.workflow_run.name == 'redline-staging' &&
       github.event.workflow_run.event == 'workflow_dispatch' &&
-      github.event.workflow_run.head_branch == 'main'))
+      github.event.workflow_run.head_branch == 'main')))
     # One group per repo, with no per-run part: tracker runs never overlap,
     # so two runs can't both open the same issue or store, or bump from a stale
     # body. On the job, so a skipped run (most CI completions) joins no group
-    # and can't displace a pending one. GitHub keeps one pending run per group:
-    # a third tracker run while one runs and one waits replaces the waiting
-    # one, and that run's flakes are not recorded (rare: it needs three
-    # rerun-then-pass runs within one tracker run, about a minute).
+    # and can't displace a pending one. queue: max keeps up to 100 pending
+    # runs in order instead of only the newest; GitHub cancels any past that,
+    # and the hourly reconcile tracks their runs. It can't be combined with
+    # cancel-in-progress: true.
     concurrency:
       group: flaky-tracker
       cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -61,6 +69,7 @@ jobs:
         with:
           node-version-file: .nvmrc
       - name: Record the flaky tests
+        if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW: ${{ github.event.workflow_run.name }}
@@ -69,3 +78,8 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           TITLE: ${{ github.event.workflow_run.display_title }}
         run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --run-id "$RUN_ID" --attempt "$ATTEMPT" --head-sha "$HEAD_SHA" --title "$TITLE"
+      - name: Reconcile runs the tracker missed
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile

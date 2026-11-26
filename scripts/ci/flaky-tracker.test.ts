@@ -10,9 +10,11 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
   bumpedBody,
+  COMMENT_MAX,
   caseName,
   codeSpan,
   e2ePackage,
+  eligible,
   escapeId,
   type Failure,
   inert,
@@ -21,6 +23,7 @@ import {
   issueTitle,
   keyOf,
   LABEL,
+  type ListedRun,
   MAX_ISSUES_PER_RUN,
   MAX_STORE_COMMENTS,
   markerBlock,
@@ -33,8 +36,10 @@ import {
   parseStore,
   parseVitest,
   plan,
+  RECONCILE_HOURS,
   type RunInfo,
   readMarkers,
+  reconcile,
   runFromArgs,
   type Sighting,
   STORE_AUTHOR,
@@ -42,6 +47,8 @@ import {
   STORE_LABEL,
   sightingLine,
   storeComment,
+  storeComments,
+  storedRuns,
   TWICE_NOTE,
   titleText,
   track,
@@ -593,6 +600,8 @@ function fakeGh(o: {
   // attempt 1's conclusion, and the run's head repository.
   attempt1?: string;
   headRepo?: string;
+  // The reconcile's listing, per workflow file.
+  listed?: Record<string, ListedRun[]>;
 }) {
   let lists = 0;
   const calls: Call[] = [];
@@ -637,6 +646,16 @@ function fakeGh(o: {
             })),
           ],
         }),
+      );
+    const wf = /actions\/workflows\/([\w.-]+)\/runs\?/.exec(a);
+    if (wf)
+      return ok(
+        (o.listed?.[wf[1] as string] ?? [])
+          .map(
+            (r) =>
+              `${JSON.stringify([r.id, r.attempt, r.name, r.event, r.branch, r.sha, r.title, r.head])}\n`,
+          )
+          .join(""),
       );
     const log = /actions\/jobs\/(\d+)\/logs/.exec(a);
     if (log) return ok(jobs[Number(log[1]) - 10]?.log ?? "");
@@ -1162,6 +1181,185 @@ describe("the per-run cap", () => {
   });
 });
 
+describe("store comments stay under GitHub's limit", () => {
+  // 300 failing tests with long titles: about 400 KB of store text.
+  const rows = Array.from({ length: 300 }, (_, i) => ({
+    f: {
+      suite: "t19" as const,
+      id: `t19:e2e/staging/rl-a/t${i}.spec.ts:case ${i} ${"x".repeat(1200)}`,
+      title: `case ${i} ${"x".repeat(1200)}`,
+      file: `e2e/staging/rl-a/t${i}.spec.ts`,
+    },
+    sighting: s900,
+  }));
+
+  it(`splits 300 failing tests into comments under ${COMMENT_MAX} characters, each read back whole`, () => {
+    const cs = storeComments(run, rows);
+    expect(cs.length).toBeGreaterThan(1);
+    for (const c of cs) {
+      expect(c.length).toBeLessThan(COMMENT_MAX);
+      expect(readMarkers(c)?.get("run")).toEqual(["900/2"]);
+    }
+    const back = parseStore(cs.map((body) => ({ user: STORE_AUTHOR, body })));
+    expect(back.size).toBe(300);
+    for (const x of rows) expect(back.get(keyOf(x.f.id))).toEqual([s900]);
+    expect(
+      storedRuns(cs.map((body) => ({ user: STORE_AUTHOR, body }))),
+    ).toEqual(new Set(["900/2"]));
+  });
+
+  it("keeps one comment when it fits, the same text storeComment writes", () => {
+    expect(storeComments(run, rows.slice(0, 2))).toEqual([
+      storeComment(run, rows.slice(0, 2)),
+    ]);
+    expect(storeComments(run, [])).toEqual([]);
+  });
+
+  it("track writes every part to the store, each under the limit", () => {
+    const log = [
+      "  300 failed",
+      ...rows.map((x) => `    [rl-a] › ${x.f.file}:1:1 › ${x.f.title}`),
+    ].join("\n");
+    const g = fakeGh({ labels: LABELS, jobs: [{ name: "t19", log }] });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toHaveLength(300);
+    const parts = writes(g).filter((c) => c.args[1] === "comment");
+    expect(parts.length).toBeGreaterThan(1);
+    for (const c of parts) expect(bodyOf(c).length).toBeLessThan(COMMENT_MAX);
+    const back = parseStore(
+      parts.map((c) => ({ user: STORE_AUTHOR, body: bodyOf(c) })),
+    );
+    expect(back.size).toBe(300);
+  });
+});
+
+describe("reconcile", () => {
+  const gate: ListedRun = {
+    id: 900,
+    attempt: 2,
+    name: "redline-staging",
+    event: "workflow_dispatch",
+    branch: "main",
+    sha: SHA,
+    title: "redline-staging v0.246.0",
+    head: "o/cloud",
+  };
+  const listed = { "redline-staging.yml": [gate] };
+
+  it("lists the watched workflows' recent runs with small reads", () => {
+    const g = fakeGh({ listed: {} });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
+    const lists = g.calls.map((c) => c.args.join(" "));
+    const from = new Date(NOW - RECONCILE_HOURS * 3600 * 1000)
+      .toISOString()
+      .replace(/\.\d+Z$/, "Z");
+    expect(lists).toHaveLength(2);
+    for (const [i, file] of ["ci.yml", "redline-staging.yml"].entries()) {
+      expect(lists[i]).toContain(
+        `repos/o/cloud/actions/workflows/${file}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
+      );
+      expect(lists[i]).toContain("--jq");
+    }
+    // Nothing to track: no store read, nothing written.
+    expect(writes(g)).toEqual([]);
+  });
+
+  it("records a run the tracker missed, with the same code as the event", () => {
+    const g = fakeGh({ labels: LABELS, listed, stores: storeWith(joins) });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked.map((t) => t.run)).toEqual([run]);
+    expect(r.tracked[0]?.done).toEqual([
+      { action: "create", id: joins.id },
+      { action: "record", id: comments.id },
+    ]);
+    const stored = bodyOf(writes(g).find((c) => c.args[1] === "comment"));
+    expect(stored).toContain(sightingLine(keyOf(joins.id), s900));
+    expect(stored).toContain(sightingLine(keyOf(comments.id), s900));
+    expect(readMarkers(stored)?.get("run")).toEqual(["900/2"]);
+  });
+
+  it("is a no-op for a run already in the store: adds nothing, bumps nothing", () => {
+    const stores = storeWith(joins);
+    stores[0]?.comments.push({
+      user: STORE_AUTHOR,
+      body: storeComment(run, [{ f: joins, sighting: s900 }]),
+    });
+    // Its test's issue is open without run 900: a re-track would bump it.
+    const open = [
+      { number: 5, body: openBody(joins.id, "2026-11-24T10:00:00Z 800/1") },
+    ];
+    const g = fakeGh({ labels: LABELS, listed, stores, open });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.tracked).toEqual([]);
+    expect(r.notes).toEqual(["run 900/2: in the store already"]);
+    expect(writes(g)).toEqual([]);
+    // It never read the run's attempts or logs.
+    expect(g.calls.some((c) => c.args.join(" ").includes("/runs/900"))).toBe(
+      false,
+    );
+  });
+
+  it("does not count a person's comment that claims the run", () => {
+    const g = fakeGh({
+      labels: LABELS,
+      listed,
+      stores: [
+        {
+          number: 3,
+          comments: [
+            {
+              user: "someone",
+              body: storeComment(run, [{ f: joins, sighting: s900 }]),
+            },
+          ],
+        },
+      ],
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.tracked).toHaveLength(1);
+  });
+
+  it("keeps the event's rules: no fork, attempt 2 or later, a release gate only when dispatched on main", () => {
+    const repo = "o/cloud";
+    expect(eligible(gate, repo)).toBe(true);
+    expect(
+      eligible(
+        { ...gate, name: "CI", event: "pull_request", branch: "x" },
+        repo,
+      ),
+    ).toBe(true);
+    expect(eligible({ ...gate, head: "fork/cloud" }, repo)).toBe(false);
+    expect(eligible({ ...gate, attempt: 1 }, repo)).toBe(false);
+    expect(eligible({ ...gate, event: "workflow_call" }, repo)).toBe(false);
+    expect(eligible({ ...gate, event: "schedule" }, repo)).toBe(false);
+    expect(eligible({ ...gate, branch: "feature" }, repo)).toBe(false);
+    expect(eligible({ ...gate, name: "other" }, repo)).toBe(false);
+    const g = fakeGh({
+      labels: LABELS,
+      listed: { "redline-staging.yml": [{ ...gate, head: "fork/cloud" }] },
+    });
+    expect(reconcile({ exec: g.exec, repo, nowMs: NOW }).tracked).toEqual([]);
+    expect(g.calls).toHaveLength(2);
+  });
+
+  it("goes on past a run that fails to track, and counts it", () => {
+    const g = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [{ ...gate, id: 901, title: "no tag" }, gate],
+      },
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(1);
+    expect(r.notes).toEqual([
+      "run 901/2: the run's title names no release tag",
+    ]);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+  });
+});
+
 describe("runFromArgs", () => {
   const base = ["--repo", "o/cloud", "--run-id", "900", "--attempt", "2"];
   it("takes the tag from a release gate's title and the head sha for CI", () => {
@@ -1223,21 +1421,39 @@ describe("flaky-tracker.yml", () => {
     ),
   );
 
-  it("runs after CI and redline-staging, only for a run that passed on a later attempt", () => {
+  it("runs after CI and redline-staging, only for a run that passed on a later attempt, and hourly to reconcile", () => {
     expect(wf.on).toEqual({
       workflow_run: {
         workflows: ["CI", "redline-staging"],
         types: ["completed"],
       },
+      schedule: [{ cron: "17 * * * *" }],
     });
     expect(wf.permissions).toEqual({});
     const cond = String(wf.jobs.track.if).replace(/\s+/g, " ");
     expect(cond).toBe(
-      "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.name == 'CI' || (github.event.workflow_run.name == 'redline-staging' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main'))",
+      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.name == 'CI' || (github.event.workflow_run.name == 'redline-staging' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
     );
   });
 
-  it("serializes tracker runs per repo: one group with no per-run part, never cancelled", () => {
+  it("tracks the event's run on workflow_run and reconciles on the schedule", () => {
+    const steps = wf.jobs.track.steps as {
+      name?: string;
+      if?: string;
+      run?: string;
+    }[];
+    const record = steps.find((s) => s.name === "Record the flaky tests");
+    const recon = steps.find(
+      (s) => s.name === "Reconcile runs the tracker missed",
+    );
+    expect(record?.if).toBe("github.event_name == 'workflow_run'");
+    expect(recon?.if).toBe("github.event_name == 'schedule'");
+    expect(recon?.run).toBe(
+      'node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile',
+    );
+  });
+
+  it("serializes tracker runs per repo: one group with no per-run part, never cancelled, every pending run kept", () => {
     // On the job, so a skipped run joins no group; the only job, so it is the
     // whole workflow's group.
     expect(Object.keys(wf.jobs)).toEqual(["track"]);
@@ -1245,6 +1461,7 @@ describe("flaky-tracker.yml", () => {
     expect(wf.jobs.track.concurrency).toEqual({
       group: "flaky-tracker",
       "cancel-in-progress": false,
+      queue: "max",
     });
     expect(String(wf.jobs.track.concurrency.group)).not.toContain("${{");
   });
