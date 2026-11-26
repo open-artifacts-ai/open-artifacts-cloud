@@ -129,6 +129,8 @@ ALLOW=(
   .github/workflows/flaky-tracker.yml
   scripts/ci/flaky-tracker.ts
   scripts/ci/flaky-tracker.test.ts
+  .github/workflows/release-retry.yml
+  scripts/ci/release-retry.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

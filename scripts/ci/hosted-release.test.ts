@@ -518,9 +518,11 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       neverReads?: boolean;
       createFailsTimes?: number; // release create says "doesn't exist" this often
       releaseExists?: boolean;
+      pinAt?: string; // PUBLIC_PIN at the existing tag's commit
     }) {
       const dir = mkdtempSync(join(tmpdir(), "relcreate-"));
       const log = join(dir, "calls.log");
+      const output = join(dir, "output");
       const fake = [
         "#!/usr/bin/env bash",
         'echo "$*" >> "$LOG"',
@@ -537,6 +539,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         `      echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}'`,
         "    fi ;;",
         '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
+        '  *"repos/o/r/contents/PUBLIC_PIN?ref="*) printf "%s\\n" "$PIN_AT" ;;',
         '  "release view"*) [ -z "${REL_EXISTS:-}" ] || exit 0; grep -q "^release create" "$LOG" && [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] ;;',
         '  "release create"*)',
         '    [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] || { echo "tag v1.2.3 doesn\'t exist" >&2; exit 1; } ;;',
@@ -572,16 +575,21 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
           TAG: "v1.2.3",
           SHA: o.sha,
           PUBLIC_REPO: "p/p",
+          PUB_SHA: "c".repeat(40),
+          PIN_AT: o.pinAt ?? "",
+          GITHUB_OUTPUT: output,
         },
       });
       const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
-      return { status: r.status, out: r.stdout + r.stderr, calls };
+      const outputs = existsSync(output) ? readFileSync(output, "utf8") : "";
+      return { status: r.status, out: r.stdout + r.stderr, calls, outputs };
     }
     it("tag exists at SHA and main has moved: a no-op success", () => {
       const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
       expect(r.status, r.out).toBe(0);
       expect(r.out).toContain("already points at");
       expect(r.calls).not.toContain("-X POST");
+      expect(r.outputs).toBe(`sha=${X}\n`);
     });
     it("tag exists at SHA but SHA left main: fails", () => {
       const r = runCreate({
@@ -593,15 +601,59 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       expect(r.status).toBe(1);
       expect(r.out).toContain("is not on main");
     });
-    it("tag exists at another commit: fails", () => {
+    it("tag exists at another commit that pins another release: fails", () => {
       const r = runCreate({
         tagAt: MAIN,
         main: MAIN,
         compare: "behind",
         sha: X,
+        pinAt: `tag=v1.2.2\nsha=${"c".repeat(40)}`,
       });
       expect(r.status).toBe(1);
-      expect(r.out).toContain("already exists and is not");
+      expect(r.out).toContain("does not pin v1.2.3");
+      expect(r.outputs).toBe("");
+    });
+    it("tag exists at another commit that pins another public sha: fails", () => {
+      const r = runCreate({
+        tagAt: MAIN,
+        main: MAIN,
+        compare: "behind",
+        sha: X,
+        pinAt: `tag=v1.2.3\nsha=${"d".repeat(40)}`,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("does not pin v1.2.3");
+    });
+    it("tag exists at an earlier main commit pinning the same release (v0.246.1): builds that commit", () => {
+      const T = "e".repeat(40);
+      const r = runCreate({
+        tagAt: T,
+        main: MAIN,
+        compare: "behind",
+        sha: MAIN,
+        pinAt: `tag=v1.2.3\nsha=${"c".repeat(40)}`,
+      });
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toContain(`building ${T}`);
+      expect(r.outputs).toBe(`sha=${T}\n`);
+      expect(r.calls).not.toContain("-X POST");
+    });
+    it("tag exists at a commit no longer on main: fails before reading its pin", () => {
+      const r = runCreate({
+        tagAt: "e".repeat(40),
+        main: MAIN,
+        compare: "diverged",
+        sha: MAIN,
+        pinAt: `tag=v1.2.3\nsha=${"c".repeat(40)}`,
+      });
+      expect(r.status).toBe(1);
+      expect(r.out).toContain("is not on main");
+      expect(r.calls).not.toContain("PUBLIC_PIN");
+    });
+    it("mirror's sha output is the tag step's sha, else this run's", () => {
+      expect(jobs.mirror.outputs.sha).toBe(
+        "${{ steps.tag.outputs.sha || github.sha }}",
+      );
     });
     it("no tag and main has moved: fails, creates nothing", () => {
       const r = runCreate({ main: MAIN, compare: "behind", sha: X });
@@ -815,7 +867,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(src).toContain("--lockfile pnpm-lock.yaml");
   });
 
-  it("attaches to this repo's release, once per env, refusing existing assets", () => {
+  it("attaches to this repo's release, once per env, refusing existing assets that differ", () => {
     for (const e of ENVS) {
       const run = runOf(allSteps(`hosted-attach-${e}`));
       expect(run).toContain(`grep '^oa-release-${e}-'`);
@@ -1110,7 +1162,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     });
 
   for (const env of ENVS)
-    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets`, () => {
+    it(`hosted-attach-${env}: contents: write, no key, only its own sign job's outputs, refuses existing assets unless identical`, () => {
       const name = `hosted-attach-${env}`;
       const job = jobs[name];
       const other = env === "prod" ? "staging" : "prod";
@@ -1135,6 +1187,16 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         run.indexOf("gh release upload"),
       );
       expect(run).not.toContain("--clobber");
+      // A rerun passes only when the attached files match this run's, byte for byte.
+      expect(run.indexOf("scripts/ci/assemble-release.mjs")).toBeLessThan(
+        run.indexOf("gh release view"),
+      );
+      expect(run).toContain(
+        `gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-${env}-*'`,
+      );
+      expect(run).toContain(`sha256sum oa-release-${env}-* | sort`);
+      expect(run).toContain('[ "$mine" = "$theirs" ] || {');
+      expect(run).toContain("differ from this run's");
       expect(
         allSteps(name).filter((x) =>
           String(x.uses ?? "").startsWith("actions/setup-node@"),
