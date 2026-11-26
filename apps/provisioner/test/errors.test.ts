@@ -17,8 +17,10 @@ import {
   jobErrorText,
   redactDetail,
   redactEmail,
+  refusalDetail,
   StepRefusal,
   stepError,
+  storedMessage,
 } from "../src/errors.js";
 import { refused } from "../src/recheck.js";
 
@@ -248,6 +250,65 @@ describe("do_step_required (#1343): the one structured value", () => {
     );
     const other = stepError(new ProvisionRefused("x", "invalid_state"));
     expect(errorTextOf(other)).toBe(JOB_ERROR_TEXT.invalid_state);
+  });
+});
+
+describe("refusalDetail (#461): only a terminal refusal has a reason", () => {
+  it("a StepRefusal's detail and a terminal ProvisionRefused's message", () => {
+    expect(refusalDetail(refused("why"))).toBe("why");
+    expect(
+      refusalDetail(
+        new ProvisionRefused("no release", "release_not_published"),
+      ),
+    ).toBe("no release");
+  });
+
+  it("null for a retry, a Cloudflare or internal error, do_step_required, a bare NonRetryableError", () => {
+    expect(
+      refusalDetail(new DoStepRequired("install x: needs 0.2.0", "0.2.0")),
+    ).toBeNull();
+    expect(refusalDetail(new ProvisionRetry("held", "lease_held"))).toBeNull();
+    expect(refusalDetail(new ProvisionRefused("x", "cf_error"))).toBeNull();
+    expect(refusalDetail(new ProvisionRefused("x", "internal"))).toBeNull();
+    expect(refusalDetail(new StepRefusal("internal", "x"))).toBeNull();
+    expect(refusalDetail(new CfError("GET", "/x", 500, "boom"))).toBeNull();
+    expect(refusalDetail(new NonRetryableError("invalid_state"))).toBeNull();
+    expect(refusalDetail(new Error("invalid_state: x"))).toBeNull();
+    expect(refusalDetail("invalid_state")).toBeNull();
+  });
+});
+
+describe("storedMessage (#461)", () => {
+  const text = JOB_ERROR_TEXT.invalid_state;
+
+  it("the fixed text alone without a reason", () => {
+    expect(storedMessage(text, null)).toBe(text);
+    expect(storedMessage(text, "  ")).toBe(text);
+  });
+
+  it("the fixed text first and unchanged, then the reason", () => {
+    expect(storedMessage(text, "google needs AUTH_DOMAINS")).toBe(
+      `${text} Reason: google needs AUTH_DOMAINS`,
+    );
+  });
+
+  it("at most ERROR_MESSAGE_MAX, the fixed text kept whole", () => {
+    const m = storedMessage(text, "r".repeat(1000));
+    expect(m.length).toBe(ERROR_MESSAGE_MAX);
+    expect(m.startsWith(`${text} Reason: r`)).toBe(true);
+    const long = "t".repeat(ERROR_MESSAGE_MAX + 5);
+    expect(storedMessage(long, "why")).toBe(long.slice(0, ERROR_MESSAGE_MAX));
+  });
+
+  it("a request value in the reason is stored only after redactDetail", () => {
+    const m = storedMessage(
+      text,
+      redactDetail(`acmeslug for ${EMAIL} on acme.test`, [
+        "acmeslug",
+        "acme.test",
+      ]),
+    );
+    expect(m).toBe(`${text} Reason: [value] for [email] on [value]`);
   });
 });
 

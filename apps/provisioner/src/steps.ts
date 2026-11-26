@@ -2,9 +2,9 @@
 // each step, `step`, `status = 'running'` and `updated_at`; in its catch,
 // `attempt`, `last_error_code`, `retry_at` and the redacted message, all
 // conditional on the job still being open, so a canceled or settled job is
-// never written back to running. Fixed categories only: a step's error is a
-// job code, and jobs.error_message that code's JOB_ERROR_TEXT (jobErrorText),
-// never an error's text.
+// never written back to running. A step's error is a job code and its
+// fixed text; jobs.error_message is that text (jobErrorText) plus, for a
+// terminal refusal only, its redacted reason (storedMessage, #461).
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { PROVISION_ERROR_CODES, type ProvisionErrorCode } from "@oa/provision";
@@ -16,8 +16,10 @@ import {
   type FailAt,
   failOf,
   redactDetail,
+  refusalDetail,
   StepRefusal,
   stepError,
+  storedMessage,
 } from "./errors.js";
 import { type ProvisionerIo, Transient, transient } from "./provisioner.js";
 // A cycle (workflow imports steps): called only at run time, never at load.
@@ -129,12 +131,13 @@ async function noteFailure(
   config: WorkflowStepConfig | undefined,
   retryIn: number | null = null,
   fail: FailAt | null = null,
+  reason: string | null = null,
 ): Promise<void> {
   const terminal = err instanceof NonRetryableError;
   const code = codeOf(err);
-  // The code's fixed text: a refusal's message can echo request values.
-  // do_step_required's names its step, a checked release version (#1343).
-  const message = errorTextOf(err);
+  // The code's fixed text (do_step_required's names its step, a checked
+  // release version, #1343), then a terminal refusal's redacted reason.
+  const message = storedMessage(errorTextOf(err), terminal ? reason : null);
   const r = { ...DEFAULT_RETRIES, ...(config?.retries ?? {}) };
   const base = typeof r.delay === "function" ? 0 : delayMs(r.delay);
   // retry_at for the next attempt: delay, then doubled (exponential),
@@ -196,7 +199,7 @@ const parsed = (raw: unknown): unknown => {
 /**
  * The request-provided values of a job (best effort): its args, the
  * signup's slug, vars and owner, the owner's email, the install's slug and
- * vars. They are redacted from the failure log line.
+ * vars. They are redacted from the failure log line and a stored reason.
  */
 async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
   const out: string[] = [];
@@ -234,7 +237,8 @@ async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
 /**
  * One console line per step failure: code, step, job id and the error's
  * detail with every request value, email, URL and IP redacted, capped.
- * The Worker's own log only: never D1, the API or the audit log.
+ * Returns a terminal refusal's reason, redacted the same way, for
+ * jobs.error_message (#461); null for any other failure.
  */
 async function logFailure(
   ctx: StepCtx,
@@ -242,8 +246,9 @@ async function logFailure(
   step: string,
   code: string,
   e: unknown,
-): Promise<void> {
+): Promise<string | null> {
   const values = await requestValues(ctx, jobId).catch(() => []);
+  const raw = refusalDetail(e);
   console.warn(
     JSON.stringify({
       evt: "job_step_failed",
@@ -253,6 +258,7 @@ async function logFailure(
       detail: redactDetail(detailOf(e), values),
     }),
   );
+  return raw === null ? null : redactDetail(raw, values);
 }
 
 /** 3.5: a Cloudflare token not active is retried every 15 min, up to 2 h. */
@@ -321,7 +327,7 @@ function stepOnce<T>(
         !(e instanceof NonRetryableError) &&
         codeOf(err) === "token_invalid";
       if (waits) err = new NonRetryableError(TOKEN_WAITING);
-      await logFailure(ctx, jobId, name, codeOf(err), e);
+      const reason = await logFailure(ctx, jobId, name, codeOf(err), e);
       await noteFailure(
         ctx,
         jobId,
@@ -329,6 +335,7 @@ function stepOnce<T>(
         config,
         waits ? delayMs(TOKEN_WAIT) : null,
         failOf(e),
+        waits ? null : reason,
       );
       throw err;
     }

@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_PUBKEY } from "../../../../packages/provision/test/fixtures/release.js";
+import { JOB_ERROR_TEXT } from "../../src/errors.js";
 import { runManage } from "../../src/manage.js";
 import { runCreate } from "../../src/workflow.js";
 import {
@@ -110,7 +111,11 @@ describe("a token-actor manage job rechecks the grant is live (#1168)", () => {
     );
     expect(dump).not.toContain("example.com");
     expect(dump).not.toMatch(/sh-/);
-    expect(r.job?.error_message).not.toMatch(/token/i);
+    // #461: the stored reason names the rule, never the token or email.
+    expect(r.job?.error_message).toBe(
+      `${JOB_ERROR_TEXT.invalid_state} Reason: the job's token is not live (revoked)`,
+    );
+    expect(r.job?.error_message).not.toMatch(/sh-|example\.com/);
   });
 
   it("a token revoked after the job was accepted, before it ran, is refused", async () => {
