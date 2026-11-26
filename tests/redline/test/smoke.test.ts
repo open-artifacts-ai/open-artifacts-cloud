@@ -377,6 +377,41 @@ describe("the sweep of leftover fresh installs", () => {
     expect(seen).toEqual(["/installs?q=rl-n-", "/installs?q=rl-n-&cursor=c1"]);
   });
 
+  it("reads every page to the end: a leftover on page 25 is found", async () => {
+    const pages: unknown[][] = Array.from({ length: 25 }, (_, i) =>
+      i === 24 ? [item("rl-n-late-1", 3 * H)] : [item(`rl-n-young-${i}`, H)],
+    );
+    const { run, seen } = fakeRun(pages);
+    expect(await staleFresh(run, NOW)).toEqual(["rl-n-late-1"]);
+    expect(seen).toHaveLength(25);
+  });
+
+  it("a page that can't be read, has no items, or repeats a cursor fails loudly, never a partial list", async () => {
+    let n = 0;
+    const failing = {
+      c: { api: "https://api.open-artifacts-staging.app" },
+      v1: vi.fn(async () =>
+        n++ < 21
+          ? { status: 200, json: { items: [], nextCursor: `c${n}` } }
+          : { status: 503, json: {} },
+      ),
+    } as unknown as Run;
+    await expect(staleFresh(failing, NOW)).rejects.toThrow(/sweep R2: 503/);
+    const noItems = {
+      c: { api: "https://api.open-artifacts-staging.app" },
+      v1: vi.fn(async () => ({ status: 200, json: { nextCursor: null } })),
+    } as unknown as Run;
+    await expect(staleFresh(noItems, NOW)).rejects.toThrow(/has no items/);
+    const loop = {
+      c: { api: "https://api.open-artifacts-staging.app" },
+      v1: vi.fn(async () => ({
+        status: 200,
+        json: { items: [], nextCursor: "same" },
+      })),
+    } as unknown as Run;
+    await expect(staleFresh(loop, NOW)).rejects.toThrow(/repeats a cursor/);
+  });
+
   it("reads a createdAt in seconds as seconds, never as 1970", async () => {
     const { run } = fakeRun([
       [

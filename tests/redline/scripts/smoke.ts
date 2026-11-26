@@ -17,11 +17,13 @@
 // purge leaves its install to the next run's sweep.
 // Needs REDLINE_TARGETS, REDLINE_RELEASE, REDLINE_RUN_ID and REDLINE_SMOKE_DIR.
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   purgeFresh,
   purgeWait,
   SMOKE_SCRIPT,
+  SWEEP_DONE,
   smokeDir,
   smokeRun,
   spawnPurge,
@@ -53,7 +55,15 @@ async function main(): Promise<number> {
   if (cmd === "purge-report") {
     const dir = smokeDir(env);
     await purgeWait(dir, { within: 0 });
-    await sweepWait(dir, { within: 0 });
+    // A sweep that ended failed (a page it couldn't read, say) is loud: an
+    // annotation on the run, still never a gate failure.
+    if (
+      !(await sweepWait(dir, { within: 0 })) &&
+      existsSync(join(dir, SWEEP_DONE))
+    )
+      console.log(
+        "::warning title=red-line sweep::the sweep of leftover rl-n installs failed; its log above says why",
+      );
     return 0;
   }
   if (cmd === "purge-wait") {

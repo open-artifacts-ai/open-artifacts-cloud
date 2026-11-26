@@ -904,6 +904,8 @@ export const SWEEP_STARTED = "sweep.started";
 export const SWEEP_LOG = "sweep.log";
 export const SWEEP_DONE = "sweep.done";
 export const FRESH_SLUG_RE = /^rl-n-[a-z0-9-]{1,40}$/;
+/** A bound far past any real list, so a broken cursor can't loop forever. */
+export const SWEEP_MAX_PAGES = 1000;
 const STAGING_API = /(^|\.)open-artifacts-staging\.app$/;
 
 /**
@@ -916,7 +918,12 @@ export async function staleFresh(run: Run, now: number): Promise<string[]> {
     throw new ProbeFail("the sweep runs on staging only");
   const out: string[] = [];
   let cursor: string | null = null;
-  for (let page = 0; page < 20; page++) {
+  const seen = new Set<string>();
+  // Every page, to the end of the list: a page that can't be read, or a
+  // cursor that comes back, throws (the sweep then reports failed).
+  for (let page = 0; ; page++) {
+    if (page >= SWEEP_MAX_PAGES)
+      throw new ProbeFail(`sweep R2: more than ${SWEEP_MAX_PAGES} pages`);
     const q = new URLSearchParams({
       q: "rl-n-",
       ...(cursor ? { cursor } : {}),
@@ -934,8 +941,13 @@ export async function staleFresh(run: Run, now: number): Promise<string[]> {
       const at = i.createdAt < 1e12 ? i.createdAt * 1000 : i.createdAt;
       if (now - at > SWEEP_AGE_MS) out.push(i.slug);
     }
+    if (!Array.isArray(j.items))
+      throw new ProbeFail(`sweep R2: page ${page + 1} has no items`);
     cursor = j.nextCursor ?? null;
     if (!cursor) break;
+    if (seen.has(cursor))
+      throw new ProbeFail(`sweep R2: page ${page + 1} repeats a cursor`);
+    seen.add(cursor);
   }
   return out;
 }
