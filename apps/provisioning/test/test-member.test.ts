@@ -19,11 +19,16 @@ import {
 
 // The staging test member's workflow (staging-test-member.yml): its OIDC
 // caller may call R2, R15 and R26, on the one install `rl-agents`, staging
-// only. Every other route is 403, every other install 404.
+// only, plus R3 and R5 once the pin carries public #3167 (Leo's pick, cloud
+// #264: rl-agents follows staging's release). Every other route is 403,
+// every other install 404.
 
 beforeEach(resetDb);
 
-const ALLOWED = ["R2", "R15", "R26"] as const;
+const BEFORE_3167 = ["R2", "R15", "R26"];
+const WITH_3167 = ["R2", "R3", "R5", "R15", "R26"];
+const ALLOWED = TEST_MEMBER.routes;
+const UPGRADES = ALLOWED.includes("R5");
 const TM: Principal = {
   ...OIDC_P,
   actorKey: `${OIDC_P.actorKey}${TEST_MEMBER.actorSuffix}`,
@@ -38,14 +43,13 @@ const mint = () => ({ requestId: requestId(), recipientKey: KEY });
 
 describe("authz: the test member's allowlist", () => {
   it("pins the slug, the routes and the key suffix", () => {
-    expect(TEST_MEMBER).toEqual({
-      slug: "rl-agents",
-      routes: ["R2", "R15", "R26"],
-      actorSuffix: ":test-member",
-    });
+    expect(TEST_MEMBER.slug).toBe("rl-agents");
+    expect(TEST_MEMBER.actorSuffix).toBe(":test-member");
+    // One of exactly two lists: before or with public #3167, never more.
+    expect([BEFORE_3167, WITH_3167]).toContainEqual([...TEST_MEMBER.routes]);
   });
 
-  it("staging: exactly R2, R15 and R26, each with own reach; every other route is 403", () => {
+  it("staging: exactly its routes, each with own reach; every other route is 403", () => {
     for (const route of ROUTE_IDS) {
       const d = authorize(route, TM, "staging");
       if ((ALLOWED as readonly string[]).includes(route))
@@ -159,6 +163,71 @@ describe("reach: rl-agents with test hooks, nothing else", () => {
         i.id,
       ).toBe("not_found");
     expect(e.manageInstall.created).toHaveLength(0);
+  });
+
+  // Public #3167: R3 and R5 on rl-agents only, so it follows staging's
+  // release. Runs once the pin carries it.
+  it.runIf(UPGRADES)(
+    "R3 and R5 on rl-agents: read, and an upgrade accepted and stored under the test member's own key",
+    async () => {
+      const e = fakeEnv();
+      const s = await seed();
+      const r3 = await call(e, TM, "R3", { params: { id: s.agents.id } });
+      expect(r3.status).toBe(200);
+      expect(r3.body.slug).toBe("rl-agents");
+      const up = await call(e, TM, "R5", {
+        params: { id: s.agents.id },
+        body: { requestId: requestId() },
+      });
+      expect(up.status).toBe(202);
+      expect(up.body.job.kind).toBe("upgrade");
+      const row = await db
+        .prepare("SELECT actor_kind, actor_key FROM jobs WHERE id = ?")
+        .bind(up.body.job.id)
+        .first();
+      expect(row).toEqual({ actor_kind: "oidc", actor_key: TM.actorKey });
+    },
+  );
+
+  it.runIf(UPGRADES)(
+    "R3 and R5 on any other install are 404, and start nothing",
+    async () => {
+      const e = fakeEnv();
+      const s = await seed();
+      for (const i of [s.rlA, s.longer, s.customer]) {
+        expect(
+          (await call(e, TM, "R3", { params: { id: i.id } })).code,
+          i.id,
+        ).toBe("not_found");
+        expect(
+          (
+            await call(e, TM, "R5", {
+              params: { id: i.id },
+              body: { requestId: requestId() },
+            })
+          ).code,
+          i.id,
+        ).toBe("not_found");
+      }
+      const n = await db.prepare("SELECT COUNT(*) AS n FROM jobs").first();
+      expect(n).toEqual({ n: 0 });
+    },
+  );
+
+  it.runIf(!UPGRADES)("before #3167 is pinned, R3 and R5 are 403", async () => {
+    const e = fakeEnv();
+    const s = await seed();
+    expect(
+      (await call(e, TM, "R3", { params: { id: s.agents.id } })).status,
+    ).toBe(403);
+    expect(
+      (
+        await call(e, TM, "R5", {
+          params: { id: s.agents.id },
+          body: { requestId: requestId() },
+        })
+      ).status,
+    ).toBe(403);
   });
 
   it("R26 on rl-agents without test hooks is 404", async () => {
