@@ -4,6 +4,15 @@
 // that deploy succeeds, redline-staging.yml (the gate) starts on its own, for
 // the same tag. prod-release-chain.yml then follows the gate as before.
 //
+// The same plan also says whether to copy the release's files to prod's
+// bucket (the stage-prod job, moved here from hosted-publish.yml, #264 step 6),
+// beside staging's deploy instead of before it. That copy keeps its own rule,
+// the one hosted-publish.yml had: every hosted-publish run that published a
+// release to staging and was not asked to publish prod (started by
+// hosted-release, or dispatched by hand with env staging). It skips none of
+// the deploy's guards below: a manual publish, an older tag and a tag that
+// already has a deploy are all staged. `stage` is that tag, or empty.
+//
 // `plan` decides from one workflow_run event whether to act and what comes
 // next; `dispatch` re-checks under the tag's concurrency group and starts the
 // next workflow. Both print `key=value` lines for $GITHUB_OUTPUT. A skip is
@@ -45,6 +54,13 @@ export const APP_ACTOR = "open-artifacts-release[bot]";
 export const DEPLOY_TITLE_RE =
   /^deploy-hosted-platform staging (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(sc[0-9]{1,20}-[0-9]{1,4})\]$/;
 const PUBLISH_JOB_RE = /^publish-staging release (v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
+/**
+ * A hand dispatch's run-name for env staging (hosted-publish.yml's run-name:
+ * env, then the tag, then the optional chain id). Only this env leaves prod
+ * out (hosted-publish-resolve.sh: both and prod publish prod themselves).
+ */
+const STAGING_ONLY_TITLE_RE =
+  /^hosted-publish staging (v\d{1,6}\.\d{1,6}\.\d{1,6})(?: \[[^\]]*\])?$/;
 
 const TARGET: Record<Next, { file: string; title: (tag: string) => string }> = {
   deploy: {
@@ -116,9 +132,11 @@ export function existingRuns(o: {
     .map((r) => r.id);
 }
 
-export type Plan =
+/** `stage`: the tag whose files go to prod's bucket now (stage-prod), when there is one. */
+export type Plan = (
   | { go: true; next: Next; tag: string }
-  | { go: false; why: string };
+  | { go: false; why: string }
+) & { stage?: string };
 
 export function plan(o: {
   exec: Exec;
@@ -140,9 +158,10 @@ export function plan(o: {
   let next: Next;
   let tag: string;
   const file = o.workflow.replace(/@.*$/, "");
+  let stage: string | undefined;
   if (file === WORKFLOW_DIR + "hosted-publish.yml") {
-    if (o.event !== "workflow_run")
-      return skip("a manual publish does not start the chain");
+    if (o.event !== "workflow_run" && o.event !== "workflow_dispatch")
+      return skip(`unexpected event ${o.event}`);
     if (!/^[1-9][0-9]{0,19}$/.test(o.runId)) throw new Error("bad run id");
     const jobs = JSON.parse(
       ghRead({ exec: o.exec, sleep: o.sleep ?? realSleep }, [
@@ -159,8 +178,20 @@ export function plan(o: {
       .filter((t): t is string => !!t);
     if (tags.length === 0) return skip("the run published no release");
     if (tags.length > 1) throw new Error("the run published several releases");
-    next = "deploy";
     tag = tags[0] as string;
+    // stage-prod's rule (it was hosted-publish.yml's): a release went to
+    // staging and the run did not publish prod itself.
+    if (
+      o.event === "workflow_run" ||
+      STAGING_ONLY_TITLE_RE.exec(o.title)?.[1] === tag
+    )
+      stage = tag;
+    if (o.event !== "workflow_run")
+      return {
+        ...skip("a manual publish does not start the chain"),
+        ...(stage ? { stage } : {}),
+      };
+    next = "deploy";
   } else if (file === WORKFLOW_DIR + "deploy-hosted-platform.yml") {
     if (o.event !== "workflow_dispatch") return skip("not a dispatched deploy");
     if (o.actor !== APP_ACTOR) return skip("not dispatched by this chain");
@@ -172,9 +203,13 @@ export function plan(o: {
   } else {
     return skip(`unexpected workflow ${o.workflow}`);
   }
+  const staged = stage ? { stage } : {};
   const latest = latestRelease(o.exec, o.repo, o.sleep);
   if (latest !== tag)
-    return skip(`${tag} is not the newest release (${latest})`);
+    return {
+      ...skip(`${tag} is not the newest release (${latest})`),
+      ...staged,
+    };
   const have = existingRuns({
     exec: o.exec,
     sleep: o.sleep,
@@ -183,8 +218,11 @@ export function plan(o: {
     tag,
   });
   if (have.length > 0)
-    return skip(`a ${TARGET[next].file} run for ${tag} already exists`);
-  return { go: true, next, tag };
+    return {
+      ...skip(`a ${TARGET[next].file} run for ${tag} already exists`),
+      ...staged,
+    };
+  return { go: true, next, tag, ...staged };
 }
 
 /** Starts the next workflow; false (nothing started) if the tag's run exists or the tag went stale. */
@@ -289,6 +327,9 @@ function main(argv: string[]) {
       actor: flag(argv, "actor"),
       runId: flag(argv, "run-id"),
     });
+    // stage-prod's own decision, first: the deploy's skip does not decide it.
+    emit("stage", p.stage ? "true" : "false");
+    emit("stage_tag", p.stage ?? "");
     emit("go", String(p.go));
     if (p.go) {
       emit("next", p.next);

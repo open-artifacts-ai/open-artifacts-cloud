@@ -15,7 +15,11 @@
 # dispatch job re-checks all that under a concurrency group keyed on the tag.
 # The deploy and the gate each hold their own gates (release gate, platform
 # tags, staging's Environment); this file only starts them, and waits for
-# nothing. Dispatches use the release App's installation token (actions:
+# nothing.
+# Beside the deploy's dispatch, the stage-prod job (moved from
+# hosted-publish.yml, #264 step 6) copies a release just published to staging
+# into prod's bucket, without its record, under hosted-publish's own rule (see
+# the job), so staging's deploy no longer waits for that copy. Dispatches use the release App's installation token (actions:
 # write), never the default token: GitHub raises no workflow_run event for a
 # run the default token started, so this chain's second step and
 # prod-release-chain would never fire. A run dispatched by the App is still
@@ -45,6 +49,8 @@ jobs:
       go: ${{ steps.plan.outputs.go }}
       next: ${{ steps.plan.outputs.next }}
       tag: ${{ steps.plan.outputs.tag }}
+      stage: ${{ steps.plan.outputs.stage }}
+      stage_tag: ${{ steps.plan.outputs.stage_tag }}
     steps:
       - name: On main
         env:
@@ -71,6 +77,93 @@ jobs:
           ACTOR: ${{ github.event.workflow_run.actor.login }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: node --experimental-strip-types scripts/ci/staging-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"
+  stage-prod:
+    # Uploads the release's files to prod's bucket while staging deploys and
+    # the red-line runs, so the prod publish after the gate (hosted-publish.yml
+    # publish-prod, dispatched by prod-release-chain.yml) writes only the
+    # record: publish-release --stage-only stops before it, and with no record
+    # nothing can install the version. If the gate fails the files stay
+    # unused. Moved here from hosted-publish.yml (#264 step 6), so staging's
+    # deploy no longer waits for this copy; it now runs beside the dispatch
+    # job. The rule is hosted-publish's, unchanged (staging-release-chain.ts
+    # plan, `stage`): every release published to staging by a run that did not
+    # publish prod, a hand dispatch with env staging, an older tag and a tag
+    # already deployed included. Not named publish-prod: the chain's
+    # "published" check must not take it for the record. Best effort: if it
+    # fails (or the plan's reads fail), publish-prod uploads what is missing.
+    # The hosted-publish-prod group is publish-prod's too, across both files,
+    # so the two never run at once (pruneStaged relies on it).
+    name: stage-prod release ${{ needs.plan.outputs.stage_tag }}
+    needs: plan
+    if: needs.plan.outputs.stage == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    environment: hosted-prod-deploy
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: hosted-publish-prod
+      cancel-in-progress: false
+    timeout-minutes: 30
+    steps:
+      - name: Runs only from main
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = refs/heads/main
+      # main, overlaid on the public tree at PUBLIC_PIN.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: _cloud
+          persist-credentials: false
+      - uses: ./_cloud/.github/actions/overlay
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @oa/provision build
+      - name: Load the hosted constants
+        run: bash scripts/ci/hosted-constants.sh prod .github/hosted
+      - name: Release gate
+        env:
+          TAG: ${{ needs.plan.outputs.stage_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/tag-passed-checks.sh prod "$TAG"
+      # No staging-first gate: this writes no record, so no version becomes
+      # installable. publish-prod keeps that gate for the record.
+      - name: Write the token files
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/hosted-publish-secrets"
+          mkdir -m 700 "$dir"
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "CLOUDFLARE_API_TOKEN is not set in this Environment"; exit 1; }
+          printf '%s\n' "$CLOUDFLARE_API_TOKEN" > "$dir/token"
+          bash scripts/ci/hosted-r2-key.sh "$dir/r2"
+      - name: Stage the files (no record)
+        env:
+          TAG: ${{ needs.plan.outputs.stage_tag }}
+          OA_HOSTED_TOKEN_FILE: ${{ runner.temp }}/hosted-publish-secrets/token
+          OA_HOSTED_R2_FILE: ${{ runner.temp }}/hosted-publish-secrets/r2
+          OA_HOSTED_ENVIRONMENT: hosted-prod-deploy
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pnpm -s --filter @oa/hosted start publish-release --env prod --tag "$TAG" --stage-only
+      - name: Remove the token files
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/hosted-publish-secrets"
+          rm -f "$d/r2" "$d/token"
+          rm -rf "$d"
+          test ! -e "$d"
+
   dispatch:
     needs: plan
     if: needs.plan.outputs.go == 'true'

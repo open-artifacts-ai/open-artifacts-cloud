@@ -511,19 +511,70 @@ describe("deploy-hosted-platform.yml", () => {
     expect(i).toBeLessThan(steps.indexOf(tagOut as Record<string, unknown>));
   });
 
-  it("zones plan, then apply in the same job; verify_only stays plan only", () => {
+  it("zones apply (which plans first) in the same job; verify_only stays plan only", () => {
     const z = named("Zones");
     expect(z.env.VERIFY_ONLY).toBe("${{ inputs.verify_only && '1' || '' }}");
     expect(text).not.toContain("apply_zones");
     const lines = (z.run as string).trim().split("\n");
     expect(lines).toEqual([
       "set -euo pipefail",
-      'bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" plan',
-      '[ -n "$VERIFY_ONLY" ] || bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" apply',
+      'if [ -n "$VERIFY_ONLY" ]; then',
+      '  bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" plan',
+      "else",
+      '  bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" apply',
+      "fi",
     ]);
-    expect(steps.indexOf(z)).toBeGreaterThan(
-      steps.indexOf(named("Deploy and verify")),
+    // apply runs the same inspection as plan, and its refusals, before any
+    // write (hosted-zones.sh: the plan-only exit comes after both).
+    const zones = readFileSync(
+      join(root, "scripts/ops/hosted-zones.sh"),
+      "utf8",
     );
+    const at = (x: string) => zones.indexOf(x);
+    expect(at("inspect report\n")).toBeGreaterThan(0);
+    expect(at("inspect report\n")).toBeLessThan(
+      at('if [ "$mode" = plan ]; then'),
+    );
+    expect(at("planned change outside the expected set")).toBeLessThan(
+      at('if [ "$mode" = plan ]; then'),
+    );
+  });
+
+  // A route sends traffic to the Worker it names, so no route, DNS or setting
+  // changes before dispatch, both brokers, provisioning and billing have
+  // deployed and passed: the zones are a step of their own, after the deploy
+  // step, which they follow only on its success (no status function in the
+  // condition), and the deploy loop never runs them.
+  it("the zones apply only after every Worker their routes name has deployed and passed", () => {
+    const z = named("Zones");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i("Zones")).toBe(i("Deploy and verify") + 1);
+    expect(z.if).toBe(
+      "${{ contains(format(',{0},', inputs.targets), ',zones,') }}",
+    );
+    expect(z.if).not.toMatch(/always\(\)|cancelled\(\)|failure\(\)/);
+    expect(z["continue-on-error"]).toBeUndefined();
+    expect(named("Deploy and verify")["continue-on-error"]).toBeUndefined();
+    const loop = named("Deploy and verify").run as string;
+    expect(loop).toContain('case "$t" in zones | scheduler) continue ;; esac');
+    expect(loop).not.toContain("hosted-zones.sh");
+    // And the plan says the same: zones need every Worker a route names.
+    const r = spawnSync(
+      "bash",
+      [join(root, "scripts/ops/deploy-waves.sh"), FULLB],
+      {
+        encoding: "utf8",
+      },
+    );
+    const zl = r.stdout.split("\n").find((l) => l.startsWith("zones "));
+    for (const t of [
+      "dispatch",
+      "auth-broker",
+      "directory-broker",
+      "provisioning",
+      "billing",
+    ])
+      expect(zl?.split(" ").slice(1)).toContain(t);
   });
 
   it("prod runs only from main, checked in the workflow and again in the script", () => {
@@ -1147,84 +1198,9 @@ describe("deploy-hosted-platform.yml", () => {
     expect(s.run).toBe(
       'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" scheduler',
     );
-    // The loop deploys everything else, in order, and never the scheduler.
+    // The loop deploys everything else and never the scheduler or the zones.
     const loop = named("Deploy and verify").run as string;
-    expect(loop).toContain('[ "$t" = zones ] && continue');
-    expect(loop).toContain('[ "$t" = scheduler ] && continue');
-    const ran = (TARGETS: string) => {
-      const r = spawnSync(
-        "bash",
-        [
-          "-c",
-          loop.replace(
-            'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
-            'echo "$t"',
-          ),
-        ],
-        {
-          env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS },
-          encoding: "utf8",
-        },
-      );
-      return r.stdout
-        .split("\n")
-        .filter((l) => l && !l.startsWith("::"))
-        .join(",");
-    };
-    expect(ran(FULL)).toBe(
-      "platform-db,auth-broker,directory-broker,provision-token,inventory,provisioner,provisioning,dispatch",
-    );
-    expect(ran("scheduler")).toBe("");
-    // A failed target fails the run: its wave-mates still finish and are
-    // logged under their own group, and no later wave starts.
-    const failing = spawnSync(
-      "bash",
-      [
-        "-c",
-        loop.replace(
-          'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
-          `bash -c 'if [ "$0" = billing ]; then echo "$0 broke"; exit 3; fi; echo "$0"' "$t"`,
-        ),
-      ],
-      {
-        env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS: FULLB },
-        encoding: "utf8",
-      },
-    );
-    expect(failing.status).not.toBe(0);
-    expect(failing.stdout).toContain("::group::prod billing (wave 2)");
-    expect(failing.stdout).toContain("billing broke");
-    expect(failing.stdout).toContain("::group::prod inventory (wave 2)");
-    expect(failing.stdout).toContain("wave 2 failed: billing");
-    expect(failing.stdout).not.toContain("provisioner");
-    // L2: killed mid-wave, the buffered logs still print, each under its group.
-    // Billing cancels the run only once its wave-mates have all signalled that
-    // they started (a file each), so the test does not race the wave's start.
-    const startedDir = mkdtempSync(join(tmpdir(), "wave-started-"));
-    const slow = spawnSync(
-      "bash",
-      [
-        "-c",
-        loop.replace(
-          'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
-          `bash -c 'echo "started $0"; touch "$STARTED/$0"; if [ "$0" = billing ]; then for i in $(seq 400); do n=0; for w in auth-broker directory-broker provision-token inventory; do [ -e "$STARTED/$w" ] && n=$((n+1)); done; [ "$n" = 4 ] && break; sleep 0.05; done; kill -TERM $PPID; fi; sleep 5' "$t"`,
-        ),
-      ],
-      {
-        env: {
-          PATH: process.env.PATH,
-          DEPLOY_ENV: "prod",
-          TARGETS: FULLB,
-          STARTED: startedDir,
-        },
-        encoding: "utf8",
-        timeout: 20000,
-      },
-    );
-    expect(slow.status).not.toBe(0);
-    expect(slow.stdout).toContain("::group::prod billing (unfinished)");
-    expect(slow.stdout).toContain("started billing");
-    expect(slow.stdout).toContain("started inventory");
+    expect(loop).toContain('case "$t" in zones | scheduler) continue ;; esac');
   });
 
   it("require_newer (the chain's): the tag must be newer than prod's scheduler, before anything deploys", () => {
@@ -1323,5 +1299,237 @@ describe("deploy-hosted-platform.yml", () => {
     expect(g.if).toBeUndefined();
     expect(g["continue-on-error"]).toBeUndefined();
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|verify_only/);
+  });
+});
+// #264 step 6: each target starts as soon as everything it needs succeeded.
+// The loop runs for real with stub targets that block on a named pipe until a
+// controller releases them (signals, no sleeps). The controller checks every
+// start against the plan (deploy-waves.sh): a target starting before a target
+// it needs was released prints EARLY. A loop that waited for a target it does
+// not need hangs instead, and the spawn's timeout fails the test.
+describe("the deploy loop (#264 step 6)", () => {
+  const DEPLOY =
+    'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"';
+  const BUILD = 'pnpm --filter "@oa/provisioning..." build';
+  // Each stub says it started, prints what the deploy script would see, then
+  // waits for its gate: "ok" exits 0, anything else exits 1.
+  const STUB = `bash -c 'echo "start $0" > "$E"; echo "$0 built=\${PROVISIONING_BUILT:-}"; read -r how < "$G/$0"; [ "$how" = ok ]' "$t"`;
+  const loopText = () => {
+    const loop = named("Deploy and verify").run as string;
+    expect(loop.split(DEPLOY)).toHaveLength(2);
+    expect(loop.split(BUILD)).toHaveLength(2);
+    return loop.replace(DEPLOY, STUB).replace(BUILD, STUB);
+  };
+  // The harness: the loop in the background (its output through a pipe the
+  // harness copies, reporting each ::error:: line), and a controller that
+  // reads start and error events and runs the scenario's POLICY on each.
+  const HARNESS = String.raw`set -euo pipefail
+W="$(mktemp -d)"
+export E="$W/events" G="$W/gates"
+mkdir "$G"
+mkfifo "$E" "$W/out"
+exec 4<> "$E"
+for t in provisioning-build platform-db auth-broker directory-broker billing provision-token provisioner provisioning dispatch inventory zones scheduler; do mkfifo "$G/$t"; done
+B=""
+case ",$TARGETS," in *,provisioning,*) [ -n "$VERIFY_ONLY" ] || B=build ;; esac
+if [ -n "$B" ]; then PLAN="$(bash scripts/ops/deploy-waves.sh "$TARGETS" build)"; else PLAN="$(bash scripts/ops/deploy-waves.sh "$TARGETS")"; fi
+bash -c "$LOOP" > "$W/out" 2>&1 &
+lp=$!
+{
+  while IFS= read -r l; do
+    printf '%s\n' "$l" >> "$W/log"
+    case "$l" in "::error::"*) echo "seen $l" >&4 ;; esac
+  done < "$W/out"
+  echo eof >&4
+} &
+started=" "
+released=" "
+lrc=""
+release() { echo "$2" > "$G/$1"; released="$released$1 "; }
+has() { case "$1" in *" $2 "*) return 0 ;; esac; return 1; }
+finish() { set +e; wait "$lp"; lrc=$?; set -e; }
+eval "$POLICY"
+while read -r kind a rest <&4; do
+  case "$kind" in
+    start)
+      started="$started$a "
+      while read -r t needs; do
+        [ "$t" = "$a" ] || continue
+        for n in $needs; do has "$released" "$n" || echo "EARLY $a before $n" >> "$W/log"; done
+      done <<< "$PLAN"
+      on_start "$a" || : ;;
+    seen) on_seen "$a $rest" || : ;;
+    eof) break ;;
+  esac
+done
+[ -n "$lrc" ] || finish
+echo "LOOP EXIT $lrc" >> "$W/log"
+echo "STARTED$started" >> "$W/log"
+cat "$W/log"
+`;
+  const drive = (TARGETS: string, POLICY: string, VERIFY_ONLY = "") => {
+    const r = spawnSync("bash", ["-c", HARNESS], {
+      cwd: root,
+      env: {
+        PATH: process.env.PATH,
+        DEPLOY_ENV: "prod",
+        TARGETS,
+        VERIFY_ONLY,
+        LOOP: loopText(),
+        POLICY,
+      },
+      encoding: "utf8",
+      timeout: 30000,
+    });
+    expect(r.error, r.stderr).toBeUndefined();
+    const out = r.stdout;
+    const started = (/^STARTED (.*)$/m.exec(out)?.[1] ?? "")
+      .trim()
+      .split(" ")
+      .filter(Boolean);
+    const exit = /^LOOP EXIT (\d+)$/m.exec(out)?.[1];
+    return { out, started, exit };
+  };
+
+  it("full list: every target once, none before what it needs; inventory holds up nothing; the build first", () => {
+    // Inventory is held until dispatch, the end of the provisioner path, has
+    // started and been released: a loop that waited for inventory would hang.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    inventory) has "$released" dispatch && release inventory ok ;;
+    dispatch)
+      echo "dispatch started; inventory released: $(has "$released" inventory && echo yes || echo no)" >> "$W/log"
+      release dispatch ok
+      has "$started" inventory && release inventory ok ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    for (const list of [FULL, FULLB]) {
+      const r = drive(list, POLICY);
+      expect(r.out).not.toContain("EARLY");
+      expect(r.exit).toBe("0");
+      const want = [
+        "provisioning-build",
+        ...list.split(",").filter((t) => t !== "zones" && t !== "scheduler"),
+      ];
+      expect([...r.started].sort()).toEqual([...want].sort());
+      // The build, platform-db and provision-token need nothing: they start
+      // first, together, before anything else.
+      expect(r.started.slice(0, 3).sort()).toEqual(
+        ["platform-db", "provision-token", "provisioning-build"].sort(),
+      );
+      expect(r.out).toContain("dispatch started; inventory released: no");
+      // provisioning skips its own build: the loop's build passed.
+      expect(r.out).toContain("provisioning built=1");
+      expect(r.out).toContain("platform-db built=");
+      expect(r.out).not.toContain("platform-db built=1");
+      for (const t of want)
+        expect(r.out).toMatch(new RegExp(`::group::prod ${t} \\(\\d+ s\\)`));
+    }
+  });
+
+  it("verify_only: no build, and provisioning is not told it was built", () => {
+    const r = drive(
+      FULL,
+      `on_start() { release "$1" ok; }\non_seen() { :; }`,
+      "1",
+    );
+    expect(r.exit).toBe("0");
+    expect(r.out).not.toContain("EARLY");
+    expect(r.started).not.toContain("provisioning-build");
+    expect(r.out).toContain("provisioning built=\n");
+  });
+
+  it("a list without provisioning builds nothing; a scheduler-only list deploys nothing here", () => {
+    const POLICY = `on_start() { release "$1" ok; }\non_seen() { :; }`;
+    const r = drive(
+      "auth-broker,directory-broker,billing,provision-token,provisioner",
+      POLICY,
+    );
+    expect(r.exit).toBe("0");
+    expect(r.out).not.toContain("EARLY");
+    expect([...r.started].sort()).toEqual(
+      [
+        "auth-broker",
+        "billing",
+        "directory-broker",
+        "provision-token",
+        "provisioner",
+      ].sort(),
+    );
+    const s = drive("scheduler", POLICY);
+    expect(s.exit).toBe("0");
+    expect(s.started).toEqual([]);
+    const z = drive("zones", POLICY);
+    expect(z.exit).toBe("0");
+    expect(z.started).toEqual([]);
+  });
+
+  it("after the first failure nothing new starts; running targets finish and are logged; the run fails", () => {
+    // Inventory fails while the provisioner is still deploying; once the loop
+    // has reported it, the provisioner succeeds, which would make provisioning
+    // startable: it must not start.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    inventory | provisioner) has "$started" inventory && has "$started" provisioner && release inventory fail ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() {
+  case "$1" in *"prod inventory failed"*) release provisioner ok ;; esac
+}`;
+    const r = drive(FULLB, POLICY);
+    expect(r.out).not.toContain("EARLY");
+    expect(r.exit).toBe("1");
+    expect(r.out).toContain("::error::prod inventory failed (exit 1)");
+    expect(r.out).toMatch(/::group::prod provisioner \(\d+ s\)/);
+    expect(r.out).toContain(
+      "failed: inventory; not started: provisioning dispatch",
+    );
+    expect(r.started).not.toContain("provisioning");
+    expect(r.started).not.toContain("dispatch");
+  });
+
+  it("a failed build fails the run before any bundling target starts", () => {
+    const POLICY = `
+on_start() {
+  case "$1" in
+    provisioning-build) release "$1" fail ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    const r = drive(FULL, POLICY);
+    expect(r.exit).toBe("1");
+    expect(r.out).toContain("::error::prod provisioning-build failed (exit 1)");
+    expect([...r.started].sort()).toEqual(
+      ["platform-db", "provision-token", "provisioning-build"].sort(),
+    );
+  });
+
+  it("cancelled mid-run: each running target's buffered log still prints under its group", () => {
+    // TERM once the four targets after the migrations are all deploying; they
+    // are released only after the loop exited.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    auth-broker | directory-broker | billing | inventory)
+      if has "$started" auth-broker && has "$started" directory-broker && has "$started" billing && has "$started" inventory; then
+        kill -TERM "$lp"
+        finish
+        for t in auth-broker directory-broker billing inventory; do release "$t" ok; done
+      fi ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    const r = drive(FULLB, POLICY);
+    expect(r.exit).toBe("143");
+    for (const t of ["auth-broker", "directory-broker", "billing", "inventory"])
+      expect(r.out).toContain(`::group::prod ${t} (unfinished)`);
+    expect(r.out).toContain("billing built=");
   });
 });
