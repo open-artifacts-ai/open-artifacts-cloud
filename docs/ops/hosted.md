@@ -422,7 +422,7 @@ When red-line passes for an exact release tag, prod takes that tag with no human
 **Two switches.** An independent review came before each was turned on.
 
 - The repo variable `PROD_RELEASE_CHAIN`: the chain's jobs run only when it is `on`. It covers the platform step.
-- Prod's `FLEET_CANARY` in `apps/scheduler/wrangler.jsonc`: the prod canary, `ifhx5rpmrhwh` (#1343). It is committed config, so it takes effect with the first release that contains it, once that release's scheduler is on prod, by the chain or by a manual deploy: the fleet's target is the scheduler's own release tag, so the fleet moves whichever way the scheduler got there. Prod's `FLEET_SMOKE` is `required` (its smoke secrets are set).
+- Prod's `FLEET_CANARY` in `apps/scheduler/wrangler.jsonc`: the prod canary, `ifhx5rpmrhwh` (#1343). It is committed config, so it takes effect with the first release that contains it, once that release's scheduler is on prod, by the chain or by a manual deploy: the fleet's target is the scheduler's own release tag, so the fleet moves whichever way the scheduler got there. Prod's and staging's `FLEET_SMOKE` are `required` (each env's smoke secrets are set; staging's since 2026-11-26).
 
 To switch the chain on, set `PROD_RELEASE_CHAIN` to `on` (repository Settings > Secrets and variables > Actions > Variables); to switch it off, set it to anything else. To switch the fleet off, empty `FLEET_CANARY` in a release.
 
