@@ -1803,6 +1803,131 @@ describe("the fleet without the deploy's wait (cloud #495)", () => {
   });
 });
 
+// Prover's controls on #497 (comment 7193897615): prod run 45820756312 in
+// #495's shape (no wait, no "Fleet done"), its "Wake the fleet" step and job
+// marked success, failure and cancelled. #495 makes a refused wake fail the
+// deploy after the final attempt.
+describe("a prod deploy whose wake failed (cloud #495)", () => {
+  const D = (hms: string) => `2026-11-26T${hms}Z`;
+  const RUN = 45820756312;
+  const URL = `https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/${RUN}`;
+  const st = (name: string, a: string, b: string, conclusion = "success") => ({
+    name,
+    status: "completed",
+    conclusion,
+    startedAt: D(a),
+    completedAt: D(b),
+  });
+  const run = (wake: "success" | "failure" | "cancelled" | "skipped"): Run => ({
+    id: RUN,
+    path: ".github/workflows/deploy-hosted-platform.yml",
+    event: "workflow_dispatch",
+    title: "deploy-hosted-platform prod v0.251.0 [c45820247442-1]",
+    status: "completed",
+    conclusion: wake === "skipped" ? "failure" : wake,
+    headSha: "c".repeat(40),
+    createdAt: D("12:33:28"),
+    startedAt: D("12:33:28"),
+    updatedAt: D("12:45:33"),
+    attempt: 1,
+    url: URL,
+    commitMessage: "x",
+    commitAt: D("12:33:28"),
+    jobs: [
+      {
+        name: "deploy",
+        conclusion: wake === "skipped" ? "failure" : wake,
+        steps: [
+          st(
+            "Read the fleet finish of earlier releases",
+            "12:34:43",
+            "12:34:44",
+          ),
+          st("Mark the platform verified", "12:37:16", "12:37:16"),
+          st(
+            "The tag's scheduler takes the fleet wake",
+            "12:37:16",
+            "12:37:17",
+            wake === "skipped" ? "failure" : "success",
+          ),
+          st(FLEET_WAKE_STEP, "12:37:17", "12:37:17", wake),
+        ],
+      },
+    ],
+  });
+  // The prod copy before it, so the deploy's wait (after) has ended.
+  const publish: Run = {
+    ...run("success"),
+    id: 45820247442,
+    path: ".github/workflows/hosted-publish.yml",
+    title: "hosted-publish prod v0.251.0 [p45820247442-1]",
+    createdAt: D("12:30:00"),
+    startedAt: D("12:30:00"),
+    updatedAt: D("12:33:00"),
+    conclusion: "success",
+    jobs: undefined,
+    url: "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/45820247442",
+  };
+  const tlOf = (r: Run, now = D("12:50:00")) =>
+    timeline({
+      release: { tag: "v0.251.0", publishedAt: D("11:12:34") },
+      runs: [publish, r],
+      prs: [],
+      mergedAt: D("10:03:10"),
+      config,
+      now,
+    });
+  const notifyOf = (r: Run) =>
+    stuck([tlOf(r)], config).filter((o) => o.stage === "prod_deploy");
+
+  it("a successful wake: the deploy is done at the wake's start, the fleet pending, no alert", () => {
+    const t = tlOf(run("success"));
+    expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+      state: "done",
+      endedAt: D("12:37:17"),
+    });
+    expect(t.stages.find((x) => x.name === "fleet")?.state).toBe("unmeasured");
+    expect(t.e2eTo).toBe(NO_FLEET);
+    expect(notifyOf(run("success"))).toEqual([]);
+  });
+
+  for (const wake of ["failure", "cancelled", "skipped"] as const)
+    it(`a ${wake} wake fails the deploy, anchors no fleet start, and is a failed-stage comment with --failed`, () => {
+      expect(fleetStep([run(wake)])).toEqual({
+        wakeFailed: run(wake),
+        fleet: { state: "none" },
+      });
+      const t = tlOf(run(wake));
+      expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+        state: "red",
+        runId: RUN,
+        url: URL,
+      });
+      expect(t.doneAt).toBeUndefined();
+      const [o] = notifyOf(run(wake));
+      expect(o).toMatchObject({
+        kind: "failed",
+        stage: "prod_deploy",
+        runId: RUN,
+      });
+      expect(commentBody(o as Overrun, "o/c", config).split("\n")[2]).toBe(
+        `- Run: [${RUN}](https://github.com/o/c/actions/runs/${RUN}), failed. It is a release workflow, so rerun only its failed jobs (AGENTS.md): open the run and choose "Re-run failed jobs", or \`gh run rerun ${RUN} --failed -R o/c\`.`,
+      );
+    });
+
+  it("a later run of the tag that woke the fleet wins over an earlier failed wake", () => {
+    const failed = run("failure");
+    const ok = {
+      ...run("success"),
+      id: RUN + 1,
+      createdAt: D("12:50:00"),
+      url: `${URL}1`,
+    };
+    expect(fleetStep([failed, ok]).deployEnd).toBe(D("12:37:17"));
+    expect(fleetStep([failed, ok]).wakeFailed).toBeUndefined();
+  });
+});
+
 describe("percentiles, history and ETA", () => {
   it("pct with n=0, 1 and 20", () => {
     expect(pct([], 50)).toBe(null);

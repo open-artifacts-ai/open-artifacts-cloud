@@ -435,23 +435,39 @@ export function fleetStep(
 ): {
   fleet: Step;
   deployEnd?: string;
+  /** A run whose "Wake the fleet" failed, was cancelled or was skipped, when none woke it. */
+  wakeFailed?: Run;
 } {
   let deployEnd: string | undefined;
   let done: { at: string; url: string } | undefined;
   let going: string | undefined;
+  let wakeFailed: Run | undefined;
   for (const r of prodRuns)
     for (const j of r.jobs ?? []) {
       const by = (n: string) => j.steps?.find((x) => x.name === n);
-      // "Wake the fleet" anchors the fleet's start and the deploy's end. The
-      // wait and "Fleet done" steps are only in runs before cloud #495.
+      // A successful "Wake the fleet" anchors the fleet's start and the
+      // deploy's end. One that failed, was cancelled or was skipped fails
+      // the deploy (cloud #495) and anchors nothing. The wait and "Fleet
+      // done" steps are only in runs before #495; the wait anchors only a
+      // run with no wake step at all.
       const wake = by(FLEET_WAKE_STEP);
       const wait = by(FLEET_WAIT_STEP);
       const fin = by(FLEET_DONE_STEP);
-      const start = ran(wake)
-        ? wake.startedAt
-        : ran(wait)
-          ? wait.startedAt
-          : undefined;
+      if (
+        wake &&
+        (wake.conclusion === "failure" ||
+          wake.conclusion === "cancelled" ||
+          wake.conclusion === "skipped")
+      ) {
+        wakeFailed = wakeFailed ?? r;
+        continue;
+      }
+      const start =
+        wake?.conclusion === "success" && wake.startedAt
+          ? wake.startedAt
+          : !wake && ran(wait)
+            ? wait.startedAt
+            : undefined;
       if (!start) continue;
       if (!deployEnd || ms(start) < ms(deployEnd)) deployEnd = start;
       if (
@@ -477,16 +493,12 @@ export function fleetStep(
       ? { ...done, exact: false }
       : undefined;
   if (!deployEnd)
-    return fin
-      ? {
-          fleet: {
-            state: "done",
-            doneAt: fin.at,
-            url: fin.url,
-            exact: fin.exact,
-          },
-        }
-      : { fleet: { state: "none" } };
+    return {
+      ...(wakeFailed ? { wakeFailed } : {}),
+      fleet: fin
+        ? { state: "done", doneAt: fin.at, url: fin.url, exact: fin.exact }
+        : { state: "none" },
+    };
   if (fin)
     return {
       deployEnd,
@@ -621,16 +633,31 @@ function groups(tag: string, runs: Run[]): Record<string, Run[]> {
 }
 
 /**
- * Pure: the prod deploy and the fleet. Once "Wake the fleet" has started, the
- * deploy's own work is done (every step before it succeeded), so the deploy
- * ends there; before cloud #495 the run then waited for the fleet.
+ * Pure: the prod deploy and the fleet. Once a successful "Wake the fleet" has
+ * started, the deploy's own work is done (every step before it succeeded), so
+ * the deploy ends there; before cloud #495 the run then waited for the fleet.
+ * A wake that failed, was cancelled or was skipped fails the deploy (#495),
+ * unless another run of the tag woke the fleet.
  */
 function prodSteps(
   prodRuns: Run[],
   late?: { at: string; url: string },
 ): { prod_deploy: Step; fleet: Step } {
   const base = step(prodRuns);
-  const { fleet, deployEnd } = fleetStep(prodRuns, late);
+  const { fleet, deployEnd, wakeFailed } = fleetStep(prodRuns, late);
+  // The wake failed, was cancelled or was skipped, and no run woke the
+  // fleet: the deploy failed (a release workflow, rerun its failed jobs).
+  if (!deployEnd && wakeFailed)
+    return {
+      prod_deploy: {
+        state: "red",
+        startedAt: base.startedAt,
+        url: wakeFailed.url,
+        runId: wakeFailed.id,
+        attempts: base.attempts ?? Math.max(1, wakeFailed.attempt),
+      },
+      fleet,
+    };
   if (!deployEnd) return { prod_deploy: base, fleet };
   const doneAt =
     base.state === "done" && base.doneAt && ms(base.doneAt) < ms(deployEnd)
