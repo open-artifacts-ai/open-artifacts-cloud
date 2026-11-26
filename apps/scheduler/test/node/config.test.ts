@@ -97,10 +97,23 @@ describe("wrangler.jsonc", () => {
         },
       ]);
       // The signups duty's producer (src/provapi/signups.ts), this env's
-      // queue only.
+      // queue only; and the consumer of this env's fleet wake (cloud #264,
+      // src/provapi/wake.ts): delivered at once, one batch at a time.
       expect(e.queues).toEqual({
         producers: [{ binding: "SIGNUPS", queue: names.signups }],
+        consumers: [
+          {
+            queue: names.fleetWake,
+            max_batch_size: 10,
+            max_batch_timeout: 0,
+            max_retries: 3,
+            max_concurrency: 1,
+          },
+        ],
       });
+      expect(names.fleetWake).toBe(
+        env === "staging" ? "oa-s-fleet-wake" : "oa-p-fleet-wake",
+      );
       // The operator alerts' one sending binding (src/provapi/alerts.ts),
       // restricted to the env's ALERT_TO (the same placeholder as the var).
       expect(e.send_email).toEqual([
@@ -163,6 +176,7 @@ describe("wrangler.jsonc", () => {
       "services",
       "workflows",
       "send_email",
+      "queues",
     ])
       expect(cfg).not.toHaveProperty(k);
   });

@@ -241,6 +241,7 @@ export function platformNames(env: Env): {
   manageInstall: string;
   signups: string;
   signupsDlq: string;
+  fleetWake: string;
   billing: string;
 } {
   if (!Object.hasOwn(ENV_PREFIX, env)) throw new ForeignResource("", env);
@@ -275,6 +276,9 @@ export function platformNames(env: Env): {
     // self-serve queue (API producer, provisioner consumer) and its DLQ.
     signups: `${p}signups`,
     signupsDlq: `${p}signups-dlq`,
+    // cloud #264: the platform deploy wakes the scheduler's fleet run here
+    // (deploy producer over the API, scheduler consumer).
+    fleetWake: `${p}fleet-wake`,
     // The tier store: the billing Worker and its own D1 share this name.
     billing: `${p}billing`,
   };

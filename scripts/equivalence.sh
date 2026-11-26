@@ -131,6 +131,11 @@ ALLOW=(
   scripts/ci/cloud-flaky-tracker.test.ts
   .github/workflows/release-retry.yml
   scripts/ci/release-retry.test.ts
+  # The platform deploy's fleet wake (cloud #264), this repo's own.
+  scripts/ci/fleet-wake.sh
+  scripts/ci/fleet-wake.test.ts
+  scripts/ci/fleet-wake-capable.sh
+  scripts/ci/fleet-wake-capable.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

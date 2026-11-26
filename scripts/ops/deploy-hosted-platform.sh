@@ -37,7 +37,9 @@
 #                    tag declares a BILLING binding, oa-<p>-billing too, #1568)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
-#                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
+#                    oa-<p>-provisioner and the oa-<p>-signups queue must exist;
+#                    the oa-<p>-fleet-wake queue it consumes is created when
+#                    absent, cloud #264)
 #                    [FLEET_SMOKE_TOKEN FLEET_SMOKE_SHARE_TO] (#1343, the canary
 #                    smoke's secrets: put on this Worker only, when given)
 #   inventory        PLATFORM_DB_ID HOSTS_KV_ID GITHUB_REPOSITORY_ID GITHUB_REPOSITORY
@@ -994,6 +996,26 @@ case "$target" in
     # The retry wait is checked before any deploy: a bad value must not leave
     # the run half done.
     [[ "${PUT_RETRY_SLEEP:-5}" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; exit 1; }
+    # The fleet wake (cloud #264): a tag whose scheduler consumes
+    # oa-<p>-fleet-wake needs that queue before the deploy attaches to it.
+    # Checked first, created only when absent (verify only refuses a missing
+    # one); a failed listing stops the run. A tag that consumes nothing (from
+    # before the wake) wants nothing; any other queue refuses.
+    wake_q="oa-$P-fleet-wake"
+    consumes="$(committed scheduler consumers | jq -r 'join(",")')" ||
+      { echo "can't read the scheduler's committed queue consumers" >&2; exit 1; }
+    case "$consumes" in
+      "") ;;
+      "$wake_q")
+        queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
+        if ! grep -qx "$wake_q" <<< "$queues"; then
+          [ -z "$VERIFY_ONLY" ] || { echo "queue $wake_q does not exist" >&2; exit 1; }
+          cf_send POST /queues "$(jq -nc --arg n "$wake_q" '{queue_name: $n}')" | must "create queue $wake_q" > /dev/null
+          echo "queue $wake_q created"
+        fi
+        ;;
+      *) echo "the tag's $env scheduler consumes '$consumes'; want none or $wake_q; refusing" >&2; exit 1 ;;
+    esac
     sched_deploy() {
       PLATFORM_DB_ID="$PLATFORM_DB_ID" EMAIL_ZONE_TAGS="$EMAIL_ZONE_TAGS" EMAIL_DAILY_LIMIT="$EMAIL_DAILY_LIMIT" \
         ALERT_TO="$ALERT_TO" ALERT_FROM="$ALERT_FROM" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" \

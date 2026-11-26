@@ -17,7 +17,10 @@
 # tag's, never the branch's. verify_only deploys and sets nothing: it reads the
 # live Workers back and runs every check, and the zones stay plan only. Every
 # run also reads back the token's own end date and opens an issue 30 days
-# ahead (scripts/ci/deploy-token-expiry.sh).
+# ahead (scripts/ci/deploy-token-expiry.sh). Once a run marks the platform
+# verified, it wakes the fleet (cloud #264): one message to the env's
+# oa-<p>-fleet-wake queue, so the scheduler starts the upgrades at once; the
+# 2-minute tick is the backup, so a failed wake only warns.
 # One version everywhere (#1040): the default is every target, in order. Any
 # other list is break-glass: it needs a reason and opens an issue naming the
 # run (verify_only is a check, so it needs neither). `billing` (the Stripe
@@ -264,7 +267,7 @@ jobs:
           done
           cp .deploy-logic/packages/provision/src/wfp.ts "$RUNNER_TEMP/main-wfp.ts"
           mkdir "$RUNNER_TEMP/main-ci"
-          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh; do
+          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh; do
             cp ".deploy-logic/scripts/ci/$f" "$RUNNER_TEMP/main-ci/$f"
           done
           cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"
@@ -346,6 +349,36 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/hosted-resource-ids.sh" "$DEPLOY_ENV"
+      # Rollouts that finished after their own deploy's 10-minute wait (cloud
+      # #264, for release-watch #456): every prod run, before it deploys,
+      # reads every fleet_done mark the platform D1 still holds (reads only,
+      # the deploy's token; the scheduler keeps one a week after it is set),
+      # so a finish that lands after any one run's read is recorded by the
+      # next. "Fleet done of earlier releases" runs when there is any, its
+      # name listing each release's tag and its mark's own time. #456 takes
+      # the earliest per tag, so a release listed again is harmless. Neither
+      # step can fail the run.
+      - id: prev_fleet
+        name: Read the fleet finish of earlier releases
+        if: ${{ inputs.env == 'prod' && contains(format(',{0},', inputs.targets), ',scheduler,') }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          if out="$(node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done-all prod)"; then
+            printf '%s\n' "$out"
+            echo "list=$(sed -n 's/^fleet_done_list=//p' <<< "$out")" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$out"
+            echo "::warning::could not read the fleet_done marks; earlier releases' finishes wait for the next prod run"
+          fi
+      - name: Fleet done of earlier releases (${{ steps.prev_fleet.outputs.list }})
+        if: ${{ steps.prev_fleet.outputs.list != '' }}
+        env:
+          LIST: ${{ steps.prev_fleet.outputs.list }}
+        run: echo "The fleet reached every install it waits for on $LIST"
       # Read-only (GETs), before any target deploys, verify_only too (#967):
       # each sender's domain in <env>.json must be onboarded in Email Sending.
       - name: The senders' domain is onboarded in Email Sending
@@ -546,13 +579,71 @@ jobs:
       # so it is how a stalled version is recovered); on prod it first passed
       # the two staging gates above, and a failed gate means no mark. A partial
       # verify_only run is ungated and never marks (the full-list condition).
-      - name: Mark the platform verified
+      - id: mark_verified
+        name: Mark the platform verified
         if: ${{ success() && steps.platform_tags.outcome == 'success' && (inputs.targets == 'platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler' || inputs.targets == 'platform-db,auth-broker,directory-broker,billing,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler') }}
         env:
           DEPLOY_ENV: ${{ inputs.env }}
           TAG: ${{ inputs.tag }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts mark-verified "$DEPLOY_ENV" "$TAG"
+      # The fleet wake (cloud #264), only for a tag whose scheduler consumes
+      # the env's oa-<p>-fleet-wake (an older tag, a recovery deploy say,
+      # skips the wake and the wait with one log line; the tick moves it).
+      # Once the mark is written, one message to
+      # the env's oa-<p>-fleet-wake queue, so the scheduler starts the
+      # upgrades at once instead of on its next 2-minute tick. The tick is the
+      # backup: the script turns every failure into a warning and exits 0, and
+      # the step can't fail the run either way. Main's copy, like the others.
+      - id: wake_capable
+        name: The tag's scheduler takes the fleet wake
+        if: ${{ success() && steps.mark_verified.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+        run: bash "$RUNNER_TEMP/main-ci/fleet-wake-capable.sh" "$DEPLOY_ENV" apps/scheduler/wrangler.jsonc scripts/ops/wrangler-env.ts
+      - name: Wake the fleet
+        if: ${{ success() && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          TAG: ${{ inputs.tag }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: bash "$RUNNER_TEMP/main-ci/fleet-wake.sh" "$DEPLOY_ENV" "$TAG"
+      # The rollout's finish (cloud #264), for release-watch (#456), which
+      # reads runs with the default token only: prod only (staging's chain
+      # waits on this run, and its smoke-off soak is 15 min), reads only, up
+      # to 10 min for the scheduler's fleet_done:<version> mark. "Fleet done"
+      # runs only once the mark is there, so its conclusion and end time are
+      # the signal, and it prints the mark's own time; neither step can fail
+      # the run. A finish after the wait is not lost: every later prod run
+      # reads every mark still held ("Fleet done of earlier releases", above).
+      - id: fleet_done
+        name: Wait for the fleet to reach every install
+        if: ${{ success() && inputs.env == 'prod' && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 12
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+          TAG: ${{ inputs.tag }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if out="$(node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG")"; then
+            printf '%s\n' "$out"
+            { echo "done=true"; echo "at=$(sed -n 's/^fleet_done_at=//p' <<< "$out")"; } >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$out"
+            echo "::warning::the fleet did not report every install upgraded within 10 minutes; the 2-minute tick carries on"
+          fi
+      - name: Fleet done
+        if: ${{ steps.fleet_done.outputs.done == 'true' }}
+        env:
+          TAG: ${{ inputs.tag }}
+          AT: ${{ steps.fleet_done.outputs.at }}
+        run: echo "The fleet reached every install it waits for on $TAG at $AT"
       # A break-glass run (a partial list that deployed something) clears every
       # platform_verified mark, whatever its outcome: the platform is no longer
       # known to be one verified release, so the fleet holds until a full green
