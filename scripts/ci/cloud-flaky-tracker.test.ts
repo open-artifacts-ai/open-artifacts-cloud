@@ -38,7 +38,6 @@ import {
   parseStore,
   parseVitest,
   plan,
-  RECONCILE_HOURS,
   RERUN_DAYS,
   type RunInfo,
   readMarkers,
@@ -1332,7 +1331,7 @@ describe("reconcile", () => {
     expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
     // Created in the last 30 days and 26 hours (a rerun up to 30 days after
-    // creation, updated in the last 26 hours); one
+    // creation, and 26 hours to list it); one
     // page each, as neither reaches 1,000 runs.
     expect(RERUN_DAYS).toBe(30);
     const range = encodeURIComponent(
@@ -1350,7 +1349,7 @@ describe("reconcile", () => {
     expect(writes(g)).toEqual([]);
   });
 
-  it(`finds a run created days ago that passed on a rerun in the last ${RECONCILE_HOURS} hours`, () => {
+  it("finds every run created in the range that passed on a rerun, however long ago it passed", () => {
     const ci: ListedRun = {
       ...gate,
       name: "CI",
@@ -1372,7 +1371,7 @@ describe("reconcile", () => {
             { ...ci, id: 903 },
             { created: 31 * DAY + 3 * HOUR, updated: 3 * HOUR },
           ),
-          // Updated 27 hours ago: an earlier reconcile had it.
+          // Updated 27 hours ago: still listed, as no update window applies.
           row({ ...ci, id: 904 }, { created: 2 * DAY, updated: 27 * HOUR }),
           // Passed on its first attempt: nothing to track.
           row({ ...ci, id: 905, attempt: 1 }, { created: 2 * DAY }),
@@ -1382,6 +1381,7 @@ describe("reconcile", () => {
     expect(
       listRuns(g.exec, "o/cloud", "CI", NOW).map((r) => [r.id, r.attempt]),
     ).toEqual([
+      [904, 2],
       [901, 3],
       [902, 2],
     ]);
@@ -1399,7 +1399,7 @@ describe("reconcile", () => {
     expect(
       listRuns(g.exec, "o/cloud", "CI", NOW).map((r) => [r.id, r.attempt]),
     ).toEqual([[900, 3]]);
-    // Still found until its update leaves the 26-hour window.
+    // Still found 25 hours later: its creation is still in the range.
     const later = NOW + 25 * HOUR;
     expect(listRuns(g.exec, "o/cloud", "CI", later).map((r) => r.id)).toEqual([
       900,
@@ -1536,6 +1536,132 @@ describe("reconcile", () => {
     // The sightings are stored, but the run is not marked recorded.
     expect(posted.length).toBeGreaterThan(0);
     expect(storedRuns(posted).has("900/2")).toBe(false);
+  });
+
+  it("tracks a run whose event was dropped when the next completion comes 3 days later", () => {
+    // Gate run 900 passed on attempt 2 three days ago; its tracker event was
+    // dropped and nothing completed since. Run 800 was marked 20 days ago, past
+    // the 7-day window: its mark still hides it.
+    const old = { ...gate, id: 800 };
+    const stores = [
+      {
+        number: 3,
+        comments: [
+          {
+            user: STORE_AUTHOR,
+            body: storeComment({ ...run, runId: 800 }, [
+              { f: joins, sighting: { ...s800, at: "2026-11-06T10:00:00Z" } },
+            ]),
+          },
+        ],
+      },
+    ];
+    const g = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [
+          row(old, { created: 21 * DAY, updated: 20 * DAY }),
+          row(gate, { created: 4 * DAY, updated: 72 * HOUR }),
+        ],
+      },
+      stores,
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.notes).toEqual(["run 800/2: in the store already"]);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+    expect(r.tracked[0]?.done.map((d) => d.action)).toEqual([
+      "record",
+      "record",
+    ]);
+    // The reconcile read the store from the start of the whole range.
+    const since = encodeURIComponent("2026-10-26T10:00:00.000Z");
+    expect(
+      g.calls.some((c) =>
+        c.args.join(" ").includes(`issues/3/comments?since=${since}&`),
+      ),
+    ).toBe(true);
+  });
+
+  it("marks a run with no failed test, so later reconciles skip it", () => {
+    // Attempt 1 failed only outside the tests: nothing to record.
+    const g = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [
+          row(gate, { created: 3 * DAY, updated: 2 * DAY }),
+        ],
+      },
+      jobs: [
+        {
+          name: "bring-up",
+          log: "##[error]Process completed with exit code 1.",
+        },
+      ],
+      stores: [{ number: 3, comments: [] }],
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(0);
+    expect(r.tracked[0]?.done).toEqual([]);
+    const w = writes(g);
+    expect(w.map((c) => c.args.slice(0, 3))).toEqual([
+      ["issue", "comment", "3"],
+    ]);
+    const mark = bodyOf(w[0]);
+    expect(storedRuns([{ user: STORE_AUTHOR, body: mark }])).toEqual(
+      new Set(["900/2"]),
+    );
+    // With that comment in the store, the next reconcile, 5 days on, reads
+    // nothing of the run and writes nothing.
+    const again = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [
+          row(gate, { created: 3 * DAY, updated: 2 * DAY }),
+        ],
+      },
+      stores: [{ number: 3, comments: [{ user: STORE_AUTHOR, body: mark }] }],
+    });
+    const r2 = reconcile({
+      exec: again.exec,
+      repo: "o/cloud",
+      nowMs: NOW + 5 * DAY,
+    });
+    expect(r2.notes).toEqual(["run 900/2: in the store already"]);
+    expect(writes(again)).toEqual([]);
+    expect(
+      again.calls.some((c) => c.args.join(" ").includes("/runs/900")),
+    ).toBe(false);
+  });
+
+  it("reads a store closed 20 days ago for its marks", () => {
+    const stores = [
+      {
+        number: 2,
+        state: "CLOSED",
+        closedAt: "2026-11-06T00:00:00Z",
+        comments: [
+          {
+            user: STORE_AUTHOR,
+            body: storeComment(run, [{ f: joins, sighting: s900 }]),
+          },
+        ],
+      },
+      { number: 4, comments: [] },
+    ];
+    const g = fakeGh({
+      labels: LABELS,
+      listed: {
+        "redline-staging.yml": [
+          row(gate, { created: 22 * DAY, updated: 21 * DAY }),
+        ],
+      },
+      stores,
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.tracked).toEqual([]);
+    expect(r.notes).toEqual(["run 900/2: in the store already"]);
+    expect(writes(g)).toEqual([]);
   });
 
   it("is a no-op for a run already in the store: adds nothing, bumps nothing", () => {

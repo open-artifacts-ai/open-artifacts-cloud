@@ -72,10 +72,12 @@
 // group, and a dropped tracker run would lose its sightings. So the same
 // job runs --reconcile right after every tracker run, on each completion of a
 // watched workflow and on dispatch, never on a clock (see reconcile()): it tracks
-// every run updated in the last RECONCILE_HOURS hours (created within
-// RERUN_DAYS plus RECONCILE_HOURS; GitHub allows a rerun for RERUN_DAYS)
-// that passed after a failed
-// attempt and that the store doesn't hold yet, by the same rules and code.
+// every run created within RERUN_DAYS plus RECONCILE_HOURS (GitHub allows a
+// rerun for RERUN_DAYS) that passed after a failed attempt and that the store
+// doesn't hold yet, however long ago it passed, by the same rules and code.
+// So a dropped event is caught by the next completion whenever it comes. A
+// run whose earlier attempts hold no failed test is marked in the store too,
+// so it is read once.
 //
 // Usage: node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
 //        node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --reconcile
@@ -817,7 +819,10 @@ export function storeComment(
   ].join("\n");
 }
 
-/** The store comment that marks this run recorded: written after every filing. */
+/**
+ * The store comment that marks this run recorded: written after every filing,
+ * and on its own for a run whose earlier attempts hold no failed test.
+ */
 export const runDoneComment = (run: RunInfo) => storeComment(run, [], true);
 
 /**
@@ -916,14 +921,14 @@ type StoreIssue = Issue & { state: string; closedAt?: string | null };
 
 /**
  * The store issues, oldest first, and the ones to read: open, or closed
- * within the window. Reads only.
+ * since `since` (by default the window's start). Reads only.
  */
 function storeIssues(
   exec: Exec,
   repo: string,
   nowMs: number,
+  since = nowMs - WINDOW_DAYS * DAY_MS,
 ): { all: StoreIssue[]; read: number[] } {
-  const since = nowMs - WINDOW_DAYS * DAY_MS;
   const all = (
     JSON.parse(
       gh(exec, [
@@ -996,14 +1001,18 @@ export function openStore(
 
 type StoreComment = { user: string; body: string };
 
-/** The store's comments within the window, by anyone (callers filter). */
+/**
+ * The store's comments since `fromMs` (by default the window's start), by
+ * anyone (callers filter).
+ */
 function storeCommentsIn(
   exec: Exec,
   repo: string,
   issues: number[],
   nowMs: number,
+  fromMs = nowMs - WINDOW_DAYS * DAY_MS,
 ): StoreComment[] {
-  const since = new Date(nowMs - WINDOW_DAYS * DAY_MS).toISOString();
+  const since = new Date(fromMs).toISOString();
   const comments: { user: string; body: string }[] = [];
   for (const n of issues) {
     const out = gh(exec, [
@@ -1104,13 +1113,52 @@ function listOpen(exec: Exec, repo: string): Issue[] {
   ) as Issue[];
 }
 
+/**
+ * A run whose earlier attempts hold no failed test (only failures outside the
+ * tests): nothing to record, but the run is marked in the store, so the
+ * reconcile, which looks back over the whole rerun period, never reads it
+ * again.
+ */
+function markNoTest(
+  exec: Exec,
+  run: RunInfo,
+  nowMs: number,
+  notes: string[],
+): { done: Done[]; notes: string[] } {
+  ensureLabel(
+    exec,
+    run.repo,
+    STORE_LABEL,
+    "EDEDED",
+    "The flaky tracker's record of tests that failed and then passed",
+  );
+  const store = openStore(exec, run.repo, nowMs);
+  notes.push(...store.notes);
+  const comments = storeCommentsIn(exec, run.repo, store.read, nowMs);
+  if (!storedRuns(comments).has(`${run.runId}/${run.attempt}`))
+    gh(
+      exec,
+      [
+        "issue",
+        "comment",
+        String(store.write),
+        "--repo",
+        run.repo,
+        "--body",
+        runDoneComment(run),
+      ],
+      { write: true },
+    );
+  return { done: [], notes };
+}
+
 export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   done: Done[];
   notes: string[];
 } {
   const { exec, run } = o;
   const { found, notes } = collect(exec, run);
-  if (!found.length) return { done: [], notes };
+  if (!found.length) return markNoTest(exec, run, o.nowMs, notes);
   ensureLabel(
     exec,
     run.repo,
@@ -1352,10 +1400,22 @@ export const runFromArgs = (argv: string[]): RunInfo =>
 
 // ---- The reconcile ----
 
-/** The reconcile tracks the runs updated in the last this many hours. */
+/**
+ * The reconcile lists runs created up to RERUN_DAYS plus this many hours ago,
+ * so a rerun that passed near the end of GitHub's rerun period stays listed.
+ */
 export const RECONCILE_HOURS = 26;
 /** GitHub lets a run be rerun for this many days after it was created. */
 export const RERUN_DAYS = 30;
+
+/**
+ * The start of the reconcile's range, in whole seconds: RERUN_DAYS plus
+ * RECONCILE_HOURS ago.
+ */
+export const reconcileFrom = (nowMs: number) =>
+  Math.floor(nowMs / 1000) * 1000 -
+  RERUN_DAYS * DAY_MS -
+  RECONCILE_HOURS * 3600 * 1000;
 /** list-workflow-runs returns at most this many runs for one query. */
 export const LIST_MAX = 1000;
 const PER_PAGE = 100;
@@ -1397,7 +1457,6 @@ type RunRow = {
   id: number;
   run_attempt: number;
   conclusion: string | null;
-  updated_at: string;
   event: string;
   head_branch: string;
   head_sha: string;
@@ -1425,7 +1484,7 @@ export function listCreated(
         "api",
         `${path}&created=${range}&per_page=${PER_PAGE}&page=${p}`,
         "--jq",
-        "{total_count, workflow_runs: [.workflow_runs[] | {id, run_attempt, conclusion, updated_at, event, head_branch, head_sha, display_title}]}",
+        "{total_count, workflow_runs: [.workflow_runs[] | {id, run_attempt, conclusion, event, head_branch, head_sha, display_title}]}",
       ]),
     ) as { total_count: number; workflow_runs: RunRow[] };
   const first = page(1);
@@ -1447,12 +1506,13 @@ export function listCreated(
 }
 
 /**
- * A watched workflow's runs created in the last RERUN_DAYS days plus
- * RECONCILE_HOURS (a run can be rerun up to RERUN_DAYS after it was created,
- * and its rerun must stay listed for the whole update window) whose latest
- * attempt passed and that were updated in the last RECONCILE_HOURS. Whether a failure counts toward
- * "twice in 7 days" is decided later, by the failed job's completion time,
- * never by the run's creation.
+ * A watched workflow's runs created since reconcileFrom (a run can be rerun
+ * up to RERUN_DAYS after it was created) whose latest attempt (2 or later)
+ * passed, however long ago it passed. No update window: a run whose event was
+ * dropped stays listed until the store marks it, so catching it never depends
+ * on how soon the next event comes. Whether a failure counts toward "twice in
+ * 7 days" is decided later, by the failed job's completion time, never by the
+ * run's creation.
  */
 export function listRuns(
   exec: Exec,
@@ -1461,22 +1521,14 @@ export function listRuns(
   nowMs: number,
 ): ListedRun[] {
   const to = Math.floor(nowMs / 1000) * 1000;
-  // A rerun can start up to RERUN_DAYS after creation, and a run updated
-  // any time in the last RECONCILE_HOURS must still be in the range.
-  const from = to - RERUN_DAYS * DAY_MS - RECONCILE_HOURS * 3600 * 1000;
-  const touched = nowMs - RECONCILE_HOURS * 3600 * 1000;
+  const from = reconcileFrom(nowMs);
   return listCreated(
     exec,
     `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true`,
     from,
     to,
   )
-    .filter(
-      (r) =>
-        r.conclusion === "success" &&
-        r.run_attempt > 1 &&
-        Date.parse(r.updated_at) >= touched,
-    )
+    .filter((r) => r.conclusion === "success" && r.run_attempt > 1)
     .map((r) => ({
       id: r.id,
       attempt: r.run_attempt,
@@ -1493,14 +1545,13 @@ export function listRuns(
 /**
  * The reconcile, after every tracker run: a tracker run GitHub dropped (its queue full, or the
  * runner gone) leaves a run unrecorded. This lists the watched workflows'
- * runs created in the last RERUN_DAYS days plus RECONCILE_HOURS and updated in the last
- * RECONCILE_HOURS hours whose latest attempt passed after an earlier one
- * (listCreated splits a listing at GitHub's limit), and tracks each the store
- * doesn't hold yet (by run id and the attempt that passed) with the same code
- * as the event. A run the
+ * runs created since reconcileFrom whose latest attempt passed after an
+ * earlier one, however long ago (listCreated splits a listing at GitHub's
+ * limit), and tracks each the store doesn't hold yet (by run id and the
+ * attempt that passed) with the same code as the event. The store is read
+ * over the same range, so a run marked weeks ago is still known. A run the
  * store holds adds nothing and bumps nothing. A run that found no test (it
- * failed outside the tests) writes nothing, so it is read again by each
- * tracker run until it leaves the window: reads only.
+ * failed outside the tests) is marked once, so it is not read again.
  */
 export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
   tracked: { run: RunInfo; done: Done[]; notes: string[] }[];
@@ -1512,9 +1563,12 @@ export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
   const runs = listed.filter((r) => eligible(r));
   if (!runs.length) return { tracked: [], notes, failed: 0 };
-  // Reads only: a store is created only when a run below has a sighting.
-  const { read } = storeIssues(exec, repo, nowMs);
-  const have = storedRuns(storeCommentsIn(exec, repo, read, nowMs));
+  // Reads only: a store is created only when a run below is tracked. Every
+  // listed run's mark was written after the run was created, so reading the
+  // stores since reconcileFrom finds all of them.
+  const from = reconcileFrom(nowMs);
+  const { read } = storeIssues(exec, repo, nowMs, from);
+  const have = storedRuns(storeCommentsIn(exec, repo, read, nowMs, from));
   const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
   let failed = 0;
   for (const r of runs) {
@@ -1557,7 +1611,7 @@ function main(argv: string[]) {
     const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
     failed = r.failed;
     lines = [
-      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and ${RECONCILE_HOURS} hours and updated in the last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
+      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
     ];
