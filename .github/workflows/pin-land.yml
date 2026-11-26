@@ -1,0 +1,131 @@
+# Direct mode's lander (cloud #264): with the repo variable PIN_BUMP_DIRECT set
+# to `on`, pin-bump.yml stages each pin commit on pin-land/<tag>, where CI runs
+# in full, and the `land` job here fast-forwards main to that exact sha, with
+# force=false, only when ci.yml's push run on that branch and sha passed in full
+# (every job main's ruleset requires green, none skipped, none on the pin-only
+# short path), the commit is the bot's verified one, it changes only
+# PUBLIC_PIN, SYNCED_FROM and pnpm-lock.yaml, and both pin files name the public
+# tag's sha. Red stays red and the branch waits for a person; a main that moved
+# meanwhile gets the same blobs on its head, pushed to the branch for CI to run
+# again, unless it moved on a lockfile-sensitive path (the branch is dropped,
+# the run goes red, which files the blocker issue, and the next plan
+# regenerates). land waits while pin-bump-arm's release pipeline gate is shut,
+# so a direct bump lands no sooner than an armed PR would.
+# land writes with its own App, never the release App: its id and key are the
+# secrets PIN_LAND_APP_ID and PIN_LAND_APP_PRIVATE_KEY in the main-only
+# Environment `pin-land`, and that App is the only bypass actor main's ruleset
+# needs. The release App (minted unnarrowed elsewhere) never moves main. Unset
+# (or anything but `on`), nothing here runs.
+#
+# Triggers (cloud #264). Event-only: there is no schedule, and no push trigger,
+# so a pin landing on main never starts the lander. land runs:
+# - after CI on a staged pin (pin-land/*): it may land now;
+# - when a release pipeline gate workflow ends, on any branch (GATE_WORKFLOWS
+#   in scripts/ci/pin-bump-arm.ts): readGate counts their runs on every branch,
+#   since a run off main still uses the shared staging and prod environments,
+#   so the end of any run it counts may open the gate. The branch is never
+#   trusted: land runs main's checkout and decides from readGate itself;
+# - on dispatch, by hand.
+# It lands every staged pin that passed, whatever started it, so every run in
+# its concurrency group does the same work: a pending run replaced by a newer
+# event loses nothing. Planning and opening are pin-bump.yml, in a group of
+# their own, so a run that only lands never takes a release dispatch's pending
+# slot. A failure is red and keeps one blocker issue "pin-land failed" open
+# (report, below); no timer retries it. Every job runs only on main of this
+# repo, never on a fork. An event no job takes (CI on any branch but
+# pin-land/*, or a workflow_run outside direct mode) runs nothing, report included, so it never closes the
+# blocker issue.
+name: pin-land
+
+on:
+  workflow_dispatch:
+  # From main's copy of this file and script; nothing from the event is used
+  # but its workflow name and branch, in the jobs' `if`. No branch filter: a
+  # gate workflow wakes this on any branch, CI only on pin-land/*.
+  workflow_run:
+    workflows:
+      [
+        CI,
+        hosted-publish,
+        staging-release-chain,
+        deploy-hosted-platform,
+        redline-staging,
+        prod-release-chain,
+      ]
+    types: [completed]
+
+permissions: {}
+
+# One run at a time, never cancelled. Every run in this group lands, so the
+# one GitHub keeps pending does what any it replaced would. An event no job
+# takes gets a group of its own, so it can never replace a pending run that has
+# work to do. The test for this group is the same as land's `if`.
+concurrency:
+  group: ${{ (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && (github.event.workflow_run.name != 'CI' || startsWith(github.event.workflow_run.head_branch, 'pin-land/')))) && 'pin-land' || format('pin-land-idle-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  # main moves to a staged pin only once a full CI push run passed on that exact sha.
+  land:
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on' && (github.event_name != 'workflow_run' || (vars.PIN_BUMP_DIRECT == 'on' && (github.event.workflow_run.name != 'CI' || startsWith(github.event.workflow_run.head_branch, 'pin-land/'))))
+    runs-on: ubuntu-latest
+    # Its own App and Environment: the bypass actor on main's ruleset is used here only.
+    environment: pin-land
+    timeout-minutes: 10
+    # actions: read lets land read ci.yml's push run and jobs on the staged sha.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PIN_LAND_APP_ID }}
+          private-key: ${{ secrets.PIN_LAND_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Land every staged pin that CI passed
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          READ_TOKEN: ${{ github.token }}
+          LAND_BOT: ${{ steps.app.outputs.app-slug }}[bot]
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts land --repo "$GITHUB_REPOSITORY"
+
+  report:
+    needs: [land]
+    # Only when land ran: an event no job took reports nothing.
+    if: ${{ always() && github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && needs.land.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Keep the blocker issue in step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ (needs.land.result == 'failure' || needs.land.result == 'cancelled') && 'failure' || 'success' }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="pin-land failed"
+          open=$(gh issue list --repo "$REPO" --state open --label blocker --limit 100 --json number,title --jq "[.[] | select(.title == \"$title\") | .number][0] // empty")
+          if [ "$RESULT" = failure ]; then
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --repo "$REPO" --body "Failed again: $RUN"
+            else
+              labels=$(gh label list --repo "$REPO" --limit 200 --json name --jq '.[].name')
+              grep -qx blocker <<< "$labels" || gh label create blocker --repo "$REPO" --description "Blocks a release or a merge" --color B60205
+              gh issue create --repo "$REPO" --title "$title" --label blocker --body "The pin-land workflow failed: $RUN"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --repo "$REPO" --comment "Green again: $RUN"
+          fi

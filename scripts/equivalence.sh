@@ -49,6 +49,7 @@ set -uo pipefail
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
 # And the pin-bump self-arm (#264): a workflow, its script and its test.
+# And direct mode's lander (#264), split from the pin-bump opener: a workflow.
 # And the shared gh retry for the pin-bump scripts: a script and its test.
 # And the T19 dry-run workflow (#166): a workflow that public never had.
 # And the staging half of the release chain (#264 step 1): a workflow, its
@@ -66,6 +67,7 @@ ALLOW=(
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/pin-bump-arm.yml
+  .github/workflows/pin-land.yml
   .github/workflows/hosted-release-alert.yml
   .github/workflows/staging-release-chain.yml
   scripts/ci/staging-release-chain.ts
