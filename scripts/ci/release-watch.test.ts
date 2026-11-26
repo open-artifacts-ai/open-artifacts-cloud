@@ -11,10 +11,15 @@ import {
   type Config,
   compute,
   eta,
+  FLEET_DONE_STEP,
+  FLEET_WAIT_STEP,
+  FLEET_WAKE_STEP,
+  fleetStep,
   type HistoryEntry,
   ISSUE_TITLE,
   issueBody,
   issuePlan,
+  type Job,
   limitOf,
   loadConfig,
   mergeHistory,
@@ -89,13 +94,32 @@ const row = (t: ReturnType<typeof tl>, name: string) =>
   t?.stages.find((s) => s.name === name);
 
 describe("release-stages.json", () => {
-  it("chains each mode's stages end to start, merged to prod deploy", () => {
+  it("each stage waits on earlier stages' ends, merged to fleet; a run stage is timed from its own start", () => {
+    const list = (k: string | string[] | undefined) =>
+      k === undefined ? [] : Array.isArray(k) ? k : [k];
     for (const mode of ["pr", "direct"] as const) {
       const s = config.stages.filter((x) => !x.mode || x.mode === mode);
       expect(s[0]?.from).toBe("merged");
-      for (let i = 1; i < s.length; i++)
-        expect(s[i]?.from, s[i]?.name).toBe(s[i - 1]?.to);
+      expect(s[s.length - 1]?.name).toBe("fleet");
+      for (let i = 1; i < s.length; i++) {
+        const x = s[i] as (typeof s)[number];
+        const ends = s.slice(0, i).map((y) => y.to);
+        // What it waits on: its after, else its own start is an earlier end.
+        for (const d of list(x.after ?? x.from))
+          expect(ends, `${x.name} waits on ${d}`).toContain(d);
+        // A stage with its own run starts at that run's start.
+        if (x.after) expect(x.from).toBe(x.to.replace(/\.done$/, ".started"));
+      }
     }
+    // Since cloud #471 the staging copy and deploy both wait on hosted_release
+    // and the red-line queue on both.
+    const by = (n: string) => config.stages.find((x) => x.name === n);
+    expect(by("staging_publish")?.after).toBe("hosted_release.done");
+    expect(by("staging_deploy")?.after).toBe("hosted_release.done");
+    expect(by("redline_queue")?.from).toEqual([
+      "staging_publish.done",
+      "staging_deploy.done",
+    ]);
   });
   it("has a direct-pin stage beside the PR stages", () => {
     const d = config.stages.find((s) => s.name === "direct_pin");
@@ -108,10 +132,16 @@ describe("release-stages.json", () => {
       config.stages.filter((s) => s.mode === "pr").map((s) => s.name),
     ).toEqual(["pin_open", "pin_merge"]);
   });
-  it("leaves fleet unmeasured, naming the source it needs", () => {
+  it("measures fleet only where the prod deploy records it, with no usual time yet and no admin reads", () => {
     const f = config.stages.find((s) => s.name === "fleet");
-    expect(f?.measured).toBe(false);
-    expect(f?.todo).toMatch(/fleet/);
+    expect(f).toMatchObject({
+      from: "fleet.started",
+      to: "fleet.done",
+      after: "prod_deploy.done",
+      optional: true,
+    });
+    expect(f?.usual).toBeUndefined();
+    expect(f?.todo).toMatch(/Fleet done/);
     expect(f?.todo).toMatch(/no admin reads/);
   });
   it("alerts past max(2 x usual, usual + 5 min); merge to every install only has a 20 min target", () => {
@@ -121,7 +151,7 @@ describe("release-stages.json", () => {
     expect(config).not.toHaveProperty("e2eWorst");
     for (const s of config.stages) {
       expect(s, s.name).not.toHaveProperty("budget");
-      if (s.measured !== false) expect(s.usual, s.name).toBeGreaterThan(0);
+      if (!s.optional) expect(s.usual, s.name).toBeGreaterThan(0);
     }
   });
   it("the usual times are the medians the note cites, release by release", () => {
@@ -142,10 +172,10 @@ describe("release-stages.json", () => {
         : ((s[h - 1] as number) + (s[h] as number)) / 2;
     };
     expect(raw.notes.filter((x) => x.startsWith("Measured v"))).toHaveLength(
-      22,
+      23,
     );
     for (const s of config.stages.filter(
-      (x) => x.measured !== false && x.name !== "direct_pin",
+      (x) => !x.optional && x.name !== "direct_pin",
     ))
       expect(median(v[s.name] ?? []), s.name).toBeCloseTo(s.usual as number, 2);
   });
@@ -186,14 +216,19 @@ describe("timeline on the recorded chain", () => {
       tag: 3.6,
       pin_open: 1.8,
       pin_merge: 10,
-      hosted_release: 2.9,
-      staging_publish: 4,
-      staging_deploy: 5.1,
+      // Each run stage from its own start: the hand-off waits are not in it.
+      hosted_release: 2.8,
+      staging_publish: 3.9,
+      staging_deploy: 4.7,
       redline_queue: 0.7,
       redline: 9.9,
-      prod_publish: 3,
-      prod_deploy: 4.9,
+      prod_publish: 1.9,
+      prod_deploy: 4.4,
+      fleet: undefined,
     });
+    // A deploy before cloud #474 has no fleet steps: done at the prod deploy.
+    expect(row(t, "fleet")?.state).toBe("unmeasured");
+    expect(t?.e2eTo).toBe("prod deploy (fleet not yet measured)");
     expect(t?.doneAt).toBe(T("19:43:43"));
     expect(t?.e2e).toBe(45.8);
     const w = world(now);
@@ -217,10 +252,10 @@ describe("timeline on the recorded chain", () => {
         tag: "v0.245.1",
         stage: "staging_deploy",
         kind: "in_flight",
-        startedAt: T("19:20:12"),
-        minutes: 9.8,
-        usual: 4.7,
-        limit: 9.7,
+        startedAt: T("19:20:38"),
+        minutes: 9.4,
+        usual: 4.3,
+        limit: 9.3,
         url: expect.stringContaining("/actions/runs/"),
       },
     ]);
@@ -228,15 +263,15 @@ describe("timeline on the recorded chain", () => {
       tag: "v0.245.1",
       stage: "staging_deploy",
       state: "current",
-      elapsed: 9.8,
-      usual: 4.7,
-      limit: 9.7,
+      elapsed: 9.4,
+      usual: 4.3,
+      limit: 9.3,
     });
     const a = issuePlan([], r.over, r.red, config);
     expect(a.action).toBe("create");
     if (a.action === "create")
       expect(a.body).toContain(
-        "- v0.245.1 staging_deploy: still going past 9.7 min (usual 4.7 min), started 2026-11-25T19:20:12Z.",
+        "- v0.245.1 staging_deploy: still going past 9.3 min (usual 4.3 min), started 2026-11-25T19:20:38Z.",
       );
   });
 
@@ -246,9 +281,9 @@ describe("timeline on the recorded chain", () => {
     w.prs = w.prs.filter((p) => p.ref !== "pin-bump/v0.245.1");
     const r = world(now, w);
     expect(r.over.map((o) => [o.tag, o.stage, o.minutes, o.limit])).toEqual([
-      ["v0.245.1", "pin_open", 7.5, 7.1],
+      ["v0.245.1", "pin_open", 7.5, 7.15],
     ]);
-    // Past twice its usual time (4.2 min), not past usual + 5 (7.1): no alert.
+    // Past twice its usual time (4.3 min), not past usual + 5 (7.15): no alert.
     const early = at(T("19:06:00"));
     early.prs = early.prs.filter((p) => p.ref !== "pin-bump/v0.245.1");
     expect(world(T("19:06:00"), early).over).toEqual([]);
@@ -420,7 +455,8 @@ describe("timeline on the recorded chain", () => {
     expect(t?.mode).toBe("direct");
     expect(t?.stages.map((s) => s.name)).not.toContain("pin_open");
     expect(row(t, "direct_pin")).toMatchObject({ state: "done", minutes: 1.5 });
-    expect(row(t, "hosted_release")?.minutes).toBe(13.2);
+    // Its own run: the wait for it to start is not counted.
+    expect(row(t, "hosted_release")?.minutes).toBe(2.8);
     expect(t?.doneAt).toBe(T("19:43:43"));
   });
 
@@ -555,7 +591,13 @@ describe("a release across recovery runs (v0.246.1)", () => {
       updatedAt: D("00:45:10"),
       jobs: [
         ok("resolve"),
-        ok("publish-staging release v0.246.1"),
+        // Job 139611132784: the copy ends here, though stage-prod runs on.
+        {
+          ...ok("publish-staging release v0.246.1"),
+          status: "completed",
+          startedAt: D("00:41:39"),
+          completedAt: D("00:43:57"),
+        },
         ok("stage-prod release v0.246.1"),
         skipped("publish-prod"),
       ],
@@ -645,21 +687,23 @@ describe("a release across recovery runs (v0.246.1)", () => {
   it("a staging publish on a later main commit that names the tag counts: the release reached prod and is done, not superseded", () => {
     const x = w(recovery());
     const t = tl("v0.246.1", now, x);
+    // From its run's start, 00:41:28Z, to its publish-staging job's end.
     expect(row(t, "staging_publish")).toMatchObject({
       state: "done",
-      minutes: 3.8,
+      minutes: 2.5,
+      endedAt: D("00:43:57"),
       url: `${RUNS}45730519720`,
     });
     expect(
       Object.fromEntries((t?.stages ?? []).map((s) => [s.name, s.minutes])),
     ).toMatchObject({
       hosted_release: 78.4,
-      staging_publish: 3.8,
-      staging_deploy: 4.6,
+      staging_publish: 2.5,
+      staging_deploy: 4.2,
       redline_queue: 0.4,
       redline: 9.7,
-      prod_publish: 3,
-      prod_deploy: 5.1,
+      prod_publish: 2,
+      prod_deploy: 4.8,
     });
     expect(t?.prodAt).toBe(D("01:07:55"));
     expect(t?.doneAt).toBe(D("01:07:55"));
@@ -669,7 +713,7 @@ describe("a release across recovery runs (v0.246.1)", () => {
     const h = r.history.find((e) => e.tag === "v0.246.1");
     expect(h).toMatchObject({ doneAt: D("01:07:55"), e2e: 237.5 });
     expect(h).not.toHaveProperty("supersededBy");
-    expect(h?.stages.staging_publish).toBe(3.8);
+    expect(h?.stages.staging_publish).toBe(2.5);
     // v0.246.0 never reached prod: superseded, closed by v0.246.1's prod deploy.
     expect(r.history.find((e) => e.tag === "v0.246.0")).toMatchObject({
       supersededBy: "v0.246.1",
@@ -683,9 +727,10 @@ describe("a release across recovery runs (v0.246.1)", () => {
     // prod deploy ran, so every stage before it happened.
     const x = w(recovery().map((r) => ({ ...r, jobs: undefined })));
     const t = tl("v0.246.1", now, x);
+    // The failed copies ran before hosted_release ended: earlier attempts.
     expect(row(t, "staging_publish")?.state).toBe("done");
     expect(row(t, "staging_publish")?.minutes).toBeUndefined();
-    expect(row(t, "staging_deploy")?.minutes).toBeUndefined();
+    expect(row(t, "staging_deploy")?.minutes).toBe(4.2);
     expect(row(t, "redline")?.minutes).toBe(9.7);
     expect(t?.supersededBy).toBeUndefined();
     expect(t?.doneAt).toBe(D("01:07:55"));
@@ -743,6 +788,325 @@ describe("a release across recovery runs (v0.246.1)", () => {
   });
 });
 
+// cloud #456 second review: since cloud #471 the staging copy and the staging
+// deploy both start when hosted-release ends. Recorded from v0.248.2:
+// hosted-release 45756226648, the copy 45756565482 (publish-staging job
+// 04:39:21 to 04:41:59, stage-prod on to 04:43:21), the deploy 45757040413
+// (4.3 min), replayed as the Prover did: the deploy starting 1 s after
+// hosted-release ended.
+describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", () => {
+  const RUNS =
+    "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/";
+  const SHA = "c80f07fffeb6a326e8a60cb9af9f0659c4f4066f";
+  const D = (hms: string) => `2026-11-26T${hms}Z`;
+  const base = (
+    file: string,
+    o: Pick<Run, "id" | "event" | "title" | "createdAt" | "updatedAt"> &
+      Partial<Run>,
+  ): Run => ({
+    path: `.github/workflows/${file}`,
+    status: "completed",
+    conclusion: "success",
+    headSha: SHA,
+    startedAt: o.createdAt,
+    attempt: 1,
+    url: `${RUNS}${o.id}`,
+    commitMessage: "chore(pin): bump PUBLIC_PIN to v0.248.2 (#473)",
+    commitAt: D("04:29:30"),
+    ...o,
+  });
+  const copyJob = (end: string | null) => ({
+    name: "publish-staging release v0.248.2",
+    status: end ? "completed" : "in_progress",
+    conclusion: end ? "success" : null,
+    startedAt: D("04:39:21"),
+    completedAt: end,
+  });
+  const chain = (o: {
+    copyEnd?: string | null;
+    copyRunEnd?: string;
+    prod?: Run[];
+  }): Run[] => [
+    base("hosted-release.yml", {
+      id: 45756226648,
+      event: "push",
+      title: "hosted-release",
+      createdAt: D("04:35:54"),
+      updatedAt: D("04:39:06"),
+    }),
+    base("hosted-publish.yml", {
+      id: 45756565482,
+      event: "workflow_run",
+      title: "hosted-publish",
+      createdAt: D("04:39:09"),
+      updatedAt: o.copyRunEnd ?? D("04:43:21"),
+      ...(o.copyRunEnd === undefined && o.copyEnd === null
+        ? { status: "in_progress", conclusion: null }
+        : {}),
+      jobs: [
+        { name: "resolve", conclusion: "success" },
+        copyJob(o.copyEnd === undefined ? D("04:41:59") : o.copyEnd),
+      ],
+    }),
+    base("deploy-hosted-platform.yml", {
+      id: 45757040413,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform staging v0.248.2 [sc45756226648-1]",
+      createdAt: D("04:39:07"),
+      updatedAt: D("04:43:27"),
+    }),
+    ...(o.prod ?? []),
+  ];
+  const world2 = (runs: Run[], now: string) => ({
+    releases: [{ tag: "v0.248.2", publishedAt: D("04:25:40") }],
+    prs: [
+      {
+        number: 473,
+        ref: "pin-bump/v0.248.2",
+        createdAt: D("04:27:54"),
+        mergedAt: D("04:35:53"),
+        url: "https://github.com/open-artifacts-ai/open-artifacts-cloud/pull/473",
+      },
+    ],
+    runs: runs.filter((r) => ms(r.createdAt) <= ms(now)),
+    merges: { "v0.248.2": D("04:21:47") },
+  });
+  const tl2 = (runs: Run[], now: string) => {
+    const w = world2(runs, now);
+    return timeline({
+      release: w.releases[0] as Release,
+      runs: w.runs,
+      prs: w.prs,
+      mergedAt: w.merges["v0.248.2"],
+      config,
+      now,
+    });
+  };
+
+  it("times the copy and the deploy each from its own start: the deploy is 4.3 min, not 0.1", () => {
+    const t = tl2(chain({}), D("04:44:00"));
+    expect(row(t, "staging_deploy")).toMatchObject({
+      state: "done",
+      startedAt: D("04:39:07"),
+      endedAt: D("04:43:27"),
+      minutes: 4.3,
+    });
+    // The copy ends with its publish-staging job, though stage-prod runs on.
+    expect(row(t, "staging_publish")).toMatchObject({
+      state: "done",
+      startedAt: D("04:39:09"),
+      endedAt: D("04:41:59"),
+      minutes: 2.8,
+    });
+    // The red-line queue starts when the later of the two ended.
+    expect(row(t, "redline_queue")).toMatchObject({
+      state: "current",
+      startedAt: D("04:43:27"),
+    });
+  });
+
+  it("a copy still running after the deploy finished is not done: it is the stage going, and the red-line queue has not started", () => {
+    const runs = chain({ copyEnd: null });
+    const t = tl2(runs, D("04:44:00"));
+    expect(row(t, "staging_deploy")?.state).toBe("done");
+    expect(row(t, "staging_publish")).toMatchObject({
+      state: "current",
+      startedAt: D("04:39:09"),
+      minutes: 4.9,
+    });
+    expect(row(t, "redline_queue")?.state).toBe("pending");
+    // A stalled copy is named as the copy, never the red-line queue.
+    const now = D("04:49:00");
+    const r = compute({
+      ...world2(runs, now),
+      history: [],
+      config,
+      now,
+    });
+    expect(r.over.filter((o) => o.kind === "in_flight")).toEqual([
+      {
+        tag: "v0.248.2",
+        stage: "staging_publish",
+        kind: "in_flight",
+        startedAt: D("04:39:09"),
+        minutes: 9.9,
+        usual: 2.8,
+        limit: 7.8,
+        url: `${RUNS}45756565482`,
+      },
+    ]);
+    expect(r.current.inFlight[0]?.going.map((g) => g.stage)).toEqual([
+      "staging_publish",
+    ]);
+  });
+
+  it("a stage that has not started counts from what it waits on, so a stall still shows", () => {
+    // The deploy never dispatched: 10 min after hosted-release ended.
+    const runs = chain({}).filter((r) => r.id !== 45757040413);
+    const now = D("04:49:06");
+    const t = tl2(runs, now);
+    expect(row(t, "staging_deploy")).toMatchObject({
+      state: "current",
+      waiting: true,
+      startedAt: D("04:39:06"),
+      minutes: 10,
+    });
+    const r = compute({ ...world2(runs, now), history: [], config, now });
+    expect(r.over.map((o) => [o.stage, o.waiting])).toEqual([
+      ["staging_deploy", true],
+    ]);
+    expect(issueBody(r.over, r.red, config)).toContain(
+      "- v0.248.2 staging_deploy: not started 9.3 min after what it waits on ended (usual 4.3 min), waiting since 2026-11-26T04:39:06Z.",
+    );
+  });
+
+  // The rest of the chain, then the prod deploy run with #474's steps.
+  const prodRuns = (
+    steps: Job["steps"] | undefined,
+    deploy?: Partial<Run>,
+  ): Run[] => [
+    base("redline-staging.yml", {
+      id: 1,
+      event: "workflow_dispatch",
+      title: "redline-staging v0.248.2",
+      createdAt: D("04:43:40"),
+      updatedAt: D("04:53:40"),
+    }),
+    base("hosted-publish.yml", {
+      id: 2,
+      event: "workflow_dispatch",
+      title: "hosted-publish prod v0.248.2 [p1-1]",
+      createdAt: D("04:54:00"),
+      updatedAt: D("04:56:00"),
+    }),
+    base("deploy-hosted-platform.yml", {
+      id: 3,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform prod v0.248.2 [c1-1]",
+      createdAt: D("04:56:10"),
+      updatedAt: D("05:06:00"),
+      ...(steps
+        ? { jobs: [{ name: "deploy", conclusion: "success", steps }] }
+        : {}),
+      ...deploy,
+    }),
+  ];
+  const stepOf = (
+    name: string,
+    startedAt: string,
+    completedAt: string | null,
+    conclusion: string | null = "success",
+  ) => ({
+    name,
+    status: completedAt ? "completed" : "in_progress",
+    conclusion,
+    startedAt,
+    completedAt,
+  });
+  const fleetDone = [
+    stepOf("Mark the platform verified", D("05:00:40"), D("05:00:55")),
+    stepOf(FLEET_WAKE_STEP, D("05:01:00"), D("05:01:02")),
+    stepOf(FLEET_WAIT_STEP, D("05:01:02"), D("05:05:50")),
+    stepOf(FLEET_DONE_STEP, D("05:05:52"), D("05:05:53")),
+  ];
+
+  it("with a Fleet done step, the release is reported to every install, and the prod deploy ends where the fleet starts", () => {
+    const now = D("05:10:00");
+    const t = tl2(chain({ prod: prodRuns(fleetDone) }), now);
+    expect(row(t, "prod_deploy")).toMatchObject({
+      state: "done",
+      startedAt: D("04:56:10"),
+      endedAt: D("05:01:00"),
+      minutes: 4.8,
+    });
+    expect(row(t, "fleet")).toMatchObject({
+      state: "done",
+      startedAt: D("05:01:00"),
+      endedAt: D("05:05:53"),
+      minutes: 4.9,
+      url: `${RUNS}3`,
+    });
+    expect(t.doneAt).toBe(D("05:05:53"));
+    expect(t.e2eTo).toBe("every install");
+    expect(t.e2e).toBe(44.1);
+    const r = compute({
+      ...world2(chain({ prod: prodRuns(fleetDone) }), now),
+      history: [],
+      config,
+      now,
+    });
+    expect(r.history[0]).toMatchObject({
+      tag: "v0.248.2",
+      e2eTo: "every install",
+      e2e: 44.1,
+    });
+    expect(r.history[0]?.stages.fleet).toBe(4.9);
+    expect(summary(r.current)).toContain(
+      "| v0.248.2 | 44.1 | every install | 24.1 over |",
+    );
+    // Fleet has no usual time yet: never an alert.
+    expect(r.over.map((o) => o.stage)).not.toContain("fleet");
+  });
+
+  it("while the fleet wait runs, the release is in flight on its fleet stage", () => {
+    const now = D("05:03:00");
+    const steps = [
+      ...fleetDone.slice(0, 2),
+      stepOf(FLEET_WAIT_STEP, D("05:01:02"), null, null),
+      { name: FLEET_DONE_STEP, status: "pending", conclusion: null },
+    ];
+    const runs = chain({
+      prod: prodRuns(steps, { status: "in_progress", conclusion: null }),
+    });
+    const t = tl2(runs, now);
+    expect(row(t, "prod_deploy")).toMatchObject({
+      state: "done",
+      endedAt: D("05:01:00"),
+    });
+    expect(row(t, "fleet")).toMatchObject({
+      state: "current",
+      startedAt: D("05:01:00"),
+      minutes: 2,
+    });
+    expect(t.doneAt).toBeUndefined();
+    expect(
+      compute({ ...world2(runs, now), history: [], config, now }).current
+        .inFlight[0],
+    ).toMatchObject({ tag: "v0.248.2", stage: "fleet", state: "current" });
+  });
+
+  it("without a Fleet done success (a deploy before #474, or a wait that ran out), the release keeps to prod deploy (fleet not yet measured)", () => {
+    const now = D("05:20:00");
+    const ranOut = [
+      ...fleetDone.slice(0, 2),
+      stepOf(FLEET_WAIT_STEP, D("05:01:02"), D("05:11:02")),
+      stepOf(FLEET_DONE_STEP, D("05:11:03"), D("05:11:03"), "skipped"),
+    ];
+    for (const steps of [undefined, ranOut]) {
+      const t = tl2(chain({ prod: prodRuns(steps) }), now);
+      expect(row(t, "fleet")?.state).toBe("unmeasured");
+      expect(t.e2eTo).toBe("prod deploy (fleet not yet measured)");
+      expect(t.doneAt).toBe(row(t, "prod_deploy")?.endedAt);
+    }
+    expect(fleetStep(prodRuns(ranOut))).toEqual({
+      deployEnd: D("05:01:00"),
+      fleet: { state: "none" },
+    });
+    expect(fleetStep(prodRuns(undefined))).toEqual({
+      fleet: { state: "none" },
+    });
+    // A Fleet done step that was skipped is no finish, nor one still pending.
+    expect(
+      fleetStep(
+        prodRuns([
+          ...fleetDone.slice(0, 3),
+          stepOf(FLEET_DONE_STEP, D("05:05:52"), D("05:05:52"), "skipped"),
+        ]),
+      ).fleet.state,
+    ).toBe("none");
+  });
+});
+
 describe("percentiles, history and ETA", () => {
   it("pct with n=0, 1 and 20", () => {
     expect(pct([], 50)).toBe(null);
@@ -765,8 +1129,8 @@ describe("percentiles, history and ETA", () => {
   it("stats take the newest statsWindow releases by tag", () => {
     const h = Array.from({ length: 25 }, (_, i) => entry(i, i));
     const s = stats(h, config);
-    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, usual: 9.8 });
-    expect(s.stages.tag).toEqual({ p50: null, p90: null, n: 0, usual: 18.2 });
+    expect(s.stages.redline).toEqual({ p50: 14, p90: 22, n: 20, usual: 10.4 });
+    expect(s.stages.tag).toEqual({ p50: null, p90: null, n: 0, usual: 20.4 });
     expect(s.e2e).not.toHaveProperty("worst");
     expect(s.e2e.target).toBe(20);
     expect(s.e2e).toMatchObject({ p50: 140, p90: 220, n: 20 });
@@ -802,9 +1166,10 @@ describe("percentiles, history and ETA", () => {
   it("ETA: what is left of the current stage, then each later stage's p50 or p90", () => {
     const now = T("19:22:12");
     const t = tl("v0.245.1", now);
+    // Timed from its own run's start, 19:20:38Z.
     expect(row(t, "staging_deploy")).toMatchObject({
       state: "current",
-      minutes: 2,
+      minutes: 1.6,
     });
     const st = stats(
       [
@@ -824,14 +1189,14 @@ describe("percentiles, history and ETA", () => {
       ],
       config,
     ).stages;
-    // (5 - 2) + 1 + 10 + 3 + 5 = 22 min.
+    // (5 - 1.6) + 1 + 10 + 3 + 5 = 22.4 min; fleet, unmeasured, adds nothing.
     expect(eta(t as never, st, now)).toEqual({
-      p50: "2026-11-25T19:44:12.000Z",
-      p90: "2026-11-25T19:44:12.000Z",
+      p50: "2026-11-25T19:44:36.000Z",
+      p90: "2026-11-25T19:44:36.000Z",
     });
-    // No samples: usual times. (4.7 - 2) + 0.5 + 9.8 + 3 + 5.1 = 21.1 min.
+    // No samples: usual times. (4.3 - 1.6) + 0.5 + 10.4 + 1.9 + 4.8 = 20.3 min.
     expect(eta(t as never, stats([], config).stages, now)?.p50).toBe(
-      "2026-11-25T19:43:18.000Z",
+      "2026-11-25T19:42:30.000Z",
     );
     // A current stage past its figure leaves nothing of it, never less.
     const late = T("19:40:12");
@@ -1230,22 +1595,28 @@ describe("tick reads", () => {
     expect(summary(r.current)).toContain(
       "### Merge to every install, target 20 min",
     );
-    // Fleet has no source without admin access yet: the total says plainly where it ends.
-    expect(r.current.e2e.to).toBe("prod deploy (fleet not yet measured)");
+    // No "Fleet done" step on this deploy: the total says plainly where it ends.
+    expect(r.current.e2e.last20).toEqual([
+      {
+        tag: "v0.245.1",
+        e2e: 45.8,
+        to: "prod deploy (fleet not yet measured)",
+      },
+    ]);
     expect(summary(r.current)).toContain(
-      "Measured from the merge to prod deploy (fleet not yet measured).",
+      "| Release | Minutes | To | Against 20 min |",
     );
     expect(summary(r.current)).toContain(
-      "| Release | Minutes, to prod deploy (fleet not yet measured) | Against 20 min |",
+      "| v0.245.1 | 45.8 | prod deploy (fleet not yet measured) | 25.8 over |",
     );
-    expect(summary(r.current)).toContain("| v0.245.1 | 45.8 | 25.8 over |");
     expect(summary(r.current)).toContain(
-      "| staging_deploy | 5.1 | 5.1 | 1 | 4.7 | 9.7 |",
+      "| staging_deploy | 4.7 | 4.7 | 1 | 4.3 | 9.3 |",
     );
-    expect(summary(r.current)).toContain("Not measured: fleet");
+    expect(summary(r.current)).toContain("| fleet | - | - | 0 | - | - |");
+    expect(summary(r.current)).toContain("Measured only where recorded: fleet");
   });
 
-  it("reads jobs only of hosted-release and hosted-publish runs since the oldest release not in history, and matches the staging publish by them", () => {
+  it("reads jobs only of hosted-release, hosted-publish and prod deploy runs since the oldest release not in history, and matches the staging publish by them", () => {
     const now = T("19:50:00");
     const f = fake(now);
     const publish = at(now).runs.find(
@@ -1308,20 +1679,22 @@ describe("tick reads", () => {
     const want = at(now)
       .runs.filter(
         (x) =>
-          /\/hosted-(release|publish)\.yml$/.test(x.path) &&
+          (/\/hosted-(release|publish)\.yml$/.test(x.path) ||
+            x.title.startsWith("deploy-hosted-platform prod ")) &&
           ms(x.createdAt) >= ms(T("19:01:32")),
       )
       .map(
         (x) => `repos/o/c/actions/runs/${x.id}/jobs?filter=latest&per_page=100`,
       );
-    expect(want.length).toBe(3);
+    // hosted-release, the staging copy, the prod copy and the prod deploy.
+    expect(want.length).toBe(4);
     expect([...f.calls.filter((c) => c.includes("/jobs?"))].sort()).toEqual(
       [...want].sort(),
     );
     const t = r.current.releases.find((x) => x.tag === "v0.245.1");
     expect(t?.stages.find((x) => x.name === "staging_publish")).toMatchObject({
       state: "done",
-      minutes: 4,
+      minutes: 3.9,
     });
   });
 

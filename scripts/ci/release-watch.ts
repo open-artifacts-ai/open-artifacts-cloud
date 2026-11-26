@@ -2,10 +2,14 @@
 // takes, stage by stage, against each stage's usual time, and one `blocker`
 // issue while a stage runs past its limit: the larger of alertFactor (2) x its
 // usual time and its usual time plus alertFloor (5) minutes, so a stage that
-// usually takes half a minute does not alert on a one-minute wait. Merge to
-// every install is reported against e2eTarget, never alerted on; until fleet
-// is measured, that total runs to the prod deploy. It gates nothing and is
-// never a required check.
+// usually takes half a minute does not alert on a one-minute wait. Each stage
+// is timed from its own start to its own end, so stages can overlap (the
+// staging copy beside the staging deploy, cloud #471); one not started yet
+// counts from what it waits on. A stage is done only once its own run or job
+// completed green. Merge to every install is reported against e2eTarget, never
+// alerted on: to the prod deploy's "Fleet done" step (cloud #474) where it
+// ran, else to the prod deploy, labelled "fleet not yet measured". It gates
+// nothing and is never a required check.
 //
 // Stateless: each tick rebuilds every recent release's timeline from GitHub
 // timestamps, so a dropped or replaced tick loses nothing. The stages are data
@@ -23,10 +27,12 @@
 // Reads: the runs of four workflows on main, public's releases, and per
 // release not yet in history its pin-bump PRs (by head branch), a compare and
 // a commit's PRs on public (its merge time). While a release is not yet in
-// history, the jobs of each hosted-release and hosted-publish run since it was
-// published (one read per run): a recovery run on a later main commit names
-// the release it built or published in its job names. A release in history is
-// done and not rebuilt. Writes: only the one issue, through gh().
+// history, the jobs (with their steps) of each hosted-release, hosted-publish
+// and prod deploy run since it was published, one read per run: a recovery run
+// on a later main commit names the release in its job names, a copy ends with
+// its publish job, and the prod deploy's steps record the fleet finish. A
+// release in history is done and not rebuilt. Writes: only the one issue,
+// through gh().
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -46,11 +52,20 @@ const MIN = 60_000;
 
 export type Stage = {
   name: string;
-  from: string;
+  /** The stage's own start: an event, or the latest of several (all must have happened). */
+  from: string | string[];
+  /** The stage's own end. */
   to: string;
-  /** Minutes: the stage's median over the measured releases. Unset only when not measured. */
+  /**
+   * What the stage waits on before it starts (the earlier stages' ends). A
+   * stage that has not started yet counts from here, so a stall still shows.
+   */
+  after?: string | string[];
+  /** Minutes: the stage's median over the measured releases. Unset only for an optional stage. */
   usual?: number;
   mode?: "pr" | "direct";
+  /** Measured only for a release whose runs record it (fleet: the "Fleet done" step). */
+  optional?: boolean;
   measured?: boolean;
   todo?: string;
 };
@@ -67,8 +82,23 @@ export type Config = {
   historySize: number;
   stages: Stage[];
 };
+/** One step of a job, as the jobs list's --jq slims it. */
+export type JobStep = {
+  name: string;
+  status?: string;
+  conclusion: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+};
 /** One job of a run's latest attempt, as the jobs list's --jq slims it. */
-export type Job = { name: string; conclusion: string | null };
+export type Job = {
+  name: string;
+  status?: string;
+  conclusion: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  steps?: JobStep[];
+};
 /** One workflow run, as the runs list's --jq slims it. */
 export type Run = {
   id: number;
@@ -85,7 +115,7 @@ export type Run = {
   url: string;
   commitMessage: string;
   commitAt: string;
-  /** Read only for hosted-release and hosted-publish runs while a release is in flight. */
+  /** Read only for hosted-release, hosted-publish and prod deploy runs while a release is in flight. */
   jobs?: Job[];
 };
 export type Pr = {
@@ -105,11 +135,15 @@ export type Step = {
 };
 export type StageRow = {
   name: string;
-  usual: number;
+  /** Unset for an optional stage with no usual time yet: never alerted on. */
+  usual?: number;
   startedAt?: string;
   endedAt?: string;
   minutes?: number;
-  state: "done" | "current" | "red" | "pending";
+  /** unmeasured: an optional stage this release's runs do not record. */
+  state: "done" | "current" | "red" | "pending" | "unmeasured";
+  /** Not started yet: startedAt is when what it waits on ended. */
+  waiting?: boolean;
   url?: string;
 };
 export type Timeline = {
@@ -121,6 +155,8 @@ export type Timeline = {
   doneAt?: string;
   /** When its prod deploy succeeded: a release that reached prod is never superseded. */
   prodAt?: string;
+  /** What e2e runs to: "every install", or "prod deploy (fleet not yet measured)". */
+  e2eTo?: string;
   /** A newer release reached the pin while this one never reached prod: it never ships alone. */
   supersededBy?: string;
   /** For a superseded release: when the newer release that carries it was done. */
@@ -135,6 +171,7 @@ export type HistoryEntry = {
   doneAt: string;
   supersededBy?: string;
   e2e?: number;
+  e2eTo?: string;
   stages: Record<string, number>;
 };
 export type Overrun = {
@@ -144,6 +181,8 @@ export type Overrun = {
   kind: "in_flight" | "finished";
   /** Unknown for a finished release read back from history. */
   startedAt?: string;
+  /** In flight and not started: startedAt is when what it waits on ended. */
+  waiting?: boolean;
   minutes: number;
   usual: number;
   /** max(alertFactor x usual, usual + alertFloor). */
@@ -152,6 +191,8 @@ export type Overrun = {
 };
 export type Red = { tag: string; stage: string; url?: string };
 
+/** What a release's total runs to when its prod deploy recorded no fleet finish. */
+export const NO_FLEET = "prod deploy (fleet not yet measured)";
 const ms = (iso: string) => Date.parse(iso);
 const mins = (a: string, b: string) =>
   Math.max(0, Math.round(((ms(b) - ms(a)) / MIN) * 10) / 10);
@@ -244,8 +285,107 @@ export function step(runs: Run[]): Step {
   };
 }
 
-/** Pure: the runs of each step of one release. */
-export function steps(tag: string, runs: Run[]): Record<string, Step> {
+/**
+ * A run seen through one of its jobs: the job's state and end, the run's
+ * start. The staging copy ends when its publish-staging job does, though the
+ * run goes on (stage-prod).
+ */
+const asJob = (r: Run, j: Job): Run => ({
+  ...r,
+  status: j.status ?? (j.conclusion ? "completed" : "in_progress"),
+  conclusion: j.conclusion,
+  updatedAt: j.completedAt ?? r.updatedAt,
+});
+const jobOf = (r: Run, re: RegExp, tag: string) =>
+  r.jobs?.find((j) => re.exec(j.name)?.[1] === tag);
+
+/** The prod deploy's fleet steps (cloud #474). */
+export const FLEET_WAKE_STEP = "Wake the fleet";
+export const FLEET_WAIT_STEP = "Wait for the fleet to reach every install";
+export const FLEET_DONE_STEP = "Fleet done";
+const ran = (x: JobStep | undefined): x is JobStep =>
+  !!x && x.conclusion !== "skipped" && !!x.startedAt;
+
+/**
+ * Pure: the fleet finish from the prod deploy's own steps (cloud #474). The
+ * wait step starts once the deploy and its verified mark are green; "Fleet
+ * done" runs only once every install is upgraded, so its success and
+ * completed_at are the finish. No such steps (a run before #474, or jobs not
+ * read), or a wait that ended without "Fleet done": none, the fleet is not
+ * measured for that release. `deployEnd` is when the wait started: the
+ * deploy's own work ended there.
+ */
+export function fleetStep(prodRuns: Run[]): {
+  fleet: Step;
+  deployEnd?: string;
+} {
+  const sorted = [...prodRuns].sort(
+    (a, b) => ms(a.createdAt) - ms(b.createdAt),
+  );
+  for (const r of sorted)
+    for (const j of r.jobs ?? []) {
+      const by = (n: string) => j.steps?.find((x) => x.name === n);
+      const wait = by(FLEET_WAIT_STEP);
+      if (!ran(wait)) continue;
+      const wake = by(FLEET_WAKE_STEP);
+      const done = by(FLEET_DONE_STEP);
+      const startedAt = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
+      const deployEnd = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
+      if (
+        done?.conclusion === "success" &&
+        done.status !== "in_progress" &&
+        done.completedAt
+      )
+        return {
+          deployEnd,
+          fleet: {
+            state: "done",
+            startedAt,
+            doneAt: done.completedAt,
+            url: r.url,
+          },
+        };
+      const going =
+        wait.status !== "completed" ||
+        (!!done && done.conclusion === null && done.status !== "completed");
+      return {
+        deployEnd,
+        fleet: going
+          ? { state: "running", startedAt, url: r.url }
+          : { state: "none" },
+      };
+    }
+  return { fleet: { state: "none" } };
+}
+
+/**
+ * Pure: the runs of each step of one release, the copies seen through their
+ * publish job, and the steps they make. With `since`, a step counts only the
+ * runs created once what it waits on ended (a minute's slack): an earlier run
+ * was an attempt against an earlier upstream attempt.
+ */
+export function steps(
+  tag: string,
+  runs: Run[],
+  since: Record<string, string | undefined> = {},
+): Record<string, Step> {
+  const g = groups(tag, runs);
+  const after = (k: string) => {
+    const t = since[k];
+    const rs = g[k] ?? [];
+    return t ? rs.filter((r) => ms(r.createdAt) >= ms(t) - MIN) : rs;
+  };
+  return {
+    hosted_release: step(after("hosted_release")),
+    staging_publish: step(after("staging_publish")),
+    staging_deploy: step(after("staging_deploy")),
+    redline: step(after("redline")),
+    prod_publish: step(after("prod_publish")),
+    ...prodSteps(after("prod_deploy")),
+  };
+}
+
+function groups(tag: string, runs: Run[]): Record<string, Run[]> {
   const pinRuns = runs.filter((r) => builds(r, tag));
   const shas = new Set(
     runs
@@ -255,37 +395,56 @@ export function steps(tag: string, runs: Run[]): Record<string, Step> {
   const by = (f: string, pred: (r: Run) => boolean) =>
     runs.filter((r) => file(r) === f && pred(r));
   return {
-    hosted_release: step(pinRuns),
-    // The publish job names the tag its resolve job verified; only a run
-    // whose jobs were not read falls back to the pin push's sha.
-    staging_publish: step(
-      by("hosted-publish.yml", (r) => {
-        const named = namedTag(r, STAGING_RE);
-        if (named !== undefined) return named === tag;
-        return r.event === "workflow_run" && shas.has(r.headSha);
-      }),
+    hosted_release: pinRuns,
+    // The publish job names the tag its resolve job verified, and its own
+    // end is the copy's; only a run whose jobs were not read falls back to
+    // the pin push's sha and the run's end.
+    staging_publish: by("hosted-publish.yml", (r) => {
+      const named = namedTag(r, STAGING_RE);
+      if (named !== undefined) return named === tag;
+      return r.event === "workflow_run" && shas.has(r.headSha);
+    }).map((r) => {
+      const j = jobOf(r, STAGING_RE, tag);
+      return j ? asJob(r, j) : r;
+    }),
+    staging_deploy: by("deploy-hosted-platform.yml", (r) =>
+      titled(r.title, `deploy-hosted-platform staging ${tag}`),
     ),
-    staging_deploy: step(
-      by("deploy-hosted-platform.yml", (r) =>
-        titled(r.title, `deploy-hosted-platform staging ${tag}`),
-      ),
+    redline: by(
+      "redline-staging.yml",
+      (r) => r.title === `redline-staging ${tag}`,
     ),
-    redline: step(
-      by("redline-staging.yml", (r) => r.title === `redline-staging ${tag}`),
+    prod_publish: by(
+      "hosted-publish.yml",
+      (r) =>
+        titled(r.title, `hosted-publish prod ${tag}`) ||
+        namedTag(r, PROD_RE) === tag,
+    ).map((r) => {
+      const j = jobOf(r, PROD_RE, tag);
+      return j ? asJob(r, j) : r;
+    }),
+    prod_deploy: by("deploy-hosted-platform.yml", (r) =>
+      titled(r.title, `deploy-hosted-platform prod ${tag}`),
     ),
-    prod_publish: step(
-      by(
-        "hosted-publish.yml",
-        (r) =>
-          titled(r.title, `hosted-publish prod ${tag}`) ||
-          namedTag(r, PROD_RE) === tag,
-      ),
-    ),
-    prod_deploy: step(
-      by("deploy-hosted-platform.yml", (r) =>
-        titled(r.title, `deploy-hosted-platform prod ${tag}`),
-      ),
-    ),
+  };
+}
+
+/**
+ * Pure: the prod deploy and the fleet. Once the fleet wait has started (cloud
+ * #474), the deploy's own work is done (every step before it succeeded), so
+ * the deploy ends there even while the run waits for the fleet.
+ */
+function prodSteps(prodRuns: Run[]): { prod_deploy: Step; fleet: Step } {
+  const base = step(prodRuns);
+  const { fleet, deployEnd } = fleetStep(prodRuns);
+  if (!deployEnd) return { prod_deploy: base, fleet };
+  const doneAt =
+    base.state === "done" && base.doneAt && ms(base.doneAt) < ms(deployEnd)
+      ? base.doneAt
+      : deployEnd;
+  return {
+    prod_deploy: { ...base, state: "done", doneAt },
+    fleet,
   };
 }
 
@@ -307,7 +466,6 @@ export function timeline(o: {
     .filter((p) => p.ref === `${BRANCH_PREFIX}${tag}`)
     .sort((a, b) => ms(a.createdAt) - ms(b.createdAt));
   const merged = pr.find((p) => p.mergedAt);
-  const st = steps(tag, o.runs);
   const pinRun = o.runs
     .filter(
       (r) =>
@@ -328,63 +486,102 @@ export function timeline(o: {
     pin_opened: pr[0]?.createdAt,
     pinned: merged?.mergedAt ?? pinRun?.commitAt,
   };
-  for (const [k, s] of Object.entries(st)) {
-    ev[`${k}.started`] = s.startedAt;
-    ev[`${k}.done`] = s.doneAt;
-  }
-  const rows: StageRow[] = [];
-  let current = false;
+  const keys = (k: string | string[] | undefined) =>
+    k === undefined ? [] : Array.isArray(k) ? k : [k];
+  // The latest of the events, once all have happened.
+  const at = (k: string | string[] | undefined): string | undefined => {
+    const v = keys(k).map((x) => ev[x]);
+    if (v.length === 0 || v.some((x) => !x)) return undefined;
+    return (v as string[]).reduce((a, b) => (ms(b) > ms(a) ? b : a));
+  };
   const list = measured(config, mode);
-  // A later stage that ended means this one happened, even unseen.
-  const lastEnded = list.reduce((m, s, i) => (ev[s.to] ? i : m), -1);
-  for (const [i, s] of list.entries()) {
-    const from = ev[s.from];
-    const to = ev[s.to];
+  // In chain order, each step from the runs created once what it waits on
+  // ended, so its events are known before a later stage reads them.
+  const since: Record<string, string | undefined> = {};
+  let st: Record<string, Step> = {};
+  for (const s of list) {
+    const k = s.to.split(".")[0] ?? "";
+    if (s.after) since[k] = at(s.after);
+    st = steps(tag, o.runs, since);
+    for (const [n, x] of Object.entries(st)) {
+      ev[`${n}.started`] = x.startedAt;
+      ev[`${n}.done`] = x.doneAt;
+    }
+  }
+  // The stages downstream of stage i: they start or wait on its end, transitively.
+  const downstreamEnded = (i: number) => {
+    const evs = new Set([(list[i] as Stage).to]);
+    for (const s of list.slice(i + 1)) {
+      if (![...keys(s.from), ...keys(s.after)].some((d) => evs.has(d)))
+        continue;
+      if (at(s.to)) return true;
+      evs.add(s.to);
+    }
+    return false;
+  };
+  const rows: StageRow[] = list.map((s, i) => {
+    const from = at(s.from);
+    const to = at(s.to);
+    const after = at(s.after);
     const owner = st[s.to.split(".")[0] ?? ""];
     const url =
       owner?.url ??
       (s.to === "pin_opened" || s.to === "pinned"
         ? (merged ?? pr[pr.length - 1])?.url
         : undefined);
-    if (current) {
-      rows.push({ name: s.name, usual: s.usual as number, state: "pending" });
-    } else if (from && to) {
-      rows.push({
-        name: s.name,
-        usual: s.usual as number,
-        startedAt: from,
-        endedAt: to,
-        minutes: mins(from, to),
-        state: "done",
-        url,
-      });
-    } else if (to || i < lastEnded) {
-      // Ended, start unknown (no previous tag to date the merge), or a later
-      // stage ended: done, untimed.
-      rows.push({
-        name: s.name,
-        usual: s.usual as number,
-        ...(to ? { endedAt: to } : {}),
-        state: "done",
-        url,
-      });
-    } else if (from) {
-      current = true;
-      rows.push({
-        name: s.name,
-        usual: s.usual as number,
-        startedAt: from,
-        minutes: mins(from, o.now),
-        state: owner?.state === "red" ? "red" : "current",
-        url,
-      });
-    } else {
-      current = true;
-      rows.push({ name: s.name, usual: s.usual as number, state: "pending" });
+    const base = { name: s.name, ...(s.usual ? { usual: s.usual } : {}) };
+    const going = (since: string, waiting: boolean, red = false): StageRow => ({
+      ...base,
+      startedAt: since,
+      minutes: mins(since, o.now),
+      state: red ? "red" : "current",
+      ...(waiting ? { waiting: true } : {}),
+      url,
+    });
+    // Done only once its own run or job completed green (`to` is set then).
+    if (to)
+      return from
+        ? {
+            ...base,
+            startedAt: from,
+            endedAt: to,
+            minutes: mins(from, to),
+            state: "done",
+            url,
+          }
+        : { ...base, endedAt: to, state: "done", url };
+    // What it waits on has not happened (an upstream rerun is still going):
+    // a run of it now is an earlier attempt's, so it counts as not started.
+    if (s.after && !after)
+      return downstreamEnded(i)
+        ? { ...base, state: "done", url }
+        : { ...base, state: "pending" };
+    if (owner?.state === "red")
+      return from ? going(from, false, true) : { ...base, state: "red", url };
+    if (owner?.state === "running") {
+      if (from) return going(from, false);
+      if (after) return going(after, true);
+      return { ...base, state: "pending" };
     }
-  }
-  const last = rows[rows.length - 1];
-  const doneAt = last?.state === "done" ? last.endedAt : undefined;
+    // No run seen, but a stage that waits on this one ended: it happened, untimed.
+    if (downstreamEnded(i)) return { ...base, state: "done", url };
+    if (s.optional) return { ...base, state: "unmeasured" };
+    if (from) return going(from, false);
+    if (after) return going(after, true);
+    return { ...base, state: "pending" };
+  });
+  // Done when the last stage this release records is done: fleet with its
+  // "Fleet done" step, else the prod deploy (fleet not yet measured).
+  const tailAt = [...rows].reverse().findIndex((r) => r.state !== "unmeasured");
+  const tail = tailAt < 0 ? undefined : rows[rows.length - 1 - tailAt];
+  const doneAt = tail?.state === "done" ? tail.endedAt : undefined;
+  const skipped = rows
+    .filter((r) => r.state === "unmeasured")
+    .map((r) => r.name);
+  const e2eTo =
+    skipped.length === 0
+      ? "every install"
+      : `${(tail?.name ?? "").replace(/_/g, " ")} (${skipped.join(", ")} not yet measured)`;
   const prodAt = ev["prod_deploy.done"];
   // Merge to every install is measured from the code merge only. With no
   // merge time it stays unknown: publishing is later, so it would undercount.
@@ -396,6 +593,7 @@ export function timeline(o: {
     stages: rows,
     doneAt,
     ...(prodAt ? { prodAt } : {}),
+    e2eTo,
     e2e: doneAt && o.mergedAt ? mins(o.mergedAt, doneAt) : undefined,
   };
 }
@@ -449,6 +647,7 @@ export function historyEntry(t: Timeline): HistoryEntry | undefined {
     doneAt,
     ...(t.supersededBy ? { supersededBy: t.supersededBy } : {}),
     e2e: t.e2e,
+    ...(t.e2eTo ? { e2eTo: t.e2eTo } : {}),
     stages,
   };
 }
@@ -473,7 +672,7 @@ export function pct(values: number[], p: number): number | null {
 
 export type Stats = Record<
   string,
-  { p50: number | null; p90: number | null; n: number; usual: number }
+  { p50: number | null; p90: number | null; n: number; usual?: number }
 >;
 /** Pure: p50/p90 per stage and e2e over the newest `statsWindow` finished releases. */
 export function stats(history: HistoryEntry[], config: Config) {
@@ -490,7 +689,7 @@ export function stats(history: HistoryEntry[], config: Config) {
       p50: pct(v, 50),
       p90: pct(v, 90),
       n: v.length,
-      usual: s.usual as number,
+      ...(s.usual ? { usual: s.usual } : {}),
     };
   }
   // A superseded release's e2e waited on a newer one: it is real wait, kept.
@@ -507,7 +706,12 @@ export function stats(history: HistoryEntry[], config: Config) {
       last20: recent
         .filter((x) => typeof x.e2e === "number")
         .slice(-20)
-        .map((x) => ({ tag: x.tag, e2e: x.e2e as number })),
+        .map((x) => ({
+          tag: x.tag,
+          e2e: x.e2e as number,
+          // History from before this field ran to the prod deploy.
+          to: x.e2eTo ?? NO_FLEET,
+        })),
     },
   };
 }
@@ -523,16 +727,25 @@ export function eta(
   st: Stats,
   now: string,
 ): { p50: string; p90: string } | null {
-  const i = t.stages.findIndex((s) => s.state !== "done");
+  const i = t.stages.findIndex(
+    (s) => s.state !== "done" && s.state !== "unmeasured",
+  );
   if (i < 0) return null;
   const cur = t.stages[i] as StageRow;
   if (cur.state === "red") return null;
-  const fig = (name: string, k: "p50" | "p90", usual: number) =>
-    st[name]?.[k] ?? usual;
+  const fig = (name: string, k: "p50" | "p90", usual?: number) =>
+    st[name]?.[k] ?? usual ?? 0;
+  // Stages that overlap are summed as if in turn: an upper estimate.
   const left = (k: "p50" | "p90") => {
     const elapsed = cur.state === "current" ? (cur.minutes ?? 0) : 0;
     let m = Math.max(0, fig(cur.name, k, cur.usual) - elapsed);
-    for (const s of t.stages.slice(i + 1)) m += fig(s.name, k, s.usual);
+    for (const s of t.stages.slice(i + 1))
+      if (s.state !== "done" && s.state !== "unmeasured")
+        m += Math.max(
+          0,
+          fig(s.name, k, s.usual) -
+            (s.state === "current" ? (s.minutes ?? 0) : 0),
+        );
     return new Date(ms(now) + Math.round(m * MIN)).toISOString();
   };
   return { p50: left("p50"), p90: left("p90") };
@@ -571,6 +784,7 @@ export function overruns(
     for (const s of t.stages)
       if (
         s.state === "done" &&
+        s.usual !== undefined &&
         s.minutes !== undefined &&
         s.minutes > limitOf(s.usual, config)
       )
@@ -588,24 +802,31 @@ export function overruns(
   const live = tls.filter((t) => !t.doneAt && !t.supersededBy);
   for (const t of live) {
     finishedOver(t);
-    const cur = t.stages.find(
-      (s) => s.state === "current" || s.state === "red",
-    );
-    if (cur?.state === "red") {
-      red.push({ tag: t.tag, stage: cur.name, url: cur.url });
-      continue;
+    // Stages can overlap (the staging copy beside the staging deploy, #471):
+    // each one going is timed from its own start, or from what it waits on.
+    for (const cur of t.stages) {
+      if (cur.state === "red") {
+        red.push({ tag: t.tag, stage: cur.name, url: cur.url });
+        continue;
+      }
+      if (
+        cur.state === "current" &&
+        cur.startedAt &&
+        cur.usual !== undefined &&
+        (cur.minutes ?? 0) > limitOf(cur.usual, config)
+      )
+        over.push({
+          tag: t.tag,
+          stage: cur.name,
+          kind: "in_flight",
+          startedAt: cur.startedAt,
+          ...(cur.waiting ? { waiting: true } : {}),
+          minutes: cur.minutes ?? 0,
+          usual: cur.usual,
+          limit: limitOf(cur.usual, config),
+          url: cur.url,
+        });
     }
-    if (cur?.startedAt && (cur.minutes ?? 0) > limitOf(cur.usual, config))
-      over.push({
-        tag: t.tag,
-        stage: cur.name,
-        kind: "in_flight",
-        startedAt: cur.startedAt,
-        minutes: cur.minutes ?? 0,
-        usual: cur.usual,
-        limit: limitOf(cur.usual, config),
-        url: cur.url,
-      });
   }
   const finished = tls
     .filter((t) => t.doneAt)
@@ -632,9 +853,11 @@ export function issueBody(over: Overrun[], red: Red[], config: Config): string {
   for (const o of over) {
     const run = o.url ? ` Run: ${o.url}` : "";
     lines.push(
-      o.kind === "in_flight"
-        ? `- ${o.tag} ${o.stage}: still going past ${o.limit} min (usual ${o.usual} min), started ${o.startedAt}.${run}`
-        : `- ${o.tag} ${o.stage}: took ${o.minutes} min (usual ${o.usual} min, limit ${o.limit} min).${run}`,
+      o.kind !== "in_flight"
+        ? `- ${o.tag} ${o.stage}: took ${o.minutes} min (usual ${o.usual} min, limit ${o.limit} min).${run}`
+        : o.waiting
+          ? `- ${o.tag} ${o.stage}: not started ${o.limit} min after what it waits on ended (usual ${o.usual} min), waiting since ${o.startedAt}.${run}`
+          : `- ${o.tag} ${o.stage}: still going past ${o.limit} min (usual ${o.usual} min), started ${o.startedAt}.${run}`,
     );
   }
   if (red.length > 0) {
@@ -684,8 +907,8 @@ export function issuePlan(
 export function fromHistory(h: HistoryEntry, config: Config): Timeline {
   const stages: StageRow[] = measured(config, h.mode).map((s) => ({
     name: s.name,
-    usual: s.usual as number,
-    state: "done",
+    ...(s.usual ? { usual: s.usual } : {}),
+    state: s.optional && h.stages[s.name] === undefined ? "unmeasured" : "done",
     ...(h.stages[s.name] !== undefined ? { minutes: h.stages[s.name] } : {}),
   }));
   return {
@@ -698,6 +921,7 @@ export function fromHistory(h: HistoryEntry, config: Config): Timeline {
       ? { supersededBy: h.supersededBy, closedAt: h.doneAt }
       : { doneAt: h.doneAt }),
     e2e: h.e2e,
+    e2eTo: h.e2eTo ?? NO_FLEET,
   };
 }
 
@@ -738,41 +962,49 @@ export function compute(o: {
   const inFlight = tls
     .filter((t) => !t.doneAt && !t.supersededBy)
     .map((t) => {
-      const cur = t.stages.find((x) => x.state !== "done");
+      const row = (x: StageRow) => ({
+        stage: x.name,
+        state: x.state,
+        ...(x.waiting ? { waiting: true } : {}),
+        stageStartedAt: x.startedAt,
+        elapsed: x.startedAt ? x.minutes : undefined,
+        usual: x.usual,
+        limit: x.usual !== undefined ? limitOf(x.usual, o.config) : undefined,
+        runUrl: x.url,
+      });
+      // Every stage going at once (they can overlap), else the next one.
+      const going = t.stages.filter(
+        (x) => x.state === "current" || x.state === "red",
+      );
+      const next = t.stages.find(
+        (x) => x.state !== "done" && x.state !== "unmeasured",
+      );
+      const rows = (going.length > 0 ? going : next ? [next] : []).map(row);
       const e = eta(t, s.stages, o.now);
       return {
         tag: t.tag,
         mode: t.mode,
         oldestMergeAt: t.mergedAt,
-        stage: cur?.name,
-        state: cur?.state,
-        stageStartedAt: cur?.startedAt,
-        elapsed: cur?.startedAt ? cur.minutes : undefined,
-        usual: cur?.usual,
-        limit: cur ? limitOf(cur.usual, o.config) : undefined,
+        ...(rows[0] ?? {}),
+        going: rows,
         etaP50: e?.p50,
         etaP90: e?.p90,
-        runUrl: cur?.url,
       };
     });
   const unmeasured = o.config.stages
-    .filter((x) => x.measured === false)
+    .filter((x) => x.measured === false || x.optional)
     .map((x) => ({ name: x.name, todo: x.todo ?? "" }));
-  // What the total runs to: every install once fleet is measured, else the
-  // last measured stage, said plainly.
-  const lastMeasured = measured(o.config, o.config.pinMode).pop();
-  const e2eTo =
-    unmeasured.length === 0
-      ? "every install"
-      : `${(lastMeasured?.name ?? "").replace(/_/g, " ")} (${unmeasured.map((u) => u.name).join(", ")} not yet measured)`;
   const current = {
     generatedAt: o.now,
     inFlight,
     stages: s.stages,
     limits: Object.fromEntries(
-      Object.entries(s.stages).map(([k, v]) => [k, limitOf(v.usual, o.config)]),
+      Object.entries(s.stages).map(([k, v]) => [
+        k,
+        v.usual !== undefined ? limitOf(v.usual, o.config) : undefined,
+      ]),
     ),
-    e2e: { ...s.e2e, to: e2eTo },
+    e2e: s.e2e,
     unmeasured,
     overruns: over,
     red,
@@ -792,9 +1024,10 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
       "|---|---|---|---|---|---|---|---|---|",
     );
     for (const r of c.inFlight)
-      out.push(
-        `| ${r.tag} | ${r.stage ?? "-"} | ${r.state ?? "-"} | ${r.stageStartedAt ?? "-"} | ${f(r.elapsed)} | ${f(r.usual)} | ${f(r.limit)} | ${r.etaP50 ?? "-"} | ${r.etaP90 ?? "-"} |`,
-      );
+      for (const g of r.going)
+        out.push(
+          `| ${r.tag} | ${g.stage} | ${g.waiting ? "waiting" : g.state} | ${g.stageStartedAt ?? "-"} | ${f(g.elapsed)} | ${f(g.usual)} | ${f(g.limit)} | ${r.etaP50 ?? "-"} | ${r.etaP90 ?? "-"} |`,
+        );
     out.push("");
   }
   out.push(
@@ -803,28 +1036,31 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
   );
   for (const [k, v] of Object.entries(c.stages))
     out.push(
-      `| ${k} | ${f(v.p50)} | ${f(v.p90)} | ${v.n} | ${v.usual} | ${f(c.limits[k])} |`,
+      `| ${k} | ${f(v.p50)} | ${f(v.p90)} | ${v.n} | ${f(v.usual)} | ${f(c.limits[k])} |`,
     );
   out.push(
     "",
     `### Merge to every install, target ${c.e2e.target} min`,
     "",
-    `Measured from the merge to ${c.e2e.to}. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
+    `Measured from the merge to every install where the prod deploy recorded the fleet finish (its "${FLEET_DONE_STEP}" step), else to ${NO_FLEET}; each release says which. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
     "",
   );
   if (c.e2e.last20.length === 0) out.push("No finished release yet.", "");
   else {
     out.push(
-      `| Release | Minutes, to ${c.e2e.to} | Against ${c.e2e.target} min |`,
-      "|---|---|---|",
+      `| Release | Minutes | To | Against ${c.e2e.target} min |`,
+      "|---|---|---|---|",
     );
     for (const r of c.e2e.last20) {
       const d = Math.round((r.e2e - c.e2e.target) * 10) / 10;
-      out.push(`| ${r.tag} | ${r.e2e} | ${d > 0 ? `${d} over` : "within"} |`);
+      out.push(
+        `| ${r.tag} | ${r.e2e} | ${r.to} | ${d > 0 ? `${d} over` : "within"} |`,
+      );
     }
     out.push("");
   }
-  for (const u of c.unmeasured) out.push(`Not measured: ${u.name}, ${u.todo}.`);
+  for (const u of c.unmeasured)
+    out.push(`Measured only where recorded: ${u.name}, ${u.todo}.`);
   if (c.overruns.length > 0)
     out.push(
       "",
@@ -887,9 +1123,18 @@ export function readRuns(exec: Exec, repo: string, since: string): Run[] {
   );
 }
 
-/** The workflows whose runs name their release in a job (cloud #469, hosted-publish.yml). */
+/**
+ * The runs whose jobs are read: the workflows that name their release in a
+ * job (cloud #469, hosted-publish.yml), and the prod deploy, whose steps
+ * record the fleet finish (cloud #474).
+ */
 export const NAMED_WORKFLOWS = ["hosted-release.yml", "hosted-publish.yml"];
-const JOB_JQ = ".jobs[] | {name, conclusion} | tojson";
+const jobsWanted = (r: Run) =>
+  NAMED_WORKFLOWS.includes(file(r)) ||
+  (file(r) === "deploy-hosted-platform.yml" &&
+    r.title.startsWith("deploy-hosted-platform prod "));
+const JOB_JQ =
+  ".jobs[] | {name, status, conclusion, startedAt: .started_at, completedAt: .completed_at, steps: [(.steps // [])[] | {name, status, conclusion, startedAt: .started_at, completedAt: .completed_at}]} | tojson";
 
 /** One run's latest attempt's jobs. */
 export function readJobs(exec: Exec, repo: string, id: number): Job[] {
@@ -906,9 +1151,9 @@ export function readJobs(exec: Exec, repo: string, id: number): Job[] {
 }
 
 /**
- * Adds the jobs of each hosted-release and hosted-publish run created since
- * `from` (the oldest release not yet in history was published). Nothing in
- * flight reads nothing.
+ * Adds the jobs of each hosted-release, hosted-publish and prod deploy run
+ * created since `from` (the oldest release not yet in history was
+ * published). Nothing in flight reads nothing.
  */
 export function withJobs(
   exec: Exec,
@@ -917,9 +1162,7 @@ export function withJobs(
   from: number | undefined,
 ): Run[] {
   return runs.map((r) =>
-    from !== undefined &&
-    NAMED_WORKFLOWS.includes(file(r)) &&
-    ms(r.createdAt) >= from
+    from !== undefined && jobsWanted(r) && ms(r.createdAt) >= from
       ? { ...r, jobs: readJobs(exec, repo, r.id) }
       : r,
   );
@@ -1154,12 +1397,19 @@ export function loadConfig(text: string): Config {
   const c = JSON.parse(text) as Config;
   if (!Array.isArray(c.stages) || c.stages.length === 0)
     throw new Error("release-stages.json: no stages");
+  const evs = (k: unknown) =>
+    typeof k === "string"
+      ? !!k
+      : Array.isArray(k) &&
+        k.length > 0 &&
+        k.every((x) => typeof x === "string" && !!x);
   for (const s of c.stages)
     if (
       !s.name ||
-      !s.from ||
+      !evs(s.from) ||
       !s.to ||
-      (s.measured !== false && !((s.usual ?? 0) > 0))
+      (s.after !== undefined && !evs(s.after)) ||
+      (s.measured !== false && !s.optional && !((s.usual ?? 0) > 0))
     )
       throw new Error(`release-stages.json: bad stage ${JSON.stringify(s)}`);
   if (

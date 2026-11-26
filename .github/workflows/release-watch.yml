@@ -2,10 +2,12 @@
 # takes, stage by stage (.github/hosted/release-stages.json), and one `blocker`
 # issue "release stage stuck" while a stage runs past its limit,
 # max(2 x usual, usual + 5 min). Merge to every install is reported against a
-# 20 min target, never alerted on; until fleet is measured it runs to the
-# prod deploy, labelled "to prod deploy (fleet not yet measured)". It gates
-# nothing: it runs beside the chain, on workflow_run and a schedule, so it is
-# never a check on any PR and must never be made required.
+# 20 min target, never alerted on: to the prod deploy's "Fleet done" step
+# (cloud #474) where it ran, else to the prod deploy, labelled "to prod deploy
+# (fleet not yet measured)". Each stage is timed from its own start, so
+# stages can overlap (cloud #471). It gates nothing: it runs beside the
+# chain, on workflow_run and a schedule, so it is never a check on any PR and
+# must never be made required.
 #
 # - Stateless: each run rebuilds every recent release's timeline from GitHub
 #   timestamps (scripts/ci/release-watch.ts). Finished releases go into
@@ -15,13 +17,14 @@
 #   7 days; a lost one only empties the p50/p90 until the next backfill.
 # - Backfill: dispatch with backfill_since (YYYY-MM-DD, such as 2026-11-20)
 #   reads every release since that day and starts the history afresh.
-# - The fleet stage is not measured yet: no GitHub record or public endpoint
-#   says when every install upgraded; it needs a public fleet done signal
-#   (Lane 5 PR2). Nothing here reads fleet state through admin tools.
-# - While a release is not finished, the jobs of its hosted-release and
-#   hosted-publish runs are read too: a recovery run on a later main commit
-#   names the release in a job ("publish-staging release <tag>", or
-#   "hosted-built <tag> <sha>" from cloud #469), never by its head sha.
+# - Fleet: the prod deploy's "Fleet done" step (cloud #474) runs only once
+#   every install is upgraded; its end, read from the run's jobs with this
+#   token, is the finish. Nothing here reads fleet state through admin tools.
+# - While a release is not finished, the jobs of its hosted-release,
+#   hosted-publish and prod deploy runs are read too: a recovery run on a
+#   later main commit names the release in a job ("publish-staging release
+#   <tag>", or "hosted-built <tag> <sha>" from cloud #469), never by its head
+#   sha, and a copy ends with its publish job.
 # - Triggers: each completed run of the chain's workflows, plus every 5
 #   minutes (GitHub's schedule can skip for hours; the workflow_run events
 #   carry the clock meanwhile). A stage that never starts raises no event, so
