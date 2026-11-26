@@ -1406,7 +1406,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     // hand-off happened (so none is skipped by its failure).
     expect(steps.slice(-4).map((s) => s.name)).toEqual([
       "Revoke this run's R26 credentials",
-      "Upgrade rl-agents to the tag once the whole gate passed (never waits for the job)",
+      "Start the rl-agents upgrade once the whole gate passed (waits for nothing)",
       "Remove the secret files",
       "Fail when the t19 hand-off did not happen",
     ]);
@@ -2158,9 +2158,9 @@ echo "RUN $*" >> "$CALLS"
 
 // Cloud #264, public #3167: a gate run upgrades rl-agents, the agents'
 // staging install, to the tag under test, only once the whole gate passed:
-// every step of the redline job so far, the hand-off and the t19 job. One R5,
-// the 202 its answer; it never waits, never fails the gate and touches no
-// other install (tests/redline/test/rl-agents.test.ts).
+// every step of the redline job so far, the hand-off and the t19 job. The
+// step starts one R5 in the background and returns at once: the gate never
+// waits on the request (tests/redline/test/rl-agents.test.ts has the call).
 describe("the rl-agents upgrade (cloud #264)", () => {
   const step = named("rl-agents");
   const idx = (n: string) => steps.findIndex((s) => s.name === n || s.id === n);
@@ -2181,18 +2181,25 @@ describe("the rl-agents upgrade (cloud #264)", () => {
     expect(step["timeout-minutes"]).toBe(1);
     expect(step.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
     expect(step.run).not.toMatch(LOOPS);
-    // No other step touches rl-agents, and nothing waits for its job.
+    // Detached: its own session, nothing on stdin or stdout, and `&`.
+    expect(step.run).toContain(
+      `setsid nohup bash -c 'pnpm --filter @oa/redline provisioning rl-agents-upgrade "$RESULT" >> "$PRIV/rl-agents-upgrade.log" 2>&1; rm -rf "$PRIV"' < /dev/null > /dev/null 2>&1 &`,
+    );
     expect(
       steps.filter((s) => JSON.stringify(s).includes("rl-agents-upgrade")),
     ).toEqual([step]);
   });
 
-  function sandbox(o: { t19: string; withCommand?: boolean; result?: string }) {
+  function sandbox(o: { t19: string; withCommand?: boolean }) {
     const d = mkdtempSync(join(tmpdir(), "oa-rl-agents-"));
     const bin = join(d, "bin");
     const tmp = join(d, "tmp");
     mkdirSync(bin);
     mkdirSync(join(tmp, "redline-secrets"), { recursive: true });
+    writeFileSync(
+      join(tmp, "redline-secrets/REDLINE_PROVISIONING_OIDC"),
+      "fake.oidc.jwt",
+    );
     mkdirSync(join(d, "tests/redline/scripts"), { recursive: true });
     writeFileSync(
       join(d, "tests/redline/scripts/provisioning.ts"),
@@ -2200,49 +2207,86 @@ describe("the rl-agents upgrade (cloud #264)", () => {
         ? "// old tag\n"
         : 'if (cmd === "rl-agents-upgrade") {}\n',
     );
+    // setsid is util-linux's (not on macOS): the step's own detach is nohup and &.
+    writeFileSync(join(bin, "setsid"), '#!/bin/sh\nexec "$@"\n', {
+      mode: 0o755,
+    });
     // The jobs API, as gh --jq prints it: this attempt's t19 conclusion.
     writeFileSync(
       join(bin, "gh"),
       `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(o.t19)}\n`,
       { mode: 0o755 },
     );
-    // Records its call and writes the result the real command would.
-    writeFileSync(
-      join(d, "canned.json"),
-      o.result ??
-        JSON.stringify({
-          kind: "started",
-          line: "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 started, job j01ABC. The gate does not wait for it.",
-        }),
-    );
+    // The held POST: records its call, the secrets dir it got and that dir's
+    // JWT, then blocks on GATE until the test releases it, and writes the
+    // result the real command would.
     writeFileSync(
       join(bin, "pnpm"),
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "$CALLS"\ncp "$CANNED" "\${@: -1}"\n`,
+      `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$CALLS"
+dir=$(jq -r .secretsDir <<< "$REDLINE_TARGETS")
+printf '%s\\n' "$dir" > "$GOT_DIR"
+cat "$dir/REDLINE_PROVISIONING_OIDC" > "$GOT_JWT"
+echo held > "$HELD"
+read -r _ < "$GATE"
+printf '%s\\n' '{"kind":"started","line":"rl-agents: started"}' > "\${@: -1}"
+`,
       { mode: 0o755 },
     );
+    // The child's last command: removing its secrets copy, then the signal.
+    writeFileSync(
+      join(bin, "rm"),
+      `#!/usr/bin/env bash\n/bin/rm "$@"\necho done > "$ENDED"\n`,
+      { mode: 0o755 },
+    );
+    for (const f of ["held", "gate", "ended"])
+      spawnSync("mkfifo", [join(d, f)], { encoding: "utf8" });
     const env = {
       PATH: `${bin}:${process.env.PATH}`,
       RUNNER_TEMP: tmp,
       CALLS: join(d, "calls"),
-      CANNED: join(d, "canned.json"),
+      GOT_DIR: join(d, "got-dir"),
+      GOT_JWT: join(d, "got-jwt"),
+      HELD: join(d, "held"),
+      GATE: join(d, "gate"),
+      ENDED: join(d, "ended"),
       GITHUB_STEP_SUMMARY: join(d, "summary"),
       GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
       GITHUB_RUN_ID: "1",
       GITHUB_RUN_ATTEMPT: "1",
+      REDLINE_RELEASE: "0.250.0",
+      REDLINE_TARGETS: JSON.stringify({
+        secretsDir: join(tmp, "redline-secrets"),
+        a: { name: "rl-a", installId: "ia", app: "https://rl-a.example" },
+        b: { name: "rl-b", installId: "ib", app: "https://rl-b.example" },
+      }),
     };
+    const read = (f: string) => (existsSync(f) ? readFileSync(f, "utf8") : "");
     const run = () => {
       const r = runBash(step.run, env, d, 10_000);
       return {
         ...r,
-        summary: existsSync(env.GITHUB_STEP_SUMMARY)
-          ? readFileSync(env.GITHUB_STEP_SUMMARY, "utf8")
-          : "",
-        calls: existsSync(env.CALLS)
-          ? readFileSync(env.CALLS, "utf8").trim().split("\n")
-          : [],
+        summary: read(env.GITHUB_STEP_SUMMARY),
+        calls: read(env.CALLS).trim().split("\n").filter(Boolean),
       };
     };
-    return { d, tmp, run, result: join(tmp, "rl-agents-upgrade/result.json") };
+    // Lets a held fake go and waits for its end signal (never a sleep). A
+    // read-write open of a fifo never blocks, so this is safe after a failure.
+    const release = () =>
+      runBash(
+        'exec 5<> "$HELD"; exec 3<> "$GATE"; echo go >&3; exec 4<> "$ENDED"; read -r -t 10 _ <&4 || true',
+        env,
+        d,
+        15_000,
+      );
+    return {
+      d,
+      env,
+      run,
+      read,
+      release,
+      result: join(tmp, "rl-agents-upgrade/result.json"),
+    };
   }
 
   it("the suite passed but T19 failed (the v0.247.0 replay): no upgrade", () => {
@@ -2261,23 +2305,44 @@ describe("the rl-agents upgrade (cloud #264)", () => {
     }
   });
 
-  it("the whole gate passed: one upgrade call for the tag's rl-agents, and its line in the summary", () => {
+  it("the whole gate passed: the step returns while the upgrade is still held, then the upgrade ends on its own", () => {
     const sb = sandbox({ t19: "success" });
+    let released = false;
     try {
       const r = sb.run();
+      // Returned with the POST still blocked on GATE: nothing waited for it.
       expect(r.status, r.stderr).toBe(0);
-      expect(r.calls).toEqual([
-        `--filter @oa/redline provisioning rl-agents-upgrade ${sb.result}`,
-      ]);
       expect(r.summary).toContain(
-        "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 started, job j01ABC.",
+        "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade to 0.250.0 started in the background, not answered yet.",
       );
+      expect(existsSync(sb.result)).toBe(false);
+      // Wait for the fake to reach its hold (its own signal, never a sleep).
+      const got = runBash(
+        'cat "$HELD" > /dev/null; cat "$GOT_JWT"',
+        sb.env,
+        sb.d,
+        10_000,
+      );
+      // Its own copy of the JWT, outside the secrets dir the next step removes.
+      expect(got.stdout).toBe("fake.oidc.jwt");
+      const dir = sb.read(sb.env.GOT_DIR).trim();
+      expect(dir).toBe(join(sb.env.RUNNER_TEMP, "rl-agents-upgrade/secrets"));
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      sb.release();
+      released = true;
+      expect(sb.read(sb.env.CALLS).trim()).toBe(
+        `--filter @oa/redline provisioning rl-agents-upgrade ${sb.result}`,
+      );
+      expect(JSON.parse(sb.read(sb.result)).kind).toBe("started");
+      // The copy is gone once the child ends.
+      expect(existsSync(dir)).toBe(false);
     } finally {
+      if (!released) sb.release();
       rmSync(sb.d, { recursive: true, force: true });
     }
   });
 
-  it("a tag without the command is reported as skipped and calls nothing", () => {
+  it("a tag without the command is reported as skipped and starts nothing", () => {
     const sb = sandbox({ t19: "success", withCommand: false });
     try {
       const r = sb.run();
@@ -2289,31 +2354,16 @@ describe("the rl-agents upgrade (cloud #264)", () => {
     }
   });
 
-  it("withholds a line holding a secret, and replaces one that is not plain text or not JSON", () => {
-    const secret = "eyJhbGciOiJSUzI1NiJ9.secret.value";
-    const cases: [string, string][] = [
-      [
-        JSON.stringify({ line: `rl-agents: ${secret}` }),
-        "the result was withheld",
-      ],
-      [JSON.stringify({ line: "rl-agents: `x`\nmore" }), "was not plain text"],
-      ["{not json", "could not be read"],
-    ];
-    for (const [result, want] of cases) {
-      const sb = sandbox({ t19: "success", result });
-      try {
-        writeFileSync(
-          join(sb.tmp, "redline-secrets/REDLINE_PROVISIONING_OIDC"),
-          secret,
-        );
-        const r = sb.run();
-        expect(r.status, r.stderr).toBe(0);
-        expect(r.summary).toContain(want);
-        expect(r.summary).not.toContain(secret);
-        expect(r.stdout).not.toContain(secret);
-      } finally {
-        rmSync(sb.d, { recursive: true, force: true });
-      }
+  it("prints no secret: the summary and the log of the step hold no JWT", () => {
+    const sb = sandbox({ t19: "success" });
+    try {
+      const r = sb.run();
+      expect(r.summary).not.toContain("fake.oidc.jwt");
+      expect(r.stdout).not.toContain("fake.oidc.jwt");
+      expect(r.stderr).not.toContain("fake.oidc.jwt");
+    } finally {
+      sb.release();
+      rmSync(sb.d, { recursive: true, force: true });
     }
   });
 });
