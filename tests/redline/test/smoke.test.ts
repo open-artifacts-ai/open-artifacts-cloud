@@ -21,9 +21,15 @@ import {
   SMOKE_ADDED,
   SMOKE_CASES,
   SMOKE_ROWS,
+  SWEEP_DONE,
   smokePeoplePrefix,
   spawnPurge,
+  spawnSweep,
+  staleFresh,
+  sweepFresh,
+  sweepWait,
 } from "../src/smoke.ts";
+import { parseTargets, secretsOf } from "../src/targets.ts";
 
 const pkg = join(import.meta.dirname, "..");
 const tmp = () => mkdtempSync(join(tmpdir(), "smoke-test-"));
@@ -300,5 +306,148 @@ describe("the background purge", () => {
       true,
     );
     expect(out.join("")).toContain("rl-n-9-1: deleted and purged");
+  });
+});
+
+describe("the sweep of leftover fresh installs", () => {
+  const NOW = Date.parse("2026-11-26T12:00:00Z");
+  const H = 60 * 60_000;
+  const item = (slug: string, agoMs: number, state = "active") => ({
+    slug,
+    state,
+    createdAt: NOW - agoMs,
+  });
+  /** A fake Run: R2 pages, then whatever removeInstall asks (no live row: a no-op). */
+  const fakeRun = (
+    pages: unknown[][],
+    api = "https://api.open-artifacts-staging.app",
+  ) => {
+    const seen: string[] = [];
+    let page = 0;
+    const run = {
+      c: { api },
+      v1: vi.fn(async (path: string) => {
+        seen.push(path);
+        if (
+          path === "/installs?q=rl-n-" ||
+          path.startsWith("/installs?q=rl-n-&")
+        ) {
+          const items = pages[page] ?? [];
+          page++;
+          return {
+            status: 200,
+            json: {
+              items,
+              nextCursor: page < pages.length ? `c${page}` : null,
+            },
+          };
+        }
+        // removeInstall's own list by slug: nothing live, so it is done.
+        return { status: 200, json: { items: [] } };
+      }),
+    } as unknown as Run;
+    return { run, seen };
+  };
+
+  it("lists rl-n-* older than 2 h, not deleted, across pages; never a young one or another slug", async () => {
+    const { run, seen } = fakeRun([
+      [item("rl-n-1-1", 3 * H), item("rl-n-2-1", H), item("rl-p-3-1", 5 * H)],
+      [
+        item("rl-n-4-1", 26 * H, "deleted"),
+        item("rl-n-5-1", 2 * H + 1),
+        item("rl-a", 9 * H),
+      ],
+    ]);
+    expect(await staleFresh(run, NOW)).toEqual(["rl-n-1-1", "rl-n-5-1"]);
+    expect(seen).toEqual(["/installs?q=rl-n-", "/installs?q=rl-n-&cursor=c1"]);
+  });
+
+  it("reads a createdAt in seconds as seconds, never as 1970", async () => {
+    const { run } = fakeRun([
+      [
+        {
+          slug: "rl-n-1-1",
+          state: "active",
+          createdAt: Math.floor((NOW - H) / 1000),
+        },
+      ],
+    ]);
+    expect(await staleFresh(run, NOW)).toEqual([]);
+  });
+
+  it("runs on staging only", async () => {
+    const { run } = fakeRun([[]], "https://api.open-artifacts.app");
+    await expect(staleFresh(run, NOW)).rejects.toThrow(/staging only/);
+  });
+
+  it("removes each leftover with the purge's own mechanism and writes its done file", async () => {
+    const d = tmp();
+    const out: string[] = [];
+    const { run, seen } = fakeRun([[item("rl-n-1-1", 3 * H)]]);
+    expect(await sweepFresh(run, d, NOW, (s) => out.push(s))).toBe(true);
+    expect(seen).toContain("/installs?q=rl-n-1-1");
+    expect(readFileSync(join(d, SWEEP_DONE), "utf8")).toBe("ok\n");
+    expect(out.join("")).toContain("rl-n-1-1: deleted and purged");
+  });
+
+  it("a failed list still writes the done file, as failed", async () => {
+    const d = tmp();
+    const run = {
+      c: { api: "https://api.open-artifacts-staging.app" },
+      v1: vi.fn(async () => ({ status: 503, json: {} })),
+    } as unknown as Run;
+    expect(await sweepFresh(run, d, NOW, () => {})).toBe(false);
+    expect(readFileSync(join(d, SWEEP_DONE), "utf8")).toBe("failed\n");
+  });
+
+  it("starts detached, and its wait is a no-op when no sweep started", async () => {
+    const d = tmp();
+    expect(await sweepWait(d, { write: () => {} })).toBe(true);
+    const unref = vi.fn();
+    const go = vi.fn(() => ({ unref }));
+    spawnSweep(d, "/x/smoke.ts", go as never);
+    const [, args, opts] = go.mock.calls[0] as unknown as [
+      string,
+      string[],
+      { detached: boolean },
+    ];
+    expect(args.slice(-2)).toEqual(["/x/smoke.ts", "sweep"]);
+    expect(opts.detached).toBe(true);
+    expect(unref).toHaveBeenCalled();
+    writeFileSync(join(d, SWEEP_DONE), "ok\n");
+    expect(await sweepWait(d, { write: () => {} })).toBe(true);
+  });
+});
+
+describe("parseTargets for the smoke (rl-a only)", () => {
+  it("loads rl-a's secrets without rl-b's files", () => {
+    const d = tmp();
+    writeFileSync(join(d, "REDLINE_RL_A_HOOK_KEY"), "k".repeat(40), {
+      mode: 0o600,
+    });
+    const env = {
+      REDLINE_TARGETS: JSON.stringify({
+        mode: "staging",
+        secretsDir: d,
+        a: {
+          name: "rl-a",
+          installId: "i-a",
+          app: "https://rl-a.example.app",
+          content: "https://rl-a.example.page",
+          testDomain: "t.example",
+        },
+        b: {
+          name: "rl-b",
+          installId: "i-b",
+          app: "https://rl-b.example.app",
+          content: "https://rl-b.example.page",
+          testDomain: "t2.example",
+        },
+      }),
+    };
+    expect(() => parseTargets(env)).toThrow(/rl-b hook key/);
+    const t = parseTargets(env, { onlyA: true });
+    expect(t.a.installId).toBe("i-a");
+    expect(secretsOf(t.a).hookKey).toBe("k".repeat(40));
   });
 });

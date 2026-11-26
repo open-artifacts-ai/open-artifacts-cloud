@@ -399,6 +399,7 @@ export function parseProd(
 /** Parses REDLINE_TARGETS and reads every secret file. No network. */
 export function parseTargets(
   env: Record<string, string | undefined> = process.env,
+  o: { onlyA?: boolean } = {},
 ): Targets {
   const json = env.REDLINE_TARGETS;
   if (!json) throw new Error("REDLINE_TARGETS is not set");
@@ -421,6 +422,22 @@ export function parseTargets(
     return v as Record<string, unknown>;
   };
   const a = parseTarget(obj(raw.a, "a"), "a", mode, secretsDir);
+  // The smoke (cloud #264 step 2) uses rl-a only: rl-b's secret files are not
+  // minted in a gate run, so it is not loaded (and t.b is a's stand-in).
+  if (o.onlyA) {
+    const out: Targets = { mode, a, b: a };
+    if (mode === "staging") {
+      const rawProd =
+        raw.prod === undefined || raw.prod === null
+          ? undefined
+          : obj(raw.prod, "prod");
+      const prod = parseProd(rawProd, secretsDir, env);
+      if (prod) out.prod = prod;
+      const inv = parseInventory(raw.inventory, secretsDir, env);
+      if (inv) out.inventory = inv;
+    }
+    return out;
+  }
   const b = parseTarget(obj(raw.b, "b"), "b", mode, secretsDir);
   const distinct = (k: keyof Target) => {
     if (a[k] === b[k]) throw new Error(`REDLINE_TARGETS: a and b share ${k}`);

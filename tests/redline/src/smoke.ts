@@ -849,41 +849,150 @@ export async function purgeFresh(
   return ok;
 }
 
+interface Waited {
+  within?: number;
+  now?: () => number;
+  wait?: (ms: number) => Promise<unknown>;
+  write?: (s: string) => void;
+}
+
+/** Waits for a detached job's done file, prints its log without workflow command lines, and says whether it ended ok. */
+async function waitDone(
+  dir: string,
+  f: { done: string; log: string; what: string },
+  o: Waited,
+): Promise<boolean> {
+  const write = o.write ?? ((s: string) => process.stdout.write(s));
+  const now = o.now ?? Date.now;
+  const wait = o.wait ?? ((ms: number) => delay(ms));
+  const end = now() + (o.within ?? PURGE_WAIT_MS);
+  while (!existsSync(join(dir, f.done)) && now() < end) await wait(2_000);
+  const log = existsSync(join(dir, f.log))
+    ? readFileSync(join(dir, f.log), "utf8")
+    : "";
+  for (const line of log.split("\n"))
+    if (line && !line.startsWith("::")) write(`${line}\n`);
+  if (!existsSync(join(dir, f.done))) {
+    write(
+      `the ${f.what} has not ended: the next run's sweep or a person must remove what is left\n`,
+    );
+    return false;
+  }
+  return readFileSync(join(dir, f.done), "utf8").trim() === "ok";
+}
+
 /**
  * Waits for the done file up to `within`, prints the purge's log (without
  * workflow command lines) and returns whether the purge succeeded. True when
  * no fresh install was ever recorded (nothing to purge).
  */
-export async function purgeWait(
-  dir: string,
-  o: {
-    within?: number;
-    now?: () => number;
-    wait?: (ms: number) => Promise<unknown>;
-    write?: (s: string) => void;
-  } = {},
-): Promise<boolean> {
-  const write = o.write ?? ((s: string) => process.stdout.write(s));
+export async function purgeWait(dir: string, o: Waited = {}): Promise<boolean> {
   if (!existsSync(join(dir, FRESH_FILE))) {
-    write("no fresh install was created: nothing to purge\n");
+    (o.write ?? ((s: string) => process.stdout.write(s)))(
+      "no fresh install was created: nothing to purge\n",
+    );
     return true;
   }
-  const now = o.now ?? Date.now;
-  const wait = o.wait ?? ((ms: number) => delay(ms));
-  const end = now() + (o.within ?? PURGE_WAIT_MS);
-  while (!existsSync(join(dir, PURGE_DONE)) && now() < end) await wait(2_000);
-  const log = existsSync(join(dir, PURGE_LOG))
-    ? readFileSync(join(dir, PURGE_LOG), "utf8")
-    : "";
-  for (const line of log.split("\n"))
-    if (line && !line.startsWith("::")) write(`${line}\n`);
-  if (!existsSync(join(dir, PURGE_DONE))) {
-    write(
-      "the purge has not ended: the next run's cleanup or a person must remove the install\n",
-    );
-    return false;
+  return waitDone(dir, { done: PURGE_DONE, log: PURGE_LOG, what: "purge" }, o);
+}
+
+// --- the sweep of leftover fresh installs ---------------------------------------------
+
+/** A fresh install older than this is a leftover: no smoke runs that long. */
+export const SWEEP_AGE_MS = 2 * 60 * 60_000;
+export const SWEEP_STARTED = "sweep.started";
+export const SWEEP_LOG = "sweep.log";
+export const SWEEP_DONE = "sweep.done";
+export const FRESH_SLUG_RE = /^rl-n-[a-z0-9-]{1,40}$/;
+const STAGING_API = /(^|\.)open-artifacts-staging\.app$/;
+
+/**
+ * The leftover fresh installs on staging: rl-n-* not deleted, created more
+ * than SWEEP_AGE_MS ago (R2, the CI robot's own list: it sees rl- installs
+ * only). Staging only: any other Provisioning API origin throws.
+ */
+export async function staleFresh(run: Run, now: number): Promise<string[]> {
+  if (!STAGING_API.test(new URL(run.c.api).hostname))
+    throw new ProbeFail("the sweep runs on staging only");
+  const out: string[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < 20; page++) {
+    const q = new URLSearchParams({
+      q: "rl-n-",
+      ...(cursor ? { cursor } : {}),
+    });
+    const r = await run.v1(`/installs?${q}`, { read: true });
+    if (r.status !== 200) throw new ProbeFail(`sweep R2: ${r.status}`);
+    const j = r.json as {
+      items?: { slug?: unknown; state?: unknown; createdAt?: unknown }[];
+      nextCursor?: string | null;
+    };
+    for (const i of j.items ?? []) {
+      if (typeof i.slug !== "string" || !FRESH_SLUG_RE.test(i.slug)) continue;
+      if (i.state === "deleted" || typeof i.createdAt !== "number") continue;
+      // Epoch ms; a seconds value is scaled up rather than read as 1970.
+      const at = i.createdAt < 1e12 ? i.createdAt * 1000 : i.createdAt;
+      if (now - at > SWEEP_AGE_MS) out.push(i.slug);
+    }
+    cursor = j.nextCursor ?? null;
+    if (!cursor) break;
   }
-  return readFileSync(join(dir, PURGE_DONE), "utf8").trim() === "ok";
+  return out;
+}
+
+/** The detached sweep's body: delete and purge each leftover (removeInstall, as the purge does), then the done file. */
+export async function sweepFresh(
+  run: Run,
+  dir: string,
+  now: number = Date.now(),
+  write: (s: string) => unknown = (s) => process.stdout.write(s),
+): Promise<boolean> {
+  let ok = true;
+  try {
+    const slugs = await staleFresh(run, now);
+    write(`sweep: ${slugs.length} leftover fresh install(s) older than 2 h\n`);
+    for (const slug of slugs) {
+      try {
+        await removeInstall(run, slug, `sweep ${slug}`);
+        write(`${slug}: deleted and purged\n`);
+      } catch (e) {
+        ok = false;
+        write(
+          `${slug}: sweep failed: ${e instanceof Error ? e.message : String(e)}\n`,
+        );
+      }
+    }
+  } catch (e) {
+    ok = false;
+    write(`sweep failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+  writeFileSync(join(dir, SWEEP_DONE), ok ? "ok\n" : "failed\n", {
+    mode: 0o600,
+  });
+  return ok;
+}
+
+/** Starts the sweep in a detached process and returns at once: it never holds or fails a run. */
+export function spawnSweep(
+  dir: string,
+  script: string,
+  go: typeof spawn = spawn,
+): void {
+  writeFileSync(join(dir, SWEEP_STARTED), `${new Date().toISOString()}\n`, {
+    mode: 0o600,
+  });
+  const fd = openSync(join(dir, SWEEP_LOG), "a", 0o600);
+  go(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", script, "sweep"],
+    { detached: true, stdio: ["ignore", fd, fd], env: process.env },
+  ).unref();
+}
+
+/** The sweep's result, like purgeWait's; true when no sweep was started. */
+export async function sweepWait(dir: string, o: Waited = {}): Promise<boolean> {
+  if (!existsSync(join(dir, SWEEP_STARTED))) return true;
+  return waitDone(dir, { done: SWEEP_DONE, log: SWEEP_LOG, what: "sweep" }, o);
 }
 
 /** The path of this module's directory's sibling scripts/smoke.ts. */

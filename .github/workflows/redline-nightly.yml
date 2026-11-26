@@ -6,10 +6,13 @@
 # The gate accepts that on a scheduled run only (report.ts, runKindOf).
 # Not a prod gate: staging-first-gate.sh reads runs of redline-staging.yml, and
 # a run called from here isn't one. Every red-line run applies the gate, so a
-# nightly is green only if every case passes, P30 aside. A running nightly holds a candidate on the
-# `redline` group for up to about 150 min, and a second dispatch while one waits
-# replaces it, so a nightly waits 3 h after any candidate run. Its T19 job runs
-# every dashboard spec (t19_full: true); a gate run runs only the @gate ones.
+# nightly is green only if every case passes, P30 aside. It never holds a
+# candidate (cloud #264 step 2): its call has its own concurrency group, and a
+# gate run cancels a running nightly first (redline-staging.yml `preempt`).
+# A cancelled nightly is not recorded as run, so the next cron runs the
+# release again; it still waits 3 h after any candidate run, so preemptions
+# stay rare. Its T19 job runs every dashboard spec (t19_full: true); a gate
+# run runs only the @gate ones.
 name: redline-nightly
 
 on:
@@ -45,32 +48,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node --experimental-strip-types scripts/ci/redline-nightly.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
-      # Before the run: a release gets one nightly, green or red.
-      - name: Record the release as run
-        if: steps.plan.outputs.run == 'true'
-        env:
-          TAG: ${{ steps.plan.outputs.tag }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ran"
-          printf '%s\n' "$TAG" > "$RUNNER_TEMP/ran/tag.txt"
-      - if: steps.plan.outputs.run == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: redline-nightly-${{ steps.plan.outputs.tag }}
-          path: ${{ runner.temp }}/ran/tag.txt
-          if-no-files-found: error
-          retention-days: 90
   redline:
     needs: pick
     if: needs.pick.outputs.run == 'true'
     # A called workflow's jobs can't hold more than this: id-token for the
     # redline job, `actions: read` for its t19 hand-off (the t19 job gets
     # only contents and actions, never id-token).
+    # actions: write only because the callee's preempt job asks for it (a
+    # called job can't hold more than its caller gives); in a called run that
+    # job's steps after its first are skipped, so nothing here cancels a run.
     permissions:
       contents: read
       id-token: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/redline-staging.yml
     with:
       tag: ${{ needs.pick.outputs.tag }}
@@ -109,3 +99,21 @@ jobs:
           RESULT: ${{ needs.pick.result == 'success' && needs.redline.result || needs.pick.result }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node --experimental-strip-types scripts/ci/redline-nightly.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN"
+      # After the run: a release gets one nightly, green or red. A cancelled
+      # one (a release gate preempts it) is not recorded, so the next cron
+      # runs the release again.
+      - name: Record the release as run
+        if: needs.pick.outputs.run == 'true' && (needs.redline.result == 'success' || needs.redline.result == 'failure')
+        env:
+          TAG: ${{ needs.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ran"
+          printf '%s\n' "$TAG" > "$RUNNER_TEMP/ran/tag.txt"
+      - if: needs.pick.outputs.run == 'true' && (needs.redline.result == 'success' || needs.redline.result == 'failure')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: redline-nightly-${{ needs.pick.outputs.tag }}
+          path: ${{ runner.temp }}/ran/tag.txt
+          if-no-files-found: error
+          retention-days: 90

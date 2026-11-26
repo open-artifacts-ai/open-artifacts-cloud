@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, it } from "vitest";
 import { describeRes, readBody } from "../src/http.ts";
 import { guardProdClean } from "../src/prod.ts";
 import { ProbeFail, type Run } from "../src/provisioning.ts";
-import { TIER_FIXTURE } from "../src/provisioning-live.ts";
+import { rawTargets, TIER_FIXTURE } from "../src/provisioning-live.ts";
 import { label, proof } from "../src/report.ts";
 import {
   codeRequestReq,
@@ -59,7 +59,7 @@ let run: Run;
 let key: string;
 
 beforeAll(async () => {
-  T = parseTargets(env);
+  T = parseTargets(env, { onlyA: true });
   A = T.a;
   run = smokeRun(env);
   key = secretsOf(A).hookKey;
@@ -384,7 +384,7 @@ describe("rl-a", () => {
       const site = siteOf(url);
       if (!site)
         throw new Error("the content address has no registrable domain");
-      for (const app of [A.app, T.b.app])
+      for (const app of [A.app, rawTargets(env.REDLINE_TARGETS).b.app])
         if (siteOf(app) === site)
           throw new Error(
             "the content address is same-site with an app address",

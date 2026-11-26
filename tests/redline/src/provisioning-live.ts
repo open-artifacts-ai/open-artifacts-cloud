@@ -65,6 +65,7 @@ import {
   provConfig,
   Run,
   revokeCreds,
+  sidesOf,
   stagedVersion,
 } from "./provisioning.ts";
 import { gitSchemaOf } from "./schema.ts";
@@ -609,8 +610,14 @@ export async function bringUp(
   // hook key for T19) never waits for rl-busa's and rl-busb's creates and
   // upgrades. The bus lane waits for the pair itself (waitBusPair, its own
   // deadline); the revoke waits for it, bounded, before revoking it.
-  startPair(t);
-  const done = await Promise.allSettled([one("a", t.a), one("b", t.b)]);
+  // A smoke gate (REDLINE_SIDES=a) brings up rl-a only, and no bus pair:
+  // rl-b and the pair are the nightly's long suite's, which upgrades them
+  // itself (this function, with both sides).
+  const sides = sidesOf(env);
+  if (sides.includes("b")) startPair(t);
+  const done = await Promise.allSettled(
+    sides.map((s) => one(s, s === "a" ? t.a : t.b)),
+  );
   const failed = done.filter(
     (d): d is PromiseRejectedResult => d.status === "rejected",
   );
@@ -668,11 +675,14 @@ export async function revokeAll(
   const now = o.now ?? Date.now;
   const deadline = o.deadline ?? jobDeadline(env);
   let failed = 0;
-  // rl-a and rl-b first, as ever: their own bound (JOB_WITHIN_MS each).
+  // rl-a and rl-b first, as ever: their own bound (JOB_WITHIN_MS each). A
+  // smoke gate (REDLINE_SIDES=a) minted rl-a's only, so it revokes rl-a's.
+  const standing = sidesOf(env);
   for (const [name, side] of [
     ["a", t.a],
     ["b", t.b],
   ] as const) {
+    if (!standing.includes(name)) continue;
     const f = credFile(t, name, "PAT");
     const pat = existsSync(f)
       ? readSecretFile(f, secretFileName(side.name, "PAT"))
@@ -774,8 +784,9 @@ export async function writeStagedVersion(
   t: RawTargets,
   file: string,
 ): Promise<void> {
-  const v = await stagedVersion(liveRun(env, t));
+  const sides = sidesOf(env);
+  const v = await stagedVersion(liveRun(env, t), sides);
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, `${v}\n`);
-  out(`rl-a and rl-b report ${v}\n`);
+  out(`${sides.map((s) => `rl-${s}`).join(" and ")} report ${v}\n`);
 }

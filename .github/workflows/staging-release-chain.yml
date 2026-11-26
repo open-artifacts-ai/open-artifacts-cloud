@@ -37,8 +37,9 @@
 # a workflow_dispatch run, the event prod-release-chain and
 # staging-first-gate.sh read.
 # The red-line nightly yields to candidates (it skips while any red-line run is
-# going), but a nightly already running holds the `redline` group, so the gate
-# waits for it (up to about 150 min), and a second dispatch replaces a waiting one.
+# going), and a nightly already running never holds the gate: the gate cancels
+# it and waits for its cleanup (redline-staging.yml `preempt`, cloud #264 step
+# 2). A second dispatch still replaces a waiting gate.
 name: staging-release-chain
 
 on:

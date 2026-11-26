@@ -58,10 +58,13 @@ jobs:
     needs: idle
     # Exactly what redline-nightly.yml gives the same callee: id-token for the
     # redline job, `actions: read` for the t19 hand-off.
+    # actions: write only because the callee's preempt job asks for it (a
+    # called job can't hold more than its caller gives); in a called run that
+    # job's steps after its first are skipped, so nothing here cancels a run.
     permissions:
       contents: read
       id-token: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/redline-staging.yml
     with:
       tag: ${{ inputs.tag }}
