@@ -473,7 +473,11 @@ jobs:
           mkdir "$RUNNER_TEMP/actionlint"
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
           cd _cloud
-          "$RUNNER_TEMP/actionlint/actionlint" -color .github/workflows/*.yml
+          # actionlint 1.7.12 predates concurrency's `queue` key (GitHub docs:
+          # single or max); flaky-tracker.yml uses `queue: max`.
+          "$RUNNER_TEMP/actionlint/actionlint" -color \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml
 
   # The provisioning and admin Playwright suites (#17), on the overlay. Both
   # start their own server (provisioning: the Worker in Miniflare; admin: vite
