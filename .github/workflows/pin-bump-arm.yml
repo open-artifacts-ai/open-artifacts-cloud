@@ -23,39 +23,61 @@
 # something is written.
 name: pin-bump-arm
 on:
-  # CI on a bump branch, and the end of the prod chain: a bump that waited on
-  # an open candidate is armed as soon as that candidate's chain finishes,
-  # without waiting for a schedule run (GitHub skipped 7 h of them on 11-24).
+  # Event-only (cloud #264): no schedule. Every event below re-plans every open
+  # bump, and the plan is the same idempotent, read-only check whatever starts it.
+  #
+  # workflow_run:
+  # - CI on a bump branch: its required checks are now green (or not).
+  # - CI in the merge queue that did not pass: a queue failure is refused with
+  #   one PR comment, and a run of cancels re-arms (see the header above).
+  # - Any release pipeline gate workflow ending (GATE_WORKFLOWS in
+  #   scripts/ci/pin-bump-arm.ts): the gate opens only when one of them ends,
+  #   so a bump that waited on an open candidate is armed at once. The prod
+  #   chain is the usual last one; the others cover a gate held by another run.
+  #   The schedule this replaces was how a waiting bump got armed before, and
+  #   GitHub skipped 7 h of it on 11-24.
   workflow_run:
-    workflows: [CI, prod-release-chain]
+    workflows:
+      [
+        CI,
+        hosted-publish,
+        staging-release-chain,
+        deploy-hosted-platform,
+        redline-staging,
+        prod-release-chain,
+      ]
     types: [completed]
   # pull_request_target: this workflow only ever checks out main and runs main's
   # script; it must never check out or run the PR's code.
   pull_request_target:
     types: [opened, reopened, synchronize]
-  # The schedule is best-effort and may never fire, and CI on main is filtered
-  # out below, so a push to main (which changes what an open bump is judged
-  # against) and a manual run also re-evaluate every open bump. Every trigger
-  # checks out main and runs main's script; the plan is read-only.
+  # CI on main is filtered out below, so a push to main (which changes what an
+  # open bump is judged against) and a manual run also re-evaluate every open
+  # bump. Every trigger checks out main and runs main's script; the plan is
+  # read-only.
   push:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
 permissions: {}
-concurrency:
-  group: pin-bump-arm
-  cancel-in-progress: false
+# One plan or arm at a time, never cancelled. The group is on the jobs, not the
+# run: a run whose plan is skipped (CI on another branch) never takes it, so it
+# can never replace a pending run that has work to do. A newer pending job may
+# replace an older one; both judge every open bump afresh (arm runs the whole
+# rule again), so no event is lost.
 jobs:
   plan:
-    # Cheap exits: a PR event for another branch, or a CI run for another branch.
+    # Cheap exits: a PR event for another branch, a CI run on another branch or
+    # a green queue run (a pass merges, and that push re-plans).
     if: >-
-      github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && startsWith(github.head_ref, 'pin-bump/')) ||
-      (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/')) ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'prod-release-chain')
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/')) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/') && github.event.workflow_run.conclusion != 'success') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name != 'CI')
+    concurrency:
+      group: pin-bump-arm
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -81,6 +103,9 @@ jobs:
   arm:
     needs: plan
     if: ${{ needs.plan.outputs.write == 'true' }}
+    concurrency:
+      group: pin-bump-arm
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 10

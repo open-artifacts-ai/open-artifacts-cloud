@@ -630,12 +630,41 @@ export function userWorkerMetadata(
   const migrations = migrationsFor(t, r.doMigrationTag);
   if (migrations) meta.migrations = migrations;
   if (missing.length > 0) meta.keep_bindings = ["secret_text", "secret_key"];
+  // Public #3200: a template binding named like a test hook (RL_HOOKS) is for
+  // test-hook installs only. Dropped after the ids are given out, so the other
+  // ratelimits keep their rlNs + index slots whatever is dropped.
+  if (!i.testHooks)
+    meta.bindings = meta.bindings.filter((b) => !isHookBinding(b.name));
+  assertNoHookBindings(meta.bindings, i.testHooks);
   assertUniqueBindings(meta.bindings);
   // open-artifacts#2641: also on what is rendered, so a release template's
   // vars can't bind DOCS_PREVIEW on prod either.
   if (r.env === "prod" && meta.bindings.some((b) => b.name === "DOCS_PREVIEW"))
     throw new Error("DOCS_PREVIEW is staging only; prod refuses it");
   return meta;
+}
+
+/**
+ * A binding for test hooks only (public #3200's RL_HOOKS, TEST_HOOKS,
+ * TEST_HOOK_KEY): its name matches /hook/i. A release install has none.
+ */
+export function isHookBinding(name: string): boolean {
+  return /hook/i.test(name);
+}
+
+/** The production hook guard: a non-test install's upload names no hook. */
+export function assertNoHookBindings(
+  bindings: readonly { name: string }[],
+  testHooks: boolean,
+): void {
+  if (testHooks) return;
+  const hook = bindings.find(
+    (b) => isHookBinding(b.name) || b.name === "TEST_DOMAIN",
+  );
+  if (hook)
+    throw new Error(
+      `hook binding ${JSON.stringify(hook.name)} on a non-test install`,
+    );
 }
 
 /** Two bindings with one name would let one silently shadow the other. */
