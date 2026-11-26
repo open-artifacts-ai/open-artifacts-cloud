@@ -85,7 +85,9 @@
 // so it is read once. One reconcile starts no run after RECONCILE_MS,
 // RECONCILE_CALLS gh calls or RECONCILE_LOGS job logs (it always does one),
 // oldest first, and logs "backlog: N left": each run is saved as it
-// finishes, so the next completion carries on.
+// finishes, and the runs left (or failed) are written to the store as its
+// pending list, which the next reconcile works whatever its listing's range,
+// so the next completion carries on.
 //
 // Usage: node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
 //        node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --reconcile
@@ -1628,14 +1630,27 @@ export function reconcile(o: {
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
   // Oldest first (run ids grow with creation), as their events would have
   // come: a late replay then writes the same store and issues as on time.
-  const runs = listed.filter((r) => eligible(r)).sort((a, b) => a.id - b.id);
-  if (!runs.length) return { tracked: [], notes, failed: 0, left: 0 };
   // Reads only: a store is created only when a run below is tracked. Every
   // listed run's mark was written after the run was created, so reading the
   // stores since reconcileFrom finds all of them.
   const from = reconcileFrom(nowMs);
   const { read } = storeIssues(exec, repo, nowMs, from);
-  const have = storedRuns(storeCommentsIn(exec, repo, read, nowMs, from));
+  const stored = storeCommentsIn(exec, repo, read, nowMs, from);
+  const have = storedRuns(stored);
+  // The pending list too, whatever the listing's range: a run found by an
+  // earlier reconcile and not finished stays a candidate until it is marked.
+  // One the listing no longer shows is read from the runs API when its turn
+  // comes.
+  const pending = pendingRuns(stored);
+  const byId = new Map<number, ListedRun | { id: number; attempt: number }>();
+  for (const p of pending) {
+    const [id, attempt] = p.split("/").map(Number) as [number, number];
+    byId.set(id, { id, attempt });
+  }
+  for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
+  const runs = [...byId.values()].sort((a, b) => a.id - b.id);
+  if (!runs.length) return { tracked: [], notes, failed: 0, left: 0 };
+  const unfinished: string[] = [];
   const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
   let failed = 0;
   let left = 0;
@@ -1654,17 +1669,19 @@ export function reconcile(o: {
         spent.logs >= (o.logs ?? RECONCILE_LOGS))
     ) {
       left++;
+      unfinished.push(`${r.id}/${r.attempt}`);
       continue;
     }
     started++;
     try {
+      const l = "name" in r ? r : listedRun(exec, repo, r.id, r.attempt);
       const run = runInfo({
         repo,
-        workflow: r.name,
-        runId: r.id,
-        attempt: r.attempt,
-        headSha: r.sha,
-        title: r.title,
+        workflow: l.name,
+        runId: l.id,
+        attempt: l.attempt,
+        headSha: l.sha,
+        title: l.title,
       });
       const t = { run, ...track({ exec, run, nowMs }) };
       tracked.push(t);
@@ -1672,12 +1689,120 @@ export function reconcile(o: {
     } catch (e) {
       // One run's failure never stops the others; the job still fails.
       failed++;
+      unfinished.push(`${r.id}/${r.attempt}`);
       const note = `run ${r.id}/${r.attempt}: ${(e as Error).message}`;
       notes.push(note);
       o.onRun?.([`  note: ${note}`]);
     }
   }
+  // What is still not marked (left, or failed) is the new pending list,
+  // written when it changed. A run leaves it only once it is marked.
+  if (unfinished.join(" ") !== pending.join(" ")) {
+    const store = openStore(exec, repo, nowMs);
+    notes.push(...store.notes);
+    gh(
+      exec,
+      [
+        "issue",
+        "comment",
+        String(store.write),
+        "--repo",
+        repo,
+        "--body",
+        pendingComment(unfinished, nowMs),
+      ],
+      { write: true },
+    );
+  }
   return { tracked, notes, failed, left };
+}
+
+/**
+ * The store comment that lists the runs a reconcile found but did not finish
+ * (its budget ran out, or the run failed): one `run: <id>/<attempt>` each,
+ * under `at` (when it was written; the newest list is the one read). Every
+ * reconcile works these along with its listing, whatever the listing's
+ * range, so a run that leaves the range while it waits is still tracked. A
+ * run leaves the list only once the store marks it.
+ */
+export const pendingComment = (runs: string[], nowMs: number) =>
+  [
+    runs.length
+      ? `The flaky tracker's reconcile has ${runs.length} runs left to track; the next one carries on.`
+      : "The flaky tracker's reconcile has no run left to track.",
+    "",
+    markerBlock([
+      ["kind", "pending"],
+      ["at", new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z")],
+      ...runs.map((r): [string, string] => ["run", r]),
+    ]),
+  ].join("\n");
+
+/** The newest pending list in the store, from the bot's comments only. */
+export function pendingRuns(comments: StoreComment[]): string[] {
+  let at = "";
+  let out: string[] = [];
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = (m.get("run") ?? []).filter((r) => /^\d{1,20}\/\d{1,4}$/.test(r));
+  }
+  return out;
+}
+
+/**
+ * A pending run the listing no longer shows, read from the runs API. It must
+ * still be a watched workflow's run that passed on this attempt; else it
+ * fails (and stays pending, so the job's failure shows it).
+ */
+function listedRun(
+  exec: Exec,
+  repo: string,
+  id: number,
+  attempt: number,
+): ListedRun {
+  const r = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/runs/${id}`,
+      "--jq",
+      "{path, run_attempt, conclusion, event, head_branch, head_sha, display_title}",
+    ]),
+  ) as {
+    path: string;
+    run_attempt: number;
+    conclusion: string | null;
+    event: string;
+    head_branch: string;
+    head_sha: string;
+    display_title: string;
+  };
+  const name = WORKFLOWS.find(
+    (w) => r.path === `.github/workflows/${WORKFLOW_FILES[w]}`,
+  );
+  const l: ListedRun | null = name
+    ? {
+        id,
+        attempt: r.run_attempt,
+        name,
+        event: r.event,
+        branch: r.head_branch,
+        sha: r.head_sha,
+        title: r.display_title,
+      }
+    : null;
+  if (
+    !l ||
+    r.conclusion !== "success" ||
+    r.run_attempt < attempt ||
+    !eligible(l)
+  )
+    throw new Error(`run ${id}/${attempt} is no longer a tracked run`);
+  return l;
 }
 
 /** The step summary's last line: how many runs wait for the next reconcile. */

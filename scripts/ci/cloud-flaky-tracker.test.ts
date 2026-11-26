@@ -38,6 +38,7 @@ import {
   parseSeen,
   parseStore,
   parseVitest,
+  pendingRuns,
   plan,
   QUIET_DAYS,
   RECONCILE_CALLS,
@@ -1319,7 +1320,9 @@ describe("reconcile", () => {
     const range = encodeURIComponent(
       "2026-09-26T10:00:00Z..2026-11-26T12:00:00Z",
     );
-    expect(lists).toHaveLength(2);
+    // The two listings, then the store's issue list (for its pending list).
+    expect(lists).toHaveLength(3);
+    expect(lists[2]).toMatch(/^issue list .*--label flaky-sightings/);
     for (const [i, file] of ["ci.yml", "redline-staging.yml"].entries()) {
       expect(lists[i]).toContain(
         `repos/o/cloud/actions/workflows/${file}/runs?status=success&exclude_pull_requests=true&created=${range}&per_page=100&page=1`,
@@ -1327,7 +1330,7 @@ describe("reconcile", () => {
       expect(lists[i]).toContain("--jq");
       expect(lists[i]).toContain("total_count");
     }
-    // Nothing to track: no store read, nothing written.
+    // Nothing to track: nothing written.
     expect(writes(g)).toEqual([]);
   });
 
@@ -1744,7 +1747,8 @@ describe("reconcile", () => {
     expect(
       reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW }).tracked,
     ).toEqual([]);
-    expect(g.calls).toHaveLength(2);
+    // The two listings and the store's issue list: nothing else is read.
+    expect(g.calls).toHaveLength(3);
   });
 
   it("tracks a fork's run it lists, whatever its head repository", () => {
@@ -2011,6 +2015,25 @@ function liveGh(o: {
       );
     const wf = /actions\/workflows\/([\w.-]+)\/runs\?/.exec(a);
     if (wf) return ok(listPage(o.listed[wf[1] as string] ?? [], args[1] ?? ""));
+    const one = /actions\/runs\/(\d+) --jq/.exec(a);
+    if (one) {
+      for (const [file, rows] of Object.entries(o.listed)) {
+        const x = rows.find((r) => r.id === Number(one[1]));
+        if (x)
+          return ok(
+            JSON.stringify({
+              path: `.github/workflows/${file}`,
+              run_attempt: x.run_attempt,
+              conclusion: x.conclusion,
+              event: x.event,
+              head_branch: x.head_branch,
+              head_sha: x.head_sha,
+              display_title: x.display_title,
+            }),
+          );
+      }
+      return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
+    }
     if (/actions\/jobs\/10\/logs/.test(a)) return ok(o.log);
     if (a.startsWith("label list")) {
       const name = val(args, "--search");
@@ -2338,11 +2361,13 @@ describe("a backlog larger than one reconcile drains over the next events", () =
         ? { code: 1, stdout: "", stderr: "killed" }
         : g.exec(cmd, args);
     g.clock.now = later;
-    const cut = reconcile({ exec: dying, repo: "o/cloud", nowMs: later });
+    // Its last write (the pending list) fails too, so the step fails.
+    expect(() =>
+      reconcile({ exec: dying, repo: "o/cloud", nowMs: later }),
+    ).toThrow("killed");
     const saved = marks(g);
     expect(saved.length).toBeGreaterThan(0);
     expect(saved.length).toBeLessThan(ids.length);
-    expect(cut.failed).toBeGreaterThan(0);
     for (let e = 1; e <= 4; e++) reconcileAt(g, later + e * HOUR, { logs: 5 });
     expect(marks(g)).toEqual(ids.map((id) => `${id}/2`));
     expect(sightingRuns(g).sort()).toEqual(
@@ -2365,5 +2390,123 @@ describe("a backlog larger than one reconcile drains over the next events", () =
       "Flaky tracker, CI at abcdef0, run 1000 (passed on attempt 2):",
       "Flaky tracker, CI at abcdef0, run 1001 (passed on attempt 2):",
     ]);
+  });
+});
+
+describe("a backlog run that leaves the listing's range while it waits", () => {
+  // The Prover's case: 32 CI runs created 60 days ago and rerun 30 days ago.
+  // The first completion tracks 10 and leaves 22; the next comes 27 hours
+  // later, when the listing no longer reaches them.
+  const ids = Array.from({ length: 32 }, (_, i) => 2000 + i);
+  const created = NOW - (RERUN_DAYS + QUIET_DAYS) * DAY;
+  const ci = (id: number): Listed => ({
+    id,
+    run_attempt: 2,
+    conclusion: "success",
+    created_at: iso(created),
+    updated_at: iso(NOW - RERUN_DAYS * DAY),
+    name: "CI",
+    event: "push",
+    head_branch: "main",
+    head_sha: SHA,
+    display_title: "a commit",
+  });
+  const make = () =>
+    liveGh({
+      listed: { "ci.yml": ids.map(ci) },
+      jobAt: Object.fromEntries(ids.map((id) => [id, NOW - RERUN_DAYS * DAY])),
+      log: CI_LOG,
+    });
+  const marks = (g: ReturnType<typeof make>) =>
+    g
+      .state()
+      .stores.flatMap((st) => [...storedRuns(st.comments)])
+      .sort();
+  const lastPending = (g: ReturnType<typeof make>) =>
+    pendingRuns(g.state().stores.flatMap((st) => st.comments));
+  const at = (g: ReturnType<typeof make>, ms: number) => {
+    g.clock.now = ms;
+    return ms;
+  };
+
+  it("is kept in the store's pending list and still tracked, every one, once", () => {
+    const g = make();
+    // 1 log a run: a budget of 10 logs tracks 10.
+    const first = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: at(g, NOW),
+      logs: 10,
+      calls: 10_000,
+    });
+    expect(first.tracked).toHaveLength(10);
+    expect(first.left).toBe(22);
+    expect(lastPending(g)).toEqual(ids.slice(10).map((id) => `${id}/2`));
+    // 27 hours on, the listing finds none of them.
+    const later = at(g, NOW + 27 * HOUR);
+    expect(listRuns(g.exec, "o/cloud", "CI", later)).toEqual([]);
+    const next = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: later,
+      logs: 100,
+      calls: 10_000,
+    });
+    expect(next.tracked.map((t) => t.run.runId)).toEqual(ids.slice(10));
+    expect(next.left).toBe(0);
+    expect(next.failed).toBe(0);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+    // The list is emptied once all are marked, then nothing more is written.
+    expect(lastPending(g)).toEqual([]);
+    const before = JSON.stringify(g.state());
+    const r = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: at(g, later + HOUR),
+    });
+    expect(r.tracked).toEqual([]);
+    expect(JSON.stringify(g.state())).toBe(before);
+  });
+
+  it("drains on the default budgets over later completions, all past the listing's range", () => {
+    const g = make();
+    reconcile({ exec: g.exec, repo: "o/cloud", nowMs: at(g, NOW), logs: 10 });
+    const left: number[] = [];
+    for (let e = 1; e <= 4; e++)
+      left.push(
+        reconcile({
+          exec: g.exec,
+          repo: "o/cloud",
+          nowMs: at(g, NOW + 27 * HOUR + e * HOUR),
+        }).left,
+      );
+    expect(left.at(-1)).toBe(0);
+    expect(marks(g)).toEqual(ids.map((id) => `${id}/2`).sort());
+  });
+
+  it("keeps a failed run on the list until it is marked", () => {
+    const g = make();
+    let fail = true;
+    const broken: Exec = (cmd, args) =>
+      fail && args.join(" ").endsWith("/runs/2000/attempts/2")
+        ? { code: 1, stdout: "", stderr: "HTTP 404: Not Found" }
+        : g.exec(cmd, args);
+    const r = reconcile({
+      exec: broken,
+      repo: "o/cloud",
+      nowMs: at(g, NOW),
+      logs: 1000,
+      calls: 10_000,
+    });
+    expect(r.failed).toBe(1);
+    expect(lastPending(g)).toEqual(["2000/2"]);
+    fail = false;
+    const again = reconcile({
+      exec: g.exec,
+      repo: "o/cloud",
+      nowMs: at(g, NOW + 27 * HOUR),
+    });
+    expect(again.tracked.map((t) => t.run.runId)).toEqual([2000]);
+    expect(lastPending(g)).toEqual([]);
   });
 });
