@@ -2,7 +2,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HookBudgetError } from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
+import {
+  claimCappedSlot,
+  claimSuiteSlot,
+  HOOK_WINDOW_MS,
+  HookBudgetError,
+  hookWindowCount,
+  ledgerWaits,
+  SUITE_HOOK_LIMIT,
+  wrongKeyLedger,
+} from "../src/hook-ledger-compat.ts";
 import { Run } from "../src/provisioning.ts";
 import {
   bringUp,
@@ -214,6 +223,93 @@ describe("bringUp waits for the new hook key to take effect", () => {
     expect(err?.name).toBe("InfraError");
     expect(f.io.now() - t0).toBeLessThanOrEqual(90_000 + 40_000);
     expect(calls(f).length).toBeLessThanOrEqual(2);
+  });
+
+  // R26's own pacing (the default `pace`), on the run's clock. Its checks
+  // may carry a wrong key, so they go in the wrong-key ledger (RL_ANON's 25 a
+  // minute; before public #3200 the app's whole ledger). The failure says how
+  // long it waited and what it sent.
+  describe("R26's pacing", () => {
+    const ledgerRoot = () => {
+      const root = mkdtempSync(join(tmpdir(), "oa-bringup-ledger-"));
+      dirs.push(root);
+      // The default pace's ledger root is os.tmpdir(): this test's own.
+      vi.stubEnv("TMPDIR", root);
+    };
+    const fill = async (
+      f: FakeApi,
+      claim: (app: string, o: { now: () => number }) => Promise<number>,
+      app: string,
+    ) => {
+      for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+        await claim(app, { now: f.io.now });
+      expect(hookWindowCount(app, { now: f.io.now })).toBe(SUITE_HOOK_LIMIT);
+    };
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("the suite's right-key calls never hold R26 back from #3200 (before it, it waits for room as always)", async () => {
+      const { f } = setup();
+      ledgerRoot();
+      await fill(f, claimSuiteSlot, CONFIG.rlA.app);
+      const run = new Run(CONFIG, f.io);
+      const t0 = f.io.now();
+      // The fake's fresh key (provisioning-fake.ts, /__test/key_check).
+      await waitHookKey(run, CONFIG.rlA.app, "h".repeat(43));
+      expect(calls(f)).toHaveLength(1);
+      if (ledgerWaits) {
+        expect(f.io.now() - t0).toBeGreaterThanOrEqual(HOOK_WINDOW_MS);
+        expect(f.io.now() - t0).toBeLessThan(HOOK_WINDOW_MS + 1_000);
+      } else expect(f.io.now()).toBe(t0);
+    });
+
+    it("a key never accepted fails at 90 s, saying the real time waited and the checks sent; its polls stay within 25 a minute", async () => {
+      const { f } = setup();
+      f.faults.add("hook_key_never");
+      ledgerRoot();
+      const run = new Run(CONFIG, f.io);
+      const t0 = f.io.now();
+      const err = await waitHookKey(run, CONFIG.rlA.app, "k").then(
+        () => null,
+        (e: Error) => e,
+      );
+      const waited = f.io.now() - t0;
+      expect(err?.name).toBe("InfraError");
+      expect(waited).toBe(90_000);
+      const sent = calls(f).length;
+      expect(sent).toBeGreaterThan(SUITE_HOOK_LIMIT);
+      expect(err?.message).toContain(
+        `(hooks answer 404 on a key mismatch; waited 90.0 s, ${sent} key checks sent)`,
+      );
+      expect(
+        hookWindowCount(wrongKeyLedger(CONFIG.rlA.app), { now: f.io.now }),
+      ).toBeLessThanOrEqual(SUITE_HOOK_LIMIT);
+    });
+
+    it("a full wrong-key ledger and a deadline shorter than its wait: fails at once, saying it waited 0 s and sent nothing", async () => {
+      const { f } = setup();
+      ledgerRoot();
+      await fill(f, claimCappedSlot, wrongKeyLedger(CONFIG.rlA.app));
+      const run = new Run(CONFIG, f.io);
+      const t0 = f.io.now();
+      const err = await waitHookKey(
+        run,
+        CONFIG.rlA.app,
+        "h".repeat(43),
+        undefined,
+        30_000,
+      ).then(
+        () => null,
+        (e: Error) => e,
+      );
+      expect(err?.name).toBe("InfraError");
+      expect(f.io.now()).toBe(t0);
+      expect(calls(f)).toHaveLength(0);
+      expect(err?.message).toMatch(
+        /not accepted within 30 s of R26 \(the hook budget had no room before the deadline: .*; waited 0\.0 s, 0 key checks sent\)/,
+      );
+    });
   });
 
   it("a request that never answers is cut off at the deadline, not at its own bound", async () => {

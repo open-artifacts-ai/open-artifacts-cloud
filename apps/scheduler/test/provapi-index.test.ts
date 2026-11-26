@@ -24,8 +24,10 @@ import scheduler, {
   REVOKE_JOB,
   SYNC_JOB,
 } from "../src/index.js";
+import { FLEET_LEASE_KEY } from "../src/provapi/fleet.js";
 import { DUTY_TIMEOUT_MS, provapiTick } from "../src/provapi/index.js";
 import { getState } from "../src/provapi/state.js";
+import { wakeBatch } from "./provapi/batch.js";
 import {
   captureLogs,
   db,
@@ -205,6 +207,54 @@ describe("scheduled() and the provapi duties", () => {
     expect(f.provision.created).toEqual([]);
     expect(f.sent).toEqual([]);
     expect(lines.some((l) => l.startsWith("provapi"))).toBe(false);
+  });
+
+  // cloud #264: the 2-minute tick's fleet duty and the deploy's wake share
+  // one lease, so they never act side by side.
+  it("*/2: the fleet duty takes the lease and gives it back; while a wake holds it, it only logs the overlap", async () => {
+    const f = fakes();
+    const lines = captureLogs(vi.spyOn);
+    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
+    expect(lines).toContain("provapi fleet no_target");
+    expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
+    await insert("platform_state", {
+      key: FLEET_LEASE_KEY,
+      value: NOW - 1_000,
+      updated_at: NOW - 1_000,
+    });
+    lines.length = 0;
+    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
+    expect(lines).toContain("provapi fleet overlap");
+    expect(lines).not.toContain("provapi fleet no_target");
+    expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - 1_000);
+  });
+
+  it("queue(): a fleet wake runs the fleet only, acks its message and writes no tick", async () => {
+    const { del } = await seedRevokeAndSync();
+    const f = fakes();
+    await job(installId(), { created_at: NOW - JOB_START_GRACE_MS });
+    const { batch, acked, retried } = wakeBatch([1, 2]);
+    const lines = captureLogs(vi.spyOn);
+    await scheduler.queue(batch, f.env);
+    expect(acked).toEqual([0, 1]);
+    expect(retried).toEqual([]);
+    // No dead-man tick, no duty, no revoke, no sync, no mail.
+    expect(await getState(db, SCHEDULER_TICK_KEY)).toBeNull();
+    expect(f.calls).toEqual([]);
+    expect(f.provision.created).toEqual([]);
+    expect(f.sent).toEqual([]);
+    expect(
+      (
+        await rows("SELECT directory_revoke FROM installs WHERE id = ?1", del)
+      )[0],
+    ).toEqual({ directory_revoke: "pending" });
+    // The fleet ran (no target in this env) and gave its lease back.
+    expect(lines).toEqual([
+      "provapi fleet no_target",
+      "provapi fleet wake ok messages=2 retried=0",
+    ]);
+    for (const l of lines) expect(l).toMatch(LINE);
+    expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
   });
 
   it("an unknown cron writes no tick", async () => {

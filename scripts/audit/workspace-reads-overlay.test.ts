@@ -121,6 +121,54 @@ describe("workspace-reads-overlay", () => {
     expect(stale[0]).not.toContain(PUBLIC_KNOWN);
   });
 
+  // Pin #478 (v0.249.1): public declared a read, cloud's line went stale at
+  // the new pin but is still needed at the old one, and pin-bump/* is protected.
+  describe('a line marked "until vX.Y.Z"', () => {
+    const cloud =
+      "apps/hosted/test/x.test.ts @oa/pub\napps/hosted/test/gone.test.ts @oa/pub # until v0.249.1\n";
+    it("is retired, with a warning, from that pin on", () => {
+      for (const tag of ["v0.249.1", "v0.250.0", "v1.0.0"]) {
+        const root = fixture({ cloud });
+        put(
+          root,
+          "package.json",
+          JSON.stringify({ name: "open-artifacts", version: tag.slice(1) }),
+        );
+        const r = run(root);
+        expect(r.err, tag).toBe("");
+        expect(r.code, tag).toBe(0);
+        expect(r.out).toContain(
+          `"apps/hosted/test/gone.test.ts @oa/pub" is retired at v0.249.1 (pin ${tag}); delete the line`,
+        );
+      }
+    });
+    it("still exits 1 when stale before that release, or with no version", () => {
+      for (const tag of ["v0.248.2", "v0.249.0", undefined]) {
+        const root = fixture({ cloud });
+        if (tag)
+          put(
+            root,
+            "package.json",
+            JSON.stringify({ name: "open-artifacts", version: tag.slice(1) }),
+          );
+        const r = run(root);
+        expect(r.code, String(tag)).toBe(1);
+        expect(r.err).toContain("gone.test.ts @oa/pub: stale");
+      }
+    });
+    it("never retires an unmarked stale line", () => {
+      const root = fixture({
+        cloud:
+          "apps/hosted/test/x.test.ts @oa/pub\napps/hosted/test/gone.test.ts @oa/pub\n",
+      });
+      put(
+        root,
+        "package.json",
+        JSON.stringify({ name: "open-artifacts", version: "9.9.9" }),
+      );
+      expect(run(root).code).toBe(1);
+    });
+  });
   it("exits 1 on a stale public line and keeps public's file name", () => {
     const root = fixture({
       pub: "packages/pub/src/gone.ts @oa/hosted\n",

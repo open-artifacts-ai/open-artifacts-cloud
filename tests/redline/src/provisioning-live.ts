@@ -13,10 +13,6 @@ import { fileURLToPath } from "node:url";
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import type { InstallDetail } from "@oa/provisioning-contract";
 import {
-  claimHookSlot,
-  HookBudgetError,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
-import {
   BusError,
   busState,
   connectRequest,
@@ -25,6 +21,11 @@ import {
   revokeMachines,
 } from "./bus.ts";
 import { boundFetch, InfraError } from "./fetch-timeout.ts";
+import {
+  claimCappedSlot,
+  HookBudgetError,
+  wrongKeyLedger,
+} from "./hook-ledger-compat.ts";
 import {
   BUS_A,
   BUS_B,
@@ -259,35 +260,51 @@ export const HOOK_KEY_WITHIN_MS = 90_000;
  * (apps/server/src/test-hooks: audit row "refused" under hook "unknown", no
  * user, session or state touched), and a wrong key gets the bare 404 (audit
  * "denied", under "unknown", so the guard's session denied-row count is
- * unaffected). Each call takes a slot of the install's hook ledger
- * (`pace`), so the polls count against the same budget as the suite's.
+ * unaffected). Until the new key is served, each check carries a wrong key,
+ * so RL_ANON is charged for it: each takes a slot of the install's
+ * wrong-key ledger (`pace`, on the run's own clock; the app's whole ledger
+ * before public #3200), at most 25 a minute; polls one per POLL_MS stay under
+ * it. Before #3200 a full ledger waits, up to the deadline; from #3200 it is
+ * refused at once. The InfraError says how long it waited and how many
+ * checks it sent.
  */
 export async function waitHookKey(
   run: Run,
   app: string,
   key: string,
   pace: (app: string, deadline: number) => Promise<unknown> = (a, deadline) =>
-    claimHookSlot(a, { deadline }),
+    claimCappedSlot(wrongKeyLedger(a), {
+      deadline,
+      now: () => run.io.now(),
+      sleep: (ms) => run.io.wait(ms),
+    }),
   within: number = HOOK_KEY_WITHIN_MS,
 ): Promise<void> {
   // One deadline for the whole wait: a ledger claim gives up at it, and each
   // request is cut off at it, so the total never runs past `within`.
-  const deadline = run.io.now() + within;
-  const fail = () =>
+  const t0 = run.io.now();
+  const deadline = t0 + within;
+  let sends = 0;
+  const fail = (why = "hooks answer 404 on a key mismatch") =>
     new InfraError(
-      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 (hooks answer 404 on a key mismatch)`,
+      `the new hook key was not accepted within ${Math.round(within / 1000)} s of R26 ` +
+        `(${why}; waited ${((run.io.now() - t0) / 1000).toFixed(1)} s, ${sends} key check${sends === 1 ? "" : "s"} sent)`,
     );
   for (;;) {
     if (deadline - run.io.now() <= 0) throw fail();
     try {
       await pace(app, deadline);
     } catch (e) {
-      if (e instanceof HookBudgetError) throw fail();
+      if (e instanceof HookBudgetError)
+        throw fail(
+          `the hook budget had no room before the deadline: ${e.message}`,
+        );
       throw e;
     }
     const left = deadline - run.io.now();
     if (left <= 0) throw fail();
     try {
+      sends++;
       const res = await run.io.fetch(`${app}/__test/key_check`, {
         method: "POST",
         redirect: "manual",

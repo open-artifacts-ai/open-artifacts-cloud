@@ -37,6 +37,19 @@
 //     read-back passed (a rerun keeps the first time; D1 errors are retried);
 //   node scripts/ops/platform-db.ts unmark-verified staging|prod
 //     deletes every `platform_verified:*` key (a break-glass run).
+//   node scripts/ops/platform-db.ts fleet-done staging|prod vX.Y.Z
+//     reads only: waits up to FLEET_DONE_WAIT_MIN minutes (default 10; 0 is
+//     one read) for the scheduler's `fleet_done:<version>` (cloud #264: every
+//     install it waits for upgraded and settled); once it is there, prints
+//     `fleet_done_at=<ISO time it was set>` and exits 0, else exits 1. The
+//     deploy's "Fleet done" step follows it (release-watch, #456).
+//   node scripts/ops/platform-db.ts fleet-done-all staging|prod
+//     reads only: every `fleet_done:<version>` the platform D1 still holds
+//     (the scheduler prunes one a week after it is set, once superseded),
+//     oldest first, as `fleet_done_list=vX.Y.Z at <ISO>, ...` (at most
+//     FLEET_DONE_LIST_MAX, the newest). Every prod deploy records them, so a
+//     finish that lands after any one deploy's read is still recorded by the
+//     next one.
 //   The log names the mark and nothing else (no counts).
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -553,6 +566,84 @@ export async function unmarkVerified({
   log("platform_verified marks cleared");
 }
 
+/** How often fleet-done reads the mark. */
+export const FLEET_DONE_POLL_MS = 15_000;
+
+/**
+ * Waits for platform_state `fleet_done:<version>` (the scheduler's mark that
+ * the rollout of the tag is finished), reading it every pollMs for up to
+ * waitMs (0: one read). The time it was set (epoch ms) once it is there,
+ * logged; null if not in time. Reads only; a failed read is one more try,
+ * never a throw.
+ */
+export async function waitFleetDone({
+  db,
+  tag,
+  now,
+  sleep,
+  log,
+  waitMs,
+  pollMs = FLEET_DONE_POLL_MS,
+}: {
+  db: Db;
+  tag: string;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (s: string) => void;
+  waitMs: number;
+  pollMs?: number;
+}): Promise<number | null> {
+  const m = STABLE_TAG.exec(tag);
+  if (!m) throw new Refused("tag must be a stable vX.Y.Z");
+  const key = `fleet_done:${m[1]}`;
+  const end = now() + waitMs;
+  let failed = 0;
+  for (;;) {
+    try {
+      const rows = await db.all(
+        "SELECT value FROM platform_state WHERE key = ?1",
+        [key],
+      );
+      const at = rows[0]?.value;
+      if (typeof at === "number") {
+        log(`${key} at ${new Date(at).toISOString()}`);
+        return at;
+      }
+    } catch {
+      failed++;
+    }
+    if (now() + pollMs > end) {
+      log(
+        `${key} not set after ${Math.round(waitMs / 60_000)} min${failed ? ` (${failed} failed reads)` : ""}`,
+      );
+      return null;
+    }
+    await sleep(pollMs);
+  }
+}
+
+/** fleet-done-all lists at most this many releases, the newest. */
+export const FLEET_DONE_LIST_MAX = 20;
+
+/**
+ * Every release whose rollout the scheduler marked finished
+ * (`fleet_done:<X.Y.Z>`), oldest first, at most FLEET_DONE_LIST_MAX (the
+ * newest), as "vX.Y.Z at <ISO>" entries. Reads only; a key that isn't a
+ * stable version or a value that isn't a time is skipped.
+ */
+export async function fleetDoneAll({ db }: { db: Db }): Promise<string[]> {
+  const rows = await db.all(
+    "SELECT key, value FROM platform_state WHERE key GLOB 'fleet_done:*' ORDER BY value, key",
+  );
+  const out: string[] = [];
+  for (const r of rows) {
+    const v = String(r.key).slice("fleet_done:".length);
+    if (!/^\d+\.\d+\.\d+$/.test(v) || typeof r.value !== "number") continue;
+    out.push(`v${v} at ${new Date(r.value).toISOString()}`);
+  }
+  return out.slice(-FLEET_DONE_LIST_MAX);
+}
+
 /** D1 over the REST API: /query, the token in a header. */
 export function d1({
   token,
@@ -611,7 +702,10 @@ if (
   realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
 ) {
   const mode =
-    process.argv[2] === "mark-verified" || process.argv[2] === "unmark-verified"
+    process.argv[2] === "mark-verified" ||
+    process.argv[2] === "unmark-verified" ||
+    process.argv[2] === "fleet-done" ||
+    process.argv[2] === "fleet-done-all"
       ? process.argv[2]
       : null;
   const env = mode ? process.argv[3] : process.argv[2];
@@ -621,11 +715,17 @@ if (
   };
   if (env !== "staging" && env !== "prod")
     fail(
-      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | staging|prod]",
+      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | fleet-done staging|prod vX.Y.Z | fleet-done-all staging|prod | staging|prod]",
       2,
     );
-  if (mode === "mark-verified" && !process.argv[4])
-    fail("usage: platform-db.ts mark-verified staging|prod vX.Y.Z", 2);
+  if ((mode === "mark-verified" || mode === "fleet-done") && !process.argv[4])
+    fail(`usage: platform-db.ts ${mode} staging|prod vX.Y.Z`, 2);
+  const waitMin = Number(process.env.FLEET_DONE_WAIT_MIN ?? "10");
+  if (
+    mode === "fleet-done" &&
+    !(Number.isInteger(waitMin) && waitMin >= 0 && waitMin <= 30)
+  )
+    fail("FLEET_DONE_WAIT_MIN must be 0 to 30 minutes", 2);
   const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, PLATFORM_DB_ID } =
     process.env;
   if (!CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required", 2);
@@ -646,6 +746,25 @@ if (
       });
       const log = (s: string) => console.log(`oa-${env?.[0]}-platform: ${s}`);
       const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+      if (mode === "fleet-done-all") {
+        const list = await fleetDoneAll({ db });
+        log(`${list.length} fleet_done mark(s)`);
+        console.log(`fleet_done_list=${list.join(", ")}`);
+        process.exit(0);
+      }
+      if (mode === "fleet-done") {
+        const at = await waitFleetDone({
+          db,
+          tag: process.argv[4] as string,
+          now: () => Date.now(),
+          sleep,
+          log,
+          waitMs: waitMin * 60_000,
+        });
+        if (at !== null)
+          console.log(`fleet_done_at=${new Date(at).toISOString()}`);
+        process.exit(at !== null ? 0 : 1);
+      }
       if (mode === "mark-verified")
         await markVerified({
           db,

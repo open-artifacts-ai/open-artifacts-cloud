@@ -10,13 +10,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  claimHookSlot,
-  HOOK_LIMIT,
-  HOOK_WINDOW_MS,
-  hookWindowCount,
-} from "../../../apps/dashboard/e2e/staging/hook-ledger.ts";
 import { InfraError } from "../src/fetch-timeout.ts";
+import {
+  claimCappedSlot,
+  HOOK_WINDOW_MS,
+  HookBudgetError,
+  hookWindowCount,
+  ledgerWaits,
+  SUITE_HOOK_LIMIT,
+} from "../src/hook-ledger-compat.ts";
 import { LOCK_DIR_ENV, withLock } from "../src/locks.ts";
 import {
   type AnonTarget,
@@ -55,11 +57,33 @@ const req = (
   headers: Record<string, string> = {},
 ) => ({ method, url, headers: new Headers(headers) });
 
+// Each install has its own ratelimit namespaces (packages/provision: a block
+// of 8 ids per install, namespace_id = rlNs + k), so an IP-keyed RL_ANON
+// bucket at rl-a is not rl-b's: the ledger key names the install.
+describe("an install's RL_ANON buckets are its own", () => {
+  const src = (f: string) =>
+    readFileSync(join(import.meta.dirname, "../../..", f), "utf8");
+  it("every install takes its own block of ratelimit namespace ids, and every binding gets one of them", () => {
+    expect(src("packages/provision/src/platform.ts")).toMatch(
+      /COALESCE\(MAX\(rl_ns\) \+ 8, \?8\)/,
+    );
+    expect(src("packages/provision/src/metadata.ts")).toMatch(
+      /namespace_id: String\(r\.rlNs \+ k\)/,
+    );
+  });
+
+  it("the same IP key at rl-a and at rl-b is two ledgers", () => {
+    expect(anonKeys(req("POST", `${A.app}/oauth/token`), T)).not.toEqual(
+      anonKeys(req("POST", `${B.app}/oauth/token`), T),
+    );
+  });
+});
+
 describe("anonKeys: what a request spends", () => {
   it.each([
-    ["POST", `${A.app}/oauth/register`, {}, ["reg:ip"]],
-    ["POST", `${B.app}/oauth/register`, {}, ["reg:ip"]],
-    ["POST", `${A.app}/oauth/token`, {}, ["tok:ip"]],
+    ["POST", `${A.app}/oauth/register`, {}, [`reg:ip:${A.installId}`]],
+    ["POST", `${B.app}/oauth/register`, {}, [`reg:ip:${B.installId}`]],
+    ["POST", `${A.app}/oauth/token`, {}, [`tok:ip:${A.installId}`]],
     [
       "GET",
       `${A.app}/oauth/authorize?x=1`,
@@ -73,15 +97,15 @@ describe("anonKeys: what a request spends", () => {
       [`consent:u:${B.installId}`],
     ],
     ["GET", `${A.app}/oauth/authorize`, {}, []],
-    ["POST", `${A.app}/bus/device`, {}, ["bus-dev:ip"]],
-    ["POST", `${A.app}/bus/device/token`, {}, ["bus-tok:ip"]],
-    ["POST", `${A.app}/bus/approve`, {}, ["bus-code:ip"]],
+    ["POST", `${A.app}/bus/device`, {}, [`bus-dev:ip:${A.installId}`]],
+    ["POST", `${A.app}/bus/device/token`, {}, [`bus-tok:ip:${A.installId}`]],
+    ["POST", `${A.app}/bus/approve`, {}, [`bus-code:ip:${A.installId}`]],
     [
       "POST",
       `${A.app}/bus/approve`,
       { cookie: "s=1" },
       [
-        "bus-code:ip",
+        `bus-code:ip:${A.installId}`,
         `bus-approve:u:${A.installId}`,
         `bus-code:u:${A.installId}`,
       ],
@@ -93,13 +117,38 @@ describe("anonKeys: what a request spends", () => {
       [`bus-write:u:${A.installId}`],
     ],
     ["GET", `${A.app}/api/v1/bus/roles`, { cookie: "s=1" }, []],
-    ["GET", `${A.app}/api/v1/artifacts/abc/data-subscribe`, {}, ["sub:ip"]],
-    ["GET", `${A.app}/api/v1/artifacts/abc/events`, {}, ["ev:ip"]],
-    ["GET", `${A.app}/api/v1/artifacts/abc/doc`, {}, ["doc:ip"]],
+    [
+      "GET",
+      `${A.app}/api/v1/artifacts/abc/data-subscribe`,
+      {},
+      [`sub:ip:${A.installId}`],
+    ],
+    [
+      "GET",
+      `${A.app}/api/v1/artifacts/abc/events`,
+      {},
+      [`ev:ip:${A.installId}`],
+    ],
+    ["GET", `${A.app}/api/v1/artifacts/abc/doc`, {}, [`doc:ip:${A.installId}`]],
     ["GET", `${A.app}/api/v1/artifacts/abc/doc`, { cookie: "s=1" }, []],
-    ["GET", `${A.app}/api/v1/artifacts/abc/anon-id`, {}, ["anonid:ip"]],
-    ["PUT", `${A.app}/api/v1/artifacts/abc/data/c/d`, {}, ["ip"]],
-    ["POST", `${A.app}/api/v1/artifacts/abc/data/c/query`, {}, ["ip"]],
+    [
+      "GET",
+      `${A.app}/api/v1/artifacts/abc/anon-id`,
+      {},
+      [`anonid:ip:${A.installId}`],
+    ],
+    [
+      "PUT",
+      `${A.app}/api/v1/artifacts/abc/data/c/d`,
+      {},
+      [`ip:${A.installId}`],
+    ],
+    [
+      "POST",
+      `${A.app}/api/v1/artifacts/abc/data/c/query`,
+      {},
+      [`ip:${A.installId}`],
+    ],
     ["GET", `${A.app}/api/v1/artifacts/abc/data/c/d`, {}, []],
     // Signed in: no anonymous key; the embed header makes any call anonymous.
     ["PUT", `${A.app}/api/v1/artifacts/abc/data/c/d`, { cookie: "s=1" }, []],
@@ -107,7 +156,7 @@ describe("anonKeys: what a request spends", () => {
       "PUT",
       `${A.app}/api/v1/artifacts/abc/data/c/d`,
       { cookie: "s=1", "x-oa-embed": "1" },
-      ["ip"],
+      [`ip:${A.installId}`],
     ],
     [
       "GET",
@@ -124,12 +173,6 @@ describe("anonKeys: what a request spends", () => {
       expect(anonKeys(req(m, url, h), T)).toEqual(want);
     },
   );
-
-  it("key names carry no install where rl-a and rl-b share the bucket", () => {
-    const a = anonKeys(req("POST", `${A.app}/oauth/token`), T);
-    const b = anonKeys(req("POST", `${B.app}/oauth/token`), T);
-    expect(a).toEqual(b);
-  });
 
   it("every paced key the table gives a request has a row in KEY_TABLE", () => {
     const all = [
@@ -162,7 +205,7 @@ describe("paceAnon", () => {
       ),
     ).toHaveLength(3);
     expect(claimed).toEqual([
-      "bus-code:ip",
+      `bus-code:ip:${A.installId}`,
       `bus-approve:u:${A.installId}`,
       `bus-code:u:${A.installId}`,
     ]);
@@ -179,7 +222,7 @@ describe("the pacing note", () => {
     await paceAnon(req("POST", `${B.app}/oauth/token`), T, async () => {});
     await paceAnon(req("POST", `${A.app}/oauth/register`), T, async () => {});
     expect(pacingNote("live/x.test.ts", "creds")).toMatch(
-      /^pacing \(lane creds, live\/x.test.ts\): 0 hook claim\(s\), 3 RL_ANON claim\(s\) \(reg:ip 1, tok:ip 2\), waited \d+\.\d s in all$/,
+      /^pacing \(lane creds, live\/x.test.ts\): 0 hook claim\(s\), 3 RL_ANON claim\(s\) \(reg:ip:iaaaaaaaaaaa 1, tok:ip:iaaaaaaaaaaa 1, tok:ip:ibbbbbbbbbbb 1\), waited \d+\.\d s in all$/,
     );
     resetPacingStats();
   });
@@ -251,7 +294,7 @@ describe("guardedFetch", () => {
       },
     );
     await f(`${A.app}/oauth/token`, { method: "POST" });
-    expect(events).toEqual(["claim tok:ip", "fetch"]);
+    expect(events).toEqual([`claim tok:ip:${A.installId}`, "fetch"]);
   });
 
   it("raises the tripwire on an unclassified 429 and passes a classified one through", async () => {
@@ -479,75 +522,142 @@ describe("wait budget follow-ups (cloud #24)", () => {
       expect(taken).toEqual([]);
     });
 
-    it("the ledger claim stops waiting on abort and leaves the ledger as it was", async () => {
-      const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
-      try {
-        let now = 1_000_000;
-        // The ledger for tok:ip is full: a new claim has to sleep.
-        for (let i = 0; i < HOOK_LIMIT; i++)
-          await claimHookSlot("rl-anon/tok:ip", { root, now: () => now });
-        expect(
-          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-        ).toBe(HOOK_LIMIT);
-        let wake: () => void = () => {};
-        const claim = ledgerClaimWith({
-          root,
-          now: () => now,
-          sleep: () => new Promise<void>((r) => (wake = r)),
-        });
-        const c = new AbortController();
-        const pending = claim("tok:ip", c.signal);
-        c.abort();
-        await expect(pending).rejects.toThrow(
-          /aborted before a slot was taken/,
-        );
-        // The window passes and the underlying sleep ends: a claim that kept
-        // going would now take a slot for the request that was never sent.
-        now += HOOK_WINDOW_MS + 1_000;
-        wake();
-        await new Promise((r) => setImmediate(r));
-        expect(
-          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-        ).toBe(0);
-        // An already aborted signal never claims at all.
-        await expect(claim("tok:ip", c.signal)).rejects.toThrow(
-          /aborted before a slot was taken/,
-        );
-        expect(
-          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-        ).toBe(0);
-        // And without a signal it claims as before.
-        await claim("tok:ip");
-        expect(
-          hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
-        ).toBe(1);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
+    it.runIf(ledgerWaits)(
+      "the ledger claim stops waiting on abort and leaves the ledger as it was",
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
+        try {
+          let now = 1_000_000;
+          // The ledger for tok:ip is full: a new claim has to sleep.
+          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+            await claimCappedSlot("rl-anon/tok:ip", { root, now: () => now });
+          expect(
+            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+          ).toBe(SUITE_HOOK_LIMIT);
+          let wake: () => void = () => {};
+          const claim = ledgerClaimWith({
+            root,
+            now: () => now,
+            sleep: () => new Promise<void>((r) => (wake = r)),
+          });
+          const c = new AbortController();
+          const pending = claim("tok:ip", c.signal);
+          c.abort();
+          await expect(pending).rejects.toThrow(
+            /aborted before a slot was taken/,
+          );
+          // The window passes and the underlying sleep ends: a claim that kept
+          // going would now take a slot for the request that was never sent.
+          now += HOOK_WINDOW_MS + 1_000;
+          wake();
+          await new Promise((r) => setImmediate(r));
+          expect(
+            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+          ).toBe(0);
+          // An already aborted signal never claims at all.
+          await expect(claim("tok:ip", c.signal)).rejects.toThrow(
+            /aborted before a slot was taken/,
+          );
+          expect(
+            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+          ).toBe(0);
+          // And without a signal it claims as before.
+          await claim("tok:ip");
+          expect(
+            hookWindowCount("rl-anon/tok:ip", { root, now: () => now }),
+          ).toBe(1);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+    );
+
+    // From public #3200 the ledger never waits: a full key is refused at
+    // once, takes no slot, and an abort still stops a claim before it starts.
+    it.runIf(!ledgerWaits)(
+      "a full key's ledger claim is refused at once and leaves the ledger as it was",
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "rl-anon-ledger-"));
+        try {
+          let now = 1_000_000;
+          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+            await claimCappedSlot("rl-anon/tok:ip", { root, now: () => now });
+          const count = () =>
+            hookWindowCount("rl-anon/tok:ip", { root, now: () => now });
+          expect(count()).toBe(SUITE_HOOK_LIMIT);
+          let slept = 0;
+          const claim = ledgerClaimWith({
+            root,
+            now: () => now,
+            sleep: async () => void slept++,
+          });
+          await expect(claim("tok:ip")).rejects.toBeInstanceOf(HookBudgetError);
+          expect(slept).toBe(0);
+          expect(count()).toBe(SUITE_HOOK_LIMIT);
+          // An already aborted signal never claims at all.
+          const c = new AbortController();
+          c.abort();
+          now += HOOK_WINDOW_MS + 1_000;
+          await expect(claim("tok:ip", c.signal)).rejects.toThrow(
+            /aborted before a slot was taken/,
+          );
+          expect(count()).toBe(0);
+          // And once the window has passed it claims as before.
+          await claim("tok:ip");
+          expect(count()).toBe(1);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+    );
   });
 
   describe("1b. an aborted claim leaves no timer armed", () => {
-    it("the claim's own sleep timer is cleared on abort", async () => {
-      const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      try {
-        const now = () => 1_000_000;
-        for (let i = 0; i < HOOK_LIMIT; i++)
-          await claimHookSlot("rl-anon/tok:ip", { root, now });
-        // No sleep seam: the default timer, which has to be cleared.
-        const claim = ledgerClaimWith({ root, now });
-        const c = new AbortController();
-        const pending = claim("tok:ip", c.signal);
-        expect(vi.getTimerCount()).toBe(1);
-        c.abort();
-        await expect(pending).rejects.toThrow(/aborted before a slot/);
-        expect(vi.getTimerCount()).toBe(0);
-      } finally {
-        vi.useRealTimers();
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
+    it.runIf(ledgerWaits)(
+      "the claim's own sleep timer is cleared on abort",
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        try {
+          const now = () => 1_000_000;
+          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+            await claimCappedSlot("rl-anon/tok:ip", { root, now });
+          // No sleep seam: the default timer, which has to be cleared.
+          const claim = ledgerClaimWith({ root, now });
+          const c = new AbortController();
+          const pending = claim("tok:ip", c.signal);
+          expect(vi.getTimerCount()).toBe(1);
+          c.abort();
+          await expect(pending).rejects.toThrow(/aborted before a slot/);
+          expect(vi.getTimerCount()).toBe(0);
+        } finally {
+          vi.useRealTimers();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it.runIf(!ledgerWaits)(
+      "a full key's claim arms no timer at all",
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "rl-anon-timer-"));
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        try {
+          const now = () => 1_000_000;
+          for (let i = 0; i < SUITE_HOOK_LIMIT; i++)
+            await claimCappedSlot("rl-anon/tok:ip", { root, now });
+          const claim = ledgerClaimWith({ root, now });
+          const c = new AbortController();
+          await expect(claim("tok:ip", c.signal)).rejects.toBeInstanceOf(
+            HookBudgetError,
+          );
+          expect(vi.getTimerCount()).toBe(0);
+        } finally {
+          vi.useRealTimers();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+    );
   });
 
   describe("2. hooks get a budget per phase, not one per file", () => {

@@ -2552,11 +2552,20 @@ export const PROBES: readonly Probe[] = [
         "P23 purge",
       );
       await run.done(g.job.id, "P23 purge");
-      await run.within(
-        PAGE_WITHIN_MS,
-        "P23 404",
-        async () => (await run.page(p.appHost)).status === 404,
-      );
+      // Both addresses: the content address is unmapped the same way as the
+      // app address (cloud #264 port 13: a content host left mapped once
+      // passed here, checked by no lookup at all).
+      if (!p.contentHost) throw new ProbeFail("P23: rl-p has no content host");
+      const hosts = [
+        ["app", p.appHost],
+        ["content", p.contentHost],
+      ] as const;
+      for (const [, h] of hosts)
+        await run.within(
+          PAGE_WITHIN_MS,
+          "P23 404",
+          async () => (await run.page(h)).status === 404,
+        );
       const inv = (await run.inventory("/installs")) as {
         installs?: { id: string; state: string }[];
       };
@@ -2564,9 +2573,11 @@ export const PROBES: readonly Probe[] = [
       if (!row) throw new ProbeFail("P23: inventory has no row for it");
       if (row.state !== "deleted")
         throw new ProbeFail(`P23: inventory state ${row.state}`);
-      await run.settledMode("P23", p.appHost, null);
-      if ((await run.hostMode(p.appHost)).installId !== null)
-        throw new ProbeFail("P23: HOSTS still maps the app host");
+      for (const [what, h] of hosts) {
+        await run.settledMode("P23", h, null);
+        if ((await run.hostMode(h)).installId !== null)
+          throw new ProbeFail(`P23: HOSTS still maps the ${what} host`);
+      }
       // A purged install keeps its row (cloud #110): its slug reads "taken"
       // for the 2 minute unmap settle (SLUG_UNMAP_SETTLE_MS), then "cooling"
       // for 30 days (SLUG_REUSE_COOLDOWN_MS). The waits above can outlast the

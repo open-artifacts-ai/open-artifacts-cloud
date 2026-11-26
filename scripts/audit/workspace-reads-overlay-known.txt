@@ -15,7 +15,6 @@
 apps/admin/vite.config.ts @oa/provisioning # cycle: provisioning declares admin; reads provisioning's dist-assets build output
 apps/provisioning/test/node/seal-copy.test.ts @oa/provisioner # cycle: provisioner declares provisioning
 apps/scheduler/test/node/config.test.ts @oa/redline # cycle: redline -> provisioner -> scheduler
-packages/bus-adapter-openclaw/test/bus.test.ts @open-artifacts/bus # public package: cloud cannot edit its package.json
 packages/provision/test/billing-backfill.test.ts @oa/billing # cycle: billing declares provision; reads a migration by path
 packages/provision/test/owner-email-source.test.ts @oa/dispatch # cycle: dispatch declares provision; source-shape guard
 packages/provision/test/owner-email-source.test.ts @oa/hosted # cycle: hosted declares provision; source-shape guard

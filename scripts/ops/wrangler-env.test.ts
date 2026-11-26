@@ -6,6 +6,7 @@ import { brokerKey } from "./broker-key.ts";
 import {
   alertPinProblems,
   committedBilling,
+  committedConsumers,
   committedRateLimits,
   committedSignups,
   committedVars,
@@ -246,6 +247,38 @@ describe("committedBilling", () => {
           committedBilling(cfg(app), env)?.entrypoint,
           `${app} ${env}`,
         ).toBe(entry[app]);
+    }
+  });
+});
+
+// cloud #264: the queues an env block consumes (the scheduler's fleet wake).
+describe("committedConsumers", () => {
+  it("reads the env block's consumer queues, sorted; none is []", () => {
+    const src = JSON.stringify({
+      env: {
+        staging: {
+          queues: {
+            producers: [{ binding: "Q", queue: "oa-s-other" }],
+            consumers: [{ queue: "oa-s-z" }, { queue: "oa-s-a" }],
+          },
+        },
+        prod: { queues: { producers: [] } },
+      },
+    });
+    expect(committedConsumers(src, "staging")).toEqual(["oa-s-a", "oa-s-z"]);
+    expect(committedConsumers(src, "prod")).toEqual([]);
+  });
+  it("the real scheduler consumes exactly its env's fleet wake; the provisioner its signups", () => {
+    for (const [env, p] of [
+      ["staging", "s"],
+      ["prod", "p"],
+    ] as const) {
+      expect(committedConsumers(cfg("scheduler"), env)).toEqual([
+        `oa-${p}-fleet-wake`,
+      ]);
+      expect(committedConsumers(cfg("provisioner"), env)).toEqual([
+        `oa-${p}-signups`,
+      ]);
     }
   });
 });
