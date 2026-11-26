@@ -2167,13 +2167,17 @@ describe("the rl-agents upgrade (cloud #264)", () => {
   const idx = (n: string) => steps.findIndex((s) => s.name === n || s.id === n);
   const LOOPS = /\b(sleep|while|until|wait)\b/;
 
-  it("starts right after the suite, on a gate run only, once rl-a and rl-b report the tag, and never fails the gate", () => {
+  it("starts right after the suite, on a gate run only, only when the suite passed, and never fails the gate", () => {
     expect(idx("rl-agents")).toBe(idx("Run the suite") + 1);
+    expect(named("suite").name).toBe("Run the suite");
     expect(start.name).toBe("Start the rl-agents upgrade, without waiting");
     // A called run (the nightly, the dry run) has the caller's workflow_ref.
+    // A red suite (the gate failed) never puts rl-agents on that release.
     expect(start.if).toBe(
-      "${{ !cancelled() && steps.staged.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}",
+      "${{ !cancelled() && steps.suite.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}",
     );
+    expect(start.if).not.toContain("always()");
+    expect(start.if).not.toContain("steps.staged");
     expect(start["continue-on-error"]).toBe(true);
     expect(start["timeout-minutes"]).toBe(1);
     expect(start.env).toBeUndefined();

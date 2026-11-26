@@ -675,7 +675,8 @@ jobs:
           if [ -s "$RUNNER_TEMP/redline-secrets/REDLINE_PROD_R2_TOKEN" ]; then
             pnpm --filter @oa/redline provisioning mint-oidc prodInventory
           fi
-      - name: Run the suite
+      - id: suite
+        name: Run the suite
         env:
           REDLINE_STG_INVENTORY_URL: ${{ vars.REDLINE_STG_INVENTORY_URL }}
           REDLINE_DELETED_HOSTS: ${{ vars.REDLINE_DELETED_HOSTS }}
@@ -698,7 +699,8 @@ jobs:
       # Cloud #264, public #3167: the agents' staging install rl-agents follows
       # the release under test, since the fleet skips installs with test hooks
       # on. A gate run only (a workflow_dispatch of this file; in a called run
-      # workflow_ref is the caller's), once rl-a and rl-b report the tag. One
+      # workflow_ref is the caller's), and only when the suite passed, so agents
+      # never prove work on a release that failed the gate. One
       # R5 upgrade in a detached process (src/rl-agents.ts): it takes the 202
       # as the answer and never waits for the job, so it never holds or fails
       # the gate, and the next gate run tries again. Its log holds masks, so it
@@ -706,7 +708,7 @@ jobs:
       # before this step has no such command and is reported as skipped.
       - id: rl-agents
         name: Start the rl-agents upgrade, without waiting
-        if: ${{ !cancelled() && steps.staged.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}
         continue-on-error: true
         timeout-minutes: 1
         run: |
