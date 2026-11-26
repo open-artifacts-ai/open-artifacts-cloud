@@ -21,9 +21,9 @@
 #   every install is upgraded; the earliest one that succeeded across every
 #   prod deploy run of the tag, read from the runs' jobs with this token, is
 #   the finish, and a release in history to the prod deploy takes a later
-#   one. A later prod deploy's "Fleet done of the release before (<tag> at
-#   <time>)" step counts too (a fleet that finished after its own deploy's
-#   wait); the earliest wins. Nothing here reads fleet state through admin
+#   one. A later prod deploy's "Fleet done of earlier releases (<tag> at
+#   <time>, ...)" step counts too (a fleet that finished after its own
+#   deploy's wait); the earliest per tag wins. Nothing here reads fleet state through admin
 #   tools.
 # - While a release is not finished, the jobs of its hosted-release,
 #   hosted-publish and prod deploy runs are read too: a recovery run on a

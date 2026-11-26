@@ -10,6 +10,8 @@ import {
   BUILT_RE,
   type Config,
   compute,
+  EARLIER_FLEET_RE,
+  earlierFleetList,
   eta,
   FLEET_DONE_STEP,
   FLEET_WAIT_STEP,
@@ -20,7 +22,6 @@ import {
   issueBody,
   issuePlan,
   type Job,
-  LATE_FLEET_RE,
   lateFleetDone,
   limitOf,
   loadConfig,
@@ -1240,12 +1241,17 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
     );
   });
 
-  // cloud #474 at 5d39fecb: a fleet that finished after its own deploy's
-  // 10 min wait is recorded by the next prod deploy, in a step named
-  //   Fleet done of the release before (${{ steps.prev_fleet.outputs.tag }} at ${{ steps.prev_fleet.outputs.at }})
-  // where `at` is platform-db.ts fleet-done's `new Date(at).toISOString()`.
+  // cloud #474 at b5e08292: every prod deploy reads every fleet_done mark
+  // (platform-db.ts fleet-done-all: oldest first, the newest 20, each
+  // `v${v} at ${new Date(value).toISOString()}`, joined with ", ") and, when
+  // there is any, runs a step named
+  //   Fleet done of earlier releases (${{ steps.prev_fleet.outputs.list }})
+  const listName = (...entries: [string, string][]) =>
+    `Fleet done of earlier releases (${entries
+      .map(([tag, at]) => `${tag} at ${new Date(at).toISOString()}`)
+      .join(", ")})`;
   const lateName = (tag: string, at: string) =>
-    `Fleet done of the release before (${tag} at ${new Date(at).toISOString()})`;
+    listName(["v0.248.1", D("03:58:00")], [tag, at]);
   const nextDeploy = (name: string, conclusion = "success", id = 6): Run =>
     base("deploy-hosted-platform.yml", {
       id,
@@ -1259,7 +1265,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
           conclusion: "success",
           steps: [
             stepOf(
-              "Read the fleet finish of the release before",
+              "Read the fleet finish of earlier releases",
               D("06:10:30"),
               D("06:10:31"),
             ),
@@ -1269,34 +1275,54 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       ],
     });
 
-  it("reads the late finish from the next prod deploy's step name, exactly as #474 writes it", () => {
+  it("reads each release's finish from a prod deploy's earlier-releases list, exactly as #474 writes it", () => {
     const name = lateName("v0.248.2", D("05:39:39"));
     expect(name).toBe(
-      "Fleet done of the release before (v0.248.2 at 2026-11-26T05:39:39.000Z)",
+      "Fleet done of earlier releases (v0.248.1 at 2026-11-26T03:58:00.000Z, v0.248.2 at 2026-11-26T05:39:39.000Z)",
     );
-    expect(LATE_FLEET_RE.exec(name)?.slice(1, 3)).toEqual([
-      "v0.248.2",
-      "2026-11-26T05:39:39.000Z",
+    expect(EARLIER_FLEET_RE.test(name)).toBe(true);
+    expect(earlierFleetList(name)).toEqual([
+      { tag: "v0.248.1", at: D("03:58:00") },
+      { tag: "v0.248.2", at: D("05:39:39") },
     ]);
+    // One entry, and 20 (the most #474 lists).
+    expect(earlierFleetList(listName(["v0.248.2", D("05:39:39")]))).toEqual([
+      { tag: "v0.248.2", at: D("05:39:39") },
+    ]);
+    const twenty = Array.from(
+      { length: 20 },
+      (_, i) => [`v0.230.${i}`, D("01:00:00")] as [string, string],
+    );
+    expect(earlierFleetList(listName(...twenty))).toHaveLength(20);
+    // A malformed entry is skipped, the rest kept; other step names list nothing.
+    expect(
+      earlierFleetList(
+        "Fleet done of earlier releases (v0.248.1 at soon, v0.248.2 at 2026-11-26T05:39:39.000Z)",
+      ),
+    ).toEqual([{ tag: "v0.248.2", at: D("05:39:39") }]);
+    expect(earlierFleetList("Fleet done of earlier releases ()")).toEqual([]);
+    expect(earlierFleetList(FLEET_DONE_STEP)).toEqual([]);
+    expect(
+      earlierFleetList(
+        "Fleet done of the release before (v0.248.2 at 2026-11-26T05:39:39.000Z)",
+      ),
+    ).toEqual([]);
     expect(lateFleetDone([nextDeploy(name)], "v0.248.2")).toEqual({
       at: D("05:39:39"),
       url: `${RUNS}6`,
     });
-    // Only a successful step, only that tag, only the exact shape.
+    expect(lateFleetDone([nextDeploy(name)], "v0.248.1")?.at).toBe(
+      D("03:58:00"),
+    );
+    // Only a successful step, only a listed tag.
     expect(lateFleetDone([nextDeploy(name, "skipped")], "v0.248.2")).toBe(
       undefined,
     );
     expect(lateFleetDone([nextDeploy(name, "failure")], "v0.248.2")).toBe(
       undefined,
     );
-    expect(lateFleetDone([nextDeploy(name)], "v0.248.1")).toBe(undefined);
-    expect(
-      lateFleetDone(
-        [nextDeploy("Fleet done of the release before ( at )")],
-        "v0.248.2",
-      ),
-    ).toBe(undefined);
-    // Two records: the earliest.
+    expect(lateFleetDone([nextDeploy(name)], "v0.247.0")).toBe(undefined);
+    // Listed by many runs: the earliest time per tag.
     expect(
       lateFleetDone(
         [

@@ -305,18 +305,39 @@ export const FLEET_WAKE_STEP = "Wake the fleet";
 export const FLEET_WAIT_STEP = "Wait for the fleet to reach every install";
 export const FLEET_DONE_STEP = "Fleet done";
 /**
- * A fleet that finished after its own deploy's 10 min wait: the next prod
- * deploy reads the scheduler's mark and records it in a step named
- * `Fleet done of the release before (<tag> at <ISO time>)` (cloud #474).
+ * Fleets that finished after their own deploy's 10 min wait: every prod
+ * deploy reads every fleet_done mark the platform still holds and, when there
+ * is any, runs a step named
+ * `Fleet done of earlier releases (<tag> at <ISO time>, <tag> at <ISO time>, ...)`,
+ * oldest first, the newest 20 at most (cloud #474, platform-db.ts
+ * fleet-done-all). A release can be listed by many runs.
  */
-export const LATE_FLEET_RE = new RegExp(
-  `^Fleet done of the release before \\(${TAG_IN} at (\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(?:\\.\\d{1,3})?Z)\\)$`,
+export const EARLIER_FLEET_RE = /^Fleet done of earlier releases \((.+)\)$/;
+const EARLIER_ENTRY_RE = new RegExp(
+  `^${TAG_IN} at (\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(?:\\.\\d{1,3})?Z)$`,
 );
 
+/** Pure: the tags and times one step name lists; an entry of another shape is skipped. */
+export function earlierFleetList(name: string): { tag: string; at: string }[] {
+  const m = EARLIER_FLEET_RE.exec(name);
+  if (!m) return [];
+  const out: { tag: string; at: string }[] = [];
+  for (const e of (m[1] as string).split(", ")) {
+    const x = EARLIER_ENTRY_RE.exec(e);
+    if (!x) continue;
+    const t = Date.parse(x[2] as string);
+    if (Number.isNaN(t)) continue;
+    out.push({
+      tag: x[1] as string,
+      at: new Date(t).toISOString().replace(/\.000Z$/, "Z"),
+    });
+  }
+  return out;
+}
+
 /**
- * Pure: the earliest late fleet finish of `tag` that any prod deploy run (of
- * any release) recorded in a successful "Fleet done of the release before"
- * step, with the time its name carries.
+ * Pure: the earliest fleet finish of `tag` that any prod deploy run (of any
+ * release) recorded in a successful "Fleet done of earlier releases" step.
  */
 export function lateFleetDone(
   runs: Run[],
@@ -332,12 +353,9 @@ export function lateFleetDone(
     for (const j of r.jobs ?? [])
       for (const x of j.steps ?? []) {
         if (x.conclusion !== "success") continue;
-        const m = LATE_FLEET_RE.exec(x.name);
-        if (!m || m[1] !== tag) continue;
-        const t = Date.parse(m[2] as string);
-        if (Number.isNaN(t)) continue;
-        const at = new Date(t).toISOString().replace(/\.000Z$/, "Z");
-        if (!best || t < ms(best.at)) best = { at, url: r.url };
+        for (const e of earlierFleetList(x.name))
+          if (e.tag === tag && (!best || ms(e.at) < ms(best.at)))
+            best = { at: e.at, url: r.url };
       }
   }
   return best;
@@ -355,7 +373,7 @@ const ran = (x: JobStep | undefined): x is JobStep =>
  * hides a later success. The fleet starts at the earliest wake (or wait) of
  * any run, and `deployEnd` is that same moment: the deploy's own work ended
  * there. `late` is a finish a later prod deploy recorded ("Fleet done of
- * the release before", lateFleetDone): the earliest of all counts. With no
+ * earlier releases", lateFleetDone): the earliest of all counts. With no
  * success: running while any wait is still going, else none
  * (no such steps: a run before #474, or jobs not read; or every wait ran
  * out), and the fleet is not measured for that release.
