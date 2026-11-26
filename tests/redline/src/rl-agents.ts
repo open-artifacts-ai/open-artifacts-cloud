@@ -9,8 +9,8 @@ import { desc, ProbeFail, type Run } from "./provisioning.ts";
 // upgrade with red-line's own OIDC scope (rl- slugs with test hooks) and
 // takes the API's 202 as the answer: it never waits for the job, so a slow or
 // failed upgrade never holds or fails the gate, and the next gate run tries
-// again. The workflow starts it in a background process only once the
-// whole gate passed (redline-staging.yml, step rl-agents).
+// again. The workflow runs it as the gate job's last step, once the whole
+// gate passed, bounded at 30 s (redline-staging.yml, step rl-agents).
 
 /** The one install this touches: the test member's, by its exact slug. */
 export const RL_AGENTS_SLUG = TEST_MEMBER.slug;

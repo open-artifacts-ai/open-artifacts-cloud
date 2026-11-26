@@ -752,66 +752,10 @@ jobs:
       - name: Revoke this run's R26 credentials
         if: always() && steps.mint.outcome == 'success'
         run: pnpm --filter @oa/redline provisioning revoke
-      # Cloud #264, public #3167: the agents' staging install rl-agents follows
-      # the release under test, since the fleet skips installs with test hooks
-      # on. Only after the whole gate passed, so agents never prove work on a
-      # release that failed it: a gate run (a workflow_dispatch of this file;
-      # in a called run workflow_ref is the caller's), every step of this job
-      # so far green (platform-tags is its need, the suite, the scan, the
-      # revoke), the hand-off made, and the t19 job ended with success. The
-      # wait step above already saw the t19 job end, so its conclusion is read
-      # once; a t19 job still running at the wait's limit has none and counts
-      # as not passed. What is left after this step (the file removal, and the
-      # hand-off check, which holds) can't fail the gate.
-      #
-      # The upgrade itself is detached: this step starts it in the background
-      # and returns at once, so the gate's result and timing never wait on
-      # the request. One R5 with red-line's own scope (src/rl-agents.ts), its
-      # 202 the answer, the job never awaited. The child gets its own 0700 copy
-      # of the provisioning JWT (the next step removes the secrets dir) and
-      # deletes it when it ends; its log, which holds masks, stays there too.
-      # It records its outcome in $RUNNER_TEMP/rl-agents-upgrade/result.json.
-      # If the job ends first, the runner stops it, and the next gate run reads
-      # rl-agents' state (R3) and tries again. A tag cut before this step has
-      # no such command and is reported as skipped.
-      - id: rl-agents
-        name: Start the rl-agents upgrade once the whole gate passed (waits for nothing)
-        if: ${{ success() && steps.handoff-up.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}
-        continue-on-error: true
-        timeout-minutes: 1
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          t19=$(timeout 20 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | (.conclusion // "none")] | first // "none"' 2> /dev/null) || t19="unreadable"
-          [[ "$t19" =~ ^[a-z_]{1,20}$ ]] || t19="unknown"
-          out="$RUNNER_TEMP/rl-agents-upgrade"
-          mkdir -p "$out"
-          app="https://rl-agents.open-artifacts-staging.app"
-          if [ "$t19" != success ]; then
-            line="rl-agents: not upgraded, the t19 job did not pass ($t19)."
-          elif ! grep -qF 'cmd === "rl-agents-upgrade"' tests/redline/scripts/provisioning.ts; then
-            line="rl-agents: not upgraded, this tag has no rl-agents upgrade (cloud #264)."
-          else
-            umask 077
-            priv="$out/secrets"
-            mkdir -m 700 "$priv"
-            jwt="$RUNNER_TEMP/redline-secrets/REDLINE_PROVISIONING_OIDC"
-            if [ -s "$jwt" ]; then cp "$jwt" "$priv/"; fi
-            targets=$(jq -c --arg d "$priv" '.secretsDir = $d' <<< "$REDLINE_TARGETS")
-            # The child expands its own variables.
-            # shellcheck disable=SC2016
-            REDLINE_TARGETS="$targets" PRIV="$priv" RESULT="$out/result.json" setsid nohup bash -c 'pnpm --filter @oa/redline provisioning rl-agents-upgrade "$RESULT" >> "$PRIV/rl-agents-upgrade.log" 2>&1; rm -rf "$PRIV"' < /dev/null > /dev/null 2>&1 &
-            line="rl-agents ($app): upgrade to ${REDLINE_RELEASE:-the tag} started in the background, not answered yet. The gate goes on without it; the next gate run reads its state and tries again if needed."
-          fi
-          re='^[A-Za-z0-9 .,:;()#_+/=@-]+$'
-          if ! [[ "$line" =~ $re ]] || [ "${#line}" -gt 400 ]; then line="rl-agents: the upgrade line was not plain text."; fi
-          echo "$line"
-          echo "$line" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove the secret files
         if: always()
         run: rm -rf "$RUNNER_TEMP/redline-secrets" "$RUNNER_TEMP/redline-turnstile-token" "$RUNNER_TEMP/t19-handoff" "$RUNNER_TEMP/t19-nohandoff" "$RUNNER_TEMP/t19-recipient-pub"
-      # The last step, so the revoke and the file removal above have run. A run
+      # The last gate step, so the revoke and the file removal above have run. A run
       # whose key was never handed over (a partial re-run of only this job, a
       # seal or upload that failed) has no T19 result: it is never green.
       - name: Fail when the t19 hand-off did not happen
@@ -819,3 +763,68 @@ jobs:
         run: |
           echo "the t19 job got no key from this attempt, so T19 did not run against this release: re-run all jobs, not only the failed ones"
           exit 1
+      # Cloud #264, public #3167: the agents' staging install rl-agents follows
+      # the release under test, since the fleet skips installs with test hooks
+      # on. The job's last step, after the gate's verdict is final, so it can't
+      # change it (continue-on-error): a gate run (a workflow_dispatch of this
+      # file; in a called run workflow_ref is the caller's), every step of this
+      # job green or skipped (platform-tags is its need, then the suite, the
+      # scan, the revoke and the hand-off check), the hand-off made, and the
+      # t19 job ended with success. The wait step before the revoke already saw
+      # the t19 job end, so its conclusion is read once; a t19 job still
+      # running at the wait's limit has none and counts as not passed.
+      #
+      # One R5 with red-line's own scope (src/rl-agents.ts), bounded at 30 s.
+      # It waits only for the 202 that accepts the job, never for the upgrade
+      # to finish, and the summary records the job id. A timeout or an error
+      # is a warning, never a failure; the next gate run tries again. The
+      # secrets dir is gone by now, so the command mints its own OIDC JWT into
+      # a fresh 0700 dir, which also holds its log (masks), and the dir is
+      # removed before the step ends. A tag cut before this step has no such
+      # command and is reported as skipped.
+      - id: rl-agents
+        name: Upgrade rl-agents to the tag once the gate passed (waits only for the 202)
+        if: ${{ success() && steps.handoff-up.outcome == 'success' && github.workflow_ref == 'open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          t19=$(timeout 10 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '[.jobs[] | select(.name | test("(^| / )t19$")) | (.conclusion // "none")] | first // "none"' 2> /dev/null) || t19="unreadable"
+          [[ "$t19" =~ ^[a-z_]{1,20}$ ]] || t19="unknown"
+          out="$RUNNER_TEMP/rl-agents-upgrade"
+          f="$out/result.json"
+          mkdir -p "$out"
+          warn=""
+          if [ "$t19" != success ]; then
+            line="rl-agents: not upgraded, the t19 job did not pass ($t19)."
+          elif ! grep -qF 'cmd === "rl-agents-upgrade"' tests/redline/scripts/provisioning.ts; then
+            line="rl-agents: not upgraded, this tag has no rl-agents upgrade (cloud #264)."
+          else
+            priv="$out/secrets"
+            mkdir -m 700 "$priv"
+            targets=$(jq -c --arg d "$priv" '.secretsDir = $d' <<< "$REDLINE_TARGETS")
+            code=0
+            REDLINE_TARGETS="$targets" timeout 30 pnpm --filter @oa/redline provisioning rl-agents-upgrade "$f" >> "$priv/rl-agents-upgrade.log" 2>&1 < /dev/null || code=$?
+            if [ "$code" = 124 ]; then
+              line="rl-agents: the upgrade request had no answer within 30 s. The next gate run tries again."
+              warn=1
+            elif [ "$code" != 0 ] || ! [ -s "$f" ]; then
+              line="rl-agents: the upgrade request failed (exit $code). The next gate run tries again."
+              warn=1
+            else
+              line=$(jq -er '.line | select(type == "string")' "$f" 2> /dev/null) || { line="rl-agents: the upgrade result could not be read."; warn=1; }
+              [ "$(jq -r '.kind' "$f" 2> /dev/null)" != failed ] || warn=1
+            fi
+            for s in "$priv"/*; do
+              [ -s "$s" ] || continue
+              case "$s" in *.log) continue ;; esac
+              if grep -qF -f "$s" <<< "$line"; then line="rl-agents: the result was withheld."; break; fi
+            done
+            rm -rf "$priv"
+          fi
+          re='^[A-Za-z0-9 .,:;()#_+/=@-]+$'
+          if ! [[ "$line" =~ $re ]] || [ "${#line}" -gt 400 ]; then line="rl-agents: the upgrade result was not plain text."; warn=1; fi
+          if [ -n "$warn" ]; then echo "::warning title=rl-agents upgrade::$line"; else echo "$line"; fi
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
