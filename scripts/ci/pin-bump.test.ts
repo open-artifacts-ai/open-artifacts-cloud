@@ -1,14 +1,13 @@
 // The pin-bump PR opener: one PR for the newest public release, never a
 // second, never armed, and any API error is a thrown error (a red run).
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
 import { sleeper } from "./gh-retry.ts";
-import { PIN_FILES as ARM_PIN_FILES } from "./pin-bump-arm.ts";
 import {
   applyPin,
   branchOf,
@@ -28,6 +27,7 @@ import {
   SURFACES_FILES,
   stage,
 } from "./pin-bump.ts";
+import { PIN_FILES as ARM_PIN_FILES } from "./pin-bump-arm.ts";
 
 // A faked 502 would otherwise sleep through the real backoff.
 beforeEach(() => {
@@ -743,7 +743,12 @@ describe("pin-bump.yml", () => {
 
     it("a PR route with nothing to open commits nothing", () => {
       const names = runs("on", { route: "pr", pr: "false" });
-      for (const n of ["commit", "Push the branch", "Open the PR (never armed)", STAGE])
+      for (const n of [
+        "commit",
+        "Push the branch",
+        "Open the PR (never armed)",
+        STAGE,
+      ])
         expect(names).not.toContain(n);
     });
 
@@ -759,7 +764,9 @@ describe("pin-bump.yml", () => {
       expect(open.indexOf(r)).toBeGreaterThan(
         open.findIndex((s) => s.name === "Apply the surfaces plan as data"),
       );
-      expect(open.indexOf(r)).toBeLessThan(open.findIndex((s) => s.id === "app"));
+      expect(open.indexOf(r)).toBeLessThan(
+        open.findIndex((s) => s.id === "app"),
+      );
       const push = open.find((s) => s.name === "Push the branch");
       const pr = open.find((s) => s.name === "Open the PR (never armed)");
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
@@ -818,8 +825,17 @@ describe("pin-bump.yml", () => {
     });
 
     it("CI runs in full on a push to pin-land/*, with the commit's parent as the port-check base", () => {
+      // In the overlay tree ci.yml is public's; this repo's sits at ../private
+      // (as in ci-pin-once-workflow.test.ts). This repo's is the one with the
+      // overlay-action job.
       const ci = parse(
-        readFileSync(join(root, ".github/workflows/ci.yml"), "utf8"),
+        [
+          join(root, "../private/.github/workflows/ci.yml"),
+          join(root, ".github/workflows/ci.yml"),
+        ]
+          .filter((f) => existsSync(f))
+          .map((f) => readFileSync(f, "utf8"))
+          .find((t) => /^ {2}overlay-action:$/m.test(t)) as string,
       );
       expect(ci.on.push.branches).toContain("pin-land/**");
       const synced = ci.jobs["overlay-shard"].steps.find(
@@ -827,7 +843,7 @@ describe("pin-bump.yml", () => {
         (s: any) => s.id === "synced",
       );
       expect(synced.run).toContain('[[ "$REF" == refs/heads/pin-land/* ]]');
-      expect(synced.run).toContain('repos/$REPO/commits/$GITHUB_SHA');
+      expect(synced.run).toContain("repos/$REPO/commits/$GITHUB_SHA");
     });
   });
 
@@ -1318,16 +1334,23 @@ describe("direct mode: stage, landBranch, land, route", () => {
         expect(c.by).toBe(c.args[1] === "-X" ? "write" : "read");
       // the checks are read for the branch head, against main's ruleset
       const paths = w.calls.map((c) => c.args.join(" "));
-      expect(paths.some((p) => p.includes(`repos/${REPO}/rules/branches/main`))).toBe(true);
+      expect(
+        paths.some((p) => p.includes(`repos/${REPO}/rules/branches/main`)),
+      ).toBe(true);
       expect(
         paths.some((p) =>
-          p.includes(`repos/${REPO}/commits/${COMMIT}/check-runs?filter=latest`),
+          p.includes(
+            `repos/${REPO}/commits/${COMMIT}/check-runs?filter=latest`,
+          ),
         ),
       ).toBe(true);
     });
 
     it.each([
-      ["a required check has not run", { checks: [green("scripts"), green("overlay")] }],
+      [
+        "a required check has not run",
+        { checks: [green("scripts"), green("overlay")] },
+      ],
       [
         "a required check is still running",
         {
@@ -1344,17 +1367,24 @@ describe("direct mode: stage, landBranch, land, route", () => {
           checks: [green("scripts"), green("overlay"), green("lint", "evil")],
         },
       ],
-    ] as [string, LandWorld][])("waits when %s, and writes nothing", (_n, o) => {
-      const w = landWorld(o);
-      expect(w.one()).toMatchObject({ action: "waiting" });
-      expect(writes(w.calls)).toHaveLength(0);
-    });
+    ] as [string, LandWorld][])(
+      "waits when %s, and writes nothing",
+      (_n, o) => {
+        const w = landWorld(o);
+        expect(w.one()).toMatchObject({ action: "waiting" });
+        expect(writes(w.calls)).toHaveLength(0);
+      },
+    );
 
     it.each(["failure", "cancelled", "skipped", "timed_out"])(
       "a required check that ended %s throws, and the branch stays for a person",
       (conclusion) => {
         const w = landWorld({
-          checks: [green("scripts"), green("overlay"), { ...green("lint"), conclusion }],
+          checks: [
+            green("scripts"),
+            green("overlay"),
+            { ...green("lint"), conclusion },
+          ],
         });
         expect(() => w.one()).toThrow(`required check lint is ${conclusion}`);
         expect(writes(w.calls)).toHaveLength(0);
@@ -1371,11 +1401,14 @@ describe("direct mode: stage, landBranch, land, route", () => {
       ["another author", { author: "someone" }],
       ["an unverified commit", { verified: false }],
       ["another committer", { committer: "someone" }],
-    ] as [string, LandWorld][])("refuses %s, and leaves the branch", (_n, o) => {
-      const w = landWorld(o);
-      expect(() => w.one()).toThrow("verified commit");
-      expect(writes(w.calls)).toHaveLength(0);
-    });
+    ] as [string, LandWorld][])(
+      "refuses %s, and leaves the branch",
+      (_n, o) => {
+        const w = landWorld(o);
+        expect(() => w.one()).toThrow("verified commit");
+        expect(writes(w.calls)).toHaveLength(0);
+      },
+    );
 
     it.each([
       [
@@ -1420,7 +1453,11 @@ describe("direct mode: stage, landBranch, land, route", () => {
     });
 
     it("a main moved on unrelated paths: the same blobs on main's head go back to the branch for CI, main does not move", () => {
-      const files = [mod("PUBLIC_PIN"), mod("SYNCED_FROM"), mod("pnpm-lock.yaml")];
+      const files = [
+        mod("PUBLIC_PIN"),
+        mod("SYNCED_FROM"),
+        mod("pnpm-lock.yaml"),
+      ];
       const w = landWorld({
         mains: [MAIN2],
         files,
@@ -1455,11 +1492,14 @@ describe("direct mode: stage, landBranch, land, route", () => {
       "SYNCED_FROM",
       "private-paths.txt",
       "tests/redline/src/regen.ts",
-    ])("a main moved under %s: drops the branch and throws, so the next run regenerates", (f) => {
-      const w = landWorld({ mains: [MAIN2], moved: { files: [f] } });
-      expect(() => w.one()).toThrow("lockfile-sensitive");
-      expect(writes(w.calls).map((a) => a[2])).toEqual(["DELETE"]);
-    });
+    ])(
+      "a main moved under %s: drops the branch and throws, so the next run regenerates",
+      (f) => {
+        const w = landWorld({ mains: [MAIN2], moved: { files: [f] } });
+        expect(() => w.one()).toThrow("lockfile-sensitive");
+        expect(writes(w.calls).map((a) => a[2])).toEqual(["DELETE"]);
+      },
+    );
 
     it("a main that is not ahead of the parent is refused", () => {
       const w = landWorld({
@@ -1499,14 +1539,22 @@ describe("direct mode: stage, landBranch, land, route", () => {
     it("refuses a branch that is not pin-land/vX.Y.Z", () => {
       const { exec, read } = landWorld({});
       expect(() =>
-        landBranch({ exec, read, repo: REPO, publicRepo: PUB, branch: "pin-land/x" }),
+        landBranch({
+          exec,
+          read,
+          repo: REPO,
+          publicRepo: PUB,
+          branch: "pin-land/x",
+        }),
       ).toThrow("not pin-land/vX.Y.Z");
     });
   });
 
   describe("land", () => {
     it("takes every staged branch, and reports one's error without skipping the rest", () => {
-      const w = landWorld({ refs: [`refs/heads/pin-land/nope`, `refs/heads/${BRANCH}`] });
+      const w = landWorld({
+        refs: [`refs/heads/pin-land/nope`, `refs/heads/${BRANCH}`],
+      });
       const r = w.all();
       expect(r).toHaveLength(2);
       expect(r[0]).toMatchObject({ branch: "pin-land/nope" });
@@ -1525,13 +1573,15 @@ describe("direct mode: stage, landBranch, land, route", () => {
   });
 
   describe("route", () => {
-    const pr = (p: Partial<ReturnType<typeof plan>> = {}) => () => ({
-      bump: true,
-      tag: TAG,
-      sha: NEW_SHA,
-      why: "w",
-      ...p,
-    });
+    const pr =
+      (p: Partial<ReturnType<typeof plan>> = {}) =>
+      () => ({
+        bump: true,
+        tag: TAG,
+        sha: NEW_SHA,
+        why: "w",
+        ...p,
+      });
     const never = () => {
       throw new Error("no PR plan expected");
     };
@@ -1540,13 +1590,30 @@ describe("direct mode: stage, landBranch, land, route", () => {
     it("off: the PR path with the plan's own branch and supersede, planned once", () => {
       for (const surfacesChanged of [true, false])
         expect(
-          route({ direct: false, surfacesChanged, tag: TAG, planned, prPlan: never }),
-        ).toMatchObject({ route: "pr", pr: true, branch: branchOf(TAG), supersede: 5 });
+          route({
+            direct: false,
+            surfacesChanged,
+            tag: TAG,
+            planned,
+            prPlan: never,
+          }),
+        ).toMatchObject({
+          route: "pr",
+          pr: true,
+          branch: branchOf(TAG),
+          supersede: 5,
+        });
     });
 
     it("on, with an empty surfaces port: direct", () => {
       expect(
-        route({ direct: true, surfacesChanged: false, tag: TAG, planned, prPlan: never }),
+        route({
+          direct: true,
+          surfacesChanged: false,
+          tag: TAG,
+          planned,
+          prPlan: never,
+        }),
       ).toEqual({ route: "direct" });
     });
 
@@ -1559,13 +1626,24 @@ describe("direct mode: stage, landBranch, land, route", () => {
           planned,
           prPlan: pr({ supersede: 8 }),
         }),
-      ).toMatchObject({ route: "pr", pr: true, branch: branchOf(TAG), supersede: 8 });
+      ).toMatchObject({
+        route: "pr",
+        pr: true,
+        branch: branchOf(TAG),
+        supersede: 8,
+      });
     });
 
     it("on, with a surfaces port the PR plan will not take for this tag: nothing is opened", () => {
       for (const p of [pr({ bump: false, tag: "" }), pr({ tag: "v0.138.0" })])
         expect(
-          route({ direct: true, surfacesChanged: true, tag: TAG, planned, prPlan: p }),
+          route({
+            direct: true,
+            surfacesChanged: true,
+            tag: TAG,
+            planned,
+            prPlan: p,
+          }),
         ).toMatchObject({ route: "pr", pr: false });
     });
   });
