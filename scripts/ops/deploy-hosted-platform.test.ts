@@ -92,7 +92,7 @@ case "$path" in
     elif jq -e 'type == "object"' "$STATE/queues.json" > /dev/null 2>&1; then cat "$STATE/queues.json"
     else ok "$(cat "$STATE/queues.json")"; fi
     exit 0 ;;
-  queues)
+  queues) [ -f "$STATE/fail-queue-create" ] && { bad; exit 0; }
     jq -c --argjson b "$body" 'if type == "object" then .result += [{queue_name: $b.queue_name}] else . + [{queue_name: $b.queue_name}] end' "$STATE/queues.json" 2>/dev/null > "$STATE/q.new" || jq -nc --argjson b "$body" '[{queue_name: $b.queue_name}]' > "$STATE/q.new"
     mv "$STATE/q.new" "$STATE/queues.json"; ok '{}'; exit 0 ;;
   r2/buckets/*) n="\${path#r2/buckets/}"
@@ -603,7 +603,13 @@ const setup = (
     );
   const queues =
     opts.queues === undefined
-      ? queueList(["oa-p-signups", "oa-s-signups", "other"])
+      ? queueList([
+          "oa-p-signups",
+          "oa-s-signups",
+          "oa-p-fleet-wake",
+          "oa-s-fleet-wake",
+          "other",
+        ])
       : opts.queues;
   if (queues !== null) writeFileSync(join(state, "queues.json"), queues);
   for (const w of [
@@ -1082,7 +1088,11 @@ describe("deploy-hosted-platform.sh", () => {
           // Verify only reads the live Worker (its settings file), deploys nothing.
           const base = {
             exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
-            queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+            queues: queueList([
+              "oa-s-signups",
+              "oa-s-signups-dlq",
+              "oa-s-fleet-wake",
+            ]),
             // Staging's tag turns the opt-out list on: the provisioner's root key.
             secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY"] },
           };
@@ -1725,6 +1735,98 @@ describe("deploy-hosted-platform.sh", () => {
     expect(ok.log).toContain(
       `curl -sS -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100`,
     );
+  });
+  // cloud #264: the scheduler consumes oa-<p>-fleet-wake, so the target makes
+  // sure that queue exists before the deploy attaches to it.
+  const WAKE_CREATE = 'WRITE POST /queues {"queue_name":"oa-p-fleet-wake"}';
+  it("the scheduler creates oa-p-fleet-wake when absent, before its deploy, and only then", () => {
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups", "oa-s-fleet-wake"]),
+    }).run("scheduler");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([WAKE_CREATE]);
+    expect(r.out).toContain("queue oa-p-fleet-wake created");
+    const created = r.log.indexOf(WAKE_CREATE);
+    const deployed = r.log.findIndex((l) => l.startsWith("wrapper scheduler"));
+    expect(created).toBeGreaterThan(-1);
+    expect(created).toBeLessThan(deployed);
+    clean(r);
+    // Present: listed, never created again.
+    const again = setup({ exists: SCHED_DEPS("p") }).run("scheduler");
+    expect(again.code, again.err).toBe(0);
+    expect(again.writes).toEqual([]);
+    expect(again.log).toContain(
+      `curl -sS -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100&page=1`,
+    );
+  });
+  it("the scheduler, staging: creates oa-s-fleet-wake, never prod's", () => {
+    const r = setup({
+      exists: SCHED_DEPS("s"),
+      queues: queueList(["oa-s-signups", "oa-p-fleet-wake"]),
+    }).run("scheduler", {}, "staging");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([
+      'WRITE POST /queues {"queue_name":"oa-s-fleet-wake"}',
+    ]);
+  });
+  it("the scheduler, verify only: a missing oa-p-fleet-wake refuses and nothing is created", () => {
+    const s = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups"]),
+    });
+    writeFileSync(join(s.state, "oa-p-scheduler.exists"), "");
+    writeFileSync(
+      join(s.state, "oa-p-scheduler.settings.json"),
+      NEXT["oa-p-scheduler"] as string,
+    );
+    const r = s.run("scheduler", { VERIFY_ONLY: "1" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("queue oa-p-fleet-wake does not exist");
+    expect(r.writes).toEqual([]);
+    expect(noDeploy(r.log)).toEqual([]);
+  });
+  it("the scheduler: a failed queue creation stops the run before its deploy", () => {
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups"]),
+      files: { "fail-queue-create": "" },
+    }).run("scheduler");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("create queue oa-p-fleet-wake failed");
+    expect(noDeploy(r.log)).toEqual([]);
+    clean(r);
+  });
+  it("the scheduler: a tag that consumes no queue lists and creates nothing; any other queue refuses", () => {
+    const none = SCHED_CONFIG.replace(
+      /"consumers": \[[\s\S]*?\n {8}\]/g,
+      '"consumers": []',
+    );
+    expect(none).not.toContain('fleet-wake"');
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      configs: { scheduler: none },
+      queues: queueList(["oa-p-signups"]),
+    }).run("scheduler");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([]);
+    expect(r.log.some((l) => l.includes("/queues?per_page=100&page="))).toBe(
+      false,
+    );
+    const other = SCHED_CONFIG.replaceAll(
+      '"queue": "oa-p-fleet-wake"',
+      '"queue": "oa-p-signups"',
+    );
+    const o = setup({
+      exists: SCHED_DEPS("p"),
+      configs: { scheduler: other },
+    }).run("scheduler");
+    expect(o.code).toBe(1);
+    expect(o.err).toContain(
+      "the tag's prod scheduler consumes 'oa-p-signups'; want none or oa-p-fleet-wake; refusing",
+    );
+    expect(o.writes).toEqual([]);
+    expect(noDeploy(o.log)).toEqual([]);
   });
   // The scheduler fails on a readback mismatch in each provisioning binding,
   // deployed or verify only. Its bindings with one changed (null: removed).

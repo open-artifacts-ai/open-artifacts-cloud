@@ -292,7 +292,7 @@ describe("deploy-hosted-platform.yml", () => {
     );
     // The constants and the id lookup are main's too, never the tag's.
     expect(use).toContain(
-      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh; do",
+      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh; do",
     );
     expect(use).toContain(
       'cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"',
@@ -411,6 +411,8 @@ describe("deploy-hosted-platform.yml", () => {
       "Scheduler, last",
       "Every platform Worker runs the tag",
       "Mark the platform verified",
+      "Wake the fleet",
+      "Wait for the fleet to reach every install",
       "Clear the platform verified marks (break-glass)",
       "The deploy token's expiry",
     ]);
@@ -968,6 +970,88 @@ describe("deploy-hosted-platform.yml", () => {
     ).toBe(false);
   });
 
+  // cloud #264: one message to the env's oa-<p>-fleet-wake once the mark is
+  // written, so the scheduler starts the upgrades at once. The tick is the
+  // backup, so the step never fails the run.
+  it("wakes the fleet right after the mark, only when the mark ran green, and never fails the run", () => {
+    const wk = named("Wake the fleet");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(named("Mark the platform verified").id).toBe("mark_verified");
+    expect(i("Wake the fleet")).toBe(i("Mark the platform verified") + 1);
+    expect(i("Wake the fleet")).toBeLessThan(i("The deploy token's expiry"));
+    expect(wk.run).toBe(
+      'bash "$RUNNER_TEMP/main-ci/fleet-wake.sh" "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(wk.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    expect(wk["continue-on-error"]).toBe(true);
+    expect(wk["timeout-minutes"]).toBeLessThanOrEqual(2);
+    const marked = { ...ran, mark_verified: "success" };
+    for (const verify_only of [false, true])
+      for (const targets of [FULL, FULLB])
+        expect(evalIf(wk, { verify_only, targets }, marked), targets).toBe(
+          true,
+        );
+    // No mark (a partial list, a failed read-back), or a failed step before
+    // it: no wake.
+    expect(
+      evalIf(
+        wk,
+        { verify_only: false, targets: "scheduler" },
+        { ...ran, mark_verified: "skipped" },
+      ),
+    ).toBe(false);
+    expect(
+      evalIf(
+        wk,
+        { verify_only: false, targets: FULL },
+        { ...ran, mark_verified: "failure" },
+      ),
+    ).toBe(false);
+    expect(
+      evalIf(wk, { verify_only: false, targets: FULL }, marked, false),
+    ).toBe(false);
+  });
+
+  // cloud #264, for release-watch (#456): the rollout's finish as a step a
+  // run reader can see with the default token.
+  it("prod waits, reads only, for the fleet's done mark after the wake; Fleet done runs only once it is there; neither fails the run", () => {
+    const wt = named("Wait for the fleet to reach every install");
+    const dn = named("Fleet done");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i(wt.name)).toBe(i("Wake the fleet") + 1);
+    expect(i(dn.name)).toBe(i(wt.name) + 1);
+    expect(wt.id).toBe("fleet_done");
+    expect(wt["continue-on-error"]).toBe(true);
+    expect(wt["timeout-minutes"]).toBeLessThanOrEqual(12);
+    expect(wt.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    expect(wt.run).toContain(
+      'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(wt.run).toContain('echo "done=true" >> "$GITHUB_OUTPUT"');
+    expect(wt.run).toContain("::warning::");
+    const marked = { ...ran, mark_verified: "success" };
+    expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(true);
+    // Staging's chain waits on this run: no wait there.
+    expect(evalIf(wt, { env: "staging", targets: FULL }, marked)).toBe(false);
+    expect(
+      evalIf(
+        wt,
+        { env: "prod", targets: FULL },
+        { ...ran, mark_verified: "skipped" },
+      ),
+    ).toBe(false);
+    expect(dn.if).toBe("${{ steps.fleet_done.outputs.done == 'true' }}");
+    expect(JSON.stringify(dn)).not.toContain("secrets.");
+  });
+
   it("prod verify_only with the full list runs both staging gates before the mark; partial verify_only runs neither gate nor mark; other runs unchanged", () => {
     const i = (n: string) => steps.indexOf(named(n));
     const gates = [
@@ -1296,7 +1380,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|continue-on-error/);
     expect(g.shell).toBeUndefined();
     expect(text).toContain(
-      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh;",
+      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh;",
     );
   });
 

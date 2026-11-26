@@ -59,6 +59,7 @@ import {
   type SmokeResult,
   smoke,
 } from "./smoke.js";
+import { claimState, unclaimState } from "./state.js";
 
 /**
  * Open fleet upgrades at a time, the insert's own guard included. After the
@@ -79,11 +80,28 @@ export const FLEET_FAIL_GAP_MS = 60_000;
 /** While the canary's upgrade is open, the tick re-checks it this often. */
 export const FLEET_FAST_POLL_MS = 3_000;
 /**
- * fleetFast's deadline from the duty's start: the fleet duty's 25 s budget
- * less a 2 s margin. A pass starts only if a slow probe and the smoke's
- * cleanup still fit; the smoke gets only the time left (smokeCanary).
+ * A wake run (wake.ts, pollBatch) re-checks the rest's batch this often once
+ * it is queued, so the rollout's finish is seen in the same run. Slower than
+ * the canary's poll: each pass probes every upgraded install.
+ */
+export const FLEET_BATCH_POLL_MS = 15_000;
+/**
+ * fleetFast's deadline from the duty's start on the 2-minute tick: the fleet
+ * duty's 25 s budget less a 2 s margin. A pass starts only if a slow probe
+ * and the smoke's cleanup still fit; the smoke gets only the time left
+ * (smokeCanary). The deploy's wake run (wake.ts) passes a longer one.
  */
 export const FLEET_FAST_DEADLINE_MS = 23_000;
+/**
+ * The fleet run's lease (platform_state), ported from cloud #458: one run at
+ * a time, the 2-minute tick's fleet duty and the deploy's wake run (wake.ts)
+ * alike, so the two never act side by side. A run that never gives it back
+ * (killed mid-run) holds it this long, longer than the longest run
+ * (FLEET_WAKE_TIMEOUT_MS in wake.ts): the ticks in between skip the fleet,
+ * and the first one after it takes it.
+ */
+export const FLEET_LEASE_KEY = "scheduler_fleet_lease";
+export const FLEET_LEASE_MS = 320_000;
 /** The smoke's cleanup runs past its budget: two calls (unshare, delete). */
 export const FLEET_SMOKE_CLEANUP_MS = 2 * SMOKE_CALL_MS;
 /**
@@ -163,6 +181,15 @@ export const FLEET_BLOCKED_PREFIX = "fleet_blocked:";
 export const FLEET_RETRY_PREFIX = "fleet_retry:";
 /** `fleet_behind:<id>`: when the duty first saw it off the target. */
 export const FLEET_BEHIND_PREFIX = "fleet_behind:";
+/**
+ * `fleet_done:<version>` (cloud #264): when a pass first found the rollout
+ * finished: the canary settled and smoked, nothing open, every upgraded
+ * install settled, and no eligible install below the version. Installs the
+ * fleet leaves out (broken, suspended, paused, red-line) are not waited on;
+ * version_skew reports them. Set once; the deploy reads it (platform-db.ts
+ * fleet-done).
+ */
+export const FLEET_DONE_PREFIX = "fleet_done:";
 
 /**
  * `platform_verified:<version>` (#1229): written by the platform deploy once
@@ -185,6 +212,7 @@ const VERSIONED_PREFIXES = [
   FLEET_SMOKE_FAIL_PREFIX,
   FLEET_SMOKE_HALT_PREFIX,
   FLEET_SMOKE_CONFIG_PREFIX,
+  FLEET_DONE_PREFIX,
 ] as const;
 
 const STABLE_TAG = /^v(\d+\.\d+\.\d+)$/;
@@ -498,6 +526,13 @@ export interface FleetOptions {
   sleep?: (ms: number) => Promise<void>;
   /** fleetFast: the ms left before its deadline; bounds the smoke. */
   left?: () => number;
+  /** fleetFast's deadline from its start (default FLEET_FAST_DEADLINE_MS). */
+  deadlineMs?: number;
+  /**
+   * fleetFast: also re-check every FLEET_BATCH_POLL_MS while the rest's
+   * batch is open or settling (the deploy's wake run; the tick does not).
+   */
+  pollBatch?: boolean;
   /** Tests only: the canary smoke (default smoke() over fetch). */
   smoke?: (i: SmokeInput) => Promise<SmokeResult>;
 }
@@ -507,15 +542,47 @@ export type FleetEnv = ProvapiEnv & { AUTH_BROKER_ORIGIN?: string };
 
 /**
  * What one pass left: "canary" while the canary's upgrade to the target is
- * open or done but not yet settled and smoked (worth a fast re-check), else
- * "idle".
+ * open or done but not yet settled and smoked (worth a fast re-check);
+ * "batch" while the rest's upgrades are open or not yet settled (worth a
+ * re-check in a wake run, pollBatch); else "idle". Both only with the smoke
+ * required: the smoke-off soak is a timer by design.
  */
-export type FleetPass = "canary" | "idle";
+export type FleetPass = "canary" | "batch" | "idle";
+
+/**
+ * One fleet run: fleetFast under the lease, so two runs never act at once
+ * (the 2-minute tick beside the deploy's wake run, a late tick, a message
+ * delivered twice). Without the lease the run does nothing, logs
+ * `provapi fleet overlap` and returns false. The lease is given back only
+ * once fleetFast has ended, even past the run's timeout.
+ */
+export async function fleetTick(
+  env: FleetEnv,
+  now: number,
+  o: FleetOptions = {},
+): Promise<boolean> {
+  const db = env.PLATFORM_DB;
+  if (!(await d1(claimState(db, FLEET_LEASE_KEY, now, now - FLEET_LEASE_MS)))) {
+    console.log("provapi fleet overlap");
+    return false;
+  }
+  try {
+    await fleetFast(env, now, o);
+  } finally {
+    // Only while it is still this run's: an expired lease taken by a later
+    // run stays that run's.
+    await unclaimState(db, FLEET_LEASE_KEY, now, null).catch(() =>
+      console.error("provapi fleet lease_release_failed"),
+    );
+  }
+  return true;
+}
 
 /**
  * The fleet duty: one pass, then, while the canary is mid-upgrade, a new pass
- * every FLEET_FAST_POLL_MS until it settles and the rest are queued, or the
- * tick's FLEET_FAST_BUDGET_MS is spent (the next tick carries on).
+ * every FLEET_FAST_POLL_MS until it settles and the rest are queued, or its
+ * deadline (o.deadlineMs, default FLEET_FAST_DEADLINE_MS) is spent (the next
+ * run carries on).
  */
 export async function fleetFast(
   env: FleetEnv,
@@ -526,16 +593,21 @@ export async function fleetFast(
   const sleep =
     o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const t0 = clock();
-  const deadline = t0 + FLEET_FAST_DEADLINE_MS;
+  const deadline = t0 + (o.deadlineMs ?? FLEET_FAST_DEADLINE_MS);
   const pass = { ...o, left: () => deadline - clock() };
   // The worst pass: a probe at its full timeout, then the smoke's cleanup
   // (the smoke itself takes only what is left).
   const worst = FLEET_PROBE_TIMEOUT_MS + FLEET_SMOKE_CLEANUP_MS;
   for (;;) {
     const r = await fleetDue(env, now + (clock() - t0), pass);
-    if (r !== "canary" || clock() + FLEET_FAST_POLL_MS + worst > deadline)
-      return;
-    await sleep(FLEET_FAST_POLL_MS);
+    const pause =
+      r === "canary"
+        ? FLEET_FAST_POLL_MS
+        : r === "batch" && o.pollBatch
+          ? FLEET_BATCH_POLL_MS
+          : null;
+    if (pause === null || clock() + pause + worst > deadline) return;
+    await sleep(pause);
   }
 }
 
@@ -599,14 +671,23 @@ export async function fleetDue(
       : "idle";
   if (hold) {
     console.log("provapi fleet holding");
-    return waiting();
+    // A batch member not yet settled: a wake run re-checks it (pollBatch).
+    const w = waiting();
+    return w === "idle" && mode === "required" ? "batch" : w;
   }
   const manage = bound(env.MANAGE_INSTALL);
 
   const ready = await canaryReady(env, now, st, canary, target, manage, o);
   if (!ready) {
     await stamp(db, now, st, target);
-    return waiting();
+    // This pass may have just queued the canary's upgrade: read it again, so
+    // fleetFast polls it at once instead of leaving it to the next run
+    // (cloud #264: no tick between the steps).
+    if (mode !== "required") return "idle";
+    const fresh = await d1(
+      db.prepare(CANARY).bind(canaryId).first<CanaryRow>(),
+    );
+    return canaryPending(st, fresh, target) ? "canary" : "idle";
   }
   await clearBlocked(db, st);
 
@@ -615,7 +696,8 @@ export async function fleetDue(
   // later batch (a fleet over the cap) waits for this one. The insert's
   // guards are what hold the cap and the halt.
   const open = await d1(db.prepare(OPEN).first<{ n: number }>());
-  if ((open?.n ?? 0) > 0) return "idle";
+  const settling = mode === "required" ? "batch" : "idle";
+  if ((open?.n ?? 0) > 0) return settling;
   const { results } = await d1(
     db.prepare(BEHIND).bind(target, canaryId).all<{
       install_id: string;
@@ -625,8 +707,8 @@ export async function fleetDue(
     }>(),
   );
   let slots = FLEET_CONCURRENCY;
+  let behind = 0;
   for (const r of results) {
-    if (slots <= 0) break;
     let below: boolean;
     try {
       below = compareVersions(r.version, target) < 0;
@@ -634,13 +716,34 @@ export async function fleetDue(
       continue;
     }
     if (!below) continue;
+    behind++;
+    if (slots <= 0) continue;
     const broken = r.serving_mode !== "serving" || r.health !== "ok";
     if (
       await upgrade(env, manage, now, r.install_id, r.version, target, broken)
     )
       slots--;
   }
+  if (behind > 0) return slots < FLEET_CONCURRENCY ? settling : "idle";
+  await markDone(db, now, st, target);
   return "idle";
+}
+
+/**
+ * The rollout of `target` is finished (FLEET_DONE_PREFIX): its mark, once,
+ * and one log line the first time.
+ */
+async function markDone(
+  db: D1Database,
+  now: number,
+  st: FleetState,
+  target: string,
+): Promise<void> {
+  const key = `${FLEET_DONE_PREFIX}${target}`;
+  if (st.rows.has(key)) return;
+  await d1(db.prepare(SET_ONCE).bind(key, now).run());
+  st.rows.set(key, { key, value: now, updated_at: now });
+  console.log("provapi fleet done", target);
 }
 
 /**

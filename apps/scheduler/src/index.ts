@@ -22,6 +22,7 @@ import {
 import { billingHealth } from "./billing-health.js";
 import { alertFor, stepAlert } from "./provapi/alerts.js";
 import { type ProvapiEnv, provapiTick, writeTick } from "./provapi/index.js";
+import { fleetWake } from "./provapi/wake.js";
 import { emailQuota, type QuotaEnv, type QuotaOutcome } from "./quota.js";
 
 // And to the tier store (see @oa/broker-core/billing-gate).
@@ -849,5 +850,11 @@ export default {
     } catch {
       console.error("owner-email failed db");
     }
+  },
+  // oa-<p>-fleet-wake (cloud #264), its only queue: the platform deploy's
+  // last step posts one message, and the fleet runs at once (provapi/wake.ts)
+  // under the same lease as the 2-minute tick's fleet duty. Never throws.
+  async queue(batch, env) {
+    await fleetWake(batch, env, Date.now());
   },
 } satisfies ExportedHandler<Env>;

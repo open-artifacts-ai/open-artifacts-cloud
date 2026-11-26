@@ -37,6 +37,11 @@
 //     read-back passed (a rerun keeps the first time; D1 errors are retried);
 //   node scripts/ops/platform-db.ts unmark-verified staging|prod
 //     deletes every `platform_verified:*` key (a break-glass run).
+//   node scripts/ops/platform-db.ts fleet-done staging|prod vX.Y.Z
+//     reads only: waits up to FLEET_DONE_WAIT_MIN minutes (default 10) for
+//     the scheduler's `fleet_done:<version>` (cloud #264: every eligible
+//     install upgraded and settled), exit 0 once it is there, 1 if not in
+//     time. The deploy's "Fleet done" step follows it (release-watch, #456).
 //   The log names the mark and nothing else (no counts).
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -553,6 +558,61 @@ export async function unmarkVerified({
   log("platform_verified marks cleared");
 }
 
+/** How often fleet-done reads the mark. */
+export const FLEET_DONE_POLL_MS = 15_000;
+
+/**
+ * Waits for platform_state `fleet_done:<version>` (the scheduler's mark that
+ * the rollout of the tag is finished), reading it every pollMs for up to
+ * waitMs. True once it is there (logging when it was set), false if not in
+ * time. Reads only; a failed read is one more try, never a throw.
+ */
+export async function waitFleetDone({
+  db,
+  tag,
+  now,
+  sleep,
+  log,
+  waitMs,
+  pollMs = FLEET_DONE_POLL_MS,
+}: {
+  db: Db;
+  tag: string;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (s: string) => void;
+  waitMs: number;
+  pollMs?: number;
+}): Promise<boolean> {
+  const m = STABLE_TAG.exec(tag);
+  if (!m) throw new Refused("tag must be a stable vX.Y.Z");
+  const key = `fleet_done:${m[1]}`;
+  const end = now() + waitMs;
+  let failed = 0;
+  for (;;) {
+    try {
+      const rows = await db.all(
+        "SELECT value FROM platform_state WHERE key = ?1",
+        [key],
+      );
+      const at = rows[0]?.value;
+      if (typeof at === "number") {
+        log(`${key} at ${new Date(at).toISOString()}`);
+        return true;
+      }
+    } catch {
+      failed++;
+    }
+    if (now() + pollMs > end) {
+      log(
+        `${key} not set after ${Math.round(waitMs / 60_000)} min${failed ? ` (${failed} failed reads)` : ""}`,
+      );
+      return false;
+    }
+    await sleep(pollMs);
+  }
+}
+
 /** D1 over the REST API: /query, the token in a header. */
 export function d1({
   token,
@@ -611,7 +671,9 @@ if (
   realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
 ) {
   const mode =
-    process.argv[2] === "mark-verified" || process.argv[2] === "unmark-verified"
+    process.argv[2] === "mark-verified" ||
+    process.argv[2] === "unmark-verified" ||
+    process.argv[2] === "fleet-done"
       ? process.argv[2]
       : null;
   const env = mode ? process.argv[3] : process.argv[2];
@@ -621,11 +683,17 @@ if (
   };
   if (env !== "staging" && env !== "prod")
     fail(
-      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | staging|prod]",
+      "usage: platform-db.ts [mark-verified staging|prod vX.Y.Z | unmark-verified staging|prod | fleet-done staging|prod vX.Y.Z | staging|prod]",
       2,
     );
-  if (mode === "mark-verified" && !process.argv[4])
-    fail("usage: platform-db.ts mark-verified staging|prod vX.Y.Z", 2);
+  if ((mode === "mark-verified" || mode === "fleet-done") && !process.argv[4])
+    fail(`usage: platform-db.ts ${mode} staging|prod vX.Y.Z`, 2);
+  const waitMin = Number(process.env.FLEET_DONE_WAIT_MIN || "10");
+  if (
+    mode === "fleet-done" &&
+    !(Number.isInteger(waitMin) && waitMin >= 1 && waitMin <= 30)
+  )
+    fail("FLEET_DONE_WAIT_MIN must be 1 to 30 minutes", 2);
   const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, PLATFORM_DB_ID } =
     process.env;
   if (!CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required", 2);
@@ -646,6 +714,17 @@ if (
       });
       const log = (s: string) => console.log(`oa-${env?.[0]}-platform: ${s}`);
       const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+      if (mode === "fleet-done") {
+        const done = await waitFleetDone({
+          db,
+          tag: process.argv[4] as string,
+          now: () => Date.now(),
+          sleep,
+          log,
+          waitMs: waitMin * 60_000,
+        });
+        process.exit(done ? 0 : 1);
+      }
       if (mode === "mark-verified")
         await markVerified({
           db,

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
+  FLEET_DONE_PREFIX,
   FLEET_VERIFIED_PREFIX,
   fleetTarget,
 } from "../../apps/scheduler/src/provapi/fleet.ts";
@@ -17,6 +18,7 @@ import {
   Refused,
   run,
   unmarkVerified,
+  waitFleetDone,
 } from "./platform-db.ts";
 
 // platform-db.ts (design v7 8.4) against a local SQLite standing in for D1:
@@ -852,6 +854,8 @@ describe("platform-db.ts", () => {
         ["mark-verified", "dev", "v1.2.3"],
         ["mark-verified", "prod"],
         ["unmark-verified", "dev"],
+        ["fleet-done", "dev", "v1.2.3"],
+        ["fleet-done", "prod"],
       ]) {
         const r = cli(args, ok);
         expect(r.status, args.join(" ")).toBe(2);
@@ -863,6 +867,108 @@ describe("platform-db.ts", () => {
           PLATFORM_DB_ID: "x",
         }).status,
       ).toBe(2);
+      for (const w of ["0", "31", "x"])
+        expect(
+          cli(["fleet-done", "prod", "v1.2.3"], {
+            ...ok,
+            FLEET_DONE_WAIT_MIN: w,
+          }).status,
+          w,
+        ).toBe(2);
+    });
+
+    // cloud #264: the deploy waits for the scheduler's fleet_done mark, so
+    // release-watch (#456) can read the rollout's finish from the run.
+    describe("waitFleetDone", () => {
+      const clocked = (f: ReturnType<typeof stateDb>) => {
+        let t = 1_000_000;
+        return {
+          now: () => t,
+          sleep: async (ms: number) => {
+            f.sleeps.push(ms);
+            t += ms;
+          },
+        };
+      };
+      it("reads the scheduler's own key: fleet_done:<version>", () => {
+        expect(`${FLEET_DONE_PREFIX}${fleetTarget({ tag: "v1.2.3" })}`).toBe(
+          "fleet_done:1.2.3",
+        );
+      });
+      it("returns at once when the mark is there, naming when it was set", async () => {
+        const f = stateDb();
+        f.sqlite.exec(
+          "INSERT INTO platform_state VALUES ('fleet_done:1.2.3', 1764134400000, 1)",
+        );
+        const log: string[] = [];
+        const c = clocked(f);
+        expect(
+          await waitFleetDone({
+            db: f.db,
+            tag: "v1.2.3",
+            ...c,
+            log: (s) => log.push(s),
+            waitMs: 10 * 60_000,
+          }),
+        ).toBe(true);
+        expect(f.sleeps).toEqual([]);
+        expect(log).toEqual(["fleet_done:1.2.3 at 2025-11-26T05:20:00.000Z"]);
+      });
+      it("polls until the mark lands; another version's never counts; failed reads are retries", async () => {
+        const f = stateDb();
+        f.sqlite.exec(
+          "INSERT INTO platform_state VALUES ('fleet_done:1.2.2', 1, 1)",
+        );
+        f.failNext(1);
+        const c = clocked(f);
+        let polls = 0;
+        const log: string[] = [];
+        const done = await waitFleetDone({
+          db: f.db,
+          tag: "v1.2.3",
+          now: c.now,
+          sleep: async (ms) => {
+            await c.sleep(ms);
+            if (++polls === 3)
+              f.sqlite.exec(
+                "INSERT INTO platform_state VALUES ('fleet_done:1.2.3', 5, 5)",
+              );
+          },
+          log: (s) => log.push(s),
+          waitMs: 10 * 60_000,
+          pollMs: 15_000,
+        });
+        expect(done).toBe(true);
+        expect(f.sleeps).toEqual([15_000, 15_000, 15_000]);
+        expect(log).toEqual(["fleet_done:1.2.3 at 1970-01-01T00:00:00.005Z"]);
+      });
+      it("gives up after the wait, reads only, and refuses a bad tag", async () => {
+        const f = stateDb();
+        const c = clocked(f);
+        const log: string[] = [];
+        expect(
+          await waitFleetDone({
+            db: f.db,
+            tag: "v1.2.3",
+            ...c,
+            log: (s) => log.push(s),
+            waitMs: 60_000,
+            pollMs: 15_000,
+          }),
+        ).toBe(false);
+        expect(f.sleeps).toEqual([15_000, 15_000, 15_000, 15_000]);
+        expect(log).toEqual(["fleet_done:1.2.3 not set after 1 min"]);
+        expect(keys(f.sqlite)).toEqual([]);
+        await expect(
+          waitFleetDone({
+            db: f.db,
+            tag: "1.2.3",
+            ...c,
+            log: () => {},
+            waitMs: 60_000,
+          }),
+        ).rejects.toThrow(/stable vX.Y.Z/);
+      });
     });
   });
 });
