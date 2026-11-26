@@ -194,10 +194,12 @@ jobs:
             where=(--target "$SHA")
             echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           fi
-          # Up to 3 tries, with a backoff before each retry (2 s, then 4 s): the
-          # one wait here, a pause before a retry, never a poll. Look for a
-          # release first each time so a partial success never duplicates one.
-          for attempt in 1 2 3; do
+          # Up to 5 tries, with a backoff before each retry (4, 6, 8, then 10 s,
+          # as before): the one wait here, a pause before a retry, never a poll.
+          # Look for a release first each time so a partial success never
+          # duplicates one.
+          attempt=1
+          while :; do
             if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
               echo "release $TAG already exists"
               break
@@ -209,7 +211,8 @@ jobs:
               break
             fi
             echo "$out"
-            if [ "$attempt" -lt 3 ]; then
+            if [ "$attempt" -lt 5 ]; then
+              attempt=$((attempt + 1))
               sleep $((attempt * 2))
               continue
             fi

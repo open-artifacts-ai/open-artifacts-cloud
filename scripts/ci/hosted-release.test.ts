@@ -695,7 +695,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       );
       expect(r.calls).not.toContain("--target");
     });
-    it("release create retries with a backoff of 2 s, then 4 s, then succeeds", () => {
+    it("release create retries with a backoff of 4 s, then 6 s, then succeeds", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
@@ -704,14 +704,14 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       });
       expect(r.status, r.out).toBe(0);
       expect(r.calls.match(/^release create/gm)?.length).toBe(3);
-      expect(r.calls.match(/^sleep .*/gm)).toEqual(["sleep 2", "sleep 4"]);
+      expect(r.calls.match(/^sleep .*/gm)).toEqual(["sleep 4", "sleep 6"]);
       // Each pause comes right after a failed create, before the next try.
       const lines = r.calls.trim().split("\n");
       for (const [i, l] of lines.entries())
         if (l.startsWith("sleep "))
           expect(lines[i - 1]).toMatch(/^release create/);
     });
-    it("release create gives up after 3 tries, and fails the run", () => {
+    it("release create gives up after 5 tries, sleeping 4, 6, 8, then 10 s, and fails the run", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
@@ -720,8 +720,13 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       });
       expect(r.status).toBe(1);
       expect(r.out).toContain("could not create release v1.2.3");
-      expect(r.calls.match(/^release create/gm)?.length).toBe(3);
-      expect(r.calls.match(/^sleep .*/gm)).toEqual(["sleep 2", "sleep 4"]);
+      expect(r.calls.match(/^release create/gm)?.length).toBe(5);
+      expect(r.calls.match(/^sleep .*/gm)).toEqual([
+        "sleep 4",
+        "sleep 6",
+        "sleep 8",
+        "sleep 10",
+      ]);
     });
     it("the only sleep in the create step is the retry backoff", () => {
       const st = allSteps("mirror").find(
@@ -729,7 +734,10 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       ) as Step;
       const sleeps = st.run.match(/\bsleep\b[^\n]*/g) ?? [];
       expect(sleeps).toEqual(["sleep $((attempt * 2))"]);
-      expect(st.run).not.toMatch(/\buntil\b|\bwhile\b/);
+      expect(st.run).not.toMatch(/\buntil\b/);
+      // the one loop is the bounded retry
+      expect(st.run.match(/\bwhile\b/g)).toEqual(["while"]);
+      expect(st.run).toContain('[ "$attempt" -lt 5 ]');
     });
     it("a release that already exists is never created again", () => {
       const r = runCreate({
