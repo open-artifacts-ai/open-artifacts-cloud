@@ -458,14 +458,16 @@ describe("main, with gh and fetch mocked", () => {
     let key = "";
     const gh = vi.fn(async (...a: string[]) => {
       ghCalls.push(a);
-      if (a[0] === "workflow") {
-        const f = a.find((x) => x.startsWith("recipient_key="));
-        key = f ? f.slice("recipient_key=".length) : "";
-        return "";
+      if (a[0] === "api") {
+        const f = a.find((x) => x.startsWith("inputs[recipient_key]="));
+        key = f ? f.slice("inputs[recipient_key]=".length) : "";
+        return "4242\n";
       }
-      if (a[0] === "run" && a[1] === "list") return "4242\n";
+      // An upgrade dispatched immediately afterwards is now the newest run.
+      if (a[0] === "run" && a[1] === "list") return "4243\n";
       if (a[0] === "run" && a[1] === "watch") return "";
       if (a[0] === "run" && a[1] === "view") {
+        expect(a[2]).toBe("4242");
         if (o.revoke)
           return "x test-member-job: 01JOB\nx test-member-revoked: rl-agents\n";
         const sealed = sealTo(
@@ -492,7 +494,6 @@ describe("main, with gh and fetch mocked", () => {
       gh,
       fetch: fetchMock,
       now: () => NOW,
-      sleep: async () => {},
       tmp,
       mcpBase: join(home, ".oa-redline", "rl-agents"),
       log: (l) => lines.push(l),
@@ -504,16 +505,11 @@ describe("main, with gh and fetch mocked", () => {
     const { d, lines, ghCalls, fetchCalls } = deps();
     expect(await main([], d)).toBe(0);
     const dispatch = ghCalls[0] as string[];
-    expect(dispatch.slice(0, 7)).toEqual([
-      "workflow",
-      "run",
-      WORKFLOW,
-      "-R",
-      "open-artifacts-ai/open-artifacts-cloud",
-      "--ref",
-      "main",
-    ]);
-    expect(dispatch).toContain("revoke=false");
+    expect(dispatch).toContain(
+      `repos/open-artifacts-ai/open-artifacts-cloud/actions/workflows/${WORKFLOW}/dispatches`,
+    );
+    expect(dispatch).toContain("ref=main");
+    expect(dispatch).toContain("inputs[revoke]=false");
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0]?.url).toBe(`https://${APP_HOST}/__test/session`);
     expect(
@@ -569,8 +565,10 @@ describe("main, with gh and fetch mocked", () => {
     const { d, lines, ghCalls, fetchCalls } = deps({ revoke: true });
     expect(await main(["--revoke"], d)).toBe(0);
     const dispatch = ghCalls[0] as string[];
-    expect(dispatch).toContain("revoke=true");
-    expect(dispatch.some((a) => a.startsWith("recipient_key="))).toBe(false);
+    expect(dispatch).toContain("inputs[revoke]=true");
+    expect(dispatch.some((a) => a.startsWith("inputs[recipient_key]="))).toBe(
+      false,
+    );
     expect(fetchCalls).toHaveLength(0);
     expect(readdirSync(tmp)).toEqual([]);
     expect(JSON.parse(lines[0] as string)).toEqual({
@@ -714,8 +712,7 @@ describe("main, with gh and fetch mocked", () => {
   it("a run id that is not a number: no watch, no fetch, no file", async () => {
     const { d, ghCalls, fetchCalls } = deps();
     const gh = d.gh;
-    d.gh = async (...a: string[]) =>
-      a[0] === "run" && a[1] === "list" ? "../evil\n" : gh(...a);
+    d.gh = async (...a: string[]) => (a[0] === "api" ? "../evil\n" : gh(...a));
     await expect(main(ADMIN_MCP, d)).rejects.toThrow(/not a number/);
     expect(ghCalls.some((a) => a[1] === "watch" || a[1] === "view")).toBe(
       false,
@@ -793,7 +790,7 @@ describe("staging-test-member.yml upgrade mode (cloud #264)", () => {
   function sandbox(o: {
     tag?: string;
     ref?: string;
-    version?: string;
+    version?: string | null;
     activeJobId?: string | null;
     statuses?: Partial<Record<"r2" | "r3" | "r5", number>>;
     clock?: number[];
@@ -806,7 +803,7 @@ describe("staging-test-member.yml upgrade mode (cloud #264)", () => {
       slug: "rl-agents",
       appHost: APP_HOST,
       state: "active",
-      version: o.version ?? "0.145.0",
+      version: o.version === undefined ? "0.145.0" : o.version,
       testHooks: true,
       activeJobId: o.activeJobId ?? null,
     };
@@ -937,6 +934,13 @@ if [ -n "$out" ]; then cp "$D/$k.json" "$out"; printf '%s' "$(cat "$D/$k.status"
       );
     }
     expect(posts(sandbox({ statuses: { r3: 403 } }).calls)).toEqual([]);
+  });
+
+  it("warns without requesting an upgrade when R3 has no installed version", () => {
+    const r = sandbox({ version: null });
+    expect(r.status, r.stderr).toBe(0);
+    expect(posts(r.calls)).toEqual([]);
+    expect(r.stdout).toContain("the installed version is unknown");
   });
 
   it("not newer, busy, a refused R5, a bad tag or another ref: no upgrade, or a warning, and always exit 0", () => {

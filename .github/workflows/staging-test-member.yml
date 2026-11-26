@@ -207,11 +207,9 @@ jobs:
           [ "$s" = 200 ] || warn "rl-agents: not upgraded, R3 answered $s$(code r3)."
           jq -e --arg s "$SLUG" '.slug == $s and .testHooks == true' "$d/r3" > /dev/null 2>&1 || warn "rl-agents: not upgraded, the install is not $SLUG with test hooks."
           from=$(jq -r '.version // ""' "$d/r3")
-          [[ "$from" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || from=""
-          if [ -n "$from" ]; then
-            newer=$(jq -rn --arg a "$to" --arg b "$from" '($a | split(".") | map(tonumber)) > ($b | split(".") | map(tonumber))')
-            if [ "$newer" != true ]; then say "rl-agents (https://$APP_HOST): on $from, not older than $to. Nothing to do."; exit 0; fi
-          fi
+          [[ "$from" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || warn "rl-agents: not upgraded, the installed version is unknown."
+          newer=$(jq -rn --arg a "$to" --arg b "$from" '($a | split(".") | map(tonumber)) > ($b | split(".") | map(tonumber))')
+          if [ "$newer" != true ]; then say "rl-agents (https://$APP_HOST): on $from, not older than $to. Nothing to do."; exit 0; fi
           jq -e '.state == "active" and (.activeJobId // null) == null' "$d/r3" > /dev/null 2>&1 || warn "rl-agents: not upgraded, it is not active and idle. The next staging release tries again."
           rid="test-member-up-$RUN_ID-$RUN_ATTEMPT"
           body=$(jq -cn --arg r "$rid" --arg v "$to" '{requestId: $r, version: $v, nonAdditive: true}')
@@ -221,4 +219,4 @@ jobs:
           [ "$s" = 202 ] || warn "rl-agents: the upgrade to $to was not accepted, R5 answered $s$(code r5). The next staging release tries again."
           job=$(jq -r '.job.id // ""' "$d/r5")
           [[ "$job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || warn "rl-agents: R5 answered 202 without a job id."
-          say "rl-agents (https://$APP_HOST): upgrade from ${from:-an unknown release} to $to accepted, job $job. Nothing waits for it to finish."
+          say "rl-agents (https://$APP_HOST): upgrade from $from to $to accepted, job $job. Nothing waits for it to finish."
