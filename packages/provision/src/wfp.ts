@@ -1771,6 +1771,16 @@ export class WfpProvisioner {
       );
   }
 
+  /** The stored vars have google on and no AUTH_DOMAINS (false if they don't parse). */
+  private googleWithoutDomainsNow(prev: Record<string, string>): boolean {
+    if (!googleNewlyEnabled({}, prev)) return false;
+    try {
+      return registryDomains(prev.AUTH_DOMAINS).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
   /** Belt and braces before every upload: hooks only reach a staging test install. */
   private assertHooksAllowed(variant: BundleVariant, testHooks: boolean): void {
     if (variant === "release") return;
@@ -4556,7 +4566,11 @@ export class WfpProvisioner {
       const vars = { ...nextVars };
       this.brokerVars(vars);
       const m = this.renderInputs(row, vars);
-      this.checkGoogleBroker(vars);
+      // An install already on google with no AUTH_DOMAINS (a self-serve
+      // create, googleWithoutDomains) keeps that shape through a vars change
+      // (mit-ai, R29 AUTH_PROVIDERS). Turning google on, or dropping the
+      // domains of an install that had them, is still refused.
+      this.checkGoogleBroker(vars, this.googleWithoutDomainsNow(prev));
       // T8 review M2: only create's broker step issues the signing key and
       // the first registry entry. Without them google can't work, and the
       // session cut would log everyone out for nothing.

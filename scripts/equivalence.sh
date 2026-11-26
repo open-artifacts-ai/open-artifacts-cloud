@@ -131,6 +131,8 @@ ALLOW=(
   scripts/ci/release-watch.ts
   scripts/ci/release-watch.test.ts
   scripts/ci/release-watch.fixture.json
+  .github/workflows/release-retry.yml
+  scripts/ci/release-retry.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }
