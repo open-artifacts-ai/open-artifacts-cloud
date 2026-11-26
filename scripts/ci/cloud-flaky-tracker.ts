@@ -664,34 +664,37 @@ function jobLog(exec: Exec, repo: string, id: number): string {
 export function collect(
   exec: Exec,
   run: RunInfo,
-  /** A run read in parts: the jobs already read and what they found. */
+  /** A run read in parts: the jobs already read (their sightings are stored). */
   resume?: Progress,
   /** False once no further job log may be read (the reconcile's budget). */
   canRead: () => boolean = () => true,
 ): {
+  /** The tests found in the jobs read this time. */
   found: Found[];
   notes: string[];
-  /** Set when canRead stopped it: every job read so far, and what they found. */
+  /** Set when it stopped part way: every job read so far. */
   partial?: Progress;
+  /** Why it stopped part way, when a read failed (else canRead stopped it). */
+  error?: Error;
 } {
   const base = `repos/${run.repo}/actions/runs/${run.runId}`;
   const last = JSON.parse(
     gh(exec, ["api", `${base}/attempts/${run.attempt}`]),
   ) as Attempt;
-  const found: Found[] = [...(resume?.found ?? [])];
+  const found: Found[] = [];
   const read = new Set(resume?.jobs ?? []);
   const notes: string[] = [];
-  const progress = (): Progress => ({ jobs: [...read], found: [...found] });
+  const partial = (): Progress => ({ jobs: [...read] });
   // A fork's run (a PR from another repo) counts too. Its logs are only read
   // as text: parseJob() takes test names from them, and inert() makes those
   // safe before they are written anywhere. Nothing from the run is executed.
   try {
     for (let a = 1; a < run.attempt; a++)
-      if (readAttempt(a)) return { found, notes, partial: progress() };
+      if (readAttempt(a)) return { found, notes, partial: partial() };
   } catch (e) {
-    // A failure part way (a 503 on one log, say) keeps what was read before
-    // it, so a retry resumes at the read that failed.
-    throw new PartialError((e as Error).message, progress());
+    // A failure part way (a 503 on one log, say): what was read before it is
+    // still recorded, and a retry resumes at the read that failed.
+    return { found, notes, partial: partial(), error: e as Error };
   }
   return { found, notes };
 
@@ -727,8 +730,9 @@ export function collect(
 }
 
 /**
- * A collect() that failed part way: the error, and what it read before it,
- * which the reconcile saves so a retry resumes at the read that failed.
+ * A run whose reads failed part way (track() recorded what it read before):
+ * the error, and the jobs read, which the reconcile saves so a retry resumes
+ * at the read that failed. Only a read of the run raises it.
  */
 export class PartialError extends Error {
   readonly progress: Progress;
@@ -1241,12 +1245,34 @@ export function track(o: {
 }): {
   done: Done[];
   notes: string[];
-  /** Stopped by canRead: nothing written yet; save this and resume later. */
+  /**
+   * Stopped by canRead part way: what it read is recorded (and filed), and
+   * the run is not marked yet; save this and resume later.
+   */
   partial?: Progress;
 } {
+  const got = collect(o.exec, o.run, o.resume, o.canRead);
+  // A run read in parts records (and files) each part's sightings as it is
+  // read, deduped by run and test like any sighting; it is marked only once
+  // every job is read. A part that found nothing writes nothing.
+  const whole = !got.partial;
+  const r =
+    whole || got.found.length
+      ? trackFound(o, got.found, got.notes, whole)
+      : { done: [], notes: got.notes };
+  if (got.error && got.partial)
+    throw new PartialError(got.error.message, got.partial);
+  return got.partial ? { ...r, partial: got.partial } : r;
+}
+
+/** Records and files the tests found; marks the run only when it is whole. */
+function trackFound(
+  o: { exec: Exec; run: RunInfo; nowMs: number },
+  found: Found[],
+  notes: string[],
+  whole: boolean,
+): { done: Done[]; notes: string[] } {
   const { exec, run } = o;
-  const { found, notes, partial } = collect(exec, run, o.resume, o.canRead);
-  if (partial) return { done: [], notes, partial };
   if (!found.length) return markNoTest(exec, run, o.nowMs, notes);
   ensureLabel(
     exec,
@@ -1311,10 +1337,11 @@ export function track(o: {
       { write: true },
     );
   const finish = () => {
-    if (!marked && filing.length) post(runDoneComment(run));
+    if (!marked && filing.length && whole) post(runDoneComment(run));
     return { done, notes };
   };
-  for (const body of storeComments(run, fresh, !filing.length)) post(body);
+  for (const body of storeComments(run, fresh, !filing.length && whole))
+    post(body);
   const summarize = filing.length > MAX_ISSUES_PER_RUN;
   for (const a of actions) {
     if (a.kind === "record") {
@@ -1704,8 +1731,6 @@ export function reconcile(o: {
   // Failed reads of runs (the run, attempts, jobs, logs) may use at most half
   // the log budget: past that, no run that failed before is tried again.
   const failCap = Math.floor(logCap / 2);
-  // The last failed gh call, while no later one has worked, and its error.
-  let lastFail: { args: string[]; stderr: string } | null = null;
   let outOfLogs = false;
   const RUN_READ = /^repos\/[^/]+\/[^/]+\/actions\/(runs\/\d+|jobs\/\d+\/logs)/;
   const LOG = /\/actions\/jobs\/\d+\/logs$/;
@@ -1727,7 +1752,6 @@ export function reconcile(o: {
     if (log) spent.logs++;
     const r = o.exec(cmd, args);
     if (r.code !== 0 && args.some((a) => RUN_READ.test(a))) spent.failedReads++;
-    lastFail = r.code === 0 ? null : { args, stderr: r.stderr };
     return r;
   };
   const notes: string[] = [];
@@ -1831,10 +1855,14 @@ export function reconcile(o: {
       continue;
     }
     started++;
-    lastFail = null;
     const k = key(r);
+    // A failure while reading the run (listedRun, or collect() inside
+    // track(), which raises PartialError) is the only kind that can be a
+    // strike.
+    let reading = true;
     try {
       const l = "name" in r ? r : listedRun(exec, repo, r.id, r.attempt);
+      reading = false;
       const run = runInfo({
         repo,
         workflow: l.name,
@@ -1888,12 +1916,9 @@ export function reconcile(o: {
       }
       fails[k] = (fails[k] ?? 0) + 1;
       failedAt[k] = nowAt;
-      const failedCall = lastFail as { args: string[]; stderr: string } | null;
       // Only a run found gone (404 or 410) is a strike; a 5xx, timeout or
       // rate limit just waits.
-      const unread =
-        !!failedCall?.args.some((a) => RUN_READ.test(a)) &&
-        GONE.test(failedCall.stderr);
+      const unread = (reading || e instanceof PartialError) && GONE.test(why);
       const n = (tries[k] ?? 0) + (unread ? 1 : 0);
       if (unread && n >= UNREADABLE_TRIES) {
         post(unreadableComment(repo, k, why));
@@ -2061,31 +2086,26 @@ export function pendingFailedAt(
   return out;
 }
 
-/** A run read in parts: the job logs already read, and what they found. */
-export type Progress = { jobs: number[]; found: Found[] };
-
-const hex = (s: string) => Buffer.from(s, "utf8").toString("hex");
-const unhex = (h: string) => Buffer.from(h, "hex").toString("utf8");
-const SUITES: readonly Suite[] = ["t19", "redline", "vitest", "e2e"];
+/**
+ * A run read in parts: the jobs whose logs were read, and whose sightings are
+ * recorded (and filed) already.
+ */
+export type Progress = { jobs: number[] };
 
 /**
  * The store comment that saves a run read in parts, so the next reconcile
- * resumes it: `kind: progress`, `run`, a `job` per job log read, and a
- * `found` per test found (its JSON as hex, so no text from a log reaches a
- * marker). The newest one for a run is read.
+ * resumes it: `kind: progress`, `run`, and a `job` per job whose log was read
+ * (its sightings are in the store already). Numbers only. The newest one for
+ * a run is read.
  */
 export const progressComment = (key: string, p: Progress) =>
   [
-    `The flaky tracker read ${p.jobs.length} job logs of run ${key} so far; the next reconcile reads the rest.`,
+    `The flaky tracker read ${p.jobs.length} job logs of run ${key} so far and recorded their sightings; the next reconcile reads the rest.`,
     "",
     markerBlock([
       ["kind", "progress"],
       ["run", key],
       ...p.jobs.map((j): [string, string] => ["job", String(j)]),
-      ...p.found.map((x): [string, string] => [
-        "found",
-        hex(JSON.stringify(x)),
-      ]),
     ]),
   ].join("\n");
 
@@ -2098,40 +2118,10 @@ export function progressOf(comments: StoreComment[]): Map<string, Progress> {
     if (m?.get("kind")?.[0] !== "progress") continue;
     const key = m.get("run")?.[0] ?? "";
     if (!/^\d{1,20}\/\d{1,4}$/.test(key)) continue;
-    const p: Progress = { jobs: [], found: [] };
+    const jobs: number[] = [];
     for (const j of m.get("job") ?? [])
-      if (/^\d{1,20}$/.test(j)) p.jobs.push(Number(j));
-    for (const h of m.get("found") ?? []) {
-      if (!/^[0-9a-f]{2,20000}$/.test(h)) continue;
-      try {
-        const x = JSON.parse(unhex(h)) as Found;
-        if (
-          SUITES.includes(x.f?.suite) &&
-          typeof x.f.id === "string" &&
-          typeof x.f.title === "string" &&
-          (x.f.file === undefined || typeof x.f.file === "string") &&
-          /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(x.sighting?.at ?? "") &&
-          Number.isSafeInteger(x.sighting.run) &&
-          Number.isSafeInteger(x.sighting.attempt)
-        )
-          p.found.push({
-            f: {
-              suite: x.f.suite,
-              id: x.f.id,
-              title: x.f.title,
-              ...(x.f.file === undefined ? {} : { file: x.f.file }),
-            },
-            sighting: {
-              at: x.sighting.at,
-              run: x.sighting.run,
-              attempt: x.sighting.attempt,
-            },
-          });
-      } catch {
-        // Not ours: skip it.
-      }
-    }
-    out.set(key, p);
+      if (/^\d{1,20}$/.test(j)) jobs.push(Number(j));
+    out.set(key, { jobs });
   }
   return out;
 }

@@ -3007,8 +3007,9 @@ describe("a run with more job logs than one reconcile may read", () => {
     expect(first.notes).toContain(
       `run 900/2: read ${RECONCILE_LOGS} job logs so far; the next reconcile reads the rest`,
     );
-    // Nothing is recorded until the run is read whole.
-    expect(parseStore(comments()).size).toBe(0);
+    // The 25 read are recorded at once; the run is not marked yet.
+    expect(parseStore(comments()).size).toBe(RECONCILE_LOGS);
+    expect([...storedRuns(comments())]).toEqual([]);
     logs = 0;
     g.clock.now = NOW + HOUR;
     const second = reconcile({ exec, repo: "o/cloud", nowMs: NOW + HOUR });
@@ -3142,5 +3143,70 @@ describe("a run whose logs fail part way, or whose jobs span pages", () => {
     const comments = g.state().stores.flatMap((st) => st.comments);
     expect(parseStore(comments).size).toBe(1);
     expect([...storedRuns(comments)]).toEqual(["900/2"]);
+  });
+});
+
+describe("a big run with many failures per log", () => {
+  it("the Prover's case: 32 jobs with 10 failures each records every sighting across reconciles, and its progress stays tiny", () => {
+    const JOBS = 32;
+    const PER = 10;
+    const logOf = (n: number) =>
+      [
+        "2026-11-19T20:59:55.6142298Z ##[group]test tests/redline",
+        ...Array.from({ length: PER }, (_, i) =>
+          vfail("test/big.test.ts", `job ${n}`, `case ${i}`),
+        ),
+      ].join("\n");
+    const g = liveGh({
+      listed: { "ci.yml": [ci1(900)] },
+      jobAt: { 900: NOW - HOUR },
+      log: CI_LOG,
+    });
+    let logs = 0;
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      if (/\/runs\/900\/attempts\/1\/jobs/.test(a))
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            total_count: JOBS,
+            jobs: Array.from({ length: JOBS }, (_, i) => ({
+              id: 100 + i,
+              name: `overlay (${i})`,
+              conclusion: "failure",
+              completed_at: new Date(NOW - HOUR).toISOString(),
+            })),
+          }),
+          stderr: "",
+        };
+      const m = /\/actions\/jobs\/(\d+)\/logs/.exec(a);
+      if (m) {
+        logs++;
+        return { code: 0, stdout: logOf(Number(m[1]) - 100), stderr: "" };
+      }
+      return g.exec(cmd, args);
+    };
+    const comments = () => g.state().stores.flatMap((st) => st.comments);
+    const results: string[] = [];
+    for (let e = 0; e < 3; e++) {
+      g.clock.now = NOW + e * HOUR;
+      logs = 0;
+      const r = reconcile({ exec, repo: "o/cloud", nowMs: g.clock.now });
+      expect(logs).toBeLessThanOrEqual(RECONCILE_LOGS);
+      results.push(r.tracked.length ? "tracked" : r.left ? "left" : "none");
+    }
+    expect(results).toEqual(["left", "tracked", "none"]);
+    const seen = parseStore(comments());
+    expect(seen.size).toBe(JOBS * PER);
+    expect([...seen.values()].every((x) => x.length === 1)).toBe(true);
+    expect([...storedRuns(comments())]).toEqual(["900/2"]);
+    // The progress is job ids only: far under any limit.
+    const progress = comments().filter(
+      (c) => readMarkers(c.body)?.get("kind")?.[0] === "progress",
+    );
+    expect(progress.length).toBeGreaterThan(0);
+    for (const c of progress) expect(c.body.length).toBeLessThan(2000);
+    // And no comment passes GitHub's limit.
+    for (const c of comments()) expect(c.body.length).toBeLessThan(65536);
   });
 });
