@@ -417,7 +417,6 @@ describe("deploy-hosted-platform.yml", () => {
       "Every platform Worker runs the tag",
       "Mark the platform verified",
       "Wake the fleet",
-      "Wait for the fleet to reach every install",
       "Clear the platform verified marks (break-glass)",
       "The deploy token's expiry",
     ]);
@@ -1110,59 +1109,23 @@ describe("deploy-hosted-platform.yml", () => {
     ).toBe(false);
   });
 
-  // cloud #264, for release-watch (#456): the rollout's finish as a step a
-  // run reader can see with the default token.
-  it("prod waits, reads only, for the fleet's done mark after the wake; Fleet done runs only once it is there; neither fails the run", () => {
-    const wt = named("Wait for the fleet to reach every install");
-    const dn = named("Fleet done");
-    const i = (n: string) => steps.indexOf(named(n));
-    expect(i(wt.name)).toBe(i("Wake the fleet") + 1);
-    expect(i(dn.name)).toBe(i(wt.name) + 1);
-    expect(wt.id).toBe("fleet_done");
-    expect(wt["continue-on-error"]).toBe(true);
-    expect(wt["timeout-minutes"]).toBeLessThanOrEqual(12);
-    expect(wt.env).toEqual({
-      DEPLOY_ENV: "${{ inputs.env }}",
-      TAG: "${{ inputs.tag }}",
-      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
-    });
-    expect(wt.run).toContain(
-      'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG"',
-    );
-    expect(wt.run).toContain('echo "done=true"; echo "at=');
-    expect(wt.run).toContain("::warning::");
-    const marked = { ...ran, mark_verified: "success" };
-    const capable = { wake_capable: { capable: "true" } };
+  // cloud #264, Leo's pick "No, the next deploy is enough" (2026-11-26): no
+  // run waits for its own rollout's finish, so none holds hosted-platform-prod
+  // polling D1. The next prod run records it (below).
+  it("no step waits for the fleet's done mark: no fleet-done read, no Fleet done step", () => {
     expect(
-      evalIf(wt, { env: "prod", targets: FULL }, marked, true, capable),
-    ).toBe(true);
-    // An older tag with no fleet-wake consumer never writes fleet_done: no
-    // 10-minute wait holding hosted-platform-prod (the Prover's case).
-    expect(
-      evalIf(wt, { env: "prod", targets: FULL }, marked, true, {
-        wake_capable: { capable: "false" },
-      }),
-    ).toBe(false);
-    expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(false);
-    // Staging's chain waits on this run: no wait there.
-    expect(
-      evalIf(wt, { env: "staging", targets: FULL }, marked, true, capable),
-    ).toBe(false);
-    expect(
-      evalIf(
-        wt,
-        { env: "prod", targets: FULL },
-        { ...ran, mark_verified: "skipped" },
+      steps.find(
+        (st) => st.name === "Wait for the fleet to reach every install",
       ),
-    ).toBe(false);
-    expect(dn.if).toBe("${{ steps.fleet_done.outputs.done == 'true' }}");
-    expect(dn.env.AT).toBe("${{ steps.fleet_done.outputs.at }}");
-    expect(JSON.stringify(dn)).not.toContain("secrets.");
+    ).toBeUndefined();
+    expect(steps.find((st) => st.name === "Fleet done")).toBeUndefined();
+    expect(text).not.toMatch(/platform-db\.ts fleet-done "/);
+    expect(text).not.toContain("steps.fleet_done");
   });
 
-  // The Prover's case: a rollout that finishes after the 10-minute wait, even
-  // after the next run's read. Every prod run, before deploying, reads every
-  // mark still held, so the first run after the finish records it.
+  // Every rollout's finish, even one after the next run's read (the Prover's
+  // case): every prod run, before deploying, reads every mark still held, so
+  // the first run after the finish records it.
   it("a late fleet finish: every prod run reads every fleet_done mark still held, before deploying, and records them by name", () => {
     const rd = named("Read the fleet finish of earlier releases");
     const i = (n: string) => steps.indexOf(named(n));

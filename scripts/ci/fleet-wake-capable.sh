@@ -4,7 +4,7 @@
 # deploy-hosted-platform.sh makes before creating that queue. An older tag
 # (one from before the wake, such as a recovery deploy) declares no consumer
 # and never writes fleet_done, so deploy-hosted-platform.yml skips "Wake the
-# fleet" and "Wait for the fleet to reach every install" for it, and the
+# fleet" for it, and the
 # 2-minute tick moves the fleet as before. An unreadable config counts as not
 # capable (the tick is the backup). Prints one line; writes capable=true or
 # capable=false to $GITHUB_OUTPUT when set. Always exits 0 on valid usage.

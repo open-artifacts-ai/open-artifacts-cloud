@@ -349,8 +349,8 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/hosted-resource-ids.sh" "$DEPLOY_ENV"
-      # Rollouts that finished after their own deploy's 10-minute wait (cloud
-      # #264, for release-watch #456): every prod run, before it deploys,
+      # Every rollout's finish (cloud #264, for release-watch #456): the
+      # deploy no longer waits for its own, so every prod run, before it deploys,
       # reads every fleet_done mark the platform D1 still holds (reads only,
       # the deploy's token; the scheduler keeps one a week after it is set),
       # so a finish that lands after any one run's read is recorded by the
@@ -612,38 +612,11 @@ jobs:
           TAG: ${{ inputs.tag }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bash "$RUNNER_TEMP/main-ci/fleet-wake.sh" "$DEPLOY_ENV" "$TAG"
-      # The rollout's finish (cloud #264), for release-watch (#456), which
-      # reads runs with the default token only: prod only (staging's chain
-      # waits on this run, and its smoke-off soak is 15 min), reads only, up
-      # to 10 min for the scheduler's fleet_done:<version> mark. "Fleet done"
-      # runs only once the mark is there, so its conclusion and end time are
-      # the signal, and it prints the mark's own time; neither step can fail
-      # the run. A finish after the wait is not lost: every later prod run
-      # reads every mark still held ("Fleet done of earlier releases", above).
-      - id: fleet_done
-        name: Wait for the fleet to reach every install
-        if: ${{ success() && inputs.env == 'prod' && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
-        continue-on-error: true
-        timeout-minutes: 12
-        env:
-          DEPLOY_ENV: ${{ inputs.env }}
-          TAG: ${{ inputs.tag }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          if out="$(node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG")"; then
-            printf '%s\n' "$out"
-            { echo "done=true"; echo "at=$(sed -n 's/^fleet_done_at=//p' <<< "$out")"; } >> "$GITHUB_OUTPUT"
-          else
-            printf '%s\n' "$out"
-            echo "::warning::the fleet did not report every install upgraded within 10 minutes; the 2-minute tick carries on"
-          fi
-      - name: Fleet done
-        if: ${{ steps.fleet_done.outputs.done == 'true' }}
-        env:
-          TAG: ${{ inputs.tag }}
-          AT: ${{ steps.fleet_done.outputs.at }}
-        run: echo "The fleet reached every install it waits for on $TAG at $AT"
+      # No wait for the rollout's finish (cloud #264). Leo picked "No, the
+      # next deploy is enough" (2026-11-26): the scheduler writes
+      # fleet_done:<version> the moment the last job ends, and the next prod
+      # run records it ("Fleet done of earlier releases", above), so this run
+      # never holds hosted-platform-prod polling for it.
       # A break-glass run (a partial list that deployed something) clears every
       # platform_verified mark, whatever its outcome: the platform is no longer
       # known to be one verified release, so the fleet holds until a full green

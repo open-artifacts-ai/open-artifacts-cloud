@@ -12,7 +12,7 @@
 // upgrade starts on the deploy's message; its end probes it and runs the
 // smoke in that same pass, and the rest are queued the moment the smoke
 // passes; the last of the rest to end writes fleet_done:<version>, which the
-// deploy reads. Nothing waits: a pass that only time can finish (a probe or
+// next prod deploy records. Nothing waits: a pass that only time can finish (a probe or
 // smoke to repeat, the lease held, a failed run) asks its message back with a
 // backoff, the one wait allowed. Every other message is acked: what is left
 // ends with a job, and that job's end is the next message.

@@ -181,8 +181,8 @@ export const FLEET_BEHIND_PREFIX = "fleet_behind:";
  * install settled, and every install it waits for (eligible, busy or not) on
  * the version or above and idle: a busy install never counts as upgraded. Installs the
  * fleet leaves out (broken, suspended, paused, red-line) are not waited on;
- * version_skew reports them. Set once; the deploy reads it (platform-db.ts
- * fleet-done).
+ * version_skew reports them. Set once; the next prod deploy records it
+ * (platform-db.ts fleet-done-all).
  */
 export const FLEET_DONE_PREFIX = "fleet_done:";
 
