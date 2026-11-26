@@ -72,7 +72,8 @@
 // group, and a dropped tracker run would lose its sightings. So the same
 // workflow also runs hourly with --reconcile (see reconcile()): it tracks
 // every run updated in the last RECONCILE_HOURS hours (created within
-// RERUN_DAYS, how long GitHub allows a rerun) that passed after a failed
+// RERUN_DAYS plus RECONCILE_HOURS; GitHub allows a rerun for RERUN_DAYS)
+// that passed after a failed
 // attempt and that the store doesn't hold yet, by the same rules and code.
 //
 // Usage: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
@@ -1445,9 +1446,10 @@ export function listCreated(
 }
 
 /**
- * A watched workflow's runs created in the last RERUN_DAYS days (a run can be
- * rerun that long after it was created) whose latest attempt passed and that
- * were updated in the last RECONCILE_HOURS. Whether a failure counts toward
+ * A watched workflow's runs created in the last RERUN_DAYS days plus
+ * RECONCILE_HOURS (a run can be rerun up to RERUN_DAYS after it was created,
+ * and its rerun must stay listed for the whole update window) whose latest
+ * attempt passed and that were updated in the last RECONCILE_HOURS. Whether a failure counts toward
  * "twice in 7 days" is decided later, by the failed job's completion time,
  * never by the run's creation.
  */
@@ -1458,7 +1460,9 @@ export function listRuns(
   nowMs: number,
 ): ListedRun[] {
   const to = Math.floor(nowMs / 1000) * 1000;
-  const from = to - RERUN_DAYS * DAY_MS;
+  // A rerun can start up to RERUN_DAYS after creation, and a run updated
+  // any time in the last RECONCILE_HOURS must still be in the range.
+  const from = to - RERUN_DAYS * DAY_MS - RECONCILE_HOURS * 3600 * 1000;
   const touched = nowMs - RECONCILE_HOURS * 3600 * 1000;
   return listCreated(
     exec,
@@ -1488,7 +1492,7 @@ export function listRuns(
 /**
  * The hourly reconcile: a tracker run GitHub dropped (its queue full, or the
  * runner gone) leaves a run unrecorded. This lists the watched workflows'
- * runs created in the last RERUN_DAYS days and updated in the last
+ * runs created in the last RERUN_DAYS days plus RECONCILE_HOURS and updated in the last
  * RECONCILE_HOURS hours whose latest attempt passed after an earlier one
  * (listCreated splits a listing at GitHub's limit), and tracks each the store
  * doesn't hold yet (by run id and the attempt that passed) with the same code
@@ -1552,7 +1556,7 @@ function main(argv: string[]) {
     const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
     failed = r.failed;
     lines = [
-      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and updated in the last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
+      `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS} days and ${RECONCILE_HOURS} hours and updated in the last ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
     ];

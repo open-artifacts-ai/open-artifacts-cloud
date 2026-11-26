@@ -1331,11 +1331,12 @@ describe("reconcile", () => {
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
     expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
-    // Created in the last 30 days, when GitHub still allows a rerun; one
+    // Created in the last 30 days and 26 hours (a rerun up to 30 days after
+    // creation, updated in the last 26 hours); one
     // page each, as neither reaches 1,000 runs.
     expect(RERUN_DAYS).toBe(30);
     const range = encodeURIComponent(
-      "2026-10-27T12:00:00Z..2026-11-26T12:00:00Z",
+      "2026-10-26T10:00:00Z..2026-11-26T12:00:00Z",
     );
     expect(lists).toHaveLength(2);
     for (const [i, file] of ["ci.yml", "redline-staging.yml"].entries()) {
@@ -1366,8 +1367,11 @@ describe("reconcile", () => {
           ),
           // Created 25 days ago: still inside GitHub's 30-day rerun period.
           row({ ...ci, id: 902 }, { created: 25 * DAY, updated: 3 * HOUR }),
-          // Created 31 days ago: GitHub can't rerun it any more.
-          row({ ...ci, id: 903 }, { created: 31 * DAY, updated: 3 * HOUR }),
+          // Created 31 days and 3 hours ago: past 30 days plus 26 hours.
+          row(
+            { ...ci, id: 903 },
+            { created: 31 * DAY + 3 * HOUR, updated: 3 * HOUR },
+          ),
           // Updated 27 hours ago: an earlier reconcile had it.
           row({ ...ci, id: 904 }, { created: 2 * DAY, updated: 27 * HOUR }),
           // Passed on its first attempt: nothing to track.
@@ -1380,6 +1384,25 @@ describe("reconcile", () => {
     ).toEqual([
       [901, 3],
       [902, 2],
+    ]);
+  });
+
+  it("finds a legal rerun that passed 29d 23h 55m after creation, scanned 10 minutes later", () => {
+    const MIN = 60 * 1000;
+    const late = {
+      created: 10 * MIN + 29 * DAY + 23 * HOUR + 55 * MIN,
+      updated: 10 * MIN,
+    };
+    const g = fakeGh({
+      listed: { "ci.yml": [row({ ...gate, name: "CI", attempt: 3 }, late)] },
+    });
+    expect(
+      listRuns(g.exec, "o/cloud", "CI", NOW).map((r) => [r.id, r.attempt]),
+    ).toEqual([[900, 3]]);
+    // Still found until its update leaves the 26-hour window.
+    const later = NOW + 25 * HOUR;
+    expect(listRuns(g.exec, "o/cloud", "CI", later).map((r) => r.id)).toEqual([
+      900,
     ]);
   });
 
@@ -1404,7 +1427,7 @@ describe("reconcile", () => {
 
   it("splits a range whose listing reaches 1,000 runs, so none is missed", () => {
     // 999 runs that passed first time in the last day, and the oldest one, a
-    // rerun from 20 days ago: 1,000 in the 30 days, GitHub's limit.
+    // rerun from 20 days ago: 1,000 in the range, GitHub's limit.
     const once = { ...gate, attempt: 1 };
     const g = fakeGh({
       listed: {
@@ -1420,9 +1443,9 @@ describe("reconcile", () => {
       listRuns(g.exec, "o/cloud", "redline-staging", NOW).map((r) => r.id),
     ).toEqual([900]);
     expect(ranges(g.calls)).toEqual([
-      "2026-10-27T12:00:00Z..2026-11-26T12:00:00Z",
-      "2026-10-27T12:00:00Z..2026-11-11T12:00:00Z",
-      "2026-11-11T12:00:01Z..2026-11-26T12:00:00Z",
+      "2026-10-26T10:00:00Z..2026-11-26T12:00:00Z",
+      "2026-10-26T10:00:00Z..2026-11-10T23:00:00Z",
+      "2026-11-10T23:00:01Z..2026-11-26T12:00:00Z",
     ]);
   });
 

@@ -17,7 +17,8 @@
 # test names in them) is data: passed through env, never put in an
 # expression inside a script, and made inert before it is written to an issue.
 # Hourly, the same job reconciles: it tracks every run of the watched
-# workflows created in the last 30 days (how long GitHub allows a rerun) and
+# workflows created in the last 30 days and 26 hours (GitHub allows a rerun
+# for 30 days; the 26 hours keep a late rerun listed) and
 # updated in the last 26 hours that passed after a failed attempt and is not
 # in the store yet (same rules, same code), so a tracker run GitHub dropped
 # loses no sighting. A listing of 1,000 runs or more (GitHub's limit for one
