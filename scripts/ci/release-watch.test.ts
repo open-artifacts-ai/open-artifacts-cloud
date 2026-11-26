@@ -9,6 +9,7 @@ import type { Exec } from "./gh-retry.ts";
 import {
   BUILT_RE,
   type Config,
+  carryMerges,
   commentBody,
   commentKey,
   commentPlan,
@@ -23,6 +24,7 @@ import {
   fleetStep,
   fromHistory,
   type HistoryEntry,
+  historyEntry,
   ISSUE_TITLE,
   type Job,
   lateFleetDone,
@@ -42,6 +44,7 @@ import {
   type Release,
   type Run,
   STAGING_RE,
+  settleSuperseded,
   stats,
   step,
   stuck,
@@ -358,7 +361,7 @@ describe("timeline on the recorded chain", () => {
     expect(r.red).toEqual([]);
   });
 
-  it("a superseded release closes when the newer one is done, counting to then", () => {
+  it("a superseded release closes when the newer one is done, with no total of its own", () => {
     const now = T("23:59:00");
     const w = at(now);
     const sha = "e910df8c";
@@ -416,12 +419,18 @@ describe("timeline on the recorded chain", () => {
     ];
     const t = tl("v0.246.0", now, w);
     expect(t?.closedAt).toBe(T("23:57:00"));
-    expect(t?.e2e).toBe(244.8);
+    // The newer release's prod deploy is not its own: no total.
+    expect(t?.e2e).toBeUndefined();
+    expect(t?.e2eTo).toBe("superseded by v0.246.1");
     const r = world(now, w);
-    expect(r.history.find((h) => h.tag === "v0.246.0")).toMatchObject({
+    const h = r.history.find((x) => x.tag === "v0.246.0");
+    expect(h).toMatchObject({
       supersededBy: "v0.246.1",
       doneAt: T("23:57:00"),
+      e2eTo: "superseded by v0.246.1",
     });
+    expect(h).not.toHaveProperty("e2e");
+    expect(r.current.e2e.last20.map((x) => x.tag)).not.toContain("v0.246.0");
     expect(r.history.find((h) => h.tag === "v0.246.1")?.doneAt).toBe(
       T("23:57:00"),
     );
@@ -729,7 +738,28 @@ describe("a release across recovery runs (v0.246.1)", () => {
     expect(t?.e2e).toBe(237.5);
     const r = world(now, x);
     const h = r.history.find((e) => e.tag === "v0.246.1");
-    expect(h).toMatchObject({ doneAt: D("01:07:55"), e2e: 237.5 });
+    // Its deploy also carried v0.246.0's code: the total starts at that merge.
+    expect(h).toMatchObject({
+      doneAt: D("01:07:55"),
+      e2e: 315.7,
+      carries: ["v0.246.0"],
+      firstMergeAt: fx.merges["v0.246.0"],
+    });
+    // current.json matches: v0.246.1 keeps its own 237.5 min and adds the
+    // carried total and list; v0.246.0 says it was superseded.
+    const cur = (tag: string) => r.current.releases.find((x) => x.tag === tag);
+    expect(cur("v0.246.1")).toMatchObject({
+      e2e: 237.5,
+      carries: ["v0.246.0"],
+      firstMergeAt: fx.merges["v0.246.0"],
+      carriedE2e: 315.7,
+    });
+    expect(cur("v0.246.0")).toMatchObject({
+      supersededBy: "v0.246.1",
+      e2eTo: "superseded by v0.246.1",
+    });
+    expect(cur("v0.246.0")).not.toHaveProperty("e2e");
+    expect(cur("v0.246.0")).not.toHaveProperty("carriedE2e");
     expect(h).not.toHaveProperty("supersededBy");
     expect(h?.stages.staging_publish).toBe(2.5);
     // v0.246.0 never reached prod: superseded, closed by v0.246.1's prod deploy.
@@ -2146,6 +2176,248 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
   });
 });
 
+// The Prover's backfill of 26 November (comment 7194698887): four superseded
+// tags saved as "every install" with their successors' prod deploy times.
+// These are the history lines that backfill wrote.
+describe("superseded releases have no total of their own", () => {
+  const saved = [
+    '{"tag":"v0.247.0","mode":"pr","supersededBy":"v0.248.0","doneAt":"2026-11-26T05:07:38Z","e2e":362.7,"e2eTo":"every install","mergedAt":"2026-11-25T23:04:59Z","publishedAt":"2026-11-26T01:44:15Z","stages":{"tag":159.3,"pin_open":2,"pin_merge":9.3,"hosted_release":3.3,"staging_publish":2.7,"staging_deploy":4.6,"redline_queue":0.5}}',
+    '{"tag":"v0.248.0","mode":"pr","supersededBy":"v0.248.1","doneAt":"2026-11-26T05:07:38Z","e2e":188.2,"e2eTo":"every install","mergedAt":"2026-11-26T01:59:24Z","publishedAt":"2026-11-26T02:02:25Z","stages":{"tag":3,"pin_open":1.8,"pin_merge":31.6,"hosted_release":3.1,"staging_publish":2.5,"staging_deploy":3.6,"redline_queue":0.4}}',
+    '{"tag":"v0.248.1","mode":"pr","supersededBy":"v0.248.2","doneAt":"2026-11-26T05:07:38Z","e2e":146.9,"e2eTo":"every install","mergedAt":"2026-11-26T02:40:45Z","publishedAt":"2026-11-26T02:56:42Z","stages":{"tag":16,"pin_open":2.1,"pin_merge":14.6,"hosted_release":3.1,"staging_publish":2.8,"staging_deploy":4,"redline_queue":0.5}}',
+    '{"tag":"v0.248.2","mode":"pr","doneAt":"2026-11-26T05:07:38Z","e2e":105.9,"e2eTo":"prod deploy (fleet not yet measured)","mergedAt":"2026-11-26T03:21:47Z","publishedAt":"2026-11-26T04:25:40Z","stages":{"tag":63.9,"prod_deploy":4.5}}',
+    '{"tag":"v0.249.0","mode":"pr","supersededBy":"v0.249.1","doneAt":"2026-11-26T09:32:30Z","e2e":281.2,"e2eTo":"every install","mergedAt":"2026-11-26T04:51:17Z","publishedAt":"2026-11-26T07:08:49Z","stages":{"tag":137.5,"prod_deploy":3.8,"fleet":1}}',
+    '{"tag":"v0.249.1","mode":"pr","doneAt":"2026-11-26T09:32:30Z","e2e":130.1,"e2eTo":"prod deploy (fleet not yet measured)","mergedAt":"2026-11-26T07:22:24Z","publishedAt":"2026-11-26T07:44:21Z","stages":{"tag":22,"prod_deploy":3.8}}',
+  ].join("\n");
+  const four = ["v0.247.0", "v0.248.0", "v0.248.1", "v0.249.0"];
+  const by: Record<string, string> = {
+    "v0.247.0": "v0.248.0",
+    "v0.248.0": "v0.248.1",
+    "v0.248.1": "v0.248.2",
+    "v0.249.0": "v0.249.1",
+  };
+
+  it("saved history is corrected: superseded by its successor, no total, no prod or fleet time", () => {
+    const h = parseHistory(saved);
+    for (const tag of four) {
+      const x = settleSuperseded(h.find((e) => e.tag === tag) as HistoryEntry);
+      expect(x.e2eTo, tag).toBe(`superseded by ${by[tag]}`);
+      expect(x, tag).not.toHaveProperty("e2e");
+      expect(x.stages, tag).not.toHaveProperty("prod_deploy");
+      expect(x.stages, tag).not.toHaveProperty("fleet");
+    }
+    // v0.249.0 had 281.2 min ending at v0.249.1's prod deploy (09:32:30Z).
+    expect(
+      settleSuperseded(h.find((e) => e.tag === "v0.249.0") as HistoryEntry),
+    ).toEqual({
+      tag: "v0.249.0",
+      mode: "pr",
+      supersededBy: "v0.249.1",
+      doneAt: "2026-11-26T09:32:30Z",
+      e2eTo: "superseded by v0.249.1",
+      mergedAt: "2026-11-26T04:51:17Z",
+      publishedAt: "2026-11-26T07:08:49Z",
+      stages: { tag: 137.5 },
+    });
+    // Releases that had their own prod deploy are unchanged.
+    const own = h.find((e) => e.tag === "v0.249.1") as HistoryEntry;
+    expect(settleSuperseded(own)).toBe(own);
+  });
+
+  it("a run carrying that history saves the corrected lines; each deploy counts once, from the earliest merge it carries", () => {
+    const h = parseHistory(saved);
+    const r = compute({
+      releases: [],
+      runs: [],
+      prs: [],
+      merges: {},
+      history: h,
+      config,
+      now: "2026-11-26T14:00:00Z",
+    });
+    for (const tag of four) {
+      const x = r.history.find((e) => e.tag === tag);
+      expect(x?.e2eTo, tag).toBe(`superseded by ${by[tag]}`);
+      expect(x, tag).not.toHaveProperty("e2e");
+    }
+    // Only v0.248.2 and v0.249.1 have totals, each from the earliest merge
+    // among it and the releases it carries: v0.247.0's 23:04:59 and
+    // v0.249.0's 04:51:17.
+    expect(r.current.e2e.last20).toEqual([
+      {
+        tag: "v0.248.2",
+        e2e: 362.7,
+        to: "prod deploy (fleet not yet measured)",
+        carries: ["v0.247.0", "v0.248.0", "v0.248.1"],
+      },
+      {
+        tag: "v0.249.1",
+        e2e: 281.2,
+        to: "prod deploy (fleet not yet measured)",
+        carries: ["v0.249.0"],
+      },
+    ]);
+    expect(r.current.e2e).toMatchObject({ n: 2, p50: 281.2, p90: 362.7 });
+    const md = summary(r.current);
+    expect(md).not.toContain("| v0.249.0 |");
+    expect(md).toContain(
+      "| v0.249.1 (carries v0.249.0) | 281.2 | prod deploy (fleet not yet measured) | 261.2 over |",
+    );
+    expect(md).toContain(
+      "| v0.248.2 (carries v0.247.0, v0.248.0, v0.248.1) | 362.7 |",
+    );
+    expect(md).toContain(
+      "Superseded, with no prod deploy or total of their own (the release that carries them counts from their first merge): v0.247.0 by v0.248.0, v0.248.0 by v0.248.1, v0.248.1 by v0.248.2, v0.249.0 by v0.249.1.",
+    );
+  });
+
+  it("the totals are over the newest 20 measured deliveries: superseded tags never push one out", () => {
+    // The Prover's backfill from 20 November: 29 history rows, 16 measured
+    // deliveries (comment 7195373309). Taking the newest 20 rows first left
+    // 14 deliveries, dropping v0.239.2 (2692.9) and v0.241.0 (614).
+    const rows: [string, string, number | null][] = [
+      ["v0.235.2", "v0.238.0", null],
+      ["v0.236.0", "v0.238.0", null],
+      ["v0.237.0", "v0.238.0", null],
+      ["v0.238.0", "v0.239.0", null],
+      ["v0.239.0", "v0.239.2", null],
+      ["v0.239.1", "v0.239.2", null],
+      ["v0.239.2", "", 2692.9],
+      ["v0.240.0", "v0.241.0", null],
+      ["v0.241.0", "", 614],
+      ["v0.242.0", "v0.242.1", null],
+      ["v0.242.1", "", 4059.4],
+      ["v0.242.2", "", 979.2],
+      ["v0.243.0", "", 62.5],
+      ["v0.244.0", "", 61],
+      ["v0.244.1", "", 99.9],
+      ["v0.245.0", "", 44],
+      ["v0.245.1", "", 45.8],
+      ["v0.246.0", "v0.246.1", null],
+      ["v0.246.1", "", 315.7],
+      ["v0.247.0", "v0.248.0", null],
+      ["v0.248.0", "v0.248.1", null],
+      ["v0.248.1", "v0.248.2", null],
+      ["v0.248.2", "", 362.7],
+      ["v0.249.0", "v0.249.1", null],
+      ["v0.249.1", "", 281.2],
+      ["v0.250.0", "", 113.2],
+      ["v0.251.0", "", 161.9],
+      ["v0.251.1", "", 81.5],
+      ["v0.252.0", "", 101.8],
+    ];
+    const history: HistoryEntry[] = rows.map(([tag, by, e2e]) => ({
+      tag,
+      mode: "pr",
+      publishedAt: "2026-11-20T00:00:00Z",
+      doneAt: "2026-11-20T01:00:00Z",
+      ...(by ? { supersededBy: by } : {}),
+      ...(e2e !== null ? { e2e } : {}),
+      stages: {},
+    }));
+    expect(history).toHaveLength(29);
+    const s = stats(history, config);
+    expect(s.e2e).toMatchObject({ n: 16, p50: 113.2, p90: 2692.9 });
+    expect(s.e2e.last20.map((x) => x.tag)).toContain("v0.239.2");
+    expect(s.e2e.last20.map((x) => x.tag)).toContain("v0.241.0");
+    // The superseded list stays apart, over the same span.
+    expect(s.e2e.superseded.map((x) => x.tag)).toEqual([
+      "v0.240.0",
+      "v0.242.0",
+      "v0.246.0",
+      "v0.247.0",
+      "v0.248.0",
+      "v0.248.1",
+      "v0.249.0",
+    ]);
+    // With more than 20 deliveries, the newest 20 of them.
+    const many: HistoryEntry[] = Array.from({ length: 30 }, (_, i) => ({
+      tag: `v0.300.${i}`,
+      mode: "pr",
+      publishedAt: "2026-11-20T00:00:00Z",
+      doneAt: "2026-11-20T01:00:00Z",
+      ...(i % 3 === 0 ? { supersededBy: `v0.300.${i + 1}` } : { e2e: i }),
+      stages: {},
+    }));
+    const m = stats(many, config);
+    expect(m.e2e.n).toBe(20);
+    expect(m.e2e.last20[0]?.tag).toBe("v0.300.1");
+  });
+
+  it("the Prover's example: v0.249.1's total starts at v0.249.0's first merge, and the deploy counts once", () => {
+    const h = carryMerges(parseHistory(saved).map(settleSuperseded));
+    const v1 = h.find((e) => e.tag === "v0.249.1");
+    expect(v1).toMatchObject({
+      firstMergeAt: "2026-11-26T04:51:17Z",
+      carries: ["v0.249.0"],
+      e2e: 281.2,
+      doneAt: "2026-11-26T09:32:30Z",
+    });
+    // 04:51:17 to 09:32:30: 281 min 13 s, of which 151 min 07 s waited before
+    // v0.249.1's own first merge (07:22:24).
+    expect(ms(v1?.doneAt ?? "") - ms(v1?.firstMergeAt ?? "")).toBe(
+      (281 * 60 + 13) * 1000,
+    );
+    expect(ms(v1?.mergedAt ?? "") - ms(v1?.firstMergeAt ?? "")).toBe(
+      (151 * 60 + 7) * 1000,
+    );
+    expect(h.find((e) => e.tag === "v0.249.0")).not.toHaveProperty("e2e");
+    // Idempotent, and kept once the carried line leaves the history.
+    expect(carryMerges(h)).toEqual(h);
+    const alone = carryMerges(h.filter((e) => e.tag !== "v0.249.0"));
+    expect(alone.find((e) => e.tag === "v0.249.1")).toMatchObject({
+      firstMergeAt: "2026-11-26T04:51:17Z",
+      e2e: 281.2,
+    });
+  });
+
+  it("a backfill rebuilding a superseded release gives it no total: v0.249.0 is not v0.249.1's 09:32:30 deploy", () => {
+    const tls = supersede([
+      {
+        tag: "v0.249.0",
+        mode: "pr",
+        mergedAt: "2026-11-26T04:51:17Z",
+        publishedAt: "2026-11-26T07:08:49Z",
+        stages: [
+          { name: "tag", usual: 20.4, minutes: 137.5, state: "done" },
+          {
+            name: "pin_open",
+            usual: 2.15,
+            state: "current",
+            startedAt: "2026-11-26T07:08:49Z",
+            minutes: 30,
+          },
+        ],
+      },
+      {
+        tag: "v0.249.1",
+        mode: "pr",
+        mergedAt: "2026-11-26T07:22:24Z",
+        publishedAt: "2026-11-26T07:44:21Z",
+        stages: [
+          {
+            name: "prod_deploy",
+            usual: 4.8,
+            minutes: 3.8,
+            state: "done",
+            endedAt: "2026-11-26T09:32:30Z",
+          },
+        ],
+        doneAt: "2026-11-26T09:32:30Z",
+        e2e: 130.1,
+        e2eTo: NO_FLEET,
+      },
+    ]);
+    const old = tls.find((t) => t.tag === "v0.249.0");
+    expect(old).toMatchObject({
+      supersededBy: "v0.249.1",
+      closedAt: "2026-11-26T09:32:30Z",
+      e2eTo: "superseded by v0.249.1",
+    });
+    expect(old).not.toHaveProperty("e2e");
+    expect(historyEntry(old as never)).not.toHaveProperty("e2e");
+  });
+});
+
 describe("percentiles, history and ETA", () => {
   it("pct with n=0, 1 and 20", () => {
     expect(pct([], 50)).toBe(null);
@@ -2864,6 +3136,9 @@ describe("tick reads", () => {
     ]);
     expect(summary(r.current)).toContain(
       "| Release | Minutes | To | Against 20 min |",
+    );
+    expect(summary(r.current)).toContain(
+      'Measured from the merge to one of three endpoints, and each release says which: "every install", exact, from a later prod deploy\'s record of the scheduler\'s fleet finish ("Fleet done of earlier releases"); "every install (upper bound: the Fleet done step\'s end)", from an older deploy\'s own "Fleet done" step; or "prod deploy (fleet not yet measured)". Reported, never alerted on.',
     );
     expect(summary(r.current)).toContain(
       "| v0.245.1 | 45.8 | prod deploy (fleet not yet measured) | 25.8 over |",

@@ -187,7 +187,15 @@ export type Timeline = {
   supersededBy?: string;
   /** For a superseded release: when the newer release that carries it was done. */
   closedAt?: string;
+  /** Its own merge to its endpoint; none for a superseded release. */
   e2e?: number;
+  /**
+   * For a shipped release that carries superseded ones (carryMerges): them,
+   * the earliest first merge among it and them, and the total from there.
+   */
+  carries?: string[];
+  firstMergeAt?: string;
+  carriedE2e?: number;
 };
 export type HistoryEntry = {
   tag: string;
@@ -198,6 +206,13 @@ export type HistoryEntry = {
   supersededBy?: string;
   e2e?: number;
   e2eTo?: string;
+  /**
+   * For a release that shipped: the superseded releases whose code reached
+   * the installs only through its deploy, and the earliest first merge among
+   * it and them, where its total starts.
+   */
+  carries?: string[];
+  firstMergeAt?: string;
   stages: Record<string, number>;
 };
 export type Overrun = {
@@ -859,9 +874,11 @@ export function timeline(o: {
 }
 
 /**
- * Pure: a release that never reached prod once a newer one is pinned never
- * ships on its own (the chain moves to the newest tag). It closes when that
- * newer release is done, and its e2e counts to then. A release whose prod
+ * Pure: a release that never had its own prod deploy, because a newer one
+ * was pinned first, never ships on its own: it is "superseded by <newer>".
+ * It gets no prod or fleet time and no merge-to-every-install total (the
+ * newer release's deploy is not its own), so it never counts toward the
+ * target. It closes when that newer release is done. A release whose prod
  * deploy succeeded is never superseded, however its runs were matched.
  */
 export function supersede(tls: Timeline[]): Timeline[] {
@@ -882,11 +899,81 @@ export function supersede(tls: Timeline[]): Timeline[] {
       );
     if (!newer) return t;
     const closedAt = byTag.slice(i + 1).find((n) => n.doneAt)?.doneAt;
+    const { e2e: _, ...rest } = t;
     return {
-      ...t,
+      ...rest,
       supersededBy: newer.tag,
       closedAt,
-      e2e: closedAt ? mins(t.mergedAt ?? t.publishedAt, closedAt) : undefined,
+      e2eTo: supersededTo(newer.tag),
+    };
+  });
+}
+
+/** What a superseded release's total runs to: none, it says by which release. */
+export const supersededTo = (tag: string) => `superseded by ${tag}`;
+/** The stages a superseded release never had of its own. */
+const NOT_ITS_OWN = ["prod_deploy", "fleet"];
+
+/**
+ * Pure: a saved history entry as the rules now read it. A superseded one
+ * (from a backfill or an earlier run that gave it the newer release's prod
+ * deploy as its own total) gets no total and no prod or fleet time, and
+ * says "superseded by <newer>".
+ */
+export function settleSuperseded(h: HistoryEntry): HistoryEntry {
+  if (!h.supersededBy) return h;
+  const { e2e: _, ...rest } = h;
+  const stages = Object.fromEntries(
+    Object.entries(h.stages).filter(([k]) => !NOT_ITS_OWN.includes(k)),
+  );
+  return { ...rest, e2eTo: supersededTo(h.supersededBy), stages };
+}
+
+/**
+ * Pure: each shipped release carries the superseded releases whose chain of
+ * "superseded by" ends at it (their code reached the installs only through
+ * its deploy). Its merge-to-every-install total starts at the earliest first
+ * merge among it and them, so the older fixes' wait is kept, and the deploy
+ * is counted once: the carried ones keep no total of their own. A carry once
+ * recorded is kept (firstMergeAt only moves earlier), even after a carried
+ * line leaves the history.
+ */
+export function carryMerges(history: HistoryEntry[]): HistoryEntry[] {
+  const byTag = new Map(history.map((h) => [h.tag, h]));
+  const carrier = (h: HistoryEntry): string | undefined => {
+    const seen = new Set<string>();
+    let cur: HistoryEntry | undefined = h;
+    while (cur?.supersededBy && !seen.has(cur.tag)) {
+      seen.add(cur.tag);
+      const next = byTag.get(cur.supersededBy);
+      if (!next) return undefined;
+      if (!next.supersededBy) return next.tag;
+      cur = next;
+    }
+    return undefined;
+  };
+  const carried = new Map<string, HistoryEntry[]>();
+  for (const h of history) {
+    const c = h.supersededBy ? carrier(h) : undefined;
+    if (c) carried.set(c, [...(carried.get(c) ?? []), h]);
+  }
+  return history.map((h) => {
+    if (h.supersededBy) return h;
+    const with_ = carried.get(h.tag) ?? [];
+    if (with_.length === 0 && !h.carries) return h;
+    const tags = [
+      ...new Set([...(h.carries ?? []), ...with_.map((x) => x.tag)]),
+    ].sort(compareTags);
+    const merges = [h.firstMergeAt, h.mergedAt, ...with_.map((x) => x.mergedAt)]
+      .filter((x): x is string => !!x)
+      .sort((a, b) => ms(a) - ms(b));
+    const firstMergeAt = merges[0];
+    return {
+      ...h,
+      carries: tags,
+      ...(firstMergeAt
+        ? { firstMergeAt, e2e: mins(firstMergeAt, h.doneAt) }
+        : {}),
     };
   });
 }
@@ -897,7 +984,11 @@ export function historyEntry(t: Timeline): HistoryEntry | undefined {
   if (!doneAt) return undefined;
   const stages: Record<string, number> = {};
   for (const s of t.stages)
-    if (s.state === "done" && s.minutes !== undefined)
+    if (
+      s.state === "done" &&
+      s.minutes !== undefined &&
+      !(t.supersededBy && NOT_ITS_OWN.includes(s.name))
+    )
       stages[s.name] = s.minutes;
   return {
     tag: t.tag,
@@ -906,7 +997,7 @@ export function historyEntry(t: Timeline): HistoryEntry | undefined {
     publishedAt: t.publishedAt,
     doneAt,
     ...(t.supersededBy ? { supersededBy: t.supersededBy } : {}),
-    e2e: t.e2e,
+    ...(t.e2e !== undefined ? { e2e: t.e2e } : {}),
     ...(t.e2eTo ? { e2eTo: t.e2eTo } : {}),
     stages,
   };
@@ -934,7 +1025,10 @@ export type Stats = Record<
   string,
   { p50: number | null; p90: number | null; n: number; usual?: number }
 >;
-/** Pure: p50/p90 per stage and e2e over the newest `statsWindow` finished releases. */
+/**
+ * Pure: p50/p90 per stage over the newest `statsWindow` finished releases,
+ * and e2e over the newest `statsWindow` measured deliveries.
+ */
 export function stats(history: HistoryEntry[], config: Config) {
   const recent = [...history]
     .sort((a, b) => compareTags(a.tag, b.tag))
@@ -952,10 +1046,15 @@ export function stats(history: HistoryEntry[], config: Config) {
       ...(s.usual ? { usual: s.usual } : {}),
     };
   }
-  // A superseded release's e2e waited on a newer one: it is real wait, kept.
-  const e = recent
-    .map((x) => x.e2e)
-    .filter((x): x is number => typeof x === "number");
+  // The totals are over the newest statsWindow measured deliveries: a
+  // superseded release has no total of its own, so it is filtered out first
+  // and never pushes a delivery out of the window.
+  const delivered = [...history]
+    .sort((a, b) => compareTags(a.tag, b.tag))
+    .filter((x) => typeof x.e2e === "number")
+    .slice(-config.statsWindow);
+  const e = delivered.map((x) => x.e2e as number);
+  const oldest = delivered[0]?.tag;
   return {
     stages,
     e2e: {
@@ -963,15 +1062,25 @@ export function stats(history: HistoryEntry[], config: Config) {
       p90: pct(e, 90),
       n: e.length,
       target: config.e2eTarget,
-      last20: recent
-        .filter((x) => typeof x.e2e === "number")
-        .slice(-20)
-        .map((x) => ({
-          tag: x.tag,
-          e2e: x.e2e as number,
-          // History from before this field ran to the prod deploy.
-          to: x.e2eTo ?? NO_FLEET,
-        })),
+      // The superseded ones in the same span (newer than the oldest
+      // delivery, or carried by one), listed apart.
+      superseded: [...history]
+        .sort((a, b) => compareTags(a.tag, b.tag))
+        .filter(
+          (x) =>
+            x.supersededBy &&
+            oldest !== undefined &&
+            (compareTags(x.tag, oldest) >= 0 ||
+              delivered.some((d) => d.carries?.includes(x.tag))),
+        )
+        .map((x) => ({ tag: x.tag, by: x.supersededBy as string })),
+      last20: delivered.slice(-20).map((x) => ({
+        tag: x.tag,
+        e2e: x.e2e as number,
+        // History from before this field ran to the prod deploy.
+        to: x.e2eTo ?? NO_FLEET,
+        ...(x.carries?.length ? { carries: x.carries } : {}),
+      })),
     },
   };
 }
@@ -1339,8 +1448,9 @@ export function compute(o: {
   /** Only releases published since then are commented on (a backfill's old ones are not). */
   notifySince?: string;
 }) {
-  // A recorded total to the prod deploy takes a later fleet finish.
-  const prior = o.history.map((h) => upgradeFleet(h, o.runs));
+  // A recorded total to the prod deploy takes a later fleet finish, and a
+  // superseded release's saved total (a newer release's deploy) is dropped.
+  const prior = o.history.map((h) => upgradeFleet(settleSuperseded(h), o.runs));
   const known = new Map(prior.map((h) => [h.tag, h]));
   const all = supersede(
     o.releases.map((release) => {
@@ -1358,10 +1468,12 @@ export function compute(o: {
   );
   // Rebuilt ones only: a finished release stays as history has it.
   const tls = all.filter((t) => !known.has(t.tag));
-  const history = mergeHistory(
-    prior,
-    tls.map(historyEntry).filter((e): e is HistoryEntry => !!e),
-    o.config.historySize,
+  const history = carryMerges(
+    mergeHistory(
+      prior,
+      tls.map(historyEntry).filter((e): e is HistoryEntry => !!e),
+      o.config.historySize,
+    ),
   );
   const s = stats(history, o.config);
   const { over, red } = overruns(all, o.config);
@@ -1418,7 +1530,19 @@ export function compute(o: {
     unmeasured,
     overruns: over,
     red,
-    releases: tls,
+    // Each release keeps its own total; a shipped one that carries
+    // superseded releases also shows them and the total from their merge.
+    releases: tls.map((t) => {
+      const h = history.find((x) => x.tag === t.tag);
+      return h?.carries?.length && !t.supersededBy
+        ? {
+            ...t,
+            carries: h.carries,
+            ...(h.firstMergeAt ? { firstMergeAt: h.firstMergeAt } : {}),
+            ...(h.e2e !== undefined ? { carriedE2e: h.e2e } : {}),
+          }
+        : t;
+    }),
   };
   return { current, history, over, red, notify };
 }
@@ -1452,7 +1576,7 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
     "",
     `### Merge to every install, target ${c.e2e.target} min`,
     "",
-    `Measured from the merge to every install where the prod deploy recorded the fleet finish (its "${FLEET_DONE_STEP}" step), else to ${NO_FLEET}; each release says which. Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
+    `Measured from the merge to one of three endpoints, and each release says which: "every install", exact, from a later prod deploy's record of the scheduler's fleet finish ("Fleet done of earlier releases"); "${FLEET_UPPER}", from an older deploy's own "${FLEET_DONE_STEP}" step; or "${NO_FLEET}". Reported, never alerted on. p50 ${f(c.e2e.p50)}, p90 ${f(c.e2e.p90)}, n ${c.e2e.n}.`,
     "",
   );
   if (c.e2e.last20.length === 0) out.push("No finished release yet.", "");
@@ -1464,11 +1588,16 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
     for (const r of c.e2e.last20) {
       const d = Math.round((r.e2e - c.e2e.target) * 10) / 10;
       out.push(
-        `| ${r.tag} | ${r.e2e} | ${r.to} | ${d > 0 ? `${d} over` : "within"} |`,
+        `| ${r.tag}${r.carries ? ` (carries ${r.carries.join(", ")})` : ""} | ${r.e2e} | ${r.to} | ${d > 0 ? `${d} over` : "within"} |`,
       );
     }
     out.push("");
   }
+  if (c.e2e.superseded.length > 0)
+    out.push(
+      `Superseded, with no prod deploy or total of their own (the release that carries them counts from their first merge): ${c.e2e.superseded.map((x) => `${x.tag} by ${x.by}`).join(", ")}.`,
+      "",
+    );
   for (const u of c.unmeasured)
     out.push(`Measured only where recorded: ${u.name}, ${u.todo}.`);
   if (c.overruns.length > 0)
@@ -1494,7 +1623,10 @@ export function parseHistory(text: string): HistoryEntry[] {
         typeof e.publishedAt === "string" &&
         e.stages &&
         typeof e.stages === "object" &&
-        Object.values(e.stages).every((v) => typeof v === "number")
+        Object.values(e.stages).every((v) => typeof v === "number") &&
+        (e.carries === undefined ||
+          (Array.isArray(e.carries) &&
+            e.carries.every((t) => typeof t === "string" && TAG_RE.test(t))))
       )
         out.push(e);
     } catch {}
