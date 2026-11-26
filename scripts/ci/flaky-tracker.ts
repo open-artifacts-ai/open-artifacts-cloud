@@ -71,7 +71,8 @@
 // Reconcile: GitHub keeps a bounded queue of pending runs per concurrency
 // group, and a dropped tracker run would lose its sightings. So the same
 // workflow also runs hourly with --reconcile (see reconcile()): it tracks
-// every run of the last RECONCILE_HOURS hours that passed after a failed
+// every run updated in the last RECONCILE_HOURS hours (created within
+// WINDOW_DAYS) that passed after a failed
 // attempt and that the store doesn't hold yet, by the same rules and code.
 //
 // Usage: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
@@ -1394,7 +1395,13 @@ function listRuns(
   workflow: Workflow,
   nowMs: number,
 ): ListedRun[] {
-  const from = new Date(nowMs - RECONCILE_HOURS * 3600 * 1000)
+  // Created in the sighting window (WINDOW_DAYS: an older failure can't count
+  // toward "twice in 7 days"), and updated in the last RECONCILE_HOURS: a run
+  // rerun to green days after it was created is still found.
+  const from = new Date(nowMs - WINDOW_DAYS * DAY_MS)
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z");
+  const touched = new Date(nowMs - RECONCILE_HOURS * 3600 * 1000)
     .toISOString()
     .replace(/\.\d+Z$/, "Z");
   const out = gh(exec, [
@@ -1402,7 +1409,7 @@ function listRuns(
     "--paginate",
     `repos/${repo}/actions/workflows/${WORKFLOW_FILES[workflow]}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
     "--jq",
-    '.workflow_runs[] | select(.run_attempt > 1) | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title, (.head_repository.full_name // "")] | @json',
+    `.workflow_runs[] | select(.run_attempt > 1 and .updated_at >= "${touched}") | [.id, .run_attempt, .name, .event, .head_branch, .head_sha, .display_title, (.head_repository.full_name // "")] | @json`,
   ]);
   return out
     .split("\n")
@@ -1420,7 +1427,8 @@ function listRuns(
 /**
  * The hourly reconcile: a tracker run GitHub dropped (its queue full, or the
  * runner gone) leaves a run unrecorded. This lists the watched workflows'
- * runs created in the last RECONCILE_HOURS hours whose latest attempt passed
+ * runs created in the last WINDOW_DAYS days and updated in the last
+ * RECONCILE_HOURS hours whose latest attempt passed
  * after an earlier one, and tracks each the store doesn't hold yet (by run id
  * and the attempt that passed) with the same code as the event. A run the
  * store holds adds nothing and bumps nothing. A run that found no test (it

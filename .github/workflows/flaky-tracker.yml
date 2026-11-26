@@ -13,7 +13,7 @@
 # Runs from forks (a PR from another repo) are skipped: their logs are
 # written by code nobody here reviewed. The script checks it again.
 # Hourly, the same job reconciles: it tracks every run of the watched
-# workflows from the last 26 hours that passed after a failed attempt and is
+# workflows created in the last 7 days and updated in the last 26 hours that passed after a failed attempt and is
 # not in the store yet (same rules, same code), so a tracker run GitHub
 # dropped loses no sighting. A run already in the store adds nothing.
 # The default token only: it reads the run's jobs and logs and the commits of

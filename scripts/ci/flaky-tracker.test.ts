@@ -53,6 +53,7 @@ import {
   titleText,
   track,
   twiceInWindow,
+  WINDOW_DAYS,
 } from "./flaky-tracker.ts";
 import type { Exec } from "./gh-retry.ts";
 
@@ -1262,7 +1263,12 @@ describe("reconcile", () => {
     const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
     expect(r).toEqual({ tracked: [], notes: [], failed: 0 });
     const lists = g.calls.map((c) => c.args.join(" "));
-    const from = new Date(NOW - RECONCILE_HOURS * 3600 * 1000)
+    // Created in the 7-day sighting window, updated in the last 26 hours:
+    // a run rerun to green days after it was created is still found.
+    const from = new Date(NOW - WINDOW_DAYS * 24 * 3600 * 1000)
+      .toISOString()
+      .replace(/\.\d+Z$/, "Z");
+    const touched = new Date(NOW - RECONCILE_HOURS * 3600 * 1000)
       .toISOString()
       .replace(/\.\d+Z$/, "Z");
     expect(lists).toHaveLength(2);
@@ -1271,6 +1277,7 @@ describe("reconcile", () => {
         `repos/o/cloud/actions/workflows/${file}/runs?status=success&exclude_pull_requests=true&per_page=100&created=${encodeURIComponent(`>=${from}`)}`,
       );
       expect(lists[i]).toContain("--jq");
+      expect(lists[i]).toContain(`.updated_at >= "${touched}"`);
     }
     // Nothing to track: no store read, nothing written.
     expect(writes(g)).toEqual([]);
