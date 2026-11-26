@@ -13,10 +13,17 @@ import {
   caseName,
   codeSpan,
   e2ePackage,
+  escapeId,
   type Failure,
+  inert,
+  isSummaryOf,
+  issueKey,
+  issueTitle,
   keyOf,
   LABEL,
   MAX_ISSUES_PER_RUN,
+  MAX_STORE_COMMENTS,
+  markerBlock,
   mergeSightings,
   newIssueBody,
   parseJob,
@@ -27,15 +34,16 @@ import {
   parseVitest,
   plan,
   type RunInfo,
+  readMarkers,
   runFromArgs,
   type Sighting,
   STORE_AUTHOR,
+  STORE_BODY,
   STORE_LABEL,
-  STORE_MARKER,
   sightingLine,
   storeComment,
-  summaryMarker,
   TWICE_NOTE,
+  titleText,
   track,
   twiceInWindow,
 } from "./flaky-tracker.ts";
@@ -352,7 +360,7 @@ describe("plan: an issue only at the second run within 7 days", () => {
 
   it("bumps the open issue that carries the test's key, and never notes a run twice", () => {
     const issue = { number: 7, body: bodyWith([s800]) };
-    expect(issue.body).toContain(`<!-- flaky-key: ${keyOf(f.id)} -->`);
+    expect(issueKey(issue.body)).toBe(keyOf(f.id));
     expect(
       plan({ f, sighting: s900, stored: [s800] }, [issue], NOW),
     ).toMatchObject({
@@ -368,6 +376,30 @@ describe("plan: an issue only at the second run within 7 days", () => {
       issue: 7,
       why: "run 900 already noted",
     });
+  });
+
+  it("bumps only at 2 or more distinct runs in the last 7 days, this one counted", () => {
+    const issue = { number: 7, body: bodyWith([]) };
+    // This run alone, even at two attempts: no bump.
+    expect(
+      plan(
+        { f, sighting: s900, stored: [{ ...s900, attempt: 2 }] },
+        [issue],
+        NOW,
+      ).kind,
+    ).toBe("record");
+    // One earlier run within 7 days in the store: a bump.
+    expect(
+      plan({ f, sighting: s900, stored: [s800] }, [issue], NOW),
+    ).toMatchObject({
+      kind: "bump",
+      added: [s800, s900],
+    });
+    // The same earlier run, 8 days old: no bump.
+    const old: Sighting = { ...s800, at: "2026-11-18T11:00:00Z" };
+    expect(plan({ f, sighting: s900, stored: [old] }, [issue], NOW).kind).toBe(
+      "record",
+    );
   });
 
   it("does not bump an open issue on a lone sighting in the window", () => {
@@ -393,6 +425,7 @@ describe("plan: an issue only at the second run within 7 days", () => {
       false,
     );
     const b = bumpedBody(
+      f,
       bodyWith([at("2026-11-24T00:00:00Z", 1)]),
       [at("2026-11-24T00:00:00Z", 1), s900],
       NOW,
@@ -430,6 +463,114 @@ describe("plan: an issue only at the second run within 7 days", () => {
   });
 });
 
+describe("untrusted text can't forge a marker or escape a comment", () => {
+  const hostile: Failure = {
+    suite: "t19",
+    id: "t19:e2e/x.spec.ts:x --> @someone <!-- flaky-tracker-markers",
+    title:
+      "x ---> @someone #1 <!-- flaky-tracker-markers\nkind: summary\nrun: 900\n--> --!> -->",
+    file: "e2e/<!--a-->.spec.ts",
+  };
+  const forgedKey = `<!-- flaky-tracker-markers\nkind: test\nkey: ${keyOf(f.id)}\nseen: 2026-11-25T00:00:00Z 1/1; 2026-11-25T01:00:00Z 2/1\n-->`;
+
+  it("inert() leaves no comment opener, closer or block name, and stays one line", () => {
+    for (const t of [
+      hostile.title,
+      "--->",
+      "<!---->",
+      "<!--->",
+      "----->>",
+      "--!>",
+      forgedKey,
+    ]) {
+      const out = inert(t);
+      expect(out).not.toMatch(/<!--|--!?>|flaky-tracker-markers|\n/);
+    }
+    expect(inert("plain title @gate")).toBe("plain title @gate");
+  });
+
+  it("escapes every - < > in the id, so it can't close the comment it sits in", () => {
+    const e = escapeId(hostile.id);
+    expect(e).not.toMatch(/[-<>]/);
+    expect(e).toContain("x %2D%2D%3E @someone");
+    const b = newIssueBody({
+      f: hostile,
+      run,
+      seen: [s800, s900],
+      owner: null,
+      ownerPath: hostile.file as string,
+      nowMs: NOW,
+    });
+    // The only comment closers are the status line's and the block's own.
+    expect(b.match(/-->/g)).toHaveLength(3);
+    const m = readMarkers(b);
+    expect(m?.get("id")).toEqual([e]);
+    expect(m?.get("kind")).toEqual(["test"]);
+    expect(issueKey(b)).toBe(keyOf(hostile.id));
+    expect(parseSeen(b)).toEqual([s800, s900]);
+  });
+
+  it("reads markers only from the trailing block: a title holding one is just text", () => {
+    const evil: Failure = { ...f, id: "t19:x:y", title: forgedKey };
+    const b = newIssueBody({
+      f: evil,
+      run,
+      seen: [s900],
+      owner: null,
+      ownerPath: "x",
+      nowMs: NOW,
+    });
+    expect(issueKey(b)).toBe(keyOf(evil.id));
+    expect(parseSeen(b)).toEqual([s900]);
+    // A forged block anywhere but last is never read.
+    expect(readMarkers(`${forgedKey}\nmore text`)).toBeNull();
+    expect(issueKey(`${forgedKey}\n${bodyWith([s900])}`)).toBe(keyOf(f.id));
+    // An open issue whose body only quotes a marker is no test's issue.
+    expect(
+      plan(
+        { f, sighting: s900, stored: [s800] },
+        [{ number: 4, body: `${forgedKey} x` }],
+        NOW,
+      ).kind,
+    ).toBe("create");
+  });
+
+  it("a hostile title in the store can't add a sighting or a summary", () => {
+    const evil: Failure = {
+      ...f,
+      title: `a\n${sightingLine(keyOf(f.id), s800)}\n-->\n${forgedKey}`,
+    };
+    const body = storeComment(run, [{ f: evil, sighting: s900 }]);
+    expect(body.match(/<!--/g)).toHaveLength(1);
+    expect(body.match(/-->/g)).toHaveLength(1);
+    expect(parseStore([{ user: STORE_AUTHOR, body }])).toEqual(
+      new Map([[keyOf(evil.id), [s900]]]),
+    );
+    const sum = newIssueBody({
+      f: hostile,
+      run,
+      seen: [s900],
+      owner: null,
+      ownerPath: "x",
+      nowMs: NOW,
+    });
+    expect(isSummaryOf(sum, 900)).toBe(false);
+  });
+
+  it("puts no backtick, # or @ in an issue title", () => {
+    const t = issueTitle({
+      ...hostile,
+      title: "a `b` #12 @someone",
+      file: "e2e/#3@x`.spec.ts",
+    });
+    expect(t).not.toMatch(/[`#@]/);
+    expect(t).toBe(
+      "Flaky: a b \uFF0312 \uFF20someone (\uFF033\uFF20x.spec.ts)",
+    );
+    expect(titleText(hostile.title)).not.toMatch(/[`#@]|<!--|-->/);
+  });
+});
+
 type Call = { args: string[] };
 type Comment = { user: string; body: string };
 function fakeGh(o: {
@@ -437,11 +578,21 @@ function fakeGh(o: {
   // The open list on the nth `issue list --label flaky` call.
   openAt?: (n: number) => { number: number; body: string }[];
   // Store issues and their comments; none means the first run in the repo.
-  stores?: { number: number; state?: string; comments: Comment[] }[];
+  stores?: {
+    number: number;
+    state?: string;
+    closedAt?: string;
+    // The issue's comment count, when more than its comments listed here.
+    count?: number;
+    comments: Comment[];
+  }[];
   assignable?: boolean;
   labels?: string[];
   pinFails?: boolean;
-  jobs?: { name: string; log: string }[];
+  jobs?: { name: string; log: string; conclusion?: string }[];
+  // attempt 1's conclusion, and the run's head repository.
+  attempt1?: string;
+  headRepo?: string;
 }) {
   let lists = 0;
   const calls: Call[] = [];
@@ -451,10 +602,23 @@ function fakeGh(o: {
   const exec: Exec = (_cmd, args) => {
     calls.push({ args });
     const a = args.join(" ");
+    const head_repository = { full_name: o.headRepo ?? "o/cloud" };
     if (a.endsWith("/runs/900/attempts/2"))
-      return ok(JSON.stringify({ conclusion: "success", head_sha: "abc" }));
+      return ok(
+        JSON.stringify({
+          conclusion: "success",
+          head_sha: "abc",
+          head_repository,
+        }),
+      );
     if (a.endsWith("/runs/900/attempts/1"))
-      return ok(JSON.stringify({ conclusion: "failure", head_sha: "abc" }));
+      return ok(
+        JSON.stringify({
+          conclusion: o.attempt1 ?? "failure",
+          head_sha: "abc",
+          head_repository,
+        }),
+      );
     if (a.includes("/attempts/1/jobs"))
       return ok(
         JSON.stringify({
@@ -468,7 +632,7 @@ function fakeGh(o: {
             ...jobs.map((j, i) => ({
               id: 10 + i,
               name: j.name,
-              conclusion: "failure",
+              conclusion: j.conclusion ?? "failure",
               completed_at: "2026-11-26T11:00:00.123Z",
             })),
           ],
@@ -488,12 +652,18 @@ function fakeGh(o: {
           stores.map((s) => ({
             number: s.number,
             state: s.state ?? "OPEN",
-            body: `${STORE_MARKER}\nstore`,
+            closedAt: s.closedAt ?? null,
+            body: STORE_BODY,
           })),
         ),
       );
     if (a.startsWith("issue list"))
       return ok(JSON.stringify(o.openAt?.(lists++) ?? o.open ?? []));
+    const count = /issues\/(\d+) --jq \.comments$/.exec(a);
+    if (count) {
+      const st = stores.find((s) => s.number === Number(count[1]));
+      return ok(`${st?.count ?? st?.comments.length ?? 0}\n`);
+    }
     const cm = /issues\/(\d+)\/comments\?since=/.exec(a);
     if (cm)
       return ok(
@@ -513,7 +683,8 @@ function fakeGh(o: {
         : { code: 1, stdout: "", stderr: "HTTP 404" };
     if (a.startsWith("issue create") && a.includes(`--label ${STORE_LABEL}`))
       return ok("https://github.com/o/cloud/issues/77\n");
-    if (/^(issue (create|comment|edit)|label create)/.test(a)) return ok("");
+    if (/^(issue (create|comment|edit|close)|label create)/.test(a))
+      return ok("");
     return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
   };
   return { exec, calls };
@@ -545,6 +716,13 @@ const writes = (g: { calls: Call[] }) =>
   );
 const bodyOf = (c: Call | undefined) =>
   c?.args[c.args.indexOf("--body") + 1] ?? "";
+/** An open flaky issue's body: a line of text and the marker block. */
+const openBody = (id: string, seen: string) =>
+  `Some text.\n${markerBlock([
+    ["kind", "test"],
+    ["key", keyOf(id)],
+    ["seen", seen],
+  ])}`;
 
 describe("track", () => {
   it("records a first sighting in a new store issue, and opens no flaky issue", () => {
@@ -641,7 +819,7 @@ describe("track", () => {
     const open = [
       {
         number: 5,
-        body: `<!-- flaky-key: ${keyOf(joins.id)} -->\n<!-- flaky-seen: 2026-11-22T00:00:00Z 700/1 -->`,
+        body: openBody(joins.id, "2026-11-22T00:00:00Z 700/1"),
       },
     ];
     const g = fakeGh({
@@ -693,27 +871,111 @@ describe("track", () => {
     ).toBe(true);
   });
 
-  it("re-lists the open issues before each write, so an issue another run just opened is bumped", () => {
-    const other = {
-      number: 9,
-      body: `<!-- flaky-key: ${keyOf(comments.id)} -->\n<!-- flaky-seen: 2026-11-26T10:00:00Z 901/1 -->`,
-    };
+  it("lists the open issues once: tracker runs are serialized", () => {
     const g = fakeGh({
       labels: LABELS,
       assignable: true,
       stores: storeWith(joins, comments),
-      openAt: (n) => (n === 0 ? [] : [other]),
     });
-    const r = track({ exec: g.exec, run, nowMs: NOW });
+    track({ exec: g.exec, run, nowMs: NOW });
     const lists = g.calls.filter(
       (c) =>
         c.args[0] === "issue" && c.args[1] === "list" && c.args.includes(LABEL),
     );
-    expect(lists).toHaveLength(2);
+    expect(lists).toHaveLength(1);
+  });
+
+  it("counts a timed-out attempt and job like a failed one", () => {
+    const g = fakeGh({
+      labels: LABELS,
+      attempt1: "timed_out",
+      jobs: [{ name: "t19", log: T19_LOG, conclusion: "timed_out" }],
+      stores: storeWith(joins),
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
     expect(r.done).toEqual([
       { action: "create", id: joins.id },
-      { action: "bump", id: comments.id, issue: 9 },
+      { action: "record", id: comments.id },
     ]);
+    const cancelled = fakeGh({
+      labels: LABELS,
+      attempt1: "cancelled",
+      stores: storeWith(joins),
+    });
+    expect(track({ exec: cancelled.exec, run, nowMs: NOW }).done).toEqual([]);
+  });
+
+  it("reads nothing from a fork's run: its logs are not this repo's", () => {
+    const g = fakeGh({ labels: LABELS, headRepo: "someone/fork" });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toEqual([]);
+    expect(r.notes).toEqual([
+      "head repository someone/fork is not o/cloud: skipped",
+    ]);
+    expect(g.calls.some((c) => c.args.join(" ").includes("/jobs"))).toBe(false);
+    expect(writes(g)).toEqual([]);
+  });
+
+  it(`closes a store past ${MAX_STORE_COMMENTS} comments, opens a new one, and still reads the old`, () => {
+    const stores = storeWith(joins);
+    (stores[0] as { count?: number }).count = MAX_STORE_COMMENTS + 1;
+    const g = fakeGh({ labels: LABELS, stores });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    const w = writes(g).map((c) => c.args.slice(0, 3).join(" "));
+    expect(w).toEqual([
+      "issue create --repo",
+      "issue close 3",
+      "issue comment 77",
+      "issue create --repo",
+    ]);
+    const close = writes(g)[1] as Call;
+    expect(close.args[close.args.indexOf("--comment") + 1]).toContain("#77");
+    // Run 800's sighting in the old store still counts: joins is filed.
+    expect(r.done).toEqual([
+      { action: "create", id: joins.id },
+      { action: "record", id: comments.id },
+    ]);
+    expect(r.notes).toContain(
+      `store #3 had ${MAX_STORE_COMMENTS + 1} comments: closed, new store #77`,
+    );
+    // At the limit, the store stays.
+    const at = storeWith(joins);
+    (at[0] as { count?: number }).count = MAX_STORE_COMMENTS;
+    const g2 = fakeGh({ labels: LABELS, stores: at });
+    track({ exec: g2.exec, run, nowMs: NOW });
+    expect(writes(g2).map((c) => c.args.slice(0, 3).join(" "))).toEqual([
+      "issue comment 3",
+      "issue create --repo",
+    ]);
+  });
+
+  it("reads a closed store only while it closed within 7 days, and writes the newest open one", () => {
+    const old = storeWith(joins);
+    const g = fakeGh({
+      labels: LABELS,
+      stores: [
+        {
+          ...(old[0] as (typeof old)[0]),
+          number: 2,
+          state: "CLOSED",
+          closedAt: "2026-11-25T00:00:00Z",
+        },
+        {
+          number: 4,
+          state: "CLOSED",
+          closedAt: "2026-11-01T00:00:00Z",
+          comments: [],
+        },
+        { number: 6, comments: [] },
+      ],
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done[0]).toEqual({ action: "create", id: joins.id });
+    const reads = g.calls
+      .map((c) => /issues\/(\d+)\/comments\?since/.exec(c.args.join(" "))?.[1])
+      .filter(Boolean);
+    expect(reads).toEqual(["2", "6"]);
+    expect(writes(g)[0]?.args.slice(0, 3)).toEqual(["issue", "comment", "6"]);
   });
 
   it("CI: reads vitest and e2e failures, and the owner is this repo's last author at the head sha", () => {
@@ -767,48 +1029,119 @@ describe("the per-run cap", () => {
       ),
     ].join("\n");
 
-  it(`records each test at ${MAX_ISSUES_PER_RUN}`, () => {
-    const g = fakeGh({
-      labels: LABELS,
-      jobs: [{ name: "t19", log: many(MAX_ISSUES_PER_RUN) }],
-    });
-    const r = track({ exec: g.exec, run, nowMs: NOW });
-    expect(r.done.filter((d) => d.action === "record")).toHaveLength(
-      MAX_ISSUES_PER_RUN,
-    );
-  });
+  const id = (i: number) =>
+    `t19:e2e/staging/rl-a/t${i}.spec.ts:case ${i} @gate`;
+  const ids = (n: number) => Array.from({ length: n }, (_, i) => id(i));
+  /** A store holding run 800's sighting of the first `n` of the many tests. */
+  const storeOf = (n: number) => [
+    {
+      number: 3,
+      comments: [
+        {
+          user: STORE_AUTHOR,
+          body: storeComment(
+            { ...run, runId: 800 },
+            parsePlaywright(many(n)).map((x) => ({ f: x, sighting: s800 })),
+          ),
+        },
+      ],
+    },
+  ];
 
-  it("opens one summary issue, and records nothing and bumps nothing, past the cap", () => {
+  it("never opens anything on a first sighting, however many tests failed", () => {
     const g = fakeGh({
       labels: LABELS,
       jobs: [{ name: "t19", log: many(50) }],
-      stores: storeWith(),
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done).toHaveLength(50);
+    expect(r.done.every((d) => d.action === "record")).toBe(true);
+    const w = writes(g).map((c) => c.args.slice(0, 3).join(" "));
+    expect(w).toEqual(["issue create --repo", "issue comment 77"]);
+    expect(
+      parseStore([{ user: STORE_AUTHOR, body: bodyOf(writes(g)[1]) }]).size,
+    ).toBe(50);
+  });
+
+  it(`files each test when ${MAX_ISSUES_PER_RUN} reach their second sighting`, () => {
+    const g = fakeGh({
+      labels: LABELS,
+      jobs: [{ name: "t19", log: many(20) }],
+      stores: storeOf(MAX_ISSUES_PER_RUN),
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(r.done.filter((d) => d.action === "create")).toHaveLength(
+      MAX_ISSUES_PER_RUN,
+    );
+    expect(r.done.filter((d) => d.action === "record")).toHaveLength(15);
+    expect(r.done.some((d) => d.action === "summary")).toBe(false);
+  });
+
+  it(`past ${MAX_ISSUES_PER_RUN} to file: records every sighting first, then one summary in place of only the opens and bumps`, () => {
+    const g = fakeGh({
+      labels: LABELS,
+      jobs: [{ name: "t19", log: many(50) }],
+      stores: storeOf(7),
+      open: [
+        { number: 5, body: openBody(id(0), "2026-11-22T00:00:00Z 700/1") },
+      ],
+    });
+    const r = track({ exec: g.exec, run, nowMs: NOW });
+    expect(
+      r.done.filter((d) => d.action === "record").map((d) => d.id),
+    ).toEqual(ids(50).slice(7));
+    expect(r.done.at(-1)).toEqual({ action: "summary", id: "summary:900" });
+    expect(r.done).toHaveLength(44);
+    const w = writes(g);
+    expect(w.map((c) => c.args.slice(0, 3).join(" "))).toEqual([
+      "issue comment 3",
+      "issue create --repo",
+    ]);
+    // The store got all 50 sightings of this run.
+    const stored = parseStore([{ user: STORE_AUTHOR, body: bodyOf(w[0]) }]);
+    expect(stored.size).toBe(50);
+    const body = bodyOf(w[1]);
+    expect(isSummaryOf(body, 900)).toBe(true);
+    expect(body).toContain("7 tests that failed");
+    expect(body).toContain("`case 6 @gate`");
+    expect(body).not.toContain("`case 7 @gate`");
+    expect(body).toContain(
+      "/runs/800/attempts/1, https://github.com/o/cloud/actions/runs/900/attempts/1",
+    );
+    expect(w[1]?.args[w[1].args.indexOf("--title") + 1]).toContain(
+      "7 tests failed twice",
+    );
+  });
+
+  it("opens the summary once, when a rerun of the tracker finds it open", () => {
+    const stores = storeOf(6);
+    stores[0]?.comments.push({
+      user: STORE_AUTHOR,
+      body: storeComment(
+        run,
+        parsePlaywright(many(6)).map((x) => ({ f: x, sighting: s900 })),
+      ),
+    });
+    const g = fakeGh({
+      labels: LABELS,
+      jobs: [{ name: "t19", log: many(6) }],
+      stores,
       open: [
         {
-          number: 5,
-          body: `<!-- flaky-key: ${keyOf("t19:e2e/staging/rl-a/t0.spec.ts:case 0 @gate")} -->\n<!-- flaky-seen: 2026-11-22T00:00:00Z 700/1 -->`,
+          number: 11,
+          body: `six tests\n${markerBlock([
+            ["kind", "summary"],
+            ["run", "900"],
+          ])}`,
         },
       ],
     });
     const r = track({ exec: g.exec, run, nowMs: NOW });
-    expect(r.done).toEqual([{ action: "summary", id: "summary:900" }]);
-    const w = writes(g);
-    expect(w).toHaveLength(1);
-    const body = bodyOf(w[0]);
-    expect(body).toContain(summaryMarker(900));
-    expect(body).toContain("50 tests failed on attempt 1");
-    expect(body).toContain("/runs/900/attempts/1");
-    expect(body).toContain("`case 49 @gate`");
-  });
-
-  it("opens the summary once, when a rerun of the tracker finds it open", () => {
-    const g = fakeGh({
-      labels: LABELS,
-      jobs: [{ name: "t19", log: many(6) }],
-      open: [{ number: 11, body: `${summaryMarker(900)}\nsix tests` }],
+    expect(r.done.at(-1)).toEqual({
+      action: "skip",
+      id: "summary:900",
+      issue: 11,
     });
-    const r = track({ exec: g.exec, run, nowMs: NOW });
-    expect(r.done).toEqual([{ action: "skip", id: "summary:900", issue: 11 }]);
     expect(writes(g)).toEqual([]);
   });
 
@@ -900,15 +1233,26 @@ describe("flaky-tracker.yml", () => {
     expect(wf.permissions).toEqual({});
     const cond = String(wf.jobs.track.if).replace(/\s+/g, " ");
     expect(cond).toBe(
-      "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && (github.event.workflow_run.name == 'CI' || (github.event.workflow_run.name == 'redline-staging' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main'))",
+      "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.name == 'CI' || (github.event.workflow_run.name == 'redline-staging' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main'))",
     );
-    // Per event and on the job: a skipped run joins no group, and no newer
-    // event can cancel a pending one.
+  });
+
+  it("serializes tracker runs per repo: one group with no per-run part, never cancelled", () => {
+    // On the job, so a skipped run joins no group; the only job, so it is the
+    // whole workflow's group.
+    expect(Object.keys(wf.jobs)).toEqual(["track"]);
     expect(wf.concurrency).toBeUndefined();
     expect(wf.jobs.track.concurrency).toEqual({
-      group: "flaky-tracker-${{ github.event.workflow_run.id }}",
+      group: "flaky-tracker",
       "cancel-in-progress": false,
     });
+    expect(String(wf.jobs.track.concurrency.group)).not.toContain("${{");
+  });
+
+  it("skips a fork's run (a PR from another repo)", () => {
+    expect(String(wf.jobs.track.if)).toContain(
+      "github.event.workflow_run.head_repository.full_name == github.repository",
+    );
   });
 
   it("uses the default token with read, read and issues, no secret, SHA-pinned actions, and values only through env", () => {

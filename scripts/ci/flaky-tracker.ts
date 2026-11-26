@@ -24,32 +24,41 @@
 // and is only listed in the step summary.
 //
 // Every sighting is recorded; an issue is opened or bumped only for a test
-// seen in two different runs within 7 days. The sightings live in one issue
-// per repo labelled `flaky-sightings` (the store): each tracker run that finds
-// new sightings adds one comment holding one machine line per test,
-// `flaky-sighting <time> <key> <run>/<attempt>`, inside an HTML comment, with a
-// readable list above it. The store is read with `since` = 7 days ago, so a
-// read is a page or two however old the issue gets, and only comments by
-// github-actions[bot] count, so a person's comment can't add a sighting. Why
-// this store: it needs no new service and no secret (the default token has
-// issues: write); it is read back at once, unlike issue search, which lags
-// its index and has its own rate limit; it is one issue, not an issue or a
-// label hit per sighting; and it outlives what Actions keeps (caches go after
-// 7 idle days and are per branch, artifacts are per run). Two tracker runs
-// racing on an empty repo may each open a store: every store issue is read,
-// and the lowest-numbered open one is written.
+// with sightings in two or more different runs within the last 7 days,
+// counting this one. The sightings live in one open issue per repo labelled
+// `flaky-sightings` (the store): each tracker run that finds new sightings
+// adds one comment with a readable list and, last, the bot's marker block
+// holding one `sighting: <time> <key> <run>/<attempt>` line per test. The
+// store is read with `since` = 7 days ago, so a read is a page or two however
+// old the issue gets, and only comments by github-actions[bot] count, so a
+// person's comment can't add a sighting. Past MAX_STORE_COMMENTS comments the
+// store is closed with a note and a new one opened; a closed store is still
+// read for 7 days after it closed. Why this store: it needs no new service
+// and no secret (the default token has issues: write); it is read back at
+// once, unlike issue search, which lags its index and has its own rate limit;
+// it is one issue, not an issue or a label hit per sighting; and it outlives
+// what Actions keeps (caches go after 7 idle days and are per branch,
+// artifacts are per run). flaky-tracker.yml runs one tracker at a time per
+// repo, so two runs never write the store or an issue at once.
 //
 // One issue per test, keyed on the test's identity only (suite, file and
 // name: `suite:file:name`), never on its error text. When more than
-// MAX_ISSUES_PER_RUN tests failed in one run, the attempt was broken rather
-// than flaky: one summary issue lists them, and no sighting is recorded. The
-// issue body carries `<!-- flaky-key: K -->` (K is a hash of the test id) and
-// `<!-- flaky-seen: ... -->`, one entry per run in it. A run already in the
-// list is never noted twice. The owner is the last author of the test file at
-// the commit under test (CI: this repo at the head sha; T19: public's file at
-// the tag's PUBLIC_PIN; red-line: this repo's tests/redline at the tag). The
-// owner is assigned when GitHub says they can be; otherwise the login is
-// written in plain text, never as a mention.
+// MAX_ISSUES_PER_RUN tests would be filed (opened or bumped) by one run, one
+// summary issue lists them instead; every sighting is still recorded first.
+//
+// Markers: every body and comment the bot writes ends with one marker block,
+// `<!-- flaky-tracker-markers` then `name: value` lines then `-->`, and only
+// that trailing block is ever parsed. A test's title, file or id is untrusted
+// (it comes from a job log): before it is written anywhere, inert() breaks
+// every `<!--`, `-->` and `--!>` in it and the block's name, so it can neither
+// forge a marker nor open or close an HTML comment. The id in the block is
+// percent-escaped (no `-`, `>` or `<` left). In an issue title, backticks are
+// dropped and `#` and `@` replaced, so nothing renders as a ref or a mention.
+// The owner is the last author of the test file at the commit under test
+// (CI: this repo at the head sha; T19: public's file at the tag's PUBLIC_PIN;
+// red-line: this repo's tests/redline at the tag). The owner is assigned when
+// GitHub says they can be; otherwise the login is written in plain text,
+// never as a mention.
 //
 // TODO(lane 3): when redline-staging runs as a reusable workflow (a queue gate
 // calling it with workflow_call), workflow_run fires under the caller's name,
@@ -67,7 +76,6 @@ import { type Exec, gh } from "./gh-retry.ts";
 
 export const LABEL = "flaky";
 export const STORE_LABEL = "flaky-sightings";
-export const STORE_MARKER = "<!-- flaky-sightings-store -->";
 /** Only this author's store comments hold sightings. */
 export const STORE_AUTHOR = "github-actions[bot]";
 export const PUBLIC_REPO = "open-artifacts-ai/open-artifacts";
@@ -76,8 +84,12 @@ export const T19_PACKAGE = "apps/dashboard";
 export const REDLINE_DIR = "tests/redline";
 export const WINDOW_DAYS = 7;
 export const TWICE_NOTE = "fails twice in 7 days";
-/** More distinct tests than this in one run: one summary issue, no per-test ones. */
+/** More tests than this filed (opened or bumped) by one run: one summary issue instead. */
 export const MAX_ISSUES_PER_RUN = 5;
+/** A store with more comments than this is closed and a new one opened. */
+export const MAX_STORE_COMMENTS = 2000;
+/** Job and attempt conclusions that count as a failed attempt. */
+const FAILED = new Set(["failure", "timed_out"]);
 /** Tests named in a summary issue; the rest are counted. */
 const SUMMARY_LIST_MAX = 50;
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
@@ -282,12 +294,82 @@ function dedupe(fs: Failure[]): Failure[] {
 export const keyOf = (id: string) =>
   createHash("sha256").update(id).digest("hex").slice(0, 16);
 
-const SEEN_RE = /<!-- flaky-seen: ([^>]*?) -->/;
+const BLOCK_NAME = "flaky-tracker-markers";
+const BLOCK_RE =
+  /(?:^|\n)<!-- flaky-tracker-markers\n((?:[a-z]+: [^\n]*\n)*)-->\s*$/;
+
+/**
+ * The bot's marker block, written last in every body and comment it writes.
+ * Values are machine text only: hex keys, run numbers, times, escaped ids.
+ */
+export function markerBlock(fields: [string, string][]): string {
+  return [
+    `<!-- ${BLOCK_NAME}`,
+    ...fields.map(([k, v]) => `${k}: ${v.replace(/[\r\n]/g, " ")}`),
+    "-->",
+  ].join("\n");
+}
+
+/** The fields of the trailing marker block, or null when the text has none. */
+export function readMarkers(text: string): Map<string, string[]> | null {
+  const m = BLOCK_RE.exec(text.replace(/\r/g, ""));
+  if (!m) return null;
+  const out = new Map<string, string[]>();
+  for (const line of (m[1] as string).split("\n")) {
+    const kv = /^([a-z]+): (.*)$/.exec(line);
+    if (kv)
+      out.set(kv[1] as string, [
+        ...(out.get(kv[1] as string) ?? []),
+        kv[2] as string,
+      ]);
+  }
+  return out;
+}
+
+const marker = (text: string, name: string) =>
+  readMarkers(text)?.get(name)?.[0];
+const kindOf = (text: string) => marker(text, "kind");
+
+/** The text with its trailing marker block replaced (or added). */
+function withMarkers(text: string, fields: [string, string][]): string {
+  const m = BLOCK_RE.exec(text);
+  const head = m ? text.slice(0, m.index) : text.replace(/\s+$/, "");
+  return `${head}\n${markerBlock(fields)}`;
+}
+
+/**
+ * Untrusted text (a test's title, file or id, from a job log) made inert:
+ * one line, with every `<!--`, `-->` and `--!>` broken by a space until none
+ * is left, and the marker block's name broken, so it can't forge a marker,
+ * open an HTML comment or close one.
+ */
+export function inert(s: string): string {
+  let out = s
+    .replace(/[\r\n]+/g, " ")
+    .replaceAll(BLOCK_NAME, "flaky tracker markers");
+  for (;;) {
+    const next = out.replace(/<!--/g, "<!- -").replace(/--(!?>)/g, "- -$1");
+    if (next === out) return out;
+    out = next;
+  }
+}
+
+/** A test id for an HTML comment: `%`, `-`, `<` and `>` percent-escaped. */
+export const escapeId = (id: string) =>
+  id
+    .replace(/[\r\n]+/g, " ")
+    .replace(
+      /[%<>-]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    );
+
+/** Untrusted text for an issue title: no backticks, no `#` or `@` to link. */
+export const titleText = (s: string) =>
+  inert(s).replace(/`/g, "").replace(/#/g, "\uFF03").replace(/@/g, "\uFF20");
 
 export function parseSeen(body: string): Sighting[] {
-  const m = SEEN_RE.exec(body);
-  if (!m) return [];
-  return (m[1] as string)
+  if (kindOf(body) !== "test") return [];
+  return (marker(body, "seen") ?? "")
     .split(";")
     .map((s) => /^\s*(\S+) (\d+)\/(\d+)\s*$/.exec(s))
     .filter((x): x is RegExpExecArray => x !== null)
@@ -298,8 +380,20 @@ export function parseSeen(body: string): Sighting[] {
     }));
 }
 
-const seenMarker = (s: Sighting[]) =>
-  `<!-- flaky-seen: ${s.map((x) => `${x.at} ${x.run}/${x.attempt}`).join("; ")} -->`;
+const seenValue = (s: Sighting[]) =>
+  s.map((x) => `${x.at} ${x.run}/${x.attempt}`).join("; ");
+
+/** The marker fields of a test's issue. */
+const testMarkers = (f: Failure, seen: Sighting[]): [string, string][] => [
+  ["kind", "test"],
+  ["key", keyOf(f.id)],
+  ["id", escapeId(f.id)],
+  ["seen", seenValue(seen)],
+];
+
+/** The test key of an open issue, from its marker block only. */
+export const issueKey = (body: string) =>
+  kindOf(body) === "test" ? marker(body, "key") : undefined;
 
 const inWindow = (s: Sighting, nowMs: number) =>
   Date.parse(s.at) >= nowMs - WINDOW_DAYS * DAY_MS;
@@ -352,8 +446,8 @@ const runLink = (r: RunInfo, attempt: number) =>
   attemptLink(r.repo, r.runId, attempt);
 
 export function issueTitle(f: Failure): string {
-  const where = f.file ? ` (${f.file.split("/").pop()})` : "";
-  const t = `Flaky: ${f.title}${where}`;
+  const where = f.file ? ` (${titleText(f.file.split("/").pop() ?? "")})` : "";
+  const t = `Flaky: ${titleText(f.title)}${where}`;
   return t.length > 240 ? `${t.slice(0, 237)}...` : t;
 }
 
@@ -390,11 +484,10 @@ export function newIssueBody(o: {
     : "unknown (no commit found, or the lookup failed)";
   const runs = new Set(o.seen.map((s) => s.run)).size;
   return [
-    `<!-- flaky-key: ${keyOf(f.id)} -->`,
     `A ${SUITE_NAME[f.suite]} test failed and then passed on a later attempt of the same run, with the same commit, in ${runs} runs within ${WINDOW_DAYS} days. Nothing changed between the attempts, so the test is flaky.`,
     "",
-    `Test: ${codeSpan(f.title)}`,
-    `File: ${codeSpan(o.ownerPath)}`,
+    `Test: ${codeSpan(inert(f.title))}`,
+    `File: ${codeSpan(inert(o.ownerPath))}`,
     `Last author of the file at ${refName(run)}: ${owner}`,
     "",
     "Runs (the failed attempt; a later attempt of each passed):",
@@ -405,17 +498,18 @@ export function newIssueBody(o: {
     "",
     "This issue only tracks the flake: it changes no retry and blocks nothing. Fix the test, or the race it found, and close the issue. A later flake of the same test is noted here while it is open.",
     "",
-    `<!-- flaky-id: ${f.id.replace(/--/g, "- -")} -->`,
-    seenMarker(o.seen),
+    markerBlock(testMarkers(f, o.seen)),
   ].join("\n");
 }
 
 /** The body with the sighting list and the status line brought up to date. */
-export function bumpedBody(body: string, seen: Sighting[], nowMs: number) {
-  const marker = seenMarker(seen);
-  let b = SEEN_RE.test(body)
-    ? body.replace(SEEN_RE, () => marker)
-    : `${body}\n${marker}`;
+export function bumpedBody(
+  f: Failure,
+  body: string,
+  seen: Sighting[],
+  nowMs: number,
+) {
+  let b = withMarkers(body, testMarkers(f, seen));
   const status = statusLine(seen, nowMs);
   const STATUS_RE = /<!-- flaky-status -->.*?<!-- \/flaky-status -->/;
   b = STATUS_RE.test(b) ? b.replace(STATUS_RE, () => status) : b;
@@ -428,10 +522,14 @@ export function bumpComment(o: {
   twice: boolean;
 }): string {
   return [
-    `<!-- run:${o.run.runId}/${o.run.attempt} -->`,
     `Failed again, then passed on attempt ${o.run.attempt} of ${runLabel(o.run)}:`,
     ...sightingLines(o.run.repo, o.added),
     ...(o.twice ? ["", `This test ${TWICE_NOTE}.`] : []),
+    "",
+    markerBlock([
+      ["kind", "bump"],
+      ["run", `${o.run.runId}/${o.run.attempt}`],
+    ]),
   ].join("\n");
 }
 
@@ -462,8 +560,10 @@ export function firstSightings(found: Found[]): Found[] {
 
 /**
  * What one test does, given its sightings in the store: only a record while
- * it has been seen in one run within 7 days; at two runs, a new issue, or a
- * bump of its open one; a skip when that issue already notes this run.
+ * fewer than two different runs within the last 7 days (this one included)
+ * saw it; at two or more, a new issue, or a bump of its open one; a skip when
+ * that issue already notes this run. The open issue is found by the key in
+ * its trailing marker block only.
  */
 export function plan(
   x: Found & { stored: Sighting[] },
@@ -471,8 +571,8 @@ export function plan(
   nowMs: number,
 ): Action {
   const { f, sighting } = x;
-  const marker = `<!-- flaky-key: ${keyOf(f.id)} -->`;
-  const issue = open.find((i) => i.body.includes(marker));
+  const key = keyOf(f.id);
+  const issue = open.find((i) => issueKey(i.body) === key);
   const prior = issue ? parseSeen(issue.body) : [];
   if (issue && prior.some((p) => p.run === sighting.run))
     return {
@@ -481,7 +581,7 @@ export function plan(
       issue: issue.number,
       why: `run ${sighting.run} already noted`,
     };
-  const window = mergeSightings(x.stored, [sighting]).filter((s) =>
+  const window = mergeSightings(x.stored, prior, [sighting]).filter((s) =>
     inWindow(s, nowMs),
   );
   if (!twiceInWindow(window, nowMs))
@@ -506,7 +606,11 @@ export function ownerPath(f: Failure): string {
   return f.file ?? "";
 }
 
-type Attempt = { conclusion: string | null; head_sha: string };
+type Attempt = {
+  conclusion: string | null;
+  head_sha: string;
+  head_repository?: { full_name?: string } | null;
+};
 type Job = {
   id: number;
   name: string;
@@ -537,11 +641,20 @@ export function collect(
   ) as Attempt;
   const found: Found[] = [];
   const notes: string[] = [];
+  // A fork's run (a PR from another repo) runs code and writes logs nobody
+  // here reviewed: never read them. flaky-tracker.yml skips them too.
+  const head = last.head_repository?.full_name ?? "";
+  if (head !== run.repo) {
+    notes.push(
+      `head repository ${head || "unknown"} is not ${run.repo}: skipped`,
+    );
+    return { found, notes };
+  }
   for (let a = 1; a < run.attempt; a++) {
     const att = JSON.parse(
       gh(exec, ["api", `${base}/attempts/${a}`]),
     ) as Attempt;
-    if (att.conclusion !== "failure") continue;
+    if (!FAILED.has(att.conclusion ?? "")) continue;
     if (att.head_sha !== last.head_sha) {
       notes.push(`attempt ${a}: another commit (${att.head_sha}), skipped`);
       continue;
@@ -550,7 +663,7 @@ export function collect(
       JSON.parse(
         gh(exec, ["api", `${base}/attempts/${a}/jobs?per_page=100`]),
       ) as { jobs: Job[] }
-    ).jobs.filter((j) => j.conclusion === "failure");
+    ).jobs.filter((j) => FAILED.has(j.conclusion ?? ""));
     for (const j of jobs) {
       const fs = parseJob(run.workflow, j.name, jobLog(exec, run.repo, j.id));
       if (!fs.length)
@@ -646,42 +759,56 @@ function ensureLabel(
 
 // ---- The sightings store ----
 
-/** One machine line per sighting; the key is the test's, never its text. */
+/** One sighting's marker line; the key is the test's, never its text. */
 export const sightingLine = (key: string, s: Sighting) =>
-  `flaky-sighting ${s.at} ${key} ${s.run}/${s.attempt}`;
+  `sighting: ${s.at} ${key} ${s.run}/${s.attempt}`;
 const SIGHTING_RE =
-  /^flaky-sighting (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) ([0-9a-f]{16}) (\d{1,20})\/(\d{1,4})$/gm;
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) ([0-9a-f]{16}) (\d{1,20})\/(\d{1,4})$/;
+
+const testLine = (f: Failure) =>
+  `${SUITE_NAME[f.suite]}: ${codeSpan(inert(f.title))}${f.file ? ` in ${codeSpan(inert(f.file))}` : ""}`;
 
 /** The store comment for this run's new sightings. */
 export function storeComment(run: RunInfo, fresh: Found[]): string {
   return [
-    `<!-- flaky-sightings: ${run.runId}/${run.attempt} -->`,
     `${runLabel(run)}, run ${run.runId}: failed, then passed on attempt ${run.attempt} (${runLink(run, run.attempt)}).`,
     "",
     ...fresh.map(
       (x) =>
-        `- ${SUITE_NAME[x.f.suite]}: ${codeSpan(x.f.title)}${x.f.file ? ` in ${codeSpan(x.f.file)}` : ""}, failed on ${runLink(run, x.sighting.attempt)}`,
+        `- ${testLine(x.f)}, failed on ${runLink(run, x.sighting.attempt)}`,
     ),
     "",
-    "<!--",
-    ...fresh.map((x) => sightingLine(keyOf(x.f.id), x.sighting)),
-    "-->",
+    markerBlock([
+      ["kind", "sightings"],
+      ["run", `${run.runId}/${run.attempt}`],
+      ...fresh.map((x): [string, string] => [
+        "sighting",
+        sightingLine(keyOf(x.f.id), x.sighting).slice("sighting: ".length),
+      ]),
+    ]),
   ].join("\n");
 }
 
-/** The sightings per test key in the store comments, only those by the bot. */
+/**
+ * The sightings per test key in the store comments: only comments by the
+ * bot, and only their trailing marker block.
+ */
 export function parseStore(
   comments: { user: string; body: string }[],
 ): Map<string, Sighting[]> {
   const out = new Map<string, Sighting[]>();
   for (const c of comments) {
     if (c.user !== STORE_AUTHOR) continue;
-    for (const m of c.body.replace(/\r/g, "").matchAll(SIGHTING_RE)) {
-      const key = m[2] as string;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "sightings") continue;
+    for (const v of m.get("sighting") ?? []) {
+      const x = SIGHTING_RE.exec(v);
+      if (!x) continue;
+      const key = x[2] as string;
       const s = {
-        at: m[1] as string,
-        run: Number(m[3]),
-        attempt: Number(m[4]),
+        at: x[1] as string,
+        run: Number(x[3]),
+        attempt: Number(x[4]),
       };
       out.set(key, mergeSightings(out.get(key) ?? [], [s]));
     }
@@ -689,41 +816,15 @@ export function parseStore(
   return out;
 }
 
-const STORE_BODY = [
-  STORE_MARKER,
+export const STORE_BODY = [
   "The flaky tracker's sightings (cloud #447): each comment by github-actions is one run that failed and then passed on a later attempt, with one line per test that failed. A test seen in two runs within 7 days gets its own issue labelled `flaky`.",
   "",
-  "Kept by `.github/workflows/flaky-tracker.yml`. Leave this issue open and its comments as they are; only the bot's comments are read.",
+  `Kept by \`.github/workflows/flaky-tracker.yml\`. Leave this issue open and its comments as they are; only the bot's comments are read. Past ${MAX_STORE_COMMENTS} comments the tracker closes it and opens a new one.`,
+  "",
+  markerBlock([["kind", "store"]]),
 ].join("\n");
 
-/** The store issues: every one to read, and the open one to write. */
-function openStore(
-  exec: Exec,
-  repo: string,
-): { write: number; read: number[] } {
-  const all = (
-    JSON.parse(
-      gh(exec, [
-        "issue",
-        "list",
-        "--repo",
-        repo,
-        "--label",
-        STORE_LABEL,
-        "--state",
-        "all",
-        "--json",
-        "number,body,state",
-        "--limit",
-        "50",
-      ]),
-    ) as (Issue & { state: string })[]
-  )
-    .filter((i) => i.body.includes(STORE_MARKER))
-    .sort((a, b) => a.number - b.number);
-  const read = all.map((i) => i.number);
-  const open = all.find((i) => i.state === "OPEN");
-  if (open) return { write: open.number, read };
+function createStore(exec: Exec, repo: string): number {
   const url = gh(
     exec,
     [
@@ -743,7 +844,80 @@ function openStore(
   const n = Number(/\/issues\/(\d+)\s*$/.exec(url.trim())?.[1]);
   if (!Number.isSafeInteger(n) || n < 1)
     throw new Error(`no issue number in: ${url.trim()}`);
-  return { write: n, read: [...read, n] };
+  return n;
+}
+
+/**
+ * The store issues: the ones to read (open, or closed within the window) and
+ * the open one to write (the newest). An open store past MAX_STORE_COMMENTS
+ * comments is closed with a note pointing at a new one, which is then written;
+ * the old one is still read.
+ */
+export function openStore(
+  exec: Exec,
+  repo: string,
+  nowMs: number,
+): { write: number; read: number[]; notes: string[] } {
+  const since = nowMs - WINDOW_DAYS * DAY_MS;
+  const all = (
+    JSON.parse(
+      gh(exec, [
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        STORE_LABEL,
+        "--state",
+        "all",
+        "--json",
+        "number,body,state,closedAt",
+        "--limit",
+        "50",
+      ]),
+    ) as (Issue & { state: string; closedAt?: string | null })[]
+  )
+    .filter((i) => kindOf(i.body) === "store")
+    .sort((a, b) => a.number - b.number);
+  const read = all
+    .filter((i) => i.state === "OPEN" || Date.parse(i.closedAt ?? "") >= since)
+    .map((i) => i.number);
+  const open = all.filter((i) => i.state === "OPEN").pop();
+  if (!open) {
+    const n = createStore(exec, repo);
+    return { write: n, read: [...read, n], notes: [] };
+  }
+  const count = Number(
+    gh(exec, [
+      "api",
+      `repos/${repo}/issues/${open.number}`,
+      "--jq",
+      ".comments",
+    ]).trim(),
+  );
+  if (!(count > MAX_STORE_COMMENTS))
+    return { write: open.number, read, notes: [] };
+  const n = createStore(exec, repo);
+  gh(
+    exec,
+    [
+      "issue",
+      "close",
+      String(open.number),
+      "--repo",
+      repo,
+      "--comment",
+      `This store has ${count} comments, more than ${MAX_STORE_COMMENTS}. New sightings go to #${n}; the tracker still reads this issue for ${WINDOW_DAYS} days after it closes.`,
+    ],
+    { write: true, idempotent: true },
+  );
+  return {
+    write: n,
+    read: [...read, n],
+    notes: [
+      `store #${open.number} had ${count} comments: closed, new store #${n}`,
+    ],
+  };
 }
 
 function readStore(
@@ -777,38 +951,43 @@ export type Done = {
   issue?: number;
 };
 
-/** The marker of a run's summary issue, so a rerun of the tracker opens one. */
-export const summaryMarker = (runId: number) =>
-  `<!-- flaky-summary: ${runId} -->`;
+/** True when the body is the summary issue of this run (by its marker block). */
+export const isSummaryOf = (body: string, runId: number) =>
+  kindOf(body) === "summary" && marker(body, "run") === String(runId);
 
-/** One issue for a run whose earlier attempt failed too many tests to file. */
+type Filing = Extract<Action, { kind: "create" | "bump" }>;
+
+/**
+ * One issue in place of the per-test issues a run would open or bump, when
+ * there are more than MAX_ISSUES_PER_RUN of them.
+ */
 export function summaryIssue(
   run: RunInfo,
-  tests: Found[],
+  filing: Filing[],
 ): { title: string; body: string } {
-  const attempts = [...new Set(tests.map((t) => t.sighting.attempt))].sort(
-    (a, b) => a - b,
-  );
-  const list = tests
+  const list = filing
     .slice(0, SUMMARY_LIST_MAX)
     .map(
-      (t) =>
-        `- ${SUITE_NAME[t.f.suite]}: ${codeSpan(t.f.title)}${t.f.file ? ` in ${codeSpan(t.f.file)}` : ""}`,
+      (a) =>
+        `- ${testLine(a.f)}, failed on ${a.seen.map((s) => attemptLink(run.repo, s.run, s.attempt)).join(", ")}`,
     );
-  const more = tests.length - list.length;
+  const more = filing.length - list.length;
   return {
-    title: `Flaky: ${tests.length} tests failed on ${runLabel(run)} run ${run.runId}, then passed`,
+    title: `Flaky: ${filing.length} tests failed twice in ${WINDOW_DAYS} days, the last time on ${runLabel(run)} run ${run.runId}`,
     body: [
-      summaryMarker(run.runId),
-      `${tests.length} tests failed on attempt ${attempts.join(", ")} of ${runLabel(run)} and the same run passed on attempt ${run.attempt}, with the same commit. More than ${MAX_ISSUES_PER_RUN} at once usually means the attempt itself was broken (an outage, a bad bring-up), not that each test is flaky, so no sighting was recorded and no issue was opened or bumped per test.`,
+      `${filing.length} tests that failed on an earlier attempt of ${runLabel(run)} (it passed on attempt ${run.attempt}, with the same commit) have now failed in two or more runs within ${WINDOW_DAYS} days. That is more than ${MAX_ISSUES_PER_RUN} issues to open or bump from one run, so they are listed here instead, with the runs they failed in. Every sighting is recorded in the \`${STORE_LABEL}\` issue as usual.`,
       "",
-      ...attempts.map((a) => `Failed attempt: ${runLink(run, a)}`),
       `Passed on: ${runLink(run, run.attempt)}`,
       "",
       ...list,
       ...(more > 0 ? [`- and ${more} more`] : []),
       "",
-      "Look at the failed attempt. If it was the environment, close this issue. If some of these tests are flaky on their own, they are recorded the next time they flake in a smaller set.",
+      "Look at the failed attempts. If it was the environment, close this issue. A test that flakes again later gets its own issue when its run files at most a few.",
+      "",
+      markerBlock([
+        ["kind", "summary"],
+        ["run", String(run.runId)],
+      ]),
     ].join("\n"),
   };
 }
@@ -846,41 +1025,6 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     "FBCA04",
     "A test that failed and then passed on a rerun of the same run",
   );
-  const done: Done[] = [];
-  const tests = firstSightings(found);
-  if (tests.length > MAX_ISSUES_PER_RUN) {
-    const marker = summaryMarker(run.runId);
-    const had = listOpen(exec, run.repo).find((i) => i.body.includes(marker));
-    if (had) {
-      done.push({
-        action: "skip",
-        id: `summary:${run.runId}`,
-        issue: had.number,
-      });
-      return { done, notes };
-    }
-    const { title, body } = summaryIssue(run, tests);
-    gh(
-      exec,
-      [
-        "issue",
-        "create",
-        "--repo",
-        run.repo,
-        "--title",
-        title,
-        "--body",
-        body,
-        "--label",
-        LABEL,
-      ],
-      { write: true },
-    );
-    done.push({ action: "summary", id: `summary:${run.runId}` });
-    return { done, notes };
-  }
-  // Record first: a sighting is kept even when an issue write below fails,
-  // and a rerun of the tracker finds this run in the store and adds nothing.
   ensureLabel(
     exec,
     run.repo,
@@ -888,7 +1032,13 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     "EDEDED",
     "The flaky tracker's record of tests that failed and then passed",
   );
-  const store = openStore(exec, run.repo);
+  const done: Done[] = [];
+  const tests = firstSightings(found);
+  // Record first, every sighting: one is kept even when an issue write below
+  // fails, and a rerun of the tracker finds this run in the store and adds
+  // nothing.
+  const store = openStore(exec, run.repo, o.nowMs);
+  notes.push(...store.notes);
   const stored = readStore(exec, run.repo, store.read, o.nowMs);
   const fresh = tests.filter(
     (t) =>
@@ -908,15 +1058,17 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       ],
       { write: true },
     );
-  // Then, for a test seen twice, a fresh list of the open issues right before
-  // each write. Tracker runs are not serialized (a shared concurrency group
-  // would let a newer event cancel a pending one), so another run may have
-  // opened or bumped the issue a moment ago.
-  for (const t of tests) {
-    const x = { ...t, stored: stored.get(keyOf(t.f.id)) ?? [] };
-    const pre = plan(x, [], o.nowMs);
-    const a =
-      pre.kind === "record" ? pre : plan(x, listOpen(exec, run.repo), o.nowMs);
+  // Tracker runs are serialized per repo (flaky-tracker.yml), so one list of
+  // the open issues holds for the whole run.
+  const open = listOpen(exec, run.repo);
+  const actions = tests.map((t) =>
+    plan({ ...t, stored: stored.get(keyOf(t.f.id)) ?? [] }, open, o.nowMs),
+  );
+  const filing = actions.filter(
+    (a): a is Filing => a.kind === "create" || a.kind === "bump",
+  );
+  const summarize = filing.length > MAX_ISSUES_PER_RUN;
+  for (const a of actions) {
     if (a.kind === "record") {
       done.push({ action: "record", id: a.f.id });
       continue;
@@ -925,6 +1077,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       done.push({ action: "skip", id: a.f.id, issue: a.issue });
       continue;
     }
+    if (summarize) continue;
     if (a.kind === "bump") {
       // The body first: it is what plan() reads, so a rerun after a failed
       // comment skips this run instead of commenting twice.
@@ -937,7 +1090,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
           "--repo",
           run.repo,
           "--body",
-          bumpedBody(a.body, a.seen, o.nowMs),
+          bumpedBody(a.f, a.body, a.seen, o.nowMs),
         ],
         { write: true, idempotent: true },
       );
@@ -995,6 +1148,34 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     );
     done.push({ action: "create", id: a.f.id });
   }
+  if (!summarize) return { done, notes };
+  const had = open.find((i) => isSummaryOf(i.body, run.runId));
+  if (had) {
+    done.push({
+      action: "skip",
+      id: `summary:${run.runId}`,
+      issue: had.number,
+    });
+    return { done, notes };
+  }
+  const { title, body } = summaryIssue(run, filing);
+  gh(
+    exec,
+    [
+      "issue",
+      "create",
+      "--repo",
+      run.repo,
+      "--title",
+      title,
+      "--body",
+      body,
+      "--label",
+      LABEL,
+    ],
+    { write: true },
+  );
+  done.push({ action: "summary", id: `summary:${run.runId}` });
   return { done, notes };
 }
 
@@ -1057,7 +1238,13 @@ function main(argv: string[]) {
   ];
   console.log(lines.join("\n"));
   const summary = process.env.GITHUB_STEP_SUMMARY;
-  if (summary) appendFileSync(summary, `${lines.join("\n")}\n`);
+  // The step summary is markdown and the ids are untrusted: a fence longer
+  // than any backtick run in them keeps it all plain text.
+  const text = lines.map(inert).join("\n");
+  const fence = "`".repeat(
+    Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)),
+  );
+  if (summary) appendFileSync(summary, `${fence}\n${text}\n${fence}\n`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
