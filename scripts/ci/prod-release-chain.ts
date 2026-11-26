@@ -25,9 +25,9 @@
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts fresh --repo owner/name --tag vX.Y.Z --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag vX.Y.Z --current vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts require-newer --tag vX.Y.Z --current vX.Y.Z
-//        node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo owner/name --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo owner/name --public-repo owner/name --tag vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo owner/name --workflow publish|deploy --run-id <id> --tag vX.Y.Z
-//        node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo owner/name --after gate|publish --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo owner/name --public-repo owner/name --after gate|publish --tag vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts result --step gate|deploy|report --plan <r> --gate <r> --start <r> --deploy <r> --finish <r> --state <s>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo owner/name --tag vX.Y.Z --result success --run <url>
 // Every other failure throws (exit 1): the chain fails closed. Needs GH_TOKEN for
@@ -138,33 +138,120 @@ export function fresh(o: {
   return { run: newest.id, go: newest.head_sha === o.headSha };
 }
 
+/** GitHub lists at most this many runs for one query (cloud-flaky-tracker.ts). */
+export const LIST_MAX = 1000;
+const PER_PAGE = 100;
+const DAY_MS = 24 * 3600 * 1000;
+const RUNS_JQ =
+  "{total_count, workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}";
+
+/**
+ * The earliest time a run for `tag` can have been created: the committer
+ * date of the tag's commit in the public repo, less a day for clock skew.
+ * Nothing is dispatched for a tag before the tag exists, so every run for it
+ * is newer. A missing, unparsable or future date throws.
+ */
+export function releasedSince(o: {
+  exec: Exec;
+  publicRepo: string;
+  tag: string;
+  nowMs: number;
+}): string {
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(o.publicRepo))
+    throw new Error("--public-repo owner/name is required");
+  const date = gh(o.exec, [
+    "api",
+    "-X",
+    "GET",
+    "--jq",
+    ".commit.committer.date",
+    `repos/${o.publicRepo}/commits/${o.tag}`,
+  ]).trim();
+  const ms = Date.parse(date);
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(date) || Number.isNaN(ms))
+    throw new Error(`no commit date for ${o.tag} in ${o.publicRepo}`);
+  if (ms > o.nowMs + DAY_MS)
+    throw new Error(`the commit date of ${o.tag} (${date}) is in the future`);
+  return new Date(ms - DAY_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * Every run a list-workflow-runs query (`path`, with a query string but no
+ * created, page or per_page) finds created at or after `since`, page by
+ * page until a short page: one paged read, no waiting. It never returns a
+ * partial list: a page that does not parse, a first page counting LIST_MAX
+ * runs or more (GitHub lists no more for one query), more pages than that,
+ * or fewer distinct runs than the first page counted (one deleted while
+ * reading) all throw.
+ */
+export function allRuns(exec: Exec, path: string, since: string): Run[] {
+  const created = encodeURIComponent(`>=${since}`);
+  const byId = new Map<number, Run>();
+  let total = 0;
+  for (let p = 1; ; p++) {
+    if (p > LIST_MAX / PER_PAGE)
+      throw new Error(
+        `more than ${LIST_MAX} runs of ${path}: refusing a partial list`,
+      );
+    const body = JSON.parse(
+      gh(exec, [
+        "api",
+        "-X",
+        "GET",
+        "--jq",
+        RUNS_JQ,
+        `${path}&created=${created}&per_page=${PER_PAGE}&page=${p}`,
+      ]),
+    ) as { total_count?: unknown; workflow_runs?: unknown };
+    const rows = body.workflow_runs;
+    if (!Array.isArray(rows) || typeof body.total_count !== "number")
+      throw new Error(`unparsable page ${p} of ${path}`);
+    if (p === 1) {
+      total = body.total_count;
+      if (total >= LIST_MAX)
+        throw new Error(
+          `${total} runs of ${path}: GitHub lists at most ${LIST_MAX}, refusing a partial list`,
+        );
+    }
+    for (const r of rows as Run[]) {
+      if (!Number.isSafeInteger(r?.id))
+        throw new Error(`unparsable page ${p} of ${path}`);
+      byId.set(r.id, r);
+    }
+    if (rows.length < PER_PAGE) break;
+  }
+  if (byId.size < total)
+    throw new Error(
+      `read ${byId.size} of ${total} runs of ${path}: refusing a partial list`,
+    );
+  return [...byId.values()];
+}
+
 /**
  * Whether `tag`'s release is already in prod's bucket (#1412): a completed
  * hosted-publish.yml run on main, of this repository, whose publish-prod job
  * for the release succeeded (the job is named "publish-prod release <tag>").
- * Publishing is create-only, so the chain must not publish it twice. An API
- * error or an unparsable answer throws.
+ * Publishing is create-only, so the chain must not publish it twice. Every
+ * run since the tag's release is read (allRuns), so an older publish on a
+ * later page still counts. An API error, an unparsable or incomplete answer
+ * throws.
  */
 export function published(o: {
   exec: Exec;
   repo: string;
   tag: string;
+  /** releasedSince: no run for the tag is older. */
+  since: string;
 }): boolean {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
-  const body = JSON.parse(
-    gh(o.exec, [
-      "api",
-      "-X",
-      "GET",
-      "--jq",
-      "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
-      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed&per_page=30`,
-    ]),
-  ) as { workflow_runs?: Run[] };
-  if (!Array.isArray(body.workflow_runs))
-    throw new Error("unparsable hosted-publish.yml runs");
+  const runs = allRuns(
+    o.exec,
+    `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed`,
+    o.since,
+  );
   const name = `publish-prod release ${o.tag}`;
-  for (const r of body.workflow_runs) {
+  for (const r of runs) {
     if (
       r.head_branch !== "main" ||
       r.status !== "completed" ||
@@ -324,22 +411,24 @@ export function child(o: {
   };
 }
 
-/** The chain's own runs of a workflow for a tag (its chain run name), newest first. */
-function chainRuns(exec: Exec, repo: string, which: Child, tag: string): Run[] {
+/**
+ * The chain's own runs of a workflow for a tag (its chain run name): every
+ * dispatched run on main since the tag's release, all pages (allRuns).
+ */
+function chainRuns(
+  exec: Exec,
+  repo: string,
+  which: Child,
+  tag: string,
+  since: string,
+): Run[] {
   const c = CHILD[which];
-  const body = JSON.parse(
-    gh(exec, [
-      "api",
-      "-X",
-      "GET",
-      "--jq",
-      "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
-      `repos/${repo}/actions/workflows/${c.file}/runs?event=workflow_dispatch&branch=main&per_page=20`,
-    ]),
-  ) as { workflow_runs?: (Run & { actor?: { login?: string } })[] };
-  if (!Array.isArray(body.workflow_runs))
-    throw new Error(`unparsable ${c.file} runs`);
-  return body.workflow_runs.filter(
+  const runs = allRuns(
+    exec,
+    `repos/${repo}/actions/workflows/${c.file}/runs?event=workflow_dispatch&branch=main`,
+    since,
+  ) as (Run & { actor?: { login?: string } })[];
+  return runs.filter(
     (r) =>
       r.event === "workflow_dispatch" &&
       r.head_branch === "main" &&
@@ -358,18 +447,24 @@ export type Start = { go: true; next: Child } | { go: false; why: string };
  * bucket must have the release (else it throws: fail closed). Never twice:
  * nothing starts while the chain's publish or deploy of the tag is queued or
  * running (its end is the next event), or once the chain's deploy of the tag
- * succeeded. A failed earlier run does not block a new event. Called under
- * the tag's concurrency group, right before the dispatch.
+ * succeeded. A failed earlier run does not block a new event. Every run
+ * since the tag's release is read, all pages, so an earlier run on a later
+ * page still counts; a read that is not complete throws and nothing is
+ * dispatched. Called under the tag's concurrency group, right before the
+ * dispatch.
  */
 export function start(o: {
   exec: Exec;
   repo: string;
+  publicRepo: string;
   after: "gate" | "publish";
   tag: string;
+  nowMs?: number;
 }): Start {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  const since = releasedSince({ ...o, nowMs: o.nowMs ?? Date.now() });
   const going = (r: Run) => r.status !== "completed";
-  const deploys = chainRuns(o.exec, o.repo, "deploy", o.tag);
+  const deploys = chainRuns(o.exec, o.repo, "deploy", o.tag, since);
   if (deploys.some(going))
     return {
       go: false,
@@ -377,7 +472,7 @@ export function start(o: {
     };
   if (deploys.some((r) => r.conclusion === "success"))
     return { go: false, why: `the chain already deployed ${o.tag}` };
-  const inBucket = published(o);
+  const inBucket = published({ ...o, since });
   if (o.after === "publish") {
     if (!inBucket)
       throw new Error(
@@ -386,7 +481,7 @@ export function start(o: {
     return { go: true, next: "deploy" };
   }
   if (inBucket) return { go: true, next: "deploy" };
-  if (chainRuns(o.exec, o.repo, "publish", o.tag).some(going))
+  if (chainRuns(o.exec, o.repo, "publish", o.tag, since).some(going))
     return {
       go: false,
       why: `the chain's publish of ${o.tag} is under way: its end is the next event`,
@@ -668,7 +763,13 @@ function main(argv: string[]) {
     const after = flag(argv, "after");
     if (after !== "gate" && after !== "publish")
       throw new Error("--after gate|publish");
-    const r = start({ exec: realExec, repo, after, tag: flag(argv, "tag") });
+    const r = start({
+      exec: realExec,
+      repo,
+      publicRepo: flag(argv, "public-repo"),
+      after,
+      tag: flag(argv, "tag"),
+    });
     emit("go", String(r.go));
     if (r.go) emit("next", r.next);
     else console.log(`::notice title=Release chain skipped::${oneLine(r.why)}`);
@@ -690,7 +791,14 @@ function main(argv: string[]) {
     return;
   }
   if (mode === "published") {
-    const go = published({ exec: realExec, repo, tag: flag(argv, "tag") });
+    const tag = flag(argv, "tag");
+    const since = releasedSince({
+      exec: realExec,
+      publicRepo: flag(argv, "public-repo"),
+      tag,
+      nowMs: Date.now(),
+    });
+    const go = published({ exec: realExec, repo, tag, since });
     console.error(
       `prod-release-chain: ${flag(argv, "tag")} is ${go ? "" : "not "}in prod's bucket`,
     );

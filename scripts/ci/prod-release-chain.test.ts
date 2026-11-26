@@ -15,6 +15,7 @@ import {
   APP_ACTOR,
   child,
   type Exec,
+  type ExecResult,
   fresh,
   isNewer,
   plan,
@@ -375,7 +376,7 @@ describe("prod-release-chain.yml", () => {
       TAG: "${{ needs.gate.outputs.tag }}",
     });
     expect(st.run).toBe(
-      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --after gate --tag "$TAG"',
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after gate --tag "$TAG"',
     );
     const d = steps.find((s) => s.id === "dispatch") as Step;
     expect(d.env).toEqual({
@@ -416,7 +417,7 @@ describe("prod-release-chain.yml", () => {
     // A rerun still going (running) starts nothing.
     expect(st.if).toBe("steps.child.outputs.state == 'success'");
     expect(st.run).toBe(
-      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --after publish --tag "$TAG"',
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after publish --tag "$TAG"',
     );
     const d = steps.find((s) => s.id === "dispatch") as Step;
     expect(d.env).toEqual({
@@ -834,7 +835,30 @@ describe("start: what the chain dispatches next for the tag, never twice", () =>
     publishes?: Api[];
     /** Completed hosted-publish runs whose publish-prod job for TAG succeeded. */
     inBucket?: boolean;
+    /** Runs of each list that are not the chain's prod runs, newer than ours (listed first). */
+    newer?: number;
+    /** A list page (url substring) that answers with an error. */
+    fail?: string;
   };
+  const PUBLIC = "open-artifacts-ai/open-artifacts";
+  // The tag's commit date in the public repo, less a day.
+  const SINCE = encodeURIComponent(">=2026-11-19T12:00:00Z");
+  const NOW = Date.parse("2026-11-26T00:00:00Z");
+  /** Staging dispatches of the same tag: never the chain's prod runs. */
+  const staging = (which: "publish" | "deploy", n: number): Api[] =>
+    Array.from({ length: n }, (_, i) => ({
+      id: 10_000 + i,
+      status: "completed",
+      conclusion: "success",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      display_title:
+        which === "publish"
+          ? `hosted-publish staging ${TAG} [sp${i}-1]`
+          : `deploy-hosted-platform staging ${TAG} [sc${i}-1]`,
+      actor: { login: APP },
+      head_repository: { full_name: REPO },
+    }));
   const chainRun = (which: "publish" | "deploy", over: Api = {}): Api => ({
     id: which === "publish" ? 501 : 601,
     status: "completed",
@@ -859,15 +883,33 @@ describe("start: what the chain dispatches next for the tag, never twice", () =>
         stdout: JSON.stringify(v),
         stderr: "",
       });
+      if (u === `repos/${PUBLIC}/commits/${TAG}`)
+        return { code: 0, stdout: "2026-11-20T12:00:00Z\n", stderr: "" };
+      if (o.fail && u.includes(o.fail))
+        return { code: 1, stdout: "", stderr: "HTTP 502" };
+      // One page of a list: every list is read since the tag's release.
+      const page = (all: Api[]) => {
+        if (!u.includes(`&created=${SINCE}&`))
+          throw new Error(`no created filter: ${u}`);
+        const p = Number(/[?&]page=(\d+)/.exec(u)?.[1]);
+        const n = Number(/[?&]per_page=(\d+)/.exec(u)?.[1]);
+        return json({
+          total_count: all.length,
+          workflow_runs: all.slice((p - 1) * n, p * n),
+        });
+      };
+      const newer = (which: "publish" | "deploy") =>
+        staging(which, o.newer ?? 0);
       if (u.includes("/workflows/deploy-hosted-platform.yml/runs?"))
-        return json({ workflow_runs: o.deploys ?? [] });
+        return page([...newer("deploy"), ...(o.deploys ?? [])]);
       if (
         u.includes("/workflows/hosted-publish.yml/runs?event=workflow_dispatch")
       )
-        return json({ workflow_runs: o.publishes ?? [] });
+        return page([...newer("publish"), ...(o.publishes ?? [])]);
       if (u.includes("/workflows/hosted-publish.yml/runs?"))
-        return json({
-          workflow_runs: o.inBucket
+        return page([
+          ...newer("publish"),
+          ...(o.inBucket
             ? [
                 {
                   id: 900,
@@ -877,17 +919,33 @@ describe("start: what the chain dispatches next for the tag, never twice", () =>
                   head_repository: { full_name: REPO },
                 },
               ]
-            : [],
-        });
+            : []),
+        ]);
       if (u.includes("/runs/900/jobs"))
         return json({
           jobs: [
             { name: `publish-prod release ${TAG}`, conclusion: "success" },
           ],
         });
+      if (/\/runs\/1\d{4}\/jobs/.test(u))
+        return json({
+          jobs: [
+            { name: `publish-staging release ${TAG}`, conclusion: "success" },
+          ],
+        });
       throw new Error(`unexpected ${u}`);
     };
-    return { r: start({ exec, repo: REPO, after, tag: TAG }), calls };
+    return {
+      r: start({
+        exec,
+        repo: REPO,
+        publicRepo: PUBLIC,
+        after,
+        tag: TAG,
+        nowMs: NOW,
+      }),
+      calls,
+    };
   };
   it("after the gate: the publish; the deploy at once when prod's bucket has the release", () => {
     expect(go("gate").r).toEqual({ go: true, next: "publish" });
@@ -949,30 +1007,159 @@ describe("start: what the chain dispatches next for the tag, never twice", () =>
         JSON.stringify(over),
       ).toEqual({ go: true, next: "publish" });
   });
-  it("fails closed on an unreadable list or a bad tag", () => {
-    expect(() =>
+  it("an earlier success on a later page still counts: no second dispatch", () => {
+    // The Prover's case: the chain's green deploy of the tag behind 20, then
+    // 150, newer staging dispatches (page two, then page two of 100-run pages).
+    for (const newer of [20, 99, 100, 150, 250]) {
+      expect(
+        go("gate", { deploys: [chainRun("deploy")], inBucket: true, newer }).r,
+        String(newer),
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      expect(
+        go("publish", {
+          deploys: [chainRun("deploy")],
+          inBucket: true,
+          newer,
+        }).r,
+        String(newer),
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      // A green prod publish behind them: the bucket has it, so the deploy.
+      expect(go("gate", { inBucket: true, newer }).r, String(newer)).toEqual({
+        go: true,
+        next: "deploy",
+      });
+      // The chain's publish still going, behind them: nothing.
+      expect(
+        go("gate", {
+          publishes: [
+            chainRun("publish", { status: "in_progress", conclusion: null }),
+          ],
+          newer,
+        }).r,
+        String(newer),
+      ).toEqual({
+        go: false,
+        why: `the chain's publish of ${TAG} is under way: its end is the next event`,
+      });
+    }
+    const { calls } = go("gate", {
+      deploys: [chainRun("deploy")],
+      newer: 150,
+    });
+    expect(
+      calls.filter((c) => c.includes("deploy-hosted-platform.yml/runs?")),
+    ).toEqual([
+      `repos/${REPO}/actions/workflows/deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created=${SINCE}&per_page=100&page=1`,
+      `repos/${REPO}/actions/workflows/deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created=${SINCE}&per_page=100&page=2`,
+    ]);
+  });
+  it("an unreadable page fails, with no dispatch", () => {
+    for (const fail of [
+      "deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created",
+      "hosted-publish.yml/runs?branch=main&status=completed&created",
+      "hosted-publish.yml/runs?event=workflow_dispatch&branch=main&created",
+    ])
+      expect(
+        () =>
+          go("gate", {
+            newer: 150,
+            fail: `${fail}=${SINCE}&per_page=100&page=2`,
+          }),
+        fail,
+      ).toThrow("HTTP 502");
+    // A page that answers but does not parse, or is missing its count.
+    const lists =
+      (body: (p: number) => unknown): Exec =>
+      (_c, a) => {
+        const u = a.at(-1) ?? "";
+        if (u.endsWith(`/commits/${TAG}`))
+          return { code: 0, stdout: "2026-11-20T12:00:00Z", stderr: "" };
+        const p = Number(/[?&]page=(\d+)/.exec(u)?.[1]);
+        return { code: 0, stdout: JSON.stringify(body(p)), stderr: "" };
+      };
+    const full = staging("deploy", 100);
+    const run = (exec: Exec) =>
       start({
-        exec: () => ({ code: 0, stdout: "{}", stderr: "" }),
+        exec,
         repo: REPO,
+        publicRepo: PUBLIC,
         after: "gate",
         tag: TAG,
-      }),
+        nowMs: NOW,
+      });
+    expect(() =>
+      run(
+        lists((p) =>
+          p === 1 ? { total_count: 101, workflow_runs: full } : {},
+        ),
+      ),
+    ).toThrow("unparsable page 2");
+    expect(() =>
+      run(lists((p) => (p === 1 ? { workflow_runs: full } : {}))),
+    ).toThrow("unparsable page 1");
+    expect(() => run(lists(() => "not json"))).toThrow("unparsable");
+    // Fewer runs than the first page counted (one went while reading).
+    expect(() =>
+      run(
+        lists((p) =>
+          p === 1
+            ? { total_count: 150, workflow_runs: full }
+            : { total_count: 149, workflow_runs: full.slice(0, 49) },
+        ),
+      ),
+    ).toThrow("refusing a partial list");
+    // More runs than GitHub lists for one query.
+    expect(() =>
+      run(lists(() => ({ total_count: 1000, workflow_runs: full }))),
+    ).toThrow("GitHub lists at most 1000");
+    // Every page full: stops at GitHub's limit instead of reading on.
+    expect(() =>
+      run(lists(() => ({ total_count: 999, workflow_runs: full }))),
+    ).toThrow("more than 1000 runs");
+  });
+  it("fails closed on an unreadable list, a bad tag or no release date", () => {
+    const at =
+      (date: string, rest: ExecResult): Exec =>
+      (_c, a) =>
+        (a.at(-1) ?? "").endsWith(`/commits/${TAG}`)
+          ? { code: 0, stdout: date, stderr: "" }
+          : rest;
+    const run = (exec: Exec, tag = TAG) =>
+      start({
+        exec,
+        repo: REPO,
+        publicRepo: PUBLIC,
+        after: "gate",
+        tag,
+        nowMs: NOW,
+      });
+    expect(() =>
+      run(at("2026-11-20T12:00:00Z", { code: 0, stdout: "{}", stderr: "" })),
     ).toThrow("unparsable");
     expect(() =>
-      start({
-        exec: () => ({ code: 1, stdout: "", stderr: "HTTP 502" }),
-        repo: REPO,
-        after: "gate",
-        tag: TAG,
-      }),
-    ).toThrow();
+      run(
+        at("2026-11-20T12:00:00Z", { code: 1, stdout: "", stderr: "HTTP 502" }),
+      ),
+    ).toThrow("HTTP 502");
+    expect(() =>
+      run(() => ({ code: 1, stdout: "", stderr: "HTTP 404" })),
+    ).toThrow("HTTP 404");
+    for (const date of ["", "null", "yesterday", "2026-12-28T00:00:00Z"])
+      expect(
+        () => run(at(date, { code: 0, stdout: "{}", stderr: "" })),
+        date,
+      ).toThrow(/no commit date|in the future/);
     expect(() =>
       start({
         exec: () => ({ code: 0, stdout: "{}", stderr: "" }),
         repo: REPO,
+        publicRepo: "",
         after: "gate",
-        tag: "v1",
+        tag: TAG,
       }),
+    ).toThrow("--public-repo");
+    expect(() =>
+      run(() => ({ code: 0, stdout: "{}", stderr: "" }), "v1"),
     ).toThrow("not a release tag");
   });
 });
@@ -1433,6 +1620,7 @@ describe("the gate's neutral skips", () => {
       published({
         repo: "o/r",
         tag: "v1.2.3",
+        since: "2026-11-19T12:00:00Z",
         exec: (_c, a) => {
           const u = a.at(-1) ?? "";
           if (u.includes("/workflows/hosted-publish.yml/runs"))
@@ -1440,6 +1628,7 @@ describe("the gate's neutral skips", () => {
               code: 0,
               stderr: "",
               stdout: JSON.stringify({
+                total_count: Object.keys(jobsByRun).length,
                 workflow_runs: Object.keys(jobsByRun).map((id) => ({
                   id: Number(id),
                   status: "completed",
@@ -1507,6 +1696,7 @@ describe("the gate's neutral skips", () => {
       published({
         repo: "o/r",
         tag: "v1.2.3",
+        since: "2026-11-19T12:00:00Z",
         exec: () => ({ code: 1, stdout: "", stderr: "boom" }),
       }),
     ).toThrow();

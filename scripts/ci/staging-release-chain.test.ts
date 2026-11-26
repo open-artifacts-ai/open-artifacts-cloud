@@ -976,8 +976,23 @@ describe("runs-list reads stay under spawnSync's 1 MiB buffer", () => {
       const src = read(`scripts/ci/${f}.ts`);
       const lists = src.match(/actions\/workflows\/[^`]*\/runs\?[^`]*`/g) ?? [];
       expect(lists.length).toBeGreaterThan(0);
-      for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
-      expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      if (f === "prod-release-chain") {
+        // fresh reads one small page; the duplicate checks read every page
+        // through allRuns, 100 runs a page, each cut down by --jq to a few
+        // hundred bytes (well under 1 MiB a page).
+        const [one, ...paged] = lists;
+        expect(one).toMatch(/per_page=30`/);
+        expect(paged.length).toBeGreaterThan(0);
+        for (const l of paged) expect(l).not.toMatch(/per_page/);
+        expect(src).toMatch(/const PER_PAGE = 100;/);
+        expect(src).toMatch(/"--jq",\s+RUNS_JQ,\s+`\$\{path\}&created=/);
+        expect(src).toMatch(
+          /RUNS_JQ =\s+"\{total_count, workflow_runs: \[\.workflow_runs\[\]\? \| \{id, display_title,/,
+        );
+      } else {
+        for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
+        expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      }
       expect(src).toMatch(/MAX_BUFFER = 16 \* 1024 \* 1024/);
       expect(src).toMatch(/maxBuffer: MAX_BUFFER/);
     });

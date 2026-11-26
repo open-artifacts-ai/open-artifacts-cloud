@@ -245,7 +245,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.gate.outputs.tag }}
-        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --after gate --tag "$TAG"
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after gate --tag "$TAG"
       - id: app
         name: Mint the dispatch token
         if: steps.start.outputs.go == 'true'
@@ -309,7 +309,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
-        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --after publish --tag "$TAG"
+        run: node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after publish --tag "$TAG"
       - id: app
         name: Mint the dispatch token
         if: steps.start.outputs.go == 'true'
