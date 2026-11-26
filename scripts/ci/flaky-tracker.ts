@@ -795,8 +795,17 @@ const storeMark = (x: Found): [string, string] => [
   sightingLine(keyOf(x.f.id), x.sighting).slice("sighting: ".length),
 ];
 
-/** One store comment for these of this run's new sightings. */
-export function storeComment(run: RunInfo, fresh: Found[]): string {
+/**
+ * One store comment for these of this run's new sightings. Only the last part
+ * of a split carries the run marker, so the reconcile treats a run as recorded
+ * only once every part is posted (a failed later part is retried, and sightings
+ * already stored are not fresh again).
+ */
+export function storeComment(
+  run: RunInfo,
+  fresh: Found[],
+  last = true,
+): string {
   return [
     `${runLabel(run)}, run ${run.runId}: failed, then passed on attempt ${run.attempt} (${runLink(run, run.attempt)}).`,
     "",
@@ -804,18 +813,25 @@ export function storeComment(run: RunInfo, fresh: Found[]): string {
     "",
     markerBlock([
       ["kind", "sightings"],
-      ["run", `${run.runId}/${run.attempt}`],
+      ...(last ? ([["run", `${run.runId}/${run.attempt}`]] as const) : []),
       ...fresh.map(storeMark),
     ]),
   ].join("\n");
 }
+
+/** The store comment that marks this run recorded: written after every filing. */
+export const runDoneComment = (run: RunInfo) => storeComment(run, [], true);
 
 /**
  * The store comments for this run's new sightings, split so each stays under
  * COMMENT_MAX characters (GitHub refuses a comment over 65536). Each is a
  * whole comment with its own marker block, so each is read on its own.
  */
-export function storeComments(run: RunInfo, fresh: Found[]): string[] {
+export function storeComments(
+  run: RunInfo,
+  fresh: Found[],
+  marksRun = true,
+): string[] {
   const base = storeComment(run, []).length;
   const out: string[] = [];
   let part: Found[] = [];
@@ -825,14 +841,14 @@ export function storeComments(run: RunInfo, fresh: Found[]): string[] {
     const add =
       storeRow(run, x).length + 1 + storeMark(x).join(": ").length + 1;
     if (part.length && size + add >= COMMENT_MAX) {
-      out.push(storeComment(run, part));
+      out.push(storeComment(run, part, false));
       part = [];
       size = base;
     }
     part.push(x);
     size += add;
   }
-  if (part.length) out.push(storeComment(run, part));
+  if (part.length) out.push(storeComment(run, part, marksRun));
   return out;
 }
 
@@ -1118,14 +1134,28 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   // nothing.
   const store = openStore(exec, run.repo, o.nowMs);
   notes.push(...store.notes);
-  const stored = parseStore(
-    storeCommentsIn(exec, run.repo, store.read, o.nowMs),
-  );
+  const comments = storeCommentsIn(exec, run.repo, store.read, o.nowMs);
+  const stored = parseStore(comments);
+  const marked = storedRuns(comments).has(`${run.runId}/${run.attempt}`);
   const fresh = tests.filter(
     (t) =>
       !(stored.get(keyOf(t.f.id)) ?? []).some((s) => s.run === t.sighting.run),
   );
-  for (const body of storeComments(run, fresh))
+  // Tracker runs are serialized per repo (flaky-tracker.yml), so one list of
+  // the open issues holds for the whole run.
+  const open = listOpen(exec, run.repo);
+  const actions = tests.map((t) =>
+    plan({ ...t, stored: stored.get(keyOf(t.f.id)) ?? [] }, open, o.nowMs),
+  );
+  const filing = actions.filter(
+    (a): a is Filing => a.kind === "create" || a.kind === "bump",
+  );
+  // The run marker says "this run is fully handled": the reconcile skips a
+  // marked run. With nothing to file it rides on the last store part. With
+  // filings it is written last (finish), so a failed create or bump leaves the
+  // run unmarked and the hourly reconcile tracks it again; its sightings are
+  // already stored, so nothing is stored twice, and plan() sees them.
+  const post = (body: string) =>
     gh(
       exec,
       [
@@ -1139,15 +1169,11 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       ],
       { write: true },
     );
-  // Tracker runs are serialized per repo (flaky-tracker.yml), so one list of
-  // the open issues holds for the whole run.
-  const open = listOpen(exec, run.repo);
-  const actions = tests.map((t) =>
-    plan({ ...t, stored: stored.get(keyOf(t.f.id)) ?? [] }, open, o.nowMs),
-  );
-  const filing = actions.filter(
-    (a): a is Filing => a.kind === "create" || a.kind === "bump",
-  );
+  const finish = () => {
+    if (!marked && filing.length) post(runDoneComment(run));
+    return { done, notes };
+  };
+  for (const body of storeComments(run, fresh, !filing.length)) post(body);
   const summarize = filing.length > MAX_ISSUES_PER_RUN;
   for (const a of actions) {
     if (a.kind === "record") {
@@ -1229,7 +1255,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     );
     done.push({ action: "create", id: a.f.id });
   }
-  if (!summarize) return { done, notes };
+  if (!summarize) return finish();
   const had = open.find((i) => isSummaryOf(i.body, run.runId));
   if (had) {
     done.push({
@@ -1237,7 +1263,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       id: `summary:${run.runId}`,
       issue: had.number,
     });
-    return { done, notes };
+    return finish();
   }
   const { title, body } = summaryIssue(run, filing);
   gh(
@@ -1257,7 +1283,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     { write: true },
   );
   done.push({ action: "summary", id: `summary:${run.runId}` });
-  return { done, notes };
+  return finish();
 }
 
 const flag = (argv: string[], name: string) => {
@@ -1382,10 +1408,12 @@ function listRuns(
     .split("\n")
     .filter((l) => l.trim())
     .map((l) => {
-      const [id, attempt, name, event, branch, sha, title, head] = JSON.parse(
+      const [id, attempt, , event, branch, sha, title, head] = JSON.parse(
         l,
       ) as [number, number, string, string, string, string, string, string];
-      return { id, attempt, name, event, branch, sha, title, head };
+      // The API's .name is the run-name ("redline-staging v0.242.2"), not the
+      // workflow's name: use the workflow this list was read for.
+      return { id, attempt, name: workflow, event, branch, sha, title, head };
     });
 }
 

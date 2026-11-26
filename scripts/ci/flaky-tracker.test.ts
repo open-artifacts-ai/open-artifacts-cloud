@@ -946,6 +946,8 @@ describe("track", () => {
       "issue close 3",
       "issue comment 77",
       "issue create --repo",
+      // The run is marked handled only after its filing.
+      "issue comment 77",
     ]);
     const close = writes(g)[1] as Call;
     expect(close.args[close.args.indexOf("--comment") + 1]).toContain("#77");
@@ -965,6 +967,7 @@ describe("track", () => {
     expect(writes(g2).map((c) => c.args.slice(0, 3).join(" "))).toEqual([
       "issue comment 3",
       "issue create --repo",
+      "issue comment 3",
     ]);
   });
 
@@ -1115,6 +1118,8 @@ describe("the per-run cap", () => {
     expect(w.map((c) => c.args.slice(0, 3).join(" "))).toEqual([
       "issue comment 3",
       "issue create --repo",
+      // The run is marked handled only after the summary is filed.
+      "issue comment 3",
     ]);
     // The store got all 50 sightings of this run.
     const stored = parseStore([{ user: STORE_AUTHOR, body: bodyOf(w[0]) }]);
@@ -1196,10 +1201,16 @@ describe("store comments stay under GitHub's limit", () => {
   it(`splits 300 failing tests into comments under ${COMMENT_MAX} characters, each read back whole`, () => {
     const cs = storeComments(run, rows);
     expect(cs.length).toBeGreaterThan(1);
-    for (const c of cs) {
+    for (const [i, c] of cs.entries()) {
       expect(c.length).toBeLessThan(COMMENT_MAX);
-      expect(readMarkers(c)?.get("run")).toEqual(["900/2"]);
+      // Only the last part marks the run recorded (a failed later part is retried).
+      expect(readMarkers(c)?.get("run")).toEqual(
+        i === cs.length - 1 ? ["900/2"] : undefined,
+      );
     }
+    expect(
+      storedRuns(cs.slice(0, -1).map((body) => ({ user: STORE_AUTHOR, body }))),
+    ).toEqual(new Set());
     const back = parseStore(cs.map((body) => ({ user: STORE_AUTHOR, body })));
     expect(back.size).toBe(300);
     for (const x of rows) expect(back.get(keyOf(x.f.id))).toEqual([s900]);
@@ -1274,10 +1285,41 @@ describe("reconcile", () => {
       { action: "create", id: joins.id },
       { action: "record", id: comments.id },
     ]);
-    const stored = bodyOf(writes(g).find((c) => c.args[1] === "comment"));
+    const posted = writes(g).filter((c) => c.args[1] === "comment");
+    const stored = bodyOf(posted[0]);
     expect(stored).toContain(sightingLine(keyOf(joins.id), s900));
     expect(stored).toContain(sightingLine(keyOf(comments.id), s900));
-    expect(readMarkers(stored)?.get("run")).toEqual(["900/2"]);
+    // The sightings come first, unmarked; the run is marked only after filing.
+    expect(readMarkers(stored)?.get("run")).toBeUndefined();
+    expect(readMarkers(bodyOf(posted.at(-1)))?.get("run")).toEqual(["900/2"]);
+  });
+
+  it("finds a release gate by its workflow, whatever its run-name says", () => {
+    // The runs API's .name is the run-name, as on live run 45546499448.
+    const named = { ...gate, name: "redline-staging v0.246.0" };
+    const g = fakeGh({
+      labels: LABELS,
+      listed: { "redline-staging.yml": [named] },
+      stores: storeWith(joins),
+    });
+    const r = reconcile({ exec: g.exec, repo: "o/cloud", nowMs: NOW });
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+  });
+
+  it("a failed create leaves the run unmarked, so the next reconcile files it", () => {
+    const g = fakeGh({ labels: LABELS, listed, stores: storeWith(joins) });
+    const failing: Exec = (cmd, args) =>
+      args[0] === "issue" && args[1] === "create"
+        ? { code: 1, stdout: "", stderr: "HTTP 502: Bad Gateway" }
+        : g.exec(cmd, args);
+    const r = reconcile({ exec: failing, repo: "o/cloud", nowMs: NOW });
+    expect(r.failed).toBe(1);
+    const posted = writes(g)
+      .filter((c) => c.args[1] === "comment")
+      .map((c) => ({ user: STORE_AUTHOR, body: bodyOf(c) }));
+    // The sightings are stored, but the run is not marked recorded.
+    expect(posted.length).toBeGreaterThan(0);
+    expect(storedRuns(posted).has("900/2")).toBe(false);
   });
 
   it("is a no-op for a run already in the store: adds nothing, bumps nothing", () => {
