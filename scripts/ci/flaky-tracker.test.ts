@@ -1474,7 +1474,7 @@ describe("flaky-tracker.yml", () => {
     expect(wf.permissions).toEqual({});
     const cond = String(wf.jobs.track.if).replace(/\s+/g, " ");
     expect(cond).toBe(
-      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.name == 'CI' || (github.event.workflow_run.name == 'redline-staging' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
+      "github.event_name == 'schedule' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.head_repository.full_name == github.repository && (github.event.workflow_run.path == '.github/workflows/ci.yml' || (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main')))",
     );
   });
 
@@ -1528,5 +1528,27 @@ describe("flaky-tracker.yml", () => {
       if (s.uses) expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
       if (s.run) expect(s.run).not.toContain("${{");
     }
+  });
+});
+
+describe("the event path names the workflow by its file", () => {
+  // workflow_run.name is the run-name: "redline-staging v0.247.0" (live run
+  // 45740398112), so a name check would never match a release gate.
+  const text = readFileSync(
+    join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../.github/workflows/flaky-tracker.yml",
+    ),
+    "utf8",
+  );
+  it("never reads workflow_run.name", () => {
+    expect(text).not.toContain("workflow_run.name");
+    expect(text).toContain(
+      "WORKFLOW_PATH: ${{ github.event.workflow_run.path }}",
+    );
+    expect(text).toContain(
+      ".github/workflows/redline-staging.yml) WORKFLOW=redline-staging ;;",
+    );
+    expect(text).toContain(".github/workflows/ci.yml) WORKFLOW=CI ;;");
   });
 });

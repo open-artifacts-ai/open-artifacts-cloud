@@ -38,8 +38,8 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.run_attempt > 1 &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      (github.event.workflow_run.name == 'CI' ||
-      (github.event.workflow_run.name == 'redline-staging' &&
+      (github.event.workflow_run.path == '.github/workflows/ci.yml' ||
+      (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' &&
       github.event.workflow_run.event == 'workflow_dispatch' &&
       github.event.workflow_run.head_branch == 'main')))
     # One group per repo, with no per-run part: tracker runs never overlap,
@@ -72,12 +72,20 @@ jobs:
         if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ github.token }}
-          WORKFLOW: ${{ github.event.workflow_run.name }}
+          # The workflow by its file: workflow_run.name is the run-name, which
+          # for redline-staging carries the tag ("redline-staging v0.247.0").
+          WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           TITLE: ${{ github.event.workflow_run.display_title }}
-        run: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --run-id "$RUN_ID" --attempt "$ATTEMPT" --head-sha "$HEAD_SHA" --title "$TITLE"
+        run: |
+          case "$WORKFLOW_PATH" in
+            .github/workflows/ci.yml) WORKFLOW=CI ;;
+            .github/workflows/redline-staging.yml) WORKFLOW=redline-staging ;;
+            *) echo "not a watched workflow: $WORKFLOW_PATH"; exit 1 ;;
+          esac
+          node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --run-id "$RUN_ID" --attempt "$ATTEMPT" --head-sha "$HEAD_SHA" --title "$TITLE"
       - name: Reconcile runs the tracker missed
         if: github.event_name == 'schedule'
         env:
