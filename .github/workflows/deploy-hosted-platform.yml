@@ -267,7 +267,7 @@ jobs:
           done
           cp .deploy-logic/packages/provision/src/wfp.ts "$RUNNER_TEMP/main-wfp.ts"
           mkdir "$RUNNER_TEMP/main-ci"
-          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh; do
+          for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh; do
             cp ".deploy-logic/scripts/ci/$f" "$RUNNER_TEMP/main-ci/$f"
           done
           cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"
@@ -531,13 +531,24 @@ jobs:
           TAG: ${{ inputs.tag }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts mark-verified "$DEPLOY_ENV" "$TAG"
-      # The fleet wake (cloud #264): once the mark is written, one message to
+      # The fleet wake (cloud #264), only for a tag whose scheduler consumes
+      # the env's oa-<p>-fleet-wake (an older tag, a recovery deploy say,
+      # skips the wake and the wait with one log line; the tick moves it).
+      # Once the mark is written, one message to
       # the env's oa-<p>-fleet-wake queue, so the scheduler starts the
       # upgrades at once instead of on its next 2-minute tick. The tick is the
       # backup: the script turns every failure into a warning and exits 0, and
       # the step can't fail the run either way. Main's copy, like the others.
-      - name: Wake the fleet
+      - id: wake_capable
+        name: The tag's scheduler takes the fleet wake
         if: ${{ success() && steps.mark_verified.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DEPLOY_ENV: ${{ inputs.env }}
+        run: bash "$RUNNER_TEMP/main-ci/fleet-wake-capable.sh" "$DEPLOY_ENV" apps/scheduler/wrangler.jsonc scripts/ops/wrangler-env.ts
+      - name: Wake the fleet
+        if: ${{ success() && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
         continue-on-error: true
         timeout-minutes: 2
         env:
@@ -555,7 +566,7 @@ jobs:
       # reads every mark still held ("Fleet done of earlier releases", above).
       - id: fleet_done
         name: Wait for the fleet to reach every install
-        if: ${{ success() && inputs.env == 'prod' && steps.mark_verified.outcome == 'success' }}
+        if: ${{ success() && inputs.env == 'prod' && steps.mark_verified.outcome == 'success' && steps.wake_capable.outputs.capable == 'true' }}
         continue-on-error: true
         timeout-minutes: 12
         env:

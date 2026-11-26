@@ -292,7 +292,7 @@ describe("deploy-hosted-platform.yml", () => {
     );
     // The constants and the id lookup are main's too, never the tag's.
     expect(use).toContain(
-      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh; do",
+      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh; do",
     );
     expect(use).toContain(
       'cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"',
@@ -910,6 +910,7 @@ describe("deploy-hosted-platform.yml", () => {
     inputs: Record<string, unknown>,
     outcomes: Record<string, string> = {},
     ok = true,
+    outputs: Record<string, Record<string, string>> = {},
   ) =>
     new Function(
       "inputs",
@@ -923,8 +924,15 @@ describe("deploy-hosted-platform.yml", () => {
         .replace(/\s*\}\}$/, "")});`,
     )(
       inputs,
-      Object.fromEntries(
-        Object.entries(outcomes).map(([k, v]) => [k, { outcome: v }]),
+      // Any step: its outcome and outputs, none when not given.
+      new Proxy(
+        {},
+        {
+          get: (_t, k: string) => ({
+            outcome: outcomes[k],
+            outputs: outputs[k] ?? {},
+          }),
+        },
       ),
       () => ok,
       () => false,
@@ -987,7 +995,10 @@ describe("deploy-hosted-platform.yml", () => {
     const wk = named("Wake the fleet");
     const i = (n: string) => steps.indexOf(named(n));
     expect(named("Mark the platform verified").id).toBe("mark_verified");
-    expect(i("Wake the fleet")).toBe(i("Mark the platform verified") + 1);
+    expect(i("The tag's scheduler takes the fleet wake")).toBe(
+      i("Mark the platform verified") + 1,
+    );
+    expect(i("Wake the fleet")).toBe(i("Mark the platform verified") + 2);
     expect(i("Wake the fleet")).toBeLessThan(i("The deploy token's expiry"));
     expect(wk.run).toBe(
       'bash "$RUNNER_TEMP/main-ci/fleet-wake.sh" "$DEPLOY_ENV" "$TAG"',
@@ -1000,11 +1011,32 @@ describe("deploy-hosted-platform.yml", () => {
     expect(wk["continue-on-error"]).toBe(true);
     expect(wk["timeout-minutes"]).toBeLessThanOrEqual(2);
     const marked = { ...ran, mark_verified: "success" };
+    const capable = { wake_capable: { capable: "true" } };
     for (const verify_only of [false, true])
       for (const targets of [FULL, FULLB])
-        expect(evalIf(wk, { verify_only, targets }, marked), targets).toBe(
-          true,
-        );
+        expect(
+          evalIf(wk, { verify_only, targets }, marked, true, capable),
+          targets,
+        ).toBe(true);
+    // The Prover's case: an older tag (a v0.250.0 recovery) with no
+    // fleet-wake consumer gets no wake.
+    for (const c of ["false", ""])
+      expect(
+        evalIf(wk, { verify_only: false, targets: FULL }, marked, true, {
+          wake_capable: { capable: c },
+        }),
+      ).toBe(false);
+    const cap = named("The tag's scheduler takes the fleet wake");
+    expect(cap.id).toBe("wake_capable");
+    expect(cap.run).toBe(
+      'bash "$RUNNER_TEMP/main-ci/fleet-wake-capable.sh" "$DEPLOY_ENV" apps/scheduler/wrangler.jsonc scripts/ops/wrangler-env.ts',
+    );
+    expect(cap.env).toEqual({ DEPLOY_ENV: "${{ inputs.env }}" });
+    expect(cap["continue-on-error"]).toBe(true);
+    expect(evalIf(cap, { targets: FULL }, marked)).toBe(true);
+    expect(
+      evalIf(cap, { targets: FULL }, { ...ran, mark_verified: "skipped" }),
+    ).toBe(false);
     // No mark (a partial list, a failed read-back), or a failed step before
     // it: no wake.
     expect(
@@ -1048,9 +1080,22 @@ describe("deploy-hosted-platform.yml", () => {
     expect(wt.run).toContain('echo "done=true"; echo "at=');
     expect(wt.run).toContain("::warning::");
     const marked = { ...ran, mark_verified: "success" };
-    expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(true);
+    const capable = { wake_capable: { capable: "true" } };
+    expect(
+      evalIf(wt, { env: "prod", targets: FULL }, marked, true, capable),
+    ).toBe(true);
+    // An older tag with no fleet-wake consumer never writes fleet_done: no
+    // 10-minute wait holding hosted-platform-prod (the Prover's case).
+    expect(
+      evalIf(wt, { env: "prod", targets: FULL }, marked, true, {
+        wake_capable: { capable: "false" },
+      }),
+    ).toBe(false);
+    expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(false);
     // Staging's chain waits on this run: no wait there.
-    expect(evalIf(wt, { env: "staging", targets: FULL }, marked)).toBe(false);
+    expect(
+      evalIf(wt, { env: "staging", targets: FULL }, marked, true, capable),
+    ).toBe(false);
     expect(
       evalIf(
         wt,
@@ -1424,7 +1469,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|continue-on-error/);
     expect(g.shell).toBeUndefined();
     expect(text).toContain(
-      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh;",
+      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh;",
     );
   });
 
