@@ -28,7 +28,8 @@ if [ "$m" = POST ]; then
   echo "POST $url $body" >> "$STUB_LOG"
   cat "$STATE/post.json" 2>/dev/null || echo '{"success":true,"result":null}'
 else
-  cat "$STATE/queues.json"
+  page="\${url##*page=}"
+  if [ -f "$STATE/queues-$page.json" ]; then cat "$STATE/queues-$page.json"; else cat "$STATE/queues.json"; fi
 fi`;
 const listing = (
   queues: { queue_name: string; queue_id?: string }[],
@@ -47,6 +48,8 @@ const WAKE = [
 const run = (
   o: {
     queues?: string;
+    /** Page n of the listing (1-based), each its own answer. */
+    pages?: readonly string[];
     post?: string;
     netFail?: boolean;
     args?: readonly string[];
@@ -55,6 +58,8 @@ const run = (
 ) => {
   const sb = sandbox({ curl });
   writeFileSync(join(sb.dir, "queues.json"), o.queues ?? listing(WAKE));
+  for (const [i, p] of (o.pages ?? []).entries())
+    writeFileSync(join(sb.dir, `queues-${i + 1}.json`), p);
   if (o.post) writeFileSync(join(sb.dir, "post.json"), o.post);
   if (o.netFail) writeFileSync(join(sb.dir, "net-fail"), "");
   const r = sb.run(["bash", SCRIPT, ...(o.args ?? ["prod", "v1.2.3"])], {
@@ -82,13 +87,45 @@ describe("fleet-wake.sh", () => {
     expect(r.out).not.toContain("::warning::");
     // The listing is one page of 100, the token on stdin only.
     expect(r.log).toContain(
-      `curl -sS --max-time 20 -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100`,
+      `curl -sS --max-time 20 -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100&page=1`,
     );
     // Staging posts to staging's queue, never prod's.
     const s = run({ args: ["staging", "v1.2.3"] });
     expect(s.code).toBe(0);
     expect(s.posts).toHaveLength(1);
     expect(s.posts[0]).toContain(`/queues/${"e".repeat(32)}/messages`);
+  });
+
+  it("a two-page listing (the Prover's case): reads every page and posts once, whichever page names the queue", () => {
+    const other = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        queue_name: `other-${i}`,
+        queue_id: i.toString(16).padStart(32, "0"),
+      }));
+    const mine = WAKE[1] as (typeof WAKE)[number];
+    for (const [pages, where] of [
+      [[listing([mine, ...other(99)], 2), listing(other(3), 2)], "page 1"],
+      [[listing(other(100), 2), listing([...other(2), mine], 2)], "page 2"],
+      // No total_pages: a full page means read on; a short one ends it.
+      [
+        [
+          JSON.stringify({ success: true, result: other(100) }),
+          JSON.stringify({ success: true, result: [mine] }),
+        ],
+        "page 2, no result_info",
+      ],
+    ] as const) {
+      const r = run({ pages: [...pages] });
+      expect(r.code, where).toBe(0);
+      expect(r.out, where).not.toContain("::warning::");
+      expect(r.posts, where).toEqual([
+        `POST https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues/${QID}/messages {"body":{"env":"prod","tag":"v1.2.3"}}`,
+      ]);
+      expect(
+        r.log.filter((l) => l.startsWith("curl") && l.includes("/queues?")),
+        where,
+      ).toEqual([1, 2].map((p) => expect.stringContaining(`page=${p}`)));
+    }
   });
 
   const warned = (r: ReturnType<typeof run>, why: string) => {
@@ -136,7 +173,25 @@ describe("fleet-wake.sh", () => {
         },
         "want exactly one queue oa-p-fleet-wake",
       ],
-      [{ queues: listing(WAKE, 2) }, "more than one page"],
+      [
+        // The same queue named on two pages is two queues.
+        {
+          pages: [
+            listing([WAKE[1] as (typeof WAKE)[number]], 2),
+            listing([WAKE[1] as (typeof WAKE)[number]], 2),
+          ],
+        },
+        "want exactly one queue oa-p-fleet-wake",
+      ],
+      [
+        {
+          pages: [
+            listing([WAKE[0] as (typeof WAKE)[number]], 2),
+            '{"success":false,"errors":[{"code":10000}]}',
+          ],
+        },
+        "listing the queues failed",
+      ],
       [
         { queues: '{"success":false,"errors":[{"code":10000}]}' },
         "listing the queues failed",

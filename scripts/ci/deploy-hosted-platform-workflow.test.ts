@@ -330,8 +330,12 @@ describe("deploy-hosted-platform.yml", () => {
       i("Resolve the resource ids") - 1,
     );
     // The Email Sending check (#967) is the last gate before the deploy.
+    // Between it and the ids: only the read-only late fleet finish (#264).
     expect(i("Resolve the resource ids")).toBe(
-      i("The senders' domain is onboarded in Email Sending") - 1,
+      i("Read the fleet finish of the release before") - 1,
+    );
+    expect(i("Read the fleet finish of the release before")).toBe(
+      i("The senders' domain is onboarded in Email Sending") - 2,
     );
     expect(i("The senders' domain is onboarded in Email Sending")).toBe(
       i("Deploy and verify") - 1,
@@ -405,6 +409,7 @@ describe("deploy-hosted-platform.yml", () => {
       "The deploy token is the Environment's",
       "The tag is newer than prod's",
       "Resolve the resource ids",
+      "Read the fleet finish of the release before",
       "The senders' domain is onboarded in Email Sending",
       "Deploy and verify",
       "Zones",
@@ -911,6 +916,8 @@ describe("deploy-hosted-platform.yml", () => {
       "steps",
       "success",
       "cancelled",
+      "contains",
+      "format",
       `return (${(step.if as string)
         .replace(/^\$\{\{\s*/, "")
         .replace(/\s*\}\}$/, "")});`,
@@ -921,6 +928,9 @@ describe("deploy-hosted-platform.yml", () => {
       ),
       () => ok,
       () => false,
+      (hay: string, needle: string) => String(hay).includes(needle),
+      (f: string, ...a: unknown[]) =>
+        f.replace(/\{(\d+)\}/g, (_m, n) => String(a[Number(n)])),
     ) as boolean;
   const ran = {
     deploy: "success",
@@ -1035,7 +1045,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(wt.run).toContain(
       'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG"',
     );
-    expect(wt.run).toContain('echo "done=true" >> "$GITHUB_OUTPUT"');
+    expect(wt.run).toContain('echo "done=true"; echo "at=');
     expect(wt.run).toContain("::warning::");
     const marked = { ...ran, mark_verified: "success" };
     expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(true);
@@ -1049,7 +1059,42 @@ describe("deploy-hosted-platform.yml", () => {
       ),
     ).toBe(false);
     expect(dn.if).toBe("${{ steps.fleet_done.outputs.done == 'true' }}");
+    expect(dn.env.AT).toBe("${{ steps.fleet_done.outputs.at }}");
     expect(JSON.stringify(dn)).not.toContain("secrets.");
+  });
+
+  // The Prover's case: a rollout that finishes after the 10-minute wait. The
+  // next prod run, before it replaces that release, reads its mark once and
+  // records it with that release's tag and the mark's own time.
+  it("a late fleet finish: the next prod run reads the release before's mark, once, before deploying, and records it by name", () => {
+    const rd = named("Read the fleet finish of the release before");
+    const i = (n: string) => steps.indexOf(named(n));
+    const rec = steps.find((st) =>
+      String(st.name).startsWith("Fleet done of the release before"),
+    ) as Record<string, any>;
+    expect(rec.name).toBe(
+      "Fleet done of the release before (${{ steps.prev_fleet.outputs.tag }} at ${{ steps.prev_fleet.outputs.at }})",
+    );
+    expect(rd.id).toBe("prev_fleet");
+    expect(i(rd.name)).toBeGreaterThan(i("Resolve the resource ids"));
+    expect(steps.indexOf(rec)).toBe(i(rd.name) + 1);
+    expect(steps.indexOf(rec)).toBeLessThan(i("Deploy and verify"));
+    expect(rd["continue-on-error"]).toBe(true);
+    expect(rd["timeout-minutes"]).toBeLessThanOrEqual(2);
+    expect(rd.env).toEqual({
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    expect(rd.run).toContain(
+      'prev="$(bash "$RUNNER_TEMP/main-ci/worker-tag.sh" prod scheduler)"',
+    );
+    expect(rd.run).toContain(
+      'FLEET_DONE_WAIT_MIN=0 node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done prod "$prev"',
+    );
+    expect(evalIf(rd, { env: "prod", targets: FULL })).toBe(true);
+    expect(evalIf(rd, { env: "staging", targets: FULL })).toBe(false);
+    expect(evalIf(rd, { env: "prod", targets: "zones" })).toBe(false);
+    expect(rec.if).toBe("${{ steps.prev_fleet.outputs.at != '' }}");
+    expect(JSON.stringify(rec)).not.toContain("secrets.");
   });
 
   it("prod verify_only with the full list runs both staging gates before the mark; partial verify_only runs neither gate nor mark; other runs unchanged", () => {

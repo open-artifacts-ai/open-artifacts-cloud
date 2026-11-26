@@ -2693,6 +2693,66 @@ describe("#433: no timers, leo with the rest", () => {
     ).toHaveLength(1);
   });
 
+  it("fleet_done: a healthy install busy with another job on the old version is not upgraded; done waits for its upgrade (the Prover's workerd case)", async () => {
+    const canary = await on("0.92.0", { created: 0 });
+    const busy = await on("0.92.0", { created: 5 });
+    // An ordinary settings update is running on it.
+    const settings = await job(busy, {
+      kind: "update",
+      workflow: "manage_install",
+      status: "running",
+      args: "{}",
+    });
+    const f = fakes({ canary });
+    const pass = (at: number) => fleetDue(f.env, at, f.opts);
+    expect(await pass(NOW)).toBe("canary");
+    const [c] = await fleetJobs();
+    await setVersion(canary, TARGET);
+    await finish(c?.id, "done", NOW + MIN);
+    // The canary settles and smokes; the busy install can't start and the
+    // rollout is not done: a wake run keeps re-checking.
+    expect(await pass(NOW + MIN)).toBe("batch");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([]);
+    expect(await pass(NOW + MIN + 15_000)).toBe("batch");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([]);
+    // The settings job ends: its upgrade is queued, still not done.
+    await finish(settings, "done", NOW + 2 * MIN);
+    expect(await pass(NOW + 2 * MIN)).toBe("batch");
+    const up = (await fleetJobs()).find((j) => j.install_id === busy);
+    expect(up?.status).toBe("queued");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([]);
+    // Upgraded and idle on the target: done.
+    await setVersion(busy, TARGET);
+    await finish(up?.id, "done", NOW + 3 * MIN);
+    expect(await pass(NOW + 3 * MIN)).toBe("idle");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([
+      `${FLEET_DONE_PREFIX}${TARGET}`,
+    ]);
+  });
+
+  it("fleet_done: an install on the target but busy is not done until it is idle", async () => {
+    const canary = await on("0.92.0", { created: 0 });
+    const there = await on(TARGET, { created: 5 });
+    const running = await job(there, {
+      kind: "update",
+      workflow: "manage_install",
+      status: "running",
+      args: "{}",
+    });
+    const f = fakes({ canary });
+    await fleetDue(f.env, NOW, f.opts);
+    const [c] = await fleetJobs();
+    await setVersion(canary, TARGET);
+    await finish(c?.id, "done", NOW + MIN);
+    expect(await fleetDue(f.env, NOW + MIN, f.opts)).toBe("batch");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([]);
+    await finish(running, "done", NOW + 2 * MIN);
+    expect(await fleetDue(f.env, NOW + 2 * MIN, f.opts)).toBe("idle");
+    expect(await stateKeys(FLEET_DONE_PREFIX)).toEqual([
+      `${FLEET_DONE_PREFIX}${TARGET}`,
+    ]);
+  });
+
   it("fleet_done: a halted version is never done", async () => {
     const canary = await on("0.92.0", { created: 0 });
     await on("0.92.0", { created: 5 });

@@ -37,14 +37,27 @@ cf() {
     curl -sS --max-time 20 -K - "$@"
 }
 
-# The queue's id, by exact name, from one whole page of the listing.
-list="$(cf "$ACCT/queues?per_page=100")" || warn "listing the queues failed (network)"
-[ "$(jq -r '.success' <<< "$list" 2> /dev/null)" = true ] ||
-  warn "listing the queues failed: $(jq -c '.errors' <<< "$list" 2> /dev/null || echo 'unparsable response')"
-jq -e '(.result_info.total_pages // 1) <= 1' <<< "$list" > /dev/null 2>&1 ||
-  warn "the queue listing has more than one page"
-ids="$(jq -r --arg q "$queue" '[.result[]? | select(.queue_name == $q) | .queue_id] | join(" ")' <<< "$list" 2> /dev/null)" ||
-  warn "the queue listing is unparsable"
+# The queue's id, by exact name, across every page of the listing (at most
+# 20 pages of 100; total_pages is trusted when Cloudflare sends it, else a
+# short page ends the list).
+ids=""
+for ((page = 1; page <= 20; page++)); do
+  list="$(cf "$ACCT/queues?per_page=100&page=$page")" || warn "listing the queues failed (network)"
+  [ "$(jq -r '.success' <<< "$list" 2> /dev/null)" = true ] ||
+    warn "listing the queues failed: $(jq -c '.errors' <<< "$list" 2> /dev/null || echo 'unparsable response')"
+  got="$(jq -r --arg q "$queue" '[.result[]? | select(.queue_name == $q) | .queue_id] | join(" ")' <<< "$list" 2> /dev/null)" ||
+    warn "the queue listing is unparsable"
+  ids="${ids:+$ids${got:+ }}$got"
+  pages="$(jq -r '.result_info.total_pages | if type == "number" then . else "" end' <<< "$list" 2> /dev/null)" ||
+    warn "the queue listing is unparsable"
+  n="$(jq -r '.result | length' <<< "$list" 2> /dev/null)" || warn "the queue listing is unparsable"
+  if [ -n "$pages" ]; then
+    [ "$page" -lt "$pages" ] || break
+  elif [ "$n" -lt 100 ]; then
+    break
+  fi
+  [ "$page" -lt 20 ] || warn "the queue listing did not end after 20 pages"
+done
 [[ "$ids" =~ ^[0-9a-f]{32}$ ]] || warn "want exactly one queue $queue with an id (found '${ids:-none}')"
 
 body="$(jq -nc --arg env "$1" --arg tag "$tag" '{body: {env: $env, tag: $tag}}')"

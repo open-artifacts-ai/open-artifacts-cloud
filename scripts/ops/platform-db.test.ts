@@ -867,7 +867,7 @@ describe("platform-db.ts", () => {
           PLATFORM_DB_ID: "x",
         }).status,
       ).toBe(2);
-      for (const w of ["0", "31", "x"])
+      for (const w of ["-1", "31", "x", "1.5"])
         expect(
           cli(["fleet-done", "prod", "v1.2.3"], {
             ...ok,
@@ -910,7 +910,7 @@ describe("platform-db.ts", () => {
             log: (s) => log.push(s),
             waitMs: 10 * 60_000,
           }),
-        ).toBe(true);
+        ).toBe(1764134400000);
         expect(f.sleeps).toEqual([]);
         expect(log).toEqual(["fleet_done:1.2.3 at 2025-11-26T05:20:00.000Z"]);
       });
@@ -938,7 +938,7 @@ describe("platform-db.ts", () => {
           waitMs: 10 * 60_000,
           pollMs: 15_000,
         });
-        expect(done).toBe(true);
+        expect(done).toBe(5);
         expect(f.sleeps).toEqual([15_000, 15_000, 15_000]);
         expect(log).toEqual(["fleet_done:1.2.3 at 1970-01-01T00:00:00.005Z"]);
       });
@@ -955,9 +955,22 @@ describe("platform-db.ts", () => {
             waitMs: 60_000,
             pollMs: 15_000,
           }),
-        ).toBe(false);
+        ).toBeNull();
         expect(f.sleeps).toEqual([15_000, 15_000, 15_000, 15_000]);
         expect(log).toEqual(["fleet_done:1.2.3 not set after 1 min"]);
+        // A wait of 0 is one read, no sleep (the next deploy's late read).
+        const once = stateDb();
+        const c0 = clocked(once);
+        expect(
+          await waitFleetDone({
+            db: once.db,
+            tag: "v1.2.3",
+            ...c0,
+            log: () => {},
+            waitMs: 0,
+          }),
+        ).toBeNull();
+        expect(once.sleeps).toEqual([]);
         expect(keys(f.sqlite)).toEqual([]);
         await expect(
           waitFleetDone({

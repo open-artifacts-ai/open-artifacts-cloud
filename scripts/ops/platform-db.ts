@@ -38,10 +38,11 @@
 //   node scripts/ops/platform-db.ts unmark-verified staging|prod
 //     deletes every `platform_verified:*` key (a break-glass run).
 //   node scripts/ops/platform-db.ts fleet-done staging|prod vX.Y.Z
-//     reads only: waits up to FLEET_DONE_WAIT_MIN minutes (default 10) for
-//     the scheduler's `fleet_done:<version>` (cloud #264: every eligible
-//     install upgraded and settled), exit 0 once it is there, 1 if not in
-//     time. The deploy's "Fleet done" step follows it (release-watch, #456).
+//     reads only: waits up to FLEET_DONE_WAIT_MIN minutes (default 10; 0 is
+//     one read) for the scheduler's `fleet_done:<version>` (cloud #264: every
+//     install it waits for upgraded and settled); once it is there, prints
+//     `fleet_done_at=<ISO time it was set>` and exits 0, else exits 1. The
+//     deploy's "Fleet done" steps follow it (release-watch, #456).
 //   The log names the mark and nothing else (no counts).
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -564,8 +565,9 @@ export const FLEET_DONE_POLL_MS = 15_000;
 /**
  * Waits for platform_state `fleet_done:<version>` (the scheduler's mark that
  * the rollout of the tag is finished), reading it every pollMs for up to
- * waitMs. True once it is there (logging when it was set), false if not in
- * time. Reads only; a failed read is one more try, never a throw.
+ * waitMs (0: one read). The time it was set (epoch ms) once it is there,
+ * logged; null if not in time. Reads only; a failed read is one more try,
+ * never a throw.
  */
 export async function waitFleetDone({
   db,
@@ -583,7 +585,7 @@ export async function waitFleetDone({
   log: (s: string) => void;
   waitMs: number;
   pollMs?: number;
-}): Promise<boolean> {
+}): Promise<number | null> {
   const m = STABLE_TAG.exec(tag);
   if (!m) throw new Refused("tag must be a stable vX.Y.Z");
   const key = `fleet_done:${m[1]}`;
@@ -598,7 +600,7 @@ export async function waitFleetDone({
       const at = rows[0]?.value;
       if (typeof at === "number") {
         log(`${key} at ${new Date(at).toISOString()}`);
-        return true;
+        return at;
       }
     } catch {
       failed++;
@@ -607,7 +609,7 @@ export async function waitFleetDone({
       log(
         `${key} not set after ${Math.round(waitMs / 60_000)} min${failed ? ` (${failed} failed reads)` : ""}`,
       );
-      return false;
+      return null;
     }
     await sleep(pollMs);
   }
@@ -688,12 +690,12 @@ if (
     );
   if ((mode === "mark-verified" || mode === "fleet-done") && !process.argv[4])
     fail(`usage: platform-db.ts ${mode} staging|prod vX.Y.Z`, 2);
-  const waitMin = Number(process.env.FLEET_DONE_WAIT_MIN || "10");
+  const waitMin = Number(process.env.FLEET_DONE_WAIT_MIN ?? "10");
   if (
     mode === "fleet-done" &&
-    !(Number.isInteger(waitMin) && waitMin >= 1 && waitMin <= 30)
+    !(Number.isInteger(waitMin) && waitMin >= 0 && waitMin <= 30)
   )
-    fail("FLEET_DONE_WAIT_MIN must be 1 to 30 minutes", 2);
+    fail("FLEET_DONE_WAIT_MIN must be 0 to 30 minutes", 2);
   const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, PLATFORM_DB_ID } =
     process.env;
   if (!CLOUDFLARE_API_TOKEN) fail("CLOUDFLARE_API_TOKEN is required", 2);
@@ -715,7 +717,7 @@ if (
       const log = (s: string) => console.log(`oa-${env?.[0]}-platform: ${s}`);
       const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
       if (mode === "fleet-done") {
-        const done = await waitFleetDone({
+        const at = await waitFleetDone({
           db,
           tag: process.argv[4] as string,
           now: () => Date.now(),
@@ -723,7 +725,9 @@ if (
           log,
           waitMs: waitMin * 60_000,
         });
-        process.exit(done ? 0 : 1);
+        if (at !== null)
+          console.log(`fleet_done_at=${new Date(at).toISOString()}`);
+        process.exit(at !== null ? 0 : 1);
       }
       if (mode === "mark-verified")
         await markVerified({

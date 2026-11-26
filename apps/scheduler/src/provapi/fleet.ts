@@ -184,7 +184,8 @@ export const FLEET_BEHIND_PREFIX = "fleet_behind:";
 /**
  * `fleet_done:<version>` (cloud #264): when a pass first found the rollout
  * finished: the canary settled and smoked, nothing open, every upgraded
- * install settled, and no eligible install below the version. Installs the
+ * install settled, and every install it waits for (eligible, busy or not) on
+ * the version or above and idle: a busy install never counts as upgraded. Installs the
  * fleet leaves out (broken, suspended, paused, red-line) are not waited on;
  * version_skew reports them. Set once; the deploy reads it (platform-db.ts
  * fleet-done).
@@ -256,6 +257,11 @@ const FAILED = `j.status = 'failed' AND COALESCE(j.error_code, '') <> 'canceled'
 const ON_TRY = `(EXISTS (SELECT 1 FROM platform_state v WHERE v.key GLOB '${FLEET_HALT_PREFIX}' || version || ':*' OR v.key GLOB '${FLEET_HALT_PREFIX}*:' || install_id)
   AND NOT EXISTS (SELECT 1 FROM platform_state t WHERE t.key = '${FLEET_RETRY_PREFIX}' || install_id))`;
 const ELIGIBLE = `state = 'active' AND install_state = 'active' AND active_job_id IS NULL AND COALESCE(test_hooks, 0) = 0 AND version IS NOT NULL AND ((serving_mode = 'serving' AND health = 'ok') OR ${ON_TRY})`;
+// The installs a finished rollout waits for (cloud #264): ELIGIBLE, busy or
+// not. A busy one can't be started now, but it is not upgraded either: it
+// keeps fleet_done unwritten until it is on the target and idle.
+const WAITED = `state = 'active' AND install_state = 'active' AND COALESCE(test_hooks, 0) = 0 AND version IS NOT NULL AND ((serving_mode = 'serving' AND health = 'ok') OR ${ON_TRY})`;
+const UNFINISHED = `SELECT version, active_job_id FROM install_status WHERE ${WAITED} AND install_id <> ?2 AND (version <> ?1 OR active_job_id IS NOT NULL)`;
 const CANARY = `SELECT install_id, version, app_host, state, install_state, serving_mode, active_job_id, test_hooks, health FROM install_status WHERE install_id = ?1`;
 // The canary's latest upgrade to ?2, any actor.
 const CANARY_JOB = `SELECT status, error_code FROM jobs WHERE install_id = ?1 AND kind = 'upgrade' AND json_extract(args, '$.to') = ?2 ORDER BY created_at DESC, id DESC LIMIT 1`;
@@ -725,6 +731,24 @@ export async function fleetDue(
       slots--;
   }
   if (behind > 0) return slots < FLEET_CONCURRENCY ? settling : "idle";
+  // Done only when every install it waits for is on the target and idle: a
+  // busy one (a settings job, say) still on the old version, or busy on the
+  // new one, is not upgraded yet. A wake run keeps re-checking it.
+  const lagging = await d1(
+    db.prepare(UNFINISHED).bind(target, canaryId).all<{
+      version: string;
+      active_job_id: string | null;
+    }>(),
+  );
+  const waits = lagging.results.some((r) => {
+    if (r.active_job_id !== null) return true;
+    try {
+      return compareVersions(r.version, target) < 0;
+    } catch {
+      return false;
+    }
+  });
+  if (waits) return settling;
   await markDone(db, now, st, target);
   return "idle";
 }
