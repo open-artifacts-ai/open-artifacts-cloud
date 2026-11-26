@@ -2337,8 +2337,8 @@ describe("a backlog larger than one reconcile drains over the next events", () =
     const r = reconcileAt(g, later, { logs: 5 });
     expect(r.tracked.map((t) => t.run.runId)).toEqual(ids.slice(0, 5));
     expect(r.left).toBe(7);
-    expect(backlogLine(r.left)).toBe(
-      "backlog: 7 left (the next completion's reconcile carries on)",
+    expect(backlogLine(r.left, r.failed)).toBe(
+      "backlog: 7 new, 0 to retry (the next completion's reconcile carries on)",
     );
     expect(marks(g)).toEqual(ids.slice(0, 5).map((id) => `${id}/2`));
   });
@@ -2656,9 +2656,19 @@ describe("a pending list while daily events go on", () => {
       broken && /\/runs\/\d+\/attempts\/2$/.test(args.join(" "))
         ? { code: 1, stdout: "", stderr: "HTTP 404: Not Found" }
         : g.exec(cmd, args);
+    let last = { left: -1, failed: -1 };
     for (let d = 0; d < 63; d++)
-      reconcile({ exec, repo: "o/cloud", nowMs: day(g, d), calls: 10_000 });
+      last = reconcile({
+        exec,
+        repo: "o/cloud",
+        nowMs: day(g, d),
+        calls: 10_000,
+      });
     expect(marks(g)).toEqual([]);
+    // All 32 failed and are saved to retry: the backlog says so.
+    expect(backlogLine(last.left, last.failed)).toBe(
+      "backlog: 0 new, 32 to retry (the next completion's reconcile carries on)",
+    );
     broken = false;
     const t = day(g, 63);
     expect(listRuns(g.exec, "o/cloud", "CI", t)).toEqual([]);

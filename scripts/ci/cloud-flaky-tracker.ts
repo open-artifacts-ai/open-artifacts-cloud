@@ -84,7 +84,7 @@
 // run whose earlier attempts hold no failed test is marked in the store too,
 // so it is read once. One reconcile starts no run after RECONCILE_MS,
 // RECONCILE_CALLS gh calls or RECONCILE_LOGS job logs (it always does one),
-// oldest first, and logs "backlog: N left": each run is saved as it
+// oldest first, and logs "backlog: N new, M to retry": each run is saved as it
 // finishes, and the runs left (or failed) are written to the store as its
 // pending list, which the next reconcile works whatever its listing's range,
 // so the next completion carries on.
@@ -1827,8 +1827,8 @@ function listedRun(
 }
 
 /** The step summary's last line: how many runs wait for the next reconcile. */
-export const backlogLine = (left: number) =>
-  `backlog: ${left} left${left ? " (the next completion's reconcile carries on)" : ""}`;
+export const backlogLine = (left: number, retry: number) =>
+  `backlog: ${left} new, ${retry} to retry${left + retry ? " (the next completion's reconcile carries on)" : ""}`;
 
 const runLines = (run: RunInfo, done: Done[], notes: string[]) => [
   `Flaky tracker, ${runLabel(run)}, run ${run.runId} (passed on attempt ${run.attempt}):`,
@@ -1856,7 +1856,9 @@ function main(argv: string[]) {
       `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS + QUIET_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
-      backlogLine(r.left),
+      // Both stay on the pending list: runs not started yet, and runs that
+      // failed this time and are saved to retry.
+      backlogLine(r.left, r.failed),
     ];
   } else {
     const run = runFromArgs(argv);
