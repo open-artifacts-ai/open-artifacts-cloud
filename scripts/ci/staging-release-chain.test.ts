@@ -260,9 +260,11 @@ describe("after hosted-publish: the staging deploy", () => {
   });
   it("fails closed on an API error", () => {
     const exec: Exec = () => ({ code: 1, stdout: "", stderr: "HTTP 502" });
+    const backoffs: number[] = [];
     expect(() =>
       plan({
         exec,
+        sleep: (ms) => backoffs.push(ms),
         repo: REPO,
         workflow: PUBLISH_PATH,
         conclusion: "success",
@@ -273,6 +275,7 @@ describe("after hosted-publish: the staging deploy", () => {
         runId: "123",
       }),
     ).toThrow(/502/);
+    expect(backoffs).toEqual([2_000, 5_000]);
   });
 });
 
