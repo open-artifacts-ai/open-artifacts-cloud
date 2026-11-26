@@ -779,11 +779,15 @@ describe("the gate's neutral skips", () => {
     expect(step.run).toBe(
       'node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"',
     );
-    // The deploy does not wait for it (cloud #264): the fleet's catalog check
-    // holds every upgrade until the record lands (fleet.ts, published()).
+    // The deploy does not wait for the job (cloud #264): its provisioning
+    // wave waits for the record instead (require_newer, the chain's), since
+    // the Provisioning API's default release is its own tag.
     expect(w.jobs.deploy.needs).toEqual(["gate"]);
-    expect(read("apps/scheduler/src/provapi/fleet.ts")).toContain(
-      'console.log("provapi fleet release_unpublished", target);',
+    expect(read("scripts/ci/chain-dispatch.ts")).toContain(
+      '"require_newer=true"',
+    );
+    expect(read(".github/workflows/deploy-hosted-platform.yml")).toContain(
+      "WAIT_PUBLISHED: ${{ inputs.require_newer && !inputs.verify_only && '1' || '' }}",
     );
     // The RESULT: gate failure, then the deploy's, then a publish failure.
     const result = (g: string, pu: string, d: string) =>
@@ -961,7 +965,7 @@ describe("the gate's neutral skips", () => {
       labels: c[c.indexOf("--label") + 1] ?? "",
     };
   };
-  it("a failed publish beside a green deploy opens a blocker that says the fleet holds", () => {
+  it("a failed publish job beside a green deploy opens a blocker", () => {
     const r = created({
       deployResult: "success",
       deployRun: "https://x/deploy",
@@ -971,12 +975,12 @@ describe("the gate's neutral skips", () => {
     });
     expect(r.labels).toBe("blocker");
     expect(r.title).toBe(
-      "Prod release chain failed: v1.2.3 (publish failed, the fleet holds)",
+      "Prod release chain failed: v1.2.3 (publish job failed)",
     );
     expect(r.body).toContain("its prod publish ended with `failure`");
+    // The deploy waited for the record before provisioning, so it landed.
+    expect(r.body).toContain("a green deploy means the record landed");
     expect(r.body).toContain("release_unpublished");
-    // Creates with no version are refused too: the platform runs the tag.
-    expect(r.body).toContain("new signups included");
     expect(r.body).toContain(
       "dispatch hosted-publish.yml on main with env prod",
     );

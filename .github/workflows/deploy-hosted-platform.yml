@@ -380,8 +380,35 @@ jobs:
           # them on the env's billing Worker alone.
           STRIPE_SECRET_KEY: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_SECRET_KEY || '' }}
           STRIPE_WEBHOOK_SECRET: ${{ contains(format(',{0},', inputs.targets), ',billing,') && secrets.STRIPE_WEBHOOK_SECRET || '' }}
+          # The release chain's alone (require_newer, cloud #264): it publishes
+          # beside this run, so the Provisioning API's wave waits for prod's
+          # release catalog to have the tag. A create or upgrade with no
+          # version gets the API's own release (resolveRelease), so moving it
+          # first would refuse every signup until the record lands. The token
+          # reads Actions runs only, and the loop unsets it before any target.
+          WAIT_PUBLISHED: ${{ inputs.require_newer && !inputs.verify_only && '1' || '' }}
+          PUBLISH_READ_TOKEN: ${{ inputs.require_newer && !inputs.verify_only && github.token || '' }}
         run: |
           set -euo pipefail
+          read_token="${PUBLISH_READ_TOKEN:-}"
+          unset PUBLISH_READ_TOKEN
+          # Polls prod-release-chain.ts published (a green publish-prod job for
+          # the tag) every 15 s for up to 20 minutes; an API error is a miss.
+          # On a timeout the run fails before the provisioning wave: the
+          # earlier targets run the tag, provisioning, dispatch, the zones and
+          # the scheduler keep the previous one, so signups and the fleet do.
+          wait_published() {
+            local i
+            for ((i = 0; i < 80; i++)); do
+              if GH_TOKEN="$read_token" node --experimental-strip-types "$RUNNER_TEMP/main-ci/prod-release-chain.ts" published --repo "$GITHUB_REPOSITORY" --tag "$DEPLOY_TAG" 2> /dev/null | grep -qx 'published=true'; then
+                echo "prod's release catalog has $DEPLOY_TAG"
+                return 0
+              fi
+              sleep 15
+            done
+            echo "::error::prod's release catalog still lacks $DEPLOY_TAG after 20 minutes: the provisioning wave and every later target did not deploy"
+            return 1
+          }
           # In waves (scripts/ops/deploy-waves.sh holds the dependencies): the
           # targets of one wave do not need each other and deploy at once, each
           # with its own log, shown under its own group once the wave is done.
@@ -409,6 +436,9 @@ jobs:
           n=0
           while IFS= read -r wave; do
             n=$((n + 1))
+            case " $wave " in
+              *" provisioning "*) [ -z "${WAIT_PUBLISHED:-}" ] || wait_published || exit 1 ;;
+            esac
             pids=()
             ts=()
             for t in $wave; do

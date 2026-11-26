@@ -1227,6 +1227,92 @@ describe("deploy-hosted-platform.yml", () => {
     expect(slow.stdout).toContain("started inventory");
   });
 
+  it("require_newer (the chain's): the provisioning wave waits for prod's catalog to have the tag (cloud #264)", () => {
+    const d = named("Deploy and verify");
+    expect(d.env.WAIT_PUBLISHED).toBe(
+      "${{ inputs.require_newer && !inputs.verify_only && '1' || '' }}",
+    );
+    expect(d.env.PUBLISH_READ_TOKEN).toBe(
+      "${{ inputs.require_newer && !inputs.verify_only && github.token || '' }}",
+    );
+    const loop = d.run as string;
+    // The token never reaches a target's deploy: unset before the first wave.
+    expect(loop.indexOf("unset PUBLISH_READ_TOKEN")).toBeLessThan(
+      loop.indexOf("deploy-waves.sh"),
+    );
+    // Run the loop with a fake node that answers published=false `misses`
+    // times, then true (or never), and no sleep.
+    const run = (misses: number, wait: string) => {
+      const dir = mkdtempSync(join(tmpdir(), "wait-published-"));
+      writeFileSync(
+        join(dir, "node"),
+        `#!/usr/bin/env bash\nn=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"; echo "token=$GH_TOKEN $*" >> "${dir}/args"; if [ "$n" -ge ${misses} ]; then echo published=true; else echo published=false; fi\n`,
+        { mode: 0o755 },
+      );
+      const r = spawnSync(
+        "bash",
+        [
+          "-c",
+          loop
+            .replace(
+              'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
+              'echo "deployed $t"',
+            )
+            .replace("sleep 15", ":"),
+        ],
+        {
+          env: {
+            PATH: `${dir}:${process.env.PATH}`,
+            DEPLOY_ENV: "prod",
+            TARGETS: FULL,
+            DEPLOY_TAG: "v1.2.3",
+            GITHUB_REPOSITORY: "o/r",
+            RUNNER_TEMP: "/rt",
+            WAIT_PUBLISHED: wait,
+            PUBLISH_READ_TOKEN: wait ? "read-token" : "",
+          },
+          encoding: "utf8",
+        },
+      );
+      let args = "";
+      try {
+        args = readFileSync(join(dir, "args"), "utf8");
+      } catch {}
+      return { ...r, args };
+    };
+    const order = (out: string) =>
+      out
+        .split("\n")
+        .filter((l) => l.startsWith("deployed ") || l.startsWith("prod's"))
+        .map((l) => (l.startsWith("prod's") ? "catalog" : l.slice(9)))
+        .join(",");
+    // Waves 1 to 3 first, then the catalog, then provisioning onwards.
+    const ok = run(2, "1");
+    expect(ok.status).toBe(0);
+    expect(order(ok.stdout)).toBe(
+      "platform-db,auth-broker,directory-broker,provision-token,inventory,provisioner,catalog,provisioning,dispatch",
+    );
+    expect(ok.args.trim().split("\n")).toHaveLength(3);
+    expect(ok.args).toContain(
+      "token=read-token --experimental-strip-types /rt/main-ci/prod-release-chain.ts published --repo o/r --tag v1.2.3",
+    );
+    // Never published: the run fails before provisioning moves.
+    const never = run(1000, "1");
+    expect(never.status).not.toBe(0);
+    expect(never.stdout).toContain(
+      "prod's release catalog still lacks v1.2.3 after 20 minutes",
+    );
+    expect(order(never.stdout)).toBe(
+      "platform-db,auth-broker,directory-broker,provision-token,inventory,provisioner",
+    );
+    expect(never.args.trim().split("\n")).toHaveLength(80);
+    // A manual deploy (no require_newer) never asks.
+    const manual = run(1000, "");
+    expect(manual.status).toBe(0);
+    expect(manual.args).toBe("");
+    expect(order(manual.stdout)).toContain("provisioner,provisioning,dispatch");
+  });
+
   it("require_newer (the chain's): the tag must be newer than prod's scheduler, before anything deploys", () => {
     const s = named("The tag is newer than prod's");
     const i = (n: string) => steps.indexOf(n === "" ? s : named(n));

@@ -8,7 +8,7 @@
 // neutral skip (a stale or repeated event, a release prod already runs), not
 // a failure. `require-newer` is the deploy's re-check, which fails instead.
 // `report` keeps one `blocker` issue open while the last chain run is red;
-// a failed publish beside a green deploy is red too, and says the fleet holds.
+// a failed publish job beside a green deploy is red too.
 // Usage: node --experimental-strip-types scripts/ci/prod-release-chain.ts tag --title "<display_title>"
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts fresh --repo owner/name --tag vX.Y.Z --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag vX.Y.Z --current vX.Y.Z
@@ -235,15 +235,15 @@ export function report(o: {
       : { action: "none" };
   }
 
-  // The deploy went green but the publish beside it did not: the scheduler
-  // runs the tag, and the fleet holds (release_unpublished) until prod's
-  // catalog has it, with nothing else saying so.
+  // The deploy went green but the publish job beside it did not. The deploy
+  // moved provisioning and the scheduler only once prod's catalog had the
+  // tag, so the record landed; the publish job's own run says what failed.
   const held =
     o.deployResult === "success" &&
     !!o.publishResult &&
     o.publishResult !== "success" &&
     o.publishResult !== "skipped";
-  const title = `${ISSUE} failed: ${tag || "no release tag"}${held ? " (publish failed, the fleet holds)" : ""}`;
+  const title = `${ISSUE} failed: ${tag || "no release tag"}${held ? " (publish job failed)" : ""}`;
   const links = [
     ...(o.deployRun ? [`Deploy run: ${o.deployRun}`, ""] : []),
     ...(o.deployNote ? [`Deploy step: ${o.deployNote}`, ""] : []),
@@ -257,7 +257,7 @@ export function report(o: {
         `Run: ${o.run}`,
         "",
         ...links,
-        "The scheduler runs the tag, so it is the fleet's target, but prod's release catalog does not have it: the fleet queues no upgrade and logs `provapi fleet release_unpublished` every tick until it does. No install moves, and the Provisioning API, which runs the tag too, refuses every create or upgrade with no version (`release_not_published`), new signups included. To clear it, read the publish run, fix the cause, then dispatch hosted-publish.yml on main with env prod and this tag. The fleet starts on its next tick once the record lands. A later chain run for this tag skips (prod already runs it), so close this issue by hand once the publish is green (docs/ops/hosted.md).",
+        "The deploy waits for prod's release catalog to have the tag before its provisioning wave, so a green deploy means the record landed: creates, upgrades and the fleet run the tag. Read the publish run for what failed after that (its watcher, or a step after the record). If the fleet logs `provapi fleet release_unpublished` for this tag, the record did not land: dispatch hosted-publish.yml on main with env prod and this tag. A later chain run for this tag skips (prod already runs it), so close this issue by hand once that is settled (docs/ops/hosted.md).",
       ].join("\n")
     : [
         `The prod release chain ended with \`${o.result}\` before the fleet started.`,
@@ -265,7 +265,7 @@ export function report(o: {
         `Run: ${o.run}`,
         "",
         ...links,
-        "The scheduler deploys last and its tag is the fleet's target. Whether it moved is not known from here: the deploy run's \"Every platform Worker runs the tag\" step reads every Worker's tag back, and runs even when a deploy step failed, so read it (or `platform-tags.sh prod`). If the scheduler runs the tag, the fleet follows it and the next chain run cannot undo that (forward only). The deploy re-runs the tagged scheduler deploy after a failed secret put, so an untagged scheduler is not expected; if the read-back still shows one, every later chain run fails at the tag-newer gate until it is repaired: dispatch deploy-hosted-platform.yml on main with the same tag, the full target list and require_newer false. Read the run: a gate refused the tag, or the deploy or its read-back failed. Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
+        "The scheduler deploys last and its tag is the fleet's target. Whether it moved is not known from here: the deploy run's \"Every platform Worker runs the tag\" step reads every Worker's tag back, and runs even when a deploy step failed, so read it (or `platform-tags.sh prod`). If the scheduler runs the tag, the fleet follows it and the next chain run cannot undo that (forward only). The deploy re-runs the tagged scheduler deploy after a failed secret put, so an untagged scheduler is not expected; if the read-back still shows one, every later chain run fails at the tag-newer gate until it is repaired: dispatch deploy-hosted-platform.yml on main with the same tag, the full target list and require_newer false. Read the run: a gate refused the tag, or the deploy or its read-back failed, or the deploy timed out waiting for prod's release catalog before its provisioning wave (the publish failed: the earlier targets run the tag, provisioning and the scheduler do not, so signups and the fleet keep the previous release). Forward only: fix the cause, cut a new release and red-line it; a green chain run closes this issue (docs/ops/hosted.md).",
       ].join("\n");
   const existing = open[0];
   if (existing) {
