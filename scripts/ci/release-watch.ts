@@ -11,8 +11,9 @@
 // staging copy beside the staging deploy, cloud #471); one not started yet
 // counts from what it waits on. A stage is done only once its own run or job
 // completed green. Merge to every install is reported against e2eTarget, never
-// alerted on: to the prod deploy's "Fleet done" step (cloud #474) where it
-// ran, else to the prod deploy, labelled "fleet not yet measured". It gates
+// alerted on: to the scheduler's fleet_done time once a later prod deploy
+// records it (cloud #495), else to the prod deploy, labelled "fleet not yet
+// measured". It gates
 // nothing and is never a required check.
 //
 // Stateless: each tick rebuilds every recent release's timeline from GitHub
@@ -76,7 +77,7 @@ export type Stage = {
   /** Minutes: the stage's median over the measured releases. Unset only for an optional stage. */
   usual?: number;
   mode?: "pr" | "direct";
-  /** Measured only for a release whose runs record it (fleet: the "Fleet done" step). */
+  /** Measured only for a release whose runs record it (fleet: its finish). */
   optional?: boolean;
   measured?: boolean;
   todo?: string;
@@ -353,8 +354,8 @@ export const FLEET_WAKE_STEP = "Wake the fleet";
 export const FLEET_WAIT_STEP = "Wait for the fleet to reach every install";
 export const FLEET_DONE_STEP = "Fleet done";
 /**
- * Fleets that finished after their own deploy's 10 min wait: every prod
- * deploy reads every fleet_done mark the platform still holds and, when there
+ * The fleet finish (cloud #474, #495): every prod deploy reads every
+ * fleet_done mark the platform still holds and, when there
  * is any, runs a step named
  * `Fleet done of earlier releases (<tag> at <ISO time>, <tag> at <ISO time>, ...)`,
  * oldest first, the newest 20 at most (cloud #474, platform-db.ts
@@ -412,19 +413,21 @@ const ran = (x: JobStep | undefined): x is JobStep =>
   !!x && x.conclusion !== "skipped" && !!x.startedAt;
 
 /**
- * Pure: the fleet finish from the prod deploy's own steps (cloud #474). The
- * wait step starts once the deploy and its verified mark are green; "Fleet
- * done" runs only once every install is upgraded, so its success and
- * completed_at are the finish. Every prod deploy run of the tag is read (a
- * rerun, or a later deploy of the same tag): the finish is the earliest
- * successful "Fleet done" across them, so an earlier wait that ran out never
- * hides a later success. The fleet starts at the earliest wake (or wait) of
- * any run, and `deployEnd` is that same moment: the deploy's own work ended
- * there. `late` is a finish a later prod deploy recorded ("Fleet done of
- * earlier releases", lateFleetDone): the earliest of all counts. With no
- * success: running while any wait is still going, else none
- * (no such steps: a run before #474, or jobs not read; or every wait ran
- * out), and the fleet is not measured for that release.
+ * Pure: the fleet finish. "Wake the fleet" starts once the deploy and its
+ * verified mark are green: the fleet starts there and the deploy's own work
+ * ends there. Since cloud #495 the deploy does not wait for the fleet: the
+ * finish comes only from a later prod deploy's "Fleet done of earlier
+ * releases" record (`late`), the scheduler's own time, and until then the
+ * fleet is not measured (the total stays to prod deploy, fleet not yet
+ * measured). Runs from before #495 also carry a wait step and a "Fleet done"
+ * step, whose end is an upper bound (FLEET_UPPER) until a record is seen.
+ * Every prod deploy run of the tag is read (a rerun, or a later deploy of the
+ * same tag): the step finish is the earliest successful "Fleet done" across
+ * them, so an earlier wait that ran out never hides a later success, and the
+ * fleet starts at the earliest wake of any run. With no finish: running while
+ * an old-shape wait is still going, else none (no record yet, no fleet steps,
+ * jobs not read, or every old wait ran out), and the fleet is not measured
+ * for that release.
  */
 export function fleetStep(
   prodRuns: Run[],
@@ -439,11 +442,23 @@ export function fleetStep(
   for (const r of prodRuns)
     for (const j of r.jobs ?? []) {
       const by = (n: string) => j.steps?.find((x) => x.name === n);
-      const wait = by(FLEET_WAIT_STEP);
-      if (!ran(wait)) continue;
+      // The first successful "Wake the fleet" of the tag anchors the fleet's
+      // start and the deploy's end: the measured first rollout. A later
+      // deploy of the tag never moves them. A wake that failed, was
+      // cancelled or was skipped anchors nothing (prodSteps judges the
+      // deploy's current state by its newest run). The
+      // wait and "Fleet done" steps are only in runs before cloud #495; the
+      // wait anchors only a run with no wake step.
       const wake = by(FLEET_WAKE_STEP);
+      const wait = by(FLEET_WAIT_STEP);
       const fin = by(FLEET_DONE_STEP);
-      const start = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
+      const start =
+        wake?.conclusion === "success" && wake.startedAt
+          ? wake.startedAt
+          : !wake && ran(wait)
+            ? wait.startedAt
+            : undefined;
+      if (!start) continue;
       if (!deployEnd || ms(start) < ms(deployEnd)) deployEnd = start;
       if (
         fin?.conclusion === "success" &&
@@ -453,8 +468,9 @@ export function fleetStep(
         if (!done || ms(fin.completedAt) < ms(done.at))
           done = { at: fin.completedAt, url: r.url };
       } else if (
-        wait.status !== "completed" ||
-        (!!fin && fin.conclusion === null && fin.status !== "completed")
+        ran(wait) &&
+        (wait.status !== "completed" ||
+          (!!fin && fin.conclusion === null && fin.status !== "completed"))
       )
         going = going ?? r.url;
     }
@@ -467,16 +483,11 @@ export function fleetStep(
       ? { ...done, exact: false }
       : undefined;
   if (!deployEnd)
-    return fin
-      ? {
-          fleet: {
-            state: "done",
-            doneAt: fin.at,
-            url: fin.url,
-            exact: fin.exact,
-          },
-        }
-      : { fleet: { state: "none" } };
+    return {
+      fleet: fin
+        ? { state: "done", doneAt: fin.at, url: fin.url, exact: fin.exact }
+        : { state: "none" },
+    };
   if (fin)
     return {
       deployEnd,
@@ -610,10 +621,23 @@ function groups(tag: string, runs: Run[]): Record<string, Run[]> {
   };
 }
 
+/** A run's "Wake the fleet" step, in any of its jobs. */
+const wakeOf = (r: Run) =>
+  (r.jobs ?? [])
+    .flatMap((j) => j.steps ?? [])
+    .find((x) => x.name === FLEET_WAKE_STEP);
+
 /**
- * Pure: the prod deploy and the fleet. Once the fleet wait has started (cloud
- * #474), the deploy's own work is done (every step before it succeeded), so
- * the deploy ends there even while the run waits for the fleet.
+ * Pure: the prod deploy and the fleet. Two roles, kept apart. The newest prod
+ * deploy run of the tag decides the current state; an older failed run never
+ * overrides a newer one. Its successful "Wake the fleet": done. Its wake
+ * failed or was cancelled (cloud #495 fails the deploy): failed. Still in
+ * progress: running. Completed green, with the wake skipped on purpose or no
+ * wake step: done. Failed or cancelled: failed. The timing is the first
+ * rollout's: a done deploy ends at the tag's first successful wake (every
+ * step before it succeeded; before #495 the run then waited for the fleet),
+ * else at the first green run's end, and a later deploy never moves it. The
+ * span starts at the first run, reruns included.
  */
 function prodSteps(
   prodRuns: Run[],
@@ -621,13 +645,57 @@ function prodSteps(
 ): { prod_deploy: Step; fleet: Step } {
   const base = step(prodRuns);
   const { fleet, deployEnd } = fleetStep(prodRuns, late);
-  if (!deployEnd) return { prod_deploy: base, fleet };
-  const doneAt =
-    base.state === "done" && base.doneAt && ms(base.doneAt) < ms(deployEnd)
-      ? base.doneAt
-      : deployEnd;
+  const newest = [...prodRuns].sort(
+    (a, b) => ms(a.createdAt) - ms(b.createdAt),
+  )[prodRuns.length - 1];
+  if (!newest) return { prod_deploy: base, fleet };
+  const id = {
+    url: newest.url,
+    runId: newest.id,
+    attempts: base.attempts ?? Math.max(1, newest.attempt),
+  };
+  // When it first reached prod: the tag's first successful wake, else the
+  // first green run's end (or this one's).
+  const first = (fallback: string) =>
+    deployEnd ??
+    (base.doneAt && ms(base.doneAt) < ms(fallback) ? base.doneAt : fallback);
+  const done = (fallback: string) => ({
+    prod_deploy: {
+      ...id,
+      state: "done" as const,
+      startedAt: base.startedAt,
+      doneAt: first(fallback),
+    },
+    fleet,
+  });
+  const wake = wakeOf(newest);
+  if (wake?.conclusion === "success" && wake.startedAt)
+    return done(wake.startedAt);
+  if (wake?.conclusion === "failure" || wake?.conclusion === "cancelled")
+    return {
+      prod_deploy: { ...id, state: "red", startedAt: base.startedAt },
+      fleet,
+    };
+  if (newest.status !== "completed") {
+    // An old-shape run past its wait step (no wake step at all) is done there.
+    if (deployEnd && !wake) return done(deployEnd);
+    return {
+      prod_deploy: {
+        ...id,
+        state: "running",
+        startedAt:
+          newest.status === "in_progress" ||
+          prodRuns.length > 1 ||
+          newest.attempt > 1
+            ? base.startedAt
+            : undefined,
+      },
+      fleet,
+    };
+  }
+  if (newest.conclusion === "success") return done(newest.updatedAt);
   return {
-    prod_deploy: { ...base, state: "done", doneAt },
+    prod_deploy: { ...id, state: "red", startedAt: base.startedAt },
     fleet,
   };
 }
@@ -760,8 +828,8 @@ export function timeline(o: {
     if (after) return going(after, true);
     return { ...base, state: "pending" };
   });
-  // Done when the last stage this release records is done: fleet with its
-  // "Fleet done" step, else the prod deploy (fleet not yet measured).
+  // Done when the last stage this release records is done: fleet once its
+  // finish is recorded, else the prod deploy (fleet not yet measured).
   const tailAt = [...rows].reverse().findIndex((r) => r.state !== "unmeasured");
   const tail = tailAt < 0 ? undefined : rows[rows.length - 1 - tailAt];
   const doneAt = tail?.state === "done" ? tail.endedAt : undefined;
