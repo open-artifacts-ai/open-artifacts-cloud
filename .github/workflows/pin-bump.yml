@@ -43,8 +43,9 @@
 # gates main. `open` pushes the same App-signed commit to pin-land/<tag>, never to
 # main, and CI runs on it in full. The `land` job (after each CI run on a
 # pin-land/* branch, and on every schedule and dispatch) fast-forwards main to
-# that exact sha, with force=false, only when every required check of main's
-# ruleset is green on it, the commit is the bot's verified one, it changes only
+# that exact sha, with force=false, only when ci.yml's push run on that branch
+# and sha passed in full (every job main's ruleset requires green, none skipped,
+# none on the pin-only short path), the commit is the bot's verified one, it changes only
 # PUBLIC_PIN, SYNCED_FROM and pnpm-lock.yaml, and both pin files name the public
 # tag's sha. Red stays red and the branch waits for a person; a main that moved
 # meanwhile gets the same blobs on its head, pushed to the branch for CI to run
@@ -324,15 +325,17 @@ jobs:
           SHA: ${{ steps.plan.outputs.sha }}
         run: node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo "$GITHUB_REPOSITORY" --base "$BASE" --commit "$COMMIT" --tag "$TAG" --sha "$SHA"
 
-  # Direct mode: main moves to a staged pin only once CI is green on that exact sha.
+  # Direct mode: main moves to a staged pin only once a full CI push run passed on that exact sha.
   land:
     if: github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on'
     runs-on: ubuntu-latest
     # Its own App and Environment: the bypass actor on main's ruleset is used here only.
     environment: pin-land
     timeout-minutes: 10
+    # actions: read lets land read ci.yml's push run and jobs on the staged sha.
     permissions:
       contents: read
+      actions: read
       checks: read
       statuses: read
     steps:

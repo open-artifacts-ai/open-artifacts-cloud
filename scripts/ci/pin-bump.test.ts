@@ -11,6 +11,7 @@ import { sleeper } from "./gh-retry.ts";
 import {
   applyPin,
   branchOf,
+  CI_WORKFLOW,
   compareTags,
   DIRECT_FILES,
   type Exec,
@@ -19,6 +20,7 @@ import {
   landBranchOf,
   lockfileSensitive,
   openPr,
+  PIN_ONLY_STEP,
   plan,
   planDirect,
   rewritePin,
@@ -524,8 +526,10 @@ describe("pin-bump.yml", () => {
         statuses: "read",
       });
     expect(jobs.report.permissions).toEqual({ issues: "write" });
+    // actions read: land reads ci.yml's push run and its jobs (cloud #264).
     expect(jobs.land.permissions).toEqual({
       contents: "read",
+      actions: "read",
       checks: "read",
       statuses: "read",
     });
@@ -887,6 +891,15 @@ describe("pin-bump.yml", () => {
       );
       expect(synced.run).toContain('[[ "$REF" == refs/heads/pin-land/* ]]');
       expect(synced.run).toContain("repos/$REPO/commits/$GITHUB_SHA");
+      // land reads the short path off this step: it runs only when pin_only is true.
+      for (const name of ["overlay-shard", "lint", "e2e"]) {
+        const short = ci.jobs[name].steps.find(
+          // biome-ignore lint/suspicious/noExplicitAny: workflow YAML is untyped
+          (s: any) => s.name === PIN_ONLY_STEP,
+        );
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+        expect(short.if).toBe("${{ steps.ro.outputs.pin_only == 'true' }}");
+      }
     });
   });
 
@@ -1167,11 +1180,33 @@ describe("direct mode: stage, landBranch, land, route", () => {
     sha: `${filename.length.toString(16).padStart(2, "0")}${"f".repeat(38)}`,
   });
   const REQUIRED = ["scripts", "overlay", "lint"];
-  const green = (name: string, app = "github-actions") => ({
-    name,
+  const RUN = 7;
+  /** ci.yml's push run on the staged branch at its head, passed. */
+  const ciRun = (o: Record<string, unknown> = {}) => ({
+    id: RUN,
+    path: CI_WORKFLOW,
+    event: "push",
+    head_branch: BRANCH,
+    head_sha: COMMIT,
     status: "completed",
     conclusion: "success",
-    app: { slug: app },
+    ...o,
+  });
+  /** A job of that run; full unless `short` (the pin-only short path ran). */
+  const job = (
+    name: string,
+    o: { conclusion?: string; short?: boolean } = {},
+  ) => ({
+    name,
+    status: "completed",
+    conclusion: o.conclusion ?? "success",
+    steps: [
+      {
+        name: "pin-only bot PR? (decided by the base commit's script)",
+        conclusion: "success",
+      },
+      { name: PIN_ONLY_STEP, conclusion: o.short ? "success" : "skipped" },
+    ],
   });
   type LandWorld = {
     parents?: string[];
@@ -1191,7 +1226,10 @@ describe("direct mode: stage, landBranch, land, route", () => {
     committer?: string;
     verified?: boolean;
     required?: string[];
-    checks?: ReturnType<typeof green>[];
+    /** ci.yml's runs the runs query lists. */
+    runs?: ReturnType<typeof ciRun>[];
+    /** the jobs of each run, by id; a run not listed has REQUIRED, all full. */
+    jobs?: Record<number, ReturnType<typeof job>[]>;
     refs?: string[];
     gate?: GateWorld;
     landBot?: string;
@@ -1286,8 +1324,15 @@ describe("direct mode: stage, landBranch, land, route", () => {
             },
           },
         ]);
-      if (path.includes(`commits/${COMMIT}/check-runs`))
-        return ok([{ check_runs: o.checks ?? REQUIRED.map((n) => green(n)) }]);
+      if (path.includes("actions/workflows/ci.yml/runs?"))
+        return ok({ workflow_runs: o.runs ?? [ciRun()] });
+      const jr = /actions\/runs\/(\d+)\/jobs\?/.exec(path);
+      if (jr)
+        return ok([
+          {
+            jobs: o.jobs?.[Number(jr[1])] ?? REQUIRED.map((n) => job(n)),
+          },
+        ]);
       if (path.endsWith("git/trees") || path.endsWith("git/commits")) {
         const i = args.indexOf("--input");
         bodies.push(JSON.parse(readFileSync(args[i + 1] ?? "", "utf8")));
@@ -1433,7 +1478,7 @@ describe("direct mode: stage, landBranch, land, route", () => {
       // every read goes through the read token, every write through the App's
       for (const c of w.calls)
         expect(c.by).toBe(c.args[1] === "-X" ? "write" : "read");
-      // the checks are read for the branch head, against main's ruleset
+      // ci.yml's push run on this branch at this sha, its jobs against main's ruleset
       const paths = w.calls.map((c) => c.args.join(" "));
       expect(
         paths.some((p) => p.includes(`repos/${REPO}/rules/branches/main`)),
@@ -1441,31 +1486,48 @@ describe("direct mode: stage, landBranch, land, route", () => {
       expect(
         paths.some((p) =>
           p.includes(
-            `repos/${REPO}/commits/${COMMIT}/check-runs?filter=latest`,
+            `repos/${REPO}/actions/workflows/ci.yml/runs?event=push&branch=pin-land%2Fv0.137.0&head_sha=${COMMIT}`,
           ),
         ),
       ).toBe(true);
+      expect(
+        paths.some((p) =>
+          p.includes(`repos/${REPO}/actions/runs/${RUN}/jobs?filter=latest`),
+        ),
+      ).toBe(true);
+      // check names on the sha are not the evidence any more
+      expect(paths.some((p) => p.includes("check-runs"))).toBe(false);
     });
 
     it.each([
+      ["there is no CI run yet", { runs: [] }],
       [
-        "a required check has not run",
-        { checks: [green("scripts"), green("overlay")] },
+        "the push run is still running",
+        { runs: [ciRun({ status: "in_progress", conclusion: null })] },
       ],
       [
-        "a required check is still running",
+        "the only green run on the branch and sha is a PR run (#468: every check green, lint and e2e skipped)",
+        { runs: [ciRun({ event: "pull_request" })] },
+      ],
+      [
+        "the only green push run is for another branch",
+        { runs: [ciRun({ head_branch: "pin-land/v0.136.9" })] },
+      ],
+      [
+        "the only green push run is for another sha",
+        { runs: [ciRun({ head_sha: MAIN2 })] },
+      ],
+      [
+        "the only green push run is another workflow's",
+        { runs: [ciRun({ path: ".github/workflows/other.yml" })] },
+      ],
+      [
+        "a newer push run on the same sha is still running",
         {
-          checks: [
-            green("scripts"),
-            green("overlay"),
-            { ...green("lint"), status: "in_progress", conclusion: null },
+          runs: [
+            ciRun(),
+            ciRun({ id: RUN + 1, status: "queued", conclusion: null }),
           ],
-        },
-      ],
-      [
-        "a check by another app does not count",
-        {
-          checks: [green("scripts"), green("overlay"), green("lint", "evil")],
         },
       ],
     ] as [string, LandWorld][])(
@@ -1477,17 +1539,68 @@ describe("direct mode: stage, landBranch, land, route", () => {
       },
     );
 
-    it.each(["failure", "cancelled", "skipped", "timed_out"])(
-      "a required check that ended %s throws, and the branch stays for a person",
+    it.each(["failure", "cancelled", "timed_out"])(
+      "a push run that ended %s throws, and the branch stays for a person",
       (conclusion) => {
-        const w = landWorld({
-          checks: [
-            green("scripts"),
-            green("overlay"),
-            { ...green("lint"), conclusion },
-          ],
-        });
-        expect(() => w.one()).toThrow(`required check lint is ${conclusion}`);
+        const w = landWorld({ runs: [ciRun({ conclusion })] });
+        expect(() => w.one()).toThrow(
+          `ci.yml run ${RUN} on ${BRANCH} at ${COMMIT} is ${conclusion}`,
+        );
+        expect(writes(w.calls)).toHaveLength(0);
+      },
+    );
+
+    it("the newest push run on the sha decides: an older green one does not count", () => {
+      const w = landWorld({
+        runs: [ciRun(), ciRun({ id: RUN + 1, conclusion: "failure" })],
+      });
+      expect(() => w.one()).toThrow(`run ${RUN + 1}`);
+      expect(writes(w.calls)).toHaveLength(0);
+      const ok = landWorld({
+        runs: [ciRun({ id: RUN + 1 }), ciRun({ conclusion: "failure" })],
+      });
+      expect(ok.one()).toEqual({ action: "landed", sha: COMMIT });
+    });
+
+    it.each([
+      [
+        "a required job was skipped",
+        [
+          job("scripts"),
+          job("overlay"),
+          job("lint", { conclusion: "skipped" }),
+        ],
+        "required job lint is skipped",
+      ],
+      [
+        "a required job failed",
+        [
+          job("scripts"),
+          job("overlay"),
+          job("lint", { conclusion: "failure" }),
+        ],
+        "required job lint is failure",
+      ],
+      [
+        "a required job is not in the run",
+        [job("scripts"), job("overlay")],
+        "required job lint is missing",
+      ],
+      [
+        "a required job took the pin-only short path",
+        [job("scripts"), job("overlay"), job("lint", { short: true })],
+        "job lint in ci.yml run 7",
+      ],
+      [
+        "a job behind a required one took the pin-only short path",
+        [...REQUIRED.map((n) => job(n)), job("overlay (a)", { short: true })],
+        "pin-only short path",
+      ],
+    ] as [string, ReturnType<typeof job>[], string][])(
+      "a passed run where %s throws, and moves nothing",
+      (_n, jobs, msg) => {
+        const w = landWorld({ jobs: { [RUN]: jobs } });
+        expect(() => w.one()).toThrow(msg);
         expect(writes(w.calls)).toHaveLength(0);
       },
     );

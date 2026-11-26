@@ -5,7 +5,7 @@
 // Direct mode (cloud #264, repo variable PIN_BUMP_DIRECT=on) lands without a PR:
 // `plan-direct` plans with no PR checks, `stage` pushes the pin commit to
 // pin-land/<tag> (never main), and `land` fast-forwards main to that exact sha
-// only when every required check of main's ruleset is green on it, the commit is
+// only when a full ci.yml push run on that branch and sha passed, the commit is
 // the bot's verified one and it changes only PUBLIC_PIN, SYNCED_FROM and the
 // lockfile. A bump that also ports surfaces goes to a PR for a person (`route`).
 // Both plan-direct and land wait on the release pipeline gate pin-bump-arm uses
@@ -626,7 +626,7 @@ function pointBranch(exec: Exec, repo: string, branch: string, sha: string) {
 /**
  * Direct mode, step 1 (cloud #264): checks the fresh pin commit and pushes it to
  * pin-land/<tag>, where CI runs in full. Main does not move here: `land` moves
- * it only once every required check is green on that exact sha.
+ * it only once a full ci.yml push run passed on that exact sha.
  */
 export function stage(o: {
   exec: Exec;
@@ -694,12 +694,98 @@ function dropBranch(exec: Exec, repo: string, branch: string) {
   }
 }
 
+/** The workflow whose push run on a pin-land branch is the evidence `land` needs. */
+export const CI_WORKFLOW = ".github/workflows/ci.yml";
+/** The step ci.yml's jobs run only on the pin-only short path (scripts/ci/pin-only.ts). */
+export const PIN_ONLY_STEP = "pin-only bot PR";
+
+type CiRun = {
+  id: number;
+  path: string;
+  event: string;
+  head_branch: string | null;
+  head_sha: string;
+  status: string;
+  conclusion: string | null;
+};
+type CiJob = {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  steps?: { name: string; conclusion: string | null }[];
+};
+
+/**
+ * The evidence a staged pin needs (cloud #264): the newest ci.yml run with event
+ * push, head_branch `branch` and head_sha `head` completed with success, every
+ * job named by main's required checks is in it and succeeded (skipped does not
+ * count), and no job took the pin-only short path. Check names on the sha alone
+ * are not enough: a pin PR's run reports them green with lint and e2e skipped.
+ * Returns why to wait (no such run yet, or still running); throws when the run
+ * failed or was not full, and the branch stays for a person.
+ */
+function fullCiRun(
+  r: ReturnType<typeof reader>,
+  branch: string,
+  head: string,
+  required: string[],
+): string | undefined {
+  const wf = CI_WORKFLOW.split("/").pop();
+  const runs = r
+    .json<{ workflow_runs?: CiRun[] }>(
+      `actions/workflows/${wf}/runs?event=push&branch=${encodeURIComponent(branch)}&head_sha=${head}&per_page=100`,
+    )
+    .workflow_runs?.filter(
+      (x) =>
+        x.path === CI_WORKFLOW &&
+        x.event === "push" &&
+        x.head_branch === branch &&
+        x.head_sha === head,
+    )
+    .sort((a, b) => b.id - a.id);
+  const run = runs?.[0];
+  if (!run) return `no ${wf} push run on ${branch} at ${head} yet`;
+  if (run.status !== "completed")
+    return `${wf} run ${run.id} on ${branch} at ${head} is ${run.status}`;
+  const left = `the branch stays for a person`;
+  if (run.conclusion !== "success")
+    throw new Error(
+      `${wf} run ${run.id} on ${branch} at ${head} is ${run.conclusion}: a port may be needed (README, "Hand-porting a public fix"); ${left}`,
+    );
+  const jobs = (
+    JSON.parse(
+      r.api(`actions/runs/${run.id}/jobs?filter=latest&per_page=100`, [
+        "--paginate",
+        "--slurp",
+      ]),
+    ) as { jobs: CiJob[] }[]
+  ).flatMap((pg) => pg.jobs);
+  for (const name of required) {
+    const job = jobs.find((j) => j.name === name);
+    if (job?.status !== "completed" || job.conclusion !== "success")
+      throw new Error(
+        `required job ${name} is ${job ? job.conclusion : "missing"} in ${wf} run ${run.id} at ${head}; ${left}`,
+      );
+  }
+  const short = jobs.find((j) =>
+    (j.steps ?? []).some(
+      (s) => s.name === PIN_ONLY_STEP && s.conclusion !== "skipped",
+    ),
+  );
+  if (short)
+    throw new Error(
+      `job ${short.name} in ${wf} run ${run.id} at ${head} took the pin-only short path, not a full run; ${left}`,
+    );
+  return undefined;
+}
+
 /**
  * Direct mode, step 2 (cloud #264): lands one pin-land/<tag> branch. Its head
  * must be the release bot's verified commit, one step on its parent, changing
- * only DIRECT_FILES to the public tag's sha, with every required check of
- * main's ruleset green on that exact sha (pending waits; red throws, and the
- * branch stays for a person). Then main fast-forwards to it, never with force.
+ * only DIRECT_FILES to the public tag's sha, and a full ci.yml push run on
+ * that branch at that exact sha must have passed, every job main's ruleset
+ * requires green in it (fullCiRun: no run yet or running waits; red, skipped or
+ * the pin-only short path throws, and the branch stays for a person). Then main fast-forwards to it, never with force.
  * When main has moved off the parent on paths that cannot touch the lockfile,
  * the same blobs are committed on main's head and pushed to the branch, so CI
  * runs again on what would land; a lockfile-sensitive move drops the branch and
@@ -707,7 +793,7 @@ function dropBranch(exec: Exec, repo: string, branch: string) {
  * Before main moves (or the branch is rebuilt), the release pipeline gate
  * (pin-bump-arm's gateRefusal, on main's current pin) must be open; a refusal
  * waits, and the next run tries again.
- * `exec` writes (the land App token); `read` reads (the job token, checks: read).
+ * `exec` writes (the land App token); `read` reads (the job token, actions: read).
  * `landBot` is the land App's bot login: a branch it rebuilt is its commit, not
  * the release bot's, and is accepted as such.
  */
@@ -755,47 +841,12 @@ export function landBranch(o: {
   const sha = resolveSha(o.read, o.publicRepo, tag);
   const files = checkPinCommit(r, parent, head, tag, sha);
 
-  // Every required check of main's ruleset, by GitHub Actions, on this sha.
+  // A full ci.yml push run on this branch at this exact sha, every required job green.
   const required = requiredChecks(r.api("rules/branches/main"));
   if (required.length === 0)
     throw new Error("main's required checks could not be read");
-  const runs = (
-    JSON.parse(
-      gh(o.read, [
-        "api",
-        "--paginate",
-        "--slurp",
-        `repos/${o.repo}/commits/${head}/check-runs?filter=latest&per_page=100`,
-      ]),
-    ) as {
-      check_runs: {
-        name: string;
-        status: string;
-        conclusion: string | null;
-        app?: { slug?: string } | null;
-      }[];
-    }[]
-  )
-    .flatMap((pg) => pg.check_runs)
-    .filter((c) => c.app?.slug === "github-actions");
-  const pending: string[] = [];
-  for (const name of required) {
-    const got = runs.filter((c) => c.name === name);
-    const red = got.find(
-      (c) => c.status === "completed" && c.conclusion !== "success",
-    );
-    if (red)
-      throw new Error(
-        `required check ${name} is ${red.conclusion} on ${o.branch} at ${head}: a port may be needed (README, "Hand-porting a public fix"); the branch stays for a person`,
-      );
-    if (got.length === 0 || got.some((c) => c.status !== "completed"))
-      pending.push(name);
-  }
-  if (pending.length > 0)
-    return {
-      action: "waiting",
-      why: `${pending.join(", ")} not done on ${head}`,
-    };
+  const notYet = fullCiRun(r, o.branch, head, required);
+  if (notYet) return { action: "waiting", why: notYet };
   // The same release pipeline gate a PR bump waits on before it is armed.
   const wait = gateRefusal(readGate(o.read, o.repo, mainPin));
   if (wait) return { action: "waiting", why: wait };
