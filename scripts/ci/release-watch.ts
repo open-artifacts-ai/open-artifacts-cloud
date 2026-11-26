@@ -442,9 +442,11 @@ export function fleetStep(
   for (const r of prodRuns)
     for (const j of r.jobs ?? []) {
       const by = (n: string) => j.steps?.find((x) => x.name === n);
-      // The newest successful "Wake the fleet" anchors the fleet's start and
-      // the deploy's end. One that failed, was cancelled or was skipped
-      // anchors nothing (prodSteps judges the deploy by its newest run). The
+      // The first successful "Wake the fleet" of the tag anchors the fleet's
+      // start and the deploy's end: the measured first rollout. A later
+      // deploy of the tag never moves them. A wake that failed, was
+      // cancelled or was skipped anchors nothing (prodSteps judges the
+      // deploy's current state by its newest run). The
       // wait and "Fleet done" steps are only in runs before cloud #495; the
       // wait anchors only a run with no wake step.
       const wake = by(FLEET_WAKE_STEP);
@@ -457,7 +459,7 @@ export function fleetStep(
             ? wait.startedAt
             : undefined;
       if (!start) continue;
-      if (!deployEnd || ms(start) > ms(deployEnd)) deployEnd = start;
+      if (!deployEnd || ms(start) < ms(deployEnd)) deployEnd = start;
       if (
         fin?.conclusion === "success" &&
         fin.status !== "in_progress" &&
@@ -626,13 +628,16 @@ const wakeOf = (r: Run) =>
     .find((x) => x.name === FLEET_WAKE_STEP);
 
 /**
- * Pure: the prod deploy and the fleet. The newest prod deploy run of the tag
- * decides; an older failed run never overrides a newer one. Its successful
- * "Wake the fleet": done there (every step before it succeeded; before cloud
- * #495 the run then waited for the fleet). Its wake failed or was cancelled
- * (#495 fails the deploy): failed. Still in progress: running. Completed
- * green, with the wake skipped on purpose or no wake step: done. Failed or
- * cancelled: failed. The span starts at the first run, reruns included.
+ * Pure: the prod deploy and the fleet. Two roles, kept apart. The newest prod
+ * deploy run of the tag decides the current state; an older failed run never
+ * overrides a newer one. Its successful "Wake the fleet": done. Its wake
+ * failed or was cancelled (cloud #495 fails the deploy): failed. Still in
+ * progress: running. Completed green, with the wake skipped on purpose or no
+ * wake step: done. Failed or cancelled: failed. The timing is the first
+ * rollout's: a done deploy ends at the tag's first successful wake (every
+ * step before it succeeded; before #495 the run then waited for the fleet),
+ * else at the first green run's end, and a later deploy never moves it. The
+ * span starts at the first run, reruns included.
  */
 function prodSteps(
   prodRuns: Run[],
@@ -649,25 +654,23 @@ function prodSteps(
     runId: newest.id,
     attempts: base.attempts ?? Math.max(1, newest.attempt),
   };
+  // When it first reached prod: the tag's first successful wake, else the
+  // first green run's end (or this one's).
+  const first = (fallback: string) =>
+    deployEnd ??
+    (base.doneAt && ms(base.doneAt) < ms(fallback) ? base.doneAt : fallback);
+  const done = (fallback: string) => ({
+    prod_deploy: {
+      ...id,
+      state: "done" as const,
+      startedAt: base.startedAt,
+      doneAt: first(fallback),
+    },
+    fleet,
+  });
   const wake = wakeOf(newest);
-  if (wake?.conclusion === "success" && wake.startedAt) {
-    const at = wake.startedAt;
-    const end =
-      newest.status === "completed" &&
-      newest.conclusion === "success" &&
-      ms(newest.updatedAt) < ms(at)
-        ? newest.updatedAt
-        : at;
-    return {
-      prod_deploy: {
-        ...id,
-        state: "done",
-        startedAt: base.startedAt,
-        doneAt: end,
-      },
-      fleet,
-    };
-  }
+  if (wake?.conclusion === "success" && wake.startedAt)
+    return done(wake.startedAt);
   if (wake?.conclusion === "failure" || wake?.conclusion === "cancelled")
     return {
       prod_deploy: { ...id, state: "red", startedAt: base.startedAt },
@@ -675,16 +678,7 @@ function prodSteps(
     };
   if (newest.status !== "completed") {
     // An old-shape run past its wait step (no wake step at all) is done there.
-    if (deployEnd && !wake)
-      return {
-        prod_deploy: {
-          ...id,
-          state: "done",
-          startedAt: base.startedAt,
-          doneAt: deployEnd,
-        },
-        fleet,
-      };
+    if (deployEnd && !wake) return done(deployEnd);
     return {
       prod_deploy: {
         ...id,
@@ -699,17 +693,7 @@ function prodSteps(
       fleet,
     };
   }
-  if (newest.conclusion === "success") {
-    // Done when it first reached prod: the first green run's end, or the
-    // newest wake (an old-shape wait) when that came first.
-    const first = base.doneAt ?? newest.updatedAt;
-    const doneAt =
-      deployEnd && !wake && ms(deployEnd) < ms(first) ? deployEnd : first;
-    return {
-      prod_deploy: { ...id, state: "done", startedAt: base.startedAt, doneAt },
-      fleet,
-    };
-  }
+  if (newest.conclusion === "success") return done(newest.updatedAt);
   return {
     prod_deploy: { ...id, state: "red", startedAt: base.startedAt },
     fleet,

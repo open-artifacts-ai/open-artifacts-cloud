@@ -1171,12 +1171,12 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
 
   it("an earlier wait that ran out never hides a later Fleet done for the same tag: the earliest success is the finish", () => {
     const later = laterRun(4, "05:30:00", "05:39:39");
-    // The fleet's start is the newest successful wake.
+    // The fleet's start is the tag's first successful wake.
     const done = {
-      deployEnd: D("05:30:00"),
+      deployEnd: D("05:01:00"),
       fleet: {
         state: "done",
-        startedAt: D("05:30:00"),
+        startedAt: D("05:01:00"),
         doneAt: D("05:39:39"),
         url: `${RUNS}4`,
         exact: false,
@@ -1197,8 +1197,12 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       state: "done",
       endedAt: D("05:39:39"),
     });
-    // The newest run decides the deploy: done at its wake.
-    expect(row(t, "prod_deploy")?.endedAt).toBe(D("05:30:00"));
+    // The newest run decides the state (done); the first wake the timing.
+    expect(row(t, "prod_deploy")).toMatchObject({
+      state: "done",
+      endedAt: D("05:01:00"),
+      runId: 4,
+    });
     expect(t.e2eTo).toBe(FLEET_UPPER);
     expect(t.doneAt).toBe(D("05:39:39"));
     // A backfill rebuilds from the runs, so it takes the later success too.
@@ -1237,7 +1241,7 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       doneAt: D("05:39:39"),
       e2e: 77.9,
       e2eTo: FLEET_UPPER,
-      stages: { prod_deploy: 4.8, fleet: 9.7 },
+      stages: { prod_deploy: 4.8, fleet: 38.7 },
     });
     // History from before e2eTo also ran to the prod deploy.
     const { e2eTo: _, ...old } = recorded;
@@ -2065,6 +2069,71 @@ describe("a prod deploy whose wake failed (cloud #495)", () => {
     });
     expect(fleetStep([run("failure"), woke]).deployEnd).toBe(D("12:58:00"));
     expect(alerts([run("failure"), woke])).toEqual([]);
+  });
+
+  it("two successful wakes with the D1 finish between them: the timing stays the first rollout's, in either run order", () => {
+    // v0.251.0's wake 12:37:17 and D1 finish 12:44:59.732 (run 45827368805's
+    // record), then a second green deploy of the tag waking at 12:55:00.
+    const again: Run = {
+      ...second({}, "success"),
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [st(FLEET_WAKE_STEP, "12:55:00", "12:55:01")],
+        },
+      ],
+    };
+    const record: Run = {
+      ...second({}, "success"),
+      id: 45827368805,
+      title: "deploy-hosted-platform prod v0.251.1 [c45827368805-1]",
+      createdAt: D("13:20:00"),
+      url: "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/45827368805",
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [
+            st(
+              "Fleet done of earlier releases (v0.251.0 at 2026-11-26T12:44:59.732Z)",
+              "13:21:00",
+              "13:21:00",
+            ),
+          ],
+        },
+      ],
+    };
+    for (const order of [
+      [run("success"), again, record],
+      [record, again, run("success")],
+    ]) {
+      const t = timeline({
+        release: { tag: "v0.251.0", publishedAt: D("11:12:34") },
+        runs: [publish, ...order],
+        prs: [],
+        mergedAt: D("10:03:10"),
+        config,
+        now: D("13:30:00"),
+      });
+      const fleet = t.stages.find((x) => x.name === "fleet");
+      expect(fleet).toMatchObject({
+        state: "done",
+        startedAt: D("12:37:17"),
+        endedAt: "2026-11-26T12:44:59.732Z",
+        minutes: 7.7,
+      });
+      expect(ms(fleet?.endedAt ?? "") - ms(fleet?.startedAt ?? "")).toBe(
+        462_732,
+      );
+      // The newest run decides the state; the first wake the timing.
+      expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+        state: "done",
+        endedAt: D("12:37:17"),
+        runId: RUN + 1,
+      });
+      expect(t.e2eTo).toBe("every install");
+    }
   });
 
   it("a newer failed run after an older green one is failed, with the newer run's id", () => {
