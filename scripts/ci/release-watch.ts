@@ -1025,7 +1025,10 @@ export type Stats = Record<
   string,
   { p50: number | null; p90: number | null; n: number; usual?: number }
 >;
-/** Pure: p50/p90 per stage and e2e over the newest `statsWindow` finished releases. */
+/**
+ * Pure: p50/p90 per stage over the newest `statsWindow` finished releases,
+ * and e2e over the newest `statsWindow` measured deliveries.
+ */
 export function stats(history: HistoryEntry[], config: Config) {
   const recent = [...history]
     .sort((a, b) => compareTags(a.tag, b.tag))
@@ -1043,10 +1046,15 @@ export function stats(history: HistoryEntry[], config: Config) {
       ...(s.usual ? { usual: s.usual } : {}),
     };
   }
-  // A superseded release has no total of its own: never counted.
-  const e = recent
-    .map((x) => x.e2e)
-    .filter((x): x is number => typeof x === "number");
+  // The totals are over the newest statsWindow measured deliveries: a
+  // superseded release has no total of its own, so it is filtered out first
+  // and never pushes a delivery out of the window.
+  const delivered = [...history]
+    .sort((a, b) => compareTags(a.tag, b.tag))
+    .filter((x) => typeof x.e2e === "number")
+    .slice(-config.statsWindow);
+  const e = delivered.map((x) => x.e2e as number);
+  const oldest = delivered[0]?.tag;
   return {
     stages,
     e2e: {
@@ -1054,19 +1062,25 @@ export function stats(history: HistoryEntry[], config: Config) {
       p90: pct(e, 90),
       n: e.length,
       target: config.e2eTarget,
-      superseded: recent
-        .filter((x) => x.supersededBy)
+      // The superseded ones in the same span (newer than the oldest
+      // delivery, or carried by one), listed apart.
+      superseded: [...history]
+        .sort((a, b) => compareTags(a.tag, b.tag))
+        .filter(
+          (x) =>
+            x.supersededBy &&
+            oldest !== undefined &&
+            (compareTags(x.tag, oldest) >= 0 ||
+              delivered.some((d) => d.carries?.includes(x.tag))),
+        )
         .map((x) => ({ tag: x.tag, by: x.supersededBy as string })),
-      last20: recent
-        .filter((x) => typeof x.e2e === "number")
-        .slice(-20)
-        .map((x) => ({
-          tag: x.tag,
-          e2e: x.e2e as number,
-          // History from before this field ran to the prod deploy.
-          to: x.e2eTo ?? NO_FLEET,
-          ...(x.carries?.length ? { carries: x.carries } : {}),
-        })),
+      last20: delivered.slice(-20).map((x) => ({
+        tag: x.tag,
+        e2e: x.e2e as number,
+        // History from before this field ran to the prod deploy.
+        to: x.e2eTo ?? NO_FLEET,
+        ...(x.carries?.length ? { carries: x.carries } : {}),
+      })),
     },
   };
 }

@@ -2270,6 +2270,79 @@ describe("superseded releases have no total of their own", () => {
     );
   });
 
+  it("the totals are over the newest 20 measured deliveries: superseded tags never push one out", () => {
+    // The Prover's backfill from 20 November: 29 history rows, 16 measured
+    // deliveries (comment 7195373309). Taking the newest 20 rows first left
+    // 14 deliveries, dropping v0.239.2 (2692.9) and v0.241.0 (614).
+    const rows: [string, string, number | null][] = [
+      ["v0.235.2", "v0.238.0", null],
+      ["v0.236.0", "v0.238.0", null],
+      ["v0.237.0", "v0.238.0", null],
+      ["v0.238.0", "v0.239.0", null],
+      ["v0.239.0", "v0.239.2", null],
+      ["v0.239.1", "v0.239.2", null],
+      ["v0.239.2", "", 2692.9],
+      ["v0.240.0", "v0.241.0", null],
+      ["v0.241.0", "", 614],
+      ["v0.242.0", "v0.242.1", null],
+      ["v0.242.1", "", 4059.4],
+      ["v0.242.2", "", 979.2],
+      ["v0.243.0", "", 62.5],
+      ["v0.244.0", "", 61],
+      ["v0.244.1", "", 99.9],
+      ["v0.245.0", "", 44],
+      ["v0.245.1", "", 45.8],
+      ["v0.246.0", "v0.246.1", null],
+      ["v0.246.1", "", 315.7],
+      ["v0.247.0", "v0.248.0", null],
+      ["v0.248.0", "v0.248.1", null],
+      ["v0.248.1", "v0.248.2", null],
+      ["v0.248.2", "", 362.7],
+      ["v0.249.0", "v0.249.1", null],
+      ["v0.249.1", "", 281.2],
+      ["v0.250.0", "", 113.2],
+      ["v0.251.0", "", 161.9],
+      ["v0.251.1", "", 81.5],
+      ["v0.252.0", "", 101.8],
+    ];
+    const history: HistoryEntry[] = rows.map(([tag, by, e2e]) => ({
+      tag,
+      mode: "pr",
+      publishedAt: "2026-11-20T00:00:00Z",
+      doneAt: "2026-11-20T01:00:00Z",
+      ...(by ? { supersededBy: by } : {}),
+      ...(e2e !== null ? { e2e } : {}),
+      stages: {},
+    }));
+    expect(history).toHaveLength(29);
+    const s = stats(history, config);
+    expect(s.e2e).toMatchObject({ n: 16, p50: 113.2, p90: 2692.9 });
+    expect(s.e2e.last20.map((x) => x.tag)).toContain("v0.239.2");
+    expect(s.e2e.last20.map((x) => x.tag)).toContain("v0.241.0");
+    // The superseded list stays apart, over the same span.
+    expect(s.e2e.superseded.map((x) => x.tag)).toEqual([
+      "v0.240.0",
+      "v0.242.0",
+      "v0.246.0",
+      "v0.247.0",
+      "v0.248.0",
+      "v0.248.1",
+      "v0.249.0",
+    ]);
+    // With more than 20 deliveries, the newest 20 of them.
+    const many: HistoryEntry[] = Array.from({ length: 30 }, (_, i) => ({
+      tag: `v0.300.${i}`,
+      mode: "pr",
+      publishedAt: "2026-11-20T00:00:00Z",
+      doneAt: "2026-11-20T01:00:00Z",
+      ...(i % 3 === 0 ? { supersededBy: `v0.300.${i + 1}` } : { e2e: i }),
+      stages: {},
+    }));
+    const m = stats(many, config);
+    expect(m.e2e.n).toBe(20);
+    expect(m.e2e.last20[0]?.tag).toBe("v0.300.1");
+  });
+
   it("the Prover's example: v0.249.1's total starts at v0.249.0's first merge, and the deploy counts once", () => {
     const h = carryMerges(parseHistory(saved).map(settleSuperseded));
     const v1 = h.find((e) => e.tag === "v0.249.1");
