@@ -321,7 +321,6 @@ const bodyWith = (seen: Sighting[]) =>
     seen,
     owner: { login: "someone", assignable: false },
     ownerPath: "apps/dashboard/e2e/staging/rl-a/comments.spec.ts",
-    nowMs: NOW,
   });
 
 describe("the sightings store", () => {
@@ -347,40 +346,34 @@ describe("the sightings store", () => {
 
 describe("plan: an issue only at the second run within 7 days", () => {
   it("only records a first sighting", () => {
-    expect(plan({ f, sighting: s900, stored: [] }, [], NOW)).toMatchObject({
+    expect(plan({ f, sighting: s900, stored: [] }, [])).toMatchObject({
       kind: "record",
     });
     // The store already holding this run is still one run.
-    expect(plan({ f, sighting: s900, stored: [s900] }, [], NOW).kind).toBe(
-      "record",
-    );
+    expect(plan({ f, sighting: s900, stored: [s900] }, []).kind).toBe("record");
   });
 
   it("opens an issue with both runs at the second, but not when the first is 8 days old", () => {
-    expect(plan({ f, sighting: s900, stored: [s800] }, [], NOW)).toEqual({
+    expect(plan({ f, sighting: s900, stored: [s800] }, [])).toEqual({
       kind: "create",
       f,
       seen: [s800, s900],
     });
     const old: Sighting = { ...s800, at: "2026-11-18T11:00:00Z" };
-    expect(plan({ f, sighting: s900, stored: [old] }, [], NOW).kind).toBe(
-      "record",
-    );
+    expect(plan({ f, sighting: s900, stored: [old] }, []).kind).toBe("record");
   });
 
   it("bumps the open issue that carries the test's key, and never notes a run twice", () => {
     const issue = { number: 7, body: bodyWith([s800]) };
     expect(issueKey(issue.body)).toBe(keyOf(f.id));
-    expect(
-      plan({ f, sighting: s900, stored: [s800] }, [issue], NOW),
-    ).toMatchObject({
+    expect(plan({ f, sighting: s900, stored: [s800] }, [issue])).toMatchObject({
       kind: "bump",
       issue: 7,
       seen: [s800, s900],
       added: [s900],
     });
     const noted = { number: 7, body: bodyWith([s800, s900]) };
-    expect(plan({ f, sighting: s900, stored: [s800] }, [noted], NOW)).toEqual({
+    expect(plan({ f, sighting: s900, stored: [s800] }, [noted])).toEqual({
       kind: "skip",
       f,
       issue: 7,
@@ -392,22 +385,17 @@ describe("plan: an issue only at the second run within 7 days", () => {
     const issue = { number: 7, body: bodyWith([]) };
     // This run alone, even at two attempts: no bump.
     expect(
-      plan(
-        { f, sighting: s900, stored: [{ ...s900, attempt: 2 }] },
-        [issue],
-        NOW,
-      ).kind,
+      plan({ f, sighting: s900, stored: [{ ...s900, attempt: 2 }] }, [issue])
+        .kind,
     ).toBe("record");
     // One earlier run within 7 days in the store: a bump.
-    expect(
-      plan({ f, sighting: s900, stored: [s800] }, [issue], NOW),
-    ).toMatchObject({
+    expect(plan({ f, sighting: s900, stored: [s800] }, [issue])).toMatchObject({
       kind: "bump",
       added: [s800, s900],
     });
     // The same earlier run, 8 days old: no bump.
     const old: Sighting = { ...s800, at: "2026-11-18T11:00:00Z" };
-    expect(plan({ f, sighting: s900, stored: [old] }, [issue], NOW).kind).toBe(
+    expect(plan({ f, sighting: s900, stored: [old] }, [issue]).kind).toBe(
       "record",
     );
   });
@@ -415,7 +403,7 @@ describe("plan: an issue only at the second run within 7 days", () => {
   it("does not bump an open issue on a lone sighting in the window", () => {
     const old: Sighting = { ...s800, at: "2026-11-01T00:00:00Z" };
     const issue = { number: 7, body: bodyWith([old]) };
-    expect(plan({ f, sighting: s900, stored: [] }, [issue], NOW).kind).toBe(
+    expect(plan({ f, sighting: s900, stored: [] }, [issue]).kind).toBe(
       "record",
     );
   });
@@ -426,20 +414,14 @@ describe("plan: an issue only at the second run within 7 days", () => {
       run: r,
       attempt: 1,
     });
-    expect(twiceInWindow([s900], NOW)).toBe(false);
-    expect(twiceInWindow([s900, { ...s900, attempt: 2 }], NOW)).toBe(false);
-    expect(twiceInWindow([at("2026-11-20T12:00:00Z", 1), s900], NOW)).toBe(
-      true,
-    );
-    expect(twiceInWindow([at("2026-11-18T12:00:00Z", 1), s900], NOW)).toBe(
-      false,
-    );
-    const b = bumpedBody(
-      f,
-      bodyWith([at("2026-11-24T00:00:00Z", 1)]),
-      [at("2026-11-24T00:00:00Z", 1), s900],
-      NOW,
-    );
+    expect(twiceInWindow([s900])).toBe(false);
+    expect(twiceInWindow([s900, { ...s900, attempt: 2 }])).toBe(false);
+    expect(twiceInWindow([at("2026-11-20T12:00:00Z", 1), s900])).toBe(true);
+    expect(twiceInWindow([at("2026-11-18T12:00:00Z", 1), s900])).toBe(false);
+    const b = bumpedBody(f, bodyWith([at("2026-11-24T00:00:00Z", 1)]), [
+      at("2026-11-24T00:00:00Z", 1),
+      s900,
+    ]);
     expect(b).toContain(`Seen in 2 runs; ${TWICE_NOTE}.`);
     expect(parseSeen(b)).toEqual([at("2026-11-24T00:00:00Z", 1), s900]);
   });
@@ -455,7 +437,6 @@ describe("plan: an issue only at the second run within 7 days", () => {
       seen: [s800, s900],
       owner: null,
       ownerPath: "apps/dashboard/e2e/a`b.spec.ts",
-      nowMs: NOW,
     });
     expect(b).toContain("Test: ``x` @someone #1 `y``");
     expect(b).toContain("File: ``apps/dashboard/e2e/a`b.spec.ts``");
@@ -509,7 +490,6 @@ describe("untrusted text can't forge a marker or escape a comment", () => {
       seen: [s800, s900],
       owner: null,
       ownerPath: hostile.file as string,
-      nowMs: NOW,
     });
     // The only comment closers are the status line's and the block's own.
     expect(b.match(/-->/g)).toHaveLength(3);
@@ -528,7 +508,6 @@ describe("untrusted text can't forge a marker or escape a comment", () => {
       seen: [s900],
       owner: null,
       ownerPath: "x",
-      nowMs: NOW,
     });
     expect(issueKey(b)).toBe(keyOf(evil.id));
     expect(parseSeen(b)).toEqual([s900]);
@@ -537,11 +516,9 @@ describe("untrusted text can't forge a marker or escape a comment", () => {
     expect(issueKey(`${forgedKey}\n${bodyWith([s900])}`)).toBe(keyOf(f.id));
     // An open issue whose body only quotes a marker is no test's issue.
     expect(
-      plan(
-        { f, sighting: s900, stored: [s800] },
-        [{ number: 4, body: `${forgedKey} x` }],
-        NOW,
-      ).kind,
+      plan({ f, sighting: s900, stored: [s800] }, [
+        { number: 4, body: `${forgedKey} x` },
+      ]).kind,
     ).toBe("create");
   });
 
@@ -562,7 +539,6 @@ describe("untrusted text can't forge a marker or escape a comment", () => {
       seen: [s900],
       owner: null,
       ownerPath: "x",
-      nowMs: NOW,
     });
     expect(isSummaryOf(sum, 900)).toBe(false);
   });
@@ -1978,5 +1954,267 @@ describe("the event path names the workflow by its file", () => {
       ".github/workflows/redline-staging.yml) WORKFLOW=redline-staging ;;",
     );
     expect(text).toContain(".github/workflows/ci.yml) WORKFLOW=CI ;;");
+  });
+});
+
+/**
+ * A fake GitHub that keeps state: store and flaky issues are created, comments
+ * written, bodies edited. Each comment is stamped with the fake clock, and a
+ * comments read honors `since` as GitHub does (by update time). Any run id has
+ * a failed attempt 1 and a passing attempt 2; its failed job completed at
+ * jobAt[run].
+ */
+function liveGh(o: {
+  listed: Record<string, Listed[]>;
+  jobAt: Record<number, number>;
+  log: string;
+}) {
+  const clock = { now: NOW };
+  const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
+  const labels = new Set<string>();
+  const stores: { number: number; comments: (Comment & { at: number })[] }[] =
+    [];
+  const flaky: { number: number; title: string; body: string }[] = [];
+  let next = 50;
+  const val = (args: string[], k: string) => args[args.indexOf(k) + 1] ?? "";
+  const exec: Exec = (_cmd, args) => {
+    const a = args.join(" ");
+    const att = /\/runs\/(\d+)\/attempts\/(\d+)$/.exec(a);
+    if (att)
+      return ok(
+        JSON.stringify({
+          conclusion: att[2] === "1" ? "failure" : "success",
+          head_sha: SHA,
+          head_repository: { full_name: "o/cloud" },
+        }),
+      );
+    const jobs = /\/runs\/(\d+)\/attempts\/1\/jobs/.exec(a);
+    if (jobs)
+      return ok(
+        JSON.stringify({
+          jobs: [
+            {
+              id: 10,
+              name: "overlay (c)",
+              conclusion: "failure",
+              completed_at: new Date(
+                o.jobAt[Number(jobs[1])] ?? NaN,
+              ).toISOString(),
+            },
+          ],
+        }),
+      );
+    const wf = /actions\/workflows\/([\w.-]+)\/runs\?/.exec(a);
+    if (wf) return ok(listPage(o.listed[wf[1] as string] ?? [], args[1] ?? ""));
+    if (/actions\/jobs\/10\/logs/.test(a)) return ok(o.log);
+    if (a.startsWith("label list")) {
+      const name = val(args, "--search");
+      return ok(JSON.stringify(labels.has(name) ? [{ name }] : []));
+    }
+    if (a.startsWith("label create")) {
+      labels.add(args[2] ?? "");
+      return ok("");
+    }
+    if (a.startsWith("issue list") && a.includes(`--label ${STORE_LABEL}`))
+      return ok(
+        JSON.stringify(
+          stores.map((s) => ({
+            number: s.number,
+            state: "OPEN",
+            closedAt: null,
+            body: STORE_BODY,
+          })),
+        ),
+      );
+    if (a.startsWith("issue list"))
+      return ok(
+        JSON.stringify(flaky.map(({ number, body }) => ({ number, body }))),
+      );
+    const count = /issues\/(\d+) --jq \.comments$/.exec(a);
+    if (count)
+      return ok(
+        `${stores.find((s) => s.number === Number(count[1]))?.comments.length ?? 0}\n`,
+      );
+    const cm = /issues\/(\d+)\/comments\?since=([^&]+)&/.exec(a);
+    if (cm) {
+      const since = Date.parse(decodeURIComponent(cm[2] as string));
+      return ok(
+        (stores.find((s) => s.number === Number(cm[1]))?.comments ?? [])
+          .filter((c) => c.at >= since)
+          .map((c) => `${JSON.stringify([c.user, c.body])}\n`)
+          .join(""),
+      );
+    }
+    if (a.includes("/commits?path="))
+      return ok(JSON.stringify([{ author: { login: "writer" } }]));
+    if (a.includes("/assignees/")) return ok("");
+    if (a.startsWith("issue create")) {
+      const n = next++;
+      if (val(args, "--label") === STORE_LABEL) {
+        stores.push({ number: n, comments: [] });
+        return ok(`https://github.com/o/cloud/issues/${n}\n`);
+      }
+      flaky.push({
+        number: n,
+        title: val(args, "--title"),
+        body: val(args, "--body"),
+      });
+      return ok("");
+    }
+    if (a.startsWith("issue comment")) {
+      const n = Number(args[2]);
+      const body = val(args, "--body");
+      const st = stores.find((s) => s.number === n);
+      if (st) st.comments.push({ user: STORE_AUTHOR, body, at: clock.now });
+      else {
+        const i = flaky.find((x) => x.number === n);
+        if (!i) return { code: 1, stdout: "", stderr: "HTTP 404" };
+      }
+      return ok("");
+    }
+    if (a.startsWith("issue edit")) {
+      const i = flaky.find((x) => x.number === Number(args[2]));
+      if (i) i.body = val(args, "--body");
+      return ok("");
+    }
+    return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
+  };
+  /** Everything written, comparable across replays (no clock stamps). */
+  const state = () => ({
+    stores: stores.map((s) => ({
+      number: s.number,
+      comments: s.comments.map(({ user, body }) => ({ user, body })),
+    })),
+    flaky: flaky.map((i) => ({ ...i })),
+  });
+  return { exec, clock, state };
+}
+
+describe("a late replay files like an immediate one", () => {
+  // The same tests failed in CI run 800 (Nov 18) and run 801 six days later
+  // (Nov 24). Then no event for 49 hours. Fake clocks only.
+  const A = Date.parse("2026-11-18T10:00:00Z");
+  const B = A + 6 * DAY;
+  const LATE = B + 49 * HOUR;
+  const tests = parseVitest(CI_LOG);
+  const ci = (id: number, at: number): Listed => ({
+    id,
+    run_attempt: 2,
+    conclusion: "success",
+    created_at: iso(at - HOUR),
+    updated_at: iso(at + 10 * 60 * 1000),
+    name: "CI",
+    event: "push",
+    head_branch: "main",
+    head_sha: SHA,
+    display_title: "a commit",
+  });
+  const make = (bAt = B) =>
+    liveGh({
+      listed: { "ci.yml": [ci(800, A), ci(801, bAt)] },
+      jobAt: { 800: A, 801: bAt },
+      log: CI_LOG,
+    });
+  const runOf = (runId: number): RunInfo => ({
+    repo: "o/cloud",
+    workflow: "CI",
+    runId,
+    attempt: 2,
+    ref: SHA,
+    url: `https://github.com/o/cloud/actions/runs/${runId}`,
+  });
+  const reconcileAt = (g: ReturnType<typeof make>, ms: number) => {
+    g.clock.now = ms;
+    return reconcile({ exec: g.exec, repo: "o/cloud", nowMs: ms });
+  };
+  const trackAt = (g: ReturnType<typeof make>, id: number, ms: number) => {
+    g.clock.now = ms;
+    return track({ exec: g.exec, run: runOf(id), nowMs: ms });
+  };
+
+  /** Both events dropped; the next CI completion comes an hour after run 801. */
+  const immediate = () => {
+    const g = make();
+    return { g, r: reconcileAt(g, B + HOUR) };
+  };
+  /** Both events dropped; the next CI completion comes 49 hours after run 801. */
+  const delayed = () => {
+    const g = make();
+    return { g, r: reconcileAt(g, LATE) };
+  };
+  /** Run 800 tracked by its event; run 801's event dropped; 49 hours quiet. */
+  const halfLate = () => {
+    const g = make();
+    expect(trackAt(g, 800, A + HOUR).done.map((d) => d.action)).toEqual(
+      tests.map(() => "record"),
+    );
+    reconcileAt(g, A + HOUR);
+    return { g, r: reconcileAt(g, LATE) };
+  };
+
+  it("has a few tests to file, each its own issue", () => {
+    expect(tests.length).toBeGreaterThan(1);
+    expect(tests.length).toBeLessThanOrEqual(MAX_ISSUES_PER_RUN);
+  });
+
+  for (const [name, replay] of [
+    ["an immediate replay", immediate],
+    ["a replay 49 hours late", delayed],
+    ["a replay 49 hours late of a run whose sighting is 8 days old", halfLate],
+  ] as const)
+    it(`${name} files the second run, with both run links`, () => {
+      const { g, r } = replay();
+      const last = r.tracked.at(-1);
+      expect(last?.run.runId).toBe(801);
+      expect(last?.done.map((d) => d.action)).toEqual(
+        tests.map(() => "create"),
+      );
+      const issues = g.state().flaky;
+      expect(issues).toHaveLength(tests.length);
+      for (const i of issues) {
+        expect(parseSeen(i.body)).toEqual([
+          { at: iso(A), run: 800, attempt: 1 },
+          { at: iso(B), run: 801, attempt: 1 },
+        ]);
+        expect(i.body).toContain(`Seen in 2 runs; ${TWICE_NOTE}.`);
+      }
+    });
+
+  it("an immediate and a late replay leave the same store and issues", () => {
+    const now = immediate().g;
+    const late = delayed().g;
+    const half = halfLate().g;
+    expect(late.state()).toEqual(now.state());
+    expect(half.state()).toEqual(now.state());
+    // Delivered again, nothing more is written.
+    for (const g of [now, late, half]) {
+      const before = JSON.stringify(g.state());
+      const r = reconcileAt(g, LATE + HOUR);
+      expect(r.tracked).toEqual([]);
+      expect(trackAt(g, 801, LATE + HOUR).done.map((d) => d.action)).toEqual(
+        tests.map(() => "skip"),
+      );
+      expect(JSON.stringify(g.state())).toBe(before);
+    }
+  });
+
+  it("files a pair tracked out of order: the older run's event comes last", () => {
+    const g = make();
+    expect(trackAt(g, 801, B + HOUR).done.map((d) => d.action)).toEqual(
+      tests.map(() => "record"),
+    );
+    expect(trackAt(g, 800, LATE).done.map((d) => d.action)).toEqual(
+      tests.map(() => "create"),
+    );
+  });
+
+  it("still never pairs failures more than 7 days apart", () => {
+    const far = A + 7 * DAY + 1000;
+    const g = make(far);
+    const r = reconcileAt(g, far + HOUR);
+    expect(r.tracked.flatMap((t) => t.done.map((d) => d.action))).toEqual(
+      [...tests, ...tests].map(() => "record"),
+    );
+    expect(g.state().flaky).toEqual([]);
   });
 });

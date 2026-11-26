@@ -24,18 +24,22 @@
 // and is only listed in the step summary.
 //
 // Every sighting is recorded; an issue is opened or bumped only for a test
-// with sightings in two or more different runs within the last 7 days,
-// counting this one. The sightings live in one open issue per repo labelled
+// with sightings in two or more different runs within 7 days of this failure,
+// counting this one. The 7 days are measured between the failures' own times
+// (each failed job's completion), never from when the tracker runs, so a run
+// the reconcile tracks days late files exactly what its event would have.
+// The sightings live in one open issue per repo labelled
 // `flaky-sightings` (the store): each tracker run that finds new sightings
 // adds one comment (more when one would pass COMMENT_MAX characters) with a
 // readable list and, last, the bot's marker block holding the run
 // (`run: <id>/<attempt that passed>`) and one
 // `sighting: <time> <key> <run>/<attempt>` line per test. The
-// store is read with `since` = 7 days ago, so a read is a page or two however
+// store is read with `since` = 7 days before the run's earliest failure (the
+// reconcile reads its marks over its whole range), so a read is a page or two however
 // old the issue gets, and only comments by github-actions[bot] count, so a
 // person's comment can't add a sighting. Past MAX_STORE_COMMENTS comments the
 // store is closed with a note and a new one opened; a closed store is still
-// read for 7 days after it closed. Why this store: it needs no new service
+// read while it closed after that `since`. Why this store: it needs no new service
 // and no secret (the default token has issues: write); it is read back at
 // once, unlike issue search, which lags its index and has its own rate limit;
 // it is one issue, not an issue or a label hit per sighting; and it outlives
@@ -414,13 +418,24 @@ const testMarkers = (f: Failure, seen: Sighting[]): [string, string][] => [
 export const issueKey = (body: string) =>
   kindOf(body) === "test" ? marker(body, "key") : undefined;
 
-const inWindow = (s: Sighting, nowMs: number) =>
-  Date.parse(s.at) >= nowMs - WINDOW_DAYS * DAY_MS;
+/**
+ * Within WINDOW_DAYS of `atMs` (a failure's own time), before or after it.
+ * Never the tracker's clock: a run tracked late, or out of order, is judged
+ * as it would have been on time.
+ */
+const near = (s: Sighting, atMs: number) =>
+  Math.abs(Date.parse(s.at) - atMs) <= WINDOW_DAYS * DAY_MS;
 
-/** Two different runs with this failure within the window, ending now. */
-export function twiceInWindow(s: Sighting[], nowMs: number): boolean {
-  const runs = new Set(s.filter((x) => inWindow(x, nowMs)).map((x) => x.run));
-  return runs.size >= 2;
+/**
+ * Two different runs with this failure within WINDOW_DAYS of each other, by
+ * the failures' own times only, so the answer never depends on when it is
+ * asked.
+ */
+export function twiceInWindow(s: Sighting[]): boolean {
+  const m = mergeSightings(s);
+  return m.some(
+    (x, i) => i > 0 && near(m[i - 1] as Sighting, Date.parse(x.at)),
+  );
 }
 
 /** One sighting per run (its earliest failed attempt), oldest first. */
@@ -435,9 +450,9 @@ export function mergeSightings(...lists: Sighting[][]): Sighting[] {
   );
 }
 
-const statusLine = (s: Sighting[], nowMs: number) => {
+const statusLine = (s: Sighting[]) => {
   const runs = new Set(s.map((x) => x.run)).size;
-  return `<!-- flaky-status -->Seen in ${runs} run${runs === 1 ? "" : "s"}${twiceInWindow(s, nowMs) ? `; ${TWICE_NOTE}` : ""}.<!-- /flaky-status -->`;
+  return `<!-- flaky-status -->Seen in ${runs} run${runs === 1 ? "" : "s"}${twiceInWindow(s) ? `; ${TWICE_NOTE}` : ""}.<!-- /flaky-status -->`;
 };
 
 export type Owner = { login: string; assignable: boolean } | null;
@@ -493,7 +508,6 @@ export function newIssueBody(o: {
   seen: Sighting[];
   owner: Owner;
   ownerPath: string;
-  nowMs: number;
 }): string {
   const { f, run } = o;
   const owner = o.owner
@@ -513,7 +527,7 @@ export function newIssueBody(o: {
     ...sightingLines(run.repo, o.seen),
     `Latest pass: ${runLink(run, run.attempt)} (${runLabel(run)})`,
     "",
-    statusLine(o.seen, o.nowMs),
+    statusLine(o.seen),
     "",
     "This issue only tracks the flake: it changes no retry and blocks nothing. Fix the test, or the race it found, and close the issue. A later flake of the same test is noted here while it is open.",
     "",
@@ -522,14 +536,9 @@ export function newIssueBody(o: {
 }
 
 /** The body with the sighting list and the status line brought up to date. */
-export function bumpedBody(
-  f: Failure,
-  body: string,
-  seen: Sighting[],
-  nowMs: number,
-) {
+export function bumpedBody(f: Failure, body: string, seen: Sighting[]) {
   let b = withMarkers(body, testMarkers(f, seen));
-  const status = statusLine(seen, nowMs);
+  const status = statusLine(seen);
   const STATUS_RE = /<!-- flaky-status -->.*?<!-- \/flaky-status -->/;
   b = STATUS_RE.test(b) ? b.replace(STATUS_RE, () => status) : b;
   return b;
@@ -579,16 +588,13 @@ export function firstSightings(found: Found[]): Found[] {
 
 /**
  * What one test does, given its sightings in the store: only a record while
- * fewer than two different runs within the last 7 days (this one included)
- * saw it; at two or more, a new issue, or a bump of its open one; a skip when
- * that issue already notes this run. The open issue is found by the key in
- * its trailing marker block only.
+ * fewer than two different runs within 7 days of this failure's own time
+ * (this one included) saw it; at two or more, a new issue, or a bump of its
+ * open one; a skip when that issue already notes this run. When the tracker
+ * runs never decides it, so a late replay files the same. The open issue is
+ * found by the key in its trailing marker block only.
  */
-export function plan(
-  x: Found & { stored: Sighting[] },
-  open: Issue[],
-  nowMs: number,
-): Action {
+export function plan(x: Found & { stored: Sighting[] }, open: Issue[]): Action {
   const { f, sighting } = x;
   const key = keyOf(f.id);
   const issue = open.find((i) => issueKey(i.body) === key);
@@ -600,10 +606,11 @@ export function plan(
       issue: issue.number,
       why: `run ${sighting.run} already noted`,
     };
+  const atMs = Date.parse(sighting.at);
   const window = mergeSightings(x.stored, prior, [sighting]).filter((s) =>
-    inWindow(s, nowMs),
+    near(s, atMs),
   );
-  if (!twiceInWindow(window, nowMs))
+  if (new Set(window.map((s) => s.run)).size < 2)
     return { kind: "record", f, why: `seen in 1 run in ${WINDOW_DAYS} days` };
   if (!issue) return { kind: "create", f, seen: window };
   const had = new Set(prior.map((p) => p.run));
@@ -960,8 +967,9 @@ export function openStore(
   exec: Exec,
   repo: string,
   nowMs: number,
+  since = nowMs - WINDOW_DAYS * DAY_MS,
 ): { write: number; read: number[]; notes: string[] } {
-  const { all, read } = storeIssues(exec, repo, nowMs);
+  const { all, read } = storeIssues(exec, repo, nowMs, since);
   const open = all.filter((i) => i.state === "OPEN").pop();
   if (!open) {
     const n = createStore(exec, repo);
@@ -1176,12 +1184,18 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   );
   const done: Done[] = [];
   const tests = firstSightings(found);
+  // The store is read from WINDOW_DAYS before this run's earliest failure,
+  // not before now: a run tracked days late still sees the sightings it
+  // pairs with (plan() judges by the failures' own times).
+  const fromMs =
+    Math.min(o.nowMs, ...tests.map((t) => Date.parse(t.sighting.at))) -
+    WINDOW_DAYS * DAY_MS;
   // Record first, every sighting: one is kept even when an issue write below
   // fails, and a rerun of the tracker finds this run in the store and adds
   // nothing.
-  const store = openStore(exec, run.repo, o.nowMs);
+  const store = openStore(exec, run.repo, o.nowMs, fromMs);
   notes.push(...store.notes);
-  const comments = storeCommentsIn(exec, run.repo, store.read, o.nowMs);
+  const comments = storeCommentsIn(exec, run.repo, store.read, o.nowMs, fromMs);
   const stored = parseStore(comments);
   const marked = storedRuns(comments).has(`${run.runId}/${run.attempt}`);
   const fresh = tests.filter(
@@ -1192,7 +1206,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
   // the open issues holds for the whole run.
   const open = listOpen(exec, run.repo);
   const actions = tests.map((t) =>
-    plan({ ...t, stored: stored.get(keyOf(t.f.id)) ?? [] }, open, o.nowMs),
+    plan({ ...t, stored: stored.get(keyOf(t.f.id)) ?? [] }, open),
   );
   const filing = actions.filter(
     (a): a is Filing => a.kind === "create" || a.kind === "bump",
@@ -1244,7 +1258,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
           "--repo",
           run.repo,
           "--body",
-          bumpedBody(a.f, a.body, a.seen, o.nowMs),
+          bumpedBody(a.f, a.body, a.seen),
         ],
         { write: true, idempotent: true },
       );
@@ -1260,7 +1274,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
           bumpComment({
             run,
             added: a.added,
-            twice: twiceInWindow(a.seen, o.nowMs),
+            twice: twiceInWindow(a.seen),
           }),
         ],
         { write: true },
@@ -1281,7 +1295,6 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       seen: a.seen,
       owner,
       ownerPath: ownerPath(a.f),
-      nowMs: o.nowMs,
     });
     gh(
       exec,
@@ -1570,7 +1583,9 @@ export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
   const { exec, repo, nowMs } = o;
   const notes: string[] = [];
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
-  const runs = listed.filter((r) => eligible(r));
+  // Oldest first (run ids grow with creation), as their events would have
+  // come: a late replay then writes the same store and issues as on time.
+  const runs = listed.filter((r) => eligible(r)).sort((a, b) => a.id - b.id);
   if (!runs.length) return { tracked: [], notes, failed: 0 };
   // Reads only: a store is created only when a run below is tracked. Every
   // listed run's mark was written after the run was created, so reading the
