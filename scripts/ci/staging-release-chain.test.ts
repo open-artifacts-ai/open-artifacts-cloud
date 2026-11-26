@@ -52,11 +52,19 @@ type World = {
   tagSha?: string;
   /** The event hosted-publish run's jobs (run 123). */
   jobs?: Job[];
+  /** The event hosted-release run's jobs (run 122); the default is a passed guard, no hosted-built job (before #469). */
+  releaseJobs?: Job[];
+  /** PUBLIC_PIN's tag at a commit; the default is the newest release's at every commit. */
+  pins?: Record<string, string>;
+  /** PUBLIC_PIN's public commit at a commit; the default is PUB at every commit. */
+  pinShas?: Record<string, string>;
   /** hosted-publish runs, newest first; the default is run 123 alone. */
   publishRuns?: { id: number; event?: string; jobs: Job[] }[];
   deployRuns?: DeployRun[];
   gateRuns?: string[];
 };
+const PUB = "c".repeat(40);
+const GUARD: Job = { name: "hosted-guard", conclusion: "success" };
 const COPIED: Job = {
   name: `publish-staging release ${TAG}`,
   conclusion: "success",
@@ -75,10 +83,19 @@ const world = (o: World = {}) => {
     const publishRuns = o.publishRuns ?? [
       { id: 123, jobs: o.jobs ?? [COPIED] },
     ];
+    const pinRef = /\/contents\/PUBLIC_PIN\?ref=([0-9a-f]{40})$/.exec(path);
+    if (pinRef) {
+      const at = pinRef[1] as string;
+      const tag = o.pins?.[at] ?? o.latest ?? TAG;
+      const pub = o.pinShas?.[at] ?? PUB;
+      return { code: 0, stdout: `tag=${tag}\nsha=${pub}\n`, stderr: "" };
+    }
     if (path.endsWith("/releases/latest"))
       return json({ tag_name: o.latest ?? TAG });
     if (path.includes("/commits/")) return json({ sha: o.tagSha ?? SHA });
     const jobsOf = /\/actions\/runs\/(\d+)\/jobs/.exec(path);
+    if (jobsOf?.[1] === "122")
+      return json({ jobs: o.releaseJobs ?? [GUARD] });
     if (jobsOf) {
       const r = publishRuns.find((p) => String(p.id) === jobsOf[1]);
       if (!r) throw new Error(`no run ${jobsOf[1]}`);
@@ -323,8 +340,94 @@ describe("after hosted-release: the staging deploy starts beside the copy", () =
     skipped(afterRelease({}, { branch: "other" }));
     skipped(afterRelease({}, { event: "schedule" }));
   });
-  it("skips a run whose commit is not the newest release's (no release cut)", () => {
-    skipped(afterRelease({ tagSha: "b".repeat(40) }));
+  it("skips a run that built an older release than the newest", () => {
+    // before #469: PUBLIC_PIN at the head names v0.98.0
+    skipped(afterRelease({ pins: { [SHA]: "v0.98.0" } }));
+    // after #469: its hosted-built job names v0.98.0
+    skipped(
+      afterRelease({
+        releaseJobs: [GUARD, { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" }],
+      }),
+    );
+  });
+  it("skips a run whose guard did not pass (it built nothing)", () => {
+    skipped(
+      afterRelease({ releaseJobs: [{ name: "hosted-guard", conclusion: "skipped" }] }),
+    );
+  });
+  // The v0.246.1 recovery (run 45728492094): a dispatch on main's newer head
+  // rebuilt the existing tag's older commit and succeeded. Its head is not
+  // the tag's commit, yet it built the newest release.
+  const OLD = "b".repeat(40);
+  it("starts for a rebuild of the newest tag's older commit, by its hosted-built job (#469)", () => {
+    const r = world({
+      tagSha: OLD,
+      releaseJobs: [
+        GUARD,
+        { name: `hosted-built ${TAG} ${OLD}`, conclusion: "success" },
+      ],
+      pins: { [SHA]: "v0.98.0" },
+    });
+    const p = plan({
+      exec: r.exec,
+      repo: REPO,
+      workflow: RELEASE_PATH,
+      conclusion: "success",
+      event: "workflow_dispatch",
+      branch: "main",
+      title: "hosted-release",
+      actor: BOT,
+      runId: "122",
+      headSha: SHA,
+    });
+    expect(p).toEqual({ go: true, next: "deploy", tag: TAG });
+    // The marker names the release: PUBLIC_PIN is never read, and the
+    // latest attempt's jobs are.
+    expect(r.calls.some((c) => c.some((a) => a.includes("PUBLIC_PIN")))).toBe(
+      false,
+    );
+    expect(
+      r.calls.some((c) =>
+        c.includes(`repos/${REPO}/actions/runs/122/jobs?filter=latest&per_page=100`),
+      ),
+    ).toBe(true);
+  });
+  it("starts for the same rebuild before #469, from what its guard checked", () => {
+    // PUBLIC_PIN at the head and at the tag's older commit pin the same release
+    expect(
+      afterRelease({ tagSha: OLD }, { event: "workflow_dispatch" }),
+    ).toEqual({ go: true, next: "deploy", tag: TAG });
+  });
+  it("fails closed when the built release doesn't hold now", () => {
+    // the marker's tag has moved to another commit
+    expect(() =>
+      afterRelease({
+        tagSha: OLD,
+        releaseJobs: [GUARD, { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" }],
+      }),
+    ).toThrow(/built v0\.99\.0 at a+, but v0\.99\.0 is at b+/);
+    // two markers
+    expect(() =>
+      afterRelease({
+        releaseJobs: [
+          { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" },
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" },
+        ],
+      }),
+    ).toThrow(/several built releases/);
+    // before #469: the tag's older commit pins another public release
+    expect(() =>
+      afterRelease({ tagSha: OLD, pinShas: { [OLD]: "d".repeat(40) } }),
+    ).toThrow(/does not pin v0\.99\.0/);
+    // a bad run id
+    expect(() => afterRelease({}, { runId: "x" })).toThrow(/run id/);
+  });
+  it("a failed hosted-built job names nothing: the guard's rule decides", () => {
+    expect(
+      afterRelease({
+        releaseJobs: [GUARD, { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "failure" }],
+      }),
+    ).toEqual({ go: true, next: "deploy", tag: TAG });
   });
   it("never twice: a deploy run for the tag in any state skips", () => {
     skipped(afterRelease({ deployRuns: [CHAIN_TITLE] }));

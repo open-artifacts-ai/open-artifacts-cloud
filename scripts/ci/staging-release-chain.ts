@@ -17,9 +17,14 @@
 // Guards, each one's own check:
 //   - the event's conclusion is success and its run is on main;
 //   - after hosted-release: a real run (run name exactly `hosted-release`,
-//     never a dry run), and the newest release's tag is that run's commit
-//     (the tag hosted-publish's staging copy resolves from the same run). It
-//     starts the deploy;
+//     never a dry run) that built the newest release. The release is the one
+//     its `hosted-built <tag> <sha>` job names (cloud #469), and the tag must
+//     still be at that commit. A run without that job (before #469) built
+//     what its hosted-guard checked: the tag PUBLIC_PIN names at the run's
+//     head, at the tag's own commit, which pins the same release. That commit
+//     can be older than the head: a dispatch on main's head rebuilds an
+//     existing tag (the v0.246.1 recovery, run 45728492094). It starts the
+//     deploy;
 //   - after hosted-publish: the run was started by hosted-release (event
 //     workflow_run, never a manual dispatch, which also carries prod and
 //     floor publishes), and its publish-staging job for a release succeeded;
@@ -58,6 +63,10 @@ export const APP_ACTOR = "open-artifacts-release[bot]";
 export const DEPLOY_TITLE_RE =
   /^deploy-hosted-platform staging (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(sc[0-9]{1,20}-[0-9]{1,4})\]$/;
 const PUBLISH_JOB_RE = /^publish-staging release (v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
+/** hosted-release.yml's marker job (cloud #469): the tag and commit the run built. */
+export const BUILT_JOB_RE =
+  /^hosted-built (v\d{1,6}\.\d{1,6}\.\d{1,6}) ([0-9a-f]{40})$/;
+const RUN_ID_RE = /^[1-9][0-9]{0,19}$/;
 
 const TARGET: Record<Next, { file: string; title: (tag: string) => string }> = {
   deploy: {
@@ -233,6 +242,94 @@ export function stagingCopied(o: {
   return false;
 }
 
+type Jobs = { name?: string; conclusion?: string | null }[];
+
+/** A run's jobs, latest attempt only (a re-run's jobs replace the first's). */
+function runJobs(
+  read: { exec: Exec; sleep: Sleep },
+  repo: string,
+  runId: string,
+): Jobs {
+  if (!RUN_ID_RE.test(runId)) throw new Error("bad run id");
+  const body = JSON.parse(
+    ghRead(read, [
+      "api",
+      "-X",
+      "GET",
+      `repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`,
+    ]),
+  ) as { jobs?: Jobs };
+  if (!Array.isArray(body.jobs)) throw new Error("unparsable run jobs");
+  return body.jobs;
+}
+
+/** PUBLIC_PIN at a commit: the public tag and commit it pins. */
+function pinAt(
+  read: { exec: Exec; sleep: Sleep },
+  repo: string,
+  sha: string,
+): { tag: string; sha: string } {
+  const text = ghRead(read, [
+    "api",
+    "-X",
+    "GET",
+    "-H",
+    "Accept: application/vnd.github.raw+json",
+    `repos/${repo}/contents/PUBLIC_PIN?ref=${sha}`,
+  ]);
+  const field = (k: string) =>
+    new RegExp(`^${k}=(.*)$`, "m").exec(text)?.[1]?.trim() ?? "";
+  const pin = { tag: field("tag"), sha: field("sha") };
+  if (!TAG_RE.test(pin.tag) || !SHA_RE.test(pin.sha))
+    throw new Error(`unparsable PUBLIC_PIN at ${sha}`);
+  return pin;
+}
+
+/**
+ * The release a successful real hosted-release run built, or null if it built
+ * none (its guard did not pass). Its hosted-built job names it (cloud #469);
+ * else its hosted-guard's rule: the tag PUBLIC_PIN names at the run's head,
+ * at that tag's own commit, whose PUBLIC_PIN pins the same release. Anything
+ * that doesn't hold throws: the chain fails closed.
+ */
+export function builtRelease(o: {
+  exec: Exec;
+  sleep?: Sleep;
+  repo: string;
+  runId: string;
+  headSha: string;
+}): { tag: string; sha: string } | null {
+  const read = { exec: o.exec, sleep: o.sleep ?? realSleep };
+  const jobs = runJobs(read, o.repo, o.runId).filter(
+    (j) => j.conclusion === "success",
+  );
+  const marks = [
+    ...new Set(
+      jobs.map((j) => j.name ?? "").filter((n) => BUILT_JOB_RE.test(n)),
+    ),
+  ];
+  if (marks.length > 1) throw new Error("the run names several built releases");
+  if (marks[0]) {
+    const [, tag = "", sha = ""] = BUILT_JOB_RE.exec(marks[0]) ?? [];
+    const at = tagCommit(o.exec, o.repo, tag, o.sleep);
+    if (at !== sha)
+      throw new Error(`the run built ${tag} at ${sha}, but ${tag} is at ${at}`);
+    return { tag, sha };
+  }
+  // Before #469: what the guard checked.
+  if (!jobs.some((j) => j.name === "hosted-guard")) return null;
+  const pin = pinAt(read, o.repo, o.headSha);
+  const sha = tagCommit(o.exec, o.repo, pin.tag, o.sleep);
+  if (sha !== o.headSha) {
+    const there = pinAt(read, o.repo, sha);
+    if (there.tag !== pin.tag || there.sha !== pin.sha)
+      throw new Error(
+        `${pin.tag} is at ${sha}, which does not pin ${pin.tag} at ${pin.sha}`,
+      );
+  }
+  return { tag: pin.tag, sha };
+}
+
 export type Plan =
   | { go: true; next: Next; tag: string }
   | { go: false; why: string };
@@ -249,7 +346,7 @@ export function plan(o: {
   title: string;
   actor: string;
   runId: string;
-  /** The event run's commit (workflow_run.head_sha); read after hosted-release only. */
+  /** The event run's commit (workflow_run.head_sha); read after hosted-release only (its guard's PUBLIC_PIN). */
   headSha?: string;
 }): Plan {
   const skip = (why: string): Plan => ({ go: false, why });
@@ -268,15 +365,24 @@ export function plan(o: {
     if (o.event !== "push" && o.event !== "workflow_dispatch")
       return skip(`a hosted-release ${o.event} run does not start the chain`);
     if (!SHA_RE.test(o.headSha ?? "")) throw new Error("bad head sha");
+    // The release the run built, which can be an older commit than its head
+    // (a rebuild of an existing tag): the tag hosted-publish's staging copy
+    // resolves from the same run.
+    const built = builtRelease({
+      ...ctx,
+      runId: o.runId,
+      headSha: o.headSha as string,
+    });
+    if (!built) return skip("the run built no release: no release cut");
     const latest = latestRelease(o.exec, o.repo, o.sleep);
-    if (tagCommit(o.exec, o.repo, latest, o.sleep) !== o.headSha)
-      return skip(`the run's commit is not ${latest}'s: no release cut`);
+    if (built.tag !== latest)
+      return skip(`the run built ${built.tag}, not the newest release ${latest}`);
     next = "deploy";
     tag = latest;
   } else if (file === WORKFLOW_DIR + "hosted-publish.yml") {
     if (o.event !== "workflow_run")
       return skip("a manual publish does not start the chain");
-    if (!/^[1-9][0-9]{0,19}$/.test(o.runId)) throw new Error("bad run id");
+    if (!RUN_ID_RE.test(o.runId)) throw new Error("bad run id");
     const jobs = JSON.parse(
       ghRead({ exec: o.exec, sleep: o.sleep ?? realSleep }, [
         "api",

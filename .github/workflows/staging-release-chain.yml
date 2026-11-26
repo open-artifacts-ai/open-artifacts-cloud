@@ -15,7 +15,9 @@
 # and the head branch is main). scripts/ci/staging-release-chain.ts decides,
 # from the event's own fields passed through env: (never into a script),
 # whether to act: success only; a real hosted-release run (never a dry run)
-# whose commit is the newest release's tag; a publish started by
+# that built the newest release (named by its hosted-built job, cloud #469,
+# else by what its hosted-guard checked; a rebuild of an existing tag's older
+# commit counts); a publish started by
 # hosted-release (never a manual or prod publish); a deploy this chain
 # dispatched (its `sc` chain id in the run name, so a manual, verify_only,
 # partial-target or prod deploy never starts the gate); the tag is the newest
