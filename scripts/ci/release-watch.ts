@@ -859,9 +859,11 @@ export function timeline(o: {
 }
 
 /**
- * Pure: a release that never reached prod once a newer one is pinned never
- * ships on its own (the chain moves to the newest tag). It closes when that
- * newer release is done, and its e2e counts to then. A release whose prod
+ * Pure: a release that never had its own prod deploy, because a newer one
+ * was pinned first, never ships on its own: it is "superseded by <newer>".
+ * It gets no prod or fleet time and no merge-to-every-install total (the
+ * newer release's deploy is not its own), so it never counts toward the
+ * target. It closes when that newer release is done. A release whose prod
  * deploy succeeded is never superseded, however its runs were matched.
  */
 export function supersede(tls: Timeline[]): Timeline[] {
@@ -882,13 +884,34 @@ export function supersede(tls: Timeline[]): Timeline[] {
       );
     if (!newer) return t;
     const closedAt = byTag.slice(i + 1).find((n) => n.doneAt)?.doneAt;
+    const { e2e: _, ...rest } = t;
     return {
-      ...t,
+      ...rest,
       supersededBy: newer.tag,
       closedAt,
-      e2e: closedAt ? mins(t.mergedAt ?? t.publishedAt, closedAt) : undefined,
+      e2eTo: supersededTo(newer.tag),
     };
   });
+}
+
+/** What a superseded release's total runs to: none, it says by which release. */
+export const supersededTo = (tag: string) => `superseded by ${tag}`;
+/** The stages a superseded release never had of its own. */
+const NOT_ITS_OWN = ["prod_deploy", "fleet"];
+
+/**
+ * Pure: a saved history entry as the rules now read it. A superseded one
+ * (from a backfill or an earlier run that gave it the newer release's prod
+ * deploy as its own total) gets no total and no prod or fleet time, and
+ * says "superseded by <newer>".
+ */
+export function settleSuperseded(h: HistoryEntry): HistoryEntry {
+  if (!h.supersededBy) return h;
+  const { e2e: _, ...rest } = h;
+  const stages = Object.fromEntries(
+    Object.entries(h.stages).filter(([k]) => !NOT_ITS_OWN.includes(k)),
+  );
+  return { ...rest, e2eTo: supersededTo(h.supersededBy), stages };
 }
 
 /** A timeline is finished (goes into history) when done or closed by a newer release. */
@@ -897,7 +920,11 @@ export function historyEntry(t: Timeline): HistoryEntry | undefined {
   if (!doneAt) return undefined;
   const stages: Record<string, number> = {};
   for (const s of t.stages)
-    if (s.state === "done" && s.minutes !== undefined)
+    if (
+      s.state === "done" &&
+      s.minutes !== undefined &&
+      !(t.supersededBy && NOT_ITS_OWN.includes(s.name))
+    )
       stages[s.name] = s.minutes;
   return {
     tag: t.tag,
@@ -906,7 +933,7 @@ export function historyEntry(t: Timeline): HistoryEntry | undefined {
     publishedAt: t.publishedAt,
     doneAt,
     ...(t.supersededBy ? { supersededBy: t.supersededBy } : {}),
-    e2e: t.e2e,
+    ...(t.e2e !== undefined ? { e2e: t.e2e } : {}),
     ...(t.e2eTo ? { e2eTo: t.e2eTo } : {}),
     stages,
   };
@@ -952,7 +979,7 @@ export function stats(history: HistoryEntry[], config: Config) {
       ...(s.usual ? { usual: s.usual } : {}),
     };
   }
-  // A superseded release's e2e waited on a newer one: it is real wait, kept.
+  // A superseded release has no total of its own: never counted.
   const e = recent
     .map((x) => x.e2e)
     .filter((x): x is number => typeof x === "number");
@@ -963,6 +990,9 @@ export function stats(history: HistoryEntry[], config: Config) {
       p90: pct(e, 90),
       n: e.length,
       target: config.e2eTarget,
+      superseded: recent
+        .filter((x) => x.supersededBy)
+        .map((x) => ({ tag: x.tag, by: x.supersededBy as string })),
       last20: recent
         .filter((x) => typeof x.e2e === "number")
         .slice(-20)
@@ -1339,8 +1369,9 @@ export function compute(o: {
   /** Only releases published since then are commented on (a backfill's old ones are not). */
   notifySince?: string;
 }) {
-  // A recorded total to the prod deploy takes a later fleet finish.
-  const prior = o.history.map((h) => upgradeFleet(h, o.runs));
+  // A recorded total to the prod deploy takes a later fleet finish, and a
+  // superseded release's saved total (a newer release's deploy) is dropped.
+  const prior = o.history.map((h) => upgradeFleet(settleSuperseded(h), o.runs));
   const known = new Map(prior.map((h) => [h.tag, h]));
   const all = supersede(
     o.releases.map((release) => {
@@ -1469,6 +1500,11 @@ export function summary(c: ReturnType<typeof compute>["current"]): string {
     }
     out.push("");
   }
+  if (c.e2e.superseded.length > 0)
+    out.push(
+      `Superseded, with no prod deploy or total of their own: ${c.e2e.superseded.map((x) => `${x.tag} by ${x.by}`).join(", ")}.`,
+      "",
+    );
   for (const u of c.unmeasured)
     out.push(`Measured only where recorded: ${u.name}, ${u.todo}.`);
   if (c.overruns.length > 0)
