@@ -4,8 +4,8 @@
 # is seen still running past its limit, max(2 x usual, usual + 5 min),
 # finishes past it, or fails. Merge to
 # every install is reported against a 20 min target, never alerted on: to the
-# prod deploy's "Fleet done" step (cloud #474) where it ran, else to the prod
-# deploy, labelled "to prod deploy (fleet not yet measured)". Each stage is
+# scheduler's fleet_done time once a later prod deploy records it, else to
+# the prod deploy, labelled "to prod deploy (fleet not yet measured)". Each stage is
 # timed from its own start, so stages can overlap (cloud #471). It gates
 # nothing: it runs beside the chain, on events only, so it is never a check
 # on any PR and must never be made required.
@@ -18,14 +18,13 @@
 #   7 days; a lost one only empties the p50/p90 until the next backfill.
 # - Backfill: dispatch with backfill_since (YYYY-MM-DD, such as 2026-11-20)
 #   reads every release since that day and starts the history afresh.
-# - Fleet: the prod deploy's "Fleet done" step (cloud #474) runs only once
-#   every install is upgraded; the earliest one that succeeded across every
-#   prod deploy run of the tag, read from the runs' jobs with this token, is
-#   the finish, and a release in history to the prod deploy takes a later
-#   one. A later prod deploy's "Fleet done of earlier releases (<tag> at
-#   <time>, ...)" step counts too (a fleet that finished after its own
-#   deploy's wait); the earliest per tag wins. Nothing here reads fleet state through admin
-#   tools.
+# - Fleet: it starts at the prod deploy's "Wake the fleet" step. Since cloud
+#   #495 the finish is the scheduler's own fleet_done time, recorded by a
+#   later prod deploy's "Fleet done of earlier releases (<tag> at <time>,
+#   ...)" step and read from the runs' jobs with this token; the earliest per
+#   tag wins, history included. Runs from before #495 also have a "Fleet
+#   done" step, an upper bound until a record corrects it. Nothing here
+#   reads fleet state through admin tools.
 # - While a release is not finished, the jobs of its hosted-release,
 #   hosted-publish and prod deploy runs are read too: a recovery run on a
 #   later main commit names the release in a job ("publish-staging release
