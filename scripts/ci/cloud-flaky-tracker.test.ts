@@ -42,6 +42,7 @@ import {
   pendingRuns,
   pendingTries,
   plan,
+  progressOf,
   QUIET_DAYS,
   RECONCILE_CALLS,
   RECONCILE_LOGS,
@@ -3022,5 +3023,124 @@ describe("a run with more job logs than one reconcile may read", () => {
     g.clock.now = NOW + 2 * HOUR;
     reconcile({ exec, repo: "o/cloud", nowMs: NOW + 2 * HOUR });
     expect(logs).toBe(0);
+  });
+});
+
+describe("a run whose logs fail part way, or whose jobs span pages", () => {
+  const logOf = (n: number) =>
+    [
+      "2026-11-19T20:59:55.6142298Z ##[group]test tests/redline",
+      vfail("test/big.test.ts", `case ${n}`),
+    ].join("\n");
+  const job = (id: number, conclusion = "failure") => ({
+    id,
+    name: `overlay (${id})`,
+    conclusion,
+    completed_at: new Date(NOW - HOUR).toISOString(),
+  });
+  /** The jobs API as GitHub pages it: per_page a page, with the full total_count. */
+  const page = (jobs: ReturnType<typeof job>[], a: string) => {
+    const q = new URLSearchParams(a.slice(a.indexOf("?") + 1).split(" ")[0]);
+    const per = Number(q.get("per_page") ?? 30);
+    const p = Number(q.get("page") ?? 1);
+    return JSON.stringify({
+      total_count: jobs.length,
+      jobs: jobs.slice((p - 1) * per, p * per),
+    });
+  };
+
+  it("a 503 on the 25th log keeps the 24 before it, lets the next run go, and resumes at the 25th", () => {
+    const sleep = sleeper.sleep;
+    sleeper.sleep = () => {};
+    onTestFinished(() => {
+      sleeper.sleep = sleep;
+    });
+    // CI run 900 has 30 failed jobs; the 25th (job 124) answers 503 for now.
+    // Run 901, behind it, is healthy.
+    const g = liveGh({
+      listed: { "ci.yml": [ci1(900, NOW - 2 * HOUR), ci1(901)] },
+      jobAt: { 900: NOW - 2 * HOUR, 901: NOW - HOUR },
+      log: CI_LOG,
+    });
+    const jobs = Array.from({ length: 30 }, (_, i) => job(100 + i));
+    let broken = true;
+    const reads = new Map<number, number>();
+    let logs = 0;
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      if (/\/runs\/900\/attempts\/1\/jobs\?/.test(a))
+        return { code: 0, stdout: page(jobs, a), stderr: "" };
+      const m = /\/actions\/jobs\/(\d+)\/logs/.exec(a);
+      if (m) logs++;
+      if (m && Number(m[1]) >= 100) {
+        const id = Number(m[1]);
+        reads.set(id, (reads.get(id) ?? 0) + 1);
+        if (broken && id === 124)
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "HTTP 503: Service Unavailable",
+          };
+        return { code: 0, stdout: logOf(id - 100), stderr: "" };
+      }
+      return g.exec(cmd, args);
+    };
+    const comments = () => g.state().stores.flatMap((st) => st.comments);
+    const completion = (e: number) => {
+      g.clock.now = NOW + e * HOUR;
+      logs = 0;
+      const r = reconcile({ exec, repo: "o/cloud", nowMs: g.clock.now });
+      expect(logs).toBeLessThanOrEqual(RECONCILE_LOGS);
+      return r;
+    };
+    completion(0);
+    // The 24 logs before the 503 are kept.
+    expect(progressOf(comments()).get("900/2")?.jobs.sort()).toEqual(
+      jobs.slice(0, 24).map((j) => j.id),
+    );
+    // The next completion retries the 25th, then the healthy run gets its turn.
+    completion(1);
+    expect(storedRuns(comments()).has("901/2")).toBe(true);
+    // Once the log answers, run 900 finishes: each log read once, but the 25th.
+    broken = false;
+    for (let e = 2; e < 6 && !storedRuns(comments()).has("900/2"); e++)
+      completion(e);
+    expect(storedRuns(comments()).has("900/2")).toBe(true);
+    for (const j of jobs.slice(0, 24)) expect(reads.get(j.id)).toBe(1);
+    const big = [...parseStore(comments()).values()]
+      .flat()
+      .filter((x) => x.run === 900);
+    expect(big).toHaveLength(30);
+  });
+
+  it("reads a failed job on the second page of the jobs listing before it marks the run", () => {
+    // 101 jobs: the first 100 passed, the 101st failed.
+    const g = liveGh({
+      listed: { "ci.yml": [ci1(900)] },
+      jobAt: { 900: NOW - HOUR },
+      log: CI_LOG,
+    });
+    const jobs = [
+      ...Array.from({ length: 100 }, (_, i) => job(100 + i, "success")),
+      job(999),
+    ];
+    const pages: string[] = [];
+    const exec: Exec = (cmd, args) => {
+      const a = args.join(" ");
+      if (/\/runs\/900\/attempts\/1\/jobs\?/.test(a)) {
+        pages.push(/[?&]page=(\d+)/.exec(a)?.[1] ?? "");
+        return { code: 0, stdout: page(jobs, a), stderr: "" };
+      }
+      if (/\/actions\/jobs\/999\/logs/.test(a))
+        return { code: 0, stdout: logOf(1), stderr: "" };
+      return g.exec(cmd, args);
+    };
+    g.clock.now = NOW;
+    const r = reconcile({ exec, repo: "o/cloud", nowMs: NOW });
+    expect(pages).toEqual(["1", "2"]);
+    expect(r.tracked.map((t) => t.run.runId)).toEqual([900]);
+    const comments = g.state().stores.flatMap((st) => st.comments);
+    expect(parseStore(comments).size).toBe(1);
+    expect([...storedRuns(comments)]).toEqual(["900/2"]);
   });
 });

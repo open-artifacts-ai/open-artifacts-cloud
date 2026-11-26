@@ -681,31 +681,36 @@ export function collect(
   const found: Found[] = [...(resume?.found ?? [])];
   const read = new Set(resume?.jobs ?? []);
   const notes: string[] = [];
+  const progress = (): Progress => ({ jobs: [...read], found: [...found] });
   // A fork's run (a PR from another repo) counts too. Its logs are only read
   // as text: parseJob() takes test names from them, and inert() makes those
   // safe before they are written anywhere. Nothing from the run is executed.
-  for (let a = 1; a < run.attempt; a++) {
+  try {
+    for (let a = 1; a < run.attempt; a++)
+      if (readAttempt(a)) return { found, notes, partial: progress() };
+  } catch (e) {
+    // A failure part way (a 503 on one log, say) keeps what was read before
+    // it, so a retry resumes at the read that failed.
+    throw new PartialError((e as Error).message, progress());
+  }
+  return { found, notes };
+
+  /** Reads one earlier attempt; true when canRead stopped it. */
+  function readAttempt(a: number): boolean {
     const att = JSON.parse(
       gh(exec, ["api", `${base}/attempts/${a}`]),
     ) as Attempt;
-    if (!FAILED.has(att.conclusion ?? "")) continue;
+    if (!FAILED.has(att.conclusion ?? "")) return false;
     if (att.head_sha !== last.head_sha) {
       notes.push(`attempt ${a}: another commit (${att.head_sha}), skipped`);
-      continue;
+      return false;
     }
-    const jobs = (
-      JSON.parse(
-        gh(exec, ["api", `${base}/attempts/${a}/jobs?per_page=100`]),
-      ) as { jobs: Job[] }
-    ).jobs.filter((j) => FAILED.has(j.conclusion ?? ""));
+    const jobs = attemptJobs(exec, `${base}/attempts/${a}/jobs`).filter((j) =>
+      FAILED.has(j.conclusion ?? ""),
+    );
     for (const j of jobs) {
       if (read.has(j.id)) continue;
-      if (!canRead())
-        return {
-          found,
-          notes,
-          partial: { jobs: [...read], found: [...found] },
-        };
+      if (!canRead()) return true;
       const fs = parseJob(run.workflow, j.name, jobLog(exec, run.repo, j.id));
       read.add(j.id);
       if (!fs.length)
@@ -717,8 +722,40 @@ export function collect(
       for (const f of fs)
         found.push({ f, sighting: { at, run: run.runId, attempt: a } });
     }
+    return false;
   }
-  return { found, notes };
+}
+
+/**
+ * A collect() that failed part way: the error, and what it read before it,
+ * which the reconcile saves so a retry resumes at the read that failed.
+ */
+export class PartialError extends Error {
+  readonly progress: Progress;
+  constructor(message: string, progress: Progress) {
+    super(message);
+    this.progress = progress;
+  }
+}
+
+/**
+ * Every job of an attempt, through every page of the listing (100 a page): a
+ * run is handled only once every page is read. Each page is a call, so it
+ * counts against the reconcile's budget.
+ */
+function attemptJobs(exec: Exec, path: string): Job[] {
+  const out: Job[] = [];
+  for (let page = 1; ; page++) {
+    const r = JSON.parse(
+      gh(exec, ["api", `${path}?per_page=${PER_PAGE}&page=${page}`]),
+    ) as { total_count?: number; jobs: Job[] };
+    out.push(...r.jobs);
+    if (
+      r.jobs.length < PER_PAGE ||
+      (r.total_count !== undefined && out.length >= r.total_count)
+    )
+      return out;
+  }
 }
 
 function lastAuthor(
@@ -1834,6 +1871,15 @@ export function reconcile(o: {
     } catch (e) {
       // One run's failure never stops the others; the job still fails.
       const why = (e as Error).message;
+      // What it read before it failed is kept (outside the budget), so the
+      // retry resumes at the read that failed.
+      if (
+        e instanceof PartialError &&
+        e.progress.jobs.length > (progress.get(k)?.jobs.length ?? 0)
+      ) {
+        post(progressComment(k, e.progress));
+        progress.set(k, e.progress);
+      }
       // Stopped by the log budget: not a failure, it just waits.
       if (outOfLogs) {
         left++;
