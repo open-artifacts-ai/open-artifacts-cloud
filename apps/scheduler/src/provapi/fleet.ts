@@ -59,6 +59,7 @@ import {
   type SmokeResult,
   smoke,
 } from "./smoke.js";
+import { claimState, unclaimState } from "./state.js";
 
 /**
  * Open fleet upgrades at a time, the insert's own guard included. After the
@@ -79,11 +80,32 @@ export const FLEET_FAIL_GAP_MS = 60_000;
 /** While the canary's upgrade is open, the tick re-checks it this often. */
 export const FLEET_FAST_POLL_MS = 3_000;
 /**
- * fleetFast's deadline from the duty's start: the fleet duty's 25 s budget
- * less a 2 s margin. A pass starts only if a slow probe and the smoke's
- * cleanup still fit; the smoke gets only the time left (smokeCanary).
+ * fleetFast's deadline from the run's start: FLEET_TICK_TIMEOUT_MS less a
+ * 5 s margin, so one run covers a canary upgrade (about 60-75 s spans at
+ * most two runs), its probe, the smoke and queueing the rest. A pass starts
+ * only if a slow probe and the smoke's cleanup still fit; the smoke gets
+ * only the time left (smokeCanary).
  */
-export const FLEET_FAST_DEADLINE_MS = 23_000;
+export const FLEET_FAST_DEADLINE_MS = 50_000;
+/**
+ * The fleet's own cron (index.ts FLEET_CRON) runs every minute, with
+ * nothing ahead of it (cloud #264); one run is bounded by this.
+ */
+export const FLEET_TICK_TIMEOUT_MS = 55_000;
+/**
+ * The fleet run's lease (platform_state): one run at a time, so a run late
+ * past its minute never acts beside the next one. A run that never gives it
+ * back (killed mid-run) holds it this long: the next minute's run waits, the
+ * one after takes it.
+ */
+export const FLEET_LEASE_KEY = "scheduler_fleet_lease";
+export const FLEET_LEASE_MS = 90_000;
+/**
+ * An unverified target is re-checked every FLEET_FAST_POLL_MS this long
+ * after the fleet first saw it: the deploy marks it seconds after the
+ * scheduler's own deploy, so that mark never costs a run.
+ */
+export const FLEET_VERIFY_POLL_MS = 2 * 60_000;
 /** The smoke's cleanup runs past its budget: two calls (unshare, delete). */
 export const FLEET_SMOKE_CLEANUP_MS = 2 * SMOKE_CALL_MS;
 /**
@@ -507,15 +529,44 @@ export type FleetEnv = ProvapiEnv & { AUTH_BROKER_ORIGIN?: string };
 
 /**
  * What one pass left: "canary" while the canary's upgrade to the target is
- * open or done but not yet settled and smoked (worth a fast re-check), else
- * "idle".
+ * open or done but not yet settled and smoked, "verify" while a target the
+ * fleet first saw under FLEET_VERIFY_POLL_MS ago is not yet marked verified
+ * (both worth a fast re-check), else "idle".
  */
-export type FleetPass = "canary" | "idle";
+export type FleetPass = "canary" | "verify" | "idle";
 
 /**
- * The fleet duty: one pass, then, while the canary is mid-upgrade, a new pass
- * every FLEET_FAST_POLL_MS until it settles and the rest are queued, or the
- * tick's FLEET_FAST_BUDGET_MS is spent (the next tick carries on).
+ * The fleet cron's run: fleetFast under the lease, so two runs never act at
+ * once (a late run, or a cron delivered twice). Without the lease the run
+ * does nothing and logs `provapi fleet overlap`. The lease is given back
+ * only once fleetFast has ended, even past the run's timeout.
+ */
+export async function fleetTick(
+  env: FleetEnv,
+  now: number,
+  o: FleetOptions = {},
+): Promise<void> {
+  const db = env.PLATFORM_DB;
+  if (!(await d1(claimState(db, FLEET_LEASE_KEY, now, now - FLEET_LEASE_MS)))) {
+    console.log("provapi fleet overlap");
+    return;
+  }
+  try {
+    await fleetFast(env, now, o);
+  } finally {
+    // Only while it is still this run's: an expired lease taken by a later
+    // run stays that run's.
+    await unclaimState(db, FLEET_LEASE_KEY, now, null).catch(() =>
+      console.error("provapi fleet lease_release_failed"),
+    );
+  }
+}
+
+/**
+ * The fleet duty: one pass, then, while the canary is mid-upgrade or the
+ * target's verified mark is due, a new pass every FLEET_FAST_POLL_MS until
+ * the canary settles and the rest are queued, or FLEET_FAST_DEADLINE_MS is
+ * spent (the next minute's run carries on).
  */
 export async function fleetFast(
   env: FleetEnv,
@@ -533,8 +584,7 @@ export async function fleetFast(
   const worst = FLEET_PROBE_TIMEOUT_MS + FLEET_SMOKE_CLEANUP_MS;
   for (;;) {
     const r = await fleetDue(env, now + (clock() - t0), pass);
-    if (r !== "canary" || clock() + FLEET_FAST_POLL_MS + worst > deadline)
-      return;
+    if (r === "idle" || clock() + FLEET_FAST_POLL_MS + worst > deadline) return;
     await sleep(FLEET_FAST_POLL_MS);
   }
 }
@@ -582,7 +632,10 @@ export async function fleetDue(
   }
   if (!(await verified(db, now, st, target))) {
     console.log("provapi fleet holding: platform not verified");
-    return "idle";
+    const seen = st.rows.get(`${FLEET_UNVERIFIED_PREFIX}${target}`)?.value;
+    return seen !== undefined && now - seen < FLEET_VERIFY_POLL_MS
+      ? "verify"
+      : "idle";
   }
   await trackBehind(db, now, st, target);
   await trackCanary(db, now, st, target, canaryId, mode);

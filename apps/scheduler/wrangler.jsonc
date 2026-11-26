@@ -2,7 +2,9 @@
 // get no cron triggers, so this Worker's nightly cron calls scheduled() on
 // every active install's script (platform D1 `installs`), 6 at a time, 25 s
 // each. Its second cron, every 2 minutes (H-DV), calls a deleting install's
-// directory-disconnect job so delete can revoke the Google grant first.
+// directory-disconnect job so delete can revoke the Google grant first. Its
+// third, every minute, runs only the fleet rollout (provapi/fleet.ts), so a
+// release reaches the installs without waiting behind the */2 duties.
 //
 // Deploy with --env staging or --env prod only (docs/ops/hosted.md): the top
 // level has no name and no main, so a deploy without --env is refused, even
@@ -107,7 +109,7 @@
       // The fleet target: this version's tag (#955, provapi/fleet.ts).
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "observability": { "enabled": true },
-      "triggers": { "crons": ["17 3 * * *", "*/2 * * * *"] },
+      "triggers": { "crons": ["17 3 * * *", "*/2 * * * *", "* * * * *"] },
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-staging" }
       ],
@@ -196,7 +198,7 @@
       // The fleet target: this version's tag (#955, provapi/fleet.ts).
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "observability": { "enabled": true },
-      "triggers": { "crons": ["17 3 * * *", "*/2 * * * *"] },
+      "triggers": { "crons": ["17 3 * * *", "*/2 * * * *", "* * * * *"] },
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-prod" }
       ],

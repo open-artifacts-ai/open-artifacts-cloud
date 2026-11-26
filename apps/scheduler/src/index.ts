@@ -21,7 +21,12 @@ import {
 } from "@oa/provision/versions";
 import { billingHealth } from "./billing-health.js";
 import { alertFor, stepAlert } from "./provapi/alerts.js";
-import { type ProvapiEnv, provapiTick, writeTick } from "./provapi/index.js";
+import {
+  fleetCronTick,
+  type ProvapiEnv,
+  provapiTick,
+  writeTick,
+} from "./provapi/index.js";
 import { emailQuota, type QuotaEnv, type QuotaOutcome } from "./quota.js";
 
 // And to the tier store (see @oa/broker-core/billing-gate).
@@ -553,6 +558,14 @@ export async function nightly(
 
 /** Every 2 minutes: move deleting installs' directory_revoke on from pending. */
 export const REVOKE_CRON = "*/2 * * * *";
+/**
+ * Every minute: the fleet rollout only (provapi/fleet.ts fleetTick), with no
+ * other duty ahead of it, so a release reaches the installs without waiting
+ * behind the revoke tick, the directory sync and the other duties (cloud
+ * #264). On even minutes it runs beside REVOKE_CRON's tick, in its own
+ * invocation; the fleet's lease keeps it to one run at a time.
+ */
+export const FLEET_CRON = "* * * * *";
 /** The install's job (Backend #616): revokes its Google directory grant. */
 export const REVOKE_JOB = "oa:directory-disconnect";
 export const REVOKE_MAX_ATTEMPTS = 5;
@@ -796,6 +809,11 @@ export async function purgeOwnerEmails(
 export default {
   async scheduled(event, env, ctx) {
     const gates = ctx.exports as unknown as GateExports;
+    if (event.cron === FLEET_CRON) {
+      // fleetCronTick bounds and isolates the run and never throws.
+      await fleetCronTick(env, event.scheduledTime);
+      return;
+    }
     if (event.cron === REVOKE_CRON) {
       // The monitor's dead-man (design v7 5.8), first and in its own try:
       // nothing after it can stop the write.

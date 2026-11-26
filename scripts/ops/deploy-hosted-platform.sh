@@ -1056,7 +1056,7 @@ case "$target" in
     expect_private "$S" '[.result.bindings[] | select(.name == "ALERT_EMAIL") | .destination_address // ""] | join(",")' \
       "$ALERT_TO" "ALERT_EMAIL destination"
     crons="$(cf_get /workers/scripts/oa-$P-scheduler/schedules | must "read oa-$P-scheduler schedules" | jq -r '[.result.schedules[].cron] | sort | join(",")')"
-    [ "$crons" = "*/2 * * * *,17 3 * * *" ] || { echo "oa-$P-scheduler schedules are '$crons'" >&2; exit 1; }
+    [ "$crons" = "* * * * *,*/2 * * * *,17 3 * * *" ] || { echo "oa-$P-scheduler schedules are '$crons'" >&2; exit 1; }
     # Only the secrets it may hold: the email-quota token and the smoke's two.
     # Read first: a failed listing fails the run, never reads as "none".
     names="$(secret_names oa-$P-scheduler)" || exit 1

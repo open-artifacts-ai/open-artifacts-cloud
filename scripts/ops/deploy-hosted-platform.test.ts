@@ -597,7 +597,11 @@ const setup = (
       JSON.stringify({
         success: true,
         result: {
-          schedules: [{ cron: "17 3 * * *" }, { cron: "*/2 * * * *" }],
+          schedules: [
+            { cron: "17 3 * * *" },
+            { cron: "*/2 * * * *" },
+            { cron: "* * * * *" },
+          ],
         },
       }),
     );
@@ -1825,7 +1829,7 @@ describe("deploy-hosted-platform.sh", () => {
       "PROVISIONER: got 'oa-p-provisioner', want 'oa-s-provisioner'",
     );
   });
-  it("the scheduler checks its two schedules exactly", () => {
+  it("the scheduler checks its three schedules exactly", () => {
     const s = setup({ exists: SCHED_DEPS("p") });
     writeFileSync(
       join(s.state, "oa-p-scheduler.schedules.json"),
@@ -1837,6 +1841,19 @@ describe("deploy-hosted-platform.sh", () => {
     const r = s.run("scheduler");
     expect(r.code).toBe(1);
     expect(r.err).toContain("schedules are '17 3 * * *'");
+    // The two crons from before the fleet's own minute are not enough.
+    writeFileSync(
+      join(s.state, "oa-p-scheduler.schedules.json"),
+      JSON.stringify({
+        success: true,
+        result: {
+          schedules: [{ cron: "17 3 * * *" }, { cron: "*/2 * * * *" }],
+        },
+      }),
+    );
+    const two = s.run("scheduler");
+    expect(two.code).toBe(1);
+    expect(two.err).toContain("schedules are '*/2 * * * *,17 3 * * *'");
   });
   it("missing inputs, a bad account id or an unknown target refuse before any call", () => {
     for (const [t, env] of [

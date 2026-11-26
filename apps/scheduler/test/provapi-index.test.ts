@@ -20,11 +20,17 @@ import {
 import scheduler, {
   CRON,
   type Env,
+  FLEET_CRON,
   REVOKE_CRON,
   REVOKE_JOB,
   SYNC_JOB,
 } from "../src/index.js";
-import { DUTY_TIMEOUT_MS, provapiTick } from "../src/provapi/index.js";
+import { FLEET_LEASE_KEY } from "../src/provapi/fleet.js";
+import {
+  DUTY_TIMEOUT_MS,
+  fleetCronTick,
+  provapiTick,
+} from "../src/provapi/index.js";
 import { getState } from "../src/provapi/state.js";
 import {
   captureLogs,
@@ -207,6 +213,68 @@ describe("scheduled() and the provapi duties", () => {
     expect(lines.some((l) => l.startsWith("provapi"))).toBe(false);
   });
 
+  it("*/2 runs no fleet duty: the fleet has its own cron", async () => {
+    const f = fakes();
+    const lines = captureLogs(vi.spyOn);
+    const out = await provapiTick(f.env, NOW);
+    expect(out).not.toHaveProperty("fleet");
+    await scheduler.scheduled(
+      controller(REVOKE_CRON),
+      f.env,
+      createExecutionContext(),
+    );
+    expect(lines.some((l) => l.startsWith("provapi fleet"))).toBe(false);
+  });
+
+  it("the fleet cron runs the fleet only: no tick, no revoke, no sync, no duty", async () => {
+    expect(FLEET_CRON).toBe("* * * * *");
+    const { del } = await seedRevokeAndSync();
+    const f = fakes();
+    await job(installId(), { created_at: NOW - JOB_START_GRACE_MS });
+    const lines = captureLogs(vi.spyOn);
+    await scheduler.scheduled(
+      controller(FLEET_CRON),
+      f.env,
+      createExecutionContext(),
+    );
+    expect(await getState(db, SCHEDULER_TICK_KEY)).toBeNull();
+    expect(f.calls).toEqual([]);
+    expect(f.provision.created).toEqual([]);
+    expect(f.sent).toEqual([]);
+    expect(
+      (
+        await rows("SELECT directory_revoke FROM installs WHERE id = ?1", del)
+      )[0],
+    ).toEqual({ directory_revoke: "pending" });
+    // The fleet ran (no target in this env) and gave its lease back.
+    expect(lines).toEqual(["provapi fleet no_target"]);
+    expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
+  });
+
+  it("fleetCronTick: a hanging fleet run times out with a fixed line, never a throw", async () => {
+    const f = fakes();
+    const lines = captureLogs(vi.spyOn);
+    const out = await fleetCronTick(f.env, NOW, {
+      timeoutMs: 20,
+      fleet: { sleep: () => new Promise<never>(() => {}) },
+    });
+    // No target: one pass and no sleep, so it ends "ok".
+    expect(out).toEqual({ fleet: "ok" });
+    const hang = {
+      ...f.env,
+      PLATFORM_DB: {
+        prepare: () => ({
+          bind: () => ({ first: () => new Promise<never>(() => {}) }),
+        }),
+      },
+    } as unknown as Env;
+    expect(await fleetCronTick(hang, NOW, { timeoutMs: 20 })).toEqual({
+      fleet: "timeout",
+    });
+    expect(lines).toContain("provapi fleet failed timeout");
+    for (const l of lines) expect(l).toMatch(LINE);
+  });
+
   it("an unknown cron writes no tick", async () => {
     const f = fakes();
     await scheduler.scheduled(
@@ -250,7 +318,6 @@ describe("scheduled() and the provapi duties", () => {
       reminders: "ok",
       purge: "ok",
       health: "ok",
-      fleet: "ok",
       alerts: "timeout",
       prune: "ok",
     });
@@ -259,6 +326,6 @@ describe("scheduled() and the provapi duties", () => {
     expect(Object.keys(DUTY_TIMEOUT_MS)).toEqual(Object.keys(out));
     // #1083 re-review N9: the budgets fit inside the 2-minute tick with room.
     const total = Object.values(DUTY_TIMEOUT_MS).reduce((a, b) => a + b, 0);
-    expect(total).toBeLessThan(120_000);
+    expect(total).toBeLessThan(100_000);
   });
 });

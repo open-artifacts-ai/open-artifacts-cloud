@@ -110,8 +110,11 @@ describe("wrangler.jsonc", () => {
         },
       ]);
       expect(e.vars).not.toHaveProperty("EMAIL_QUOTA_TOKEN");
-      // The nightly run, and H-DV's directory revoke tick every 2 minutes.
-      expect(e.triggers).toEqual({ crons: ["17 3 * * *", "*/2 * * * *"] });
+      // The nightly run, H-DV's directory revoke tick every 2 minutes, and
+      // the fleet rollout's own minute (cloud #264).
+      expect(e.triggers).toEqual({
+        crons: ["17 3 * * *", "*/2 * * * *", "* * * * *"],
+      });
       expect(e.dispatch_namespaces).toEqual([
         { binding: "DISPATCHER", namespace: NAMESPACES[env] },
       ]);
