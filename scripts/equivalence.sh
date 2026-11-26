@@ -132,9 +132,9 @@ ALLOW=(
   scripts/ci/release-watch.test.ts
   scripts/ci/release-watch.fixture.json
   # The flaky tracker (#447): a workflow, its script and its test.
-  .github/workflows/flaky-tracker.yml
-  scripts/ci/flaky-tracker.ts
-  scripts/ci/flaky-tracker.test.ts
+  .github/workflows/cloud-flaky-tracker.yml
+  scripts/ci/cloud-flaky-tracker.ts
+  scripts/ci/cloud-flaky-tracker.test.ts
   .github/workflows/release-retry.yml
   scripts/ci/release-retry.test.ts
 )

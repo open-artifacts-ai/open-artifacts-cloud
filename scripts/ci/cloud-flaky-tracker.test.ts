@@ -56,7 +56,7 @@ import {
   titleText,
   track,
   twiceInWindow,
-} from "./flaky-tracker.ts";
+} from "./cloud-flaky-tracker.ts";
 import type { Exec } from "./gh-retry.ts";
 
 const E = "\u001b";
@@ -1686,12 +1686,12 @@ describe("runFromArgs", () => {
   });
 });
 
-describe("flaky-tracker.yml", () => {
+describe("cloud-flaky-tracker.yml", () => {
   const wf = parse(
     readFileSync(
       join(
         dirname(fileURLToPath(import.meta.url)),
-        "../../.github/workflows/flaky-tracker.yml",
+        "../../.github/workflows/cloud-flaky-tracker.yml",
       ),
       "utf8",
     ),
@@ -1725,7 +1725,7 @@ describe("flaky-tracker.yml", () => {
     expect(record?.if).toBe("github.event_name == 'workflow_run'");
     expect(recon?.if).toBe("github.event_name == 'schedule'");
     expect(recon?.run).toBe(
-      'node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile',
+      'node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile',
     );
   });
 
@@ -1786,7 +1786,7 @@ describe("the event path names the workflow by its file", () => {
   const text = readFileSync(
     join(
       dirname(fileURLToPath(import.meta.url)),
-      "../../.github/workflows/flaky-tracker.yml",
+      "../../.github/workflows/cloud-flaky-tracker.yml",
     ),
     "utf8",
   );
