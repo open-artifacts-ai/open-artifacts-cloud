@@ -315,12 +315,35 @@ function eventsOf(on: unknown): Set<string> {
   return new Set();
 }
 
-/** A run block's commands, with shell comments dropped. */
+/** A run block's commands, with shell comments dropped, split at ;, && and ||. */
 const commandsOf = (run: string) =>
   run
     .split("\n")
-    .map((l) => l.replace(/(^|\s)#.*$/, "").trim())
+    .map((l) => l.replace(/(^|\s)#.*$/, ""))
+    .flatMap((l) => l.split(/;|&&|\|\|/))
+    .map((l) => l.trim())
     .filter(Boolean);
+
+/** A command that runs the package script itself: pnpm, npm or yarn, never echo or printf of it. */
+const RUNNERS = new Set(["pnpm", "npm", "yarn"]);
+export const invokesHosted = (cmd: string): boolean => {
+  const words = cmd.split(/\s+/);
+  return (
+    RUNNERS.has(words[0] ?? "") &&
+    words.slice(1).includes(HOSTED_MATRIX_CI.text)
+  );
+};
+
+/**
+ * A step condition that can't leave a PR or merge-queue run out: none, or
+ * one that reads only this job's step outputs (public's release-only skip).
+ * One that reads the event (github.*), or can only be false, can.
+ */
+const runsOnEveryPr = (cond: unknown): boolean =>
+  cond === undefined ||
+  (!neverRuns(cond) &&
+    typeof cond === "string" &&
+    !/github\.|event/.test(cond));
 
 /**
  * What keeps public's CI from running the hosted matrix as a blocking check
@@ -351,13 +374,8 @@ export function hostedMatrixCiGaps(text: string | null): string[] {
       continue;
     for (const st of (job.steps ?? []) as Record<string, unknown>[]) {
       if (typeof st?.run !== "string") continue;
-      if (
-        !commandsOf(st.run).some((l) =>
-          /(^|\s)\S*test:authz:hosted(\s|$)/.test(l),
-        )
-      )
-        continue;
-      if (neverRuns(st.if) || truthy(st["continue-on-error"])) continue;
+      if (!commandsOf(st.run).some(invokesHosted)) continue;
+      if (!runsOnEveryPr(st.if) || truthy(st["continue-on-error"])) continue;
       return [];
     }
   }

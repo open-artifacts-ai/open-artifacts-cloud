@@ -296,6 +296,27 @@ describe("a skipped test is no replacement (cloud #264 step 2)", () => {
         (t) => t.replace(step, `${step}        continue-on-error: true\n`),
       ],
       [
+        "only on push",
+        (t) =>
+          t.replace(step, `${step}        if: github.event_name == 'push'\n`),
+      ],
+      [
+        "only echoed",
+        (t) =>
+          t.replace(
+            step,
+            "      - run: echo pnpm --filter @oa/server test:authz:hosted\n",
+          ),
+      ],
+      [
+        "only printed by printf",
+        (t) =>
+          t.replace(
+            step,
+            "      - run: printf '%s' 'pnpm --filter @oa/server test:authz:hosted'\n",
+          ),
+      ],
+      [
         "a non-PR job",
         (t) =>
           t.replace(
