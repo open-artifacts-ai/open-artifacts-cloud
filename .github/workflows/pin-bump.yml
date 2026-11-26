@@ -60,12 +60,27 @@
 # Environment `pin-land`, and that App is the only bypass actor main's ruleset
 # needs. The release App (minted unnarrowed elsewhere) never moves main. Unset
 # (or anything but `on`), the PR path runs exactly as before.
+#
+# Triggers (cloud #264). A stable public release starts this at once (public
+# release-please.yml, cloud-pin-bump: `gh workflow run pin-bump.yml --ref main`).
+# That run does nothing while an older bump is open and green, so when a pin
+# lands on main (a pin PR merges, or land moves main), the push that changes
+# PUBLIC_PIN runs the same plan again at once: a release that waited behind the
+# open bump is bumped then, not at the next schedule. The plan is the same
+# idempotent check whatever starts it, so a push with nothing newer does nothing.
+# The schedule stays as the backstop. Every job runs only on main of this repo,
+# never on a fork; land never runs on the push (it runs after CI on pin-land/*,
+# on the schedule and on dispatch).
 name: pin-bump
 
 on:
   schedule:
     - cron: "23 */6 * * *"
   workflow_dispatch:
+  # A pin landed on main: plan again for a newer release (see Triggers above).
+  push:
+    branches: [main]
+    paths: [PUBLIC_PIN]
   # Direct mode: CI finished on a staged pin. Only the land job runs, from main's
   # copy of this file and script; nothing from the event is used.
   workflow_run:
@@ -81,7 +96,7 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'workflow_run'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -177,7 +192,7 @@ jobs:
 
   open:
     needs: prepare
-    if: github.ref == 'refs/heads/main' && github.event_name != 'workflow_run' && needs.prepare.outputs.bump == 'true'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event_name != 'workflow_run' && needs.prepare.outputs.bump == 'true'
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 10
@@ -327,7 +342,7 @@ jobs:
 
   # Direct mode: main moves to a staged pin only once a full CI push run passed on that exact sha.
   land:
-    if: github.ref == 'refs/heads/main' && vars.PIN_BUMP_DIRECT == 'on'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && github.event_name != 'push' && vars.PIN_BUMP_DIRECT == 'on'
     runs-on: ubuntu-latest
     # Its own App and Environment: the bypass actor on main's ruleset is used here only.
     environment: pin-land
@@ -361,7 +376,7 @@ jobs:
 
   report:
     needs: [prepare, open, land]
-    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
