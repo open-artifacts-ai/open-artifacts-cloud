@@ -29,6 +29,7 @@ import {
   limitOf,
   loadConfig,
   mergeHistory,
+  NO_FLEET,
   namedTag,
   notifyStuck,
   type Overrun,
@@ -1640,6 +1641,165 @@ describe("overlapping releases and the exact fleet finish (v0.251.0, v0.251.1)",
       now: D("13:35:00"),
     });
     expect(r.history.find((h) => h.tag === "v0.251.0")).toEqual(fixed);
+  });
+});
+
+// cloud #495 (head 92906afe): the prod deploy no longer waits for the fleet.
+// It keeps "Wake the fleet" and drops "Wait for the fleet to reach every
+// install" and "Fleet done"; the finish comes only from a later prod deploy's
+// "Fleet done of earlier releases" record.
+describe("the fleet without the deploy's wait (cloud #495)", () => {
+  const D = (hms: string) => `2026-11-27T${hms}Z`;
+  const RUNS =
+    "https://github.com/open-artifacts-ai/open-artifacts-cloud/actions/runs/";
+  const st = (name: string, a: string, b: string, conclusion = "success") => ({
+    name,
+    status: "completed",
+    conclusion,
+    startedAt: D(a),
+    completedAt: D(b),
+  });
+  const deploy = (
+    id: number,
+    tag: string,
+    created: string,
+    updated: string,
+    steps: Job["steps"],
+  ): Run => ({
+    id,
+    path: ".github/workflows/deploy-hosted-platform.yml",
+    event: "workflow_dispatch",
+    title: `deploy-hosted-platform prod ${tag} [c${id}-1]`,
+    status: "completed",
+    conclusion: "success",
+    headSha: "b".repeat(40),
+    createdAt: D(created),
+    startedAt: D(created),
+    updatedAt: D(updated),
+    attempt: 1,
+    url: `${RUNS}${id}`,
+    commitMessage: "x",
+    commitAt: D(created),
+    jobs: [{ name: "deploy", conclusion: "success", steps }],
+  });
+  // #495's shape: wake, then the run ends; no wait, no "Fleet done".
+  const own = deploy(100, "v0.252.0", "09:00:00", "09:06:30", [
+    st("Read the fleet finish of earlier releases", "09:01:00", "09:01:01"),
+    st("Fleet done of earlier releases ()", "09:01:01", "09:01:01", "skipped"),
+    st("Mark the platform verified", "09:04:00", "09:04:01"),
+    st("The tag's scheduler takes the fleet wake", "09:04:01", "09:04:02"),
+    st(FLEET_WAKE_STEP, "09:04:02", "09:04:03"),
+  ]);
+  const next = deploy(200, "v0.252.1", "11:00:00", "11:06:00", [
+    st("Read the fleet finish of earlier releases", "11:01:00", "11:01:01"),
+    st(
+      "Fleet done of earlier releases (v0.251.1 at 2026-11-26T14:00:00.000Z, v0.252.0 at 2026-11-27T09:09:41.250Z)",
+      "11:01:01",
+      "11:01:01",
+    ),
+  ]);
+  const rel = { tag: "v0.252.0", publishedAt: D("08:30:00") };
+  const tl3 = (runs: Run[], now: string) =>
+    timeline({
+      release: rel,
+      runs,
+      prs: [],
+      mergedAt: D("08:20:00"),
+      config,
+      now: D(now),
+    });
+
+  it("the deploy ends at Wake the fleet even with no wait step; before the next prod deploy the fleet is pending", () => {
+    expect(fleetStep([own])).toEqual({
+      deployEnd: D("09:04:02"),
+      fleet: { state: "none" },
+    });
+    const t = tl3([own], "10:00:00");
+    expect(t.stages.find((x) => x.name === "prod_deploy")).toMatchObject({
+      state: "done",
+      startedAt: D("09:00:00"),
+      endedAt: D("09:04:02"),
+    });
+    expect(t.stages.find((x) => x.name === "fleet")?.state).toBe("unmeasured");
+    expect(t.e2eTo).toBe(NO_FLEET);
+    expect(t.doneAt).toBe(D("09:04:02"));
+  });
+
+  it("the next prod deploy's record is the exact finish, from the wake; never an upper bound", () => {
+    const late = lateFleetDone([own, next], "v0.252.0");
+    expect(late).toEqual({ at: "2026-11-27T09:09:41.250Z", url: `${RUNS}200` });
+    expect(fleetStep([own], late)).toEqual({
+      deployEnd: D("09:04:02"),
+      fleet: {
+        state: "done",
+        startedAt: D("09:04:02"),
+        doneAt: "2026-11-27T09:09:41.250Z",
+        url: `${RUNS}200`,
+        exact: true,
+      },
+    });
+    const t = tl3([own, next], "11:10:00");
+    expect(t.stages.find((x) => x.name === "fleet")).toMatchObject({
+      state: "done",
+      startedAt: D("09:04:02"),
+      endedAt: "2026-11-27T09:09:41.250Z",
+      minutes: 5.7,
+    });
+    expect(t.e2eTo).toBe("every install");
+    expect(t.e2e).toBe(49.7);
+    // History saved at the prod deploy takes it when the record appears.
+    const h: HistoryEntry = {
+      tag: "v0.252.0",
+      mode: "pr",
+      mergedAt: D("08:20:00"),
+      publishedAt: D("08:30:00"),
+      doneAt: D("09:04:02"),
+      e2e: 44,
+      e2eTo: NO_FLEET,
+      stages: { prod_deploy: 4 },
+    };
+    expect(upgradeFleet(h, [own])).toBe(h);
+    expect(upgradeFleet(h, [own, next])).toEqual({
+      ...h,
+      doneAt: "2026-11-27T09:09:41.250Z",
+      e2e: 49.7,
+      e2eTo: "every install",
+      stages: { prod_deploy: 4, fleet: 5.7 },
+    });
+  });
+
+  it("older runs with the wait and Fleet done steps still read the same way: an upper bound until a record", () => {
+    const old = deploy(300, "v0.252.0", "09:00:00", "09:12:00", [
+      st("Mark the platform verified", "09:04:00", "09:04:01"),
+      st(FLEET_WAKE_STEP, "09:04:02", "09:04:03"),
+      st(FLEET_WAIT_STEP, "09:04:03", "09:09:50"),
+      st(FLEET_DONE_STEP, "09:10:05", "09:10:05"),
+    ]);
+    expect(fleetStep([old]).fleet).toMatchObject({
+      state: "done",
+      startedAt: D("09:04:02"),
+      doneAt: D("09:10:05"),
+      exact: false,
+    });
+    expect(tl3([old], "10:00:00").e2eTo).toBe(FLEET_UPPER);
+    expect(
+      fleetStep([old], lateFleetDone([old, next], "v0.252.0")).fleet,
+    ).toMatchObject({ doneAt: "2026-11-27T09:09:41.250Z", exact: true });
+    // An old wait still going: the fleet is running.
+    const going = deploy(301, "v0.252.0", "09:00:00", "09:06:00", [
+      st(FLEET_WAKE_STEP, "09:04:02", "09:04:03"),
+      {
+        name: FLEET_WAIT_STEP,
+        status: "in_progress",
+        conclusion: null,
+        startedAt: D("09:04:03"),
+        completedAt: null,
+      },
+    ]);
+    expect(
+      fleetStep([{ ...going, status: "in_progress", conclusion: null }]).fleet
+        .state,
+    ).toBe("running");
   });
 });
 
