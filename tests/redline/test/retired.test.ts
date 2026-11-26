@@ -296,6 +296,51 @@ describe("a skipped test is no replacement (cloud #264 step 2)", () => {
         (t) => t.replace(step, `${step}        continue-on-error: true\n`),
       ],
       [
+        "|| true",
+        (t) => t.replace(step, step.replace("hosted\n", "hosted || true\n")),
+      ],
+      [
+        "; true",
+        (t) => t.replace(step, step.replace("hosted\n", "hosted; true\n")),
+      ],
+      [
+        "a pipe",
+        (t) => t.replace(step, step.replace("hosted\n", "hosted | tee log\n")),
+      ],
+      [
+        "& in the background",
+        (t) => t.replace(step, step.replace("hosted\n", "hosted &\n")),
+      ],
+      [
+        "a subshell",
+        (t) =>
+          t.replace(
+            step,
+            "      - run: (pnpm --filter @oa/server test:authz:hosted)\n",
+          ),
+      ],
+      [
+        "a second line",
+        (t) =>
+          t.replace(
+            step,
+            "      - run: |\n          pnpm --filter @oa/server test:authz:hosted\n          true\n",
+          ),
+      ],
+      [
+        "continue-on-error: false still counts as extra text",
+        (t) => t.replace(step, `${step}        continue-on-error: false\n`),
+      ],
+      [
+        "another condition",
+        (t) =>
+          t.replace(
+            step +
+              "        if: ${{ steps.ro.outputs.release_only != 'true' }}\n",
+            step + "        if: ${{ always() }}\n",
+          ),
+      ],
+      [
         "only on push",
         (t) =>
           t.replace(step, `${step}        if: github.event_name == 'push'\n`),

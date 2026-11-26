@@ -294,17 +294,6 @@ export const HOSTED_MATRIX_CI = {
   text: "test:authz:hosted",
 } as const;
 
-/** A condition GitHub can only read as false: the step or job never runs. */
-const neverRuns = (cond: unknown): boolean => {
-  if (cond === false || cond === 0) return true;
-  if (typeof cond !== "string") return false;
-  const c = cond
-    .trim()
-    .replace(/^\$\{\{([\s\S]*)\}\}$/, "$1")
-    .trim();
-  return /^(false|0|''|""|null)$/.test(c);
-};
-
 const truthy = (v: unknown) => v === true || v === "true";
 
 /** The workflow's events: `on` as a string, a list or a map. */
@@ -315,43 +304,24 @@ function eventsOf(on: unknown): Set<string> {
   return new Set();
 }
 
-/** A run block's commands, with shell comments dropped, split at ;, && and ||. */
-const commandsOf = (run: string) =>
-  run
-    .split("\n")
-    .map((l) => l.replace(/(^|\s)#.*$/, ""))
-    .flatMap((l) => l.split(/;|&&|\|\|/))
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-/** A command that runs the package script itself: pnpm, npm or yarn, never echo or printf of it. */
-const RUNNERS = new Set(["pnpm", "npm", "yarn"]);
-export const invokesHosted = (cmd: string): boolean => {
-  const words = cmd.split(/\s+/);
-  return (
-    RUNNERS.has(words[0] ?? "") &&
-    words.slice(1).includes(HOSTED_MATRIX_CI.text)
-  );
-};
-
+/** The one step that runs the hosted matrix: exactly this run, nothing else. */
+export const HOSTED_MATRIX_STEP = "pnpm --filter @oa/server test:authz:hosted";
 /**
- * A step condition that can't leave a PR or merge-queue run out: none, or
- * one that reads only this job's step outputs (public's release-only skip).
- * One that reads the event (github.*), or can only be false, can.
+ * The one condition public's step may carry: its release-only skip, which
+ * skips only when the change touches nothing but release files. Any other
+ * condition (an event check, false) fails the guard.
  */
-const runsOnEveryPr = (cond: unknown): boolean =>
-  cond === undefined ||
-  (!neverRuns(cond) &&
-    typeof cond === "string" &&
-    !/github\.|event/.test(cond));
+export const HOSTED_MATRIX_IF =
+  "${{ steps.ro.outputs.release_only != 'true' }}";
 
 /**
  * What keeps public's CI from running the hosted matrix as a blocking check
- * on every PR, read as YAML: the workflow must run on pull_request and
- * merge_group, and a job with no job-level condition and no
- * continue-on-error must have a step whose run (comments aside) calls
- * test:authz:hosted, with no condition that can only be false and no
- * continue-on-error. Empty when one does.
+ * on every PR, read as YAML, matched exactly and never by pattern: the
+ * workflow runs on pull_request and merge_group, and a job with no
+ * job-level condition and no continue-on-error has a step whose run, once
+ * trimmed, is exactly HOSTED_MATRIX_STEP (one line, no other text, so no
+ * operator, pipe, subshell or second command), with no continue-on-error,
+ * and no condition but exactly HOSTED_MATRIX_IF. Empty when one does.
  */
 export function hostedMatrixCiGaps(text: string | null): string[] {
   const why = (s: string) => [
@@ -373,9 +343,10 @@ export function hostedMatrixCiGaps(text: string | null): string[] {
     if (!job || job.if !== undefined || truthy(job["continue-on-error"]))
       continue;
     for (const st of (job.steps ?? []) as Record<string, unknown>[]) {
-      if (typeof st?.run !== "string") continue;
-      if (!commandsOf(st.run).some(invokesHosted)) continue;
-      if (!runsOnEveryPr(st.if) || truthy(st["continue-on-error"])) continue;
+      if (typeof st?.run !== "string" || st.run.trim() !== HOSTED_MATRIX_STEP)
+        continue;
+      if (st["continue-on-error"] !== undefined) continue;
+      if (st.if !== undefined && st.if !== HOSTED_MATRIX_IF) continue;
       return [];
     }
   }
