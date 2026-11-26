@@ -1,5 +1,5 @@
 // The flaky tracker (cloud #447, #264 lane 4 PR2). Tracking only: it changes
-// no retry and nothing that blocks. flaky-tracker.yml runs it when a CI run or
+// no retry and nothing that blocks. cloud-flaky-tracker.yml runs it when a CI run or
 // a release gate (redline-staging) passes on a later attempt (2 or more) after
 // an earlier attempt of the same run, so the same head sha, failed. Each test
 // that failed on an earlier attempt failed and then passed with no change.
@@ -40,7 +40,7 @@
 // once, unlike issue search, which lags its index and has its own rate limit;
 // it is one issue, not an issue or a label hit per sighting; and it outlives
 // what Actions keeps (caches go after 7 idle days and are per branch,
-// artifacts are per run). flaky-tracker.yml runs one tracker at a time per
+// artifacts are per run). cloud-flaky-tracker.yml runs one tracker at a time per
 // repo, so two runs never write the store or an issue at once.
 //
 // One issue per test, keyed on the test's identity only (suite, file and
@@ -65,7 +65,7 @@
 // TODO(lane 3): when redline-staging runs as a reusable workflow (a queue gate
 // calling it with workflow_call), workflow_run fires under the caller's name,
 // not redline-staging, and this tracker never sees that run. Add the caller to
-// flaky-tracker.yml's workflows and read its jobs (named `<caller job> /
+// cloud-flaky-tracker.yml's workflows and read its jobs (named `<caller job> /
 // t19`, `<caller job> / redline`) the same way. Not built yet.
 //
 // Reconcile: GitHub keeps a bounded queue of pending runs per concurrency
@@ -76,8 +76,8 @@
 // that passed after a failed
 // attempt and that the store doesn't hold yet, by the same rules and code.
 //
-// Usage: node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
-//        node --experimental-strip-types scripts/ci/flaky-tracker.ts --repo o/n --reconcile
+// Usage: node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
+//        node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --reconcile
 // Needs GH_TOKEN (actions: read, contents: read, issues: write).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -877,7 +877,7 @@ export function parseStore(comments: StoreComment[]): Map<string, Sighting[]> {
 export const STORE_BODY = [
   "The flaky tracker's sightings (cloud #447): each comment by github-actions is one run that failed and then passed on a later attempt, with one line per test that failed. A test seen in two runs within 7 days gets its own issue labelled `flaky`.",
   "",
-  `Kept by \`.github/workflows/flaky-tracker.yml\`. Leave this issue open and its comments as they are; only the bot's comments are read. Past ${MAX_STORE_COMMENTS} comments the tracker closes it and opens a new one.`,
+  `Kept by \`.github/workflows/cloud-flaky-tracker.yml\`. Leave this issue open and its comments as they are; only the bot's comments are read. Past ${MAX_STORE_COMMENTS} comments the tracker closes it and opens a new one.`,
   "",
   markerBlock([["kind", "store"]]),
 ].join("\n");
@@ -1138,7 +1138,7 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
     (t) =>
       !(stored.get(keyOf(t.f.id)) ?? []).some((s) => s.run === t.sighting.run),
   );
-  // Tracker runs are serialized per repo (flaky-tracker.yml), so one list of
+  // Tracker runs are serialized per repo (cloud-flaky-tracker.yml), so one list of
   // the open issues holds for the whole run.
   const open = listOpen(exec, run.repo);
   const actions = tests.map((t) =>
