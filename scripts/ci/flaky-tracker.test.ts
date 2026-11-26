@@ -1542,7 +1542,10 @@ describe("the event path names the workflow by its file", () => {
     "utf8",
   );
   it("never reads workflow_run.name", () => {
-    expect(text).not.toContain("workflow_run.name");
+    // Only in comments: no expression or condition reads it.
+    expect(text).not.toMatch(
+      /\$\{\{[^}]*workflow_run\.name|workflow_run\.name ==/,
+    );
     expect(text).toContain(
       "WORKFLOW_PATH: ${{ github.event.workflow_run.path }}",
     );
