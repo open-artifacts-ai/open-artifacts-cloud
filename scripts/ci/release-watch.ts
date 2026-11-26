@@ -1060,6 +1060,27 @@ export const commentKey = (o: {
       `<!-- release-watch ${o.tag} ${o.stage} running -->`
     : `<!-- release-watch ${o.tag} ${o.stage} -->`;
 
+/**
+ * Stages whose run is a test gate (redline-staging, with T19 in it): AGENTS.md
+ * reruns test and CI workflows whole. Every other run stage is a release
+ * workflow (hosted-release, hosted-publish, the deploys, the chains), rerun
+ * for its failed jobs only.
+ */
+export const WHOLE_RERUN_STAGES = new Set(["redline", "redline_queue"]);
+
+/**
+ * Pure: what to do with the stage's run, by its workflow and state. Failed: a
+ * test gate reruns whole, a release workflow its failed jobs only. Still
+ * running or finished green: nothing to rerun.
+ */
+export function rerunAdvice(o: Overrun, repo: string): string {
+  if (o.kind === "in_flight") return ", still running, nothing to rerun yet.";
+  if (o.kind === "finished") return ", finished green, nothing to rerun.";
+  return WHOLE_RERUN_STAGES.has(o.stage)
+    ? `, failed. It is a test gate, so rerun it whole (AGENTS.md): open the run and choose "Re-run all jobs", or \`gh run rerun ${o.runId} -R ${repo}\`.`
+    : `, failed. It is a release workflow, so rerun only its failed jobs (AGENTS.md): open the run and choose "Re-run failed jobs", or \`gh run rerun ${o.runId} --failed -R ${repo}\`.`;
+}
+
 /** What a failed stage's run says: its failed job and step, by name. */
 export type Failure = { job: string; step?: string };
 
@@ -1091,7 +1112,7 @@ export function commentBody(
     head,
     "",
     runUrl
-      ? `- Run: [${o.runId}](${runUrl}). To rerun it, open the run and choose "Re-run failed jobs", or \`gh run rerun ${o.runId} --failed -R ${repo}\`.`
+      ? `- Run: [${o.runId}](${runUrl})${rerunAdvice(o, repo)}`
       : `- Run: none. This stage is a wait between events${o.url ? ` (${o.url})` : ""}.`,
   ];
   if (failure)

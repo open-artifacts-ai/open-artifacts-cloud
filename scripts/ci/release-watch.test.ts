@@ -284,7 +284,7 @@ describe("timeline on the recorded chain", () => {
       "**v0.245.1 staging_deploy** is still running past its limit: it has been going 9.4 min (since 2026-11-25T19:20:38Z); usual 4.3 min, limit 9.3 min",
     );
     expect(body).toContain(
-      '- Run: [45684245945](https://github.com/o/c/actions/runs/45684245945). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45684245945 --failed -R o/c`.',
+      "- Run: [45684245945](https://github.com/o/c/actions/runs/45684245945), still running, nothing to rerun yet.",
     );
     expect(body).toContain("- Attempts: 1");
     expect(body).toContain(
@@ -1950,7 +1950,7 @@ describe("the stuck-stage issue", () => {
       ),
     ).toEqual(["pin_merge"]);
   });
-  it("the comment names the release, stage, run with a rerun, failed job and step, and attempts; never a log line", () => {
+  it("the comment names the release, stage, run with how to rerun it, failed job and step, and attempts; never a log line", () => {
     const o: Overrun = {
       tag: "v0.248.2",
       stage: "redline",
@@ -1971,13 +1971,64 @@ describe("the stuck-stage issue", () => {
     expect(body.split("\n")).toEqual([
       "**v0.248.2 redline** failed 31 min after it started (2026-11-25T10:00:00Z); usual 10.4 min, limit 20.8 min (the larger of 2 x its usual time and its usual time plus 5 min).",
       "",
-      '- Run: [45750964492](https://github.com/o/c/actions/runs/45750964492). To rerun it, open the run and choose "Re-run failed jobs", or `gh run rerun 45750964492 --failed -R o/c`.',
+      '- Run: [45750964492](https://github.com/o/c/actions/runs/45750964492), failed. It is a test gate, so rerun it whole (AGENTS.md): open the run and choose "Re-run all jobs", or `gh run rerun 45750964492 -R o/c`.',
       "- Failed job: `redline`, step `T19`. Its log is on the run.",
       "- Attempts: 2",
       "",
       "Every stage, time and ETA: the [release-watch job summary](https://github.com/o/c/actions/workflows/release-watch.yml).",
       "<!-- release-watch v0.248.2 redline -->",
     ]);
+  });
+  it("rerun advice follows AGENTS.md by workflow and state", () => {
+    const o = (
+      stage: string,
+      kind: Overrun["kind"],
+      runId = 45740398112,
+    ): Overrun => ({
+      tag: "v0.247.0",
+      stage,
+      kind,
+      ...(kind === "failed" ? { red: true } : {}),
+      startedAt: T("10:00:00"),
+      runId,
+      attempts: 1,
+      minutes: 30,
+      usual: 10.4,
+      limit: 20.8,
+    });
+    const run = (x: Overrun) =>
+      commentBody(x, "o/c", config).split("\n")[2] as string;
+    // The real failed v0.247.0 gate (run 45740398112, job T19, "Run T19"): a
+    // test gate reruns whole, never --failed.
+    const gate = run(o("redline", "failed"));
+    expect(gate).toBe(
+      '- Run: [45740398112](https://github.com/o/c/actions/runs/45740398112), failed. It is a test gate, so rerun it whole (AGENTS.md): open the run and choose "Re-run all jobs", or `gh run rerun 45740398112 -R o/c`.',
+    );
+    expect(gate).not.toContain("--failed");
+    expect(run(o("redline_queue", "failed"))).toContain(
+      "`gh run rerun 45740398112 -R o/c`",
+    );
+    // Release workflows: failed jobs only.
+    for (const stage of [
+      "hosted_release",
+      "staging_publish",
+      "staging_deploy",
+      "prod_publish",
+      "prod_deploy",
+    ])
+      expect(run(o(stage, "failed", 7)), stage).toBe(
+        '- Run: [7](https://github.com/o/c/actions/runs/7), failed. It is a release workflow, so rerun only its failed jobs (AGENTS.md): open the run and choose "Re-run failed jobs", or `gh run rerun 7 --failed -R o/c`.',
+      );
+    // Still running, or finished green but slow: nothing to rerun.
+    for (const stage of ["redline", "staging_deploy"]) {
+      expect(run(o(stage, "in_flight", 7))).toBe(
+        "- Run: [7](https://github.com/o/c/actions/runs/7), still running, nothing to rerun yet.",
+      );
+      expect(run(o(stage, "finished", 7))).toBe(
+        "- Run: [7](https://github.com/o/c/actions/runs/7), finished green, nothing to rerun.",
+      );
+      expect(run(o(stage, "finished", 7))).not.toContain("gh run rerun");
+    }
   });
   it("a failed stage is a failed entry whatever its time; one still going past its limit is an in-flight overrun", () => {
     const t = (state: "red" | "current", minutes: number) =>
@@ -2207,7 +2258,7 @@ describe("the stuck-stage issue", () => {
       "- Failed job: `redline`, step `T19`. Its log is on the run.",
     );
     expect(body).toContain(
-      "- Run: [45750964492](https://github.com/o/r/actions/runs/45750964492).",
+      "- Run: [45750964492](https://github.com/o/r/actions/runs/45750964492), failed. It is a test gate, so rerun it whole",
     );
     expect(body).toContain("- Attempts: 2");
   });
