@@ -40,6 +40,7 @@ import {
   syncIssue,
   tick,
   timeline,
+  upgradeFleet,
 } from "./release-watch.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -1105,6 +1106,137 @@ describe("stages that overlap (cloud #471) and the fleet finish (cloud #474)", (
       ).fleet.state,
     ).toBe("none");
   });
+
+  // The Prover's replay (cloud #264 comment 7185291783): a first prod deploy
+  // of the tag whose wait ran out, then a later one (a rerun or a new deploy
+  // of the same tag) whose "Fleet done" succeeded at 05:39:39.
+  const ranOutRun = (): Run =>
+    base("deploy-hosted-platform.yml", {
+      id: 3,
+      event: "workflow_dispatch",
+      title: "deploy-hosted-platform prod v0.248.2 [c1-1]",
+      createdAt: D("04:56:10"),
+      updatedAt: D("05:12:00"),
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [
+            ...fleetDone.slice(0, 2),
+            stepOf(FLEET_WAIT_STEP, D("05:01:02"), D("05:11:02")),
+            stepOf(FLEET_DONE_STEP, D("05:11:03"), D("05:11:03"), "skipped"),
+          ],
+        },
+      ],
+    });
+  const laterRun = (id: number, start: string, end: string): Run =>
+    base("deploy-hosted-platform.yml", {
+      id,
+      event: "workflow_dispatch",
+      title: `deploy-hosted-platform prod v0.248.2 [c${id}-1]`,
+      createdAt: D(start),
+      updatedAt: D(end),
+      jobs: [
+        {
+          name: "deploy",
+          conclusion: "success",
+          steps: [
+            stepOf(FLEET_WAKE_STEP, D(start), D(start)),
+            stepOf(FLEET_WAIT_STEP, D(start), D(end)),
+            stepOf(FLEET_DONE_STEP, D(end), D(end)),
+          ],
+        },
+      ],
+    });
+
+  it("an earlier wait that ran out never hides a later Fleet done for the same tag: the earliest success is the finish", () => {
+    const later = laterRun(4, "05:30:00", "05:39:39");
+    const done = {
+      deployEnd: D("05:01:00"),
+      fleet: {
+        state: "done",
+        startedAt: D("05:01:00"),
+        doneAt: D("05:39:39"),
+        url: `${RUNS}4`,
+      },
+    };
+    // Whatever order the runs come in.
+    expect(fleetStep([ranOutRun(), later])).toEqual(done);
+    expect(fleetStep([later, ranOutRun()])).toEqual(done);
+    // Two successes: the earliest.
+    expect(
+      fleetStep([laterRun(5, "05:40:00", "05:45:00"), later, ranOutRun()]).fleet
+        .doneAt,
+    ).toBe(D("05:39:39"));
+    const now = D("05:50:00");
+    const prod = [...prodRuns(undefined).slice(0, 2), ranOutRun(), later];
+    const t = tl2(chain({ prod }), now);
+    expect(row(t, "fleet")).toMatchObject({
+      state: "done",
+      endedAt: D("05:39:39"),
+    });
+    expect(row(t, "prod_deploy")?.endedAt).toBe(D("05:01:00"));
+    expect(t.e2eTo).toBe("every install");
+    expect(t.doneAt).toBe(D("05:39:39"));
+    // A backfill rebuilds from the runs, so it takes the later success too.
+    const r = compute({
+      ...world2(chain({ prod }), now),
+      history: [],
+      config,
+      now,
+    });
+    expect(r.history[0]).toMatchObject({
+      e2eTo: "every install",
+      doneAt: D("05:39:39"),
+    });
+  });
+
+  it("a release already in history to the prod deploy takes a later Fleet done; one measured to every install is kept", () => {
+    const now = D("05:50:00");
+    const recorded: HistoryEntry = {
+      tag: "v0.248.2",
+      mode: "pr",
+      mergedAt: D("04:21:47"),
+      publishedAt: D("04:25:40"),
+      doneAt: D("05:01:00"),
+      e2e: 39.2,
+      e2eTo: "prod deploy (fleet not yet measured)",
+      stages: { prod_deploy: 4.8 },
+    };
+    const prod = [
+      ...prodRuns(undefined).slice(0, 2),
+      ranOutRun(),
+      laterRun(4, "05:30:00", "05:39:39"),
+    ];
+    const up = upgradeFleet(recorded, prod);
+    expect(up).toEqual({
+      ...recorded,
+      doneAt: D("05:39:39"),
+      e2e: 77.9,
+      e2eTo: "every install",
+      stages: { prod_deploy: 4.8, fleet: 38.7 },
+    });
+    // History from before e2eTo also ran to the prod deploy.
+    const { e2eTo: _, ...old } = recorded;
+    expect(upgradeFleet(old, prod).e2eTo).toBe("every install");
+    // Nothing new: unchanged. Already to every install, or superseded: unchanged.
+    expect(upgradeFleet(recorded, [ranOutRun()])).toBe(recorded);
+    const full = { ...recorded, e2eTo: "every install" };
+    expect(upgradeFleet(full, prod)).toBe(full);
+    const sup = { ...recorded, supersededBy: "v0.248.3" };
+    expect(upgradeFleet(sup, prod)).toBe(sup);
+    // Through a tick's compute: the history line and the summary move.
+    const r = compute({
+      ...world2(chain({ prod }), now),
+      history: [recorded],
+      config,
+      now,
+    });
+    expect(r.history).toEqual([up]);
+    expect(summary(r.current)).toContain(
+      "| v0.248.2 | 77.9 | every install | 57.9 over |",
+    );
+  });
 });
 
 describe("percentiles, history and ETA", () => {
@@ -1688,8 +1820,16 @@ describe("tick reads", () => {
       );
     // hosted-release, the staging copy, the prod copy and the prod deploy.
     expect(want.length).toBe(4);
+    // Plus v0.245.0's prod deploy: it is in history to the prod deploy (no
+    // fleet measured), so a later "Fleet done" for its tag would count.
+    const v0450 = at(now).runs.find((x) =>
+      x.title.startsWith("deploy-hosted-platform prod v0.245.0"),
+    ) as Run;
     expect([...f.calls.filter((c) => c.includes("/jobs?"))].sort()).toEqual(
-      [...want].sort(),
+      [
+        ...want,
+        `repos/o/c/actions/runs/${v0450.id}/jobs?filter=latest&per_page=100`,
+      ].sort(),
     );
     const t = r.current.releases.find((x) => x.tag === "v0.245.1");
     expect(t?.stages.find((x) => x.name === "staging_publish")).toMatchObject({

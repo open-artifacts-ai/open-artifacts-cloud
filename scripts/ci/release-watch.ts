@@ -31,8 +31,9 @@
 // and prod deploy run since it was published, one read per run: a recovery run
 // on a later main commit names the release in its job names, a copy ends with
 // its publish job, and the prod deploy's steps record the fleet finish. A
-// release in history is done and not rebuilt. Writes: only the one issue,
-// through gh().
+// release in history is done and not rebuilt, but one whose total stopped at
+// the prod deploy has its prod deploys' jobs read in the window, and takes a
+// later "Fleet done" for its tag. Writes: only the one issue, through gh().
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -310,52 +311,89 @@ const ran = (x: JobStep | undefined): x is JobStep =>
  * Pure: the fleet finish from the prod deploy's own steps (cloud #474). The
  * wait step starts once the deploy and its verified mark are green; "Fleet
  * done" runs only once every install is upgraded, so its success and
- * completed_at are the finish. No such steps (a run before #474, or jobs not
- * read), or a wait that ended without "Fleet done": none, the fleet is not
- * measured for that release. `deployEnd` is when the wait started: the
- * deploy's own work ended there.
+ * completed_at are the finish. Every prod deploy run of the tag is read (a
+ * rerun, or a later deploy of the same tag): the finish is the earliest
+ * successful "Fleet done" across them, so an earlier wait that ran out never
+ * hides a later success. The fleet starts at the earliest wake (or wait) of
+ * any run, and `deployEnd` is that same moment: the deploy's own work ended
+ * there. With no success: running while any wait is still going, else none
+ * (no such steps: a run before #474, or jobs not read; or every wait ran
+ * out), and the fleet is not measured for that release.
  */
 export function fleetStep(prodRuns: Run[]): {
   fleet: Step;
   deployEnd?: string;
 } {
-  const sorted = [...prodRuns].sort(
-    (a, b) => ms(a.createdAt) - ms(b.createdAt),
-  );
-  for (const r of sorted)
+  let deployEnd: string | undefined;
+  let done: { at: string; url: string } | undefined;
+  let going: string | undefined;
+  for (const r of prodRuns)
     for (const j of r.jobs ?? []) {
       const by = (n: string) => j.steps?.find((x) => x.name === n);
       const wait = by(FLEET_WAIT_STEP);
       if (!ran(wait)) continue;
       const wake = by(FLEET_WAKE_STEP);
-      const done = by(FLEET_DONE_STEP);
-      const startedAt = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
-      const deployEnd = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
+      const fin = by(FLEET_DONE_STEP);
+      const start = (ran(wake) ? wake.startedAt : wait.startedAt) as string;
+      if (!deployEnd || ms(start) < ms(deployEnd)) deployEnd = start;
       if (
-        done?.conclusion === "success" &&
-        done.status !== "in_progress" &&
-        done.completedAt
-      )
-        return {
-          deployEnd,
-          fleet: {
-            state: "done",
-            startedAt,
-            doneAt: done.completedAt,
-            url: r.url,
-          },
-        };
-      const going =
+        fin?.conclusion === "success" &&
+        fin.status !== "in_progress" &&
+        fin.completedAt
+      ) {
+        if (!done || ms(fin.completedAt) < ms(done.at))
+          done = { at: fin.completedAt, url: r.url };
+      } else if (
         wait.status !== "completed" ||
-        (!!done && done.conclusion === null && done.status !== "completed");
-      return {
-        deployEnd,
-        fleet: going
-          ? { state: "running", startedAt, url: r.url }
-          : { state: "none" },
-      };
+        (!!fin && fin.conclusion === null && fin.status !== "completed")
+      )
+        going = going ?? r.url;
     }
-  return { fleet: { state: "none" } };
+  if (!deployEnd) return { fleet: { state: "none" } };
+  if (done)
+    return {
+      deployEnd,
+      fleet: {
+        state: "done",
+        startedAt: deployEnd,
+        doneAt: done.at,
+        url: done.url,
+      },
+    };
+  return {
+    deployEnd,
+    fleet: going
+      ? { state: "running", startedAt: deployEnd, url: going }
+      : { state: "none" },
+  };
+}
+
+/** The prod deploy runs of one release, by run name. */
+const prodDeploys = (runs: Run[], tag: string) =>
+  runs.filter(
+    (r) =>
+      file(r) === "deploy-hosted-platform.yml" &&
+      titled(r.title, `deploy-hosted-platform prod ${tag}`),
+  );
+
+/**
+ * Pure: a finished release in history whose total stopped at the prod deploy
+ * (its fleet wait ran out, or was not read yet) takes a later successful
+ * "Fleet done" for the same tag: the total then runs to every install. A
+ * release already measured to every install, or one that never reached prod,
+ * is left as it is.
+ */
+export function upgradeFleet(h: HistoryEntry, runs: Run[]): HistoryEntry {
+  if (h.supersededBy || h.e2eTo === "every install") return h;
+  const { fleet } = fleetStep(prodDeploys(runs, h.tag));
+  if (fleet.state !== "done" || !fleet.doneAt || !fleet.startedAt) return h;
+  return {
+    ...h,
+    doneAt: fleet.doneAt,
+    e2e: h.mergedAt ? mins(h.mergedAt, fleet.doneAt) : h.e2e,
+    e2eTo: "every install",
+    stages: { ...h.stages, fleet: mins(fleet.startedAt, fleet.doneAt) },
+  };
 }
 
 /**
@@ -423,9 +461,7 @@ function groups(tag: string, runs: Run[]): Record<string, Run[]> {
       const j = jobOf(r, PROD_RE, tag);
       return j ? asJob(r, j) : r;
     }),
-    prod_deploy: by("deploy-hosted-platform.yml", (r) =>
-      titled(r.title, `deploy-hosted-platform prod ${tag}`),
-    ),
+    prod_deploy: prodDeploys(runs, tag),
   };
 }
 
@@ -935,7 +971,9 @@ export function compute(o: {
   config: Config;
   now: string;
 }) {
-  const known = new Map(o.history.map((h) => [h.tag, h]));
+  // A recorded total to the prod deploy takes a later fleet finish.
+  const prior = o.history.map((h) => upgradeFleet(h, o.runs));
+  const known = new Map(prior.map((h) => [h.tag, h]));
   const all = supersede(
     o.releases.map((release) => {
       const h = known.get(release.tag);
@@ -953,7 +991,7 @@ export function compute(o: {
   // Rebuilt ones only: a finished release stays as history has it.
   const tls = all.filter((t) => !known.has(t.tag));
   const history = mergeHistory(
-    o.history,
+    prior,
     tls.map(historyEntry).filter((e): e is HistoryEntry => !!e),
     o.config.historySize,
   );
@@ -1160,11 +1198,15 @@ export function withJobs(
   repo: string,
   runs: Run[],
   from: number | undefined,
+  fleetTags: string[] = [],
 ): Run[] {
+  // Plus the prod deploys of finished releases whose fleet is not measured:
+  // a later "Fleet done" for that tag counts.
+  const want = (r: Run) =>
+    (from !== undefined && jobsWanted(r) && ms(r.createdAt) >= from) ||
+    fleetTags.some((t) => prodDeploys([r], t).length > 0);
   return runs.map((r) =>
-    from !== undefined && jobsWanted(r) && ms(r.createdAt) >= from
-      ? { ...r, jobs: readJobs(exec, repo, r.id) }
-      : r,
+    want(r) ? { ...r, jobs: readJobs(exec, repo, r.id) } : r,
   );
 }
 
@@ -1374,7 +1416,19 @@ export function tick(o: {
       : undefined;
   const out = compute({
     releases,
-    runs: withJobs(o.exec, o.repo, readRuns(o.exec, o.repo, since), jobsFrom),
+    runs: withJobs(
+      o.exec,
+      o.repo,
+      readRuns(o.exec, o.repo, since),
+      jobsFrom,
+      releases
+        .map((r) => known.get(r.tag))
+        .filter(
+          (h): h is HistoryEntry =>
+            !!h && !h.supersededBy && h.e2eTo !== "every install",
+        )
+        .map((h) => h.tag),
+    ),
     prs: backfill
       ? readPrs(o.exec, o.repo)
       : readPinPrs(
