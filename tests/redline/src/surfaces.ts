@@ -341,6 +341,8 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
   "DELETE /api/v1/bus/machines/:id":
     "real-only: no bus machine can be made on a hosted install (the device flow is 404 until #1299); A at B is deny-only",
   // #1296: reached through bus/routes.ts roleWriter, not a direct call.
+  "POST /api/v1/bus/roles":
+    "interactive-only: a member moves or frees an away holder in a browser session; A at B is deny-only",
   "PUT /api/v1/bus/roles":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/bus/roles/:id":
@@ -471,6 +473,7 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
 export const INTERACTIVE_ONLY: readonly string[] = [
   "POST /api/v1/members/:id/erase",
   "PUT /api/v1/bus/share-notices",
+  "POST /api/v1/bus/roles",
   "PUT /api/v1/bus/roles",
   "DELETE /api/v1/bus/roles/:id",
   ...(hasProposalDecision ? [proposalDecision] : []),
@@ -793,6 +796,17 @@ export const DROPPED: Readonly<
         file: SHARE_NOTICE_TESTS,
         describe: "R.shareNotices",
         test: "a PAT reads but can't set it; guests and anonymous callers neither",
+      },
+    ],
+  },
+  "org POST /api/v1/bus/roles": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: ROLE_TESTS,
+        describe: ROLE_D,
+        test: "guards the away holder and lets the member %s its name",
       },
     ],
   },

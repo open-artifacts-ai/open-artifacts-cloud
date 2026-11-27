@@ -261,7 +261,7 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     // subscription changes (#2512, #2762) add seven more.
     // v0.219.0: the agent-requests switch save and the three listens-to
     // routes (#2577 S2) add four more.
-    expect(only).toHaveLength(52);
+    expect(only).toHaveLength(53);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
@@ -406,9 +406,9 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(52);
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(53);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 53);
+    expect(by("own")).toHaveLength(cases.length - 2 - 54);
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
