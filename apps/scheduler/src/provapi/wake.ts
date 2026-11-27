@@ -12,10 +12,20 @@
 // upgrade starts on the deploy's message; its end probes it and runs the
 // smoke in that same pass, and the rest are queued the moment the smoke
 // passes; the last of the rest to end writes fleet_done:<version>, which the
-// next prod deploy records. Nothing waits: a pass that only time can finish (a probe or
-// smoke to repeat, the lease held, a failed run) asks its message back with a
-// backoff, the one wait allowed. Every other message is acked: what is left
-// ends with a job, and that job's end is the next message.
+// next prod deploy records. Nothing waits: a pass that only time can finish
+// (a probe or smoke to repeat, the lease held, a failed run) asks its message
+// back with a backoff, the one wait allowed. Every other message is acked:
+// what is left ends with a job, and that job's end is the next message.
+//
+// Where the canary smoke is required no tick runs the fleet (cloud
+// #264). Every pass reads the whole fleet from state, so a lost message (a
+// job-end send that ran out of retries, a wake out of deliveries) is
+// recovered by the next event of any kind: another job's end, the next
+// deploy's wake. Past that, a stuck rollout is OA Manager L-2's to catch, the
+// release watcher Leo named; the alerts (canary_blocked, fleet_halted,
+// version_skew) still open off the tick's alert marks (fleetMarks). No timer
+// is added for it. Where the smoke is off, the 2-minute tick keeps
+// its fleet duty for the passive soak (provapi/index.ts tickRunsFleet).
 //
 // The body is never read: the fleet's target is this Worker's own version
 // tag, so a message for an older release, or a job of any kind, is just one
@@ -46,8 +56,8 @@ export const FLEET_WAKE_BACKOFF_MAX_S = 60;
 /**
  * The queue's max_retries (apps/scheduler/wrangler.jsonc, both envs; the
  * config test pins them equal): 1 + 2 + ... + 32 s, then 14 retries at 60 s,
- * about 15 min, after which the message is acked and the 2-minute tick
- * carries on.
+ * about 15 min, after which the message is acked; the next event of any kind
+ * picks the fleet up from state (and, smoke off, the tick's fleet duty).
  */
 export const FLEET_WAKE_MAX_RETRIES = 20;
 

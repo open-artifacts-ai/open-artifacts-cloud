@@ -24,9 +24,17 @@
 //
 // Settle (the "soaked" marks, so state carries over): every pass probes the
 // installs upgraded to the target. With the smoke required, one passing probe
-// settles an install (FLEET_SOAK_MS is 0). With the smoke off (staging), its
+// settles an install (FLEET_SOAK_MS is 0). With the smoke off, its
 // probes must pass unbroken for FLEET_SOAK_MIN; a gap over FLEET_SOAK_GAP_MS
-// restarts that clock, as a failure does.
+// restarts that clock, as a failure does. That soak is a timer by design, so
+// where the smoke is off the 2-minute tick keeps its fleet duty
+// (provapi/index.ts tickRunsFleet).
+//
+// Every pass works from state, never from the message that started it: any
+// event (a job's end, a deploy's wake) re-reads the whole fleet, so one lost
+// message is recovered by the next event of any kind. Where the smoke is
+// required no tick runs the fleet (cloud #264); the 2-minute cron
+// keeps only its alert marks (fleetMarks).
 //
 // Smoke: once the canary has settled, smoke() runs in the same pass, then
 // once per pass until it passes (fleet_smoked). The canary answering wrongly
@@ -81,9 +89,9 @@ export const FLEET_SOAK_MS = 0;
  */
 export const FLEET_FAIL_GAP_MS = 60_000;
 /**
- * A pass's deadline from its start on the 2-minute tick: the fleet duty's
- * 25 s budget less a 2 s margin. The smoke gets only the time left, its
- * cleanup aside (smokeCanary). A wake (wake.ts) passes its own.
+ * A pass's deadline from its start on the 2-minute tick (smoke off only):
+ * the fleet duty's 25 s budget less a 2 s margin. The smoke gets only the
+ * time left, its cleanup aside (smokeCanary). A wake (wake.ts) passes its own.
  */
 export const FLEET_TICK_DEADLINE_MS = 23_000;
 /**
@@ -780,6 +788,54 @@ async function markDone(
   await d1(db.prepare(SET_ONCE).bind(key, now).run());
   st.rows.set(key, { key, value: now, updated_at: now });
   console.log("provapi fleet done", target);
+}
+
+/**
+ * The fleet's alert marks, on every 2-minute tick (the alerts duty), so they
+ * stay current where no tick runs the fleet (cloud #264, smoke required):
+ * `fleet_unverified:` (platform_unverified) while the target has no verified
+ * mark, then the blocked-canary clock and `fleet_behind:` stamps. The same
+ * writes, under the same conditions, as a fleet pass makes, so an install
+ * that falls behind or catches up between releases, and a deploy that never
+ * marked its release verified, alert as before. Moves nothing: no job, no
+ * probe, no lease.
+ */
+export async function fleetMarks(env: FleetEnv, now: number): Promise<void> {
+  const target = fleetTarget(env.CF_VERSION_METADATA);
+  const canary = fleetCanary(env.FLEET_CANARY);
+  if (target === null || canary === null) return;
+  const db = env.PLATFORM_DB;
+  const st = await fleetState(db);
+  if (!(await verified(db, now, st, target))) return;
+  await trackBehind(db, now, st, target);
+  if (
+    fleetSmokeMode(env.FLEET_SMOKE) !== "required" ||
+    st.rows.has(blockedKey(target)) ||
+    isHalted(st, target) ||
+    (st.rows.has(soakedKey(target, canary)) &&
+      st.rows.has(smokedKey(target, canary)))
+  )
+    return;
+  // A wake may settle or halt the canary after our read. Check its marks
+  // in the insert so a late alert tick cannot restart a finished clock.
+  await d1(
+    db
+      .prepare(
+        `INSERT INTO platform_state (key, value, updated_at)
+         SELECT ?1, ?2, ?2
+         WHERE NOT EXISTS (SELECT 1 FROM platform_state WHERE key GLOB ?3)
+           AND (SELECT COUNT(*) FROM platform_state WHERE key IN (?4, ?5)) < 2
+         ON CONFLICT (key) DO NOTHING`,
+      )
+      .bind(
+        blockedKey(target),
+        now,
+        `${FLEET_HALT_PREFIX}${target}:*`,
+        soakedKey(target, canary),
+        smokedKey(target, canary),
+      )
+      .run(),
+  );
 }
 
 /**

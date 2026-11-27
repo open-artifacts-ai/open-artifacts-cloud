@@ -209,13 +209,14 @@ describe("scheduled() and the provapi duties", () => {
     expect(lines.some((l) => l.startsWith("provapi"))).toBe(false);
   });
 
-  // cloud #264: the 2-minute tick's fleet duty and the deploy's wake share
-  // one lease, so they never act side by side.
-  it("*/2: the fleet duty takes the lease and gives it back; while a wake holds it, it only logs the overlap", async () => {
+  // cloud #264: with the smoke required (unset here, as on prod) the
+  // 2-minute tick runs no fleet; only queue() does, on the fleet's events, so
+  // the tick never touches the fleet lease.
+  it("*/2, smoke required: no fleet duty: the tick runs no fleet pass and leaves the fleet lease alone", async () => {
     const f = fakes();
     const lines = captureLogs(vi.spyOn);
-    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
-    expect(lines).toContain("provapi fleet no_target");
+    expect(await provapiTick(f.env, NOW)).not.toHaveProperty("fleet");
+    expect(lines).not.toContain("provapi fleet no_target");
     expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
     await insert("platform_state", {
       key: FLEET_LEASE_KEY,
@@ -223,9 +224,12 @@ describe("scheduled() and the provapi duties", () => {
       updated_at: NOW - 1_000,
     });
     lines.length = 0;
-    expect((await provapiTick(f.env, NOW)).fleet).toBe("ok");
-    expect(lines).toContain("provapi fleet overlap");
-    expect(lines).not.toContain("provapi fleet no_target");
+    await scheduler.scheduled(
+      controller(REVOKE_CRON),
+      f.env,
+      createExecutionContext(),
+    );
+    expect(lines.filter((l) => l.startsWith("provapi fleet"))).toEqual([]);
     expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - 1_000);
   });
 
@@ -300,13 +304,15 @@ describe("scheduled() and the provapi duties", () => {
       reminders: "ok",
       purge: "ok",
       health: "ok",
-      fleet: "ok",
       alerts: "timeout",
       prune: "ok",
     });
     expect(lines).toContain("provapi alerts failed timeout");
     for (const l of lines) expect(l).toMatch(LINE);
-    expect(Object.keys(DUTY_TIMEOUT_MS)).toEqual(Object.keys(out));
+    // The smoke is required here (unset), so no fleet duty runs (cloud #264).
+    expect(Object.keys(DUTY_TIMEOUT_MS).filter((k) => k !== "fleet")).toEqual(
+      Object.keys(out),
+    );
     // #1083 re-review N9: the budgets fit inside the 2-minute tick with room.
     const total = Object.values(DUTY_TIMEOUT_MS).reduce((a, b) => a + b, 0);
     expect(total).toBeLessThan(120_000);

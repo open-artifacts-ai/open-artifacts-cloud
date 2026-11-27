@@ -104,9 +104,9 @@
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
       // message once the release is verified, and the provisioner one at
       // every ManageInstall job's end; each batch is one fleet pass. One
-      // batch at a time; the fleet lease covers the 2-minute tick. A pass
-      // only time can finish comes back with a backoff, up to max_retries
-      // (FLEET_WAKE_MAX_RETRIES, about 15 min).
+      // batch at a time, under the fleet lease. A pass only time can finish
+      // comes back with a backoff, up to max_retries (FLEET_WAKE_MAX_RETRIES,
+      // about 15 min).
       "queues": {
         "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }],
         "consumers": [
@@ -208,9 +208,9 @@
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
       // message once the release is verified, and the provisioner one at
       // every ManageInstall job's end; each batch is one fleet pass. One
-      // batch at a time; the fleet lease covers the 2-minute tick. A pass
-      // only time can finish comes back with a backoff, up to max_retries
-      // (FLEET_WAKE_MAX_RETRIES, about 15 min).
+      // batch at a time, under the fleet lease. A pass only time can finish
+      // comes back with a backoff, up to max_retries (FLEET_WAKE_MAX_RETRIES,
+      // about 15 min).
       "queues": {
         "producers": [{ "binding": "SIGNUPS", "queue": "oa-p-signups" }],
         "consumers": [

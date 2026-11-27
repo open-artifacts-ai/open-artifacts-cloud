@@ -42,6 +42,7 @@ import {
   fleetBlockedMs,
   fleetConditions,
   fleetDue,
+  fleetMarks,
   fleetPass,
   fleetRequestId,
   fleetSmokeMode,
@@ -51,6 +52,7 @@ import {
   onTarget,
 } from "../src/provapi/fleet.js";
 import type { HealthProbe } from "../src/provapi/health.js";
+import { provapiTick } from "../src/provapi/index.js";
 import type { SmokeInput, SmokeResult } from "../src/provapi/smoke.js";
 import { getState } from "../src/provapi/state.js";
 import {
@@ -820,7 +822,7 @@ describe("soak", () => {
     expect(await queued()).toEqual([rest]);
   });
 
-  // With the smoke off (staging), the passive soak's clock: 4 minutes here.
+  // With the smoke off, the passive soak's clock: 4 minutes here.
   const SOAK = 4 * MIN;
   const passive = (f: ReturnType<typeof fakes>) =>
     Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "4" });
@@ -2803,6 +2805,17 @@ describe("#433: no timers, leo with the rest", () => {
     );
     expect(last.retried).toEqual([]);
     expect(last.acked).toEqual([0]);
+    // No more deliveries. The alerts tick must start the canary clock itself.
+    await fleetMarks(f.env, NOW);
+    const before = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS - 1);
+    expect(before.fleet_halted.rows.map((row) => row.code)).not.toContain(
+      "canary_blocked",
+    );
+    await fleetMarks(f.env, NOW + FLEET_BLOCKED_MS);
+    const due = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS);
+    expect(due.fleet_halted.rows).toContainEqual(
+      expect.objectContaining({ code: "canary_blocked", since: NOW }),
+    );
     // Nothing moved, and the other run's lease is still its own.
     expect(await fleetJobs()).toEqual([]);
     expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - MIN);
@@ -2857,6 +2870,164 @@ describe("#433: no timers, leo with the rest", () => {
     // About 15 min: past the 60 s fail gap, inside canary_blocked's 45 min.
     expect(total).toBeGreaterThan(FLEET_FAIL_GAP_MS / 1_000);
     expect(total * 1_000).toBeLessThan(FLEET_BLOCKED_MS);
+  });
+
+  // cloud #264: the 2-minute tick runs no fleet. It keeps only the fleet's
+  // alert marks, so version_skew and platform_unverified alert as before.
+  it("*/2, smoke required: the tick moves no install and takes no lease, even with the fleet behind; its alerts duty keeps fleet_behind", async () => {
+    const canary = await on("0.92.0", { created: 0 });
+    const rest = await on("0.92.0", { created: 5 });
+    const f = fakes({ canary });
+    const lines = captureLogs(vi.spyOn);
+    const out = await provapiTick(f.env, NOW, {
+      timeoutMs: { sweep: 1_000, health: 1_000 },
+      healthProbe: f.opts.probe,
+    });
+    expect(out).not.toHaveProperty("fleet");
+    expect(await fleetJobs()).toEqual([]);
+    expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
+    expect(
+      lines.filter((l) =>
+        /^provapi fleet (upgrade|overlap|holding|soaked)/.test(l),
+      ),
+    ).toEqual([]);
+    expect(await stateKeys(FLEET_BEHIND_PREFIX)).toEqual(
+      [canary, rest].sort().map((id) => `${FLEET_BEHIND_PREFIX}${id}`),
+    );
+  });
+
+  it("fleetMarks: stamps fleet_unverified while the target has no mark, then fleet_behind; clears a caught-up one; moves nothing", async () => {
+    await db
+      .prepare("DELETE FROM platform_state WHERE key = ?1")
+      .bind(`${FLEET_VERIFIED_PREFIX}${TARGET}`)
+      .run();
+    const canary = await on("0.92.0", { created: 0 });
+    const rest = await on("0.92.0", { created: 5 });
+    const f = fakes({ canary });
+    await fleetMarks(f.env, NOW);
+    expect(await getState(db, `${FLEET_UNVERIFIED_PREFIX}${TARGET}`)).toBe(NOW);
+    expect(await stateKeys(FLEET_BEHIND_PREFIX)).toEqual([]);
+    // After 45 minutes, platform_unverified opens off the tick's own stamp.
+    const late = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS);
+    expect(late.fleet_halted.rows.map((r) => r.code)).toContain(
+      "platform_unverified",
+    );
+    await db
+      .prepare(
+        "INSERT INTO platform_state (key, value, updated_at) VALUES (?1, ?2, ?2)",
+      )
+      .bind(`${FLEET_VERIFIED_PREFIX}${TARGET}`, NOW + MIN)
+      .run();
+    await fleetMarks(f.env, NOW + 2 * MIN);
+    expect(await stateKeys(FLEET_UNVERIFIED_PREFIX)).toEqual([]);
+    expect(await stateKeys(FLEET_BEHIND_PREFIX)).toEqual(
+      [canary, rest].sort().map((id) => `${FLEET_BEHIND_PREFIX}${id}`),
+    );
+    // An install that catches up between releases (by hand, say) is cleared
+    // on the next tick, so version_skew doesn't stay open for it.
+    await setVersion(rest, TARGET);
+    await fleetMarks(f.env, NOW + 4 * MIN);
+    expect(await stateKeys(FLEET_BEHIND_PREFIX)).toEqual([
+      `${FLEET_BEHIND_PREFIX}${canary}`,
+    ]);
+    // ... and one left behind past FLEET_SKEW_MS opens version_skew.
+    const skew = await fleetConditions(f.env, NOW + 2 * MIN + FLEET_SKEW_MS);
+    expect(skew.version_skew.open).toBe(true);
+    expect(await fleetJobs()).toEqual([]);
+    expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
+  });
+
+  it("fleetMarks: no canary or no target writes nothing", async () => {
+    await on("0.92.0");
+    await fleetMarks(fakes({}).env, NOW);
+    const canary = await on("0.92.0");
+    await fleetMarks(fakes({ canary, tag: "nope" }).env, NOW);
+    expect(await stateKeys("fleet_")).toEqual([]);
+  });
+
+  // An explicitly configured passive soak needs passes at most FLEET_SOAK_GAP_MS apart.
+  it(
+    "*/2, smoke off: the tick runs the fleet duty and soaks with main's 5-min gap rule",
+    async () => {
+      const canary = await on(TARGET, { created: 0 });
+      await fleetJob(canary, { finished_at: NOW - MIN });
+      const rest = await on("0.92.0", { created: 5 });
+      const f = fakes({ canary });
+      Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "15" });
+      const tick = (at: number) =>
+        provapiTick(f.env, at, {
+          timeoutMs: { sweep: 1_000, health: 1_000 },
+          healthProbe: f.opts.probe,
+          fleet: f.opts,
+        });
+      expect((await tick(NOW)).fleet).toBe("ok");
+      // Ticks 2 min apart for 14 min: still soaking, nothing queued.
+      for (let t = NOW + 2 * MIN; t < NOW + 15 * MIN; t += 2 * MIN)
+        await tick(t);
+      expect(await queued()).toEqual([]);
+      // The tick at 16 min soaks it and queues the rest.
+      await tick(NOW + 16 * MIN);
+      expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:`)).toEqual([
+        `${FLEET_SOAKED_PREFIX}${TARGET}:${canary}`,
+      ]);
+      expect(await queued()).toEqual([rest]);
+      expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
+    },
+    fleetTicksTimeout(20),
+  );
+
+  it("smoke off: a tick gap over FLEET_SOAK_GAP_MS restarts the soak, as on main", async () => {
+    const canary = await on(TARGET, { created: 0 });
+    await fleetJob(canary, { finished_at: NOW - MIN });
+    await on("0.92.0", { created: 5 });
+    const f = fakes({ canary });
+    Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "15" });
+    const tick = (at: number) =>
+      provapiTick(f.env, at, {
+        timeoutMs: { sweep: 1_000, health: 1_000 },
+        healthProbe: f.opts.probe,
+        fleet: f.opts,
+      });
+    await tick(NOW);
+    // One delivery 15 min later is a gap over 5 min: no soak, the clock restarts.
+    await tick(NOW + 15 * MIN);
+    expect(await stateKeys(`${FLEET_SOAKED_PREFIX}${TARGET}:`)).toEqual([]);
+    expect(FLEET_SOAK_GAP_MS).toBe(5 * MIN);
+  });
+
+  // A lost job-end message (the provisioner's send ran out of retries): no
+  // tick re-checks, but every pass reads the fleet from state, so the next
+  // event of any kind (here another install's job ending) moves it on.
+  it("a lost canary job-end message: the next event of any kind, read from state, moves the rollout on", async () => {
+    const canary = await on("0.92.0", { created: 0 });
+    const rest = await on("0.92.0", { created: 5 });
+    const other = await on("0.92.0", { created: 6, health: "failing" });
+    const f = fakes({ canary });
+    const deliver = async (at: number, body: unknown) => {
+      const b = wakeBatch([1], at);
+      for (const m of b.batch.messages)
+        (m as unknown as { body: unknown }).body = body;
+      await fleetWake(b.batch, f.env, at, {
+        fleet: { ...f.opts, clock: () => at },
+      });
+      return b;
+    };
+    await deliver(NOW, { env: "staging", tag: `v${TARGET}` });
+    const [c] = await fleetJobs();
+    await setVersion(canary, TARGET);
+    await finish(c?.id, "done", NOW + MIN);
+    // The canary's own job-end message never arrives. Later, an unrelated
+    // job on another install ends, and its message names only that job.
+    const settings = await job(other, {
+      kind: "update",
+      workflow: "manage_install",
+      status: "done",
+      args: "{}",
+    });
+    const b = await deliver(NOW + 30 * MIN, { jobId: settings });
+    expect(b.acked).toEqual([0]);
+    expect(f.smokes).toHaveLength(1);
+    expect((await fleetJobs()).map((j) => j.install_id)).toContain(rest);
   });
 
   it(
