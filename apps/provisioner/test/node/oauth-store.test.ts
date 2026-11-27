@@ -794,15 +794,31 @@ describe("update: AUTH_PROVIDERS (R29, cloud#435)", () => {
   const codes = (v: string) => ({ vars: { AUTH_PROVIDERS: v } });
   const stored = (id: string) => JSON.parse(w.install(id)?.vars as string);
 
-  it("checks stored providers before a domain-code update writes the script", async () => {
-    const id = await activeWith(GOOGLE);
-    install(id);
-    const writes = w.fake.writes().length;
-    const r = await run({ domainCodes: true }, id);
-    expect(r.job.status).toBe("failed");
-    expect(w.fake.writes().length).toBe(writes);
-    expect(stored(id).EMAIL_CODE_DOMAIN).toBeUndefined();
-  });
+  it.each([
+    ["google", "finqore.test"],
+    ["email", "outside.test"],
+  ])(
+    "refuses both settings before upload for providers=%s and domains=%s",
+    async (providers, domains) => {
+      const id = await activeWith({ ...GOOGLE, AUTH_PROVIDERS: "email" });
+      install(id);
+      const before = {
+        ...stored(id),
+        AUTH_PROVIDERS: providers,
+        AUTH_DOMAINS: domains,
+      };
+      w.db
+        .prepare("UPDATE installs SET vars = ? WHERE id = ?")
+        .run(JSON.stringify(before), id);
+      for (const domainCodes of [true, false]) {
+        const writes = w.fake.writes().length;
+        const r = await run({ domainCodes }, id);
+        expect(r.job.status).toBe("failed");
+        expect(w.fake.writes().length).toBe(writes);
+        expect(stored(id)).toEqual(before);
+      }
+    },
+  );
 
   it("enables and disables domain codes on the live script and stored vars", async () => {
     const id = await activeWith({ ...GOOGLE, AUTH_PROVIDERS: "email" });

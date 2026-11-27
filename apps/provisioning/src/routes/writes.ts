@@ -305,17 +305,12 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
       if (!stored)
         throw new ApiError("invalid_state", "the install has no vars");
       try {
-        withDomainCodes(
-          stored,
-          domainCodes,
-          domainCodes ? await ownerEmailFor(a.env, row) : null,
-          {
-            source: row.source,
-            selfServeTier: a.env.SELF_SERVE_TIER,
-            testHooks: row.test_hooks === 1,
-            env: a.env.OA_ENV,
-          },
-        );
+        withDomainCodes(stored, domainCodes, await ownerEmailFor(a.env, row), {
+          source: row.source,
+          selfServeTier: a.env.SELF_SERVE_TIER,
+          testHooks: row.test_hooks === 1,
+          env: a.env.OA_ENV,
+        });
       } catch (e) {
         if (e instanceof OwnerVarsRefusal)
           throw new ApiError("invalid_state", e.why);

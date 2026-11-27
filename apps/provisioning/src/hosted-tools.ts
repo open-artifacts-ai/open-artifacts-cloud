@@ -205,7 +205,7 @@ export const HOSTED_TOOLS: readonly HostedTool[] = [
   {
     name: DOMAIN_CODES_TOOL,
     description:
-      "Enable or disable domain sign-in codes on an existing install. Enabling requires email-only sign-in and the owner's domain in the install's domain list. Returns the update job.",
+      "Enable or disable domain sign-in codes on an existing install. Both settings require email-only sign-in and the owner's domain in the install's domain list. Returns the update job.",
     input: DomainCodesBody.extend({ id: InstallIdSchema }),
     annotations: { ...WRITE, idempotentHint: true },
     async run(env, principal, args, client) {

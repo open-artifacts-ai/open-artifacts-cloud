@@ -289,13 +289,11 @@ async function putMode(
       : authProvidersVars(ctx, job, row, vars, want.authProviders);
   if (want.domainCodes !== undefined) {
     if (!job.source) throw refused("no install source");
-    const owner = want.domainCodes
-      ? await transient(
-          ctx.env.PLATFORM_DB.prepare("SELECT * FROM installs WHERE id = ?")
-            .bind(job.installId)
-            .first<Record<string, unknown>>(),
-        )
-      : null;
+    const owner = await transient(
+      ctx.env.PLATFORM_DB.prepare("SELECT * FROM installs WHERE id = ?")
+        .bind(job.installId)
+        .first<Record<string, unknown>>(),
+    );
     try {
       merged = withDomainCodes(
         vars,

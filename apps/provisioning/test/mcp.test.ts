@@ -791,12 +791,20 @@ describe("admin MCP only: set_oauth_store and copy_oauth_store (#1008)", () => {
           TIER: "team",
         },
       });
-      const r = await callTool(client, "set_install_domain_codes", {
-        id,
-        domainCodes: true,
-        requestId: requestId(),
-      });
-      expect(r.structuredContent.error.code).toBe(code);
+      for (const domainCodes of [true, false]) {
+        const r = await callTool(client, "set_install_domain_codes", {
+          id,
+          domainCodes,
+          requestId: requestId(),
+        });
+        expect(r.structuredContent.error?.code).toBe(code);
+        expect(
+          await db
+            .prepare("SELECT id FROM jobs WHERE install_id = ?")
+            .bind(id)
+            .first(),
+        ).toBeNull();
+      }
     }
   });
   const liveDual = (id: string) =>

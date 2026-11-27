@@ -185,16 +185,13 @@ export function withDomainCodes(
   ownerEmail: string | null,
   o: Omit<OwnerVarsOptions, "login">,
 ): Record<string, string> {
-  const after = { ...stored };
-  if (enabled) {
-    const domain = ownerEmail?.split("@")[1]?.toLowerCase();
-    if (!domain || !(stored.AUTH_DOMAINS ?? "").split(",").includes(domain))
-      throw refused("the owner's domain must be in AUTH_DOMAINS");
-    after.EMAIL_CODE_DOMAIN = "on";
-  } else {
-    delete after.EMAIL_CODE_DOMAIN;
-  }
-  return validateOwnerChange(after, o);
+  const domain = ownerEmail?.split("@")[1]?.toLowerCase();
+  if (!domain || !(stored.AUTH_DOMAINS ?? "").split(",").includes(domain))
+    throw refused("the owner's domain must be in AUTH_DOMAINS");
+  // Both directions require an install eligible for domain codes.
+  const after = validateOwnerChange({ ...stored, EMAIL_CODE_DOMAIN: "on" }, o);
+  if (!enabled) delete after.EMAIL_CODE_DOMAIN;
+  return after;
 }
 
 function validateOwnerChange(
