@@ -605,6 +605,24 @@ describe("ProvisionInstall: release gate and failures", () => {
     expect(w.fake.writes().length).toBe(before);
   });
 
+  it.each(["q", "qz"])(
+    "stores the fixed conflict reason for short slug %s",
+    async (slug) => {
+      const s = seedCreate(w, { slug });
+      w.db
+        .prepare(
+          "INSERT INTO installs (id, slug, app_host, content_host, owner_email, rl_ns, inputs_hash, state, created_at, updated_at) VALUES ('iabcdefghjkm', ?, ?, ?, 'owner@example.test', 8000008, 'h', 'active', 1, 1)",
+        )
+        .run(slug, app(slug), `${slug}.content.test`);
+      await run(w, s.jobId);
+      expect(w.job(s.jobId)).toMatchObject({
+        status: "failed",
+        error_code: "slug_taken",
+        error_message: `${JOB_ERROR_TEXT.slug_taken} Reason: an active install already holds the requested slug`,
+      });
+    },
+  );
+
   it.each(["LEAK_KEY_ACME", "QZ", "on"])(
     "redacts unexpected var %s in both the log and the stored refusal",
     async (key) => {

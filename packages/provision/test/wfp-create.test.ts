@@ -686,7 +686,7 @@ describe("WfpProvisioner.create", () => {
           s.p.create(input("finqore", { installId: "iabcdefghjkn" })),
         );
         expect(e.message).toMatch(
-          /slug finqore is already taken by install iabcdefghjkm/,
+          /another install already holds the requested slug/,
         );
         expect(e.code).toBe("slug_taken");
         expect(nonReads(s.fake, n)).toEqual([]);
@@ -699,7 +699,7 @@ describe("WfpProvisioner.create", () => {
         const n = s.fake.writes().length;
         const e = await fails(s.p.create(input("finqore", { installId: ID })));
         expect(e.message).toMatch(
-          /slug finqore already exists as active install/,
+          /an active install already holds the requested slug/,
         );
         expect(e.code).toBe("slug_taken");
         expect(nonReads(s.fake, n)).toEqual([]);
@@ -710,7 +710,7 @@ describe("WfpProvisioner.create", () => {
         const n = s.fake.writes().length;
         const e = await fails(s.p.create(input("other", { installId: ID })));
         expect(e.message).toMatch(
-          /installId iabcdefghjkm is not the install for slug other/,
+          /the install ID does not match the requested slug/,
         );
         expect(provisionErrorCode(e)).toBe("invalid_state");
         expect(nonReads(s.fake, n)).toEqual([]);

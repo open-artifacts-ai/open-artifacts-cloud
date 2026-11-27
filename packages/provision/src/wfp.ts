@@ -2043,7 +2043,7 @@ export class WfpProvisioner {
     if (row) {
       if (row.state === "active")
         throw new ProvisionRefused(
-          `slug ${i.slug} already exists as active install ${row.id}`,
+          "an active install already holds the requested slug",
           "slug_taken",
         );
       // Covers deleted too: its slug and hosts stay held until a purge.
@@ -2087,7 +2087,7 @@ export class WfpProvisioner {
       ]);
       if (held.length > 0)
         throw new ProvisionRefused(
-          `host ${held[0]?.host} is already taken by ${held[0]?.install_id}`,
+          "the requested host is already taken",
           "slug_taken",
         );
       res = await this.resources(row);
@@ -2095,7 +2095,7 @@ export class WfpProvisioner {
       const holders = await this.platform.holdersOf([appHost, contentHost]);
       if (holders.length > 0)
         throw new ProvisionRefused(
-          `host or broker origin already taken by install ${holders[0]?.id} (slug ${i.slug})`,
+          "the requested host or broker origin is already taken",
           "slug_taken",
         );
     }
@@ -2105,7 +2105,7 @@ export class WfpProvisioner {
       const p = cur === null ? null : parseHostsValue(cur);
       if (cur !== null && (!p || p.installId !== row?.id))
         throw new ProvisionRefused(
-          `host ${h} is already taken by ${cur}`,
+          "the requested host is already taken",
           "slug_taken",
         );
     }
@@ -2397,13 +2397,13 @@ export class WfpProvisioner {
       const byId = await this.platform.byId(i.installId);
       if (byId && byId.slug !== i.slug)
         throw new ProvisionRefused(
-          `installId ${i.installId} is not the install for slug ${i.slug}`,
+          "the install ID does not match the requested slug",
           "invalid_state",
         );
-      // An active row keeps its own refusal (slug ... already exists).
+      // An active row keeps its own refusal.
       if (bySlug && bySlug.id !== i.installId && bySlug.state !== "active")
         throw new ProvisionRefused(
-          `slug ${i.slug} is already taken by install ${bySlug.id}`,
+          "another install already holds the requested slug",
           "slug_taken",
         );
       return bySlug;
@@ -2412,7 +2412,7 @@ export class WfpProvisioner {
     const byId = await this.platform.byId(i.resumeId);
     if (!byId || byId.slug !== i.slug || bySlug?.id !== byId.id)
       throw new ProvisionRefused(
-        `resumeId ${i.resumeId} is not the install for slug ${i.slug}`,
+        "the resume ID does not match the requested slug",
         "invalid_state",
       );
     return byId;
@@ -2785,7 +2785,7 @@ export class WfpProvisioner {
       if (cur !== null && parseHostsValue(cur)?.installId === id) continue;
       if (cur !== null)
         throw new ProvisionRefused(
-          `host ${h} is already taken by ${cur}`,
+          "the requested host is already taken",
           "slug_taken",
         );
       assertOwnResource(this.hostsKv.title, this.env);
@@ -3576,7 +3576,7 @@ export class WfpProvisioner {
         // The PUT is idempotent.
         if (cur !== null && parseHostsValue(cur)?.installId !== id)
           throw new ProvisionRefused(
-            `host ${h} is already taken by ${cur}`,
+            "the requested host is already taken",
             "slug_taken",
           );
         assertOwnResource(this.hostsKv.title, this.env);
