@@ -82,7 +82,12 @@
 // doesn't hold yet, however long ago it passed, by the same rules and code.
 // So a dropped event is caught by the next completion whenever it comes. A
 // run whose earlier attempts hold no failed test is marked in the store too,
-// so it is read once.
+// so it is read once. One reconcile starts no run after RECONCILE_MS,
+// RECONCILE_CALLS gh calls or RECONCILE_LOGS job logs (it always does one),
+// oldest first, and logs "backlog: N new, M to retry": each run is saved as it
+// finishes, and the runs left (or failed) are written to the store as its
+// pending list, which the next reconcile works whatever its listing's range,
+// so the next completion carries on.
 //
 // Usage: node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --workflow <CI|redline-staging> --run-id <id> --attempt <n> --head-sha <sha> [--title "redline-staging vX.Y.Z"]
 //        node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo o/n --reconcile
@@ -659,32 +664,58 @@ function jobLog(exec: Exec, repo: string, id: number): string {
 export function collect(
   exec: Exec,
   run: RunInfo,
-): { found: Found[]; notes: string[] } {
+  /** A run read in parts: the jobs already read (their sightings are stored). */
+  resume?: Progress,
+  /** False once no further job log may be read (the reconcile's budget). */
+  canRead: () => boolean = () => true,
+): {
+  /** The tests found in the jobs read this time. */
+  found: Found[];
+  notes: string[];
+  /** Set when it stopped part way: every job read so far. */
+  partial?: Progress;
+  /** Why it stopped part way, when a read failed (else canRead stopped it). */
+  error?: Error;
+} {
   const base = `repos/${run.repo}/actions/runs/${run.runId}`;
   const last = JSON.parse(
     gh(exec, ["api", `${base}/attempts/${run.attempt}`]),
   ) as Attempt;
   const found: Found[] = [];
+  const read = new Set(resume?.jobs ?? []);
   const notes: string[] = [];
+  const partial = (): Progress => ({ jobs: [...read] });
   // A fork's run (a PR from another repo) counts too. Its logs are only read
   // as text: parseJob() takes test names from them, and inert() makes those
   // safe before they are written anywhere. Nothing from the run is executed.
-  for (let a = 1; a < run.attempt; a++) {
+  try {
+    for (let a = 1; a < run.attempt; a++)
+      if (readAttempt(a)) return { found, notes, partial: partial() };
+  } catch (e) {
+    // A failure part way (a 503 on one log, say): what was read before it is
+    // still recorded, and a retry resumes at the read that failed.
+    return { found, notes, partial: partial(), error: e as Error };
+  }
+  return { found, notes };
+
+  /** Reads one earlier attempt; true when canRead stopped it. */
+  function readAttempt(a: number): boolean {
     const att = JSON.parse(
       gh(exec, ["api", `${base}/attempts/${a}`]),
     ) as Attempt;
-    if (!FAILED.has(att.conclusion ?? "")) continue;
+    if (!FAILED.has(att.conclusion ?? "")) return false;
     if (att.head_sha !== last.head_sha) {
       notes.push(`attempt ${a}: another commit (${att.head_sha}), skipped`);
-      continue;
+      return false;
     }
-    const jobs = (
-      JSON.parse(
-        gh(exec, ["api", `${base}/attempts/${a}/jobs?per_page=100`]),
-      ) as { jobs: Job[] }
-    ).jobs.filter((j) => FAILED.has(j.conclusion ?? ""));
+    const jobs = attemptJobs(exec, `${base}/attempts/${a}/jobs`).filter((j) =>
+      FAILED.has(j.conclusion ?? ""),
+    );
     for (const j of jobs) {
+      if (read.has(j.id)) continue;
+      if (!canRead()) return true;
       const fs = parseJob(run.workflow, j.name, jobLog(exec, run.repo, j.id));
+      read.add(j.id);
       if (!fs.length)
         notes.push(`attempt ${a}: job ${j.name} failed outside the tests`);
       const at = (j.completed_at ?? new Date().toISOString()).replace(
@@ -694,8 +725,41 @@ export function collect(
       for (const f of fs)
         found.push({ f, sighting: { at, run: run.runId, attempt: a } });
     }
+    return false;
   }
-  return { found, notes };
+}
+
+/**
+ * A run whose reads failed part way (track() recorded what it read before):
+ * the error, and the jobs read, which the reconcile saves so a retry resumes
+ * at the read that failed. Only a read of the run raises it.
+ */
+export class PartialError extends Error {
+  readonly progress: Progress;
+  constructor(message: string, progress: Progress) {
+    super(message);
+    this.progress = progress;
+  }
+}
+
+/**
+ * Every job of an attempt, through every page of the listing (100 a page): a
+ * run is handled only once every page is read. Each page is a call, so it
+ * counts against the reconcile's budget.
+ */
+function attemptJobs(exec: Exec, path: string): Job[] {
+  const out: Job[] = [];
+  for (let page = 1; ; page++) {
+    const r = JSON.parse(
+      gh(exec, ["api", `${path}?per_page=${PER_PAGE}&page=${page}`]),
+    ) as { total_count?: number; jobs: Job[] };
+    out.push(...r.jobs);
+    if (
+      r.jobs.length < PER_PAGE ||
+      (r.total_count !== undefined && out.length >= r.total_count)
+    )
+      return out;
+  }
 }
 
 function lastAuthor(
@@ -746,6 +810,7 @@ function ensureLabel(
   color: string,
   description: string,
 ) {
+  // gh prints nothing at all, not `[]`, when no label matches the search.
   const labels = JSON.parse(
     gh(exec, [
       "label",
@@ -756,7 +821,7 @@ function ensureLabel(
       name,
       "--json",
       "name",
-    ]),
+    ]).trim() || "[]",
   ) as { name: string }[];
   if (labels.some((l) => l.name === name)) return;
   gh(
@@ -897,6 +962,14 @@ export const STORE_BODY = [
 ].join("\n");
 
 function createStore(exec: Exec, repo: string): number {
+  // The label first: GitHub refuses an issue with a label the repo lacks.
+  ensureLabel(
+    exec,
+    repo,
+    STORE_LABEL,
+    "EDEDED",
+    "The flaky tracker's record of tests that failed and then passed",
+  );
   const url = gh(
     exec,
     [
@@ -1161,12 +1234,45 @@ function markNoTest(
   return { done: [], notes };
 }
 
-export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
+export function track(o: {
+  exec: Exec;
+  run: RunInfo;
+  nowMs: number;
+  /** A run read in parts: carry on from here. */
+  resume?: Progress;
+  /** False once no further job log may be read (the reconcile's budget). */
+  canRead?: () => boolean;
+}): {
   done: Done[];
   notes: string[];
+  /**
+   * Stopped by canRead part way: what it read is recorded (and filed), and
+   * the run is not marked yet; save this and resume later.
+   */
+  partial?: Progress;
 } {
+  const got = collect(o.exec, o.run, o.resume, o.canRead);
+  // A run read in parts records (and files) each part's sightings as it is
+  // read, deduped by run and test like any sighting; it is marked only once
+  // every job is read. A part that found nothing writes nothing.
+  const whole = !got.partial;
+  const r =
+    whole || got.found.length
+      ? trackFound(o, got.found, got.notes, whole)
+      : { done: [], notes: got.notes };
+  if (got.error && got.partial)
+    throw new PartialError(got.error.message, got.partial);
+  return got.partial ? { ...r, partial: got.partial } : r;
+}
+
+/** Records and files the tests found; marks the run only when it is whole. */
+function trackFound(
+  o: { exec: Exec; run: RunInfo; nowMs: number },
+  found: Found[],
+  notes: string[],
+  whole: boolean,
+): { done: Done[]; notes: string[] } {
   const { exec, run } = o;
-  const { found, notes } = collect(exec, run);
   if (!found.length) return markNoTest(exec, run, o.nowMs, notes);
   ensureLabel(
     exec,
@@ -1231,10 +1337,11 @@ export function track(o: { exec: Exec; run: RunInfo; nowMs: number }): {
       { write: true },
     );
   const finish = () => {
-    if (!marked && filing.length) post(runDoneComment(run));
+    if (!marked && filing.length && whole) post(runDoneComment(run));
     return { done, notes };
   };
-  for (const body of storeComments(run, fresh, !filing.length)) post(body);
+  for (const body of storeComments(run, fresh, !filing.length && whole))
+    post(body);
   const summarize = filing.length > MAX_ISSUES_PER_RUN;
   for (const a of actions) {
     if (a.kind === "record") {
@@ -1355,11 +1462,18 @@ const realExec: Exec = (cmd, args) => {
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
+    timeout: GH_TIMEOUT_MS,
   });
+  // A killed call (the timeout) says "timed out", which gh() retries.
+  const err = r.error
+    ? /ETIMEDOUT/.test(String(r.error))
+      ? `timed out after ${GH_TIMEOUT_MS / 1000} s`
+      : String(r.error)
+    : "";
   return {
     code: r.status ?? 1,
     stdout: r.stdout ?? "",
-    stderr: r.stderr ?? String(r.error ?? ""),
+    stderr: err || (r.stderr ?? ""),
   };
 };
 
@@ -1416,6 +1530,17 @@ export const runFromArgs = (argv: string[]): RunInfo =>
 
 /** Slack on top of RERUN_DAYS plus QUIET_DAYS in the reconcile's range. */
 export const RECONCILE_HOURS = 26;
+/**
+ * The most time, gh calls and job logs one reconcile spends before it stops
+ * starting runs, well inside the job's 10 minutes. The rest is the backlog:
+ * each run's work is saved in the store as it finishes, and the next
+ * completion's reconcile carries on, oldest first.
+ */
+export const RECONCILE_MS = 4 * 60 * 1000;
+export const RECONCILE_CALLS = 150;
+export const RECONCILE_LOGS = 25;
+/** One gh call that takes longer is killed, and retried like a 5xx. */
+const GH_TIMEOUT_MS = 120_000;
 /** GitHub lets a run be rerun for this many days after it was created. */
 export const RERUN_DAYS = 30;
 /**
@@ -1575,49 +1700,493 @@ export function listRuns(
  * store holds adds nothing and bumps nothing. A run that found no test (it
  * failed outside the tests) is marked once, so it is not read again.
  */
-export function reconcile(o: { exec: Exec; repo: string; nowMs: number }): {
+export function reconcile(o: {
+  exec: Exec;
+  repo: string;
+  nowMs: number;
+  ms?: number;
+  calls?: number;
+  logs?: number;
+  /** The wall clock the time budget reads (a fake one in tests). */
+  clock?: () => number;
+  /** Each run's lines, as soon as it is done. */
+  onRun?: (lines: string[]) => void;
+}): {
   tracked: { run: RunInfo; done: Done[]; notes: string[] }[];
   notes: string[];
+  /** Runs that failed this time and stay on the pending list to retry. */
   failed: number;
+  /** Runs not started this time (the budget ran out): the backlog. */
+  left: number;
+  /** Runs dropped this time: no reconcile could read them UNREADABLE_TRIES times. */
+  dropped: string[];
 } {
-  const { exec, repo, nowMs } = o;
+  const { repo, nowMs } = o;
+  const clock = o.clock ?? Date.now;
+  const start = clock();
+  const spent = { calls: 0, logs: 0, failedReads: 0 };
+  let started = 0;
+  const callCap = o.calls ?? RECONCILE_CALLS;
+  const logCap = o.logs ?? RECONCILE_LOGS;
+  // Failed reads of runs (the run, attempts, jobs, logs) may use at most half
+  // the log budget: past that, no run that failed before is tried again.
+  const failCap = Math.floor(logCap / 2);
+  let outOfLogs = false;
+  const RUN_READ = /^repos\/[^/]+\/[^/]+\/actions\/(runs\/\d+|jobs\/\d+\/logs)/;
+  const LOG = /\/actions\/jobs\/\d+\/logs$/;
+  // Every call counts, failed or not. A job log past the log budget is never
+  // read: collect() stops before it (canRead), and saves how far it got, so
+  // a run with more logs than the budget is read across reconciles. This
+  // refusal is only the backstop.
+  const exec: Exec = (cmd, args) => {
+    const log = args.some((a) => LOG.test(a));
+    if (log && spent.logs >= logCap) {
+      outOfLogs = true;
+      return {
+        code: 1,
+        stdout: "",
+        stderr: "the reconcile's log budget is spent",
+      };
+    }
+    spent.calls++;
+    if (log) spent.logs++;
+    const r = o.exec(cmd, args);
+    if (r.code !== 0 && args.some((a) => RUN_READ.test(a))) spent.failedReads++;
+    return r;
+  };
   const notes: string[] = [];
   const listed = WORKFLOWS.flatMap((w) => listRuns(exec, repo, w, nowMs));
   // Oldest first (run ids grow with creation), as their events would have
   // come: a late replay then writes the same store and issues as on time.
-  const runs = listed.filter((r) => eligible(r)).sort((a, b) => a.id - b.id);
-  if (!runs.length) return { tracked: [], notes, failed: 0 };
   // Reads only: a store is created only when a run below is tracked. Every
   // listed run's mark was written after the run was created, so reading the
   // stores since reconcileFrom finds all of them.
   const from = reconcileFrom(nowMs);
   const { read } = storeIssues(exec, repo, nowMs, from);
-  const have = storedRuns(storeCommentsIn(exec, repo, read, nowMs, from));
+  const stored = storeCommentsIn(exec, repo, read, nowMs, from);
+  const marked = storedRuns(stored);
+  const unreadable = unreadableRuns(stored);
+  const have = { has: (k: string) => marked.has(k) || unreadable.has(k) };
+  // The pending list too, whatever the listing's range: a run found by an
+  // earlier reconcile and not finished stays a candidate until it is marked.
+  // One the listing no longer shows is read from the runs API when its turn
+  // comes.
+  const pending = pendingRuns(stored);
+  const tries = pendingTries(stored);
+  const fails = pendingFails(stored);
+  const failedAt = pendingFailedAt(stored);
+  const progress = progressOf(stored);
+  const canRead = () => spent.logs < logCap;
+  const nowAt = new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z");
+  const byId = new Map<number, ListedRun | { id: number; attempt: number }>();
+  for (const p of pending) {
+    const [id, attempt] = p.split("/").map(Number) as [number, number];
+    byId.set(id, { id, attempt });
+  }
+  for (const r of listed.filter((x) => eligible(x))) byId.set(r.id, r);
+  const key = (r: { id: number; attempt: number }) => `${r.id}/${r.attempt}`;
+  const failedBefore = (k: string) => (fails[k] ?? 0) > 0;
+  // Runs that never failed first, oldest first. Then the ones that did,
+  // the longest since their last failure first: a run that just failed goes
+  // behind every other, so a few runs that keep failing take turns at the
+  // back and never hide the rest.
+  const runs = [...byId.values()].sort(
+    (a, b) =>
+      Number(failedBefore(key(a))) - Number(failedBefore(key(b))) ||
+      (failedAt[key(a)] ?? "").localeCompare(failedAt[key(b)] ?? "") ||
+      a.id - b.id,
+  );
+  if (!runs.length)
+    return { tracked: [], notes, failed: 0, left: 0, dropped: [] };
+  // The pending list is saved first, when it changed: the whole list of runs
+  // not yet marked, before any run starts, so a job killed at any point after
+  // loses none of them. At the end, what is still not marked is written
+  // again, as a fresh comment, whenever any is left, even unchanged: the
+  // store is read only over the reconcile's range, so a list never rewritten
+  // would age out of it while its runs still wait.
+  const listText = (list: string[]) =>
+    [...list]
+      .sort()
+      .map((k) => `${k} ${tries[k] ?? 0} ${fails[k] ?? 0} ${failedAt[k] ?? ""}`)
+      .join(" ");
+  let saved = listText(pending);
+  // The store writes outside the runs (the pending list, a drop) are outside
+  // the budget.
+  const post = (body: string) => {
+    const store = openStore(o.exec, repo, nowMs);
+    notes.push(...store.notes);
+    gh(
+      o.exec,
+      ["issue", "comment", String(store.write), "--repo", repo, "--body", body],
+      { write: true },
+    );
+  };
+  const savePending = (list: string[], fresh = false) => {
+    if (listText(list) === saved && !(fresh && list.length)) return;
+    post(pendingComment(list, nowMs, tries, fails, failedAt));
+    saved = listText(list);
+  };
+  savePending(
+    runs.map((r) => `${r.id}/${r.attempt}`).filter((k) => !have.has(k)),
+  );
+  const unfinished: string[] = [];
+  const dropped: string[] = [];
   const tracked: { run: RunInfo; done: Done[]; notes: string[] }[] = [];
   let failed = 0;
+  let left = 0;
   for (const r of runs) {
     if (have.has(`${r.id}/${r.attempt}`)) {
       notes.push(`run ${r.id}/${r.attempt}: in the store already`);
       continue;
     }
+    // Oldest first, and at least one run each time, so a listing that alone
+    // spends the budget still never stops the backlog.
+    // Past the failed-read cap, only runs that never failed are started.
+    if (
+      spent.logs >= logCap ||
+      outOfLogs ||
+      (started > 0 &&
+        (clock() - start >= (o.ms ?? RECONCILE_MS) ||
+          spent.calls >= callCap ||
+          (spent.failedReads >= failCap && failedBefore(key(r)))))
+    ) {
+      left++;
+      unfinished.push(`${r.id}/${r.attempt}`);
+      continue;
+    }
+    started++;
+    const k = key(r);
+    // A failure while reading the run (listedRun, or collect() inside
+    // track(), which raises PartialError) is the only kind that can be a
+    // strike.
+    let reading = true;
     try {
+      const l = "name" in r ? r : listedRun(exec, repo, r.id, r.attempt);
+      reading = false;
       const run = runInfo({
         repo,
-        workflow: r.name,
-        runId: r.id,
-        attempt: r.attempt,
-        headSha: r.sha,
-        title: r.title,
+        workflow: l.name,
+        runId: l.id,
+        attempt: l.attempt,
+        headSha: l.sha,
+        title: l.title,
       });
-      tracked.push({ run, ...track({ exec, run, nowMs }) });
+      const done = track({
+        exec,
+        run,
+        nowMs,
+        resume: progress.get(k),
+        canRead,
+      });
+      if (done.partial) {
+        // Read in parts: save how far it got (outside the budget); the next
+        // reconcile resumes it.
+        post(progressComment(k, done.partial));
+        progress.set(k, done.partial);
+        left++;
+        unfinished.push(k);
+        const note = `run ${k}: read ${done.partial.jobs.length} job logs so far; the next reconcile reads the rest`;
+        notes.push(note);
+        o.onRun?.([`  note: ${note}`]);
+        continue;
+      }
+      const t = { run, done: done.done, notes: done.notes };
+      tracked.push(t);
+      delete tries[k];
+      delete fails[k];
+      delete failedAt[k];
+      o.onRun?.(runLines(t.run, t.done, t.notes));
     } catch (e) {
       // One run's failure never stops the others; the job still fails.
+      const why = (e as Error).message;
+      // What it read before it failed is kept (outside the budget), so the
+      // retry resumes at the read that failed.
+      if (
+        e instanceof PartialError &&
+        e.progress.jobs.length > (progress.get(k)?.jobs.length ?? 0)
+      ) {
+        post(progressComment(k, e.progress));
+        progress.set(k, e.progress);
+      }
+      // Stopped by the log budget: not a failure, it just waits.
+      if (outOfLogs) {
+        left++;
+        unfinished.push(k);
+        continue;
+      }
+      fails[k] = (fails[k] ?? 0) + 1;
+      failedAt[k] = nowAt;
+      // Only a run found gone (404 or 410) is a strike; a 5xx, timeout or
+      // rate limit just waits.
+      const unread = (reading || e instanceof PartialError) && GONE.test(why);
+      const n = (tries[k] ?? 0) + (unread ? 1 : 0);
+      if (unread && n >= UNREADABLE_TRIES) {
+        post(unreadableComment(repo, k, why));
+        delete tries[k];
+        delete fails[k];
+        delete failedAt[k];
+        dropped.push(k);
+        const note = `run ${k}: unreadable: found gone (404 or 410) on ${UNREADABLE_TRIES} reconciles: dropped, and marked unreadable in the store (${why})`;
+        notes.push(note);
+        o.onRun?.([`  note: ${note}`]);
+        continue;
+      }
+      if (unread) tries[k] = n;
       failed++;
-      notes.push(`run ${r.id}/${r.attempt}: ${(e as Error).message}`);
+      unfinished.push(k);
+      const note = `run ${k}: ${why}${unread ? ` (gone: strike ${n} of ${UNREADABLE_TRIES})` : ""}`;
+      notes.push(note);
+      o.onRun?.([`  note: ${note}`]);
     }
   }
-  return { tracked, notes, failed };
+  // What is still not marked (left, or failed) is the new pending list. A
+  // run leaves it only once it is marked.
+  savePending(unfinished, true);
+  return { tracked, notes, failed, left, dropped };
 }
+
+/**
+ * The store comment that lists the runs a reconcile found but did not finish
+ * (its budget ran out, or the run failed): one `run: <id>/<attempt>` each,
+ * under `at` (when it was written; the newest list is the one read). Every
+ * reconcile works these along with its listing, whatever the listing's
+ * range, so a run that leaves the range while it waits is still tracked. A
+ * run leaves the list only once the store marks it.
+ */
+export const pendingComment = (
+  runs: string[],
+  nowMs: number,
+  tries: Record<string, number> = {},
+  fails: Record<string, number> = {},
+  failedAt: Record<string, string> = {},
+) =>
+  [
+    runs.length
+      ? `The flaky tracker's reconcile has ${runs.length} runs left to track; the next one carries on.`
+      : "The flaky tracker's reconcile has no run left to track.",
+    "",
+    markerBlock([
+      ["kind", "pending"],
+      ["at", new Date(nowMs).toISOString().replace(/\.\d+Z$/, "Z")],
+      ...runs.map((r): [string, string] => [
+        "run",
+        // `<id>/<attempt> <strikes> <failures> [last failure]`, or just the
+        // run when it never failed.
+        tries[r] || fails[r]
+          ? `${r} ${tries[r] ?? 0} ${fails[r] ?? 0}${failedAt[r] ? ` ${failedAt[r]}` : ""}`
+          : r,
+      ]),
+    ]),
+  ].join("\n");
+
+/**
+ * A pending run is dropped once this many reconciles found it gone: a read of
+ * the run, its attempts, jobs or logs answered 404 or 410. A transient error
+ * (5xx, a timeout, a rate limit) is no strike: the run stays pending.
+ */
+export const UNREADABLE_TRIES = 3;
+/** A gh error that says the run, or its logs, are gone for good. */
+export const GONE = /HTTP 404|HTTP 410|Not Found|\bGone\b/;
+
+/**
+ * The store comment that drops a run no reconcile could read (the run, its
+ * attempts, jobs or logs) on UNREADABLE_TRIES reconciles: `kind:
+ * unreadable`, `run: <id>/<attempt>`, which every reconcile then skips like a
+ * marked run, so it leaves the pending list visibly.
+ */
+export const unreadableComment = (repo: string, key: string, why: string) =>
+  [
+    `Run https://github.com/${repo}/actions/runs/${key.split("/")[0]} (passed on attempt ${key.split("/")[1]}) was found gone (404 or 410) on ${UNREADABLE_TRIES} reconciles, so the flaky tracker drops it. Last error: ${codeSpan(inert(why))}`,
+    "",
+    markerBlock([
+      ["kind", "unreadable"],
+      ["run", key],
+    ]),
+  ].join("\n");
+
+/** The runs dropped as unreadable, from the bot's comments only. */
+export function unreadableRuns(comments: StoreComment[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "unreadable") continue;
+    const r = m.get("run")?.[0] ?? "";
+    if (/^\d{1,20}\/\d{1,4}$/.test(r)) out.add(r);
+  }
+  return out;
+}
+
+/** The newest pending list's numbers per run: index 0 strikes, 1 failures. */
+function pendingCounts(
+  comments: StoreComment[],
+  index: 0 | 1,
+): Record<string, number> {
+  let at = "";
+  let out: Record<string, number> = {};
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = {};
+    for (const v of m.get("run") ?? []) {
+      const x =
+        /^(\d{1,20}\/\d{1,4}) (\d{1,3}) (\d{1,4})(?: (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ))?$/.exec(
+          v,
+        );
+      if (x) out[x[1] as string] = Number(x[2 + index]);
+    }
+  }
+  return out;
+}
+
+/** The newest pending list in the store, from the bot's comments only. */
+export function pendingRuns(comments: StoreComment[]): string[] {
+  let at = "";
+  let out: string[] = [];
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = (m.get("run") ?? [])
+      .map((r) => r.split(" ")[0] ?? "")
+      .filter((r) => /^\d{1,20}\/\d{1,4}$/.test(r));
+  }
+  return out;
+}
+
+/** The newest pending list's last failure time of each run that failed. */
+export function pendingFailedAt(
+  comments: StoreComment[],
+): Record<string, string> {
+  let at = "";
+  let out: Record<string, string> = {};
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "pending") continue;
+    const when = m.get("at")?.[0] ?? "";
+    if (when < at) continue;
+    at = when;
+    out = {};
+    for (const v of m.get("run") ?? []) {
+      const x =
+        /^(\d{1,20}\/\d{1,4}) \d{1,3} \d{1,4} (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$/.exec(
+          v,
+        );
+      if (x) out[x[1] as string] = x[2] as string;
+    }
+  }
+  return out;
+}
+
+/**
+ * A run read in parts: the jobs whose logs were read, and whose sightings are
+ * recorded (and filed) already.
+ */
+export type Progress = { jobs: number[] };
+
+/**
+ * The store comment that saves a run read in parts, so the next reconcile
+ * resumes it: `kind: progress`, `run`, and a `job` per job whose log was read
+ * (its sightings are in the store already). Numbers only. The newest one for
+ * a run is read.
+ */
+export const progressComment = (key: string, p: Progress) =>
+  [
+    `The flaky tracker read ${p.jobs.length} job logs of run ${key} so far and recorded their sightings; the next reconcile reads the rest.`,
+    "",
+    markerBlock([
+      ["kind", "progress"],
+      ["run", key],
+      ...p.jobs.map((j): [string, string] => ["job", String(j)]),
+    ]),
+  ].join("\n");
+
+/** The newest progress of each run read in parts, from the bot's comments only. */
+export function progressOf(comments: StoreComment[]): Map<string, Progress> {
+  const out = new Map<string, Progress>();
+  for (const c of comments) {
+    if (c.user !== STORE_AUTHOR) continue;
+    const m = readMarkers(c.body);
+    if (m?.get("kind")?.[0] !== "progress") continue;
+    const key = m.get("run")?.[0] ?? "";
+    if (!/^\d{1,20}\/\d{1,4}$/.test(key)) continue;
+    const jobs: number[] = [];
+    for (const j of m.get("job") ?? [])
+      if (/^\d{1,20}$/.test(j)) jobs.push(Number(j));
+    out.set(key, { jobs });
+  }
+  return out;
+}
+
+/** The newest pending list's strikes: how many reconciles found each run gone. */
+export const pendingTries = (comments: StoreComment[]) =>
+  pendingCounts(comments, 0);
+/** The newest pending list's failures: how many reconciles failed each run. */
+export const pendingFails = (comments: StoreComment[]) =>
+  pendingCounts(comments, 1);
+
+/**
+ * A pending run the listing no longer shows, read from the runs API. It must
+ * still be a watched workflow's run that passed on this attempt; else it
+ * fails (and stays pending, so the job's failure shows it).
+ */
+function listedRun(
+  exec: Exec,
+  repo: string,
+  id: number,
+  attempt: number,
+): ListedRun {
+  const r = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/runs/${id}`,
+      "--jq",
+      "{path, run_attempt, conclusion, event, head_branch, head_sha, display_title}",
+    ]),
+  ) as {
+    path: string;
+    run_attempt: number;
+    conclusion: string | null;
+    event: string;
+    head_branch: string;
+    head_sha: string;
+    display_title: string;
+  };
+  const name = WORKFLOWS.find(
+    (w) => r.path === `.github/workflows/${WORKFLOW_FILES[w]}`,
+  );
+  const l: ListedRun | null = name
+    ? {
+        id,
+        attempt: r.run_attempt,
+        name,
+        event: r.event,
+        branch: r.head_branch,
+        sha: r.head_sha,
+        title: r.display_title,
+      }
+    : null;
+  if (
+    !l ||
+    r.conclusion !== "success" ||
+    r.run_attempt < attempt ||
+    !eligible(l)
+  )
+    throw new Error(`run ${id}/${attempt} is no longer a tracked run`);
+  return l;
+}
+
+/** The step summary's last line: how many runs wait for the next reconcile. */
+export const backlogLine = (left: number, retry: number) =>
+  `backlog: ${left} new, ${retry} to retry${left + retry ? " (the next completion's reconcile carries on)" : ""}`;
 
 const runLines = (run: RunInfo, done: Done[], notes: string[]) => [
   `Flaky tracker, ${runLabel(run)}, run ${run.runId} (passed on attempt ${run.attempt}):`,
@@ -1632,12 +2201,23 @@ function main(argv: string[]) {
   if (argv.includes("--reconcile")) {
     const repo = flag(argv, "repo");
     if (!REPO_RE.test(repo)) throw new Error("bad --repo");
-    const r = reconcile({ exec: realExec, repo, nowMs: Date.now() });
-    failed = r.failed;
+    // Each run's lines go to the log as it is done, so a job cut off still
+    // shows what it saved.
+    const r = reconcile({
+      exec: realExec,
+      repo,
+      nowMs: Date.now(),
+      onRun: (l) => console.log(l.map(inert).join("\n")),
+    });
+    // A run dropped as unreadable fails the job once, so it is seen.
+    failed = r.failed + r.dropped.length;
     lines = [
       `Flaky tracker reconcile, runs created in the last ${RERUN_DAYS + QUIET_DAYS} days and ${RECONCILE_HOURS} hours: ${r.tracked.length} run${r.tracked.length === 1 ? "" : "s"} tracked`,
       ...r.notes.map((n) => `  note: ${n}`),
       ...r.tracked.flatMap((t) => runLines(t.run, t.done, t.notes)),
+      // Both stay on the pending list: runs not started yet, and runs that
+      // failed this time and are saved to retry.
+      backlogLine(r.left, r.failed),
     ];
   } else {
     const run = runFromArgs(argv);
