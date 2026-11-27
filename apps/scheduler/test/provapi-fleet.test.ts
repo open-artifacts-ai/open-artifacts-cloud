@@ -2417,6 +2417,7 @@ describe("#433: no timers, leo with the rest", () => {
     // Only time can tell: the message comes back (wake.ts).
     expect(await fleetPass(f.env, NOW, f.opts)).toEqual({
       pass: "canary",
+      reason: "awaiting_probe",
       again: true,
     });
     expect(await queued()).toEqual([]);
@@ -2425,7 +2426,7 @@ describe("#433: no timers, leo with the rest", () => {
     // and what is left ends with their jobs (no again).
     expect(
       await fleetPass(f.env, NOW + wakeBackoffS(1) * 1_000, f.opts),
-    ).toEqual({ pass: "batch", again: false });
+    ).toEqual({ pass: "batch", reason: "fleet_jobs_queued", again: false });
     expect(await queued()).toEqual([rest]);
     expect(await stateKeys(`fleet_halt:${TARGET}:`)).toEqual([]);
   });
@@ -2500,7 +2501,11 @@ describe("#433: no timers, leo with the rest", () => {
         return probe(...a);
       },
     });
-    expect(r).toEqual({ pass: "canary", again: true });
+    expect(r).toEqual({
+      pass: "canary",
+      reason: "smoke_deferred",
+      again: true,
+    });
     expect(f.smokes).toEqual([]);
     expect(await stateKeys("fleet_smoke_")).toEqual([]);
     expect(await queued()).toEqual([]);
@@ -2805,6 +2810,15 @@ describe("#433: no timers, leo with the rest", () => {
     );
     expect(last.retried).toEqual([]);
     expect(last.acked).toEqual([0]);
+    const audit = await rows(
+      "SELECT detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ? ORDER BY id",
+      canary,
+    );
+    const held = { to: TARGET, canary, decision: "held", reason: "lease_held" };
+    expect(audit.map((row) => JSON.parse(String(row.detail)))).toEqual([
+      { ...held, retried: true },
+      { ...held, retried: false },
+    ]);
     // No more deliveries. The alerts tick must start the canary clock itself.
     await fleetMarks(f.env, NOW);
     const before = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS - 1);
@@ -2842,9 +2856,12 @@ describe("#433: no timers, leo with the rest", () => {
     const hang = {
       ...f.env,
       PLATFORM_DB: {
-        prepare: () => ({
-          bind: () => ({ first: () => new Promise<never>(() => {}) }),
-        }),
+        prepare: (sql: string) =>
+          sql.includes("INSERT INTO hosted_audit")
+            ? db.prepare(sql)
+            : {
+                bind: () => ({ first: () => new Promise<never>(() => {}) }),
+              },
       },
     } as unknown as ProvapiEnv;
     const { batch, acked, retried } = wakeBatch([1]);

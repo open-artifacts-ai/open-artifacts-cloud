@@ -560,6 +560,7 @@ export type FleetPass = "canary" | "batch" | "idle";
  */
 export interface FleetRun {
   pass: FleetPass;
+  reason: string;
   again: boolean;
 }
 
@@ -608,13 +609,14 @@ export async function fleetPass(
   now: number,
   o: FleetOptions = {},
 ): Promise<FleetRun> {
-  const need: Need = { again: false };
+  const need: Need = { again: false, reason: "no_jobs_queued" };
   const pass = await onePass(env, now, o, need);
-  return { pass, again: need.again };
+  return { pass, ...need };
 }
 
 /** Set by a pass when only time can finish what it left (FleetRun). */
 interface Need {
+  reason: string;
   again: boolean;
 }
 
@@ -635,6 +637,7 @@ async function onePass(
   await prune(db, now, st, target);
   if (target === null) {
     // With a canary set, fleet_halted opens for it (fleetConditions).
+    need.reason = "no_target";
     console.log("provapi fleet no_target");
     return "idle";
   }
@@ -657,16 +660,19 @@ async function onePass(
     need,
   );
   if (canaryId === null) {
+    need.reason = "no_canary";
     console.log("provapi fleet no_canary");
     return "idle";
   }
   if (!(await verified(db, now, st, target))) {
+    need.reason = "platform_unverified";
     console.log("provapi fleet holding: platform not verified");
     return "idle";
   }
   await trackBehind(db, now, st, target);
   await trackCanary(db, now, st, target, canaryId, mode);
   if (isHalted(st, target)) {
+    need.reason = "fleet_halted";
     console.log("provapi fleet halted", target);
     return "idle";
   }
@@ -678,6 +684,7 @@ async function onePass(
       ? "canary"
       : "idle";
   if (hold) {
+    need.reason = "awaiting_probe";
     console.log("provapi fleet holding");
     // A batch member not yet settled: its job's end, or a repeated probe
     // (need.again), moves it on.
@@ -714,7 +721,10 @@ async function onePass(
   // guards are what hold the cap and the halt.
   const open = await d1(db.prepare(OPEN).first<{ n: number }>());
   const settling = mode === "required" ? "batch" : "idle";
-  if ((open?.n ?? 0) > 0) return settling;
+  if ((open?.n ?? 0) > 0) {
+    need.reason = "fleet_jobs_open";
+    return settling;
+  }
   const { results } = await d1(
     db.prepare(BEHIND).bind(target, canaryId).all<{
       install_id: string;
@@ -750,7 +760,13 @@ async function onePass(
     )
       slots--;
   }
-  if (behind > 0) return slots < FLEET_CONCURRENCY ? settling : "idle";
+  if (behind > 0) {
+    if (slots < FLEET_CONCURRENCY) {
+      need.reason = "fleet_jobs_queued";
+      return settling;
+    }
+    return "idle";
+  }
   // Done only when every install it waits for is on the target and idle: a
   // busy one (a settings job, say) still on the old version, or busy on the
   // new one, is not upgraded yet. Its job's end is the next event.
@@ -768,8 +784,12 @@ async function onePass(
       return false;
     }
   });
-  if (waits) return settling;
+  if (waits) {
+    need.reason = "fleet_jobs_pending";
+    return settling;
+  }
   await markDone(db, now, st, target);
+  need.reason = "fleet_done";
   return "idle";
 }
 
@@ -938,6 +958,7 @@ async function canaryReady(
 ): Promise<boolean> {
   const db = env.PLATFORM_DB;
   const stuck = (why: string) => {
+    need.reason = `canary_${why}`;
     console.log("provapi fleet canary_blocked", why);
     return false;
   };
@@ -960,6 +981,7 @@ async function canaryReady(
   const openJob = last?.status === "queued" || last?.status === "running";
   if (canary.install_state !== "active" || canary.active_job_id !== null) {
     if (!openJob) return stuck("busy");
+    need.reason = "canary_job_open";
     console.log("provapi fleet canary_busy");
     return false;
   }
@@ -972,13 +994,17 @@ async function canaryReady(
   if (c > 0) return stuck("off_target");
   if (c < 0 && canary.health !== "ok" && !exempt) return stuck("unhealthy");
   if (!(await published(env, target))) {
+    need.reason = "release_unavailable";
     // The catalog may not have it yet: only time tells.
     need.again = true;
     return false;
   }
   if (c < 0) {
     const broken = canary.serving_mode !== "serving" || canary.health !== "ok";
-    await upgrade(env, manage, now, id, canary.version, target, broken, need);
+    if (
+      await upgrade(env, manage, now, id, canary.version, target, broken, need)
+    )
+      need.reason = "canary_job_queued";
     return false;
   }
   // On the target, its upgrade (if it had one) done and not just written. A
@@ -988,10 +1014,11 @@ async function canaryReady(
     last.status !== "done" &&
     last.error_code !== "canceled"
   ) {
+    need.reason = "canary_job_incomplete";
     console.log("provapi fleet canary_not_done");
     return false;
   }
-  if (!st.rows.has(soakedKey(target, id))) return false;
+  if (!st.rows.has(soakedKey(target, id))) return stuck("awaiting_probe");
   // FLEET_SMOKE "off": the soak alone, as before the smoke.
   if (fleetSmokeMode(env.FLEET_SMOKE) === "off") return true;
   if (st.rows.has(smokedKey(target, id))) return true;
@@ -1048,6 +1075,7 @@ async function smokeCanary(
       ? SMOKE_BUDGET_MS
       : Math.min(SMOKE_BUDGET_MS, o.left() - FLEET_SMOKE_CLEANUP_MS);
   if (budgetMs < SMOKE_CALL_MS) {
+    need.reason = "smoke_deferred";
     console.log("provapi fleet smoke deferred");
     need.again = true;
     return false;
@@ -1072,6 +1100,7 @@ async function smokeCanary(
     console.log("provapi fleet smoke passed", id, target, ...r.notes);
     return true;
   }
+  need.reason = `smoke_${r.kind}`;
   console.log("provapi fleet smoke", r.kind, r.check);
   if (r.kind === "budget") {
     need.again = true;
@@ -1171,7 +1200,10 @@ async function upgrade(
     );
   } catch (e) {
     console.error("provapi fleet install_failed", dutyCategory(e), installId);
-    if (need) need.again = true;
+    if (need) {
+      need.reason = "job_insert_failed";
+      need.again = true;
+    }
     return false;
   }
   // null: already queued for this target, at the cap, halted, held by the
@@ -1181,6 +1213,8 @@ async function upgrade(
       .bind(to)
       .first<{ install_id: string }>()
       .catch(() => null);
+    if (need)
+      need.reason = by ? "previous_batch_unsettled" : "job_insert_guard";
     if (by) console.log(`provapi fleet held by ${by.install_id}`);
     return false;
   }

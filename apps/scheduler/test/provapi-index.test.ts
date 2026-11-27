@@ -1,4 +1,8 @@
-import { createExecutionContext } from "cloudflare:test";
+import {
+  createExecutionContext,
+  createMessageBatch,
+  getQueueResult,
+} from "cloudflare:test";
 import { REVOKE_MIN_VERSION } from "@oa/provision/versions";
 import {
   FakeWorkflow,
@@ -8,6 +12,7 @@ import {
   JOB_START_GRACE_MS,
   SCHEDULER_TICK_KEY,
 } from "@oa/provisioning-contract/state";
+import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import {
   afterEach,
   beforeAll,
@@ -24,7 +29,11 @@ import scheduler, {
   REVOKE_JOB,
   SYNC_JOB,
 } from "../src/index.js";
-import { FLEET_LEASE_KEY } from "../src/provapi/fleet.js";
+import {
+  FLEET_LEASE_KEY,
+  FLEET_VERIFIED_PREFIX,
+  fleetRequestId,
+} from "../src/provapi/fleet.js";
 import { DUTY_TIMEOUT_MS, provapiTick } from "../src/provapi/index.js";
 import { getState } from "../src/provapi/state.js";
 import { wakeBatch } from "./provapi/batch.js";
@@ -35,6 +44,7 @@ import {
   install,
   installId,
   job,
+  lifecycle,
   migrate,
   reset,
   rows,
@@ -231,6 +241,100 @@ describe("scheduled() and the provapi duties", () => {
     );
     expect(lines.filter((l) => l.startsWith("provapi fleet"))).toEqual([]);
     expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - 1_000);
+  });
+
+  it("replays the 09:43Z staging deploy wake through the consumer and records its canary decision", async () => {
+    const canary = "i33m6mbc3zuz";
+    const to = "0.268.0";
+    const tag = `v${to}`;
+    const at = Date.parse("2026-11-27T09:43:10.878Z");
+    vi.spyOn(Date, "now").mockReturnValue(at);
+    const { env, manage } = fakes();
+    await install(canary, { version: "0.265.0" });
+    await lifecycle(canary, { serving_mode: "serving", health: "ok" });
+    await job(canary, {
+      kind: "upgrade",
+      workflow: "manage_install",
+      actor_kind: "system",
+      actor_key: SYSTEM_ACTOR.key,
+      request_id: fleetRequestId(canary, "0.265.0"),
+      args: JSON.stringify({ from: "0.264.0", to: "0.265.0" }),
+      status: "done",
+    });
+    for (let n = 0; n < 6; n++) {
+      const id = installId();
+      await install(id, { version: "0.251.1" });
+      await lifecycle(id, { serving_mode: "serving", health: "ok" });
+      await job(id, {
+        kind: "upgrade",
+        workflow: "manage_install",
+        actor_kind: "system",
+        actor_key: SYSTEM_ACTOR.key,
+        request_id: fleetRequestId(id, "0.265.0"),
+        args: JSON.stringify({ from: "0.251.1", to: "0.265.0" }),
+        status: "failed",
+        error_code: "migration_held",
+      });
+    }
+    await insert("platform_state", {
+      key: FLEET_VERIFIED_PREFIX + to,
+      value: at - 676,
+      updated_at: at - 676,
+    });
+    const batch = createMessageBatch("oa-s-fleet-wake", [
+      {
+        id: "deploy",
+        timestamp: at,
+        attempts: 1,
+        body: { env: "staging", tag },
+      },
+    ]);
+    await scheduler.queue(batch, {
+      ...env,
+      FLEET_CANARY: canary,
+      FLEET_SMOKE: "required",
+      CF_VERSION_METADATA: {
+        id: "test",
+        tag,
+        timestamp: new Date(at).toISOString(),
+      },
+      PROVISIONER: fakeProvisionerRpc({
+        releases: [
+          {
+            version: to,
+            publishedAt: 1,
+            variants: ["release"],
+            installable: true,
+            latest: true,
+          },
+        ],
+      }) as Env["PROVISIONER"],
+    });
+    expect(await getQueueResult(batch, createExecutionContext())).toMatchObject(
+      {
+        explicitAcks: ["deploy"],
+        retryMessages: [],
+      },
+    );
+    expect(
+      await rows(
+        "SELECT install_id, request_id FROM jobs WHERE status = 'queued'",
+      ),
+    ).toEqual([{ install_id: canary, request_id: fleetRequestId(canary, to) }]);
+    expect(manage.created).toHaveLength(1);
+    const audit = await rows(
+      "SELECT actor, detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ?",
+      canary,
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0]?.actor).toBe(SYSTEM_ACTOR.key);
+    expect(JSON.parse(String(audit[0]?.detail))).toEqual({
+      to,
+      canary,
+      decision: "canary",
+      reason: "canary_job_queued",
+      retried: false,
+    });
   });
 
   it("queue(): a fleet wake runs the fleet only, acks its message and writes no tick", async () => {

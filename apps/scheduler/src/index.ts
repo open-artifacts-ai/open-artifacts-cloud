@@ -856,7 +856,7 @@ export default {
   // wake and every ManageInstall job's end; each batch is one fleet pass under
   // the fleet lease (provapi/wake.ts). Where the smoke is required the
   // only start of a fleet run; where it is off the tick's fleet duty
-  // also runs one. Never throws.
+  // also runs one. A failed audit write leaves the batch for redelivery.
   async queue(batch, env) {
     await fleetWake(batch, env, Date.now());
   },

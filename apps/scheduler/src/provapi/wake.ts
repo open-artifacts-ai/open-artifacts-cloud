@@ -30,8 +30,10 @@
 // The body is never read: the fleet's target is this Worker's own version
 // tag, so a message for an older release, or a job of any kind, is just one
 // more pass.
+
+import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import type { FleetEnv, FleetOptions, FleetRun } from "./fleet.js";
-import { fleetTick } from "./fleet.js";
+import { fleetCanary, fleetTarget, fleetTick } from "./fleet.js";
 import { type DutyOutcome, runDuties } from "./run.js";
 
 /**
@@ -80,8 +82,8 @@ export type WakeOutcome = DutyOutcome | "held";
  * only time can finish what it left (FleetRun.again), the lease was held or
  * the run failed, the message with the fewest deliveries (and retries left)
  * comes back after wakeBackoffS; the rest are acked, so duplicates collapse
- * into one chain. Otherwise every message is acked. Never throws; logs one
- * fixed line.
+ * into one chain. Otherwise every message is acked. The decision is recorded before acknowledgment, so a failed audit write
+ * leaves the batch available for redelivery.
  */
 export async function fleetWake(
   batch: MessageBatch<unknown>,
@@ -113,6 +115,19 @@ export async function fleetWake(
         (back === undefined || m.attempts < back.attempts)
       )
         back = m;
+  const canary = fleetCanary(env.FLEET_CANARY);
+  const detail = {
+    retried: back !== undefined,
+    to: fleetTarget(env.CF_VERSION_METADATA),
+    canary,
+    decision: run?.pass ?? outcome,
+    reason: run?.reason ?? (outcome === "held" ? "lease_held" : outcome),
+  };
+  await env.PLATFORM_DB.prepare(
+    "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, 'fleet.wake', ?4)",
+  )
+    .bind(now, SYSTEM_ACTOR.key, canary ?? "-", JSON.stringify(detail))
+    .run();
   for (const m of batch.messages) {
     if (m === back) m.retry({ delaySeconds: wakeBackoffS(m.attempts) });
     else m.ack();
