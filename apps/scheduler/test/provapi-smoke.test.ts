@@ -1,5 +1,5 @@
 import type { GetArtifactResult } from "@oa/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SMOKE_BUS_SKIPPED,
   SMOKE_SHARE_SKIPPED,
@@ -475,6 +475,55 @@ describe("the canary smoke", () => {
       });
       expect(c.arts).toEqual([]);
     });
+
+  it("completes the staging checks in nine seconds with the ten-second budget", async () => {
+    let elapsed = 0;
+    const c = canary();
+    const fetch: SmokeFetch = (url, init) => {
+      if (init.method !== "DELETE") elapsed += 750;
+      return c.fetch(url, init);
+    };
+    const result = await smoke(
+      input(c, {
+        bus: false,
+        clock: () => elapsed,
+        fetch,
+        budgetMs: 10_000,
+        callMs: 3_000,
+      }),
+    );
+    expect(result).toEqual({ ok: true, notes: [SMOKE_BUS_SKIPPED] });
+    expect(elapsed).toBe(9_000);
+    expect(live(c)).toEqual([]);
+  });
+
+  it("a request limited by the remaining budget expires as budget and cleans up", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = canary();
+      let elapsed = 0;
+      const fetch: SmokeFetch = (url, init) => {
+        if (new URL(url).pathname === "/mcp")
+          return new Promise<Response>(() => {});
+        if (init.method !== "DELETE") elapsed += 750;
+        return c.fetch(url, init);
+      };
+      const result = smoke(
+        input(c, {
+          bus: false,
+          clock: () => elapsed,
+          fetch,
+          budgetMs: 10_000,
+          callMs: 3_000,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(2_500);
+      expect(await result).toEqual({ ok: false, kind: "budget", check: "mcp" });
+      expect(live(c)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("the budget: past it, the run stops as budget, and still cleans up", async () => {
     let t = 0;

@@ -32,7 +32,7 @@
 //
 // Never logged or stored: the PAT, any response body, the target's address.
 // Results name a check and a kind only.
-import { within } from "./env.js";
+import { Stall, within } from "./env.js";
 
 /** Every smoke artifact's title starts with this; the sweep deletes only these. */
 export const SMOKE_TITLE_PREFIX = "fleet-smoke-";
@@ -154,8 +154,8 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     init: RequestInit = {},
     o2: { auth?: boolean; noBudget?: boolean } = {},
   ): Promise<Response> => {
-    if (!o2.noBudget && clock() + callMs > deadline)
-      throw new Fail("budget", check);
+    const remainingMs = o2.noBudget ? Infinity : deadline - clock();
+    if (remainingMs <= 0) throw new Fail("budget", check);
     const headers = new Headers(init.headers);
     if (o2.auth !== false) headers.set("authorization", `Bearer ${token}`);
     let res: Response;
@@ -166,10 +166,12 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
           headers,
           redirect: "manual",
         }),
-        callMs,
+        Math.min(callMs, remainingMs),
       );
-    } catch {
-      // A Stall (timeout) or a network error.
+    } catch (error) {
+      // Only the shared deadline expiring counts as budget exhaustion.
+      if (error instanceof Stall && remainingMs < callMs)
+        throw new Fail("budget", check);
       throw new Fail("transport", check);
     }
     if (res.status >= 500 || res.status === 429) {
