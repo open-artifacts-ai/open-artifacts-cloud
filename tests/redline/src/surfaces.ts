@@ -340,6 +340,8 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/bus/roles/:id":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  "POST /api/v1/bus/roles/proposals/:id":
+    "interactive-only: the member answers the handover card in a browser session; A at B is deny-only",
   // #1567: reached through bus/routes.ts roleWriter, like the role writes.
   "PUT /api/v1/bus/links":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
@@ -464,6 +466,7 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "PUT /api/v1/bus/share-notices",
   "PUT /api/v1/bus/roles",
   "DELETE /api/v1/bus/roles/:id",
+  "POST /api/v1/bus/roles/proposals/:id",
   "PUT /api/v1/bus/links",
   "DELETE /api/v1/bus/links/:id",
   "PUT /api/v1/bus/reach",
@@ -817,6 +820,22 @@ export const DROPPED: Readonly<
         file: ROLE_TESTS,
         describe: ROLE_D,
         test: "a PAT may read but never set or remove; guests, capped and anonymous callers get nothing",
+      },
+    ],
+  },
+  "org POST /api/v1/bus/roles/proposals/:id": {
+    why: "interactive-only",
+    coveredBy: [
+      INSTANCE,
+      {
+        file: "apps/server/test/bus/role-card.3132.test.ts",
+        describe: "the handover card (#3132)",
+        test: "no token answers for the member: a PAT, an OAuth grant or a machine token; guests and anonymous get nothing",
+      },
+      {
+        file: "apps/server/test/bus/role-card.3132.test.ts",
+        describe: "the handover card (#3132)",
+        test: "Yes moves the role to the asking session and audits confirmed and moved; it is single use",
       },
     ],
   },
