@@ -33,14 +33,15 @@ const pkg = join(import.meta.dirname, "..");
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds exactly main's 329 cases, in main's order, plus the declared additions", () => {
+  // main's 329 at #1730's base, less the 217 cloud #264 step 2 retired.
+  it("manifest.json holds exactly main's 112 cases, in main's order, plus the declared additions", () => {
     const m = parseManifest(read("live/manifest.json"));
     const all = m.cases.map((c) => ({ file: c.file, name: c.name }));
     const key = (c: { file: string; name: string }) =>
       `${c.file}\u0000${c.name}`;
     const added = new Set(CASES_ADDED_SINCE_1730.map(key));
     const base = new Set(main.manifest.map(key));
-    expect(main.manifest).toHaveLength(329);
+    expect(main.manifest).toHaveLength(112);
     expect(added.size).toBe(CASES_ADDED_SINCE_1730.length);
     // Every declared addition is in the manifest and not already main's.
     for (const k of added) {
@@ -83,7 +84,7 @@ describe("the same cases", () => {
         expect(hit, `${f}: "${name}" is not a manifest case`).toBe(true);
       }
     }
-    expect(literal).toBeGreaterThan(30);
+    expect(literal).toBeGreaterThan(10);
   });
 });
 

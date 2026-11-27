@@ -1,15 +1,19 @@
 import { afterAll, beforeAll, describe, it } from "vitest";
 import {
+  AFTER_CHAINS,
+  CHAINS,
   CLEANUP_TIMEOUT_MS,
   caseTimeoutMs,
   cleanupInstalls,
   type Outcome,
   PROBES,
+  type ProbeId,
   type Run,
   startChains,
 } from "../src/provisioning.ts";
 import { liveRun, rawTargets } from "../src/provisioning-live.ts";
 import { label, proof } from "../src/report.ts";
+import { RETIRED_PROBE_IDS } from "../src/retired-split.ts";
 
 // The provisioning probes (design v7 12.2) against the staging Provisioning
 // API as the GitHub OIDC principal. The probes run as chains, all at once
@@ -18,6 +22,13 @@ import { label, proof } from "../src/report.ts";
 // chain, later probes use what earlier ones made. Each case awaits its own
 // probe; every case is listed in live/manifest.json. Local mode has no API:
 // each case is not-applicable.
+
+// Cloud #264 step 2 (red-line page v3): the probes the page moves to PR CI
+// or deletes are out of the live run (src/retired-split.ts names what guards
+// each now). Their code stays, with its fake-API unit tests, until the
+// red-line cleanup step.
+const live = (ids: readonly ProbeId[]) =>
+  ids.filter((id) => !RETIRED_PROBE_IDS.has(id));
 
 let run: Run | undefined;
 let why: string | undefined;
@@ -31,7 +42,10 @@ beforeAll(() => {
     return;
   }
   run = liveRun(env, rawTargets(env.REDLINE_TARGETS));
-  plan = startChains(run);
+  plan = startChains(run, {
+    chains: CHAINS.map((c) => ({ ...c, probes: live(c.probes) })),
+    after: live(AFTER_CHAINS),
+  });
 });
 
 // Once every chain is done (so it never races one): whatever a probe created
@@ -42,7 +56,7 @@ afterAll(async () => {
 }, CLEANUP_TIMEOUT_MS + caseTimeoutMs("P33"));
 
 describe("provisioning", () => {
-  for (const p of PROBES)
+  for (const p of PROBES.filter((p) => !RETIRED_PROBE_IDS.has(p.id)))
     it(
       `${p.id}: ${p.title}`,
       async (ctx) => {

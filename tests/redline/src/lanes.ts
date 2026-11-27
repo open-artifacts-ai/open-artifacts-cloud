@@ -212,23 +212,6 @@ export const CLAIMS: Record<string, Claims> = {
       "provisioning-api": ordered("prov-done"),
     },
   },
-  "live/provisioner.test.ts": {
-    state: {
-      ...installs(),
-      // Its own signups rows and queue messages on staging's platform D1, and
-      // the provisioner's work on them. It never changes an install: rl-a is
-      // read (its row before and after) and checked with verifyTarget.
-      "provisioner-plane": "write",
-    },
-    buckets: {
-      ...installBuckets(),
-      // createTaken spends RL_PV_WRITE / RL_PV_PRE_IP, which provisioning's
-      // P25 and friends also spend: its own lane, beside prov, and createTaken
-      // waits for the prov lane's exit (waitFor("prov-done", { orLaneExit:
-      // "prov" }); nothing marks it). The replay case spends none.
-      "provisioning-api": ordered("prov-done"),
-    },
-  },
 };
 
 export interface Lane {
@@ -266,13 +249,10 @@ const shardLane = (
 });
 
 /**
- * The run (#1730, #26, cloud #202): one phase, eight lanes.
+ * The run (#1730, #26, cloud #202): one phase, seven lanes. Cloud #264
+ * step 2 took out the provisioner lane: both of its cases left the live run.
  * - prov: provisioning (337.7 s in run 42402998826), P34 behind the broker
  *   barrier;
- * - provisioner: #859's provisioner file, in a lane of its own so its 60 s
- *   replay watch runs beside prov instead of after it (the job would end
- *   about 180 s later). Its createTaken spends the provisioning-api bucket,
- *   so that case waits for prov's exit (the prov-done barrier);
  * - surfaces, surfaces-b: surfaces split in two by case (#26; REDLINE_SURFACES_SHARD
  *   a and b, src/surfaces.ts SHARD_B_PREFIXES): 430 s in run 43007228059 as one
  *   lane, about 235 s each (about 41 s of setup and cleanup in each, the
@@ -288,7 +268,6 @@ const shardLane = (
 export const PLAN: readonly Phase[] = [
   [
     lane("prov", "provisioning"),
-    lane("provisioner", "provisioner"),
     shardLane("surfaces", "surfaces", "a", "REDLINE_SURFACES_SHARD"),
     shardLane("surfaces-b", "surfaces", "b", "REDLINE_SURFACES_SHARD"),
     lane("creds", "credentials"),
@@ -301,15 +280,13 @@ export const PLAN: readonly Phase[] = [
 /**
  * The plan #1730 replaced, kept as the kill switch (REDLINE_PLAN=serial).
  * Phase 1: signin (the broker) and edge, with nothing beside them. Phase 2:
- * the other install files, one at a time, beside provisioning and the
- * provisioner file (its createTaken waits for provisioning's lane to exit).
+ * the other install files, one at a time, beside provisioning.
  */
 export const PLAN_SERIAL: readonly Phase[] = [
   [lane("front", "signin", "edge")],
   [
     lane("install", "credentials", "live", "guard", "surfaces"),
     lane("prov", "provisioning"),
-    lane("provisioner", "provisioner"),
   ],
 ];
 

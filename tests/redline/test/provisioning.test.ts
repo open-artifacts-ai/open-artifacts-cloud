@@ -60,6 +60,7 @@ import {
   PRE_PROD_REASON,
   parseManifest,
 } from "../src/report.ts";
+import { RETIRED_PROBE_IDS } from "../src/retired-split.ts";
 import { newRecipient, openSealed, parseCreds } from "../src/seal.ts";
 import {
   parseProd,
@@ -227,7 +228,7 @@ describe("the probes on a conforming staging fake", () => {
 
   // A renamed probe title is a required case that did not run plus a case not
   // in the manifest (run 41322062244's P22): catch it before the live run.
-  it("live/manifest.json lists every probe by the name the reporter gives it, and nothing else", () => {
+  it("live/manifest.json lists every live probe by the name the reporter gives it, and nothing else", () => {
     const file = "live/provisioning.test.ts";
     const m = parseManifest(
       readFileSync(
@@ -240,13 +241,22 @@ describe("the probes on a conforming staging fake", () => {
         .filter((x) => x.file === file)
         .map((x) => caseKey(x.file, x.name)),
     );
+    // Cloud #264 step 2: the probes the red-line page moves to PR CI or
+    // deletes run no more live (src/retired-split.ts); their code stays here.
+    const live = PROBES.filter((p) => !RETIRED_PROBE_IDS.has(p.id));
     const named = new Set(
-      PROBES.map((p) => caseKey(file, `provisioning > ${p.id}: ${p.title}`)),
+      live.map((p) => caseKey(file, `provisioning > ${p.id}: ${p.title}`)),
     );
     const show = (k: string) => k.split("\u0000")[1];
     expect([...listed].filter((k) => !named.has(k)).map(show)).toEqual([]);
     expect([...named].filter((k) => !listed.has(k)).map(show)).toEqual([]);
-    expect(listed.size).toBe(PROBES.length);
+    expect(listed.size).toBe(live.length);
+    expect(RETIRED_PROBE_IDS.size).toBe(27);
+    for (const id of RETIRED_PROBE_IDS)
+      expect(
+        PROBES.some((p) => p.id === id),
+        id,
+      ).toBe(true);
   });
 
   // The gate matches these by exact name and reason: no run-specific text.

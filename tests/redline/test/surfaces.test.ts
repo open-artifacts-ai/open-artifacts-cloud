@@ -36,6 +36,11 @@ import {
 } from "../src/refused.ts";
 import { parseManifest } from "../src/report.ts";
 import {
+  KEPT_SURFACES,
+  surfaceCite,
+  surfaceCiteGaps,
+} from "../src/retired-split.ts";
+import {
   A_AT_A,
   citationGaps,
   cleanup,
@@ -56,6 +61,7 @@ import {
   ORG_FRESH,
   type ProbeCase,
   pickOwnGrant,
+  probeCases,
   readRepoFile,
   runRead,
   SHARD_B_PREFIXES,
@@ -502,7 +508,7 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     expect(GRANT_CASE_TIMEOUT_MS).toBeGreaterThanOrEqual(3 * GRANT_LIST_MS);
   });
 
-  it("are all in the required-case manifest, and no drop is", () => {
+  it("the kept ones are in the required-case manifest, and no drop or retired case is", () => {
     const m = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
@@ -511,10 +517,12 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => c.file === "live/surfaces.test.ts")
         .map((c) => c.name),
     );
-    const want = [
-      "every ROUTE_POLICY route, MCP tool and content route has a case",
-      ...cases.map((c) => c.name),
-    ].map((n) => `surface probes (cross-install) > ${n}`);
+    // Cloud #264 step 2: only KEPT_SURFACES stay live (nightly); the rest
+    // moved to PR CI or were deleted (src/retired-split.ts).
+    const want = cases
+      .filter((c) => KEPT_SURFACES.has(c.name))
+      .map((c) => `surface probes (cross-install) > ${c.name}`);
+    expect(want).toHaveLength(KEPT_SURFACES.size);
     expect([...listed].sort()).toEqual([...want].sort());
   });
 });
@@ -1415,5 +1423,51 @@ describe("hiddenToolGate", () => {
     const r = await hiddenToolGate(c(), { a: t, b: t, credA: w, credB: w });
     expect(r).toBe(true);
     expect(seen).toContain("tools/list");
+  });
+});
+
+describe("surfaceCite: the matrix's named test for a retired surface case (cloud #264 step 2)", () => {
+  it("names the matrix test for a cookie leg (REST, org, space) and a PAT leg on MCP", () => {
+    expect(surfaceCite("artifact rest get [session]")).toMatchObject({
+      describe: "artifact surfaces (sync stale 8 days)",
+      test: "%s",
+      each: { table: "SURFACES", value: "rest get", caller: "orgAdmin" },
+    });
+    expect(surfaceCite("artifact mcp get_artifact [pat]")).toMatchObject({
+      each: {
+        table: "SURFACES",
+        value: "mcp get_artifact",
+        caller: "orgAdmin",
+      },
+    });
+    expect(surfaceCite("org GET /api/v1/me [session]")).toMatchObject({
+      describe: "instance routes",
+      test: "every caller",
+      each: { table: "ORG_SURFACES", value: "GET /api/v1/me" },
+    });
+  });
+
+  it("has none where the matrix sends another credential: such a case stays live", () => {
+    // The matrix sends REST and org probes with the cookie, so a PAT leg has no test.
+    for (const n of [
+      "artifact rest get [pat]",
+      "org GET /api/v1/me [pat]",
+      "artifact mcp get_artifact [oauth]",
+      "artifact no-such-surface [session]",
+      "plain name",
+    ]) {
+      expect(surfaceCite(n), n).toBeNull();
+      if (probeCases().some((c) => c.name === n))
+        expect(KEPT_SURFACES.has(n), n).toBe(true);
+    }
+  });
+
+  it("flags a parameter the matrix's table no longer has", () => {
+    const c = surfaceCite("artifact rest get [session]");
+    if (!c) throw new Error("no cite");
+    expect(
+      surfaceCiteGaps("x", { ...c, each: { ...c.each, value: "gone" } }),
+    ).toEqual(["x: the matrix's SURFACES has no gone"]);
+    expect(surfaceCiteGaps("x", c)).toEqual([]);
   });
 });
