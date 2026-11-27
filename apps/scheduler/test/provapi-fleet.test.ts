@@ -2799,13 +2799,6 @@ describe("#433: no timers, leo with the rest", () => {
     );
     expect(two.retried).toEqual([{ i: 1, delaySeconds: wakeBackoffS(1) }]);
     expect(two.acked).toEqual([0]);
-    const audit = await rows(
-      "SELECT detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ?",
-      canary,
-    );
-    expect(audit.map((row) => JSON.parse(String(row.detail)))).toEqual([
-      { to: TARGET, canary, decision: "held", reason: "lease_held" },
-    ]);
     expect(lines).toEqual([
       "provapi fleet overlap",
       "provapi fleet wake held messages=2 retried=1 again=1",
@@ -2817,6 +2810,15 @@ describe("#433: no timers, leo with the rest", () => {
     );
     expect(last.retried).toEqual([]);
     expect(last.acked).toEqual([0]);
+    const audit = await rows(
+      "SELECT detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ? ORDER BY id",
+      canary,
+    );
+    const held = { to: TARGET, canary, decision: "held", reason: "lease_held" };
+    expect(audit.map((row) => JSON.parse(String(row.detail)))).toEqual([
+      { ...held, retried: true },
+      { ...held, retried: false },
+    ]);
     // No more deliveries. The alerts tick must start the canary clock itself.
     await fleetMarks(f.env, NOW);
     const before = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS - 1);

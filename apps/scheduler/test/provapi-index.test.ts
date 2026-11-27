@@ -333,6 +333,7 @@ describe("scheduled() and the provapi duties", () => {
       canary,
       decision: "canary",
       reason: "canary_job_queued",
+      retried: false,
     });
   });
 
