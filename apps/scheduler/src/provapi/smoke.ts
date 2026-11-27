@@ -147,40 +147,45 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     broker = o.brokerOrigin ? new URL(o.brokerOrigin).origin : null;
   } catch {}
 
-  /** One call; transport failures and the budget throw Fail. */
+  /** One request deadline covers headers, reading or discarding the body. */
   const call = async (
     check: SmokeCheck,
     path: string,
     init: RequestInit = {},
-    o2: { auth?: boolean; noBudget?: boolean } = {},
-  ): Promise<Response> => {
+    o2: { auth?: boolean; noBudget?: boolean; discard?: boolean } = {},
+  ) => {
     if (deadline !== undefined && !o2.noBudget && clock() + callMs > deadline)
       throw new Fail("budget", check);
     const headers = new Headers(init.headers);
     if (o2.auth !== false) headers.set("authorization", `Bearer ${token}`);
-    let res: Response;
+    const controller = new AbortController();
+    const request = async () => {
+      const res = await o.fetch(`${origin}${path}`, {
+        ...init,
+        headers,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      let text = "";
+      if (!res.ok || o2.discard || init.method === "DELETE") {
+        await res.body?.cancel();
+      } else {
+        text = await res.text();
+      }
+      if (res.status >= 500 || res.status === 429)
+        throw new Fail("transport", check);
+      return { status: res.status, headers: res.headers, text };
+    };
     try {
-      res = await within(
-        o.fetch(`${origin}${path}`, {
-          ...init,
-          headers,
-          redirect: "manual",
-        }),
-        callMs,
-      );
+      return await within(request(), callMs);
     } catch {
-      // A Stall (timeout) or a network error.
+      controller.abort();
       throw new Fail("transport", check);
     }
-    if (res.status >= 500 || res.status === 429) {
-      await res.body?.cancel();
-      throw new Fail("transport", check);
-    }
-    return res;
   };
-  const json = async (check: SmokeCheck, res: Response): Promise<unknown> => {
+  const json = (check: SmokeCheck, res: { text: string }): unknown => {
     try {
-      return await res.json();
+      return JSON.parse(res.text);
     } catch {
       throw new Fail("assert", check);
     }
@@ -188,10 +193,6 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
   const expect = (check: SmokeCheck, ok: boolean) => {
     if (!ok) throw new Fail("assert", check);
   };
-  const drop = async (res: Response) => {
-    await res.body?.cancel().catch(() => undefined);
-  };
-
   let artifactId: string | null = null;
   let shared = false;
   const notes: string[] = [];
@@ -200,7 +201,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     // The canary runs the release: /healthz, public, as the fleet probes it.
     const hz = await call("health", "/healthz", {}, { auth: false });
     expect("health", hz.status === 200);
-    const h = (await json("health", hz)) as Record<string, unknown> | null;
+    const h = json("health", hz) as Record<string, unknown> | null;
     expect(
       "health",
       h?.ok === true &&
@@ -212,14 +213,12 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     // sign-in
     const me = await call("signin", "/api/v1/me");
     if (me.status === 401 || me.status === 403) {
-      await drop(me);
       // A revoked token, or PAT auth broken by this release: never a pass.
       throw new Fail("config", "token_rejected");
     }
     expect("signin", me.status === 200);
-    const user = (
-      (await json("signin", me)) as { user?: Record<string, unknown> }
-    )?.user;
+    const user = (json("signin", me) as { user?: Record<string, unknown> })
+      ?.user;
     expect(
       "signin",
       typeof user?.id === "string" && typeof user.email === "string",
@@ -242,12 +241,17 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     const prov = await call("signin", "/auth/providers", {}, { auth: false });
     expect("signin", prov.status === 200);
     const providers = (
-      (await json("signin", prov)) as { providers?: { id?: unknown }[] }
+      json("signin", prov) as { providers?: { id?: unknown }[] }
     )?.providers;
     expect("signin", Array.isArray(providers) && providers.length > 0);
     if (providers?.some((p) => p?.id === "google")) {
-      const g = await call("signin", "/auth/login/google", {}, { auth: false });
-      await drop(g);
+      const g = await call(
+        "signin",
+        "/auth/login/google",
+        {},
+        { auth: false, discard: true },
+      );
+
       expect("signin", g.status === 302);
       const loc = g.headers.get("location") ?? "";
       let url: URL | null = null;
@@ -267,7 +271,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     // sweep: smoke's own leftovers only.
     const list = await call("sweep", "/api/v1/artifacts?scope=mine&limit=100");
     expect("sweep", list.status === 200);
-    const items = ((await json("sweep", list)) as { items?: unknown[] })?.items;
+    const items = (json("sweep", list) as { items?: unknown[] })?.items;
     expect("sweep", Array.isArray(items));
     for (const it of items as {
       id?: unknown;
@@ -286,7 +290,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
         `/api/v1/artifacts/${encodeURIComponent(it.id)}`,
         { method: "DELETE" },
       );
-      await drop(d);
+
       expect("sweep", d.status === 204 || d.status === 200 || d.status === 404);
     }
 
@@ -305,7 +309,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
       }),
     });
     expect("publish", pub.status === 201);
-    const made = (await json("publish", pub)) as {
+    const made = json("publish", pub) as {
       id?: unknown;
       version?: unknown;
     };
@@ -316,7 +320,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     // read
     const vs = await call("read", `${art}/versions`);
     expect("read", vs.status === 200);
-    const vj = (await json("read", vs)) as
+    const vj = json("read", vs) as
       | { items?: { version?: unknown; entry?: unknown }[] }
       | { version?: unknown; entry?: unknown }[];
     const v0 = (Array.isArray(vj) ? vj : vj?.items)?.[0];
@@ -332,7 +336,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
         .join("/")}`,
     );
     expect("read", file.status === 200);
-    expect("read", (await file.text()) === content);
+    expect("read", file.text === content);
 
     // share, with no email: the target is a member, so the server sends
     // none. The unshare is in the finally.
@@ -348,11 +352,11 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
         body: JSON.stringify({ email: shareTo, role: "viewer" }),
       });
       expect("share", put.status === 200 || put.status === 201);
-      const sj = (await json("share", put)) as { emailed?: unknown };
+      const sj = json("share", put) as { emailed?: unknown };
       expect("share", sj?.emailed === false);
       const ls = await call("share", `${art}/shares`);
       expect("share", ls.status === 200);
-      const lj = (await json("share", ls)) as
+      const lj = json("share", ls) as
         | { email?: unknown }[]
         | { items?: { email?: unknown }[]; shares?: { email?: unknown }[] };
       const rows = Array.isArray(lj) ? lj : (lj?.items ?? lj?.shares ?? []);
@@ -374,7 +378,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       });
       expect("mcp", r.status === 200);
-      const text = await r.text();
+      const text = r.text;
       let msg: unknown;
       try {
         msg = JSON.parse(text);
@@ -416,7 +420,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     else {
       const ping = await call("bus", "/api/v1/bus/ping");
       expect("bus", ping.status === 200);
-      const pj = (await json("bus", ping)) as { ok?: unknown } | null;
+      const pj = json("bus", ping) as { ok?: unknown } | null;
       expect("bus", pj?.ok === true);
     }
   } catch (e) {
@@ -441,7 +445,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
               { method: "DELETE" },
               { noBudget: true },
             );
-            await drop(un);
+
             if (result.ok && !(un.status === 204 || un.status === 200))
               result = { ok: false, kind: "assert", check: "share" };
           } catch (e) {
@@ -461,7 +465,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
             noBudget: true,
           },
         );
-        await drop(d);
+
         if (result.ok && !(d.status === 204 || d.status === 200))
           result = { ok: false, kind: "assert", check: "delete" };
       }
