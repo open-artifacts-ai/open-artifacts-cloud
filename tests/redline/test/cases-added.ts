@@ -210,8 +210,11 @@ export const CASES_ADDED_SINCE_1730: readonly { file: string; name: string }[] =
       "org GET /api/v1/me/teammates [session]",
       "org POST /api/v1/me/onboarding/listens-asked [session]",
       "artifact mcp get_comment_picture [pat]",
+      "org GET /api/v1/me/handle [session]",
+      "org GET /api/v1/me/handle [pat]",
       "org POST /api/v1/me/agent-listens [session]",
       "org GET /api/v1/me/agent-asks/history [session]",
+      "org POST /api/v1/bus/roles/proposals/:id [session]",
     ].map((n) => ({
       file: "live/surfaces.test.ts",
       name: `surface probes (cross-install) > ${n}`,
