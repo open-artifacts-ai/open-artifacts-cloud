@@ -285,6 +285,11 @@ const DISCONNECT: Citation = {
     "directory disconnect: cookie sessions only, plus the platform system job",
 };
 
+// The decision route first shipped in v0.266.0. Classify it only in overlays
+// whose public policy table registers it.
+const proposalDecision = "POST /api/v1/bus/roles/proposals/:id";
+const hasProposalDecision = Object.hasOwn(ROUTE_POLICY, proposalDecision);
+
 /**
  * Routes and tools no case reaches, each only through a recorded drop
  * (DROPPED), with why. The coverage check fails on any other unreached
@@ -340,6 +345,10 @@ export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
   "DELETE /api/v1/bus/roles/:id":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
+  ...(hasProposalDecision && {
+    [proposalDecision]:
+      "interactive-only: the member answers the handover card in a browser session; A at B is deny-only",
+  }),
   // #1567: reached through bus/routes.ts roleWriter, like the role writes.
   "PUT /api/v1/bus/links":
     "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
@@ -464,6 +473,7 @@ export const INTERACTIVE_ONLY: readonly string[] = [
   "PUT /api/v1/bus/share-notices",
   "PUT /api/v1/bus/roles",
   "DELETE /api/v1/bus/roles/:id",
+  ...(hasProposalDecision ? [proposalDecision] : []),
   "PUT /api/v1/bus/links",
   "DELETE /api/v1/bus/links/:id",
   "PUT /api/v1/bus/reach",
@@ -820,6 +830,24 @@ export const DROPPED: Readonly<
       },
     ],
   },
+  ...(hasProposalDecision && {
+    [`org ${proposalDecision}`]: {
+      why: "interactive-only",
+      coveredBy: [
+        INSTANCE,
+        {
+          file: "apps/server/test/bus/role-card.3132.test.ts",
+          describe: "the handover card (#3132)",
+          test: "no token answers for the member: a PAT, an OAuth grant or a machine token; guests and anonymous get nothing",
+        },
+        {
+          file: "apps/server/test/bus/role-card.3132.test.ts",
+          describe: "the handover card (#3132)",
+          test: "Yes moves the role to the asking session and audits confirmed and moved; it is single use",
+        },
+      ],
+    },
+  }),
   // #1567: the matrix links two probe namespaces (200, or the named conflict
   // while the caller has no bus) and removes one (204) in an Access session.
   "org PUT /api/v1/bus/links": {
