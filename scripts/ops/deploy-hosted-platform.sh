@@ -1081,6 +1081,10 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .entrypoint' ProvisionerRpc "PROVISIONER entrypoint"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .type' queue "SIGNUPS type"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .queue_name' oa-$P-signups "SIGNUPS"
+    sched_producers="$(committed scheduler producers)" || exit 1
+    if jq -e 'any(.[]; startswith("FLEET_WAKE "))' <<< "$sched_producers" >/dev/null; then
+      expect "$S" '.result.bindings[] | select(.name == "FLEET_WAKE") | "\(.type) \(.queue_name)"' "queue $wake_q" "FLEET_WAKE"
+    fi
     # Workflow bindings: the read-back field names for the workflow's name and
     # script are not documented, so only the type is checked.
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | .type' workflow "PROVISION_INSTALL"

@@ -9,7 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { root, sandbox, write } from "../ci/stubs.ts";
-import { committedRateLimits, committedVars } from "./wrangler-env.ts";
+import {
+  committedConsumers,
+  committedRateLimits,
+  committedVars,
+} from "./wrangler-env.ts";
 
 // deploy-hosted-platform.sh: deploy through the allowlisted wrapper, secrets only
 // after the Worker exists (Google secrets every run, state keys only when
@@ -232,6 +236,9 @@ function schedulerBindings(
     },
     { type: "service", name: "BILLING", service: `oa-${p}-billing` },
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
+    ...(p === "s"
+      ? [{ type: "queue", name: "FLEET_WAKE", queue_name: "oa-s-fleet-wake" }]
+      : []),
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
     alerts
@@ -1862,7 +1869,7 @@ describe("deploy-hosted-platform.sh", () => {
       /"consumers": \[[\s\S]*?\n {8}\]/g,
       '"consumers": []',
     );
-    expect(none).not.toContain('fleet-wake"');
+    expect(committedConsumers(none, "prod")).toEqual([]);
     const r = setup({
       exists: SCHED_DEPS("p"),
       configs: { scheduler: none },

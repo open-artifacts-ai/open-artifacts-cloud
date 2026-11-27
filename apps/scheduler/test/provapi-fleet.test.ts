@@ -3082,6 +3082,73 @@ describe("#1343: the canary smoke gates the rollout", () => {
   const codes = async (f: ReturnType<typeof fakes>, at: number) =>
     (await fleetConditions(f.env, at)).fleet_halted.rows;
 
+  it("a queued smoke and its completion advance the fleet on separate deliveries", async () => {
+    const { canary, rest } = await settled();
+    const f = fakes({ canary });
+    const sent: unknown[] = [];
+    f.env.FLEET_WAKE = {
+      send: async (body) => {
+        sent.push(body);
+        return {
+          metadata: { metrics: { backlogCount: sent.length, backlogBytes: 0 } },
+        };
+      },
+    };
+    const deliver = async (body: unknown) => {
+      const b = wakeBatch([1]);
+      for (const message of b.batch.messages) Object.assign(message, { body });
+      await fleetWake(b.batch, f.env, NOW, { fleet: f.opts });
+      expect(b.acked).toEqual([0]);
+    };
+    await deliver({ jobId: "canary-upgrade" });
+    expect(sent).toEqual([{ kind: "canary_smoke", target: TARGET, canary }]);
+    expect(f.smokes).toHaveLength(0);
+    await deliver({ kind: "canary_smoke", target: "0.1.0", canary });
+    await deliver({ kind: "canary_smoke", target: TARGET, canary: rest });
+    expect(f.smokes).toHaveLength(0);
+    await deliver(sent[0]);
+    expect(f.smokes).toHaveLength(1);
+    expect(f.smokes[0]?.budgetMs).toBeUndefined();
+    expect(await queued()).toEqual([]);
+    expect(sent[1]).toEqual({ kind: "smoke_finished", target: TARGET, canary });
+    await deliver(sent[0]);
+    expect(f.smokes).toHaveLength(1);
+    await deliver(sent[1]);
+    expect(await queued()).toEqual([rest]);
+  });
+
+  it("a queued transport failure retries with the check in the audit; a config failure holds", async () => {
+    const { canary } = await settled();
+    const f = fakes({
+      canary,
+      smoke: [
+        { ok: false, kind: "transport", check: "read" },
+        { ok: false, kind: "config", check: "token" },
+      ],
+    });
+    const send = vi.fn();
+    f.env.FLEET_WAKE = { send };
+    for (const attempts of [1, 2]) {
+      const b = wakeBatch([attempts]);
+      for (const message of b.batch.messages)
+        Object.assign(message, {
+          body: { kind: "canary_smoke", target: TARGET, canary },
+        });
+      await fleetWake(b.batch, f.env, NOW + attempts, { fleet: f.opts });
+      expect(b.retried).toHaveLength(attempts === 1 ? 1 : 0);
+    }
+    const audits = await rows(
+      "SELECT detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ? ORDER BY id",
+      canary,
+    );
+    expect(audits.map((row) => JSON.parse(String(row.detail)))).toMatchObject([
+      { reason: "smoke_transport", check: "read", retried: true },
+      { reason: "smoke_config", check: "token", retried: false },
+    ]);
+    expect(send).not.toHaveBeenCalled();
+    expect(await queued()).toEqual([]);
+  });
+
   it("passes: marks the version smoked, and the rest move the same tick", async () => {
     const { canary, rest } = await settled();
     const f = fakes({
