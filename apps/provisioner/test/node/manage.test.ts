@@ -400,6 +400,71 @@ describe("upgrade and rollback (5.4)", () => {
     expect(w.install(s.installId)?.version).toBe(V2);
   });
 
+  // cloud #264, Leo: "Everything should be event-based, push, never PULL".
+  // A job's end is the fleet's next event: { jobId } to oa-<p>-fleet-wake.
+  it("cloud #264: a job's end posts { jobId } to FLEET_WAKE after done, or after fail before any lease wait; unbound, nothing", async () => {
+    const sent: unknown[] = [];
+    const order: string[] = [];
+    const queue = {
+      send: async (m: unknown) => {
+        order.push("send");
+        sent.push(m);
+      },
+    } as unknown as Queue<{ jobId: string }>;
+    w.ctx.env.FLEET_WAKE = queue;
+    const s = await active({ slug: "wakeco", version: V1 });
+    const ok = await manage("upgrade", s.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(ok.job?.status).toBe("done");
+    expect(ok.log.map((l) => l.name)).toEqual([
+      "load",
+      "recheck",
+      "release_gate",
+      "upload",
+      "done",
+      "fleet_wake",
+    ]);
+    expect(sent).toEqual([{ jobId: ok.id }]);
+    // A failed job: the wake follows fail, so a failed fleet upgrade halts
+    // its version on that event.
+    await w.r2.put(FLOOR_KEY, JSON.stringify(signFloor(floorOf())));
+    const t = await active({ slug: "wakefail", version: V1 });
+    await w.r2.put(
+      FLOOR_KEY,
+      JSON.stringify(signFloor(floorOf({ revoked: [V2] }))),
+    );
+    const bad = await manage("upgrade", t.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(bad.job?.status).toBe("failed");
+    const names = bad.log.map((l) => l.name);
+    expect(names.indexOf("fleet_wake")).toBe(names.indexOf("fail") + 1);
+    expect(sent).toEqual([{ jobId: ok.id }, { jobId: bad.id }]);
+    // A send that keeps failing never changes the job's outcome.
+    await w.r2.put(FLOOR_KEY, JSON.stringify(signFloor(floorOf())));
+    w.ctx.env.FLEET_WAKE = {
+      send: async () => {
+        throw new Error("queue 503");
+      },
+    } as unknown as Queue<{ jobId: string }>;
+    const u = await active({ slug: "wakedown", version: V1 });
+    const down = await manage("upgrade", u.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(down.error).toBeNull();
+    expect(down.job?.status).toBe("done");
+    expect(logged()).toContain("provisioner fleet_wake failed");
+    // Unbound (a config from before it): no step, no message.
+    w.ctx.env.FLEET_WAKE = undefined;
+    const v = await active({ slug: "wakenone", version: V1 });
+    const none = await manage("upgrade", v.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(none.log.map((l) => l.name)).not.toContain("fleet_wake");
+    expect(order).toEqual(["send", "send"]);
+  });
+
   it("an upgrade to a below-floor or revoked version: release_unverified, still on from (3.5, #1029)", async () => {
     for (const [slug, floor] of [
       ["belowco", floorOf({ minVersion: "0.25.0" })],

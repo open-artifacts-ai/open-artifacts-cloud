@@ -48,7 +48,10 @@ interface Block {
   send_email?: { name?: string; destination_address?: string }[];
   observability?: { enabled?: boolean };
   services?: { binding?: string; service?: string; entrypoint?: string }[];
-  queues?: { consumers?: { queue?: unknown }[] };
+  queues?: {
+    consumers?: { queue?: unknown }[];
+    producers?: { binding?: unknown; queue?: unknown }[];
+  };
   ratelimits?: {
     name: string;
     namespace_id: string | number;
@@ -134,6 +137,18 @@ export function committedSignups(
 export function committedConsumers(src: string, env: Env): string[] {
   return (block(src, env).queues?.consumers ?? [])
     .map((c) => String(c.queue ?? ""))
+    .sort();
+}
+
+/**
+ * The queues the env block produces to, as "<binding> <queue>", sorted
+ * (cloud #264: the provisioner's FLEET_WAKE to oa-<p>-fleet-wake). The
+ * deploy creates the fleet wake queue when declared and absent, and reads
+ * the binding back; a tag that declares none wants none.
+ */
+export function committedProducers(src: string, env: Env): string[] {
+  return (block(src, env).queues?.producers ?? [])
+    .map((c) => `${String(c.binding ?? "")} ${String(c.queue ?? "")}`)
     .sort();
 }
 
@@ -242,7 +257,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|consumers|observability|docs-preview",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|consumers|producers|observability|docs-preview",
     );
     process.exit(2);
   }
@@ -260,6 +275,7 @@ if (
     } else if (what === "billing") out = committedBilling(src, env);
     else if (what === "login") out = committedLogin(src, env);
     else if (what === "consumers") out = committedConsumers(src, env);
+    else if (what === "producers") out = committedProducers(src, env);
     else if (what === "alert-pins") {
       if (!alertWired(src, env)) out = "absent";
       else {

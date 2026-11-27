@@ -102,6 +102,13 @@ export interface WorkflowEnv extends OpsEnv {
   WELCOME_FROM: string;
   /** A prod_dirty create's purge job starts here (5.2 fail). */
   MANAGE_INSTALL: Workflow<WorkflowParams>;
+  /**
+   * oa-<p>-fleet-wake (cloud #264), the scheduler's queue: every
+   * ManageInstall job's end posts { jobId } (manage.ts fleet_wake), so the
+   * fleet's next step starts on that event. Unbound (a config from before
+   * it), no message is sent.
+   */
+  FLEET_WAKE?: Queue<{ jobId: string }>;
 }
 
 /** The rechecked create job (2.5): what the later steps read. */

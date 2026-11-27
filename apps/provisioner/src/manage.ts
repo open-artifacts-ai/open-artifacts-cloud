@@ -167,6 +167,42 @@ export const LEASED_STEP = {
   retries: { limit: 5, delay: "1 minute", backoff: "exponential" },
 } as const;
 
+/**
+ * fleet_wake (cloud #264): the send is retried with a backoff, 1 s doubling;
+ * a send that still fails is logged and the job's outcome stands (the
+ * scheduler's 2-minute tick is the backup).
+ */
+export const FLEET_WAKE_STEP = {
+  retries: { limit: 4, delay: "1 second", backoff: "exponential" },
+  timeout: "10 seconds",
+} as const;
+
+/**
+ * cloud #264, Leo: "Everything should be event-based, push, never PULL (no
+ * waits, sleeps, polls)". A job's end is the fleet's next event: the
+ * canary's upgrade ending starts its probe and smoke, the last of the rest
+ * ending writes fleet_done, a failed one halts its version, and any job
+ * that leaves an install idle lets the fleet reach it. So every job posts
+ * { jobId } to oa-<p>-fleet-wake once it is done or failed (the scheduler
+ * reads nothing from the body). Never throws.
+ */
+async function wakeFleet(
+  ctx: CreateCtx,
+  step: WorkflowStep,
+  jobId: string,
+): Promise<void> {
+  const q = ctx.env.FLEET_WAKE;
+  if (q === undefined) return;
+  try {
+    await step.do("fleet_wake", FLEET_WAKE_STEP, async () => {
+      await q.send({ jobId });
+      return { sent: true };
+    });
+  } catch {
+    console.warn("provisioner fleet_wake failed", jobId);
+  }
+}
+
 /** Soft delete grace (5.6). */
 export const GRACE_MS = 7 * 86_400_000;
 /** The fixed, audited skip reason for a purge of a never-routed create (5.2). */
@@ -217,6 +253,9 @@ export async function runManage(
         throw new Error(codeOf(x));
       }
     });
+    // The job is failed now: a failed fleet upgrade halts its version on
+    // this event, before any lease wait below.
+    await wakeFleet(ctx, step, jobId);
     // An upgrade or rollback left upgrading under its lease: wait it out,
     // then release it without force (5.4 fail).
     if (f.leaseUntil !== null) {
@@ -232,6 +271,7 @@ export async function runManage(
     }
     throw e;
   }
+  await wakeFleet(ctx, step, jobId);
 }
 
 /**

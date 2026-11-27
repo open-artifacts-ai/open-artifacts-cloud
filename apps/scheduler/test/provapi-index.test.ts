@@ -251,7 +251,7 @@ describe("scheduled() and the provapi duties", () => {
     // The fleet ran (no target in this env) and gave its lease back.
     expect(lines).toEqual([
       "provapi fleet no_target",
-      "provapi fleet wake ok messages=2 retried=0",
+      "provapi fleet wake ok messages=2 retried=0 again=0",
     ]);
     for (const l of lines) expect(l).toMatch(LINE);
     expect(await getState(db, FLEET_LEASE_KEY)).toBeNull();
