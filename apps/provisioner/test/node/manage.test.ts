@@ -278,6 +278,28 @@ describe("upgrade and rollback (5.4)", () => {
     expect(w.install(s.installId)).toMatchObject({ version: HELD });
   });
 
+  it("the scheduler's fleet job crosses the reviewed release without an admin flag", async () => {
+    w = await world({ held: true });
+    const s = await active({ slug: "canary", version: V1 });
+    const db = installDb(s.installId);
+    db.exec(
+      "CREATE TABLE held_probe (id INTEGER); INSERT INTO held_probe VALUES (1), (2)",
+    );
+    const r = await manage("upgrade", s.installId, {
+      actor: "system",
+      actorKey: SYSTEM_ACTOR.key,
+      requestId: fleetRequestId(s.installId, HELD),
+      args: { from: V1, to: HELD },
+    });
+    expect(r.job).toMatchObject({ status: "done", error_code: null });
+    expect(db.prepare("SELECT id FROM held_probe").all()).toEqual([{ id: 2 }]);
+    expect(
+      w.all(
+        "SELECT id FROM hosted_audit WHERE action = 'upgrade.restore_point'",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("#1343: an install on DO tag v3, to a release binding BusHub: do_step_required names the step, and the fleet halt shows it", async () => {
     // The server template binds BusHub (#1425): the target. The step,
     // 0.24.5, is the same template with BusHub added but unbound. V2 binds

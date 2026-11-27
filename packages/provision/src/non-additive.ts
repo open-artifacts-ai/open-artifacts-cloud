@@ -184,7 +184,7 @@ const has = (s: readonly Token[], ...seq: string[]) =>
   s.some((_, i) => seq.every((w, k) => word(s[i + k]) === w));
 
 /** Why this statement can lose data, or null when its form keeps data. */
-function statementRisk(s: readonly Token[]): string | null {
+function statementRisk(s: readonly Token[], fleet: boolean): string | null {
   const [a, b] = [word(s[0]), word(s[1])];
   switch (a) {
     case "SELECT":
@@ -197,7 +197,7 @@ function statementRisk(s: readonly Token[]): string | null {
       const at = s.findIndex((x) => word(x) === "BEGIN");
       if (at < 0 || word(s.at(-1)) !== "END") return "unknown";
       for (const body of statements(s.slice(at + 1, -1))) {
-        const why = statementRisk(body);
+        const why = statementRisk(body, fleet);
         if (why) return `trigger_${why}`;
       }
       return null;
@@ -219,21 +219,21 @@ function statementRisk(s: readonly Token[]): string | null {
       return b === "OR" ? "replace" : "unknown";
     case "UPDATE":
       if (b === "OR") return "replace";
-      return narrowed(s) ? null : "update_all";
+      return !fleet && narrowed(s) ? null : "update_all";
     case "DELETE":
-      return narrowed(s) ? null : "delete_all";
+      return !fleet && narrowed(s) ? null : "delete_all";
     default:
       return "unknown";
   }
 }
 
 /** Why this file can lose data, or null when it can't. */
-export function nonAdditiveReason(sql: string): string | null {
+export function nonAdditiveReason(sql: string, fleet = false): string | null {
   if (sql.split("\n", 1)[0]?.trimEnd() === NON_ADDITIVE_MARK) return "marker";
   const ts = tokens(sql);
   if (!ts) return "unreadable";
   for (const s of statements(ts)) {
-    const why = statementRisk(s);
+    const why = statementRisk(s, fleet);
     if (why) return why;
   }
   return null;

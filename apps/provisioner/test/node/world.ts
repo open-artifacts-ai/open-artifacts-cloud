@@ -210,7 +210,7 @@ export async function world(
             {
               name: "9002_held.sql",
               bytes: new TextEncoder().encode(
-                "-- oa:non-additive\nCREATE TABLE held_probe (id INTEGER);",
+                "-- oa:non-additive\n-- oa:verify Count the retained rows.\nCREATE TABLE IF NOT EXISTS held_probe (id INTEGER); DELETE FROM held_probe WHERE id = 1;",
               ),
             },
           ],

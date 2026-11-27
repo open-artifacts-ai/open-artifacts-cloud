@@ -75,4 +75,9 @@ gh api "$R/actions/artifacts/$art/zip" > "$dir/a.zip" 2> /dev/null || fail "down
 got="$(unzip -p "$dir/a.zip" version.txt 2> /dev/null)" || fail "run $run's redline-staged-version has no version.txt"
 got="$(printf '%s' "$got" | tr -d '[:space:]')"
 [ "$got" = "$version" ] || fail "run $run staged version '$got', want '$version'"
+# rl-a and rl-b are brought up by R5. The normal staging fleet canary
+# crosses via its own fleet job before prod may release this tag.
+curl --fail --silent --show-error --max-time 15 https://canary.open-artifacts-staging.app/healthz |
+  jq -es --arg version "$version" 'length == 1 and (.[0] | type == "object" and .ok == true and .version == $version)' > /dev/null ||
+  fail "staging fleet canary is not healthy on $tag"
 echo "staging first: redline-staging.yml passed $tag on version $version (run $run)"
