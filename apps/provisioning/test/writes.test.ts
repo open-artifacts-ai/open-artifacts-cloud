@@ -483,7 +483,7 @@ describe("R4 auth.domainCodes (#1088)", () => {
 });
 
 describe("R4 create by a token and by OIDC", () => {
-  it("a token: owner domain must be in auth.domains; sendWelcome and testHooks forbidden", async () => {
+  it("a token: owner domain must be in auth.domains and sendWelcome is forbidden", async () => {
     const e = fakeEnv();
     expect(
       (await call(e, WRITE, "R4", { body: leo({ ownerEmail: "x@evil.test" }) }))
@@ -493,6 +493,11 @@ describe("R4 create by a token and by OIDC", () => {
       (await call(e, WRITE, "R4", { body: leo({ sendWelcome: true }) })).code,
     ).toBe("forbidden");
     const { sendWelcome: _s, ...body } = leo();
+    const prod = fakeEnv({ OA_ENV: "prod" });
+    expect(
+      (await call(prod, WRITE, "R4", { body: { ...body, testHooks: true } }))
+        .code,
+    ).toBe("forbidden");
     const r = await call(e, WRITE, "R4", { body });
     expect(r.status).toBe(202);
     expect(r.body.job.actor).toEqual({

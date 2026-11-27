@@ -493,10 +493,28 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
       );
   });
 
-  it("the 3.3 testHooks matrix: never a token or self-serve; OIDC needs it and an rl- slug", async () => {
-    await refusedWith(
-      seedCreate(w, { slug: "rl-tok", actor: "token", testHooks: true }),
+  it("creates a staging test-hooks install for an admin token", async () => {
+    const seed = seedCreate(w, {
+      slug: "t-token",
+      actor: "token",
+      testHooks: true,
+    });
+    const r = await run(w, seed.jobId);
+    expect(r.error).toBeNull();
+    expect(w.job(seed.jobId)?.status).toBe("done");
+    expect(plain(w, seed.installId, "TEST_DOMAIN")?.text).toBe(
+      "oa-redline-a.fyi",
     );
+  });
+
+  it("refuses a token test-hooks job on prod before provisioning", async () => {
+    w.ctx.env.OA_ENV = "prod";
+    await refusedWith(
+      seedCreate(w, { slug: "t-prod", actor: "token", testHooks: true }),
+    );
+  });
+
+  it("refuses self-serve test hooks and enforces the OIDC fixture rules", async () => {
     await refusedWith(
       seedCreate(w, {
         slug: "rl-ss",
