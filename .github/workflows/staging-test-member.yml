@@ -8,8 +8,11 @@
 # without the caller's private key the value opens to nothing.
 # `revoke: true` rotates the key to one nobody holds and revokes the PATs.
 # scripts/ops/staging-test-member.ts runs this end to end.
-# This JWT may call only R2, R15 and R26, on rl-agents only (authz
-# TEST_MEMBER). The redline-staging Environment is the OIDC pin
+# `upgrade_tag: vX.Y.Z` runs the upgrade job instead (cloud #264): rl-agents
+# follows staging's release, since the fleet skips installs with test hooks.
+# The staging release chain dispatches it once staging's deploy is done.
+# This JWT may call only R2, R3, R5, R15 and R26, on rl-agents only (authz
+# TEST_MEMBER; R3 and R5 from public #3167, Leo's pick). The redline-staging Environment is the OIDC pin
 # (OIDC_ENVIRONMENT); this job reads none of its secrets. Staging only: prod
 # has no OIDC principal.
 name: staging-test-member
@@ -28,16 +31,24 @@ on:
         required: false
         default: false
         type: boolean
+      upgrade_tag:
+        description: "Upgrade instead: ask for one upgrade of rl-agents to this release (vX.Y.Z), waiting only for the 202"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
+# The upgrade has its own group, so a dispatch from the release chain never
+# replaces an agent's pending mint, nor a mint a pending upgrade.
 concurrency:
-  group: staging-test-member
+  group: staging-test-member${{ inputs.upgrade_tag != '' && '-upgrade' || '' }}
   cancel-in-progress: false
 
 jobs:
   creds:
+    if: inputs.upgrade_tag == ''
     runs-on: ubuntu-latest
     environment: redline-staging
     # The OIDC principal: this job only.
@@ -114,3 +125,98 @@ jobs:
           [[ "$sealed" =~ ^oa-seal-v1\.[A-Za-z0-9_.-]+$ ]] || { echo "no sealed credentials in the job"; exit 1; }
           echo "test-member-app-host: $host"
           echo "test-member-sealed: $sealed"
+  # Cloud #264: rl-agents follows staging's release. One deadline of 30 s
+  # for everything: each request gets only the time left, and none left is a
+  # warning. R2 finds rl-agents (the only install this JWT reaches), R3 reads
+  # it, and R5 is sent only when the tag is newer than its version and it is
+  # active, idle and has test hooks on. R5 waits only for the 202 that accepts
+  # the job, never for the upgrade to finish (that would be polling); the
+  # summary records the job id. Every problem is a warning, never a failure:
+  # the next staging release tries again. R3 and R5 are 403 until a public
+  # release with #3167 is pinned and staging provisioning is deployed, and
+  # that 403 is a warning too. It prints no token and no body: only statuses,
+  # error codes, versions and the job id.
+  upgrade:
+    if: inputs.upgrade_tag != ''
+    runs-on: ubuntu-latest
+    environment: redline-staging
+    # The OIDC principal: this job only.
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 1
+    steps:
+      - name: Upgrade rl-agents to the release (waits only for the 202)
+        env:
+          REF: ${{ github.ref }}
+          TAG: ${{ inputs.upgrade_tag }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # apps/provisioning/wrangler.jsonc env.staging OIDC_AUDIENCE.
+          AUDIENCE: https://api.open-artifacts-staging.app
+          SLUG: rl-agents
+          APP_HOST: rl-agents.open-artifacts-staging.app
+        run: |
+          set +x
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 30 ))
+          say() { echo "$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          warn() { echo "::warning title=rl-agents upgrade::$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          late="rl-agents: not upgraded, the 30 s deadline passed. The next staging release tries again."
+          # The seconds left before the deadline; fails when none are left.
+          left() {
+            local l=$(( deadline - $(date +%s) ))
+            [ "$l" -gt 0 ] || return 1
+            echo "$l"
+          }
+          [ "$REF" = refs/heads/main ] || warn "rl-agents: not upgraded, dispatch staging-test-member on main."
+          [[ "$TAG" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || warn "rl-agents: not upgraded, upgrade_tag is not a release tag (vX.Y.Z)."
+          [ "$AUDIENCE" = https://api.open-artifacts-staging.app ] || warn "rl-agents: not upgraded, staging only."
+          to="${TAG#v}"
+          d=$(mktemp -d)
+          trap 'rm -rf "$d"' EXIT
+          umask 077
+          # Each token reaches curl on stdin, never argv.
+          t=$(left) || warn "$late"
+          jwt=$(printf 'header = "Authorization: Bearer %s"\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" |
+            curl -sS -K - --max-time "$t" "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=$AUDIENCE" 2> /dev/null |
+            jq -er '.value | select(type == "string" and length > 0)' 2> /dev/null) || warn "rl-agents: not upgraded, no OIDC token."
+          echo "::add-mask::$jwt"
+          # req <name> <method> <path> [body]: the HTTP status ("no answer" when
+          # none came in time, late for no time left), the body in $d/<name>.
+          req() {
+            local t c
+            t=$(left) || { echo late; return; }
+            local a=(-sS -K - -o "$d/$1" -w '%{http_code}' --max-time "$t" -X "$2")
+            [ -z "${4:-}" ] || a+=(-H 'content-type: application/json' --data "$4")
+            c=$(printf 'header = "Authorization: Bearer %s"\n' "$jwt" | curl "${a[@]}" "$AUDIENCE$3" 2> /dev/null) || true
+            if [[ "$c" =~ ^[0-9]{3}$ ]] && [ "$c" != 000 ]; then echo "$c"; else echo "no answer"; fi
+          }
+          code() { local c; c=$(jq -r '.error.code // empty' "$d/$1" 2> /dev/null); [[ "$c" =~ ^[a-z_]{1,40}$ ]] && echo ", code $c"; }
+          # A 403 before the scope is live (public #3167 pinned and deployed).
+          refused() { [ "$1" != 403 ] || warn "rl-agents: not upgraded, $2 answered 403: the test member's R3 and R5 are not live on staging yet (public #3167 pinned and staging provisioning deployed)."; }
+          s=$(req r2 GET "/v1/installs?q=$SLUG")
+          [ "$s" != late ] || warn "$late"
+          refused "$s" R2
+          [ "$s" = 200 ] || warn "rl-agents: not upgraded, R2 answered $s$(code r2)."
+          id=$(jq -r --arg s "$SLUG" --arg h "$APP_HOST" '[.items[]? | select(.slug == $s and .state != "deleted" and .state != "deleting")] | if length == 1 and .[0].appHost == $h then .[0].id else empty end' "$d/r2" 2> /dev/null) || id=""
+          [[ "$id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || warn "rl-agents: not upgraded, no single live $SLUG install on $APP_HOST."
+          s=$(req r3 GET "/v1/installs/$id")
+          [ "$s" != late ] || warn "$late"
+          refused "$s" R3
+          [ "$s" = 200 ] || warn "rl-agents: not upgraded, R3 answered $s$(code r3)."
+          jq -e --arg s "$SLUG" '.slug == $s and .testHooks == true' "$d/r3" > /dev/null 2>&1 || warn "rl-agents: not upgraded, the install is not $SLUG with test hooks."
+          from=$(jq -r '.version // ""' "$d/r3")
+          [[ "$from" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || warn "rl-agents: not upgraded, the installed version is unknown."
+          newer=$(jq -rn --arg a "$to" --arg b "$from" '($a | split(".") | map(tonumber)) > ($b | split(".") | map(tonumber))')
+          if [ "$newer" != true ]; then say "rl-agents (https://$APP_HOST): on $from, not older than $to. Nothing to do."; exit 0; fi
+          jq -e '.state == "active" and (.activeJobId // null) == null' "$d/r3" > /dev/null 2>&1 || warn "rl-agents: not upgraded, it is not active and idle. The next staging release tries again."
+          rid="test-member-up-$RUN_ID-$RUN_ATTEMPT"
+          body=$(jq -cn --arg r "$rid" --arg v "$to" '{requestId: $r, version: $v, nonAdditive: true}')
+          s=$(req r5 POST "/v1/installs/$id/upgrade" "$body")
+          [ "$s" != late ] || warn "$late"
+          refused "$s" R5
+          [ "$s" = 202 ] || warn "rl-agents: the upgrade to $to was not accepted, R5 answered $s$(code r5). The next staging release tries again."
+          job=$(jq -r '.job.id // ""' "$d/r5")
+          [[ "$job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || warn "rl-agents: R5 answered 202 without a job id."
+          say "rl-agents (https://$APP_HOST): upgrade from $from to $to accepted, job $job. Nothing waits for it to finish."

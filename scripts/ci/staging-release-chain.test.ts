@@ -3,7 +3,16 @@
 // the staging deploy beside the staging copy; the gate starts once both the
 // copy and a chain-dispatched staging deploy succeeded, each once per tag,
 // never for a manual or test run.
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -251,9 +260,11 @@ describe("after hosted-publish: the staging deploy", () => {
   });
   it("fails closed on an API error", () => {
     const exec: Exec = () => ({ code: 1, stdout: "", stderr: "HTTP 502" });
+    const backoffs: number[] = [];
     expect(() =>
       plan({
         exec,
+        sleep: (ms) => backoffs.push(ms),
         repo: REPO,
         workflow: PUBLISH_PATH,
         conclusion: "success",
@@ -264,6 +275,7 @@ describe("after hosted-publish: the staging deploy", () => {
         runId: "123",
       }),
     ).toThrow(/502/);
+    expect(backoffs).toEqual([2_000, 5_000]);
   });
 });
 
@@ -292,6 +304,11 @@ describe("after the staging deploy: the gate", () => {
       ),
     );
     skipped(afterDeploy({}, { title: `${CHAIN_TITLE} x` }));
+    // cloud #264: the prod chain's own deploy, dispatched by the same App,
+    // never starts the staging gate.
+    skipped(
+      afterDeploy({}, { title: `deploy-hosted-platform prod ${TAG} [c77-1]` }),
+    );
   });
   it("skips a deploy not dispatched by the bot, or not a dispatch", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
@@ -952,28 +969,130 @@ describe("the workflow", () => {
       if (name !== "dispatch")
         expect((j as { environment?: unknown }).environment).toBeUndefined();
   });
-  it("leaves prod-release-chain's trigger and order as they were (prod copies, then deploys)", () => {
+  it("hands over to prod-release-chain, which keeps prod's order (copy, then deploy) on its own events", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));
-    expect(p.on.workflow_run.workflows).toEqual(["redline-staging"]);
-    expect(p.jobs.publish.needs).toBe("gate");
-    expect(p.jobs.deploy.needs).toEqual(["gate", "publish"]);
+    expect(p.on.workflow_run.workflows).toEqual([
+      "redline-staging",
+      "hosted-publish",
+      "deploy-hosted-platform",
+    ]);
+    expect(p.jobs.start.needs).toEqual(["plan", "gate"]);
+    expect(p.jobs.deploy.if).toBe("needs.plan.outputs.step == 'deploy'");
   });
 });
 
 describe("runs-list reads stay under spawnSync's 1 MiB buffer", () => {
-  for (const f of [
-    "chain-dispatch",
-    "staging-release-chain",
-    "prod-release-chain",
-  ]) {
+  // chain-dispatch.ts lists no runs (cloud #264: it dispatches and ends).
+  for (const f of ["staging-release-chain", "prod-release-chain"]) {
     it(`${f}: small page, --jq, maxBuffer backstop`, () => {
       const src = read(`scripts/ci/${f}.ts`);
       const lists = src.match(/actions\/workflows\/[^`]*\/runs\?[^`]*`/g) ?? [];
       expect(lists.length).toBeGreaterThan(0);
-      for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
-      expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      if (f === "prod-release-chain") {
+        // fresh reads one small page; the duplicate checks read every page
+        // through allRuns, 100 runs a page, each cut down by --jq to a few
+        // hundred bytes (well under 1 MiB a page).
+        const [one, ...paged] = lists;
+        expect(one).toMatch(/per_page=30`/);
+        expect(paged.length).toBeGreaterThan(0);
+        for (const l of paged) expect(l).not.toMatch(/per_page/);
+        expect(src).toMatch(/const PER_PAGE = 100;/);
+        expect(src).toMatch(/"--jq",\s+RUNS_JQ,\s+`\$\{path\}&created=/);
+        expect(src).toMatch(
+          /RUNS_JQ =\s+"\{total_count, workflow_runs: \[\.workflow_runs\[\]\? \| \{id, display_title,/,
+        );
+      } else {
+        for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
+        expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      }
       expect(src).toMatch(/MAX_BUFFER = 16 \* 1024 \* 1024/);
       expect(src).toMatch(/maxBuffer: MAX_BUFFER/);
     });
   }
+});
+
+// Cloud #264: once the chain starts the gate (staging's deploy and copy both
+// green), it also dispatches the rl-agents upgrade (staging-test-member.yml
+// upgrade_tag) with the release App's token. Nothing waits for it, and it
+// can't fail the chain.
+describe("the rl-agents upgrade dispatch (cloud #264)", () => {
+  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+  const steps: any[] = w.jobs.dispatch.steps;
+  const iStart = steps.findIndex((s) => s.id === "start");
+  const iUp = steps.findIndex(
+    (s) =>
+      s.name === "Start the rl-agents upgrade for the tag (waits for nothing)",
+  );
+  const up = steps[iUp];
+
+  it("comes right after the gate's dispatch, only when that started the gate, with the App token, and never fails the chain", () => {
+    expect(iStart).toBeGreaterThanOrEqual(0);
+    expect(steps[iStart].run).toContain("staging-release-chain.ts dispatch");
+    expect(iUp).toBe(iStart + 1);
+    expect(up.if).toBe(
+      "needs.plan.outputs.next == 'gate' && steps.start.outputs.started == 'true'",
+    );
+    expect(up["continue-on-error"]).toBe(true);
+    expect(up["timeout-minutes"]).toBe(1);
+    expect(up.env).toEqual({
+      GH_TOKEN: "${{ steps.app.outputs.token }}",
+      TAG: "${{ needs.plan.outputs.tag }}",
+    });
+    expect(up.run).toContain(
+      'gh workflow run staging-test-member.yml --repo "$GITHUB_REPOSITORY" --ref main -f upgrade_tag="$TAG"',
+    );
+    // A dispatch, never a watch.
+    expect(up.run).not.toMatch(/\b(sleep|while|until|wait|watch)\b/);
+    // The test member's workflow has the mode it dispatches.
+    const tm = parse(read(".github/workflows/staging-test-member.yml"));
+    expect(Object.keys(tm.on.workflow_dispatch.inputs)).toContain(
+      "upgrade_tag",
+    );
+  });
+
+  function runUp(o: { tag?: string; ghExit: number }) {
+    const d = mkdtempSync(join(tmpdir(), "oa-chain-up-"));
+    const bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "gh"),
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/calls"\nexit ${o.ghExit}\n`,
+      { mode: 0o755 },
+    );
+    const summary = join(d, "summary");
+    const r = spawnSync("bash", ["-c", up.run], {
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        TAG: o.tag ?? "v0.250.0",
+        GH_TOKEN: "app-token",
+        GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
+        GITHUB_STEP_SUMMARY: summary,
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const calls = existsSync(join(d, "calls"))
+      ? readFileSync(join(d, "calls"), "utf8").trim().split("\n")
+      : [];
+    const sum = existsSync(summary) ? readFileSync(summary, "utf8") : "";
+    rmSync(d, { recursive: true, force: true });
+    return { ...r, calls, sum };
+  }
+
+  it("dispatches the upgrade for the tag once; a failed dispatch or a bad tag warns and exits 0", () => {
+    const ok = runUp({ ghExit: 0 });
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(ok.calls).toEqual([
+      "workflow run staging-test-member.yml --repo open-artifacts-ai/open-artifacts-cloud --ref main -f upgrade_tag=v0.250.0",
+    ]);
+    expect(ok.sum).toContain("rl-agents: upgrade to v0.250.0 dispatched");
+    const failed = runUp({ ghExit: 1 });
+    expect(failed.status).toBe(0);
+    expect(failed.stdout).toContain(
+      "::warning title=rl-agents upgrade::the dispatch failed",
+    );
+    const bad = runUp({ tag: "main", ghExit: 0 });
+    expect(bad.status).toBe(0);
+    expect(bad.calls).toEqual([]);
+  });
 });

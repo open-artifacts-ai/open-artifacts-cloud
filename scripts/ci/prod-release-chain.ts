@@ -1,22 +1,39 @@
 // The automatic prod release chain (#1343, prod-release-chain.yml): a green
 // redline-staging dispatch for a release tag deploys that tag to the prod
 // platform, and the scheduler's fleet duty (#955) takes it from there.
-// `tag` reads the tag from the run's display title (redline-staging.yml's
-// run-name, the shape staging-first-gate.sh matches); `fresh` says whether
-// this event is the newest gated run for the tag; `newer` whether the tag is
-// above what prod's scheduler runs. Both print `go=true|false`: false is a
-// neutral skip (a stale or repeated event, a release prod already runs), not
-// a failure. `require-newer` is the deploy's re-check, which fails instead.
-// `report` keeps one `blocker` issue open while the last chain run is red.
-// Usage: node --experimental-strip-types scripts/ci/prod-release-chain.ts tag --title "<display_title>"
+// Event-driven (cloud #264): each step starts on the previous step's
+// workflow_run event and ends once it has started the next; nothing waits,
+// sleeps or polls for a run.
+//   redline-staging green  -> gate, then dispatch hosted-publish (prod), or
+//                             the deploy when prod's bucket has the release
+//   that publish completed -> check it, then dispatch deploy-hosted-platform
+//   that deploy completed  -> check it, then the blocker issue
+// `plan` classifies one workflow_run event from its own fields (no API call):
+// which step, the tag, the run that ended. `tag` reads the tag from a red-line
+// run's display title (redline-staging.yml's run-name, the shape
+// staging-first-gate.sh matches); `fresh` says whether this event is the
+// newest gated run for the tag; `newer` whether the tag is above what prod's
+// scheduler runs. Both print `go=true|false`: false is a neutral skip (a
+// stale or repeated event, a release prod already runs), not a failure.
+// `require-newer` is the deploy's re-check, which fails instead. `child`
+// reads the run that ended and checks it is the chain's own, for the tag;
+// `start` decides what to dispatch next (never twice); `result` folds the
+// jobs into one result and `report` keeps one `blocker` issue open while the
+// chain is red.
+// Usage: node --experimental-strip-types scripts/ci/prod-release-chain.ts plan --repo owner/name --switch <on> --workflow <path> --conclusion <c> --event <e> --branch <b> --head-repo <owner/name> --title <t> --actor <a> --run-id <id>
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts tag --title "<display_title>"
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts fresh --repo owner/name --tag vX.Y.Z --head-sha <sha>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts newer --tag vX.Y.Z --current vX.Y.Z
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts require-newer --tag vX.Y.Z --current vX.Y.Z
-//        node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo owner/name --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts published --repo owner/name --public-repo owner/name --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo owner/name --workflow publish|deploy --run-id <id> --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo owner/name --public-repo owner/name --after gate|publish --tag vX.Y.Z
+//        node --experimental-strip-types scripts/ci/prod-release-chain.ts result --step gate|deploy|report --plan <r> --gate <r> --start <r> --deploy <r> --finish <r> --state <s>
 //        node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo owner/name --tag vX.Y.Z --result success --run <url>
 // Every other failure throws (exit 1): the chain fails closed. Needs GH_TOKEN for
-// fresh and report.
+// fresh, published, child, start and report.
 import { spawnSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 /** redline-staging.yml's run-name for one tag: `redline-staging ${{ inputs.tag }}`. */
@@ -24,6 +41,20 @@ export const TITLE_RE = /^redline-staging (v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const ISSUE = "Prod release chain";
+/**
+ * The release App's public login: the actor of a run the chain dispatched
+ * (staging-release-chain.ts holds the same). Not imported: deploy-hosted-platform.yml
+ * copies this file alone to run require-newer.
+ */
+export const APP_ACTOR = "open-artifacts-release[bot]";
+/**
+ * Who dispatched the previous chain's runs (it used the default token, run
+ * 45797335479). Its runs carry the same run names, so the duplicate check
+ * counts them as earlier dispatches of the tag; they never start a step
+ * (plan and child require APP_ACTOR).
+ */
+export const OLD_CHAIN_ACTOR = "github-actions[bot]";
+const DISPATCHERS: readonly string[] = [APP_ACTOR, OLD_CHAIN_ACTOR];
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
 export type Exec = (cmd: string, args: string[]) => ExecResult;
@@ -115,33 +146,120 @@ export function fresh(o: {
   return { run: newest.id, go: newest.head_sha === o.headSha };
 }
 
+/** GitHub lists at most this many runs for one query (cloud-flaky-tracker.ts). */
+export const LIST_MAX = 1000;
+const PER_PAGE = 100;
+const DAY_MS = 24 * 3600 * 1000;
+const RUNS_JQ =
+  "{total_count, workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}";
+
+/**
+ * The earliest time a run for `tag` can have been created: the committer
+ * date of the tag's commit in the public repo, less a day for clock skew.
+ * Nothing is dispatched for a tag before the tag exists, so every run for it
+ * is newer. A missing, unparsable or future date throws.
+ */
+export function releasedSince(o: {
+  exec: Exec;
+  publicRepo: string;
+  tag: string;
+  nowMs: number;
+}): string {
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(o.publicRepo))
+    throw new Error("--public-repo owner/name is required");
+  const date = gh(o.exec, [
+    "api",
+    "-X",
+    "GET",
+    "--jq",
+    ".commit.committer.date",
+    `repos/${o.publicRepo}/commits/${o.tag}`,
+  ]).trim();
+  const ms = Date.parse(date);
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(date) || Number.isNaN(ms))
+    throw new Error(`no commit date for ${o.tag} in ${o.publicRepo}`);
+  if (ms > o.nowMs + DAY_MS)
+    throw new Error(`the commit date of ${o.tag} (${date}) is in the future`);
+  return new Date(ms - DAY_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * Every run a list-workflow-runs query (`path`, with a query string but no
+ * created, page or per_page) finds created at or after `since`, page by
+ * page until a short page: one paged read, no waiting. It never returns a
+ * partial list: a page that does not parse, a first page counting LIST_MAX
+ * runs or more (GitHub lists no more for one query), more pages than that,
+ * or fewer distinct runs than the first page counted (one deleted while
+ * reading) all throw.
+ */
+export function allRuns(exec: Exec, path: string, since: string): Run[] {
+  const created = encodeURIComponent(`>=${since}`);
+  const byId = new Map<number, Run>();
+  let total = 0;
+  for (let p = 1; ; p++) {
+    if (p > LIST_MAX / PER_PAGE)
+      throw new Error(
+        `more than ${LIST_MAX} runs of ${path}: refusing a partial list`,
+      );
+    const body = JSON.parse(
+      gh(exec, [
+        "api",
+        "-X",
+        "GET",
+        "--jq",
+        RUNS_JQ,
+        `${path}&created=${created}&per_page=${PER_PAGE}&page=${p}`,
+      ]),
+    ) as { total_count?: unknown; workflow_runs?: unknown };
+    const rows = body.workflow_runs;
+    if (!Array.isArray(rows) || typeof body.total_count !== "number")
+      throw new Error(`unparsable page ${p} of ${path}`);
+    if (p === 1) {
+      total = body.total_count;
+      if (total >= LIST_MAX)
+        throw new Error(
+          `${total} runs of ${path}: GitHub lists at most ${LIST_MAX}, refusing a partial list`,
+        );
+    }
+    for (const r of rows as Run[]) {
+      if (!Number.isSafeInteger(r?.id))
+        throw new Error(`unparsable page ${p} of ${path}`);
+      byId.set(r.id, r);
+    }
+    if (rows.length < PER_PAGE) break;
+  }
+  if (byId.size < total)
+    throw new Error(
+      `read ${byId.size} of ${total} runs of ${path}: refusing a partial list`,
+    );
+  return [...byId.values()];
+}
+
 /**
  * Whether `tag`'s release is already in prod's bucket (#1412): a completed
  * hosted-publish.yml run on main, of this repository, whose publish-prod job
  * for the release succeeded (the job is named "publish-prod release <tag>").
- * Publishing is create-only, so the chain must not publish it twice. An API
- * error or an unparsable answer throws.
+ * Publishing is create-only, so the chain must not publish it twice. Every
+ * run since the tag's release is read (allRuns), so an older publish on a
+ * later page still counts. An API error, an unparsable or incomplete answer
+ * throws.
  */
 export function published(o: {
   exec: Exec;
   repo: string;
   tag: string;
+  /** releasedSince: no run for the tag is older. */
+  since: string;
 }): boolean {
   if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
-  const body = JSON.parse(
-    gh(o.exec, [
-      "api",
-      "-X",
-      "GET",
-      "--jq",
-      "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
-      `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed&per_page=30`,
-    ]),
-  ) as { workflow_runs?: Run[] };
-  if (!Array.isArray(body.workflow_runs))
-    throw new Error("unparsable hosted-publish.yml runs");
+  const runs = allRuns(
+    o.exec,
+    `repos/${o.repo}/actions/workflows/hosted-publish.yml/runs?branch=main&status=completed`,
+    o.since,
+  );
   const name = `publish-prod release ${o.tag}`;
-  for (const r of body.workflow_runs) {
+  for (const r of runs) {
     if (
       r.head_branch !== "main" ||
       r.status !== "completed" ||
@@ -167,6 +285,248 @@ export function published(o: {
       return true;
   }
   return false;
+}
+
+const WORKFLOW_DIR = ".github/workflows/";
+/** The runs this chain dispatches, by step (scripts/ci/chain-dispatch.ts). */
+const CHILD = {
+  publish: {
+    file: "hosted-publish.yml",
+    // hosted-publish.yml's run-name for a chain dispatch (env prod, a tag, a chain id).
+    title:
+      /^hosted-publish prod (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(p[0-9]{1,20}-[0-9]{1,4})\]$/,
+  },
+  deploy: {
+    file: "deploy-hosted-platform.yml",
+    // deploy-hosted-platform.yml's run-name for a chain dispatch.
+    title:
+      /^deploy-hosted-platform prod (v\d{1,6}\.\d{1,6}\.\d{1,6}) \[(c[0-9]{1,20}-[0-9]{1,4})\]$/,
+  },
+} as const;
+export type Child = keyof typeof CHILD;
+const RUN_ID_RE = /^[1-9][0-9]{0,19}$/;
+
+export type Step = "gate" | "deploy" | "report" | "none";
+export type Plan =
+  | { step: "gate"; tag: string }
+  | { step: "deploy" | "report"; tag: string; child: string }
+  | { step: "none"; why: string };
+
+/**
+ * Which step one workflow_run event starts, from the event's own fields only
+ * (no API call, so an unrelated event can never fail the chain):
+ *   - a redline-staging run, green, dispatched: the gate. Its tag is the
+ *     display title's (empty if the title is not a release's: the gate's own
+ *     tag step then fails red, as before);
+ *   - a hosted-publish run this chain dispatched (event workflow_dispatch,
+ *     the release App's bot, title `hosted-publish prod <tag> [p<run>-<n>]`),
+ *     in any conclusion: `deploy`, which checks it and starts the deploy;
+ *   - a deploy-hosted-platform run this chain dispatched (title
+ *     `deploy-hosted-platform prod <tag> [c<run>-<n>]`): `report`.
+ * Everything else is `none`: the switch is off, the run is not on main or
+ * not this repository's, a staging copy or deploy, a hand dispatch, a floor.
+ */
+export function plan(o: {
+  repo: string;
+  /** The repo variable PROD_RELEASE_CHAIN: the chain runs only when it is `on`. */
+  switch: string;
+  /** The event run's workflow file (workflow_run.path): a run-name replaces the name. */
+  workflow: string;
+  conclusion: string;
+  event: string;
+  branch: string;
+  headRepo: string;
+  title: string;
+  actor: string;
+  runId: string;
+}): Plan {
+  const none = (why: string): Plan => ({ step: "none", why });
+  if (o.switch !== "on") return none("PROD_RELEASE_CHAIN is not on");
+  if (o.branch !== "main") return none("the run is not on main");
+  if (o.headRepo !== o.repo) return none("the run is not this repository's");
+  const file = o.workflow.replace(/@.*$/, "");
+  if (file === `${WORKFLOW_DIR}redline-staging.yml`) {
+    if (o.conclusion !== "success")
+      return none(`the red-line run concluded ${o.conclusion}`);
+    // The nightly calls redline-staging, so its runs never count.
+    if (o.event !== "workflow_dispatch")
+      return none("not a dispatched red-line run");
+    return { step: "gate", tag: TITLE_RE.exec(o.title)?.[1] ?? "" };
+  }
+  for (const [which, step] of [
+    ["publish", "deploy"],
+    ["deploy", "report"],
+  ] as const) {
+    if (file !== WORKFLOW_DIR + CHILD[which].file) continue;
+    const m = CHILD[which].title.exec(o.title);
+    if (o.event !== "workflow_dispatch" || o.actor !== APP_ACTOR || !m?.[1])
+      return none(`not a prod ${which} this chain dispatched`);
+    if (!RUN_ID_RE.test(o.runId)) throw new Error("bad run id");
+    return { step, tag: m[1], child: o.runId };
+  }
+  return none(`unexpected workflow ${o.workflow}`);
+}
+
+export type ChildState = {
+  state: "success" | "running" | "failed";
+  url: string;
+  conclusion: string;
+};
+
+/**
+ * The run whose end started this step, read again by id (its newest attempt,
+ * so a rerun in progress is `running`, not the failure the event carried).
+ * It must be the chain's own run of that workflow for exactly this tag: the
+ * workflow file, event workflow_dispatch, the release App's bot, branch main,
+ * this repository, and the chain's run name for the tag. Anything else
+ * throws: the chain fails closed.
+ */
+export function child(o: {
+  exec: Exec;
+  repo: string;
+  which: Child;
+  runId: string;
+  tag: string;
+}): ChildState {
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  if (!RUN_ID_RE.test(o.runId)) throw new Error("bad run id");
+  const r = JSON.parse(
+    // One run object (a few KB), not a list: no --jq needed.
+    gh(o.exec, ["api", "-X", "GET", `repos/${o.repo}/actions/runs/${o.runId}`]),
+  ) as Run & { path?: string; html_url?: string; actor?: { login?: string } };
+  const c = CHILD[o.which];
+  const ours =
+    String(r.id) === o.runId &&
+    (r.path ?? "").replace(/@.*$/, "") === WORKFLOW_DIR + c.file &&
+    r.event === "workflow_dispatch" &&
+    r.head_branch === "main" &&
+    (r.head_repository?.full_name ?? "") === o.repo &&
+    r.actor?.login === APP_ACTOR &&
+    c.title.exec(r.display_title ?? "")?.[1] === o.tag;
+  if (!ours)
+    throw new Error(
+      `run ${o.runId} is not this chain's prod ${o.which} of ${o.tag}`,
+    );
+  const url =
+    r.html_url ?? `https://github.com/${o.repo}/actions/runs/${o.runId}`;
+  if (r.status !== "completed")
+    return { state: "running", url, conclusion: "" };
+  const conclusion = r.conclusion ?? "none";
+  return {
+    state: conclusion === "success" ? "success" : "failed",
+    url,
+    conclusion,
+  };
+}
+
+/**
+ * The chain's runs of a workflow for a tag (its chain run name), this
+ * chain's (the release App's) or the previous chain's (OLD_CHAIN_ACTOR):
+ * every dispatched run on main since the tag's release, all pages (allRuns).
+ */
+function chainRuns(
+  exec: Exec,
+  repo: string,
+  which: Child,
+  tag: string,
+  since: string,
+): Run[] {
+  const c = CHILD[which];
+  const runs = allRuns(
+    exec,
+    `repos/${repo}/actions/workflows/${c.file}/runs?event=workflow_dispatch&branch=main`,
+    since,
+  ) as (Run & { actor?: { login?: string } })[];
+  return runs.filter(
+    (r) =>
+      r.event === "workflow_dispatch" &&
+      r.head_branch === "main" &&
+      (r.head_repository?.full_name ?? "") === repo &&
+      DISPATCHERS.includes(r.actor?.login ?? "") &&
+      c.title.exec(r.display_title ?? "")?.[1] === tag,
+  );
+}
+
+export type Start = { go: true; next: Child } | { go: false; why: string };
+
+/**
+ * What the chain starts next for the tag, once: after the gate, the publish,
+ * or the deploy straight away when prod's bucket already has the release
+ * (publishing is create-only); after a green publish, the deploy, and the
+ * bucket must have the release (else it throws: fail closed). Never twice:
+ * nothing starts while the chain's publish or deploy of the tag is queued or
+ * running (its end is the next event), or once the chain's deploy of the tag
+ * succeeded. The previous chain's runs of the tag count the same way, so
+ * the first event after the switch never repeats its rollout. A failed
+ * earlier run does not block a new event. Every run
+ * since the tag's release is read, all pages, so an earlier run on a later
+ * page still counts; a read that is not complete throws and nothing is
+ * dispatched. Called under the tag's concurrency group, right before the
+ * dispatch.
+ */
+export function start(o: {
+  exec: Exec;
+  repo: string;
+  publicRepo: string;
+  after: "gate" | "publish";
+  tag: string;
+  nowMs?: number;
+}): Start {
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  const since = releasedSince({ ...o, nowMs: o.nowMs ?? Date.now() });
+  const going = (r: Run) => r.status !== "completed";
+  const deploys = chainRuns(o.exec, o.repo, "deploy", o.tag, since);
+  if (deploys.some(going))
+    return {
+      go: false,
+      why: `the chain's deploy of ${o.tag} is under way: its end is the next event`,
+    };
+  if (deploys.some((r) => r.conclusion === "success"))
+    return { go: false, why: `the chain already deployed ${o.tag}` };
+  const inBucket = published({ ...o, since });
+  if (o.after === "publish") {
+    if (!inBucket)
+      throw new Error(
+        `the publish of ${o.tag} is green but prod's bucket has no record of it`,
+      );
+    return { go: true, next: "deploy" };
+  }
+  if (inBucket) return { go: true, next: "deploy" };
+  if (chainRuns(o.exec, o.repo, "publish", o.tag, since).some(going))
+    return {
+      go: false,
+      why: `the chain's publish of ${o.tag} is under way: its end is the next event`,
+    };
+  return { go: true, next: "publish" };
+}
+
+/**
+ * One result for the blocker issue from the run's job results. Red
+ * (failure, cancelled, ...) opens or refreshes it; `success` closes it, and
+ * only the deploy's own green end is a success; `skipped` (a neutral skip,
+ * a step that started the next one, a rerun still going) leaves it.
+ */
+export function result(r: {
+  step: string;
+  plan: string;
+  gate: string;
+  start: string;
+  deploy: string;
+  finish: string;
+  /** The ended deploy's state (child): success, running or failed. */
+  state: string;
+}): string {
+  if (r.plan !== "success") return r.plan || "failure";
+  if (r.step === "gate") {
+    if (r.gate !== "success") return r.gate;
+    return r.start === "success" || r.start === "skipped" ? "skipped" : r.start;
+  }
+  if (r.step === "deploy") return r.deploy === "success" ? "skipped" : r.deploy;
+  if (r.step === "report") {
+    if (r.finish !== "success") return r.finish;
+    return r.state === "success" ? "success" : "skipped";
+  }
+  return "skipped";
 }
 
 export type Report =
@@ -312,9 +672,38 @@ const flag = (argv: string[], name: string) => {
   const i = argv.indexOf(`--${name}`);
   return i < 0 ? "" : (argv[i + 1] ?? "");
 };
+/** One line, no control characters, capped: safe for $GITHUB_OUTPUT and a workflow command. */
+const oneLine = (s: string) =>
+  [...s]
+    .map((c) => (c.charCodeAt(0) < 32 || c === "\x7f" ? " " : c))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+/** A `key=value` line on stdout and in $GITHUB_OUTPUT (when set), so stdout stays free for notices. */
+const emit = (key: string, value: string) => {
+  const line = `${key}=${oneLine(value)}\n`;
+  process.stdout.write(line);
+  const out = process.env.GITHUB_OUTPUT;
+  if (out) appendFileSync(out, line);
+};
 
 function main(argv: string[]) {
   const [mode] = argv;
+  if (mode === "result") {
+    console.log(
+      result({
+        step: flag(argv, "step"),
+        plan: flag(argv, "plan"),
+        gate: flag(argv, "gate"),
+        start: flag(argv, "start"),
+        deploy: flag(argv, "deploy"),
+        finish: flag(argv, "finish"),
+        state: flag(argv, "state"),
+      }),
+    );
+    return;
+  }
   if (mode === "tag") {
     console.log(`tag=${tagOf(flag(argv, "title"))}`);
     return;
@@ -333,6 +722,70 @@ function main(argv: string[]) {
   }
   const repo = flag(argv, "repo");
   if (!repo) throw new Error("--repo owner/name is required");
+  if (mode === "plan") {
+    const p = plan({
+      repo,
+      switch: flag(argv, "switch"),
+      workflow: flag(argv, "workflow"),
+      conclusion: flag(argv, "conclusion"),
+      event: flag(argv, "event"),
+      branch: flag(argv, "branch"),
+      headRepo: flag(argv, "head-repo"),
+      title: flag(argv, "title"),
+      actor: flag(argv, "actor"),
+      runId: flag(argv, "run-id"),
+    });
+    emit("step", p.step);
+    if (p.step === "none") {
+      console.error(`prod-release-chain: nothing to do: ${oneLine(p.why)}`);
+      return;
+    }
+    emit("tag", p.tag);
+    if (p.step !== "gate") emit("child", p.child);
+    return;
+  }
+  if (mode === "child") {
+    const which = flag(argv, "workflow");
+    if (which !== "publish" && which !== "deploy")
+      throw new Error("--workflow publish|deploy");
+    const c = child({
+      exec: realExec,
+      repo,
+      which,
+      runId: flag(argv, "run-id"),
+      tag: flag(argv, "tag"),
+    });
+    emit("state", c.state);
+    emit("url", c.url);
+    if (c.state === "running") {
+      console.log(
+        `::notice title=Release chain waits for its event::the ${which} run ${c.url} is running again (a rerun): its end is the next event`,
+      );
+      return;
+    }
+    if (c.state === "failed") {
+      const note = `${which} run ${flag(argv, "run-id")} concluded ${c.conclusion}: ${c.url}`;
+      emit("note", note);
+      throw new Error(note);
+    }
+    return;
+  }
+  if (mode === "start") {
+    const after = flag(argv, "after");
+    if (after !== "gate" && after !== "publish")
+      throw new Error("--after gate|publish");
+    const r = start({
+      exec: realExec,
+      repo,
+      publicRepo: flag(argv, "public-repo"),
+      after,
+      tag: flag(argv, "tag"),
+    });
+    emit("go", String(r.go));
+    if (r.go) emit("next", r.next);
+    else console.log(`::notice title=Release chain skipped::${oneLine(r.why)}`);
+    return;
+  }
   if (mode === "fresh") {
     const r = fresh({
       exec: realExec,
@@ -349,7 +802,14 @@ function main(argv: string[]) {
     return;
   }
   if (mode === "published") {
-    const go = published({ exec: realExec, repo, tag: flag(argv, "tag") });
+    const tag = flag(argv, "tag");
+    const since = releasedSince({
+      exec: realExec,
+      publicRepo: flag(argv, "public-repo"),
+      tag,
+      nowMs: Date.now(),
+    });
+    const go = published({ exec: realExec, repo, tag, since });
     console.error(
       `prod-release-chain: ${flag(argv, "tag")} is ${go ? "" : "not "}in prod's bucket`,
     );
@@ -370,7 +830,7 @@ function main(argv: string[]) {
     return;
   }
   throw new Error(
-    "usage: prod-release-chain.ts <tag|fresh|newer|require-newer|published|report> ...",
+    "usage: prod-release-chain.ts <plan|tag|fresh|newer|require-newer|published|child|start|result|report> ...",
   );
 }
 

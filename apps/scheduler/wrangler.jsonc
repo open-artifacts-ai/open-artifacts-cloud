@@ -53,9 +53,9 @@
         // secrets the deploy puts from the Environment (docs/ops/hosted.md),
         // never vars here.
         // #1343: the canary smoke, "off" (the passive soak, as before) or
-        // "required". "off" until the user's one-time smoke setup for this
-        // env (docs/ops/hosted.md); "required" is a later one-line PR.
-        "FLEET_SMOKE": "off",
+        // "required". "required" since Leo's staging smoke setup (2026-11-26,
+        // cloud #264): the canary must pass the smoke, as on prod.
+        "FLEET_SMOKE": "required",
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",

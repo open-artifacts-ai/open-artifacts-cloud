@@ -1,25 +1,25 @@
-// The release chain's deploy (#1343): dispatch deploy-hosted-platform.yml on
-// main with GITHUB_TOKEN, find the one run that dispatch started, and wait
-// for it. It fails closed: a dispatch it cannot match to exactly one run, or
-// a run that is not a success, fails the chain.
+// The prod release chain's dispatch (#1343, cloud #264): start
+// deploy-hosted-platform.yml or hosted-publish.yml on main for one tag, and
+// end. It never waits: the started run's own completion is the next event
+// (prod-release-chain.yml listens for both workflows), so nothing here polls,
+// sleeps or times out. The release App's installation token dispatches
+// (GH_TOKEN, minted by the calling job in the main-only release-app
+// Environment): GitHub raises no workflow_run event for a run the default
+// GITHUB_TOKEN started, so a token-started run would end the chain silently.
 //
-// The same machinery dispatches hosted-publish.yml (workflow "publish",
-// #1412): the chain publishes a tag's release to prod's bucket, with env=prod,
-// the tag and its chain id, before it deploys. Both are matched and waited for
-// the same way.
+// The deploy gets env=prod, the tag, every target (billing included once
+// prod's prices are filled), no reason, verify_only false, require_newer true
+// and the chain id; the publish (#1412) gets env=prod, the tag and the chain
+// id only. The chain id rides in the run's name
+// (`deploy-hosted-platform prod <tag> [c<run>-<n>]`,
+// `hosted-publish prod <tag> [p<run>-<n>]`), which is how the next step knows
+// the run is the chain's own.
 //
 // A reusable-workflow call cannot be used: a secret the caller does not pass
 // resolves empty even when the called job's Environment has it, and the
 // caller (a `uses:` job) cannot set an Environment (run 42109047045). A
 // dispatched run is an ordinary run of the workflow, so every secret comes
 // from its own job's Environment.
-//
-// The run is matched by event workflow_dispatch, actor github-actions[bot],
-// branch main, created no earlier than the dispatch (minus a little clock
-// skew) and a display title that is exactly
-// `deploy-hosted-platform prod <tag> [<chain id>]`, which the workflow's
-// run-name builds from its inputs. Zero matches by the
-// find deadline, or more than one, fails.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -35,7 +35,6 @@ const WORKFLOWS: Record<Which, { file: string; name: string }> = {
   },
   publish: { file: "hosted-publish.yml", name: "hosted-publish" },
 };
-const BOT = "github-actions[bot]";
 export const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
 /** The full list with billing (#1568), between the directory broker and provision-token. */
@@ -73,21 +72,11 @@ export function billingConfigured(prodJson: string): boolean {
   return filled === REQUIRED_PRICES.length;
 }
 const TAG_RE = /^v\d{1,6}\.\d{1,6}\.\d{1,6}$/;
-const CHAIN_RE = /^[A-Za-z0-9-]{1,40}$/;
-
-type WorkflowRun = {
-  id: number;
-  status: string;
-  conclusion: string | null;
-  event?: string;
-  display_title?: string;
-  head_branch?: string;
-  created_at?: string;
-  html_url?: string;
-  actor?: { login?: string } | null;
+/** The chain id each workflow's run name carries: p for the publish, c for the deploy. */
+export const CHAIN_RE: Record<Which, RegExp> = {
+  deploy: /^c[0-9]{1,20}-[0-9]{1,4}$/,
+  publish: /^p[0-9]{1,20}-[0-9]{1,4}$/,
 };
-
-export type Outcome = { runId: number; url: string; conclusion: string };
 
 export interface Opts {
   exec: Exec;
@@ -98,14 +87,6 @@ export interface Opts {
   workflow?: Which;
   /** Deploy with the billing target (prod's billing is configured). */
   billing?: boolean;
-  now: () => number;
-  sleep: (ms: number) => void;
-  /** Called as soon as the run is found, before waiting for it. */
-  onFound?: (runId: number, url: string) => void;
-  skewMs?: number;
-  findTimeoutMs?: number;
-  waitTimeoutMs?: number;
-  pollMs?: number;
 }
 
 const gh = (exec: Exec, args: string[]): string => {
@@ -121,12 +102,12 @@ const gh = (exec: Exec, args: string[]): string => {
 const READ_BACKOFF_MS = [2_000, 5_000, 10_000];
 
 /**
- * A read-only gh call, tried up to 3 times with backoff so one transient
- * failure does not fail the chain while the deploy it started keeps running.
- * Never use this for a write (the dispatch, the cancel).
+ * A read-only gh call, tried up to 3 times with backoff so one transient API
+ * failure does not fail a chain step. A retry of a failed read, not a wait
+ * for anything. Never use this for a write (the dispatch).
  */
 export const ghRead = (
-  o: Pick<Opts, "exec" | "sleep">,
+  o: { exec: Exec; sleep: (ms: number) => void },
   args: string[],
 ): string => {
   for (let i = 0; ; i++) {
@@ -139,21 +120,19 @@ export const ghRead = (
   }
 };
 
-export function dispatchAndWait(o: Opts): Outcome {
-  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
-  if (!CHAIN_RE.test(o.chainId)) throw new Error("bad chain id");
-  const skew = o.skewMs ?? 60_000;
-  const findFor = o.findTimeoutMs ?? 5 * 60_000;
-  const waitFor = o.waitTimeoutMs ?? 45 * 60_000;
-  const poll = o.pollMs ?? 10_000;
-
+/**
+ * Dispatches the workflow once and returns the run name it will carry. A bad
+ * tag or chain id throws before any call; a refused dispatch throws (never
+ * retried: a write). Nothing is waited for.
+ */
+export function dispatch(o: Opts): { title: string } {
   const which = o.workflow ?? "deploy";
-  const WORKFLOW = WORKFLOWS[which].file;
-  const t0 = o.now();
+  if (!TAG_RE.test(o.tag)) throw new Error(`not a release tag: ${o.tag}`);
+  if (!CHAIN_RE[which].test(o.chainId)) throw new Error("bad chain id");
   gh(o.exec, [
     "workflow",
     "run",
-    WORKFLOW,
+    WORKFLOWS[which].file,
     "--repo",
     o.repo,
     "--ref",
@@ -177,89 +156,8 @@ export function dispatchAndWait(o: Opts): Outcome {
     "-f",
     `chain_id=${o.chainId}`,
   ]);
-
-  const since = o.now() - skew;
-  // The run-name is exactly this (deploy-hosted-platform.yml): a wrong env or
-  // tag in the title is not our run.
-  const title = `${WORKFLOWS[which].name} prod ${o.tag} [${o.chainId}]`;
-  const matches = (): WorkflowRun[] => {
-    const out = JSON.parse(
-      ghRead(o, [
-        "api",
-        `repos/${o.repo}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&branch=main&per_page=20`,
-        "--jq",
-        "{workflow_runs: [.workflow_runs[]? | {id, display_title, status, conclusion, event, head_branch, head_sha, created_at, html_url, actor: {login: .actor.login}, head_repository: {full_name: .head_repository.full_name}}]}",
-      ]),
-    ) as { workflow_runs?: WorkflowRun[] };
-    return (out.workflow_runs ?? []).filter(
-      (r) =>
-        r.event === "workflow_dispatch" &&
-        r.actor?.login === BOT &&
-        r.head_branch === "main" &&
-        Date.parse(r.created_at ?? "") >= since &&
-        r.display_title === title,
-    );
-  };
-
-  let found: WorkflowRun | undefined;
-  while (!found) {
-    const m = matches();
-    if (m.length > 1)
-      throw new Error(
-        `${m.length} runs match chain id ${o.chainId}: refusing to guess`,
-      );
-    if (m[0]) found = m[0];
-    else if (o.now() - t0 >= findFor)
-      throw new Error(`no run for chain id ${o.chainId} within ${findFor} ms`);
-    else o.sleep(poll);
-  }
-  const url =
-    found.html_url ?? `https://github.com/${o.repo}/actions/runs/${found.id}`;
-  o.onFound?.(found.id, url);
-
-  const start = o.now();
-  for (;;) {
-    const r = JSON.parse(
-      ghRead(o, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
-    ) as WorkflowRun;
-    if (r.status === "completed") {
-      if (r.conclusion !== "success")
-        throw new Error(
-          `${which} run ${found.id} concluded ${r.conclusion ?? "none"}: ${url}`,
-        );
-      return { runId: found.id, url, conclusion: "success" };
-    }
-    if (o.now() - start >= waitFor) {
-      // Never leave a prod deploy running unwatched: cancel it, then look
-      // once more. A run that finished green while the cancel was in flight
-      // is a success; anything else fails, saying what was done.
-      let did: string;
-      try {
-        gh(o.exec, [
-          "api",
-          "-X",
-          "POST",
-          `repos/${o.repo}/actions/runs/${found.id}/cancel`,
-        ]);
-        did = `cancelled the dispatched run ${url}`;
-      } catch (e) {
-        did = `could not cancel the dispatched run ${url} (${(e as Error).message})`;
-      }
-      try {
-        const last = JSON.parse(
-          ghRead(o, ["api", `repos/${o.repo}/actions/runs/${found.id}`]),
-        ) as WorkflowRun;
-        if (last.status === "completed" && last.conclusion === "success")
-          return { runId: found.id, url, conclusion: "success" };
-      } catch {
-        // Fall through: not proven green.
-      }
-      throw new Error(
-        `${which} run ${found.id} did not finish within ${waitFor} ms; ${did}`,
-      );
-    }
-    o.sleep(poll);
-  }
+  // The run-name each workflow builds from these inputs.
+  return { title: `${WORKFLOWS[which].name} prod ${o.tag} [${o.chainId}]` };
 }
 
 /**
@@ -320,22 +218,16 @@ function main(argv: string[]) {
           ? "chain-dispatch: the billing target is included"
           : "chain-dispatch: billing skipped (prod's price ids are not filled in prod.json)",
       );
-    const r = dispatchAndWait({
+    const r = dispatch({
       billing,
       exec: realExec,
       repo: flag(argv, "repo"),
       tag: flag(argv, "tag"),
       chainId: flag(argv, "chain-id"),
       workflow: flag(argv, "workflow") === "publish" ? "publish" : "deploy",
-      now: Date.now,
-      sleep: (ms) =>
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
-      onFound: (id, url) => {
-        emit("deploy_run", String(id));
-        emit("deploy_url", url);
-      },
     });
-    emit("deploy_conclusion", r.conclusion);
+    // Its end is the next event: prod-release-chain.yml takes it from there.
+    emit("dispatched", r.title);
   } catch (e) {
     const line = outputLine("deploy_note", (e as Error).message);
     console.error(`chain-dispatch: ${line.trim()}`);

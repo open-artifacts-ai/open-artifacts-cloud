@@ -1,4 +1,4 @@
-// The scheduled pin-bump opener (cloud #20). When public has a release newer
+// The pin-bump opener (cloud #20). When public has a release newer
 // than PUBLIC_PIN, one PR bumps the pin (and SYNCED_FROM, with the regenerated
 // lockfile); CI's pin-check port check and equivalence check judge it. On the
 // PR path this script never arms or merges anything, and never opens a second PR.

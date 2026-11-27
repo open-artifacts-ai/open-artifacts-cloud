@@ -4,12 +4,13 @@
 #   hosted-release -> THIS: deploy-hosted-platform (env staging, the
 #     workflow's default targets), beside the copy
 #   copy and deploy both green -> THIS: redline-staging (the gate)
-#     -> prod-release-chain.yml (unchanged)
+#     -> prod-release-chain.yml (prod copies, then deploys, each step on the
+#        previous step's event)
 # Step 4: the staging deploy starts beside the staging copy, not after it,
 # and the gate starts from whichever of the two ends last, only once both
 # succeeded for the tag. A failed copy or deploy never starts the gate, so
 # nothing reaches prod. Prod's own order (copy, then deploy) is
-# prod-release-chain's and stays as it was.
+# prod-release-chain's.
 # The only triggers are completed hosted-release, hosted-publish and
 # deploy-hosted-platform runs (workflow_run: main's copy of this file runs,
 # and the head branch is main). scripts/ci/staging-release-chain.ts decides,
@@ -29,7 +30,9 @@
 # is no longer green, it starts nothing and says why.
 # The deploy and the gate each hold their own gates (release gate, platform
 # tags, staging's Environment); this file only starts them, and waits for
-# nothing. Dispatches use the release App's installation token (actions:
+# nothing. After the gate, the chain also dispatches the rl-agents upgrade
+# (staging-test-member.yml upgrade_tag, cloud #264), never waiting for it.
+# Dispatches use the release App's installation token (actions:
 # write), never the default token: GitHub raises no workflow_run event for a
 # run the default token started, so this chain's second step and
 # prod-release-chain would never fire. A run dispatched by the App is still
@@ -122,10 +125,31 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-actions: write
-      - name: Start the next workflow for the tag
+      - id: start
+        name: Start the next workflow for the tag
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           NEXT: ${{ needs.plan.outputs.next }}
           TAG: ${{ needs.plan.outputs.tag }}
           CHAIN_ID: sc${{ github.run_id }}-${{ github.run_attempt }}
         run: node --experimental-strip-types scripts/ci/staging-release-chain.ts dispatch --repo "$GITHUB_REPOSITORY" --next "$NEXT" --tag "$TAG" --chain-id "$CHAIN_ID"
+      # Cloud #264: once staging's deploy is done (this dispatch started the
+      # gate, after both the deploy and the copy were green), rl-agents follows
+      # the tag: the test member's upgrade mode (staging-test-member.yml,
+      # upgrade_tag), one request that waits only for the 202. A dispatch that
+      # nothing waits for, and it can't fail the chain.
+      - name: Start the rl-agents upgrade for the tag (waits for nothing)
+        if: needs.plan.outputs.next == 'gate' && steps.start.outputs.started == 'true'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -uo pipefail
+          [[ "$TAG" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || { echo "::warning title=rl-agents upgrade::not a release tag"; exit 0; }
+          if gh workflow run staging-test-member.yml --repo "$GITHUB_REPOSITORY" --ref main -f upgrade_tag="$TAG"; then
+            echo "rl-agents: upgrade to $TAG dispatched (staging-test-member.yml)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=rl-agents upgrade::the dispatch failed; the next staging release tries again"
+          fi

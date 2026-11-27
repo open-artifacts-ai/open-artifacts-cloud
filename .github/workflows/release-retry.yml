@@ -12,13 +12,16 @@
 # hosted-attach-staging, which refuses ("the release already has staging
 # assets"), so it could never recover; --failed keeps the jobs that succeeded,
 # their outputs and attachments.
-# One layer only: prod-release-chain waits on the deploy (" [c..]") and the
-# prod publish (" [p..]") it dispatches, so those children are never retried
-# here; the chain's failed jobs are, which dispatch the child again. Retrying
-# both would start two prod deploys per failure. staging-release-chain waits
-# for nothing, so its staging deploy (" [sc..]") is retried on its own.
+# One layer only: neither chain waits for what it dispatches (cloud #264), so
+# a chain's children are retried on their own: the staging deploy (" [sc..]"),
+# the prod publish (" [p..]") and the prod deploy (" [c..]"). A rerun of a
+# failed prod-release-chain job never dispatches a child again: the step that
+# read a failed child reads it again by run id, finds the rerun going, and
+# starts nothing (its end is the next event), so a failure never starts two
+# prod deploys.
 # Retried: pushes, workflow_run events, and dispatches whose run-name has
-# " [sc". A hand dispatch, and a hosted-release dry run, are left alone.
+# " [sc", " [p" or " [c". A hand dispatch, and a hosted-release dry run, are
+# left alone.
 # Each retry notes the run on #428. The rerun uses the release App's token
 # (actions: write, this repo only) from the main-only release-app Environment,
 # so its completion fires the next workflow_run as a person's rerun does.
@@ -44,7 +47,9 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       !contains(github.event.workflow_run.display_title, '(dry run)') &&
       (github.event.workflow_run.event != 'workflow_dispatch' ||
-      contains(github.event.workflow_run.display_title, ' [sc'))
+      contains(github.event.workflow_run.display_title, ' [sc') ||
+      contains(github.event.workflow_run.display_title, ' [p') ||
+      contains(github.event.workflow_run.display_title, ' [c'))
     runs-on: ubuntu-latest
     environment: release-app
     timeout-minutes: 5
