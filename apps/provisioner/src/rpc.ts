@@ -8,6 +8,7 @@ import {
   bucketVersions,
   CfError,
   cfClient,
+  isCatalogVersion,
   type R2CatalogBucket,
   r2BindingReleaseReader,
   releaseCatalog,
@@ -48,10 +49,13 @@ export async function listReleases(
 ): Promise<Release[]> {
   const e = deployEnv(env.OA_ENV);
   const bucket = env.RELEASES as unknown as R2CatalogBucket;
+  if (o.version !== undefined && !isCatalogVersion(o.version)) return [];
+  const versions =
+    o.version === undefined ? await bucketVersions(bucket) : [o.version];
   return releaseCatalog({
     release: r2BindingReleaseReader(bucket, e),
     env: e,
-    versions: await bucketVersions(bucket),
+    versions,
     publishedAt: bucketPublishedAt(bucket),
     ...(o.version === undefined ? {} : { only: o.version }),
   });

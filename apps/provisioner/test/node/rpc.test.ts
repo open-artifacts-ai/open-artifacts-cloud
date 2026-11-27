@@ -87,6 +87,7 @@ describe("releases()", () => {
   });
 
   it("{ version }: exactly that release; an unknown version is [] (#1029)", async () => {
+    w.r2.reads.length = 0;
     expect(await listReleases(w.env, { version: V1 })).toEqual([
       {
         version: V1,
@@ -96,7 +97,11 @@ describe("releases()", () => {
         latest: false,
       },
     ]);
+    expect(w.r2.reads.filter((read) => read.startsWith("list "))).toEqual([]);
     expect(await listReleases(w.env, { version: "99.0.0" })).toEqual([]);
+    w.r2.reads.length = 0;
+    expect(await listReleases(w.env, { version: "../floor" })).toEqual([]);
+    expect(w.r2.reads).toEqual([]);
   });
 });
 
