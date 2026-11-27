@@ -179,6 +179,7 @@ describe("OIDC on staging /mcp (9A.10)", () => {
       "allow_signup",
       "remove_allowed",
       "set_install_tier",
+      "set_install_domain_codes",
     ]);
     const rl = await seedInstall({ slug: "rl-p1", testHooks: true });
     const other = await seedInstall({ slug: "acme" });

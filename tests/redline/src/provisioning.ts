@@ -32,6 +32,7 @@ import { newRecipient, openSealed, parseCreds } from "./seal.ts";
 // tests/redline/test/hosted-tool-names.test.ts fails if the two drift.
 export const HOSTED_TOOL_NAMES: readonly string[] = [
   "set_install_tier",
+  "set_install_domain_codes",
   "allow_signup",
   "approve_waitlist",
   "beta_stats",

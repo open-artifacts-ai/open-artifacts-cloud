@@ -922,6 +922,8 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         );
         out.source = st.source;
       }
+      if (oauth.op === "set" && oauth.domainCodes !== undefined)
+        out.source = st.source;
       out.oauth = oauth;
       break;
     }

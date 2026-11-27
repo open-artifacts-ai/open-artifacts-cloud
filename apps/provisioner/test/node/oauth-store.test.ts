@@ -794,6 +794,48 @@ describe("update: AUTH_PROVIDERS (R29, cloud#435)", () => {
   const codes = (v: string) => ({ vars: { AUTH_PROVIDERS: v } });
   const stored = (id: string) => JSON.parse(w.install(id)?.vars as string);
 
+  it.each([
+    ["google", "finqore.test"],
+    ["email", "outside.test"],
+  ])(
+    "refuses both settings before upload for providers=%s and domains=%s",
+    async (providers, domains) => {
+      const id = await activeWith({ ...GOOGLE, AUTH_PROVIDERS: "email" });
+      install(id);
+      const before = {
+        ...stored(id),
+        AUTH_PROVIDERS: providers,
+        AUTH_DOMAINS: domains,
+      };
+      w.db
+        .prepare("UPDATE installs SET vars = ? WHERE id = ?")
+        .run(JSON.stringify(before), id);
+      for (const domainCodes of [true, false]) {
+        const writes = w.fake.writes().length;
+        const r = await run({ domainCodes }, id);
+        expect(r.job.status).toBe("failed");
+        expect(w.fake.writes().length).toBe(writes);
+        expect(stored(id)).toEqual(before);
+      }
+    },
+  );
+
+  it("enables and disables domain codes on the live script and stored vars", async () => {
+    const id = await activeWith({ ...GOOGLE, AUTH_PROVIDERS: "email" });
+    install(id);
+    for (const enabled of [true, false]) {
+      const r = await run({ domainCodes: enabled }, id);
+      expect(r.job.status).toBe("done");
+      expect(plain(id, "EMAIL_CODE_DOMAIN")).toBe(enabled ? "on" : undefined);
+      expect(stored(id).EMAIL_CODE_DOMAIN).toBe(enabled ? "on" : undefined);
+    }
+    expect(
+      auditOf(id)
+        .filter((a) => a.action === "domain_codes.set")
+        .map((a) => JSON.parse(a.detail).value),
+    ).toEqual([true, false]);
+  });
+
   it("google to google,email and back: the var goes up with the Turnstile pair, the install keeps the rest, each audited", async () => {
     const id = await activeWith(GOOGLE);
     install(id);
