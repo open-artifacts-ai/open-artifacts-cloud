@@ -10,6 +10,7 @@ import {
   parseTemplate,
 } from "@oa/provision";
 import { RESUME_JOB_MIN_VERSION } from "@oa/provision/versions";
+import { fakeProvisionerRpc } from "@oa/provisioning-contract/fakes";
 import { REDLINE_SCOPE_FIXTURE } from "@oa/provisioning-contract/fixtures";
 import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,9 +27,12 @@ import {
   claimedByOther,
 } from "../../../provisioning/src/routes/writes.js";
 import {
+  FLEET_VERIFIED_PREFIX,
   fleetConditions,
   fleetRequestId,
 } from "../../../scheduler/src/provapi/fleet.js";
+import { fleetWake } from "../../../scheduler/src/provapi/wake.js";
+import { wakeBatch } from "../../../scheduler/test/provapi/batch.js";
 import { ERROR_MESSAGE_MAX, JOB_ERROR_TEXT } from "../../src/errors.js";
 import {
   GRACE_MS,
@@ -410,6 +414,88 @@ describe("upgrade and rollback (5.4)", () => {
     });
     expect(w.install(s.installId)?.version).toBe(V2);
   });
+
+  it.each(["deploy", "token completion"] as const)(
+    "a %s wake starts the next system upgrade",
+    async (trigger) => {
+      const canary = await active({ slug: "wakecanary", version: V1 });
+      const member = await active({ slug: "wakemember", version: V1 });
+      w.db.prepare("UPDATE install_lifecycle SET health = 'ok'").run();
+      w.db
+        .prepare(
+          "INSERT INTO platform_state (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .run(FLEET_VERIFIED_PREFIX + V2, w.clock.t, w.clock.t);
+      const tag = `v${V2}`;
+      let body: unknown = { env: "staging", tag };
+      if (trigger === "token completion") {
+        const send = vi.fn(async (_message: { jobId: string }) => {});
+        w.ctx.env.FLEET_WAKE = { send } as unknown as Queue<{ jobId: string }>;
+        const completed = await manage("upgrade", canary.installId, {
+          actor: "token",
+          args: { from: V1, to: V2 },
+        });
+        expect(completed.job).toMatchObject({
+          actor_kind: "token",
+          status: "done",
+        });
+        expect(send.mock.calls).toEqual([[{ jobId: completed.id }]]);
+        body = send.mock.calls[0]?.[0];
+      }
+      const { batch, acked, retried } = wakeBatch([1], w.clock.t);
+      const smoke = vi.fn(async () => ({ ok: true as const, notes: [] }));
+      const env = {
+        OA_ENV: ENV,
+        PLATFORM_DB: w.env.PLATFORM_DB,
+        MANAGE_INSTALL: w.manage,
+        FLEET_CANARY: canary.installId,
+        FLEET_SMOKE: "required",
+        CF_VERSION_METADATA: {
+          id: "test",
+          tag,
+          timestamp: new Date(w.clock.t).toISOString(),
+        },
+        PROVISIONER: fakeProvisionerRpc({
+          releases: [
+            {
+              version: V2,
+              installable: true,
+              latest: true,
+              variants: ["release"],
+              publishedAt: 1,
+            },
+          ],
+        }),
+      };
+      const outcome = await fleetWake(
+        { ...batch, messages: batch.messages.map((m) => ({ ...m, body })) },
+        env,
+        w.clock.t,
+        {
+          fleet: {
+            probe: async (id) =>
+              Response.json({
+                ok: true,
+                installId: id,
+                version: w.install(id)?.version,
+              }),
+            smoke,
+          },
+        },
+      );
+      expect(outcome).toBe("ok");
+      expect(acked).toEqual([0]);
+      expect(retried).toEqual([]);
+      expect(smoke).toHaveBeenCalledTimes(trigger === "deploy" ? 0 : 1);
+      const next = trigger === "deploy" ? canary.installId : member.installId;
+      expect(
+        w.all(
+          "SELECT install_id, request_id FROM jobs WHERE kind = 'upgrade' AND actor_kind = 'system'",
+        ),
+      ).toEqual([{ install_id: next, request_id: fleetRequestId(next, V2) }]);
+      expect(w.manage.created).toHaveLength(1);
+    },
+  );
 
   // cloud #264, Leo: "Everything should be event-based, push, never PULL".
   // A job's end is the fleet's next event: { jobId } to oa-<p>-fleet-wake.
