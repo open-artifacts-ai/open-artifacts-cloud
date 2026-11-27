@@ -131,6 +131,7 @@ export type ManageJob = {
     force?: boolean;
     /** upgrade: a person chose to cross a held migration (MIG-2). */
     nonAdditive?: boolean;
+    reviewedFleetMigration?: boolean;
     /** upgrade: the #1106 test seam (request id prefix; staging rl-f- only). */
     testFailCheck?: "health" | "kill" | "kill_after_write";
     /** redline_creds: the R26 variant (C6 RedlineCredsSchema; never the key). */
@@ -627,6 +628,9 @@ async function render(
     kind === "upgrade"
       ? await w.upgrade(job.installId, to, {
           nonAdditive: job.args.nonAdditive === true,
+          ...(job.args.reviewedFleetMigration
+            ? { reviewedFleetMigration: true }
+            : {}),
           ...(job.args.testFailCheck
             ? { testFailCheck: job.args.testFailCheck }
             : {}),
@@ -800,6 +804,11 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       out.args = {
         from: args.from,
         to: args.to,
+        ...(kind === "upgrade" &&
+        job.actor_kind === "system" &&
+        job.request_id.startsWith("fleet-")
+          ? { reviewedFleetMigration: true }
+          : {}),
         ...(kind === "upgrade" && args.nonAdditive === true
           ? { nonAdditive: true }
           : {}),

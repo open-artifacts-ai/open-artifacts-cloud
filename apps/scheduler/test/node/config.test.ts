@@ -49,9 +49,9 @@ describe("wrangler.jsonc", () => {
         FLEET_CANARY: env === "staging" ? "i33m6mbc3zuz" : "ifhx5rpmrhwh",
         // The smoke's token and share target are secrets, never vars: no
         // address is ever committed. No install goes second (cloud #433).
-        // #1343: required on prod, its smoke secrets set; off on staging
-        // until its setup.
-        FLEET_SMOKE: env === "staging" ? "off" : "required",
+        // #1343: required on both, each env's smoke secrets set (staging's
+        // since 2026-11-26, cloud #264).
+        FLEET_SMOKE: "required",
         // The share check is on in both: an explicit, committed choice.
         FLEET_SMOKE_SHARE: "on",
         // #1299: on exactly when red-line's flag says the /bus routes are

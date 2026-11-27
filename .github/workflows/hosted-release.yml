@@ -164,7 +164,23 @@ jobs:
         run: |
           set -euo pipefail
           main_sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
-          if existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> /dev/null); then
+          # Only a confirmed 404 means there is no tag yet. Any other failure
+          # (5xx, network) stops here, before anything is created: GitHub would
+          # put a new release on an existing tag whatever --target says, and
+          # skip the existing-tag checks below. release-retry reruns a failed run.
+          tag_err=$(mktemp)
+          tag=found
+          existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> "$tag_err") || tag=error
+          if [ "$tag" = error ]; then
+            if grep -q '(HTTP 404)' "$tag_err"; then
+              tag=missing
+            else
+              cat "$tag_err" >&2
+              echo "::error::could not read tag $TAG (not a 404); nothing was created"
+              exit 1
+            fi
+          fi
+          if [ "$tag" = found ]; then
             # A re-run: the tag's commit is on main and pins this same release.
             [ "$(jq -r .object.type <<< "$existing")" = commit ] || { echo "::error::tag $TAG is not a lightweight tag on a commit"; exit 1; }
             tsha=$(jq -r .object.sha <<< "$existing")
@@ -183,38 +199,35 @@ jobs:
               echo "tag $TAG already points at $SHA"
             fi
             echo "sha=$tsha" >> "$GITHUB_OUTPUT"
+            # The tag exists and was just read, so the release names it as is.
+            where=(--verify-tag)
           else
             [ "$main_sha" = "$SHA" ] || { echo "::error::$SHA is not the head of main ($main_sha); dispatch again from main's head"; exit 1; }
-            gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" > /dev/null
-            echo "created tag $TAG at $SHA"
+            # No separate POST git/refs: the release creates the tag at $SHA in
+            # the same write, so nothing waits for a new ref to read back (that
+            # read-after-write lag was cloud #124; no polls, cloud #264).
+            # hosted-guard re-checks that the tag is this commit.
+            where=(--target "$SHA")
             echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-            # The new ref can lag behind its own write (read-after-write), and
-            # release create --verify-tag reads it. Wait until it reads back.
-            waited=0
-            delay=1
-            until [ "$(gh api "repos/$REPO/git/ref/tags/$TAG" -q .object.sha 2> /dev/null || true)" = "$SHA" ]; do
-              [ "$waited" -lt 60 ] || { echo "::error::tag $TAG did not read back at $SHA within 60 s"; exit 1; }
-              sleep "$delay"
-              waited=$((waited + delay))
-              delay=$((delay < 8 ? delay * 2 : 8))
-            done
-            echo "tag $TAG reads back at $SHA"
           fi
-          # Retry only the verify-tag "doesn't exist" error, and look for a
-          # release first each time so a partial success never duplicates one.
+          # Up to 5 tries, with a backoff before each retry (4, 6, 8, then 10 s,
+          # as before): the one wait here, a pause before a retry, never a poll.
+          # Look for a release first each time so a partial success never
+          # duplicates one.
           attempt=1
           while :; do
             if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
               echo "release $TAG already exists"
               break
             fi
-            if out=$(gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" \
+            if out=$(gh release create "$TAG" --repo "$REPO" "${where[@]}" --title "$TAG" \
               --notes "Hosted build of $PUBLIC_REPO $TAG. The signed hosted release files are attached by hosted-release.yml." 2>&1); then
               echo "$out"
+              [ "${where[0]}" = --verify-tag ] || echo "created tag $TAG at $SHA with its release"
               break
             fi
             echo "$out"
-            if [[ "$out" == *"doesn't exist"* ]] && [ "$attempt" -lt 5 ]; then
+            if [ "$attempt" -lt 5 ]; then
               attempt=$((attempt + 1))
               sleep $((attempt * 2))
               continue
@@ -351,10 +364,15 @@ jobs:
       - name: Build both variants and the release files, with manifest.json
         working-directory: public
         env:
+          BUS_PIN_REQUIRED: "1"
           PUB_SHA: ${{ needs.hosted-guard.outputs.public_sha }}
+          VERSION: ${{ needs.hosted-guard.outputs.version }}
         run: |
           pnpm --filter @oa/provision build
-          pnpm --filter @oa/server build
+          # The server build pins the published bus release (public #2586): the
+          # release's own, or an older stable that verifies (a warning). Build
+          # once; fail if version.gen.ts has no pin (no unpinned hosted release).
+          node --experimental-strip-types scripts/ci/bus-pin-build.ts "$VERSION" apps/server/src/version.gen.ts -- pnpm --filter @oa/server build
           node --experimental-strip-types scripts/ci/build-hosted-release.ts "$RUNNER_TEMP/hosted" --commit "$PUB_SHA"
       - name: The built server reports exactly the release version
         working-directory: public

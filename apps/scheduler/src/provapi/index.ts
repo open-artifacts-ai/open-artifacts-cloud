@@ -1,9 +1,9 @@
 // The Provisioning API's scheduler duties (design v7 5.8), run on the */2
 // tick after the revoke tick and the directory sync. The fleet rollout runs
 // on its events (cloud #264, wake.ts). Where the canary smoke is required
-// (prod) the tick runs no fleet and keeps only its alert marks (fleetMarks,
-// in the alerts duty). Where it is off (staging) the tick keeps its fleet
-// duty: the passive soak is a timer by design until Leo picks staging smoke.
+// the tick runs no fleet and keeps only its alert marks (fleetMarks,
+// in the alerts duty). Where it is off the tick keeps its fleet
+// duty: the passive soak is a timer by design.
 import { ALERT_KEYS } from "@oa/provisioning-contract/enum-values";
 import { trialRemindersDue } from "../trial-reminder.js";
 import { alertFor, factsOf, prodcleanReport, stepAlert } from "./alerts.js";
@@ -45,9 +45,9 @@ export const DUTY_TIMEOUT_MS = {
 
 /**
  * Whether the tick runs the fleet duty: only where the canary smoke is off
- * (staging, FLEET_SMOKE "off"), whose passive soak needs passes at most
- * FLEET_SOAK_GAP_MS apart. Where it is required (prod) the fleet moves only
- * on its events (wake.ts). When Leo picks staging smoke this goes: one line.
+ * (FLEET_SMOKE "off"), whose passive soak needs passes at most
+ * FLEET_SOAK_GAP_MS apart. Where it is required the fleet moves only
+ * on its events (wake.ts).
  */
 export const tickRunsFleet = (env: Pick<ProvapiEnv, "FLEET_SMOKE">) =>
   fleetSmokeMode(env.FLEET_SMOKE) === "off";

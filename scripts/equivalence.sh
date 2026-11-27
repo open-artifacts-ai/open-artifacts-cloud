@@ -49,6 +49,7 @@ set -uo pipefail
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
 # And the pin-bump self-arm (#264): a workflow, its script and its test.
+# And direct mode's lander (#264), split from the pin-bump opener: a workflow.
 # And the shared gh retry for the pin-bump scripts: a script and its test.
 # And the T19 dry-run workflow (#166): a workflow that public never had.
 # And the staging half of the release chain (#264 step 1): a workflow, its
@@ -66,10 +67,13 @@ ALLOW=(
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/pin-bump-arm.yml
+  .github/workflows/pin-land.yml
   .github/workflows/hosted-release-alert.yml
   .github/workflows/staging-release-chain.yml
   scripts/ci/staging-release-chain.ts
   scripts/ci/staging-release-chain.test.ts
+  scripts/ci/bus-pin-build.ts
+  scripts/ci/bus-pin-build.test.ts
   scripts/ci/pin-bump.ts
   scripts/ci/pin-bump.test.ts
   scripts/ci/pin-bump-arm.ts
@@ -125,6 +129,12 @@ ALLOW=(
   # The one automatic rerun of a red release gate (#428): a workflow and its test.
   .github/workflows/redline-retry.yml
   scripts/ci/redline-retry.test.ts
+  # The release watch (#264, measure only): a workflow, its script, its test and
+  # the test's recorded runs, this repo's own.
+  .github/workflows/release-watch.yml
+  scripts/ci/release-watch.ts
+  scripts/ci/release-watch.test.ts
+  scripts/ci/release-watch.fixture.json
   # The flaky tracker (#447): a workflow, its script and its test.
   .github/workflows/cloud-flaky-tracker.yml
   scripts/ci/cloud-flaky-tracker.ts

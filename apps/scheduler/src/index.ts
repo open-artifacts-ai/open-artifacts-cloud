@@ -854,8 +854,8 @@ export default {
   },
   // oa-<p>-fleet-wake (cloud #264), its only queue: the platform deploy's
   // wake and every ManageInstall job's end; each batch is one fleet pass under
-  // the fleet lease (provapi/wake.ts). Where the smoke is required (prod) the
-  // only start of a fleet run; where it is off (staging) the tick's fleet duty
+  // the fleet lease (provapi/wake.ts). Where the smoke is required the
+  // only start of a fleet run; where it is off the tick's fleet duty
   // also runs one. Never throws.
   async queue(batch, env) {
     await fleetWake(batch, env, Date.now());

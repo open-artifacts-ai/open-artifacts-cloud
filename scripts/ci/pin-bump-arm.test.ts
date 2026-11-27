@@ -1525,37 +1525,112 @@ describe("workflow", () => {
     "utf8",
   );
   const wf = parse(text);
-  it("triggers on CI completion, bump PRs and a schedule, and never cancels a run", () => {
+  it("is event-only: CI, the release pipeline gate, bump PRs, a push to main and dispatch; never a schedule, never cancels a run", () => {
+    // cloud #264: no schedule, no timer of any kind
     expect(Object.keys(wf.on).sort()).toEqual([
       "pull_request_target",
       "push",
-      "schedule",
       "workflow_dispatch",
       "workflow_run",
     ]);
+    expect(wf.on.schedule).toBeUndefined();
+    expect(text).not.toMatch(/\bcron:/);
     // A push to main and a manual run re-evaluate open bumps; neither takes inputs.
     expect(wf.on.push).toEqual({ branches: ["main"] });
     expect(wf.on.workflow_dispatch ?? null).toBeNull();
     // The event filter lives on the plan job; arm only follows a plan that says write.
     expect(wf.jobs.arm.needs).toBe("plan");
-    const cond = String(wf.jobs.plan.if);
-    for (const ev of ["schedule", "push", "workflow_dispatch"])
-      expect(cond).toContain(`github.event_name == '${ev}'`);
+    // The gate opens only when one of its workflows ends, so each one's end re-plans.
     expect(wf.on.workflow_run).toEqual({
-      workflows: ["CI", "prod-release-chain"],
+      workflows: ["CI", ...GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, ""))],
       types: ["completed"],
     });
-    // A bump that waited on an open candidate re-plans when the prod chain ends
-    // (cloud #264): CI only counts on a bump branch, the chain on any branch.
-    expect(cond).toContain(
-      "startsWith(github.event.workflow_run.head_branch, 'pin-bump/')",
-    );
-    expect(cond).toContain(
-      "github.event.workflow_run.name == 'prod-release-chain'",
-    );
-    expect(wf.concurrency["cancel-in-progress"]).toBe(false);
+    for (const f of GATE_WORKFLOWS) {
+      const g = parse(
+        readFileSync(join(dir, "../../.github/workflows", f), "utf8"),
+      ) as { name: string };
+      expect(g.name).toBe(f.replace(/\.yml$/, ""));
+    }
+    // One plan or arm at a time, on the jobs: a run whose plan is skipped never
+    // takes the group, so it cannot replace a pending run with work to do.
+    expect(wf.concurrency).toBeUndefined();
+    for (const j of ["plan", "arm"])
+      expect(wf.jobs[j].concurrency).toEqual({
+        group: "pin-bump-arm",
+        "cancel-in-progress": false,
+      });
     expect(wf.permissions).toEqual({});
   });
+
+  describe("which events plan (cloud #264)", () => {
+    type Ev = {
+      event: string;
+      headRef?: string;
+      wf?: string;
+      branch?: string;
+      conclusion?: string;
+    };
+    const plans = (o: Ev): boolean =>
+      Boolean(
+        new Function(
+          "github",
+          "startsWith",
+          `return ${String(wf.jobs.plan.if)};`,
+        )(
+          {
+            event_name: o.event,
+            head_ref: o.headRef ?? "",
+            event: {
+              workflow_run: {
+                name: o.wf ?? "",
+                head_branch: o.branch ?? "",
+                conclusion: o.conclusion ?? "success",
+              },
+            },
+          },
+          (a: string, b: string) => a.startsWith(b),
+        ),
+      );
+    const wr = (wf: string, branch: string, conclusion = "success"): Ev => ({
+      event: "workflow_run",
+      wf,
+      branch,
+      conclusion,
+    });
+
+    it("a push to main and a manual run always plan", () => {
+      expect(plans({ event: "push" })).toBe(true);
+      expect(plans({ event: "workflow_dispatch" })).toBe(true);
+    });
+
+    it("a bump PR opened or pushed plans; another PR does not", () => {
+      expect(
+        plans({ event: "pull_request_target", headRef: "pin-bump/v1.2.3" }),
+      ).toBe(true);
+      expect(plans({ event: "pull_request_target", headRef: "feature" })).toBe(
+        false,
+      );
+    });
+
+    it("CI plans on a bump branch, and in the merge queue only when it did not pass", () => {
+      expect(plans(wr("CI", "pin-bump/v1.2.3"))).toBe(true);
+      expect(plans(wr("CI", "pin-bump/v1.2.3", "failure"))).toBe(true);
+      const q = "gh-readonly-queue/main/pr-12-0123abcd";
+      for (const c of ["failure", "timed_out", "startup_failure", "cancelled"])
+        expect(plans(wr("CI", q, c))).toBe(true);
+      // a pass merges, and that push to main plans
+      expect(plans(wr("CI", q))).toBe(false);
+      expect(plans(wr("CI", "main"))).toBe(false);
+      expect(plans(wr("CI", "feature", "failure"))).toBe(false);
+    });
+
+    it("any gate workflow ending plans, green or red: the gate may be open now", () => {
+      for (const f of GATE_WORKFLOWS)
+        for (const c of ["success", "failure", "cancelled"])
+          expect(plans(wr(f.replace(/\.yml$/, ""), "main", c))).toBe(true);
+    });
+  });
+
   it("plans read-only with no environment, then mints the App token only in the arm job, and never runs the PR's code", () => {
     type Step = {
       id?: string;

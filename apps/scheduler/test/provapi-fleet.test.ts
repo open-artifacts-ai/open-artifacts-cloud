@@ -822,7 +822,7 @@ describe("soak", () => {
     expect(await queued()).toEqual([rest]);
   });
 
-  // With the smoke off (staging), the passive soak's clock: 4 minutes here.
+  // With the smoke off, the passive soak's clock: 4 minutes here.
   const SOAK = 4 * MIN;
   const passive = (f: ReturnType<typeof fakes>) =>
     Object.assign(f.env, { FLEET_SMOKE: "off", FLEET_SOAK_MIN: "4" });
@@ -2863,7 +2863,7 @@ describe("#433: no timers, leo with the rest", () => {
 
   // cloud #264: the 2-minute tick runs no fleet. It keeps only the fleet's
   // alert marks, so version_skew and platform_unverified alert as before.
-  it("*/2, smoke required (prod): the tick moves no install and takes no lease, even with the fleet behind; its alerts duty keeps fleet_behind", async () => {
+  it("*/2, smoke required: the tick moves no install and takes no lease, even with the fleet behind; its alerts duty keeps fleet_behind", async () => {
     const canary = await on("0.92.0", { created: 0 });
     const rest = await on("0.92.0", { created: 5 });
     const f = fakes({ canary });
@@ -2934,11 +2934,9 @@ describe("#433: no timers, leo with the rest", () => {
     expect(await stateKeys("fleet_")).toEqual([]);
   });
 
-  // Staging (smoke off) keeps the tick's fleet duty until Leo picks staging
-  // smoke: its passive soak needs passes at most FLEET_SOAK_GAP_MS apart, and
-  // the tick soaks exactly as on main.
+  // An explicitly configured passive soak needs passes at most FLEET_SOAK_GAP_MS apart.
   it(
-    "*/2, smoke off (staging): the tick runs the fleet duty and soaks with main's 5-min gap rule",
+    "*/2, smoke off: the tick runs the fleet duty and soaks with main's 5-min gap rule",
     async () => {
       const canary = await on(TARGET, { created: 0 });
       await fleetJob(canary, { finished_at: NOW - MIN });

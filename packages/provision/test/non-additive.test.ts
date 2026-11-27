@@ -222,11 +222,24 @@ describe("nonAdditiveReason", () => {
       expect(nonAdditiveReason(sql)).toBe("unreadable");
   });
 
-  it("every shipped migration: only 0017 is held", () => {
+  it("every shipped migration: only 0017 and 0053 are held", () => {
     const dir = join(import.meta.dirname, "../../../apps/server/migrations");
-    const held = readdirSync(dir)
-      .filter((f) => f.endsWith(".sql"))
-      .filter((f) => nonAdditiveReason(readFileSync(join(dir, f), "utf8")));
-    expect(held).toEqual(["0017_image_format.sql"]);
+    const files = readdirSync(dir).filter((f) => f.endsWith(".sql"));
+    const held = files.filter((f) =>
+      nonAdditiveReason(readFileSync(join(dir, f), "utf8")),
+    );
+    // 0053 (public #3026, from v0.253.1) is held on purpose: its DELETE has a
+    // top-level OR, so it can't be shown to narrow. It stays held until Leo
+    // decides how installs cross it:
+    // https://artifacts.leourbina.com/a/28NbnvQaK2DSXSnJ#thread-f1YEJwHSHHf9rY3q
+    // Before v0.253.1 the file isn't there, so it isn't expected; any other
+    // held file still fails.
+    const expected = ["0017_image_format.sql"];
+    if (files.includes("0053_account_push.sql")) {
+      expected.push("0053_account_push.sql");
+      const sql = readFileSync(join(dir, "0053_account_push.sql"), "utf8");
+      expect(nonAdditiveReason(sql)).toBe("delete_all");
+    }
+    expect(held).toEqual(expected);
   });
 });

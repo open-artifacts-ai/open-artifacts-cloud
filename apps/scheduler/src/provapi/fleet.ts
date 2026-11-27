@@ -24,16 +24,16 @@
 //
 // Settle (the "soaked" marks, so state carries over): every pass probes the
 // installs upgraded to the target. With the smoke required, one passing probe
-// settles an install (FLEET_SOAK_MS is 0). With the smoke off (staging), its
+// settles an install (FLEET_SOAK_MS is 0). With the smoke off, its
 // probes must pass unbroken for FLEET_SOAK_MIN; a gap over FLEET_SOAK_GAP_MS
 // restarts that clock, as a failure does. That soak is a timer by design, so
 // where the smoke is off the 2-minute tick keeps its fleet duty
-// (provapi/index.ts tickRunsFleet) until Leo picks staging smoke.
+// (provapi/index.ts tickRunsFleet).
 //
 // Every pass works from state, never from the message that started it: any
 // event (a job's end, a deploy's wake) re-reads the whole fleet, so one lost
 // message is recovered by the next event of any kind. Where the smoke is
-// required (prod) no tick runs the fleet (cloud #264); the 2-minute cron
+// required no tick runs the fleet (cloud #264); the 2-minute cron
 // keeps only its alert marks (fleetMarks).
 //
 // Smoke: once the canary has settled, smoke() runs in the same pass, then

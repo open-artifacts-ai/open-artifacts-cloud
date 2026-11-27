@@ -17,14 +17,14 @@
 // back with a backoff, the one wait allowed. Every other message is acked:
 // what is left ends with a job, and that job's end is the next message.
 //
-// Where the canary smoke is required (prod) no tick runs the fleet (cloud
+// Where the canary smoke is required no tick runs the fleet (cloud
 // #264). Every pass reads the whole fleet from state, so a lost message (a
 // job-end send that ran out of retries, a wake out of deliveries) is
 // recovered by the next event of any kind: another job's end, the next
 // deploy's wake. Past that, a stuck rollout is OA Manager L-2's to catch, the
 // release watcher Leo named; the alerts (canary_blocked, fleet_halted,
 // version_skew) still open off the tick's alert marks (fleetMarks). No timer
-// is added for it. Where the smoke is off (staging), the 2-minute tick keeps
+// is added for it. Where the smoke is off, the 2-minute tick keeps
 // its fleet duty for the passive soak (provapi/index.ts tickRunsFleet).
 //
 // The body is never read: the fleet's target is this Worker's own version

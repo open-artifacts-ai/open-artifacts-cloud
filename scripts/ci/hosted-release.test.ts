@@ -530,9 +530,9 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       main: string;
       compare: string;
       sha: string;
-      readAfter?: number; // a new tag reads back on this many-th read (default 1)
-      neverReads?: boolean;
-      createFailsTimes?: number; // release create says "doesn't exist" this often
+      createFailsTimes?: number; // release create fails this often
+      tagErr?: string; // the tag read fails with this, not a 404
+      tagRaw?: string; // the tag read succeeds with this body
       releaseExists?: boolean;
       pinAt?: string; // PUBLIC_PIN at the existing tag's commit
     }) {
@@ -545,20 +545,15 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         'case "$*" in',
         '  "api repos/o/r/git/ref/heads/main -q .object.sha") echo "$MAIN" ;;',
         `  "api repos/o/r/git/ref/tags/"*)`,
-        '    if [ -z "${TAG_AT:-}" ]; then',
-        '      grep -q -- "-X POST" "$LOG" || exit 1',
-        '      [ -z "${NEVER:-}" ] || exit 1',
-        '      n=$(grep -c "git/ref/tags/" "$LOG")',
-        '      [ "$n" -ge "$READ_AFTER" ] || exit 1',
-        '      case "$*" in *" -q "*) echo "$SHA_" ;; *) echo \'{"object":{"type":"commit","sha":"\'"$SHA_"\'"}}\' ;; esac',
-        "    else",
-        `      echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}'`,
-        "    fi ;;",
+        '    [ -z "${TAG_ERR:-}" ] || { echo "$TAG_ERR" >&2; exit 1; }',
+        '    [ -z "${TAG_RAW:-}" ] || { echo "$TAG_RAW"; exit 0; }',
+        '    [ -n "${TAG_AT:-}" ] || { echo \'{"message":"Not Found","status":"404"}\'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; }',
+        `    echo '{"object":{"type":"commit","sha":"'"$TAG_AT"'"}}' ;;`,
         '  "api repos/o/r/compare/"*) echo "$COMPARE" ;;',
         '  *"repos/o/r/contents/PUBLIC_PIN?ref="*) printf "%s\\n" "$PIN_AT" ;;',
         '  "release view"*) [ -z "${REL_EXISTS:-}" ] || exit 0; grep -q "^release create" "$LOG" && [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] ;;',
         '  "release create"*)',
-        '    [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] || { echo "tag v1.2.3 doesn\'t exist" >&2; exit 1; } ;;',
+        '    [ "$(grep -c "^release create" "$LOG")" -gt "${CREATE_FAILS:-0}" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; } ;;',
         "  *) exit 0 ;;",
         "esac",
       ].join("\n");
@@ -582,9 +577,8 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
           MAIN: o.main,
           COMPARE: o.compare,
           TAG_AT: o.tagAt ?? "",
-          SHA_: o.sha,
-          READ_AFTER: String(o.readAfter ?? 1),
-          NEVER: o.neverReads ? "1" : "",
+          TAG_ERR: o.tagErr ?? "",
+          TAG_RAW: o.tagRaw ?? "",
           CREATE_FAILS: String(o.createFailsTimes ?? 0),
           REL_EXISTS: o.releaseExists ? "1" : "",
           REPO: "o/r",
@@ -677,43 +671,82 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       expect(r.out).toContain("not the head of main");
       expect(r.calls).not.toContain("-X POST");
     });
-    it("no tag and SHA is main's head: creates the tag", () => {
+    it("no tag and SHA is main's head: the release creates the tag in the same write", () => {
       const r = runCreate({ main: X, compare: "identical", sha: X });
       expect(r.status, r.out).toBe(0);
-      expect(r.calls).toContain("-X POST");
-      expect(r.calls).toContain("release create");
+      // No separate tag write, so nothing has to read a new ref back (#124).
+      expect(r.calls).not.toContain("-X POST");
+      expect(r.calls).not.toContain("git/refs");
+      expect(r.calls).toMatch(
+        new RegExp(`^release create v1\\.2\\.3 --repo o/r --target ${X} `, "m"),
+      );
+      expect(r.calls).not.toContain("--verify-tag");
+      expect(r.out).toContain(`created tag v1.2.3 at ${X} with its release`);
+      expect(r.outputs).toBe(`sha=${X}\n`);
     });
-    it("a new tag that reads back only after several tries: waits, then releases", () => {
-      const r = runCreate({
-        main: X,
-        compare: "identical",
-        sha: X,
-        readAfter: 5,
-      });
+    it("the tag read: a 404 creates the tag with its release", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
       expect(r.status, r.out).toBe(0);
-      expect(r.calls.match(/^sleep /gm)?.length).toBe(3);
-      expect(r.calls.indexOf("release create")).toBeGreaterThan(
-        r.calls.lastIndexOf("git/ref/tags/"),
+      expect(r.calls).toMatch(
+        /^release create v1\.2\.3 --repo o\/r --target /m,
       );
     });
-    it("a new tag that never reads back: fails after a bounded wait, no release", () => {
+    for (const err of [
+      "gh: Service Unavailable (HTTP 503)",
+      "gh: Bad Gateway (HTTP 502)",
+      "error connecting to api.github.com",
+    ])
+      it(`the tag read: "${err}" fails the step and creates nothing`, () => {
+        const r = runCreate({
+          main: X,
+          compare: "identical",
+          sha: X,
+          tagErr: err,
+        });
+        expect(r.status).toBe(1);
+        expect(r.out).toContain("could not read tag v1.2.3 (not a 404)");
+        expect(r.out).toContain(err);
+        expect(r.calls).not.toContain("release create");
+        expect(r.calls).not.toContain("release view");
+        expect(r.calls).not.toContain("-X POST");
+        expect(r.outputs).toBe("");
+      });
+    it("the tag read: a 200 takes the existing-tag path, with --verify-tag", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toMatch(
+        /^release create v1\.2\.3 --repo o\/r --verify-tag /m,
+      );
+      expect(r.calls).not.toContain("--target");
+    });
+    it("the tag read: an unparsable 200 fails before any release", () => {
       const r = runCreate({
-        main: X,
-        compare: "identical",
+        tagRaw: "<html>oops</html>",
+        main: MAIN,
+        compare: "behind",
         sha: X,
-        neverReads: true,
       });
       expect(r.status).toBe(1);
-      expect(r.out).toContain("did not read back");
       expect(r.calls).not.toContain("release create");
-      const total = [...r.calls.matchAll(/^sleep (\d+)$/gm)].reduce(
-        (a, m) => a + Number(m[1]),
-        0,
-      );
-      expect(total).toBeGreaterThanOrEqual(60);
-      expect(total).toBeLessThan(75);
     });
-    it("release create retries on 'doesn't exist', then succeeds once", () => {
+    it("a new tag is never polled: one tag read (does it exist?), no sleep", () => {
+      const r = runCreate({ main: X, compare: "identical", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls.match(/git\/ref\/tags\//g)?.length).toBe(1);
+      expect(r.calls.indexOf("git/ref/tags/")).toBeLessThan(
+        r.calls.indexOf("release create"),
+      );
+      expect(r.calls).not.toMatch(/^sleep /m);
+    });
+    it("an existing tag with no release: the release names that tag, never a new target", () => {
+      const r = runCreate({ tagAt: X, main: MAIN, compare: "behind", sha: X });
+      expect(r.status, r.out).toBe(0);
+      expect(r.calls).toMatch(
+        /^release create v1\.2\.3 --repo o\/r --verify-tag /m,
+      );
+      expect(r.calls).not.toContain("--target");
+    });
+    it("release create retries with a backoff of 4 s, then 6 s, then succeeds", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
@@ -722,8 +755,14 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
       });
       expect(r.status, r.out).toBe(0);
       expect(r.calls.match(/^release create/gm)?.length).toBe(3);
+      expect(r.calls.match(/^sleep .*/gm)).toEqual(["sleep 4", "sleep 6"]);
+      // Each pause comes right after a failed create, before the next try.
+      const lines = r.calls.trim().split("\n");
+      for (const [i, l] of lines.entries())
+        if (l.startsWith("sleep "))
+          expect(lines[i - 1]).toMatch(/^release create/);
     });
-    it("release create gives up after a bounded number of tries", () => {
+    it("release create gives up after 5 tries, sleeping 4, 6, 8, then 10 s, and fails the run", () => {
       const r = runCreate({
         main: X,
         compare: "identical",
@@ -731,7 +770,25 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
         createFailsTimes: 99,
       });
       expect(r.status).toBe(1);
+      expect(r.out).toContain("could not create release v1.2.3");
       expect(r.calls.match(/^release create/gm)?.length).toBe(5);
+      expect(r.calls.match(/^sleep .*/gm)).toEqual([
+        "sleep 4",
+        "sleep 6",
+        "sleep 8",
+        "sleep 10",
+      ]);
+    });
+    it("the only sleep in the create step is the retry backoff", () => {
+      const st = allSteps("mirror").find(
+        (x) => x.name === "Create the tag and the release",
+      ) as Step;
+      const sleeps = st.run.match(/\bsleep\b[^\n]*/g) ?? [];
+      expect(sleeps).toEqual(["sleep $((attempt * 2))"]);
+      expect(st.run).not.toMatch(/\buntil\b/);
+      // the one loop is the bounded retry
+      expect(st.run.match(/\bwhile\b/g)).toEqual(["while"]);
+      expect(st.run).toContain('[ "$attempt" -lt 5 ]');
     });
     it("a release that already exists is never created again", () => {
       const r = runCreate({
@@ -1079,12 +1136,31 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     );
   });
 
+  it("hosted-build builds the server through the bus-pin wrapper, with the release version, before the release files", () => {
+    const st = allSteps("hosted-build");
+    const b = st.findIndex((x) =>
+      (x.run ?? "").includes("build-hosted-release"),
+    );
+    expect(st[b]?.env?.VERSION).toBe(
+      "${{ needs.hosted-guard.outputs.version }}",
+    );
+    expect(st[b]?.env?.BUS_PIN_REQUIRED).toBe("1");
+    const run = st[b]?.run ?? "";
+    expect(run).toContain(
+      'scripts/ci/bus-pin-build.ts "$VERSION" apps/server/src/version.gen.ts -- pnpm --filter @oa/server build',
+    );
+    expect(run.indexOf("bus-pin-build.ts")).toBeLessThan(
+      run.indexOf("build-hosted-release"),
+    );
+    expect(run).not.toMatch(/^\s*pnpm --filter @oa\/server build/m);
+  });
+
   it("hosted-build fails unless the built server reports exactly the release version", () => {
     const st = allSteps("hosted-build");
     const b = st.findIndex((x) =>
       (x.run ?? "").includes("build-hosted-release"),
     );
-    const v = st.findIndex((x) => (x.run ?? "").includes("version.gen.ts"));
+    const v = st.findIndex((x) => (x.run ?? "").includes("grep -Fqx"));
     expect(v).toBeGreaterThan(b);
     expect(st[v]?.env?.VERSION).toBe(
       "${{ needs.hosted-guard.outputs.version }}",

@@ -1,0 +1,141 @@
+# Release watch, measure only (cloud #264, Lane 5 PR1): how long each release
+# takes, stage by stage (.github/hosted/release-stages.json), and one comment
+# per release and stage, on the one open issue "release stuck", when a stage
+# is seen still running past its limit, max(2 x usual, usual + 5 min),
+# finishes past it, or fails. Merge to
+# every install is reported against a 20 min target, never alerted on: to the
+# scheduler's fleet_done time once a later prod deploy records it, else to
+# the prod deploy, labelled "to prod deploy (fleet not yet measured)". Each stage is
+# timed from its own start, so stages can overlap (cloud #471). It gates
+# nothing: it runs beside the chain, on events only, so it is never a check
+# on any PR and must never be made required.
+#
+# - Stateless: each run rebuilds every recent release's timeline from GitHub
+#   timestamps (scripts/ci/release-watch.ts). Finished releases go into
+#   history.jsonl, carried from the `release-stats` artifact of this
+#   workflow's newest successful run on main (never one a branch or PR run
+#   uploaded) to the next, with current.json beside it. The artifact is kept
+#   7 days; a lost one only empties the p50/p90 until the next backfill.
+# - Backfill: dispatch with backfill_since (YYYY-MM-DD, such as 2026-11-20)
+#   reads every release since that day and starts the history afresh.
+# - Fleet: it starts at the prod deploy's "Wake the fleet" step. Since cloud
+#   #495 the finish is the scheduler's own fleet_done time, recorded by a
+#   later prod deploy's "Fleet done of earlier releases (<tag> at <time>,
+#   ...)" step and read from the runs' jobs with this token; the earliest per
+#   tag wins, history included. Runs from before #495 also have a "Fleet
+#   done" step, an upper bound until a record corrects it. Nothing here
+#   reads fleet state through admin tools.
+# - While a release is not finished, the jobs of its hosted-release,
+#   hosted-publish and prod deploy runs are read too: a recovery run on a
+#   later main commit names the release in a job ("publish-staging release
+#   <tag>", or "hosted-built <tag> <sha>" from cloud #469), never by its head
+#   sha, and a copy ends with its publish job.
+# - Triggers, events only, never a schedule or a poll (Leo, 2026-11-26:
+#   "Everything should be event-based, push, never PULL"): each completed run
+#   of every release workflow on main, a push to main that moves PUBLIC_PIN,
+#   and a dispatch. Each run refreshes the times and comments on any stage
+#   it sees still running past its limit (once, marked "still running"),
+#   finished past it, or failed. A stage that never finishes
+#   raises no event: catching it is the release agent's (OA Manager L-2) job,
+#   with this run's summary and current.json as its picture.
+# - No secret but the default token: contents read (the checkout), actions
+#   read (runs, jobs, the previous artifact; never a log) and issues
+#   write (the one issue and its comments).
+#   The public repo's releases and commits are public reads. The only input,
+#   backfill_since, goes through env: and is checked by the script.
+# - The concurrency group keeps two runs from racing on the issue (and the
+#   hidden key per release and stage keeps a comment from repeating); a
+#   replaced pending run loses nothing, because the next one recomputes
+#   everything.
+# - workflow_run runs only from the default branch's copy of this file.
+name: release-watch
+
+on:
+  workflow_run:
+    workflows:
+      [
+        pin-bump,
+        hosted-release,
+        hosted-publish,
+        staging-release-chain,
+        deploy-hosted-platform,
+        redline-staging,
+        prod-release-chain,
+      ]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+    paths: [PUBLIC_PIN]
+  workflow_dispatch:
+    inputs:
+      backfill_since:
+        description: "Backfill from this day (YYYY-MM-DD, such as 2026-11-20); empty for a normal tick"
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            scripts/ci
+            .github/hosted
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Fetch the previous history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          mkdir -p prev
+          run=$(gh api -X GET "repos/$REPO/actions/workflows/release-watch.yml/runs?branch=main&status=success&per_page=20" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$REPO\" and (.event == \"push\" or .event == \"workflow_run\" or .event == \"workflow_dispatch\"))][0].id // empty" 2> /dev/null || true)
+          id=""
+          if [ -n "$run" ]; then
+            id=$(gh api -X GET "repos/$REPO/actions/runs/$run/artifacts?name=release-stats&per_page=1" --jq '.artifacts[0] | select(.expired | not) | .id' 2> /dev/null || true)
+          fi
+          if [ -z "$id" ]; then
+            echo "::notice title=Release watch::no previous release-stats artifact: history starts empty"
+            exit 0
+          fi
+          if gh api "repos/$REPO/actions/artifacts/$id/zip" > prev.zip && unzip -o -q prev.zip -d prev; then
+            echo "History from artifact $id."
+          else
+            echo "::notice title=Release watch::could not read artifact $id: history starts empty"
+            rm -f prev/history.jsonl
+          fi
+      - name: Measure the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKFILL_SINCE: ${{ inputs.backfill_since }}
+        run: |
+          set -euo pipefail
+          args=(tick --repo "$GITHUB_REPOSITORY" --out out --history prev/history.jsonl)
+          if [ -n "${BACKFILL_SINCE:-}" ]; then args+=(--since "$BACKFILL_SINCE"); fi
+          node --experimental-strip-types --no-warnings scripts/ci/release-watch.ts "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-stats
+          path: |
+            out/current.json
+            out/history.jsonl
+          retention-days: 7
+          if-no-files-found: error

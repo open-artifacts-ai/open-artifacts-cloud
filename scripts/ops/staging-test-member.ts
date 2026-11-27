@@ -315,7 +315,6 @@ export type Deps = {
   gh: (...args: string[]) => Promise<string>;
   fetch: typeof fetch;
   now: () => number;
-  sleep: (ms: number) => Promise<void>;
   tmp: string;
   /** Where --mcp writes; MCP_BASE outside tests. */
   mcpBase: string;
@@ -325,48 +324,29 @@ export type Deps = {
 /** Dispatches, finds this dispatch's run, waits; the run's log. */
 async function dispatchAndWait(
   d: Deps,
-  fields: string[],
+  fields: Record<string, string>,
 ): Promise<{
   id: string;
   log: string;
 }> {
-  const since = new Date(d.now() - 5_000).toISOString();
-  await d.gh(
-    "workflow",
-    "run",
-    WORKFLOW,
-    "-R",
-    REPO,
-    "--ref",
-    "main",
-    ...fields.flatMap((f) => ["-f", f]),
-  );
-  // The run this dispatch made: the newest workflow_dispatch run since then.
-  let id = "";
-  for (let i = 0; i < 30 && !id; i++) {
-    await d.sleep(2_000);
-    id = (
-      await d.gh(
-        "run",
-        "list",
-        "-R",
-        REPO,
-        "-w",
-        WORKFLOW,
-        "-e",
-        "workflow_dispatch",
-        "-L",
-        "1",
-        "--created",
-        `>=${since}`,
-        "--json",
-        "databaseId",
-        "-q",
-        ".[0].databaseId // empty",
-      )
-    ).trim();
-  }
-  if (!id) throw new Error("the dispatched run did not appear");
+  const id = (
+    await d.gh(
+      "api",
+      "--method",
+      "POST",
+      `repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`,
+      "-H",
+      "X-GitHub-Api-Version: 2026-03-10",
+      "-f",
+      "ref=main",
+      ...Object.entries(fields).flatMap(([name, value]) => [
+        "-f",
+        `inputs[${name}]=${value}`,
+      ]),
+      "--jq",
+      ".workflow_run_id // empty",
+    )
+  ).trim();
   // A run id names files; only digits.
   if (!/^\d+$/.test(id))
     throw new Error("the dispatched run's id is not a number");
@@ -385,7 +365,7 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
     return 0;
   }
   if (args.revoke) {
-    const run = await dispatchAndWait(d, ["revoke=true"]);
+    const run = await dispatchAndWait(d, { revoke: "true" });
     if (!parseRevokeLog(run.log))
       throw new Error(`run ${run.id}: no revoke in its log`);
     d.log(JSON.stringify({ revoked: "rl-agents", run: run.id }));
@@ -396,10 +376,7 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
   const mcpDir = args.mcp ? prepareMcpDir(d.mcpBase) : null;
   const { privateKey, publicKey } = generateKeyPairSync("x25519");
   const pub = publicKey.export({ format: "jwk" }).x as string;
-  const run = await dispatchAndWait(d, [
-    `recipient_key=${pub}`,
-    "revoke=false",
-  ]);
+  const run = await dispatchAndWait(d, { recipient_key: pub, revoke: "false" });
   const got = parseMintLog(run.log);
   if (!got) throw new Error(`run ${run.id}: no sealed credentials in its log`);
   const { hookKey, pat } = credsOf(
@@ -443,7 +420,6 @@ if (realpathSync(process.argv[1] ?? "") === fileURLToPath(import.meta.url))
     gh,
     fetch: globalThis.fetch,
     now: Date.now,
-    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     tmp: tmpdir(),
     mcpBase: MCP_BASE,
     log: (l) => console.log(l),

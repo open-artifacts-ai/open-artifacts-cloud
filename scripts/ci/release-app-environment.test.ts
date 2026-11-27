@@ -1,6 +1,6 @@
 // #302: the release App key lives in the main-only Environment `release-app`.
 // Every job that mints the App token declares it; no other job reads the secrets.
-// The one exception (cloud #264): pin-bump.yml's land job mints its own App's
+// The one exception (cloud #264): pin-land.yml's land job mints its own App's
 // token (PIN_LAND_APP_*, Environment `pin-land`), the only bypass actor on main.
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -49,7 +49,7 @@ describe("release App key environment", () => {
     ).toBeGreaterThanOrEqual(4);
   });
 
-  const LAND = "pin-bump.yml:land";
+  const LAND = "pin-land.yml:land";
 
   it("every job minting the token declares environment: release-app", () => {
     for (const j of all.filter(
