@@ -175,7 +175,7 @@ type ToolResult = {
 };
 const callTool = async (
   client: Client,
-  name: AdminToolName,
+  name: AdminToolName | "set_install_domain_codes",
   args: Record<string, unknown>,
 ) =>
   (await client.callTool({ name, arguments: args })) as unknown as ToolResult;
@@ -403,9 +403,11 @@ describe("server identity, tools, resources, prompts (9A.5)", () => {
       "allow_signup",
       "remove_allowed",
       "set_install_tier",
+      "set_install_domain_codes",
     ]);
     for (const t of tools.filter(
       (x) =>
+        x.name !== "set_install_domain_codes" &&
         x.name !== "set_install_tier" &&
         !x.name.match(/waitlist|allow|beta_stats|business_requests/),
     )) {
@@ -727,7 +729,10 @@ describe("OAuth principal (the W13b seam)", () => {
 describe("admin MCP only: set_oauth_store and copy_oauth_store (#1008)", () => {
   const VARS = { AUTH_PROVIDERS: "google", TIER: "team" };
   /** A grant's client on /mcp, as bearer.ts's oauthPrincipal answers it. */
-  async function granted(scopes: TokenScope[]) {
+  async function granted(
+    scopes: TokenScope[],
+    environment: "prod" | "staging" = "staging",
+  ) {
     const a = await seedAdmin(db, Date.now());
     const m = await mintAgentToken(a.env, a.principal, {
       kind: "oauth",
@@ -740,12 +745,60 @@ describe("admin MCP only: set_oauth_store and copy_oauth_store (#1008)", () => {
       oauthPrincipal: (_r, env) => principalByTokenId(env, m.tokenId, "oauth"),
     };
     return {
-      client: await connect({ env: a.env, ctx: w.ctx }, "grant-access", {
-        deps,
-      }),
+      client: await connect(
+        { env: { ...a.env, OA_ENV: environment }, ctx: w.ctx },
+        "grant-access",
+        {
+          deps,
+        },
+      ),
       tokenId: m.tokenId,
     };
   }
+  it.each(["staging", "prod"] as const)(
+    "%s accepts and replays a domain-code admin job",
+    async (environment) => {
+      const { client } = await granted(["installs:write"], environment);
+      const { id } = await seedInstall({
+        vars: {
+          AUTH_PROVIDERS: "email",
+          AUTH_DOMAINS: "acme.test",
+          TIER: "team",
+        },
+      });
+      const args = { id, domainCodes: true, requestId: requestId() };
+      const first = await callTool(client, "set_install_domain_codes", args);
+      expect(first.structuredContent.job).toMatchObject({
+        kind: "update",
+        args: { domainCodes: true },
+      });
+      const again = await callTool(client, "set_install_domain_codes", args);
+      expect(again.structuredContent.job).toEqual(first.structuredContent.job);
+    },
+  );
+  it("refuses a read-only grant, Google sign-in and an owner outside the allowed domains", async () => {
+    const { client: reader } = await granted(["installs:read"]);
+    const { client: writer } = await granted(["installs:write"]);
+    for (const [client, providers, domains, code] of [
+      [reader, "email", "acme.test", "forbidden"],
+      [writer, "google,email", "acme.test", "invalid_state"],
+      [writer, "email", "another.test", "invalid_state"],
+    ] as const) {
+      const { id } = await seedInstall({
+        vars: {
+          AUTH_PROVIDERS: providers,
+          AUTH_DOMAINS: domains,
+          TIER: "team",
+        },
+      });
+      const r = await callTool(client, "set_install_domain_codes", {
+        id,
+        domainCodes: true,
+        requestId: requestId(),
+      });
+      expect(r.structuredContent.error.code).toBe(code);
+    }
+  });
   const liveDual = (id: string) =>
     insert("hosted_audit", {
       at: Date.now() - 600_000,

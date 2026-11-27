@@ -794,6 +794,32 @@ describe("update: AUTH_PROVIDERS (R29, cloud#435)", () => {
   const codes = (v: string) => ({ vars: { AUTH_PROVIDERS: v } });
   const stored = (id: string) => JSON.parse(w.install(id)?.vars as string);
 
+  it("checks stored providers before a domain-code update writes the script", async () => {
+    const id = await activeWith(GOOGLE);
+    install(id);
+    const writes = w.fake.writes().length;
+    const r = await run({ domainCodes: true }, id);
+    expect(r.job.status).toBe("failed");
+    expect(w.fake.writes().length).toBe(writes);
+    expect(stored(id).EMAIL_CODE_DOMAIN).toBeUndefined();
+  });
+
+  it("enables and disables domain codes on the live script and stored vars", async () => {
+    const id = await activeWith({ ...GOOGLE, AUTH_PROVIDERS: "email" });
+    install(id);
+    for (const enabled of [true, false]) {
+      const r = await run({ domainCodes: enabled }, id);
+      expect(r.job.status).toBe("done");
+      expect(plain(id, "EMAIL_CODE_DOMAIN")).toBe(enabled ? "on" : undefined);
+      expect(stored(id).EMAIL_CODE_DOMAIN).toBe(enabled ? "on" : undefined);
+    }
+    expect(
+      auditOf(id)
+        .filter((a) => a.action === "domain_codes.set")
+        .map((a) => JSON.parse(a.detail).value),
+    ).toEqual([true, false]);
+  });
+
   it("google to google,email and back: the var goes up with the Turnstile pair, the install keeps the rest, each audited", async () => {
     const id = await activeWith(GOOGLE);
     install(id);

@@ -1,4 +1,8 @@
-import { OwnerVarsRefusal, withAuthProviders } from "@oa/provision";
+import {
+  OwnerVarsRefusal,
+  withAuthProviders,
+  withDomainCodes,
+} from "@oa/provision";
 import {
   type ApiRouteId,
   type CancelJobSchema,
@@ -26,7 +30,12 @@ import {
 import type { z } from "zod";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
-import { loadInReach, loadJob, type StatusRow } from "../model.js";
+import {
+  loadInReach,
+  loadJob,
+  ownerEmailFor,
+  type StatusRow,
+} from "../model.js";
 import type { Principal } from "../principal.js";
 import { platformRelease, releaseOf, releases } from "../services/cache.js";
 import {
@@ -40,6 +49,7 @@ import {
   type Write,
   writeOf,
 } from "../services/jobs.js";
+import { DOMAIN_CODES_TOOL, type DomainCodesBody } from "./domain-codes.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
 import { parseVars } from "./login-change.js";
@@ -289,6 +299,30 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   // job_in_progress already.
   R29: async (a, row) => {
     refuseUnless(can(row, "update", a.principal));
+    if (a.surface.kind === "mcp" && a.surface.tool === DOMAIN_CODES_TOOL) {
+      const { domainCodes } = bodyOf<typeof DomainCodesBody>(a);
+      const stored = parseVars(row.install_vars);
+      if (!stored)
+        throw new ApiError("invalid_state", "the install has no vars");
+      try {
+        withDomainCodes(
+          stored,
+          domainCodes,
+          domainCodes ? await ownerEmailFor(a.env, row) : null,
+          {
+            source: row.source,
+            selfServeTier: a.env.SELF_SERVE_TIER,
+            testHooks: row.test_hooks === 1,
+            env: a.env.OA_ENV,
+          },
+        );
+      } catch (e) {
+        if (e instanceof OwnerVarsRefusal)
+          throw new ApiError("invalid_state", e.why);
+        throw e;
+      }
+      return { kind: "update", args: { domainCodes } };
+    }
     const body = bodyOf<typeof SetOAuthStoreSchema>(a);
     // open-artifacts#2641: DOCS_PREVIEW is staging only, either value. The
     // job's recheck and provision's metadata guard refuse it on prod too.

@@ -176,6 +176,31 @@ export function withAuthProviders(
   if (stored.EMAIL_CODE_DOMAIN !== undefined)
     throw refused("AUTH_PROVIDERS can't change with EMAIL_CODE_DOMAIN set");
   const after: Record<string, string> = { ...stored, AUTH_PROVIDERS: value };
+  return validateOwnerChange(after, o);
+}
+
+export function withDomainCodes(
+  stored: Record<string, string>,
+  enabled: boolean,
+  ownerEmail: string | null,
+  o: Omit<OwnerVarsOptions, "login">,
+): Record<string, string> {
+  const after = { ...stored };
+  if (enabled) {
+    const domain = ownerEmail?.split("@")[1]?.toLowerCase();
+    if (!domain || !(stored.AUTH_DOMAINS ?? "").split(",").includes(domain))
+      throw refused("the owner's domain must be in AUTH_DOMAINS");
+    after.EMAIL_CODE_DOMAIN = "on";
+  } else {
+    delete after.EMAIL_CODE_DOMAIN;
+  }
+  return validateOwnerChange(after, o);
+}
+
+function validateOwnerChange(
+  after: Record<string, string>,
+  o: Omit<OwnerVarsOptions, "login">,
+) {
   const owner: Record<string, string> = {};
   for (const k of OWNER_KEYS)
     if (after[k] !== undefined) owner[k] = after[k] as string;

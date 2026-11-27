@@ -398,7 +398,7 @@ export function auditStatement(
   ctx: StepCtx,
   installId: string,
   action: string,
-  detail: Record<string, string | number>,
+  detail: Record<string, string | number | boolean>,
   jobId: string,
 ): D1PreparedStatement {
   const sorted = Object.fromEntries(
