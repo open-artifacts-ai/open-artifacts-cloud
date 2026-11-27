@@ -605,41 +605,41 @@ describe("ProvisionInstall: release gate and failures", () => {
     expect(w.fake.writes().length).toBe(before);
   });
 
-  it("a refusal echoing request values: jobs.error_message is the fixed text and the redacted reason", async () => {
-    const key = "LEAK_KEY_ACME";
-    const s = seedCreate(w, {
-      slug: "leakyslug",
-      vars: {
-        AUTH_PROVIDERS: "google",
-        AUTH_DOMAINS: "finqore.test",
-        TIER: "business",
-        [key]: "x",
-      },
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const r = await run(w, s.jobId);
-    const lines = warn.mock.calls.map((c) => String(c[0]));
-    warn.mockRestore();
-    expect(r.error).not.toBeNull();
-    // recheck's detail reaches only the log line, the key redacted.
-    expect(lines.join("\n")).toContain("var [value] is not allowed");
-    expect(lines.join("\n")).not.toContain(key);
-    // The engine's record is the fixed text too: no detail.
-    expect(r.log.find((l) => l.name === "recheck")?.error?.message).toBe(
-      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
-    );
-    const job = w.job(s.jobId);
-    expect(job).toMatchObject({
-      status: "failed",
-      error_code: "invalid_state",
-    });
-    // #461: the reason, redacted as in the log line.
-    expect(job?.error_message).toBe(
-      `${JOB_ERROR_TEXT.invalid_state} Reason: var [value] is not allowed`,
-    );
-    expect(job?.error_message).not.toContain(key);
-    expect(job?.last_error_code).toBe("invalid_state");
-  });
+  it.each(["LEAK_KEY_ACME", "QZ", "on"])(
+    "redacts unexpected var %s in both the log and the stored refusal",
+    async (key) => {
+      const s = seedCreate(w, {
+        slug: "leakyslug",
+        vars: {
+          AUTH_PROVIDERS: "google",
+          AUTH_DOMAINS: "finqore.test",
+          TIER: "business",
+          [key]: "x",
+        },
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const r = await run(w, s.jobId);
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      warn.mockRestore();
+      expect(r.error).not.toBeNull();
+      expect(lines.join("\n")).toContain("var [value] is not allowed");
+      expect(lines.join("\n")).not.toContain(`var ${key} is not allowed`);
+      // The engine's record is the fixed text too: no detail.
+      expect(r.log.find((l) => l.name === "recheck")?.error?.message).toBe(
+        `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
+      );
+      const job = w.job(s.jobId);
+      expect(job).toMatchObject({
+        status: "failed",
+        error_code: "invalid_state",
+      });
+      // #461: the reason, redacted as in the log line.
+      expect(job?.error_message).toBe(
+        `${JOB_ERROR_TEXT.invalid_state} Reason: var [value] is not allowed`,
+      );
+      expect(job?.last_error_code).toBe("invalid_state");
+    },
+  );
 
   it("a failure logs one console line: code, step, job id, detail redacted and capped", async () => {
     const key = "LEAK_KEY_ACME";

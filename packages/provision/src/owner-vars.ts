@@ -69,7 +69,7 @@ export function ownerVars(
   if (o.login) optional.push("AUTH_DOMAIN_JOIN", DOMAIN_JOIN_SOURCE_VAR);
   for (const k of Object.keys(vars))
     if (!allowed.includes(k) && !optional.includes(k))
-      throw refused(`var ${k.slice(0, 40)} is not allowed`);
+      throw refused("var [value] is not allowed");
   for (const k of allowed)
     if (typeof vars[k] !== "string") throw refused(`var ${k} is missing`);
   const providers = (vars.AUTH_PROVIDERS as string).split(",");
