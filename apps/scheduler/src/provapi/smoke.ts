@@ -133,7 +133,7 @@ const randomNonce = () => {
 export async function smoke(o: SmokeInput): Promise<SmokeResult> {
   const clock = o.clock ?? Date.now;
   const callMs = o.callMs ?? SMOKE_CALL_MS;
-  const deadline = clock() + (o.budgetMs ?? SMOKE_BUDGET_MS);
+  const deadline = o.budgetMs === undefined ? undefined : clock() + o.budgetMs;
   const token = o.token?.trim() ?? "";
   const shareTo = o.shareTo?.trim().toLowerCase() ?? "";
   if (token === "") return { ok: false, kind: "config", check: "token" };
@@ -154,7 +154,7 @@ export async function smoke(o: SmokeInput): Promise<SmokeResult> {
     init: RequestInit = {},
     o2: { auth?: boolean; noBudget?: boolean } = {},
   ): Promise<Response> => {
-    if (!o2.noBudget && clock() + callMs > deadline)
+    if (deadline !== undefined && !o2.noBudget && clock() + callMs > deadline)
       throw new Fail("budget", check);
     const headers = new Headers(init.headers);
     if (o2.auth !== false) headers.set("authorization", `Bearer ${token}`);

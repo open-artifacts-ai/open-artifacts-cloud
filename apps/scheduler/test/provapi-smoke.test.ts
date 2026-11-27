@@ -476,6 +476,24 @@ describe("the canary smoke", () => {
       expect(c.arts).toEqual([]);
     });
 
+  it("the standalone job completes checks beyond the inline ten-second deadline", async () => {
+    const c = canary();
+    let elapsed = 0;
+    const r = await smoke(
+      input(c, {
+        budgetMs: undefined,
+        clock: () => elapsed,
+        fetch: (url, init) => {
+          elapsed += 1_000;
+          return c.fetch(url, init);
+        },
+      }),
+    );
+    expect(elapsed).toBeGreaterThan(10_000);
+    expect(r.ok).toBe(true);
+    expect(live(c)).toEqual([]);
+  });
+
   it("the budget: past it, the run stops as budget, and still cleans up", async () => {
     let t = 0;
     const c = canary();

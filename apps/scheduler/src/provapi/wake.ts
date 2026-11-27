@@ -9,9 +9,9 @@
 // Each batch is one fleet pass (fleetTick), under the same lease as the
 // 2-minute tick's fleet duty, with every safety check the pass has: the
 // verified mark, the canary first, the halts, the smoke. So the canary's
-// upgrade starts on the deploy's message; its end probes it and runs the
-// smoke in that same pass, and the rest are queued the moment the smoke
-// passes; the last of the rest to end writes fleet_done:<version>, which the
+// upgrade starts on the deploy's message; its end probes it. With a queue producer, the smoke runs
+// on its own delivery and its completion wakes the fleet. Without a producer,
+// the legacy pass runs the smoke inline; the last of the rest to end writes fleet_done:<version>, which the
 // next prod deploy records. Nothing waits: a pass that only time can finish
 // (a probe or smoke to repeat, the lease held, a failed run) asks its message
 // back with a backoff, the one wait allowed. Every other message is acked:
@@ -27,19 +27,23 @@
 // is added for it. Where the smoke is off, the 2-minute tick keeps
 // its fleet duty for the passive soak (provapi/index.ts tickRunsFleet).
 //
-// The body is never read: the fleet's target is this Worker's own version
-// tag, so a message for an older release, or a job of any kind, is just one
-// more pass.
+// A canary_smoke message runs outside the bounded fleet pass. A passing job
+// persists its result and sends smoke_finished; that wake reads fleet state.
 
 import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import type { FleetEnv, FleetOptions, FleetRun } from "./fleet.js";
-import { fleetCanary, fleetTarget, fleetTick } from "./fleet.js";
+import {
+  fleetCanary,
+  fleetTarget,
+  fleetTick,
+  runQueuedSmoke,
+} from "./fleet.js";
 import { type DutyOutcome, runDuties } from "./run.js";
 
 /**
  * A wake pass's deadline: room for a probe at its full timeout (8 s), the
- * catalog read (5 s), the smoke (10 s) and its cleanup (6 s), and the rest's
- * inserts, with margin. The smoke gets only what is left.
+ * catalog read (5 s), fleet inserts and, where still enabled, the inline smoke.
+ * A queued smoke runs outside this deadline.
  */
 export const FLEET_WAKE_DEADLINE_MS = 50_000;
 /**
@@ -91,6 +95,30 @@ export async function fleetWake(
   now: number,
   o: WakeOptions = {},
 ): Promise<WakeOutcome> {
+  const wakes: Message<unknown>[] = [];
+  for (const message of batch.messages) {
+    const body = message.body;
+    if (
+      !body ||
+      typeof body !== "object" ||
+      !("kind" in body) ||
+      body.kind !== "canary_smoke"
+    ) {
+      wakes.push(message);
+      continue;
+    }
+    const again = await runQueuedSmoke(
+      env,
+      "target" in body ? body.target : null,
+      "canary" in body ? body.canary : null,
+      now,
+      message.attempts <= FLEET_WAKE_MAX_RETRIES,
+      o.fleet?.smoke,
+    );
+    if (again) message.retry({ delaySeconds: wakeBackoffS(message.attempts) });
+    else message.ack();
+  }
+  if (wakes.length === 0) return "ok";
   let run: FleetRun | null | undefined;
   const out = await runDuties([
     {
@@ -109,7 +137,7 @@ export async function fleetWake(
   const again = outcome !== "ok" || run?.again === true;
   let back: Message<unknown> | undefined;
   if (again)
-    for (const m of batch.messages)
+    for (const m of wakes)
       if (
         m.attempts <= FLEET_WAKE_MAX_RETRIES &&
         (back === undefined || m.attempts < back.attempts)
@@ -129,14 +157,14 @@ export async function fleetWake(
   )
     .bind(now, SYSTEM_ACTOR.key, canary ?? "-", JSON.stringify(detail))
     .run();
-  for (const m of batch.messages) {
+  for (const m of wakes) {
     if (m === back) m.retry({ delaySeconds: wakeBackoffS(m.attempts) });
     else m.ack();
   }
   console.log(
     "provapi fleet wake",
     outcome,
-    `messages=${batch.messages.length}`,
+    `messages=${wakes.length}`,
     `retried=${back === undefined ? 0 : 1}`,
     `again=${again ? 1 : 0}`,
   );

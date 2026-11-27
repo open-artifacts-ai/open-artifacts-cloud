@@ -232,6 +232,9 @@ function schedulerBindings(
     },
     { type: "service", name: "BILLING", service: `oa-${p}-billing` },
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
+    ...(p === "s"
+      ? [{ type: "queue", name: "FLEET_WAKE", queue_name: "oa-s-fleet-wake" }]
+      : []),
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
     alerts

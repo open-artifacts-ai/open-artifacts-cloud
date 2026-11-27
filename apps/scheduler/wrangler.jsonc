@@ -108,11 +108,14 @@
       // comes back with a backoff, up to max_retries (FLEET_WAKE_MAX_RETRIES,
       // about 15 min).
       "queues": {
-        "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }],
+        "producers": [
+          { "binding": "SIGNUPS", "queue": "oa-s-signups" },
+          { "binding": "FLEET_WAKE", "queue": "oa-s-fleet-wake" }
+        ],
         "consumers": [
           {
             "queue": "oa-s-fleet-wake",
-            "max_batch_size": 10,
+            "max_batch_size": 1,
             "max_batch_timeout": 0,
             "max_retries": 20,
             "max_concurrency": 1

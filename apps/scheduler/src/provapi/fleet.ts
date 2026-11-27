@@ -1025,6 +1025,11 @@ async function canaryReady(
   // FLEET_SMOKE "off": the soak alone, as before the smoke.
   if (fleetSmokeMode(env.FLEET_SMOKE) === "off") return true;
   if (st.rows.has(smokedKey(target, id))) return true;
+  if (env.FLEET_WAKE) {
+    await env.FLEET_WAKE.send({ kind: "canary_smoke", target, canary: id });
+    need.reason = "smoke_queued";
+    return false;
+  }
   return await smokeCanary(env, now, st, canary, target, o, need);
 }
 
@@ -1069,8 +1074,6 @@ async function smokeCanary(
   o: FleetOptions,
   need: Need,
 ): Promise<boolean> {
-  const db = env.PLATFORM_DB;
-  const id = canary.install_id;
   // Only the run's time left, its cleanup aside: too little for one call and
   // the smoke waits for the next pass. Neither a pass nor a fail.
   const budgetMs =
@@ -1083,7 +1086,31 @@ async function smokeCanary(
     need.again = true;
     return false;
   }
-  const r = await (o.smoke ?? smoke)({
+  return performSmoke(
+    env,
+    now,
+    st,
+    canary,
+    target,
+    need,
+    o.smoke ?? smoke,
+    budgetMs,
+  );
+}
+
+async function performSmoke(
+  env: FleetEnv,
+  now: number,
+  st: FleetState,
+  canary: CanaryRow,
+  target: string,
+  need: Need,
+  execute: typeof smoke,
+  budgetMs?: number,
+): Promise<boolean> {
+  const db = env.PLATFORM_DB;
+  const id = canary.install_id;
+  const r = await execute({
     budgetMs,
     fetch: (url, init) => fetch(url, init),
     installId: id,
@@ -1142,6 +1169,81 @@ async function smokeCanary(
   await setOnce(db, st, `${FLEET_SMOKE_HALT_PREFIX}${target}:${r.check}`, now);
   await halt(db, now, st, target, id);
   return false;
+}
+
+/** One queue job. Derive the host and eligibility from current platform state.
+ * A redelivery after a successful smoke can resend the completion event.
+ */
+export async function runQueuedSmoke(
+  env: FleetEnv,
+  target: unknown,
+  id: unknown,
+  now: number,
+  canRetry: boolean,
+  execute = smoke,
+): Promise<boolean> {
+  if (
+    !env.FLEET_WAKE ||
+    typeof target !== "string" ||
+    target !== fleetTarget(env.CF_VERSION_METADATA) ||
+    typeof id !== "string" ||
+    id !== fleetCanary(env.FLEET_CANARY) ||
+    fleetSmokeMode(env.FLEET_SMOKE) !== "required"
+  )
+    return false;
+  const db = env.PLATFORM_DB;
+  const st = await fleetState(db);
+  if (
+    isHalted(st, target) ||
+    !st.rows.has(FLEET_VERIFIED_PREFIX + target) ||
+    !st.rows.has(soakedKey(target, id))
+  )
+    return false;
+  const canary = await d1(db.prepare(CANARY).bind(id).first<CanaryRow>());
+  if (
+    !canary ||
+    canary.version !== target ||
+    !canary.app_host ||
+    canary.state !== "active" ||
+    canary.install_state !== "active" ||
+    canary.active_job_id !== null ||
+    canary.serving_mode !== "serving" ||
+    (canary.test_hooks ?? 0) !== 0
+  )
+    return false;
+  const alreadyPassed = st.rows.has(smokedKey(target, id));
+  const need: Need = {
+    reason: alreadyPassed ? "smoke_already_passed" : "smoke_passed",
+    again: false,
+  };
+  const passed =
+    alreadyPassed ||
+    (await performSmoke(env, now, st, canary, target, need, execute));
+  await db
+    .prepare(
+      "INSERT INTO hosted_audit (at, actor, install_id, action, detail) VALUES (?1, ?2, ?3, 'fleet.wake', ?4)",
+    )
+    .bind(
+      Date.now(),
+      SYSTEM_ACTOR.key,
+      id,
+      JSON.stringify({
+        to: target,
+        canary: id,
+        decision: "smoke",
+        retried: need.again && canRetry,
+        reason: need.reason,
+        check: need.check,
+      }),
+    )
+    .run();
+  if (passed)
+    await bound(env.FLEET_WAKE).send({
+      kind: "smoke_finished",
+      target,
+      canary: id,
+    });
+  return need.again && canRetry;
 }
 
 /**
