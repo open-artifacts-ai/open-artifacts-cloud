@@ -3246,7 +3246,15 @@ describe("#1343: the canary smoke gates the rollout", () => {
         { ok: true, notes: [] },
       ],
     });
-    await fleetDue(f.env, NOW, f.opts);
+    await fleetWake(wakeBatch([1]).batch, f.env, NOW, { fleet: f.opts });
+    const [audit] = await rows(
+      "SELECT detail FROM hosted_audit WHERE action = 'fleet.wake' AND install_id = ?",
+      canary,
+    );
+    expect(JSON.parse(String(audit?.detail))).toMatchObject({
+      reason: "smoke_budget",
+      check: "mcp",
+    });
     expect(await halted()).toEqual([]);
     expect(await stateKeys("fleet_smoke_")).toEqual([]);
     expect(await queued()).toEqual([]);

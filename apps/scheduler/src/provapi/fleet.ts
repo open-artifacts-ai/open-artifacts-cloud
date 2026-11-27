@@ -66,6 +66,7 @@ import { dutyCategory } from "./run.js";
 import {
   SMOKE_BUDGET_MS,
   SMOKE_CALL_MS,
+  type SmokeCheck,
   type SmokeInput,
   type SmokeResult,
   smoke,
@@ -561,6 +562,7 @@ export type FleetPass = "canary" | "batch" | "idle";
 export interface FleetRun {
   pass: FleetPass;
   reason: string;
+  check?: SmokeCheck;
   again: boolean;
 }
 
@@ -617,6 +619,7 @@ export async function fleetPass(
 /** Set by a pass when only time can finish what it left (FleetRun). */
 interface Need {
   reason: string;
+  check?: SmokeCheck;
   again: boolean;
 }
 
@@ -1101,6 +1104,7 @@ async function smokeCanary(
     return true;
   }
   need.reason = `smoke_${r.kind}`;
+  need.check = r.check;
   console.log("provapi fleet smoke", r.kind, r.check);
   if (r.kind === "budget") {
     need.again = true;
