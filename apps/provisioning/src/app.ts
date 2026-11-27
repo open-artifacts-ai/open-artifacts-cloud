@@ -34,6 +34,7 @@ import { BETA_PATH_RE, betaApi } from "./routes/beta.js";
 import { BUSINESS_PATH_RE, businessApi } from "./routes/business.js";
 import { CLAIM_FREE_PATH, freeClaim } from "./routes/claim-free.js";
 import { bodyKeys, invokeRoute } from "./routes/invoke.js";
+import { UNSUBSCRIBE_PATH, unsubscribe } from "./routes/optouts.js";
 import { SET_TIER_PATH_RE, setTier } from "./routes/set-tier.js";
 import { matchRoute } from "./routes/table.js";
 import { ipKeyOf } from "./services/counters.js";
@@ -82,6 +83,8 @@ export async function handle(
   if (host === "signup")
     return browserHeaders(await route(req, env, ctx, "signup", url, signin), {
       csp: SIGNUP_CSP,
+      // The unsubscribe page carries its own, stricter CSP.
+      ownCsp: url.pathname === UNSUBSCRIBE_PATH,
     });
   // Every admin-host response, SPA and errors alike, carries the 4.5
   // browser-host headers; the consent page keeps its own CSP (9A.3.2).
@@ -124,6 +127,11 @@ async function route(
     );
   }
   if (isOAuthPath(path)) return notFound();
+
+  // The public unsubscribe page (#2652): a mail client's one-click POST has no
+  // Origin to check, and the page sets no cookie and reads none.
+  if (host === "signup" && path === UNSUBSCRIBE_PATH)
+    return unsubscribe(req, env, ipKey);
 
   // Browser writes: Origin before authn (4.2).
   if (host === "admin" || host === "signup") {

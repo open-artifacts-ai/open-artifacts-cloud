@@ -1,8 +1,18 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: literal workflow expressions
-// staging-release-chain.yml (cloud #264 step 1): a published release starts
-// the staging deploy, a green chain-dispatched staging deploy starts the gate,
-// each once per tag, never for a manual or test run.
-import { readFileSync } from "node:fs";
+// staging-release-chain.yml (cloud #264 steps 1 and 4): a cut release starts
+// the staging deploy beside the staging copy; the gate starts once both the
+// copy and a chain-dispatched staging deploy succeeded, each once per tag,
+// never for a manual or test run.
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -31,14 +41,42 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 const REPO = "open-artifacts-ai/open-artifacts-cloud";
 const TAG = "v0.99.0";
 const PUBLISH_PATH = ".github/workflows/hosted-publish.yml";
+const RELEASE_PATH = ".github/workflows/hosted-release.yml";
+const SHA = "a".repeat(40);
 const DEPLOY_PATH = ".github/workflows/deploy-hosted-platform.yml";
 const BOT = APP_ACTOR;
 
+type Job = { name: string; conclusion: string | null };
+type DeployRun =
+  | string
+  | {
+      title: string;
+      status?: string;
+      conclusion?: string | null;
+      actor?: string;
+    };
 type World = {
   latest?: string;
-  jobs?: { name: string; conclusion: string | null }[];
-  deployRuns?: string[];
+  /** The latest tag's commit. */
+  tagSha?: string;
+  /** The event hosted-publish run's jobs (run 123). */
+  jobs?: Job[];
+  /** The event hosted-release run's jobs (run 122); the default is a passed guard, no hosted-built job (before #469). */
+  releaseJobs?: Job[];
+  /** PUBLIC_PIN's tag at a commit; the default is the newest release's at every commit. */
+  pins?: Record<string, string>;
+  /** PUBLIC_PIN's public commit at a commit; the default is PUB at every commit. */
+  pinShas?: Record<string, string>;
+  /** hosted-publish runs, newest first; the default is run 123 alone. */
+  publishRuns?: { id: number; event?: string; jobs: Job[] }[];
+  deployRuns?: DeployRun[];
   gateRuns?: string[];
+};
+const PUB = "c".repeat(40);
+const GUARD: Job = { name: "hosted-guard", conclusion: "success" };
+const COPIED: Job = {
+  name: `publish-staging release ${TAG}`,
+  conclusion: "success",
 };
 const world = (o: World = {}) => {
   const calls: string[][] = [];
@@ -51,20 +89,46 @@ const world = (o: World = {}) => {
       stderr: "",
     });
     if (args[0] === "workflow") return { code: 0, stdout: "", stderr: "" };
+    const publishRuns = o.publishRuns ?? [
+      { id: 123, jobs: o.jobs ?? [COPIED] },
+    ];
+    const pinRef = /\/contents\/PUBLIC_PIN\?ref=([0-9a-f]{40})$/.exec(path);
+    if (pinRef) {
+      const at = pinRef[1] as string;
+      const tag = o.pins?.[at] ?? o.latest ?? TAG;
+      const pub = o.pinShas?.[at] ?? PUB;
+      return { code: 0, stdout: `tag=${tag}\nsha=${pub}\n`, stderr: "" };
+    }
     if (path.endsWith("/releases/latest"))
       return json({ tag_name: o.latest ?? TAG });
-    if (path.includes("/jobs"))
+    if (path.includes("/commits/")) return json({ sha: o.tagSha ?? SHA });
+    const jobsOf = /\/actions\/runs\/(\d+)\/jobs/.exec(path);
+    if (jobsOf?.[1] === "122") return json({ jobs: o.releaseJobs ?? [GUARD] });
+    if (jobsOf) {
+      const r = publishRuns.find((p) => String(p.id) === jobsOf[1]);
+      if (!r) throw new Error(`no run ${jobsOf[1]}`);
+      return json({ jobs: r.jobs });
+    }
+    if (path.includes("/workflows/hosted-publish.yml/"))
       return json({
-        jobs: o.jobs ?? [
-          { name: `publish-staging release ${TAG}`, conclusion: "success" },
-        ],
+        workflow_runs: publishRuns.map((r) => ({
+          id: r.id,
+          event: r.event ?? "workflow_run",
+          head_branch: "main",
+        })),
       });
     if (path.includes("/workflows/deploy-hosted-platform.yml/"))
       return json({
-        workflow_runs: (o.deployRuns ?? []).map((t, id) => ({
-          id: id + 1,
-          display_title: t,
-        })),
+        workflow_runs: (o.deployRuns ?? []).map((d, id) => {
+          const r = typeof d === "string" ? { title: d } : d;
+          return {
+            id: id + 1,
+            display_title: r.title,
+            status: r.status,
+            conclusion: r.conclusion,
+            actor: { login: r.actor },
+          };
+        }),
       });
     if (path.includes("/workflows/redline-staging.yml/"))
       return json({
@@ -77,6 +141,20 @@ const world = (o: World = {}) => {
   };
   return { exec, calls };
 };
+const afterRelease = (o: World = {}, over: Record<string, string> = {}) =>
+  plan({
+    exec: world(o).exec,
+    repo: REPO,
+    workflow: RELEASE_PATH,
+    conclusion: "success",
+    event: "push",
+    branch: "main",
+    title: "hosted-release",
+    actor: BOT,
+    runId: "122",
+    headSha: SHA,
+    ...over,
+  });
 const afterPublish = (o: World = {}, over: Record<string, string> = {}) =>
   plan({
     exec: world(o).exec,
@@ -182,9 +260,11 @@ describe("after hosted-publish: the staging deploy", () => {
   });
   it("fails closed on an API error", () => {
     const exec: Exec = () => ({ code: 1, stdout: "", stderr: "HTTP 502" });
+    const backoffs: number[] = [];
     expect(() =>
       plan({
         exec,
+        sleep: (ms) => backoffs.push(ms),
         repo: REPO,
         workflow: PUBLISH_PATH,
         conclusion: "success",
@@ -195,6 +275,7 @@ describe("after hosted-publish: the staging deploy", () => {
         runId: "123",
       }),
     ).toThrow(/502/);
+    expect(backoffs).toEqual([2_000, 5_000]);
   });
 });
 
@@ -223,6 +304,11 @@ describe("after the staging deploy: the gate", () => {
       ),
     );
     skipped(afterDeploy({}, { title: `${CHAIN_TITLE} x` }));
+    // cloud #264: the prod chain's own deploy, dispatched by the same App,
+    // never starts the staging gate.
+    skipped(
+      afterDeploy({}, { title: `deploy-hosted-platform prod ${TAG} [c77-1]` }),
+    );
   });
   it("skips a deploy not dispatched by the bot, or not a dispatch", () => {
     skipped(afterDeploy({}, { actor: "someone" }));
@@ -257,7 +343,398 @@ describe("after the staging deploy: the gate", () => {
   });
 });
 
+describe("after hosted-release: the staging deploy starts beside the copy", () => {
+  it("starts for the release the run cut (its commit is the newest tag's)", () => {
+    expect(afterRelease()).toEqual({ go: true, next: "deploy", tag: TAG });
+    // a real run dispatched by hand (dry_run false) has the same name
+    expect(afterRelease({}, { event: "workflow_dispatch" }).go).toBe(true);
+  });
+  it("skips a dry run, a failed, cancelled or off-main run, another event", () => {
+    skipped(afterRelease({}, { title: "hosted-release (dry run)" }));
+    skipped(afterRelease({}, { conclusion: "failure" }));
+    skipped(afterRelease({}, { conclusion: "cancelled" }));
+    skipped(afterRelease({}, { branch: "other" }));
+    skipped(afterRelease({}, { event: "schedule" }));
+  });
+  it("skips a run that built an older release than the newest", () => {
+    // before #469: PUBLIC_PIN at the head names v0.98.0
+    skipped(afterRelease({ pins: { [SHA]: "v0.98.0" } }));
+    // after #469: its hosted-built job names v0.98.0
+    skipped(
+      afterRelease({
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" },
+        ],
+      }),
+    );
+  });
+  it("skips a run whose guard did not pass (it built nothing)", () => {
+    skipped(
+      afterRelease({
+        releaseJobs: [{ name: "hosted-guard", conclusion: "skipped" }],
+      }),
+    );
+  });
+  // The v0.246.1 recovery (run 45728492094): a dispatch on main's newer head
+  // rebuilt the existing tag's older commit and succeeded. Its head is not
+  // the tag's commit, yet it built the newest release.
+  const OLD = "b".repeat(40);
+  it("starts for a rebuild of the newest tag's older commit, by its hosted-built job (#469)", () => {
+    const r = world({
+      tagSha: OLD,
+      releaseJobs: [
+        GUARD,
+        { name: `hosted-built ${TAG} ${OLD}`, conclusion: "success" },
+      ],
+      pins: { [SHA]: "v0.98.0" },
+    });
+    const p = plan({
+      exec: r.exec,
+      repo: REPO,
+      workflow: RELEASE_PATH,
+      conclusion: "success",
+      event: "workflow_dispatch",
+      branch: "main",
+      title: "hosted-release",
+      actor: BOT,
+      runId: "122",
+      headSha: SHA,
+    });
+    expect(p).toEqual({ go: true, next: "deploy", tag: TAG });
+    // The marker names the release: PUBLIC_PIN is never read, and the
+    // latest attempt's jobs are.
+    expect(r.calls.some((c) => c.some((a) => a.includes("PUBLIC_PIN")))).toBe(
+      false,
+    );
+    expect(
+      r.calls.some((c) =>
+        c.includes(
+          `repos/${REPO}/actions/runs/122/jobs?filter=latest&per_page=100`,
+        ),
+      ),
+    ).toBe(true);
+  });
+  it("starts for the same rebuild before #469, from what its guard checked", () => {
+    // PUBLIC_PIN at the head and at the tag's older commit pin the same release
+    expect(
+      afterRelease({ tagSha: OLD }, { event: "workflow_dispatch" }),
+    ).toEqual({ go: true, next: "deploy", tag: TAG });
+  });
+  it("fails closed when the built release doesn't hold now", () => {
+    // the marker's tag has moved to another commit
+    expect(() =>
+      afterRelease({
+        tagSha: OLD,
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" },
+        ],
+      }),
+    ).toThrow(/built v0\.99\.0 at a+, but v0\.99\.0 is at b+/);
+    // two markers
+    expect(() =>
+      afterRelease({
+        releaseJobs: [
+          { name: `hosted-built ${TAG} ${SHA}`, conclusion: "success" },
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "success" },
+        ],
+      }),
+    ).toThrow(/several built releases/);
+    // before #469: the tag's older commit pins another public release
+    expect(() =>
+      afterRelease({ tagSha: OLD, pinShas: { [OLD]: "d".repeat(40) } }),
+    ).toThrow(/does not pin v0\.99\.0/);
+    // a bad run id
+    expect(() => afterRelease({}, { runId: "x" })).toThrow(/run id/);
+  });
+  it("a failed hosted-built job names nothing: the guard's rule decides", () => {
+    expect(
+      afterRelease({
+        releaseJobs: [
+          GUARD,
+          { name: `hosted-built v0.98.0 ${SHA}`, conclusion: "failure" },
+        ],
+      }),
+    ).toEqual({ go: true, next: "deploy", tag: TAG });
+  });
+  it("never twice: a deploy run for the tag in any state skips", () => {
+    skipped(afterRelease({ deployRuns: [CHAIN_TITLE] }));
+    skipped(
+      afterRelease({ deployRuns: [`deploy-hosted-platform staging ${TAG}`] }),
+    );
+  });
+  it("fails closed on a bad head sha", () => {
+    expect(() => afterRelease({}, { headSha: "" })).toThrow(/head sha/);
+    expect(() => afterRelease({}, { headSha: "main" })).toThrow(/head sha/);
+  });
+});
+
+describe("after hosted-publish once the deploy started beside it", () => {
+  const green = {
+    title: CHAIN_TITLE,
+    status: "completed",
+    conclusion: "success",
+    actor: BOT,
+  };
+  // A late completion event from an older publish run (123, its copy
+  // green) after a newer run (200) copied the same tag and did not succeed:
+  // the newest copy decides, never the event run's own job.
+  it("a late older run's event never opens the gate after a newer copy failed, was cancelled or still runs", () => {
+    for (const conclusion of ["failure", "cancelled", null]) {
+      const late = {
+        jobs: [COPIED],
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      };
+      const p = afterPublish({ ...late, deployRuns: [green] });
+      skipped(p);
+      expect(JSON.stringify(p), String(conclusion)).toContain(
+        "newest staging copy",
+      );
+      // nor starts the fallback deploy
+      skipped(afterPublish(late));
+    }
+    // a newer successful copy: the same late event may open it
+    expect(
+      afterPublish({
+        jobs: [COPIED],
+        deployRuns: [green],
+        publishRuns: [
+          { id: 200, jobs: [COPIED] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      }),
+    ).toEqual({ go: true, next: "gate", tag: TAG });
+  });
+  it("starts the gate when this chain's deploy already succeeded", () => {
+    expect(afterPublish({ deployRuns: [green] })).toEqual({
+      go: true,
+      next: "gate",
+      tag: TAG,
+    });
+  });
+  it("waits while the deploy runs, and never gates on a failed one", () => {
+    skipped(
+      afterPublish({
+        deployRuns: [{ ...green, status: "in_progress", conclusion: null }],
+      }),
+    );
+    skipped(
+      afterPublish({ deployRuns: [{ ...green, conclusion: "failure" }] }),
+    );
+  });
+  it("a manual green deploy of the tag (no chain id, not the bot) never gates", () => {
+    skipped(
+      afterPublish({
+        deployRuns: [
+          { ...green, title: `deploy-hosted-platform staging ${TAG}` },
+        ],
+      }),
+    );
+    skipped(afterPublish({ deployRuns: [{ ...green, actor: "someone" }] }));
+  });
+  it("never twice: a gate run for the tag skips", () => {
+    skipped(
+      afterPublish({
+        deployRuns: [green],
+        gateRuns: [`redline-staging ${TAG}`],
+      }),
+    );
+  });
+});
+
+describe("after the staging deploy: the gate waits for the staging copy", () => {
+  const other: Job = { name: "publish-staging none ", conclusion: "skipped" };
+  it("starts once a hosted-release publish run copied the tag", () => {
+    expect(afterDeploy()).toEqual({ go: true, next: "gate", tag: TAG });
+    // the copy is in an older run: the newest published nothing
+    expect(
+      afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [other] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      }).go,
+    ).toBe(true);
+    // its run may still be going (stage-prod after the copy)
+    expect(
+      afterDeploy({
+        publishRuns: [
+          {
+            id: 123,
+            jobs: [
+              COPIED,
+              { name: `stage-prod release ${TAG}`, conclusion: null },
+            ],
+          },
+        ],
+      }).go,
+    ).toBe(true);
+  });
+  it("waits while the copy runs: its end starts the gate", () => {
+    const p = afterDeploy({
+      publishRuns: [
+        { id: 123, jobs: [{ name: COPIED.name, conclusion: null }] },
+        // an older green copy of the tag is not read past a running one
+        { id: 99, jobs: [COPIED] },
+      ],
+    });
+    skipped(p);
+    expect(JSON.stringify(p)).toContain("staging copy");
+  });
+  it("a failed or missing copy never starts the gate", () => {
+    skipped(
+      afterDeploy({
+        publishRuns: [
+          { id: 123, jobs: [{ ...COPIED, conclusion: "failure" }] },
+        ],
+      }),
+    );
+    skipped(afterDeploy({ publishRuns: [] }));
+    skipped(
+      afterDeploy({
+        publishRuns: [
+          {
+            id: 123,
+            jobs: [
+              {
+                name: "publish-staging release v0.98.0",
+                conclusion: "success",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+  });
+  it("the newest copy decides: a newer failed copy keeps the gate shut over an older success", () => {
+    for (const conclusion of ["failure", "cancelled"]) {
+      const p = afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      });
+      skipped(p);
+      expect(JSON.stringify(p), conclusion).toContain("staging copy");
+    }
+    // a newer success after an older failure opens it
+    expect(
+      afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [COPIED] },
+          { id: 123, jobs: [{ ...COPIED, conclusion: "failure" }] },
+        ],
+      }).go,
+    ).toBe(true);
+    // a newer run that skipped the copy is passed over
+    expect(
+      afterDeploy({
+        publishRuns: [
+          { id: 200, jobs: [{ ...COPIED, conclusion: "skipped" }] },
+          { id: 123, jobs: [COPIED] },
+        ],
+      }).go,
+    ).toBe(true);
+  });
+  it("a manual publish's copy does not count", () => {
+    skipped(
+      afterDeploy({
+        publishRuns: [{ id: 123, event: "workflow_dispatch", jobs: [COPIED] }],
+      }),
+    );
+  });
+});
+
+describe("step 4 ordering: the gate starts once, after both, from whichever ends last", () => {
+  const green = {
+    title: CHAIN_TITLE,
+    status: "completed",
+    conclusion: "success",
+    actor: BOT,
+  };
+  const running = { ...green, status: "in_progress", conclusion: null };
+  const copying: Job = { name: COPIED.name, conclusion: null };
+  it("hosted-release starts the deploy; the copy then sees it started and does not start another", () => {
+    expect(afterRelease().go).toBe(true);
+    // the copy ends while the deploy runs: neither a second deploy nor the gate
+    skipped(afterPublish({ deployRuns: [running] }));
+    // the deploy ends after the copy: the gate
+    expect(afterDeploy({ deployRuns: [green] })).toEqual({
+      go: true,
+      next: "gate",
+      tag: TAG,
+    });
+  });
+  it("the deploy ends first: it waits, and the copy's end starts the gate", () => {
+    skipped(
+      afterDeploy({
+        deployRuns: [green],
+        publishRuns: [{ id: 123, jobs: [copying] }],
+      }),
+    );
+    expect(afterPublish({ deployRuns: [green] })).toEqual({
+      go: true,
+      next: "gate",
+      tag: TAG,
+    });
+  });
+  it("the copy fails: neither end starts the gate, so nothing reaches prod", () => {
+    const failed: Job = { ...COPIED, conclusion: "failure" };
+    skipped(
+      afterDeploy({
+        deployRuns: [green],
+        publishRuns: [{ id: 123, jobs: [failed] }],
+      }),
+    );
+    skipped(
+      afterPublish(
+        { deployRuns: [green], jobs: [failed] },
+        { conclusion: "failure" },
+      ),
+    );
+  });
+  it("the deploy fails: neither end starts the gate", () => {
+    const red = { ...green, conclusion: "failure" };
+    skipped(afterDeploy({ deployRuns: [red] }, { conclusion: "failure" }));
+    skipped(afterPublish({ deployRuns: [red] }));
+  });
+  it("both ends see both green: the second finds the first's gate run and starts nothing", () => {
+    expect(afterDeploy({ deployRuns: [green] }).go).toBe(true);
+    skipped(
+      afterPublish({
+        deployRuns: [green],
+        gateRuns: [`redline-staging ${TAG}`],
+      }),
+    );
+    const wd = world({
+      deployRuns: [green],
+      gateRuns: [`redline-staging ${TAG}`],
+    });
+    expect(
+      dispatch({
+        exec: wd.exec,
+        repo: REPO,
+        next: "gate",
+        tag: TAG,
+        chainId: "sc9-1",
+      }).started,
+    ).toBe(false);
+  });
+});
+
 describe("dispatch", () => {
+  const greenDeploy = {
+    title: CHAIN_TITLE,
+    status: "completed",
+    conclusion: "success",
+    actor: BOT,
+  };
+  /** The world the plan saw for the gate: deploy and copy green. */
+  const ready: World = { deployRuns: [greenDeploy] };
   const call = (o: World, next: "deploy" | "gate") => {
     const wd = world(o);
     const r = dispatch({
@@ -308,10 +785,10 @@ describe("dispatch", () => {
     expect(FULL_BILLING).toContain("directory-broker,billing,provision-token");
     expect(call({}, "deploy").started[0]?.join(" ")).not.toContain("targets=");
     // the gate never takes targets
-    expect(call({}, "gate").started[0]?.join(" ")).not.toContain("targets=");
+    expect(call(ready, "gate").started[0]?.join(" ")).not.toContain("targets=");
   });
   it("dispatches the gate with the tag only", () => {
-    const { started } = call({}, "gate");
+    const { started } = call(ready, "gate");
     expect(started[0]?.slice(2)).toEqual([
       "redline-staging.yml",
       "--repo",
@@ -328,6 +805,52 @@ describe("dispatch", () => {
       call({ gateRuns: [`redline-staging ${TAG}`] }, "gate").started,
     ).toEqual([]);
     expect(call({ latest: "v1.0.0" }, "deploy").r.started).toBe(false);
+  });
+  // Between the plan job and this one, a newer copy of the tag failed, was
+  // cancelled or started, or the deploy is not green: the gate isn't started.
+  it("re-checks the copy and the deploy right before the gate", () => {
+    for (const conclusion of ["failure", "cancelled", null]) {
+      const { r, started } = call(
+        {
+          ...ready,
+          publishRuns: [
+            { id: 200, jobs: [{ ...COPIED, conclusion }] },
+            { id: 123, jobs: [COPIED] },
+          ],
+        },
+        "gate",
+      );
+      expect(started, String(conclusion)).toEqual([]);
+      expect(r).toEqual({
+        started: false,
+        why: `the newest staging copy of ${TAG} is no longer green at dispatch: the gate is not started`,
+      });
+    }
+    const noDeploy = call({}, "gate");
+    expect(noDeploy.started).toEqual([]);
+    expect(noDeploy.r.why).toMatch(
+      /staging deploy of v0\.99\.0 is no longer green/,
+    );
+    // a newer successful copy: started
+    expect(
+      call(
+        {
+          ...ready,
+          publishRuns: [
+            { id: 200, jobs: [COPIED] },
+            { id: 123, jobs: [COPIED] },
+          ],
+        },
+        "gate",
+      ).r.started,
+    ).toBe(true);
+    // the deploy start never waits on the copy (it runs beside it)
+    expect(
+      call(
+        { publishRuns: [{ id: 123, jobs: [{ ...COPIED, conclusion: null }] }] },
+        "deploy",
+      ).r.started,
+    ).toBe(true);
   });
   it("refuses a bad tag or chain id", () => {
     const e = world().exec;
@@ -347,10 +870,14 @@ describe("dispatch", () => {
 });
 
 describe("the workflow", () => {
-  it("is triggered only by completed hosted-publish and deploy runs on main", () => {
+  it("is triggered only by completed hosted-release, hosted-publish and deploy runs on main", () => {
     expect(w.on).toEqual({
       workflow_run: {
-        workflows: ["hosted-publish", "deploy-hosted-platform"],
+        workflows: [
+          "hosted-release",
+          "hosted-publish",
+          "deploy-hosted-platform",
+        ],
         types: ["completed"],
         branches: ["main"],
       },
@@ -359,6 +886,14 @@ describe("the workflow", () => {
   });
   it("names exactly the workflows and run-names the script matches", () => {
     expect(publish.name).toBe("hosted-publish");
+    // hosted-release's real runs are named exactly "hosted-release"; dry runs
+    // add "(dry run)". hosted-publish follows the same completed runs.
+    const release = parse(read(".github/workflows/hosted-release.yml"));
+    expect(release.name).toBe("hosted-release");
+    expect(release["run-name"]).toBe(
+      "${{ inputs.dry_run && 'hosted-release (dry run)' || 'hosted-release' }}",
+    );
+    expect(publish.on.workflow_run.workflows).toEqual(["hosted-release"]);
     expect(deploy.name).toBe("deploy-hosted-platform");
     expect(publish.jobs["publish-staging"].name).toBe(
       "publish-staging ${{ needs.resolve.outputs.kind }} ${{ needs.resolve.outputs.tag }}",
@@ -392,6 +927,8 @@ describe("the workflow", () => {
     expect(step.env.TITLE).toBe(
       "${{ github.event.workflow_run.display_title }}",
     );
+    expect(step.env.HEAD_SHA).toBe("${{ github.event.workflow_run.head_sha }}");
+    expect(step.run).toContain('--head-sha "$HEAD_SHA"');
   });
   it("dispatches with the release App's token (actions: write), never github.token", () => {
     // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
@@ -426,29 +963,136 @@ describe("the workflow", () => {
       "needs.plan.outputs.tag",
     );
     expect(w.jobs.dispatch.concurrency["cancel-in-progress"]).toBe(false);
-    for (const j of Object.values(w.jobs))
-      expect((j as { environment?: unknown }).environment).toBeUndefined();
+    // Only the job that mints the release App token has an environment (#302).
+    expect(w.jobs.dispatch.environment).toBe("release-app");
+    for (const [name, j] of Object.entries(w.jobs))
+      if (name !== "dispatch")
+        expect((j as { environment?: unknown }).environment).toBeUndefined();
   });
-  it("leaves prod-release-chain's trigger as it was", () => {
+  it("hands over to prod-release-chain, which keeps prod's order (copy, then deploy) on its own events", () => {
     const p = parse(read(".github/workflows/prod-release-chain.yml"));
-    expect(p.on.workflow_run.workflows).toEqual(["redline-staging"]);
+    expect(p.on.workflow_run.workflows).toEqual([
+      "redline-staging",
+      "hosted-publish",
+      "deploy-hosted-platform",
+    ]);
+    expect(p.jobs.start.needs).toEqual(["plan", "gate"]);
+    expect(p.jobs.deploy.if).toBe("needs.plan.outputs.step == 'deploy'");
   });
 });
 
 describe("runs-list reads stay under spawnSync's 1 MiB buffer", () => {
-  for (const f of [
-    "chain-dispatch",
-    "staging-release-chain",
-    "prod-release-chain",
-  ]) {
+  // chain-dispatch.ts lists no runs (cloud #264: it dispatches and ends).
+  for (const f of ["staging-release-chain", "prod-release-chain"]) {
     it(`${f}: small page, --jq, maxBuffer backstop`, () => {
       const src = read(`scripts/ci/${f}.ts`);
       const lists = src.match(/actions\/workflows\/[^`]*\/runs\?[^`]*`/g) ?? [];
       expect(lists.length).toBeGreaterThan(0);
-      for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
-      expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      if (f === "prod-release-chain") {
+        // fresh reads one small page; the duplicate checks read every page
+        // through allRuns, 100 runs a page, each cut down by --jq to a few
+        // hundred bytes (well under 1 MiB a page).
+        const [one, ...paged] = lists;
+        expect(one).toMatch(/per_page=30`/);
+        expect(paged.length).toBeGreaterThan(0);
+        for (const l of paged) expect(l).not.toMatch(/per_page/);
+        expect(src).toMatch(/const PER_PAGE = 100;/);
+        expect(src).toMatch(/"--jq",\s+RUNS_JQ,\s+`\$\{path\}&created=/);
+        expect(src).toMatch(
+          /RUNS_JQ =\s+"\{total_count, workflow_runs: \[\.workflow_runs\[\]\? \| \{id, display_title,/,
+        );
+      } else {
+        for (const l of lists) expect(l).toMatch(/per_page=(20|30)`/);
+        expect(src.match(/"--jq"/g)?.length).toBe(lists.length);
+      }
       expect(src).toMatch(/MAX_BUFFER = 16 \* 1024 \* 1024/);
       expect(src).toMatch(/maxBuffer: MAX_BUFFER/);
     });
   }
+});
+
+// Cloud #264: once the chain starts the gate (staging's deploy and copy both
+// green), it also dispatches the rl-agents upgrade (staging-test-member.yml
+// upgrade_tag) with the release App's token. Nothing waits for it, and it
+// can't fail the chain.
+describe("the rl-agents upgrade dispatch (cloud #264)", () => {
+  // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+  const steps: any[] = w.jobs.dispatch.steps;
+  const iStart = steps.findIndex((s) => s.id === "start");
+  const iUp = steps.findIndex(
+    (s) =>
+      s.name === "Start the rl-agents upgrade for the tag (waits for nothing)",
+  );
+  const up = steps[iUp];
+
+  it("comes right after the gate's dispatch, only when that started the gate, with the App token, and never fails the chain", () => {
+    expect(iStart).toBeGreaterThanOrEqual(0);
+    expect(steps[iStart].run).toContain("staging-release-chain.ts dispatch");
+    expect(iUp).toBe(iStart + 1);
+    expect(up.if).toBe(
+      "needs.plan.outputs.next == 'gate' && steps.start.outputs.started == 'true'",
+    );
+    expect(up["continue-on-error"]).toBe(true);
+    expect(up["timeout-minutes"]).toBe(1);
+    expect(up.env).toEqual({
+      GH_TOKEN: "${{ steps.app.outputs.token }}",
+      TAG: "${{ needs.plan.outputs.tag }}",
+    });
+    expect(up.run).toContain(
+      'gh workflow run staging-test-member.yml --repo "$GITHUB_REPOSITORY" --ref main -f upgrade_tag="$TAG"',
+    );
+    // A dispatch, never a watch.
+    expect(up.run).not.toMatch(/\b(sleep|while|until|wait|watch)\b/);
+    // The test member's workflow has the mode it dispatches.
+    const tm = parse(read(".github/workflows/staging-test-member.yml"));
+    expect(Object.keys(tm.on.workflow_dispatch.inputs)).toContain(
+      "upgrade_tag",
+    );
+  });
+
+  function runUp(o: { tag?: string; ghExit: number }) {
+    const d = mkdtempSync(join(tmpdir(), "oa-chain-up-"));
+    const bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "gh"),
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${d}/calls"\nexit ${o.ghExit}\n`,
+      { mode: 0o755 },
+    );
+    const summary = join(d, "summary");
+    const r = spawnSync("bash", ["-c", up.run], {
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        TAG: o.tag ?? "v0.250.0",
+        GH_TOKEN: "app-token",
+        GITHUB_REPOSITORY: "open-artifacts-ai/open-artifacts-cloud",
+        GITHUB_STEP_SUMMARY: summary,
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const calls = existsSync(join(d, "calls"))
+      ? readFileSync(join(d, "calls"), "utf8").trim().split("\n")
+      : [];
+    const sum = existsSync(summary) ? readFileSync(summary, "utf8") : "";
+    rmSync(d, { recursive: true, force: true });
+    return { ...r, calls, sum };
+  }
+
+  it("dispatches the upgrade for the tag once; a failed dispatch or a bad tag warns and exits 0", () => {
+    const ok = runUp({ ghExit: 0 });
+    expect(ok.status, ok.stderr).toBe(0);
+    expect(ok.calls).toEqual([
+      "workflow run staging-test-member.yml --repo open-artifacts-ai/open-artifacts-cloud --ref main -f upgrade_tag=v0.250.0",
+    ]);
+    expect(ok.sum).toContain("rl-agents: upgrade to v0.250.0 dispatched");
+    const failed = runUp({ ghExit: 1 });
+    expect(failed.status).toBe(0);
+    expect(failed.stdout).toContain(
+      "::warning title=rl-agents upgrade::the dispatch failed",
+    );
+    const bad = runUp({ tag: "main", ghExit: 0 });
+    expect(bad.status).toBe(0);
+    expect(bad.calls).toEqual([]);
+  });
 });

@@ -37,8 +37,6 @@ export interface ProvapiEnv {
   CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** The install the fleet rollout upgrades first; unset means no rollout. */
   FLEET_CANARY?: string;
-  /** The install upgraded alone right after the canary (fleet.ts fleetSecond). */
-  FLEET_SECOND?: string;
   /** The canary smoke: "off" (the passive soak) or "required"; else required. */
   FLEET_SMOKE?: string;
   /** The smoke's share check: "off" skips it; anything else runs it. */

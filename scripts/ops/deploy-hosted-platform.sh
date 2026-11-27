@@ -37,7 +37,9 @@
 #                    tag declares a BILLING binding, oa-<p>-billing too, #1568)
 #   scheduler        PLATFORM_DB_ID EMAIL_ZONE_TAGS EMAIL_DAILY_LIMIT ALERT_TO ALERT_FROM
 #                    SIGNUP_DAILY_CAP SIGNUPS_ENABLED (both brokers,
-#                    oa-<p>-provisioner and the oa-<p>-signups queue must exist)
+#                    oa-<p>-provisioner and the oa-<p>-signups queue must exist;
+#                    the oa-<p>-fleet-wake queue it consumes is created when
+#                    absent, cloud #264)
 #                    [FLEET_SMOKE_TOKEN FLEET_SMOKE_SHARE_TO] (#1343, the canary
 #                    smoke's secrets: put on this Worker only, when given)
 #   inventory        PLATFORM_DB_ID HOSTS_KV_ID GITHUB_REPOSITORY_ID GITHUB_REPOSITORY
@@ -312,6 +314,16 @@ signups_committed() {
 signups_deployed() {
   signups_ok "$(jq -r '[.result.bindings[] | select(.name == "SIGNUPS_ENABLED") | .text // ""] | join(",")' <<< "$1")" "deployed $2"
 }
+# optout_declared <app>: 0 when the tag's committed config for this env turns
+# the hosted opt-out list on (OPTOUT_LIST "1", open-artifacts#2652). Only then
+# are the opt-out keys generated and read back; a tag without the var, or with
+# "0", wants none of them.
+optout_declared() {
+  local v
+  v="$(ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" committed "$1" vars)" ||
+    { echo "can't read $1's committed vars" >&2; exit 1; }
+  [ "$(jq -r '.OPTOUT_LIST // ""' <<< "$v")" = 1 ]
+}
 # names_are <settings json> <want>: the non-var, non-secret binding names, sorted, comma-joined.
 names_are() {
   local got
@@ -487,6 +499,20 @@ case "$target" in
       cf_send POST /r2/buckets "$(jq -nc --arg n "$bucket" '{name: $n}')" | must "create R2 bucket $bucket" > /dev/null
       echo "R2 bucket $bucket created"
     fi
+    # The opt-out root key (open-artifacts#2652), when the tag turns the list
+    # on: the one platform secret the provisioner derives every hosted
+    # install's OPTOUT_HASH_KEY from (HKDF, info oa-optout-v1). Put BEFORE the
+    # deploy, so the one deploy carries the tag and the Worker never serves
+    # without it. Made only when truly absent (a direct read, the Worker may
+    # not exist yet), never overwritten, never printed. Without it the tag
+    # wants no secret at all.
+    PROVISIONER_SECRET=""
+    if optout_declared provisioner; then
+      PROVISIONER_SECRET="OPTOUT_ROOT_KEY"
+      if secret_absent "oa-$P-provisioner" OPTOUT_ROOT_KEY; then
+        openssl rand -base64 32 | put_secret "oa-$P-provisioner" provisioner OPTOUT_ROOT_KEY
+      fi
+    fi
     PLATFORM_DB_ID="$PLATFORM_DB_ID" SECRETS_STORE_ID="$SECRETS_STORE_ID" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" \
       SIGNUPS_ENABLED="$SIGNUPS_ENABLED" WELCOME_FROM="${WELCOME_FROM:-}" deploy provisioner
     S="$(settings oa-$P-provisioner)"
@@ -506,9 +532,13 @@ case "$target" in
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
     observability_is "$S" provisioner
-    no_secret_bindings "$S" oa-$P-provisioner
-    names="$(secret_names oa-$P-provisioner | tr '\n' ' ')"
-    [ -z "$names" ] || { echo "oa-$P-provisioner has secrets '$names'; want none" >&2; exit 1; }
+    # POSTHOG_KEY (open-artifacts#2479) is optional: set by hand with wrangler
+    # secret put, never by a deploy; present or absent is clean.
+    got="$(jq -r '[.result.bindings[] | select(.type == "secret_text" and .name != "POSTHOG_KEY") | .name] | join(",")' <<< "$S")"
+    [ "$got" = "$PROVISIONER_SECRET" ] || { echo "oa-$P-provisioner has secret bindings ($got); want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
+    raw="$(secret_names oa-$P-provisioner)"
+    names="$(grep -vxe POSTHOG_KEY -e '' <<< "$raw" | tr '\n' ' ' || true)"
+    [ "$names" = "${PROVISIONER_SECRET:+$PROVISIONER_SECRET }" ] || { echo "oa-$P-provisioner has secrets '$names'; want '${PROVISIONER_SECRET:-none}'" >&2; exit 1; }
     ;;
   provisioning)
     need PLATFORM_DB_ID; need BROKER_REGISTRY_ID; need DIRECTORY_REGISTRY_ID; need GITHUB_REPOSITORY_ID; need SIGNUP_DAILY_CAP; need SIGNUPS_ENABLED
@@ -577,8 +607,16 @@ case "$target" in
     # The Worker and what it depends on, the admin SPA among them (@oa/admin
     # is a devDependency). Its vite build writes apps/provisioning/dist-assets
     # (ASSETS) itself, nothing is copied, and the wrapper refuses a deploy
-    # without its index.html.
-    if [ -z "$VERIFY_ONLY" ]; then (cd "$root" && pnpm --filter "@oa/provisioning..." build); fi
+    # without its index.html. PROVISIONING_BUILT=1: deploy-hosted-platform.yml
+    # already ran this exact build, beside the migrations (#264 step 6), and
+    # every other bundling target waited for it.
+    if [ -z "$VERIFY_ONLY" ]; then
+      if [ "${PROVISIONING_BUILT:-}" = 1 ]; then
+        echo "provisioning: built earlier in this run (PROVISIONING_BUILT)"
+      else
+        (cd "$root" && pnpm --filter "@oa/provisioning..." build)
+      fi
+    fi
     # The OAuth KV namespace: check first, create only when absent.
     ns="oa-$P-provisioning-oauth"
     kvs="$(list_all "/storage/kv/namespaces?" "list KV namespaces")"
@@ -596,6 +634,18 @@ case "$target" in
     have="$(secret_names "$W")"
     if ! grep -qx ADMIN_SESSION_KEY <<< "$have" && secret_absent "$W" ADMIN_SESSION_KEY; then
       openssl rand -base64 32 | put_secret "$W" provisioning ADMIN_SESSION_KEY
+    fi
+    # The hosted opt-out list's two keys (open-artifacts#2652), when the tag
+    # turns it on: made like ADMIN_SESSION_KEY (only when truly absent, never
+    # overwritten, never printed).
+    OPTOUT_KEYS_WANTED=""
+    if optout_declared provisioning; then
+      OPTOUT_KEYS_WANTED="OPTOUT_STORE_KEY OPTOUT_TOKEN_KEY"
+      for k in $OPTOUT_KEYS_WANTED; do
+        if ! grep -qx "$k" <<< "$have" && secret_absent "$W" "$k"; then
+          openssl rand -base64 32 | put_secret "$W" provisioning "$k"
+        fi
+      done
     fi
     # The admin's registry entry (4.3) carries the public half of
     # ADMIN_BROKER_KEY: a new key when either is missing, entry first (4.6).
@@ -713,7 +763,9 @@ case "$target" in
     names="$(secret_names "$W" | sort | tr '\n' ' ')"
     # TURNSTILE_SITEKEY may be there or not (set once, kept while empty).
     names="${names/TURNSTILE_SITEKEY /}"
-    want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
+    # POSTHOG_KEY (open-artifacts#2479, signed_up): optional, set by hand.
+    names="${names/POSTHOG_KEY /}"
+    want_names="ADMIN_BROKER_KEY ADMIN_IDENTITIES ADMIN_SESSION_KEY ${OPTOUT_KEYS_WANTED:+$OPTOUT_KEYS_WANTED }${SIGNUP_KEY_WANTED:+SIGNUP_BROKER_KEY }"
     [ "$names" = "$want_names" ] || { echo "$W secrets are '$names'" >&2; exit 1; }
     if [ -n "$SIGNUP_KEY_WANTED" ]; then
       rc=0
@@ -944,6 +996,26 @@ case "$target" in
     # The retry wait is checked before any deploy: a bad value must not leave
     # the run half done.
     [[ "${PUT_RETRY_SLEEP:-5}" =~ ^[0-9]{1,3}$ ]] || { echo "PUT_RETRY_SLEEP must be 0 to 999 seconds" >&2; exit 1; }
+    # The fleet wake (cloud #264): a tag whose scheduler consumes
+    # oa-<p>-fleet-wake needs that queue before the deploy attaches to it.
+    # Checked first, created only when absent (verify only refuses a missing
+    # one); a failed listing stops the run. A tag that consumes nothing (from
+    # before the wake) wants nothing; any other queue refuses.
+    wake_q="oa-$P-fleet-wake"
+    consumes="$(committed scheduler consumers | jq -r 'join(",")')" ||
+      { echo "can't read the scheduler's committed queue consumers" >&2; exit 1; }
+    case "$consumes" in
+      "") ;;
+      "$wake_q")
+        queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
+        if ! grep -qx "$wake_q" <<< "$queues"; then
+          [ -z "$VERIFY_ONLY" ] || { echo "queue $wake_q does not exist" >&2; exit 1; }
+          cf_send POST /queues "$(jq -nc --arg n "$wake_q" '{queue_name: $n}')" | must "create queue $wake_q" > /dev/null
+          echo "queue $wake_q created"
+        fi
+        ;;
+      *) echo "the tag's $env scheduler consumes '$consumes'; want none or $wake_q; refusing" >&2; exit 1 ;;
+    esac
     sched_deploy() {
       PLATFORM_DB_ID="$PLATFORM_DB_ID" EMAIL_ZONE_TAGS="$EMAIL_ZONE_TAGS" EMAIL_DAILY_LIMIT="$EMAIL_DAILY_LIMIT" \
         ALERT_TO="$ALERT_TO" ALERT_FROM="$ALERT_FROM" SIGNUP_DAILY_CAP="$SIGNUP_DAILY_CAP" SIGNUPS_ENABLED="$SIGNUPS_ENABLED" \

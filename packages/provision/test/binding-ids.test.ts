@@ -30,7 +30,7 @@ const E: BindingIdExpect = {
   rowKvId: KV,
   r2: SCRIPT,
   script: SCRIPT,
-  planned: plannedBindings(TEMPLATE, RL_NS),
+  planned: plannedBindings(TEMPLATE, RL_NS, false),
 };
 const OK: SettingsBinding[] = [
   { type: "d1", name: "DB", id: D1 },
@@ -140,6 +140,25 @@ describe("bindingIdProblems", () => {
     const text = JSON.stringify(edited("DB", { id: "secret-id" }));
     expect(text).toContain("DB");
     expect(text).not.toContain("secret-id");
+  });
+});
+
+describe("plannedBindings: hook limiters (public #3200)", () => {
+  const T = {
+    ...TEMPLATE,
+    ratelimits: [{ name: "RL_HOOKS" }, { name: "RL_A" }, { name: "RL_B" }],
+  };
+  const rl = (testHooks: boolean) =>
+    plannedBindings(T, RL_NS, testHooks)
+      .filter((b) => b.type === "ratelimit")
+      .map((b) => `${b.name}:${b.namespaceId}`);
+  it("plans RL_HOOKS for a test-hook install only; the rest keep their slots", () => {
+    expect(rl(true)).toEqual([
+      "RL_HOOKS:1000008",
+      "RL_A:1000009",
+      "RL_B:1000010",
+    ]);
+    expect(rl(false)).toEqual(["RL_A:1000009", "RL_B:1000010"]);
   });
 });
 

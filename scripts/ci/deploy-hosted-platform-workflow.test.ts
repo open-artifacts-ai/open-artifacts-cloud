@@ -237,7 +237,8 @@ describe("deploy-hosted-platform.yml", () => {
       group: "hosted-platform-${{ inputs.env }}",
       "cancel-in-progress": false,
     });
-    expect(job["timeout-minutes"]).toBeLessThanOrEqual(30);
+    // 25 min of it may be the CI guard waiting for main's push CI (tag-ci-green.sh).
+    expect(job["timeout-minutes"]).toBeLessThanOrEqual(40);
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
@@ -277,7 +278,7 @@ describe("deploy-hosted-platform.yml", () => {
     });
     const use = named("Use main's deploy scripts").run as string;
     expect(use).toContain(
-      "for f in deploy-hosted-platform.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
+      "for f in deploy-hosted-platform.sh deploy-waves.sh deploy-platform-worker.sh hosted-zones.sh platform-db.ts billing-db.ts check-migration-lock.mjs wrangler-env.ts broker-key.ts; do",
     );
     // The broker's Google client pin is main's, never the tag's.
     expect(use).toContain(
@@ -291,7 +292,7 @@ describe("deploy-hosted-platform.yml", () => {
     );
     // The constants and the id lookup are main's too, never the tag's.
     expect(use).toContain(
-      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh; do",
+      "for f in hosted-cf.sh hosted-constants.sh hosted-resource-ids.sh staging-first-gate.sh staging-smoke-gate.sh deploy-token-expiry.sh platform-tags.sh worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh; do",
     );
     expect(use).toContain(
       'cp -R .deploy-logic/.github/hosted "$RUNNER_TEMP/main-ci/hosted"',
@@ -329,8 +330,12 @@ describe("deploy-hosted-platform.yml", () => {
       i("Resolve the resource ids") - 1,
     );
     // The Email Sending check (#967) is the last gate before the deploy.
+    // Between it and the ids: only the read-only late fleet finish (#264).
     expect(i("Resolve the resource ids")).toBe(
-      i("The senders' domain is onboarded in Email Sending") - 1,
+      i("Read the fleet finish of earlier releases") - 1,
+    );
+    expect(i("Read the fleet finish of earlier releases")).toBe(
+      i("The senders' domain is onboarded in Email Sending") - 2,
     );
     expect(i("The senders' domain is onboarded in Email Sending")).toBe(
       i("Deploy and verify") - 1,
@@ -404,12 +409,15 @@ describe("deploy-hosted-platform.yml", () => {
       "The deploy token is the Environment's",
       "The tag is newer than prod's",
       "Resolve the resource ids",
+      "Read the fleet finish of earlier releases",
       "The senders' domain is onboarded in Email Sending",
       "Deploy and verify",
       "Zones",
       "Scheduler, last",
       "Every platform Worker runs the tag",
       "Mark the platform verified",
+      "Wake the fleet",
+      "Wait for the fleet to reach every install",
       "Clear the platform verified marks (break-glass)",
       "The deploy token's expiry",
     ]);
@@ -510,19 +518,70 @@ describe("deploy-hosted-platform.yml", () => {
     expect(i).toBeLessThan(steps.indexOf(tagOut as Record<string, unknown>));
   });
 
-  it("zones plan, then apply in the same job; verify_only stays plan only", () => {
+  it("zones apply (which plans first) in the same job; verify_only stays plan only", () => {
     const z = named("Zones");
     expect(z.env.VERIFY_ONLY).toBe("${{ inputs.verify_only && '1' || '' }}");
     expect(text).not.toContain("apply_zones");
     const lines = (z.run as string).trim().split("\n");
     expect(lines).toEqual([
       "set -euo pipefail",
-      'bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" plan',
-      '[ -n "$VERIFY_ONLY" ] || bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" apply',
+      'if [ -n "$VERIFY_ONLY" ]; then',
+      '  bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" plan',
+      "else",
+      '  bash scripts/ops/hosted-zones.sh "$DEPLOY_ENV" apply',
+      "fi",
     ]);
-    expect(steps.indexOf(z)).toBeGreaterThan(
-      steps.indexOf(named("Deploy and verify")),
+    // apply runs the same inspection as plan, and its refusals, before any
+    // write (hosted-zones.sh: the plan-only exit comes after both).
+    const zones = readFileSync(
+      join(root, "scripts/ops/hosted-zones.sh"),
+      "utf8",
     );
+    const at = (x: string) => zones.indexOf(x);
+    expect(at("inspect report\n")).toBeGreaterThan(0);
+    expect(at("inspect report\n")).toBeLessThan(
+      at('if [ "$mode" = plan ]; then'),
+    );
+    expect(at("planned change outside the expected set")).toBeLessThan(
+      at('if [ "$mode" = plan ]; then'),
+    );
+  });
+
+  // A route sends traffic to the Worker it names, so no route, DNS or setting
+  // changes before dispatch, both brokers, provisioning and billing have
+  // deployed and passed: the zones are a step of their own, after the deploy
+  // step, which they follow only on its success (no status function in the
+  // condition), and the deploy loop never runs them.
+  it("the zones apply only after every Worker their routes name has deployed and passed", () => {
+    const z = named("Zones");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i("Zones")).toBe(i("Deploy and verify") + 1);
+    expect(z.if).toBe(
+      "${{ contains(format(',{0},', inputs.targets), ',zones,') }}",
+    );
+    expect(z.if).not.toMatch(/always\(\)|cancelled\(\)|failure\(\)/);
+    expect(z["continue-on-error"]).toBeUndefined();
+    expect(named("Deploy and verify")["continue-on-error"]).toBeUndefined();
+    const loop = named("Deploy and verify").run as string;
+    expect(loop).toContain('case "$t" in zones | scheduler) continue ;; esac');
+    expect(loop).not.toContain("hosted-zones.sh");
+    // And the plan says the same: zones need every Worker a route names.
+    const r = spawnSync(
+      "bash",
+      [join(root, "scripts/ops/deploy-waves.sh"), FULLB],
+      {
+        encoding: "utf8",
+      },
+    );
+    const zl = r.stdout.split("\n").find((l) => l.startsWith("zones "));
+    for (const t of [
+      "dispatch",
+      "auth-broker",
+      "directory-broker",
+      "provisioning",
+      "billing",
+    ])
+      expect(zl?.split(" ").slice(1)).toContain(t);
   });
 
   it("prod runs only from main, checked in the workflow and again in the script", () => {
@@ -851,24 +910,23 @@ describe("deploy-hosted-platform.yml", () => {
     );
   });
 
-  it("builds and tests the Provisioning API Workers and the admin SPA too", () => {
-    const run = named("Build and test the Workers being deployed")
-      .run as string;
-    for (const p of ["@oa/provisioner", "@oa/provisioning", "@oa/admin"])
-      expect(run).toContain(`--filter ${p}`);
-    // The billing service and its Stripe core (#1568): built and tested only
-    // when the run deploys it, on either env; a run without it is what it was.
-    const step = named("Build and test the Workers being deployed");
-    expect(step.env).toEqual({
-      DEPLOY_ENV: "${{ inputs.env }}",
-      TARGETS: "${{ inputs.targets }}",
-    });
-    expect(run).toContain(
-      'case ",$TARGETS," in *,billing,*) pnpm --filter @oa/billing --filter @oa/billing-core test ;; esac',
+  it("builds only: the package tests are CI's, and a guard refuses a tag whose commit has no green CI (#264)", () => {
+    const run = named("Build the Workers being deployed").run as string;
+    expect(run).toBe("pnpm --filter @oa/provision build");
+    expect(text).not.toContain("Build and test the Workers");
+    for (const st of steps)
+      expect(String(st.run ?? ""), st.name).not.toMatch(/pnpm .*\btest\b/);
+    // The guard is main's copy, in the release gate step, so it runs before the
+    // tag's code is checked out and for every run, verify_only included.
+    const gate = named("The tag passed every earlier check");
+    expect(gate.run).toContain(
+      'bash .release-gate/scripts/ci/tag-ci-green.sh "$TAG"',
     );
-    const main =
-      run.split("\n").find((l) => l.includes("--filter @oa/admin test")) ?? "";
-    expect(main).not.toContain("billing");
+    expect(gate.run.indexOf("tag-passed-checks.sh")).toBeLessThan(
+      gate.run.indexOf("tag-ci-green.sh"),
+    );
+    expect(gate.run).toContain("set -euo pipefail");
+    expect(gate["continue-on-error"]).toBeUndefined();
   });
 
   it("reads every Worker's tag back with main's script after a full-list run (#1064)", () => {
@@ -903,22 +961,35 @@ describe("deploy-hosted-platform.yml", () => {
     inputs: Record<string, unknown>,
     outcomes: Record<string, string> = {},
     ok = true,
+    outputs: Record<string, Record<string, string>> = {},
   ) =>
     new Function(
       "inputs",
       "steps",
       "success",
       "cancelled",
+      "contains",
+      "format",
       `return (${(step.if as string)
         .replace(/^\$\{\{\s*/, "")
         .replace(/\s*\}\}$/, "")});`,
     )(
       inputs,
-      Object.fromEntries(
-        Object.entries(outcomes).map(([k, v]) => [k, { outcome: v }]),
+      // Any step: its outcome and outputs, none when not given.
+      new Proxy(
+        {},
+        {
+          get: (_t, k: string) => ({
+            outcome: outcomes[k],
+            outputs: outputs[k] ?? {},
+          }),
+        },
       ),
       () => ok,
       () => false,
+      (hay: string, needle: string) => String(hay).includes(needle),
+      (f: string, ...a: unknown[]) =>
+        f.replace(/\{(\d+)\}/g, (_m, n) => String(a[Number(n)])),
     ) as boolean;
   const ran = {
     deploy: "success",
@@ -966,6 +1037,159 @@ describe("deploy-hosted-platform.yml", () => {
         },
       ),
     ).toBe(false);
+  });
+
+  // cloud #264: one message to the env's oa-<p>-fleet-wake once the mark is
+  // written, so the scheduler starts the upgrades at once. The tick is the
+  // backup, so the step never fails the run.
+  it("wakes the fleet right after the mark, only when the mark ran green, and never fails the run", () => {
+    const wk = named("Wake the fleet");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(named("Mark the platform verified").id).toBe("mark_verified");
+    expect(i("The tag's scheduler takes the fleet wake")).toBe(
+      i("Mark the platform verified") + 1,
+    );
+    expect(i("Wake the fleet")).toBe(i("Mark the platform verified") + 2);
+    expect(i("Wake the fleet")).toBeLessThan(i("The deploy token's expiry"));
+    expect(wk.run).toBe(
+      'bash "$RUNNER_TEMP/main-ci/fleet-wake.sh" "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(wk.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    expect(wk["continue-on-error"]).toBe(true);
+    expect(wk["timeout-minutes"]).toBeLessThanOrEqual(2);
+    const marked = { ...ran, mark_verified: "success" };
+    const capable = { wake_capable: { capable: "true" } };
+    for (const verify_only of [false, true])
+      for (const targets of [FULL, FULLB])
+        expect(
+          evalIf(wk, { verify_only, targets }, marked, true, capable),
+          targets,
+        ).toBe(true);
+    // The Prover's case: an older tag (a v0.250.0 recovery) with no
+    // fleet-wake consumer gets no wake.
+    for (const c of ["false", ""])
+      expect(
+        evalIf(wk, { verify_only: false, targets: FULL }, marked, true, {
+          wake_capable: { capable: c },
+        }),
+      ).toBe(false);
+    const cap = named("The tag's scheduler takes the fleet wake");
+    expect(cap.id).toBe("wake_capable");
+    expect(cap.run).toBe(
+      'bash "$RUNNER_TEMP/main-ci/fleet-wake-capable.sh" "$DEPLOY_ENV" apps/scheduler/wrangler.jsonc scripts/ops/wrangler-env.ts',
+    );
+    expect(cap.env).toEqual({ DEPLOY_ENV: "${{ inputs.env }}" });
+    expect(cap["continue-on-error"]).toBe(true);
+    expect(evalIf(cap, { targets: FULL }, marked)).toBe(true);
+    expect(
+      evalIf(cap, { targets: FULL }, { ...ran, mark_verified: "skipped" }),
+    ).toBe(false);
+    // No mark (a partial list, a failed read-back), or a failed step before
+    // it: no wake.
+    expect(
+      evalIf(
+        wk,
+        { verify_only: false, targets: "scheduler" },
+        { ...ran, mark_verified: "skipped" },
+      ),
+    ).toBe(false);
+    expect(
+      evalIf(
+        wk,
+        { verify_only: false, targets: FULL },
+        { ...ran, mark_verified: "failure" },
+      ),
+    ).toBe(false);
+    expect(
+      evalIf(wk, { verify_only: false, targets: FULL }, marked, false),
+    ).toBe(false);
+  });
+
+  // cloud #264, for release-watch (#456): the rollout's finish as a step a
+  // run reader can see with the default token.
+  it("prod waits, reads only, for the fleet's done mark after the wake; Fleet done runs only once it is there; neither fails the run", () => {
+    const wt = named("Wait for the fleet to reach every install");
+    const dn = named("Fleet done");
+    const i = (n: string) => steps.indexOf(named(n));
+    expect(i(wt.name)).toBe(i("Wake the fleet") + 1);
+    expect(i(dn.name)).toBe(i(wt.name) + 1);
+    expect(wt.id).toBe("fleet_done");
+    expect(wt["continue-on-error"]).toBe(true);
+    expect(wt["timeout-minutes"]).toBeLessThanOrEqual(12);
+    expect(wt.env).toEqual({
+      DEPLOY_ENV: "${{ inputs.env }}",
+      TAG: "${{ inputs.tag }}",
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    expect(wt.run).toContain(
+      'node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done "$DEPLOY_ENV" "$TAG"',
+    );
+    expect(wt.run).toContain('echo "done=true"; echo "at=');
+    expect(wt.run).toContain("::warning::");
+    const marked = { ...ran, mark_verified: "success" };
+    const capable = { wake_capable: { capable: "true" } };
+    expect(
+      evalIf(wt, { env: "prod", targets: FULL }, marked, true, capable),
+    ).toBe(true);
+    // An older tag with no fleet-wake consumer never writes fleet_done: no
+    // 10-minute wait holding hosted-platform-prod (the Prover's case).
+    expect(
+      evalIf(wt, { env: "prod", targets: FULL }, marked, true, {
+        wake_capable: { capable: "false" },
+      }),
+    ).toBe(false);
+    expect(evalIf(wt, { env: "prod", targets: FULL }, marked)).toBe(false);
+    // Staging's chain waits on this run: no wait there.
+    expect(
+      evalIf(wt, { env: "staging", targets: FULL }, marked, true, capable),
+    ).toBe(false);
+    expect(
+      evalIf(
+        wt,
+        { env: "prod", targets: FULL },
+        { ...ran, mark_verified: "skipped" },
+      ),
+    ).toBe(false);
+    expect(dn.if).toBe("${{ steps.fleet_done.outputs.done == 'true' }}");
+    expect(dn.env.AT).toBe("${{ steps.fleet_done.outputs.at }}");
+    expect(JSON.stringify(dn)).not.toContain("secrets.");
+  });
+
+  // The Prover's case: a rollout that finishes after the 10-minute wait, even
+  // after the next run's read. Every prod run, before deploying, reads every
+  // mark still held, so the first run after the finish records it.
+  it("a late fleet finish: every prod run reads every fleet_done mark still held, before deploying, and records them by name", () => {
+    const rd = named("Read the fleet finish of earlier releases");
+    const i = (n: string) => steps.indexOf(named(n));
+    const rec = steps.find((st) =>
+      String(st.name).startsWith("Fleet done of earlier releases"),
+    ) as Record<string, any>;
+    expect(rec.name).toBe(
+      "Fleet done of earlier releases (${{ steps.prev_fleet.outputs.list }})",
+    );
+    expect(rd.id).toBe("prev_fleet");
+    expect(i(rd.name)).toBeGreaterThan(i("Resolve the resource ids"));
+    expect(steps.indexOf(rec)).toBe(i(rd.name) + 1);
+    expect(steps.indexOf(rec)).toBeLessThan(i("Deploy and verify"));
+    expect(rd["continue-on-error"]).toBe(true);
+    expect(rd["timeout-minutes"]).toBeLessThanOrEqual(2);
+    expect(rd.env).toEqual({
+      CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    });
+    // Every mark, not one tag's: no lookup of the release it replaces.
+    expect(rd.run).toContain(
+      "node --experimental-strip-types --no-warnings scripts/ops/platform-db.ts fleet-done-all prod",
+    );
+    expect(rd.run).not.toContain("worker-tag.sh");
+    expect(evalIf(rd, { env: "prod", targets: FULL })).toBe(true);
+    expect(evalIf(rd, { env: "staging", targets: FULL })).toBe(false);
+    expect(evalIf(rd, { env: "prod", targets: "zones" })).toBe(false);
+    expect(rec.if).toBe("${{ steps.prev_fleet.outputs.list != '' }}");
+    expect(JSON.stringify(rec)).not.toContain("secrets.");
   });
 
   it("prod verify_only with the full list runs both staging gates before the mark; partial verify_only runs neither gate nor mark; other runs unchanged", () => {
@@ -1147,34 +1371,9 @@ describe("deploy-hosted-platform.yml", () => {
     expect(s.run).toBe(
       'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" scheduler',
     );
-    // The loop deploys everything else, in order, and never the scheduler.
+    // The loop deploys everything else and never the scheduler or the zones.
     const loop = named("Deploy and verify").run as string;
-    expect(loop).toContain('[ "$t" = zones ] && continue');
-    expect(loop).toContain('[ "$t" = scheduler ] && continue');
-    const ran = (TARGETS: string) => {
-      const r = spawnSync(
-        "bash",
-        [
-          "-c",
-          loop.replace(
-            'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"',
-            'echo "$t"',
-          ),
-        ],
-        {
-          env: { PATH: process.env.PATH, DEPLOY_ENV: "prod", TARGETS },
-          encoding: "utf8",
-        },
-      );
-      return r.stdout
-        .split("\n")
-        .filter((l) => l && !l.startsWith("::"))
-        .join(",");
-    };
-    expect(ran(FULL)).toBe(
-      "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory",
-    );
-    expect(ran("scheduler")).toBe("");
+    expect(loop).toContain('case "$t" in zones | scheduler) continue ;; esac');
   });
 
   it("require_newer (the chain's): the tag must be newer than prod's scheduler, before anything deploys", () => {
@@ -1246,7 +1445,7 @@ describe("deploy-hosted-platform.yml", () => {
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|continue-on-error/);
     expect(g.shell).toBeUndefined();
     expect(text).toContain(
-      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh;",
+      "worker-tag.sh prod-release-chain.ts deploy-token-identity.sh provapi-token-verify.sh fleet-wake.sh fleet-wake-capable.sh;",
     );
   });
 
@@ -1273,5 +1472,237 @@ describe("deploy-hosted-platform.yml", () => {
     expect(g.if).toBeUndefined();
     expect(g["continue-on-error"]).toBeUndefined();
     expect(JSON.stringify(g)).not.toMatch(/\|\|\s*true|verify_only/);
+  });
+});
+// #264 step 6: each target starts as soon as everything it needs succeeded.
+// The loop runs for real with stub targets that block on a named pipe until a
+// controller releases them (signals, no sleeps). The controller checks every
+// start against the plan (deploy-waves.sh): a target starting before a target
+// it needs was released prints EARLY. A loop that waited for a target it does
+// not need hangs instead, and the spawn's timeout fails the test.
+describe("the deploy loop (#264 step 6)", () => {
+  const DEPLOY =
+    'bash scripts/ops/deploy-hosted-platform.sh "$DEPLOY_ENV" "$t"';
+  const BUILD = 'pnpm --filter "@oa/provisioning..." build';
+  // Each stub says it started, prints what the deploy script would see, then
+  // waits for its gate: "ok" exits 0, anything else exits 1.
+  const STUB = `bash -c 'echo "start $0" > "$E"; echo "$0 built=\${PROVISIONING_BUILT:-}"; read -r how < "$G/$0"; [ "$how" = ok ]' "$t"`;
+  const loopText = () => {
+    const loop = named("Deploy and verify").run as string;
+    expect(loop.split(DEPLOY)).toHaveLength(2);
+    expect(loop.split(BUILD)).toHaveLength(2);
+    return loop.replace(DEPLOY, STUB).replace(BUILD, STUB);
+  };
+  // The harness: the loop in the background (its output through a pipe the
+  // harness copies, reporting each ::error:: line), and a controller that
+  // reads start and error events and runs the scenario's POLICY on each.
+  const HARNESS = String.raw`set -euo pipefail
+W="$(mktemp -d)"
+export E="$W/events" G="$W/gates"
+mkdir "$G"
+mkfifo "$E" "$W/out"
+exec 4<> "$E"
+for t in provisioning-build platform-db auth-broker directory-broker billing provision-token provisioner provisioning dispatch inventory zones scheduler; do mkfifo "$G/$t"; done
+B=""
+case ",$TARGETS," in *,provisioning,*) [ -n "$VERIFY_ONLY" ] || B=build ;; esac
+if [ -n "$B" ]; then PLAN="$(bash scripts/ops/deploy-waves.sh "$TARGETS" build)"; else PLAN="$(bash scripts/ops/deploy-waves.sh "$TARGETS")"; fi
+bash -c "$LOOP" > "$W/out" 2>&1 &
+lp=$!
+{
+  while IFS= read -r l; do
+    printf '%s\n' "$l" >> "$W/log"
+    case "$l" in "::error::"*) echo "seen $l" >&4 ;; esac
+  done < "$W/out"
+  echo eof >&4
+} &
+started=" "
+released=" "
+lrc=""
+release() { echo "$2" > "$G/$1"; released="$released$1 "; }
+has() { case "$1" in *" $2 "*) return 0 ;; esac; return 1; }
+finish() { set +e; wait "$lp"; lrc=$?; set -e; }
+eval "$POLICY"
+while read -r kind a rest <&4; do
+  case "$kind" in
+    start)
+      started="$started$a "
+      while read -r t needs; do
+        [ "$t" = "$a" ] || continue
+        for n in $needs; do has "$released" "$n" || echo "EARLY $a before $n" >> "$W/log"; done
+      done <<< "$PLAN"
+      on_start "$a" || : ;;
+    seen) on_seen "$a $rest" || : ;;
+    eof) break ;;
+  esac
+done
+[ -n "$lrc" ] || finish
+echo "LOOP EXIT $lrc" >> "$W/log"
+echo "STARTED$started" >> "$W/log"
+cat "$W/log"
+`;
+  const drive = (TARGETS: string, POLICY: string, VERIFY_ONLY = "") => {
+    const r = spawnSync("bash", ["-c", HARNESS], {
+      cwd: root,
+      env: {
+        PATH: process.env.PATH,
+        DEPLOY_ENV: "prod",
+        TARGETS,
+        VERIFY_ONLY,
+        LOOP: loopText(),
+        POLICY,
+      },
+      encoding: "utf8",
+      timeout: 30000,
+    });
+    expect(r.error, r.stderr).toBeUndefined();
+    const out = r.stdout;
+    const started = (/^STARTED (.*)$/m.exec(out)?.[1] ?? "")
+      .trim()
+      .split(" ")
+      .filter(Boolean);
+    const exit = /^LOOP EXIT (\d+)$/m.exec(out)?.[1];
+    return { out, started, exit };
+  };
+
+  it("full list: every target once, none before what it needs; inventory holds up nothing; the build first", () => {
+    // Inventory is held until dispatch, the end of the provisioner path, has
+    // started and been released: a loop that waited for inventory would hang.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    inventory) has "$released" dispatch && release inventory ok ;;
+    dispatch)
+      echo "dispatch started; inventory released: $(has "$released" inventory && echo yes || echo no)" >> "$W/log"
+      release dispatch ok
+      has "$started" inventory && release inventory ok ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    for (const list of [FULL, FULLB]) {
+      const r = drive(list, POLICY);
+      expect(r.out).not.toContain("EARLY");
+      expect(r.exit).toBe("0");
+      const want = [
+        "provisioning-build",
+        ...list.split(",").filter((t) => t !== "zones" && t !== "scheduler"),
+      ];
+      expect([...r.started].sort()).toEqual([...want].sort());
+      // The build, platform-db and provision-token need nothing: they start
+      // first, together, before anything else.
+      expect(r.started.slice(0, 3).sort()).toEqual(
+        ["platform-db", "provision-token", "provisioning-build"].sort(),
+      );
+      expect(r.out).toContain("dispatch started; inventory released: no");
+      // provisioning skips its own build: the loop's build passed.
+      expect(r.out).toContain("provisioning built=1");
+      expect(r.out).toContain("platform-db built=");
+      expect(r.out).not.toContain("platform-db built=1");
+      for (const t of want)
+        expect(r.out).toMatch(new RegExp(`::group::prod ${t} \\(\\d+ s\\)`));
+    }
+  });
+
+  it("verify_only: no build, and provisioning is not told it was built", () => {
+    const r = drive(
+      FULL,
+      `on_start() { release "$1" ok; }\non_seen() { :; }`,
+      "1",
+    );
+    expect(r.exit).toBe("0");
+    expect(r.out).not.toContain("EARLY");
+    expect(r.started).not.toContain("provisioning-build");
+    expect(r.out).toContain("provisioning built=\n");
+  });
+
+  it("a list without provisioning builds nothing; a scheduler-only list deploys nothing here", () => {
+    const POLICY = `on_start() { release "$1" ok; }\non_seen() { :; }`;
+    const r = drive(
+      "auth-broker,directory-broker,billing,provision-token,provisioner",
+      POLICY,
+    );
+    expect(r.exit).toBe("0");
+    expect(r.out).not.toContain("EARLY");
+    expect([...r.started].sort()).toEqual(
+      [
+        "auth-broker",
+        "billing",
+        "directory-broker",
+        "provision-token",
+        "provisioner",
+      ].sort(),
+    );
+    const s = drive("scheduler", POLICY);
+    expect(s.exit).toBe("0");
+    expect(s.started).toEqual([]);
+    const z = drive("zones", POLICY);
+    expect(z.exit).toBe("0");
+    expect(z.started).toEqual([]);
+  });
+
+  it("after the first failure nothing new starts; running targets finish and are logged; the run fails", () => {
+    // Inventory fails while the provisioner is still deploying; once the loop
+    // has reported it, the provisioner succeeds, which would make provisioning
+    // startable: it must not start.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    inventory | provisioner) has "$started" inventory && has "$started" provisioner && release inventory fail ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() {
+  case "$1" in *"prod inventory failed"*) release provisioner ok ;; esac
+}`;
+    const r = drive(FULLB, POLICY);
+    expect(r.out).not.toContain("EARLY");
+    expect(r.exit).toBe("1");
+    expect(r.out).toContain("::error::prod inventory failed (exit 1)");
+    expect(r.out).toMatch(/::group::prod provisioner \(\d+ s\)/);
+    expect(r.out).toContain(
+      "failed: inventory; not started: provisioning dispatch",
+    );
+    expect(r.started).not.toContain("provisioning");
+    expect(r.started).not.toContain("dispatch");
+  });
+
+  it("a failed build fails the run before any bundling target starts", () => {
+    const POLICY = `
+on_start() {
+  case "$1" in
+    provisioning-build) release "$1" fail ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    const r = drive(FULL, POLICY);
+    expect(r.exit).toBe("1");
+    expect(r.out).toContain("::error::prod provisioning-build failed (exit 1)");
+    expect([...r.started].sort()).toEqual(
+      ["platform-db", "provision-token", "provisioning-build"].sort(),
+    );
+  });
+
+  it("cancelled mid-run: each running target's buffered log still prints under its group", () => {
+    // TERM once the four targets after the migrations are all deploying; they
+    // are released only after the loop exited.
+    const POLICY = `
+on_start() {
+  case "$1" in
+    auth-broker | directory-broker | billing | inventory)
+      if has "$started" auth-broker && has "$started" directory-broker && has "$started" billing && has "$started" inventory; then
+        kill -TERM "$lp"
+        finish
+        for t in auth-broker directory-broker billing inventory; do release "$t" ok; done
+      fi ;;
+    *) release "$1" ok ;;
+  esac
+}
+on_seen() { :; }`;
+    const r = drive(FULLB, POLICY);
+    expect(r.exit).toBe("143");
+    for (const t of ["auth-broker", "directory-broker", "billing", "inventory"])
+      expect(r.out).toContain(`::group::prod ${t} (unfinished)`);
+    expect(r.out).toContain("billing built=");
   });
 });

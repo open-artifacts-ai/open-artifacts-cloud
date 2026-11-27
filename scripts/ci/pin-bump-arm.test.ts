@@ -8,13 +8,20 @@ import { parse } from "yaml";
 import {
   BOT,
   type Check,
+  commitOk,
   decide,
   type Exec,
   GATE_WORKFLOWS,
   gateRefusal,
+  gateRejected,
   type Input,
   isChainProdDeploy,
   parseView,
+  type QueueRun,
+  queueFailure,
+  queueMarker,
+  queueNotice,
+  queueVerdict,
   requiredChecks,
   run,
 } from "./pin-bump-arm.ts";
@@ -27,6 +34,12 @@ const HEAD = "c".repeat(40);
 const pinText = (tag: string, sha: string) => `# c\ntag=${tag}\nsha=${sha}\n`;
 const syncedText = (tag: string, sha: string) =>
   `# c\nsha=${sha}\ntag=${tag}\nlist=x\n`;
+const HEAD_AT = "2026-11-17T10:00:00Z";
+const qrun = (createdAt: string, conclusion: string | null): QueueRun => ({
+  createdAt,
+  status: conclusion === null ? "in_progress" : "completed",
+  conclusion,
+});
 const REQUIRED_CHECKS = [
   "scripts",
   "overlay",
@@ -66,6 +79,8 @@ const base = (o: Partial<Input> = {}): Input => ({
   commits: [{ author: BOT, committer: BOT, verified: true }],
   required: REQUIRED_CHECKS,
   armed: false,
+  headAt: HEAD_AT,
+  queueRuns: [],
   ...o,
 });
 const left = (o: Partial<Input>, why: RegExp) => {
@@ -310,10 +325,53 @@ describe("decide", () => {
       { commits: [{ author: BOT, committer: "leourbina", verified: true }] },
       /committed by leourbina/,
     );
+  });
+  it("accepts web-flow as committer only for a verified commit authored by the bot", () => {
+    const wf = (author: string, verified: boolean) => ({
+      commits: [{ author, committer: "web-flow", verified }],
+    });
+    expect(decide(base(wf(BOT, true))).arm).toBe(true);
     left(
-      { commits: [{ author: BOT, committer: "web-flow", verified: true }] },
-      /committed by web-flow/,
+      wf("leourbina", true),
+      /commit is by leourbina, committed by web-flow/,
     );
+    left(wf(BOT, false), /unverified/);
+    left(wf("", true), /committed by web-flow/);
+    left(wf("web-flow", true), /commit is by web-flow/);
+    left(wf(`x${BOT}`, true), /commit is by/);
+    // One bad commit among good ones still refuses.
+    left(
+      {
+        commits: [
+          { author: BOT, committer: "web-flow", verified: true },
+          { author: "leourbina", committer: "web-flow", verified: true },
+        ],
+      },
+      /leourbina/,
+    );
+    // Other committers stay refused, even for the bot's own commit.
+    left(
+      { commits: [{ author: BOT, committer: "github", verified: true }] },
+      /committed by github/,
+    );
+    expect(
+      commitOk({ author: BOT, committer: "web-flow", verified: true }),
+    ).toBe(true);
+    expect(commitOk({ author: BOT, committer: BOT, verified: true })).toBe(
+      true,
+    );
+  });
+  it("takes back the bot's arming over a human web-flow commit, keeps it for the bot's", () => {
+    expect(
+      go(
+        "arm",
+        fake({ armed: true, commitAuthor: "leourbina", committer: "web-flow" }),
+      ).disarmed,
+    ).toEqual([7]);
+    expect(
+      go("arm", fake({ armed: true, committer: "web-flow" })).disarmed,
+    ).toEqual([]);
+    expect(go("arm", fake({ committer: "web-flow" })).armed).toEqual([7]);
   });
   it("leaves a commit GitHub could not attribute, or a PR with no commits", () => {
     left(
@@ -434,6 +492,280 @@ const RULES = JSON.stringify([
   },
   { type: "merge_queue", parameters: {} },
 ]);
+describe("the merge queue run of a pin-only bump (no re-arm loop)", () => {
+  const FAIL = qrun("2026-11-17T10:30:00Z", "failure");
+  it("leaves a head whose merge queue run failed, timed out or never started", () => {
+    for (const c of ["failure", "timed_out", "startup_failure"])
+      left(
+        { queueRuns: [qrun(FAIL.createdAt, c)] },
+        new RegExp(`merge queue run on this head ended ${c}`),
+      );
+  });
+  it("does not hold a head for one cancelled, skipped or neutral run (no verdict)", () => {
+    for (const c of [
+      "cancelled",
+      "skipped",
+      "neutral",
+      "action_required",
+      null,
+    ])
+      expect(
+        decide(base({ queueRuns: [qrun(FAIL.createdAt, c)] })).arm,
+        String(c),
+      ).toBe(true);
+  });
+  it("a cancelled run newer than a failure does not clear the failure; a success does", () => {
+    const cancelled = qrun("2026-11-17T11:00:00Z", "cancelled");
+    expect(decide(base({ queueRuns: [FAIL, cancelled] })).arm).toBe(false);
+    const ok = qrun("2026-11-17T12:00:00Z", "success");
+    expect(decide(base({ queueRuns: [FAIL, cancelled, ok] })).arm).toBe(true);
+  });
+  it("holds a head whose newest three queue runs were all cancelled", () => {
+    const c = (at: string) => qrun(at, "cancelled");
+    const three = [
+      c("2026-11-17T10:10:00Z"),
+      c("2026-11-17T10:20:00Z"),
+      c("2026-11-17T10:30:00Z"),
+    ];
+    left({ queueRuns: three }, /last 3 merge queue runs.*all cancelled/);
+    left({ queueRuns: [...three].reverse() }, /all cancelled/);
+    // Two are not enough, a success or a still-running newest run breaks the streak,
+    // and cancels made before the head commit are another head's.
+    expect(decide(base({ queueRuns: three.slice(1) })).arm).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [...three, qrun("2026-11-17T10:40:00Z", "success")],
+        }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({ queueRuns: [...three, qrun("2026-11-17T10:40:00Z", null)] }),
+      ).arm,
+    ).toBe(true);
+    expect(
+      decide(
+        base({
+          queueRuns: [
+            c("2026-11-17T09:00:00Z"),
+            c("2026-11-17T09:10:00Z"),
+            c("2026-11-17T10:10:00Z"),
+          ],
+        }),
+      ).arm,
+    ).toBe(true);
+    // The newest three decide: an older failure under three newer cancels holds as cancels.
+    expect(
+      queueVerdict(HEAD_AT, [
+        FAIL,
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
+    expect(
+      queueVerdict(HEAD_AT, [
+        qrun("2026-11-17T10:05:00Z", "success"),
+        ...three.map((r, n) => ({
+          ...r,
+          createdAt: `2026-11-17T1${n + 1}:00:00Z`,
+        })),
+      ])?.cancels,
+    ).toBe(true);
+  });
+  it("arms a head whose queue run is still going, or ended green", () => {
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", null)] })).arm,
+    ).toBe(true);
+    expect(
+      decide(base({ queueRuns: [qrun("2026-11-17T10:30:00Z", "success")] }))
+        .arm,
+    ).toBe(true);
+  });
+  it("ignores a failed run made before this head commit (an older head)", () => {
+    const old = qrun("2026-11-17T09:59:59Z", "failure");
+    expect(decide(base({ queueRuns: [old] })).arm).toBe(true);
+  });
+  it("judges by the newest run after the head, whatever the order", () => {
+    const bad = qrun("2026-11-17T10:30:00Z", "failure");
+    const good = qrun("2026-11-17T11:00:00Z", "success");
+    expect(decide(base({ queueRuns: [bad, good] })).arm).toBe(true);
+    expect(decide(base({ queueRuns: [good, bad] })).arm).toBe(true);
+    const late = qrun("2026-11-17T12:00:00Z", "failure");
+    expect(decide(base({ queueRuns: [good, bad, late] })).arm).toBe(false);
+    expect(decide(base({ queueRuns: [late, good, bad] })).arm).toBe(false);
+  });
+  it("fails closed on an unreadable head date or run date", () => {
+    left({ headAt: "" }, /date is unreadable/);
+    left({ headAt: "soon" }, /date is unreadable/);
+    left({ queueRuns: [qrun("", "success")] }, /no readable date/);
+  });
+  it("queueFailure says nothing without runs", () => {
+    expect(queueFailure(HEAD_AT, [])).toBeUndefined();
+  });
+  it("run: a failed queue run keeps the PR un-armed on every pass, until a new head", () => {
+    // The first pass leaves its one comment (see the next describe); with the
+    // marker there, every later pass writes nothing at all.
+    const f = fake({
+      queue: [FAIL],
+      comments: [{ user: { login: BOT }, body: queueMarker(HEAD) }],
+    });
+    for (let n = 0; n < 3; n++) {
+      const r = go("arm", f);
+      expect(r.armed).toEqual([]);
+      expect(r.write).toBe(false);
+      expect(r.merges).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(
+        /#7: leave: its merge queue run on this head ended failure/,
+      );
+    }
+    // A new head commit made after the failed run is judged afresh.
+    expect(
+      go("arm", fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" })).armed,
+    ).toEqual([7]);
+  });
+  it("run: a queue run in the API that cannot be read leaves the PR", () => {
+    const r = go("arm", fake({ notFound: ["event=merge_group"] }));
+    expect(r.armed).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/could not read what it needs/);
+    const g = go("arm", fake({ notFound: ["/git/commits/"] }));
+    expect(g.armed).toEqual([]);
+  });
+  it("run: a bot-armed PR with a failed queue run is disarmed", () => {
+    const f = fake({ armed: true, queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+  });
+});
+
+describe("the failed queue run leaves one visible trace per head", () => {
+  const RUN_URL = `https://github.com/${REPO}/actions/runs/123456`;
+  const FAIL: QueueRun = {
+    ...qrun("2026-11-17T10:30:00Z", "failure"),
+    url: RUN_URL,
+  };
+  const posts = (f: ReturnType<typeof fake>) =>
+    f.calls.filter((c) => c.join(" ").includes("-X POST"));
+  const mine = (head = HEAD) => ({
+    user: { login: BOT },
+    body: `${queueMarker(head)}\nold`,
+  });
+  it("plan reports write=true, and posts nothing", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("plan", f);
+    expect(r.write).toBe(true);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([]);
+  });
+  it("arm posts one comment with the marker and the run link, and never arms", () => {
+    const f = fake({ queue: [FAIL] });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    expect(r.armed).toEqual([]);
+    expect(r.merges).toEqual([]);
+    expect(posts(f)).toHaveLength(1);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toContain(`repos/${REPO}/issues/7/comments`);
+    expect(call).toContain(queueMarker(HEAD));
+    expect(call).toContain(RUN_URL);
+    expect(call).toMatch(/port or fix is needed/);
+    expect(call).toMatch(/new commit/);
+    expect(call).toMatch(/by hand/);
+    expect(call).not.toContain("\u2014");
+  });
+  it("posts nothing more once its own marker for this head is there", () => {
+    const f = fake({ queue: [FAIL], comments: [mine()] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.noticed).toEqual([]);
+    expect(r.write).toBe(false);
+    expect(go("plan", fake({ queue: [FAIL], comments: [mine()] })).write).toBe(
+      false,
+    );
+  });
+  it("counts only the bot's marker, and only for this head", () => {
+    const stranger = { user: { login: "someone" }, body: queueMarker(HEAD) };
+    expect(posts(fake({ queue: [FAIL], comments: [stranger] }))).toEqual([]);
+    for (const comments of [[stranger], [mine("9".repeat(40))]]) {
+      const f = fake({ queue: [FAIL], comments });
+      go("arm", f);
+      expect(posts(f)).toHaveLength(1);
+    }
+  });
+  it("says nothing when the PR is held back for another reason, or the queue run is fine", () => {
+    for (const o of [
+      { checks: green.slice(1) },
+      { commitAuthor: "leourbina" },
+      { released: false },
+    ]) {
+      const f = fake({ queue: [FAIL], ...o });
+      go("arm", f);
+      expect(posts(f)).toEqual([]);
+    }
+    const ok = fake({ queue: [qrun("2026-11-17T10:30:00Z", "success")] });
+    go("arm", ok);
+    expect(posts(ok)).toEqual([]);
+    const g = fake({ queue: [FAIL], armed: true, autoBy: "leourbina" });
+    go("arm", g);
+    expect(posts(g)).toEqual([]);
+  });
+  it("a new head after the failure is judged afresh and gets no comment", () => {
+    const f = fake({ queue: [FAIL], headAt: "2026-11-17T11:00:00Z" });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
+  });
+  it("takes back the bot's own arming over a failed queue run, and says so once", () => {
+    const f = fake({ queue: [FAIL], armed: true });
+    const r = go("arm", f);
+    expect(r.disarmed).toEqual([7]);
+    expect(posts(f)).toHaveLength(1);
+  });
+  it("turns the run red when the comment cannot be read or posted", () => {
+    expect(() => go("arm", fake({ queue: [FAIL], postFails: true }))).toThrow(
+      /403/,
+    );
+    expect(() =>
+      go("arm", fake({ queue: [FAIL], notFound: ["/issues/7/comments"] })),
+    ).toThrow(/Not Found/);
+  });
+  it("says so when the hold is three cancels in a row", () => {
+    const runs = [1, 2, 3].map((n) => ({
+      ...qrun(`2026-11-17T10:${n}0:00Z`, "cancelled"),
+      url: `https://github.com/${REPO}/actions/runs/${n}`,
+    }));
+    const f = fake({ queue: runs });
+    const r = go("arm", f);
+    expect(r.noticed).toEqual([7]);
+    const call = (posts(f)[0] ?? []).join(" ");
+    expect(call).toMatch(/cancelled 3 times in a row/);
+    expect(call).toContain("/actions/runs/3");
+    expect(r.armed).toEqual([]);
+  });
+  it("a cancelled run alone leaves no comment, and the PR is armed", () => {
+    const f = fake({ queue: [qrun("2026-11-17T10:30:00Z", "cancelled")] });
+    const r = go("arm", f);
+    expect(posts(f)).toEqual([]);
+    expect(r.armed).toEqual([7]);
+  });
+  it("links only this repository's run pages", () => {
+    const i = base({ queueRuns: [{ ...FAIL, url: "https://evil.example/x" }] });
+    expect(queueNotice(i, REPO)).not.toContain("evil.example");
+    expect(queueNotice(i, REPO)).toContain(queueMarker(HEAD));
+    expect(queueNotice(base({ queueRuns: [FAIL] }), REPO)).toContain(RUN_URL);
+  });
+  it("reads the run url in the gh query", () => {
+    const f = fake({ queue: [FAIL] });
+    go("arm", f);
+    const q = f.calls
+      .map((c) => c.join(" "))
+      .find((c) => c.includes("event=merge_group"));
+    expect(q).toContain("url: .html_url");
+  });
+});
+
 describe("requiredChecks", () => {
   it("reads the contexts of the required_status_checks rule", () => {
     expect(requiredChecks(RULES)).toEqual(REQUIRED_CHECKS);
@@ -472,6 +804,7 @@ const fake = (
     armed?: boolean;
     author?: string;
     commitAuthor?: string;
+    committer?: string;
     rulesFail?: boolean;
     unverified?: boolean;
     released?: boolean;
@@ -487,7 +820,13 @@ const fake = (
     junkCount?: boolean;
     deployTitles?: string[];
     deepDeploy?: boolean;
+    /** The completed redline-staging runs, newest first. */
+    gateRuns?: { t: string; c: string | null; a: number }[];
     tagSha?: string;
+    queue?: QueueRun[];
+    headAt?: string;
+    comments?: { user: { login: string }; body: string }[];
+    postFails?: boolean;
   } = {},
 ) => {
   const calls: Call[] = [];
@@ -500,6 +839,12 @@ const fake = (
       return { code: 1, stdout: "", stderr: "HTTP 404: Not Found" };
     const wr = /actions\/workflows\/([\w.-]+)\/runs\?status=(\w+)/.exec(a);
     if (wr) {
+      if (wr[1] === "redline-staging.yml" && wr[2] === "completed") {
+        expect(a).toMatch(/per_page=20\b/);
+        expect(a).toContain("--jq");
+        if (o.junkCount) return ok("oops");
+        return ok(JSON.stringify(o.gateRuns ?? []));
+      }
       if (wr[2] !== "success") {
         expect(a).toMatch(/per_page=1\b/);
         expect(a).toContain("--jq");
@@ -532,6 +877,13 @@ const fake = (
           ? "1"
           : "0",
       );
+    }
+    if (a.includes("/git/commits/"))
+      return ok(JSON.stringify({ committer: { date: o.headAt ?? HEAD_AT } }));
+    if (a.includes("actions/workflows/ci.yml/runs?event=merge_group")) {
+      expect(a).toContain("per_page=100");
+      expect(a).toContain("gh-readonly-queue/main/pr-7-");
+      return ok(JSON.stringify(o.queue ?? []));
     }
     if (a.includes("/pulls?state=open"))
       return ok(
@@ -572,7 +924,7 @@ const fake = (
           [
             {
               author: { login: o.commitAuthor ?? BOT },
-              committer: { login: BOT },
+              committer: { login: o.committer ?? BOT },
               commit: { verification: { verified: !o.unverified } },
             },
           ],
@@ -640,6 +992,13 @@ const fake = (
           },
         }),
       );
+    }
+    if (a.includes("/issues/7/comments")) {
+      if (a.includes("-X POST"))
+        return o.postFails
+          ? { code: 1, stdout: "", stderr: "HTTP 403" }
+          : ok("{}");
+      return ok(JSON.stringify([o.comments ?? []]));
     }
     if (a.startsWith("pr merge")) return ok("");
     return { code: 1, stdout: "", stderr: `unexpected ${cmd} ${a}` };
@@ -829,10 +1188,58 @@ describe("gateRefusal", () => {
       /candidate open: hosted-publish.yml/,
     );
   });
+  it("lets the next bump through when main's pin was rejected", () => {
+    expect(
+      gateRefusal({ ...idle, prodDeployed: false, rejected: true }),
+    ).toBeUndefined();
+    expect(
+      gateRefusal({
+        ...idle,
+        busy: ["redline-staging.yml"],
+        prodDeployed: false,
+        rejected: true,
+      }),
+    ).toMatch(/candidate open: redline-staging.yml/);
+  });
   it("refuses while main's pin has no prod deploy", () => {
     expect(gateRefusal({ ...idle, prodDeployed: false })).toMatch(
       /v0.181.0 has no successful prod deploy/,
     );
+  });
+});
+
+describe("gateRejected", () => {
+  const T = "v0.246.0";
+  it("is the newest run for the tag failing on a rerun", () => {
+    expect(
+      gateRejected(
+        [
+          { t: `redline-staging ${T}`, c: "failure", a: 2 },
+          { t: `redline-staging ${T}`, c: "success", a: 1 },
+        ],
+        T,
+      ),
+    ).toBe(true);
+  });
+  it("a newer passing run for the tag wins over an older rejection", () => {
+    expect(
+      gateRejected(
+        [
+          { t: `redline-staging ${T}`, c: "success", a: 1 },
+          { t: `redline-staging ${T}`, c: "failure", a: 2 },
+        ],
+        T,
+      ),
+    ).toBe(false);
+  });
+  it("a first-attempt failure, no run, or a longer tag is not a rejection", () => {
+    expect(
+      gateRejected([{ t: `redline-staging ${T}`, c: "failure", a: 1 }], T),
+    ).toBe(false);
+    expect(gateRejected([], T)).toBe(false);
+    expect(
+      gateRejected([{ t: `redline-staging ${T}0`, c: "failure", a: 2 }], T),
+    ).toBe(false);
   });
 });
 
@@ -1038,6 +1445,35 @@ describe("the release gate in run", () => {
     expect(r.armed).toEqual([]);
     expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
   });
+  it("arms past main's pin when the gate rejected it after the retry (#448)", () => {
+    const rejected = [
+      { t: "redline-staging v0.181.0", c: "failure", a: 2 },
+      { t: "redline-staging v0.180.0", c: "success", a: 1 },
+    ];
+    expect(
+      go("arm", fake({ prodDone: false, gateRuns: rejected })).armed,
+    ).toEqual([7]);
+  });
+  it("still waits on main's pin while its gate failed only once, or another tag's did", () => {
+    for (const gateRuns of [
+      [{ t: "redline-staging v0.181.0", c: "failure", a: 1 }],
+      [{ t: "redline-staging v0.180.0", c: "failure", a: 2 }],
+      [{ t: "redline-staging v0.181.0", c: "cancelled", a: 2 }],
+    ]) {
+      const r = go("arm", fake({ prodDone: false, gateRuns }));
+      expect(r.armed, JSON.stringify(gateRuns)).toEqual([]);
+      expect(r.logs.join("\n")).toMatch(/no successful prod deploy/);
+    }
+  });
+  it("does not read gate runs when main's pin is on prod", () => {
+    const f = fake();
+    go("arm", f);
+    expect(
+      f.calls.some((c) =>
+        c.join(" ").includes("redline-staging.yml/runs?status=completed"),
+      ),
+    ).toBe(false);
+  });
   it("arms when every gate workflow is idle and prod has the current pin", () => {
     expect(go("arm", fake()).armed).toEqual([7]);
   });
@@ -1061,7 +1497,10 @@ describe("the release gate in run", () => {
     go("arm", f);
     const reads = f.calls
       .map((c) => c.join(" "))
-      .filter((c) => c.includes("/actions/workflows/"));
+      .filter(
+        (c) =>
+          c.includes("/actions/workflows/") && !c.includes("workflows/ci.yml/"),
+      );
     expect(reads.length).toBe(GATE_WORKFLOWS.length * 2 + 1);
     expect(reads.filter((c) => c.includes("per_page=100")).length).toBe(1);
     for (const c of reads) {
@@ -1086,40 +1525,134 @@ describe("workflow", () => {
     "utf8",
   );
   const wf = parse(text);
-  it("triggers on CI completion, bump PRs and a schedule, and never cancels a run", () => {
+  it("is event-only: CI, the release pipeline gate, bump PRs, a push to main and dispatch; never a schedule, never cancels a run", () => {
+    // cloud #264: no schedule, no timer of any kind
     expect(Object.keys(wf.on).sort()).toEqual([
       "pull_request_target",
       "push",
-      "schedule",
       "workflow_dispatch",
       "workflow_run",
     ]);
+    expect(wf.on.schedule).toBeUndefined();
+    expect(text).not.toMatch(/\bcron:/);
     // A push to main and a manual run re-evaluate open bumps; neither takes inputs.
     expect(wf.on.push).toEqual({ branches: ["main"] });
     expect(wf.on.workflow_dispatch ?? null).toBeNull();
-    const cond = String(wf.jobs.arm.if);
-    for (const ev of ["schedule", "push", "workflow_dispatch"])
-      expect(cond).toContain(`github.event_name == '${ev}'`);
+    // The event filter lives on the plan job; arm only follows a plan that says write.
+    expect(wf.jobs.arm.needs).toBe("plan");
+    // The gate opens only when one of its workflows ends, so each one's end re-plans.
     expect(wf.on.workflow_run).toEqual({
-      workflows: ["CI"],
+      workflows: ["CI", ...GATE_WORKFLOWS.map((f) => f.replace(/\.yml$/, ""))],
       types: ["completed"],
     });
-    expect(wf.concurrency["cancel-in-progress"]).toBe(false);
+    for (const f of GATE_WORKFLOWS) {
+      const g = parse(
+        readFileSync(join(dir, "../../.github/workflows", f), "utf8"),
+      ) as { name: string };
+      expect(g.name).toBe(f.replace(/\.yml$/, ""));
+    }
+    // One plan or arm at a time, on the jobs: a run whose plan is skipped never
+    // takes the group, so it cannot replace a pending run with work to do.
+    expect(wf.concurrency).toBeUndefined();
+    for (const j of ["plan", "arm"])
+      expect(wf.jobs[j].concurrency).toEqual({
+        group: "pin-bump-arm",
+        "cancel-in-progress": false,
+      });
     expect(wf.permissions).toEqual({});
   });
-  it("mints the App token only after the plan, only for the arm step, and never runs the PR's code", () => {
-    const steps = wf.jobs.arm.steps as {
+
+  describe("which events plan (cloud #264)", () => {
+    type Ev = {
+      event: string;
+      headRef?: string;
+      wf?: string;
+      branch?: string;
+      conclusion?: string;
+    };
+    const plans = (o: Ev): boolean =>
+      Boolean(
+        new Function(
+          "github",
+          "startsWith",
+          `return ${String(wf.jobs.plan.if)};`,
+        )(
+          {
+            event_name: o.event,
+            head_ref: o.headRef ?? "",
+            event: {
+              workflow_run: {
+                name: o.wf ?? "",
+                head_branch: o.branch ?? "",
+                conclusion: o.conclusion ?? "success",
+              },
+            },
+          },
+          (a: string, b: string) => a.startsWith(b),
+        ),
+      );
+    const wr = (wf: string, branch: string, conclusion = "success"): Ev => ({
+      event: "workflow_run",
+      wf,
+      branch,
+      conclusion,
+    });
+
+    it("a push to main and a manual run always plan", () => {
+      expect(plans({ event: "push" })).toBe(true);
+      expect(plans({ event: "workflow_dispatch" })).toBe(true);
+    });
+
+    it("a bump PR opened or pushed plans; another PR does not", () => {
+      expect(
+        plans({ event: "pull_request_target", headRef: "pin-bump/v1.2.3" }),
+      ).toBe(true);
+      expect(plans({ event: "pull_request_target", headRef: "feature" })).toBe(
+        false,
+      );
+    });
+
+    it("CI plans on a bump branch, and in the merge queue only when it did not pass", () => {
+      expect(plans(wr("CI", "pin-bump/v1.2.3"))).toBe(true);
+      expect(plans(wr("CI", "pin-bump/v1.2.3", "failure"))).toBe(true);
+      const q = "gh-readonly-queue/main/pr-12-0123abcd";
+      for (const c of ["failure", "timed_out", "startup_failure", "cancelled"])
+        expect(plans(wr("CI", q, c))).toBe(true);
+      // a pass merges, and that push to main plans
+      expect(plans(wr("CI", q))).toBe(false);
+      expect(plans(wr("CI", "main"))).toBe(false);
+      expect(plans(wr("CI", "feature", "failure"))).toBe(false);
+    });
+
+    it("any gate workflow ending plans, green or red: the gate may be open now", () => {
+      for (const f of GATE_WORKFLOWS)
+        for (const c of ["success", "failure", "cancelled"])
+          expect(plans(wr(f.replace(/\.yml$/, ""), "main", c))).toBe(true);
+    });
+  });
+
+  it("plans read-only with no environment, then mints the App token only in the arm job, and never runs the PR's code", () => {
+    type Step = {
       id?: string;
       name?: string;
       if?: string;
       uses?: string;
       with?: Record<string, string>;
-    }[];
+    };
+    const planJob = wf.jobs.plan;
+    const armJob = wf.jobs.arm;
+    expect(planJob.environment).toBeUndefined();
+    expect(planJob.outputs.write).toBe("${{ steps.plan.outputs.write }}");
+    expect(JSON.stringify(planJob)).not.toMatch(
+      /create-github-app-token|RELEASE_APP/,
+    );
+    expect(armJob.needs).toBe("plan");
+    expect(armJob.if).toContain("needs.plan.outputs.write == 'true'");
+    expect(armJob.environment).toBe("release-app");
+    const steps = armJob.steps as Step[];
     const ids = steps.map((s) => s.id ?? s.name);
-    expect(ids.indexOf("plan")).toBeLessThan(ids.indexOf("app"));
     expect(ids.indexOf("app")).toBeLessThan(ids.indexOf("Arm"));
     const app = steps.find((s) => s.id === "app")!;
-    expect(app.if).toContain("steps.plan.outputs.write == 'true'");
     expect(app.uses).toMatch(/^actions\/create-github-app-token@[0-9a-f]{40}$/);
     expect(app.with?.["permission-pull-requests"]).toBe("write");
     expect(text).not.toMatch(/github\.head_ref\s*\}\}|head_sha/);
@@ -1130,27 +1663,26 @@ describe("workflow", () => {
       "reopened",
       "synchronize",
     ]);
-    const checkouts = steps.filter((s) =>
-      s.uses?.startsWith("actions/checkout@"),
-    );
-    expect(checkouts).toHaveLength(1);
-    expect(checkouts[0]?.with).toMatchObject({
-      ref: "${{ github.event.repository.default_branch }}",
-      "persist-credentials": false,
-    });
-    const runs = JSON.stringify(wf.jobs.arm.steps);
-    expect(runs).not.toMatch(
-      /pull_request\.head|head_ref\}|github\.event\.pull_request|merge_commit/,
-    );
-    expect(
-      wf.jobs.arm.steps.some((s: { uses?: string }) =>
-        /pnpm|install/.test(s.uses ?? ""),
-      ),
-    ).toBe(false);
-    expect(runs).not.toMatch(/pnpm|npm (ci|install)/);
-    expect(steps[0]?.with).toMatchObject({
-      ref: "${{ github.event.repository.default_branch }}",
-    });
-    expect(wf.jobs.arm.permissions["pull-requests"]).toBe("read");
+    for (const job of [planJob, armJob]) {
+      const js = job.steps as Step[];
+      const checkouts = js.filter((s) =>
+        s.uses?.startsWith("actions/checkout@"),
+      );
+      expect(checkouts).toHaveLength(1);
+      expect(checkouts[0]?.with).toMatchObject({
+        ref: "${{ github.event.repository.default_branch }}",
+        "persist-credentials": false,
+      });
+      expect(js[0]?.with).toMatchObject({
+        ref: "${{ github.event.repository.default_branch }}",
+      });
+      const runs = JSON.stringify(js);
+      expect(runs).not.toMatch(
+        /pull_request\.head|head_ref\}|github\.event\.pull_request|merge_commit/,
+      );
+      expect(runs).not.toMatch(/pnpm|npm (ci|install)/);
+      expect(js.some((s) => /pnpm|install/.test(s.uses ?? ""))).toBe(false);
+    }
+    expect(planJob.permissions["pull-requests"]).toBe("read");
   });
 });

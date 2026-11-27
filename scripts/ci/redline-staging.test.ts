@@ -588,7 +588,11 @@ describe("redline-staging.yml", () => {
 
     it("keeps the pin: T19_EXPECT_VERSION is the staged version.txt handed over with the key, and no file or an empty one stops it (#1251)", () => {
       const t19 = t19Named("t19");
-      expect(t19.env).toEqual({ T19_EXPECT_TIER: "team" });
+      expect(t19.env).toEqual({
+        T19_EXPECT_TIER: "team",
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+        T19_FULL: "${{ inputs.t19_full }}",
+      });
       const run = String(t19.run);
       const pin =
         'T19_EXPECT_VERSION="$(cat "$RUNNER_TEMP/t19-sealed/version.txt")"';
@@ -602,7 +606,7 @@ describe("redline-staging.yml", () => {
       );
       // leo's pin stays unset in CI until #955 keeps leo current (#1251).
       expect(text).not.toContain("T19_EXPECT_LEO_VERSION");
-      const pre = run.slice(0, run.indexOf("pnpm --filter @oa/dashboard"));
+      const pre = run.slice(0, run.indexOf("pw() {"));
       const temp = mkdtempSync(join(tmpdir(), "t19-pin-"));
       try {
         mkdirSync(join(temp, "t19-sealed"));
@@ -1570,7 +1574,7 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     const up = t19Steps.filter((s) => s.with?.name === "t19-report");
     expect(up).toHaveLength(1);
     expect(up[0]?.if).toBe(
-      "always() && steps.scan.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'",
+      "always() && steps.scan.outcome == 'success' && steps.deep.outcome == 'success' && steps.trace.outcome == 'success' && steps.t19.outcome != 'skipped'",
     );
     expect(t19Steps.indexOf(up[0] ?? {})).toBeGreaterThan(
       t19Steps.indexOf(scan),
@@ -1585,6 +1589,11 @@ case "$*" in *t19-seal*) echo "sealed-by-pnpm" > "$last";; esac
     );
     expect(t19Steps.indexOf(trace)).toBeLessThan(t19Steps.indexOf(scan));
     expect(t19Named("t19").run).toContain("--trace retain-on-failure");
+    // #294: the deep scan runs after the text scan, before the upload.
+    const deep = t19Named("deep");
+    expect(deep.run).toContain("t19-trace scan");
+    expect(t19Steps.indexOf(deep)).toBeGreaterThan(t19Steps.indexOf(scan));
+    expect(t19Steps.indexOf(deep)).toBeLessThan(t19Steps.indexOf(up[0] ?? {}));
     expect(up[0]?.with.path).toBe("apps/dashboard/playwright-report");
     const tmp = mkdtempSync(join(tmpdir(), "t19-scan-"));
     try {
@@ -1763,6 +1772,7 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
       tag: "${{ inputs.tag }}",
       t19_public_branch: "${{ inputs.public_branch }}",
       t19_public_sha: "${{ inputs.public_sha }}",
+      t19_full: true,
     });
     const nightly = parse(
       readFileSync(join(root, ".github/workflows/redline-nightly.yml"), "utf8"),
@@ -1920,6 +1930,223 @@ describe("t19-dry-run: a non-gate T19 run with a public branch's specs", () => {
       }
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// The gate tier (the user's "trim", 2026-11-18): a gate run runs only the specs
+// tagged @gate; the nightly and the dry run run every spec; nothing selected is
+// a failure.
+describe("t19 gate tier", () => {
+  const step = t19Named("t19");
+  const nightlyText = readFileSync(
+    join(root, ".github/workflows/redline-nightly.yml"),
+    "utf8",
+  );
+  const nightly = parse(nightlyText);
+
+  it("t19_full is a workflow_call boolean defaulting to false; a gate dispatch has no such input", () => {
+    expect(w.on.workflow_call.inputs.t19_full).toEqual({
+      type: "boolean",
+      required: false,
+      default: false,
+    });
+    expect(Object.keys(w.on.workflow_dispatch.inputs)).toEqual(["tag"]);
+    // Only the T19 step reads it.
+    const users = [...text.matchAll(/inputs\.t19_full/g)].length;
+    expect(users).toBe(
+      (JSON.stringify(step).match(/inputs\.t19_full/g) ?? []).length,
+    );
+    expect(String(step.run)).not.toContain("${{");
+  });
+
+  it("the nightly and the dry run run every spec; nothing the release chain reads is the nightly", () => {
+    expect(nightly.jobs.redline.with.t19_full).toBe(true);
+    const dry = parse(
+      readFileSync(join(root, ".github/workflows/t19-dry-run.yml"), "utf8"),
+    );
+    expect(dry.jobs.redline.with.t19_full).toBe(true);
+    // The gate and the prod chain read runs of redline-staging.yml with event
+    // workflow_dispatch: a called nightly run is neither.
+    for (const f of [
+      "scripts/ci/staging-first-gate.sh",
+      "scripts/ci/prod-release-chain.ts",
+      "scripts/ci/staging-release-chain.ts",
+      ".github/workflows/prod-release-chain.yml",
+      ".github/workflows/staging-release-chain.yml",
+    ]) {
+      const src = readFileSync(join(root, f), "utf8");
+      expect(src, f).not.toContain("redline-nightly");
+      expect(src, f).not.toContain("t19_full");
+    }
+    // It reports through its own blocker issue and shares the callee's
+    // `redline` concurrency group with a gate run, so they never overlap.
+    expect(nightly.jobs.report).toBeDefined();
+    expect(w.concurrency).toEqual({
+      group: "redline",
+      "cancel-in-progress": false,
+    });
+  });
+
+  it("keeps the secret handling: the scrub, the scan and the deep scan still run on every selection", () => {
+    for (const id of ["trace", "scan", "deep"]) {
+      expect(String(t19Named(id).if)).toContain("always()");
+    }
+    expect(t19Steps.at(-1)?.run).toContain("redline-secrets");
+  });
+
+  /** A fake pnpm: lists `list` tests for a selection and logs real runs. */
+  function sandbox(
+    counts: { all: number; gate: number; guard: number },
+    // Which listing breaks with a real error (exit 2, not "No tests found").
+    broken: "all" | "gate" | "" = "",
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), "t19-sel-"));
+    mkdirSync(join(dir, "bin"));
+    mkdirSync(join(dir, "t19-sealed"));
+    writeFileSync(join(dir, "t19-sealed", "version.txt"), "0.97.0\n");
+    writeFileSync(
+      join(dir, "bin", "pnpm"),
+      `#!/usr/bin/env bash
+case "$*" in
+  *--list*)
+    if [[ "$*" == *--project* ]]; then n=${counts.guard}; kind=guard
+    elif [[ "$*" == *"--grep @gate(\\s|\$)"* ]]; then n=${counts.gate}; kind=gate
+    else n=${counts.all}; kind=all; fi
+    if [ "$kind" = "${broken}" ]; then echo "Error: browserType.launch crashed"; exit 2; fi
+    if [ "$n" -eq 0 ]; then echo "Error: No tests found"; exit 1; fi
+    echo "Listing tests:"; echo "Total: $n tests in 3 files"; exit 0;;
+esac
+echo "RUN $*" >> "$CALLS"
+`,
+      { mode: 0o755 },
+    );
+    const run = (env: Record<string, string>) => {
+      const calls = join(dir, "calls");
+      writeFileSync(calls, "");
+      const r = runBash(String(step.run), {
+        RUNNER_TEMP: dir,
+        CALLS: calls,
+        T19_EXPECT_TIER: "team",
+        PATH: `${join(dir, "bin")}:${process.env.PATH}`,
+        ...env,
+      });
+      return { r, calls: readFileSync(calls, "utf8") };
+    };
+    return { dir, run };
+  }
+
+  it("a gate run (T19_FULL unset or false) runs only the @gate set", () => {
+    const sb = sandbox({ all: 24, gate: 9, guard: 2 });
+    try {
+      const envs: Record<string, string>[] = [
+        {},
+        { T19_FULL: "false" },
+        { T19_FULL: "" },
+      ];
+      for (const env of envs) {
+        const { r, calls } = sb.run(env);
+        expect(r.status, r.stdout + r.stderr).toBe(0);
+        expect(r.stdout).toContain("T19 set: gate, 9 tests");
+        expect(calls).toBe(
+          "RUN --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure --grep @gate(\\s|$)\n",
+        );
+      }
+    } finally {
+      rmSync(sb.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the nightly (T19_FULL=true) runs every spec, with no grep", () => {
+    const sb = sandbox({ all: 24, gate: 9, guard: 2 });
+    try {
+      const { r, calls } = sb.run({ T19_FULL: "true" });
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(r.stdout).toContain("T19 set: all, 24 tests");
+      expect(calls).toBe(
+        "RUN --filter @oa/dashboard exec playwright test -c playwright.staging.config.ts --trace retain-on-failure\n",
+      );
+    } finally {
+      rmSync(sb.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a public version with no @gate tag falls back to every spec, never to none", () => {
+    const sb = sandbox({ all: 21, gate: 0, guard: 0 });
+    try {
+      const { r, calls } = sb.run({});
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(r.stdout).toContain("no spec is tagged @gate");
+      expect(r.stdout).toContain("T19 set: all, 21 tests");
+      expect(calls).not.toContain("--grep");
+      expect(calls).toContain("--trace retain-on-failure");
+    } finally {
+      rmSync(sb.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a selection that matches no test fails and runs nothing", () => {
+    const none = sandbox({ all: 0, gate: 0, guard: 0 });
+    try {
+      for (const env of [{}, { T19_FULL: "true" }] as Record<
+        string,
+        string
+      >[]) {
+        const { r, calls } = none.run(env);
+        expect(r.status, JSON.stringify(env)).toBe(1);
+        expect(r.stdout).toContain("matched no test");
+        expect(calls).toBe("");
+      }
+    } finally {
+      rmSync(none.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a list that fails is an error, never zero: no fallback, nothing runs; only "No tests found" counts as zero', () => {
+    for (const broken of ["all", "gate"] as const) {
+      const sb = sandbox({ all: 24, gate: 9, guard: 2 }, broken);
+      try {
+        for (const env of [{}, { T19_FULL: "true" }] as Record<
+          string,
+          string
+        >[]) {
+          const { r, calls } = sb.run(env);
+          // The gate-listing break only matters when the gate lists.
+          if (broken === "gate" && env.T19_FULL) {
+            expect(r.status).toBe(0);
+            continue;
+          }
+          expect(r.status, `${broken} ${JSON.stringify(env)}`).toBe(1);
+          expect(r.stdout).toContain("T19: could not list the tests");
+          expect(r.stdout).not.toContain("running every spec");
+          expect(calls).toBe("");
+        }
+      } finally {
+        rmSync(sb.dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("the @gate pattern has a boundary: @gated and @gateway never match, @gate does", () => {
+    const m = /GATE_RE='([^']+)'/.exec(String(step.run));
+    expect(m).not.toBeNull();
+    // Playwright greps "<project> › <file> › <title> @tag1 @tag2".
+    const re = new RegExp(String(m?.[1]));
+    expect(re.test("rl-a › a.spec.ts › does a thing @gate")).toBe(true);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gate @other")).toBe(true);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gated")).toBe(false);
+    expect(re.test("rl-a › a.spec.ts › does a thing @gateway")).toBe(false);
+  });
+
+  it("a gate set without the rl-a guard fails and runs nothing", () => {
+    const sb = sandbox({ all: 24, gate: 7, guard: 0 });
+    try {
+      const { r, calls } = sb.run({});
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain("no case of the rl-a guard project");
+      expect(calls).toBe("");
+    } finally {
+      rmSync(sb.dir, { recursive: true, force: true });
     }
   });
 });

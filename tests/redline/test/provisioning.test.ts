@@ -361,6 +361,8 @@ describe("each probe fails on the behaviour it guards", () => {
     ["p21_stays_paused", "P21", /P21 \/healthz 200: not within 120 s/],
     ["p22_closed_404", "P22", /P22 closed page/],
     ["p23_no_row", "P23", /P23: inventory has no row for it/],
+    // Cloud #264 port 13: the content address must be unmapped too.
+    ["p23_content_mapped", "P23", /P23: HOSTS still maps the content host/],
     [
       "p23_slug_freed",
       "P23",

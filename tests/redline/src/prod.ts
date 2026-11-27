@@ -44,15 +44,20 @@ import { callerRetries, freshAgent } from "./transport.ts";
 // prod install can run test hooks: every published prod release is the
 // signed `release` variant with the hooks define false, its bytes match the
 // signed sha, and they hold none of the hook SQL; every prod install's
-// /healthz has no testHooks and its script lists no hook secret or var.
+// /healthz has no testHooks and its script lists no hook secret or var, and
+// no staging-only var (DOCS_PREVIEW).
 // Configured with zero releases or zero installs is a pass (Manager, user's
 // decision 2026-10-30); a probe missing its R2 or inventory config, or a
 // missing releases bucket, is a fail, never not-applicable.
 
 const API = "https://api.cloudflare.com/client/v4";
 const PREFIX = "releases/";
+/** Most record-less (staged) versions a clean prod bucket may hold. */
+const MAX_STAGED = 5;
 const FLOOR = "releases/floor.json";
 const HOOK_NAMES = ["TEST_HOOK_KEY", "TEST_HOOKS"];
+/** Staging-only names (open-artifacts#2641: DOCS_PREVIEW opens doc creation). */
+const STAGING_ONLY_NAMES = ["DOCS_PREVIEW"];
 const MAX_KEYS = 200_000;
 
 /**
@@ -197,7 +202,13 @@ export const prodCleanLine = (failCode?: string) =>
 export const PROD_CLEAN_LINE_RE =
   /^prod-clean: (pass|fail \([a-z][a-z0-9_]{0,39}\))$/;
 
-export type ProdResult = { level: "pass"; releases: number; installs: number };
+export type ProdResult = {
+  level: "pass";
+  releases: number;
+  installs: number;
+  /** Versions with files but no record: staged before the gate (cloud #329), skipped. */
+  staged?: string[];
+};
 
 /** A 429 is retried this many times per request (Retry-After honoured). */
 export const CF_429_RETRIES = 3;
@@ -408,6 +419,13 @@ async function checkRelease(
       "release_dirty",
       `${what}: the bundle sha does not match the record`,
     );
+  scanModules(bundle, what);
+}
+
+function scanModules(
+  bundle: { modules: { name: string; bytes: Uint8Array }[] },
+  what: string,
+): void {
   const dec = new TextDecoder();
   for (const m of bundle.modules) {
     const text = dec.decode(m.bytes);
@@ -418,6 +436,32 @@ async function checkRelease(
           `${what}: module ${m.name.slice(0, 60)} holds hook SQL`,
         );
   }
+}
+
+/** Dotted-numeric order; a non-numeric part sorts as 0 (never throws). */
+function versionCmp(a: string, b: string): number {
+  const pa = a.split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
+  const pb = b.split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** True when the staged version's files could not all be read yet (stage-prod may still be uploading). */
+async function checkStaged(cf: Cf, version: string): Promise<boolean> {
+  let bundle: Awaited<
+    ReturnType<ReturnType<typeof r2ReleaseReader>["modules"]>
+  >;
+  try {
+    bundle = await r2ReleaseReader(cf, "prod").modules(version, "release");
+  } catch {
+    return true;
+  }
+  // Scan what was read; a missing main module means the upload is unfinished.
+  scanModules(bundle, `release ${version.slice(0, 40)} (staged)`);
+  return !bundle.modules.some((m) => m.name === bundle.mainModule);
 }
 
 /**
@@ -517,7 +561,7 @@ async function getJson(
   }
 }
 
-/** The script's secret names and settings bindings hold no hook name. */
+/** The script's secret names and settings bindings hold no hook or staging-only name. */
 type Get = (
   url: string,
   token: string | null,
@@ -549,6 +593,8 @@ async function checkScript(
   for (const n of [...secretNames, ...bindings.map((b) => b.name)])
     if (HOOK_NAMES.includes(String(n)))
       throw dirty(`script lists ${String(n)}`);
+    else if (STAGING_ONLY_NAMES.includes(String(n)))
+      throw dirty(`script lists ${String(n)} (staging only)`);
 }
 
 /**
@@ -620,8 +666,58 @@ async function scan(
           "release_dirty",
           `release ${version.slice(0, 40)}: variant ${v.slice(0, 20)} in prod`,
         );
+  // A version with files but no record is staged (stage-prod uploads before
+  // the gate; the record is written after it): skipped and listed. A record
+  // without its files, or any other odd shape, still fails in checkRelease.
+  const recorded = new Set(keys);
+  const staged = [...releases.keys()].filter(
+    (v) => !recorded.has(`releases/${v}/release/${RECORD_FILE}`),
+  );
+  const recordedVs = [...releases.keys()].filter((v) => !staged.includes(v));
+  if (staged.length > MAX_STAGED)
+    throw new ProdDirty(
+      "release_dirty",
+      `releases bucket: ${staged.length} staged versions (max ${MAX_STAGED})`,
+    );
+  for (const v of staged) {
+    const vs = releases.get(v);
+    if (!vs || vs.size !== 1 || !vs.has("release"))
+      throw new ProdDirty(
+        "release_dirty",
+        `release ${v.slice(0, 40)}: a staged version holds only the release variant`,
+      );
+  }
+  for (const v of staged)
+    if (recordedVs.some((r) => versionCmp(v, r) <= 0))
+      throw new ProdDirty(
+        "release_dirty",
+        `release ${v.slice(0, 40)}: no ${RECORD_FILE} and not newer than every recorded version`,
+      );
+  const incomplete: string[] = [];
   await forEachLimit(
-    [...releases.keys()],
+    staged,
+    PROD_CLEAN_CONCURRENCY,
+    async (v) => {
+      if (await checkStaged(r2, v)) incomplete.push(v);
+    },
+    isDirty,
+  );
+  if (incomplete.length)
+    console.log(
+      `prodClean: staged, incomplete: ${incomplete
+        .map((v) => v.slice(0, 40))
+        .sort()
+        .join(", ")}`,
+    );
+  if (staged.length)
+    console.log(
+      `prodClean: staged (no record): ${staged
+        .map((v) => v.slice(0, 40))
+        .sort()
+        .join(", ")}`,
+    );
+  await forEachLimit(
+    [...releases.keys()].filter((v) => !staged.includes(v)),
     PROD_CLEAN_CONCURRENCY,
     (version) => checkRelease(r2, version, pubkey),
     isDirty,
@@ -713,7 +809,14 @@ async function scan(
   };
   await forEachLimit(rows, PROD_CLEAN_CONCURRENCY, checkInstall, isDirty);
 
-  return { level: "pass", releases: releases.size, installs: rows.length };
+  return {
+    level: "pass",
+    releases: releases.size - staged.length,
+    installs: rows.length,
+    ...(staged.length
+      ? { staged: staged.map((v) => v.slice(0, 40)).sort() }
+      : {}),
+  };
 }
 
 /** The prod admin origin, as the provisioning probes read it (REDLINE_PROD_PROV_ADMIN). */

@@ -5,7 +5,7 @@ import { trialRemindersDue } from "../trial-reminder.js";
 import { alertFor, factsOf, prodcleanReport, stepAlert } from "./alerts.js";
 import { alertConditions, signupDailyCap } from "./conditions.js";
 import type { ProvapiEnv } from "./env.js";
-import { type FleetOptions, fleetDue } from "./fleet.js";
+import { type FleetOptions, fleetTick } from "./fleet.js";
 import { type HealthProbe, healthDue } from "./health.js";
 import { prune } from "./prune.js";
 import { purgeDue } from "./purge.js";
@@ -114,9 +114,13 @@ export function provapiTick(
       },
     },
     {
+      // Under the fleet lease (fleetTick): while the deploy's wake run
+      // (wake.ts) holds it, this pass logs `provapi fleet overlap` and ends.
       name: "fleet",
       timeoutMs: t.fleet,
-      run: () => fleetDue(env, now, o.fleet),
+      run: async () => {
+        await fleetTick(env, now, o.fleet);
+      },
     },
     { name: "alerts", timeoutMs: t.alerts, run: () => alertsTick(env, now) },
     { name: "prune", timeoutMs: t.prune, run: () => prune(env, now) },

@@ -15,7 +15,10 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_PUBKEY } from "../../../../packages/provision/test/fixtures/release.js";
 import { runManage } from "../../src/manage.js";
-import { COPY_MAX_PAGES } from "../../src/oauth-store.js";
+import {
+  AUTH_PROVIDERS_ACTION,
+  COPY_MAX_PAGES,
+} from "../../src/oauth-store.js";
 import { runCreate } from "../../src/workflow.js";
 import {
   ENV,
@@ -265,6 +268,84 @@ describe("update: set OAUTH_STORE (R29)", () => {
     expect(r.log.map((l) => l.name)).toEqual(
       expect.arrayContaining(["precheck", "update_vars", "mode_live"]),
     );
+  });
+
+  it("DOCS_PREVIEW alone: the var goes up, the install keeps it and its mode, no mode poll or mode_live row", async () => {
+    const id = await active();
+    install(id);
+    await run(setMode("dual"), id);
+    const r = await run({ vars: { DOCS_PREVIEW: "1" } }, id);
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done", step: "done" });
+    expect(plain(id, "DOCS_PREVIEW")).toBe("1");
+    expect(plain(id, "OAUTH_STORE")).toBe("dual");
+    expect(JSON.parse(w.install(id)?.vars as string)).toMatchObject({
+      OAUTH_STORE: "dual",
+      DOCS_PREVIEW: "1",
+    });
+    expect(r.log.map((l) => l.name)).toContain("update_vars");
+    expect(r.log.map((l) => l.name)).not.toContain("mode_live");
+    expect(
+      auditOf(id).filter((a) => a.action === "docs_preview.set"),
+    ).toHaveLength(1);
+    expect(r.log.map((l) => l.name)).not.toContain("precheck");
+    expect(
+      auditOf(id).filter((a) => a.action === OAUTH_MODE_LIVE_ACTION),
+    ).toHaveLength(1);
+  });
+
+  it('DOCS_PREVIEW survives an upgrade, and "" removes it', async () => {
+    const id = await active();
+    install(id);
+    await run({ vars: { DOCS_PREVIEW: "1" } }, id);
+    expect(JSON.parse(w.install(id)?.vars as string).DOCS_PREVIEW).toBe("1");
+    const off = await run({ vars: { DOCS_PREVIEW: "" } }, id);
+    expect(off.error).toBeNull();
+    expect(
+      auditOf(id)
+        .filter((a) => a.action === "docs_preview.set")
+        .map((a) => JSON.parse(a.detail)),
+    ).toEqual([{ value: "1" }, { value: "" }]);
+    expect(plain(id, "DOCS_PREVIEW")).toBeUndefined();
+    expect(JSON.parse(w.install(id)?.vars as string)).not.toHaveProperty(
+      "DOCS_PREVIEW",
+    );
+  });
+
+  it("OAUTH_STORE and DOCS_PREVIEW together: both go up and the mode is verified", async () => {
+    const id = await active();
+    install(id);
+    const r = await run(
+      { vars: { OAUTH_STORE: "dual", DOCS_PREVIEW: "1" } },
+      id,
+    );
+    expect(r.error).toBeNull();
+    expect(plain(id, "OAUTH_STORE")).toBe("dual");
+    expect(plain(id, "DOCS_PREVIEW")).toBe("1");
+    expect(r.log.map((l) => l.name)).toContain("mode_live");
+  });
+
+  it("a mode-only job writes no docs_preview row", async () => {
+    const id = await active();
+    install(id);
+    await run(setMode("dual"), id);
+    expect(
+      auditOf(id).filter((a) => a.action === "docs_preview.set"),
+    ).toHaveLength(0);
+  });
+
+  it("a bad DOCS_PREVIEW value or an extra var does not parse", async () => {
+    const id = await active();
+    install(id);
+    for (const vars of [
+      { DOCS_PREVIEW: "0" },
+      { DOCS_PREVIEW: "1", TIER: "team" },
+      {},
+    ]) {
+      const r = await run({ vars }, id);
+      expect(r.error, JSON.stringify(vars)).not.toBeNull();
+    }
+    expect(plain(id, "DOCS_PREVIEW")).toBeUndefined();
   });
 
   it("keeps the install's other vars", async () => {
@@ -692,6 +773,104 @@ describe("update: set OAUTH_STORE (R29)", () => {
     expect(r.log.map((l) => l.name)).toContain("fail_release");
     expect(w.install(id)?.lease ?? null).toBeNull();
     expect(w.install(id)?.state).toBe("active");
+  });
+});
+
+describe("update: AUTH_PROVIDERS (R29, cloud#435)", () => {
+  async function activeWith(vars: Record<string, string>) {
+    const s = seedCreate(w, {
+      slug: `a${Math.random().toString(36).slice(2, 8)}`,
+      vars,
+    });
+    await runCreate(w.ctx, event(s.jobId), stepRunner(w.clock).step);
+    expect(w.job(s.jobId)?.status).toBe("done");
+    return s.installId;
+  }
+  const GOOGLE = {
+    AUTH_PROVIDERS: "google",
+    AUTH_DOMAINS: "finqore.test",
+    TIER: "business",
+  };
+  const codes = (v: string) => ({ vars: { AUTH_PROVIDERS: v } });
+  const stored = (id: string) => JSON.parse(w.install(id)?.vars as string);
+
+  it("google to google,email and back: the var goes up with the Turnstile pair, the install keeps the rest, each audited", async () => {
+    const id = await activeWith(GOOGLE);
+    install(id);
+    expect(plain(id, "TURNSTILE_SITE_KEY")).toBeUndefined();
+    const on = await run(codes("google,email"), id);
+    expect(on.error).toBeNull();
+    expect(on.job).toMatchObject({ status: "done", step: "done" });
+    expect(plain(id, "AUTH_PROVIDERS")).toBe("google,email");
+    expect(plain(id, "TURNSTILE_SITE_KEY")).toBeTruthy();
+    expect(scriptOf(id).secrets.get("TURNSTILE_SECRET")).toBeTruthy();
+    expect(stored(id)).toMatchObject({
+      ...GOOGLE,
+      AUTH_PROVIDERS: "google,email",
+    });
+    expect(on.log.map((l) => l.name)).not.toContain("mode_live");
+    const off = await run(codes("google"), id);
+    expect(off.error).toBeNull();
+    expect(plain(id, "AUTH_PROVIDERS")).toBe("google");
+    expect(stored(id).AUTH_PROVIDERS).toBe("google");
+    expect(
+      auditOf(id)
+        .filter((a) => a.action === AUTH_PROVIDERS_ACTION)
+        .map((a) => JSON.parse(a.detail)),
+    ).toEqual([{ value: "google,email" }, { value: "google" }]);
+  });
+
+  it.each([
+    [
+      "an email-only install",
+      { AUTH_PROVIDERS: "email", AUTH_DOMAINS: "", TIER: "business" },
+    ],
+    [
+      "a domain-codes install",
+      {
+        AUTH_PROVIDERS: "email",
+        AUTH_DOMAINS: "finqore.test",
+        EMAIL_CODE_DOMAIN: "on",
+        TIER: "business",
+      },
+    ],
+  ])(
+    "%s is refused in the recheck, nothing written: Google never changes",
+    async (_n, vars) => {
+      const id = await activeWith(vars);
+      install(id);
+      const before = stored(id);
+      const writes = w.fake.writes().length;
+      const r = await run(codes("google,email"), id);
+      expect(r.error).not.toBeNull();
+      expect(r.job).toMatchObject({ status: "failed" });
+      expect(r.log.map((l) => l.name)).not.toContain("update_vars");
+      expect(stored(id)).toEqual(before);
+      expect(w.fake.writes().length).toBe(writes);
+    },
+  );
+
+  it("codes on with the env's widget gone: turnstile_missing, the install unchanged", async () => {
+    const id = await activeWith(GOOGLE);
+    install(id);
+    w.fake.turnstile.clear();
+    const r = await run(codes("google,email"), id);
+    expect(r.job).toMatchObject({
+      status: "failed",
+      error_code: "turnstile_missing",
+    });
+    expect(stored(id).AUTH_PROVIDERS).toBe("google");
+    expect(plain(id, "AUTH_PROVIDERS")).toBe("google");
+  });
+
+  it("other values or a list do not parse", async () => {
+    const id = await activeWith(GOOGLE);
+    install(id);
+    for (const v of ["email", "email,google", "google,access", ""]) {
+      const r = await run(codes(v), id);
+      expect(r.error, v).not.toBeNull();
+    }
+    expect(stored(id).AUTH_PROVIDERS).toBe("google");
   });
 });
 

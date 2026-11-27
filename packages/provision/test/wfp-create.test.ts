@@ -33,7 +33,11 @@ import {
 import * as INDEX from "../src/index.js";
 import { RELEASE_PUBKEY_PLACEHOLDER } from "../src/internal/gates.js";
 import { loadTemplate } from "../src/internal/template.js";
-import { HOSTED_ADDED, userWorkerMetadata } from "../src/metadata.js";
+import {
+  HOSTED_ADDED,
+  type Template,
+  userWorkerMetadata,
+} from "../src/metadata.js";
 import {
   ENV_PREFIX,
   type Env,
@@ -1472,6 +1476,23 @@ describe("WfpProvisioner.create", () => {
       "PLAN",
     ]);
     for (const b of meta.bindings) expect(known.has(b.name), b.name).toBe(true);
+    // Public #3200's RL_HOOKS is the test variant's only: a red-line install
+    // gets every template hook binding, this release create none.
+    const hooks = ((t.ratelimits ?? []) as { name: string }[])
+      .map((r) => r.name)
+      .filter((n) => /hook/i.test(n));
+    await s.p.create(hookInput());
+    const test = metaOf(uploads(s.fake).at(-1)?.body as string);
+    const testNames = test.bindings.map((b: { name: string }) => b.name);
+    for (const n of testNames)
+      expect(known.has(n) || hooks.includes(n), n).toBe(true);
+    for (const n of hooks) {
+      expect(testNames, n).toContain(n);
+      expect(
+        meta.bindings.map((b: { name: string }) => b.name),
+        n,
+      ).not.toContain(n);
+    }
   });
 
   describe("bundle variants and the release record (decision 8, H2)", () => {
@@ -1652,6 +1673,25 @@ describe("WfpProvisioner.create", () => {
     });
   });
 
+  describe("DOCS_PREVIEW is staging only (open-artifacts#2641)", () => {
+    it("a prod create is refused with zero calls", async () => {
+      const s = setup({ env: "prod" });
+      const e = await fails(
+        s.p.create(input("finqore", { vars: { DOCS_PREVIEW: "1" } })),
+      );
+      expect(e.message).toMatch(/DOCS_PREVIEW is staging only/);
+      expect(s.fake.log).toEqual([]);
+    });
+    it("a staging create binds it as 1", async () => {
+      const s = setup();
+      await s.p.create(input("finqore", { vars: { DOCS_PREVIEW: "1" } }));
+      const meta = metaOf(uploads(s.fake)[0]?.body as string);
+      expect(
+        meta.bindings.find((b: { name: string }) => b.name === "DOCS_PREVIEW"),
+      ).toMatchObject({ type: "plain_text", text: "1" });
+    });
+  });
+
   describe("TEST_DOMAIN", () => {
     it("a test-hook install without TEST_DOMAIN is refused with zero calls", async () => {
       const s = setup();
@@ -1784,6 +1824,52 @@ describe("WfpProvisioner.create", () => {
     expect(new Set(sa.values()).size).toBe(sa.size);
   });
 
+  // Red-line port (guard.test.ts and surfaces.test.ts isolation cases: "a
+  // setup mistake that wires two installs to one database" or shares a
+  // secret). Each install's upload binds its own D1 and OAuth KV, by id, and
+  // carries its own SESSION_SECRET and CONTENT_SIGNING_KEY.
+  it("two installs each get their own D1 and OAuth KV ids and fresh SESSION_SECRET and CONTENT_SIGNING_KEY", async () => {
+    const s = setup();
+    const a = await s.p.create(input("alpha"));
+    const b = await s.p.create(input("beta"));
+    type B = { type: string; name: string; id?: string; namespace_id?: string };
+    const bindingsOf = (id: string) => {
+      const up = uploads(s.fake).filter((u) =>
+        u.path.endsWith(`/scripts/oa-s-${id}`),
+      );
+      expect(up).toHaveLength(1);
+      return metaOf(up[0]?.body as string).bindings as B[];
+    };
+    const rowOf = (id: string) => s.rows().find((r) => r.id === id);
+    const of = (id: string) => {
+      const bs = bindingsOf(id);
+      const d1 = bs.filter((x) => x.type === "d1");
+      const kv = bs.filter((x) => x.type === "kv_namespace");
+      expect(d1.map((x) => x.name)).toEqual(["DB"]);
+      expect(kv.map((x) => x.name)).toEqual(["OAUTH_KV"]);
+      const sec = s.scriptOf(id)?.secrets as Map<string, string>;
+      return {
+        d1: d1[0]?.id,
+        kv: kv[0]?.namespace_id,
+        session: sec.get("SESSION_SECRET"),
+        signing: sec.get("CONTENT_SIGNING_KEY"),
+      };
+    };
+    const [x, y] = [of(a.id), of(b.id)];
+    // Bound to the resources made for that install, by its own row.
+    expect(x.d1).toBe(rowOf(a.id)?.d1_id);
+    expect(y.d1).toBe(rowOf(b.id)?.d1_id);
+    expect(x.kv).toBe(rowOf(a.id)?.kv_id);
+    expect(y.kv).toBe(rowOf(b.id)?.kv_id);
+    for (const k of ["d1", "kv", "session", "signing"] as const) {
+      expect(x[k], k).toBeTruthy();
+      expect(y[k], k).toBeTruthy();
+      expect(x[k], k).not.toBe(y[k]);
+    }
+    // No value of one install is any value of the other.
+    expect(new Set([...Object.values(x), ...Object.values(y)]).size).toBe(8);
+  });
+
   it("a rerun/resume of the same install does not mint a new SESSION_SECRET, even when it uploads", async () => {
     const s = setup();
     await failAtHealth(s);
@@ -1829,7 +1915,10 @@ describe("WfpProvisioner.create", () => {
     expect([...(s.scriptOf(inst.id)?.secrets.keys() ?? [])].sort()).toEqual([
       "CONTENT_SIGNING_KEY",
       "DIRECTORY_TOKEN_KEY",
+      "INSTALL_OPTOUT_KEY",
       "SESSION_SECRET",
+      "VAPID_PRIVATE_KEY",
+      "VAPID_PUBLIC_KEY",
     ]);
   });
 
@@ -2400,14 +2489,20 @@ describe("WfpProvisioner.create", () => {
             x.namespace_id,
           ]),
         );
+        // A release create drops hook limiters (public #3200's RL_HOOKS);
+        // the rest keep rlNs + their template index.
         expect(by).toEqual(
           Object.fromEntries(
-            tplRl.map((r, k) => [r.name, String(row.rl_ns + k)]),
+            tplRl.flatMap((r, k) =>
+              /hook/i.test(r.name) ? [] : [[r.name, String(row.rl_ns + k)]],
+            ),
           ),
         );
         ids.push(...Object.values(by as Record<string, string>));
       }
-      expect(new Set(ids).size).toBe(2 * tplRl.length);
+      expect(new Set(ids).size).toBe(
+        2 * tplRl.filter((r) => !/hook/i.test(r.name)).length,
+      );
       for (const r of tplRl) expect(ids).not.toContain(r.namespace_id);
     });
 
@@ -2439,6 +2534,76 @@ describe("WfpProvisioner.create", () => {
         expect(s.fake.log).toEqual([]);
       },
     );
+  });
+
+  describe("hook bindings are the test variant's only (public #3200)", () => {
+    type Rl = {
+      name: string;
+      namespace_id: string;
+      simple: { limit: number; period: number };
+    };
+    /** The release template with RL_HOOKS, whether this pin has it or not. */
+    const withHooks = (): Template => {
+      const t = structuredClone(loadTemplate());
+      const rls = (t.ratelimits ?? []) as Rl[];
+      if (!rls.some((r) => r.name === "RL_HOOKS"))
+        rls.push({
+          name: "RL_HOOKS",
+          namespace_id: "1005",
+          simple: { limit: 600, period: 60 },
+        });
+      t.ratelimits = rls;
+      return t;
+    };
+    const created = async (env: Env, i: ReturnType<typeof input>) => {
+      const t = withHooks();
+      const s = setup({ env, release: makeRelease({ env, template: t }) });
+      const inst = await s.p.create(i);
+      const meta = s.scriptOf(inst.id)?.metadata as {
+        bindings: { name: string; type: string; namespace_id?: string }[];
+      };
+      const row = s.rows().find((r) => r.id === inst.id);
+      const rl = Object.fromEntries(
+        meta.bindings
+          .filter((b) => b.type === "ratelimit")
+          .map((b) => [b.name, b.namespace_id]),
+      );
+      const slot = (n: string) =>
+        String(
+          row.rl_ns +
+            ((t.ratelimits ?? []) as Rl[]).findIndex((r) => r.name === n),
+        );
+      return { t, meta, rl, slot };
+    };
+
+    it.each(["staging", "prod"] as const)(
+      "a %s release create has no hook binding even when the template has RL_HOOKS",
+      async (env) => {
+        const { t, meta, rl, slot } = await created(env, input());
+        expect(meta.bindings.map((b) => b.name)).not.toContain("RL_HOOKS");
+        expect(JSON.stringify(meta)).not.toMatch(/hook/i);
+        // The other limiters keep their rlNs + index slots.
+        const rest = ((t.ratelimits ?? []) as Rl[]).filter(
+          (r) => r.name !== "RL_HOOKS",
+        );
+        expect(rl).toEqual(
+          Object.fromEntries(rest.map((r) => [r.name, slot(r.name)])),
+        );
+      },
+    );
+
+    it("a test-variant create has RL_HOOKS at rlNs + its template index", async () => {
+      const { t, meta, rl, slot } = await created("staging", hookInput());
+      expect(meta.bindings.find((b) => b.name === "RL_HOOKS")).toMatchObject({
+        type: "ratelimit",
+        simple: { limit: 600, period: 60 },
+      });
+      expect(rl).toEqual(
+        Object.fromEntries(
+          ((t.ratelimits ?? []) as Rl[]).map((r) => [r.name, slot(r.name)]),
+        ),
+      );
+    });
   });
 
   describe("env and target (decisions 1, 2)", () => {

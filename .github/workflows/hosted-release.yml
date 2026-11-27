@@ -56,6 +56,7 @@ jobs:
   mirror:
     if: ${{ inputs.dry_run || github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    environment: release-app
     permissions:
       contents: read
       actions: read
@@ -65,7 +66,9 @@ jobs:
     outputs:
       tag: ${{ steps.pin.outputs.tag }}
       public_sha: ${{ steps.pin.outputs.public_sha }}
-      sha: ${{ github.sha }}
+      # The commit to build: an existing tag's own commit on a re-run (see
+      # "Create the tag and the release"), else this run's.
+      sha: ${{ steps.tag.outputs.sha || github.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -143,60 +146,88 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      # A new tag is this commit, which must be main's head. An existing tag
-      # must already be this commit (a re-run, even after main moved, as long
-      # as the commit is still on main); a different one stops the run.
-      - name: Create the tag and the release
+      # A new tag is this commit, which must be main's head. An existing tag is
+      # a re-run of that release: its commit must be on main and pin the same
+      # public release (PUBLIC_PIN tag and sha). It may be an older main commit
+      # than this run's (main moved since, as after the v0.246.1 attach fix):
+      # then the run builds the tag's commit, which hosted-guard re-checks.
+      # Anything else stops the run.
+      - id: tag
+        name: Create the tag and the release
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.pin.outputs.tag }}
+          PUB_SHA: ${{ steps.pin.outputs.public_sha }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           main_sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
-          if existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> /dev/null); then
-            # A re-run: the tag is already this commit, and main may have moved on.
-            [ "$(jq -r .object.type <<< "$existing")" = commit ] && [ "$(jq -r .object.sha <<< "$existing")" = "$SHA" ] \
-              || { echo "::error::tag $TAG already exists and is not $SHA"; exit 1; }
-            status=$(gh api "repos/$REPO/compare/$main_sha...$SHA" -q .status)
+          # Only a confirmed 404 means there is no tag yet. Any other failure
+          # (5xx, network) stops here, before anything is created: GitHub would
+          # put a new release on an existing tag whatever --target says, and
+          # skip the existing-tag checks below. release-retry reruns a failed run.
+          tag_err=$(mktemp)
+          tag=found
+          existing=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2> "$tag_err") || tag=error
+          if [ "$tag" = error ]; then
+            if grep -q '(HTTP 404)' "$tag_err"; then
+              tag=missing
+            else
+              cat "$tag_err" >&2
+              echo "::error::could not read tag $TAG (not a 404); nothing was created"
+              exit 1
+            fi
+          fi
+          if [ "$tag" = found ]; then
+            # A re-run: the tag's commit is on main and pins this same release.
+            [ "$(jq -r .object.type <<< "$existing")" = commit ] || { echo "::error::tag $TAG is not a lightweight tag on a commit"; exit 1; }
+            tsha=$(jq -r .object.sha <<< "$existing")
+            [[ "$tsha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::tag $TAG has no commit"; exit 1; }
+            status=$(gh api "repos/$REPO/compare/$main_sha...$tsha" -q .status)
             case "$status" in
               behind|identical) ;;
-              *) echo "::error::$SHA is not on main (compare: $status)"; exit 1 ;;
+              *) echo "::error::tag $TAG ($tsha) is not on main (compare: $status)"; exit 1 ;;
             esac
-            echo "tag $TAG already points at $SHA"
+            if [ "$tsha" != "$SHA" ]; then
+              pin=$(gh api -H "Accept: application/vnd.github.raw+json" "repos/$REPO/contents/PUBLIC_PIN?ref=$tsha")
+              [ "$(sed -n 's/^tag=//p' <<< "$pin")" = "$TAG" ] && [ "$(sed -n 's/^sha=//p' <<< "$pin")" = "$PUB_SHA" ] \
+                || { echo "::error::tag $TAG already exists at $tsha, which does not pin $TAG at $PUB_SHA"; exit 1; }
+              echo "tag $TAG already points at $tsha (an earlier main commit pinning the same release); building $tsha"
+            else
+              echo "tag $TAG already points at $SHA"
+            fi
+            echo "sha=$tsha" >> "$GITHUB_OUTPUT"
+            # The tag exists and was just read, so the release names it as is.
+            where=(--verify-tag)
           else
             [ "$main_sha" = "$SHA" ] || { echo "::error::$SHA is not the head of main ($main_sha); dispatch again from main's head"; exit 1; }
-            gh api -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" > /dev/null
-            echo "created tag $TAG at $SHA"
-            # The new ref can lag behind its own write (read-after-write), and
-            # release create --verify-tag reads it. Wait until it reads back.
-            waited=0
-            delay=1
-            until [ "$(gh api "repos/$REPO/git/ref/tags/$TAG" -q .object.sha 2> /dev/null || true)" = "$SHA" ]; do
-              [ "$waited" -lt 60 ] || { echo "::error::tag $TAG did not read back at $SHA within 60 s"; exit 1; }
-              sleep "$delay"
-              waited=$((waited + delay))
-              delay=$((delay < 8 ? delay * 2 : 8))
-            done
-            echo "tag $TAG reads back at $SHA"
+            # No separate POST git/refs: the release creates the tag at $SHA in
+            # the same write, so nothing waits for a new ref to read back (that
+            # read-after-write lag was cloud #124; no polls, cloud #264).
+            # hosted-guard re-checks that the tag is this commit.
+            where=(--target "$SHA")
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           fi
-          # Retry only the verify-tag "doesn't exist" error, and look for a
-          # release first each time so a partial success never duplicates one.
+          # Up to 5 tries, with a backoff before each retry (4, 6, 8, then 10 s,
+          # as before): the one wait here, a pause before a retry, never a poll.
+          # Look for a release first each time so a partial success never
+          # duplicates one.
           attempt=1
           while :; do
             if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
               echo "release $TAG already exists"
               break
             fi
-            if out=$(gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" \
+            if out=$(gh release create "$TAG" --repo "$REPO" "${where[@]}" --title "$TAG" \
               --notes "Hosted build of $PUBLIC_REPO $TAG. The signed hosted release files are attached by hosted-release.yml." 2>&1); then
               echo "$out"
+              [ "${where[0]}" = --verify-tag ] || echo "created tag $TAG at $SHA with its release"
               break
             fi
             echo "$out"
-            if [[ "$out" == *"doesn't exist"* ]] && [ "$attempt" -lt 5 ]; then
+            if [ "$attempt" -lt 5 ]; then
               attempt=$((attempt + 1))
               sleep $((attempt * 2))
               continue
@@ -269,6 +300,20 @@ jobs:
           [ "$(sed -n 's/^tag=//p' <<< "$pin")" = "$TAG" ] || { echo "PUBLIC_PIN at $sha is not $TAG"; exit 1; }
           [ "$(sed -n 's/^sha=//p' <<< "$pin")" = "$PUB_SHA" ] || { echo "PUBLIC_PIN at $sha is not public commit $PUB_SHA"; exit 1; }
           { echo "sha=$sha"; echo "public_sha=$PUB_SHA"; echo "tag=$TAG"; echo "version=${TAG#v}"; } >> "$GITHUB_OUTPUT"
+  # Names the commit this run built, for the release gate and hosted-publish
+  # (#459). A dispatch on main's head can build an older existing tag's commit
+  # (#457), so the run's head_sha is not the built commit. The job name carries
+  # hosted-guard's resolved tag and commit; the job runs only for a real run
+  # whose guard passed, and tag-passed-checks.sh and hosted-publish-resolve.sh
+  # read the name from the jobs API.
+  hosted-built:
+    name: hosted-built ${{ needs.hosted-guard.outputs.tag }} ${{ needs.hosted-guard.outputs.sha }}
+    needs: [hosted-guard]
+    if: ${{ !cancelled() && needs.hosted-guard.result == 'success' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "built ${{ needs.hosted-guard.outputs.tag }} at ${{ needs.hosted-guard.outputs.sha }}"
   hosted-build:
     needs: [hosted-guard]
     if: ${{ !cancelled() && needs.hosted-guard.result == 'success' }}
@@ -542,7 +587,8 @@ jobs:
           path: ${{ runner.temp }}/hosted
       # Rebuilt from the same verified bytes; refused unless the tar and the
       # record hash to what hosted-sign-staging signed and the signature verifies
-      # (pinned key). Refuses if any staging asset is already on the release.
+      # (pinned key). If staging assets are already on the release, passes only
+      # when they are byte-identical to these (a rerun), else refuses.
       # The release is this repo's, created by the mirror.
       - name: Attach the signed staging release files to the GitHub release
         working-directory: public
@@ -558,9 +604,21 @@ jobs:
           REDLINE: ${{ needs.hosted-sign-staging.outputs.staging_redline_signature }}:${{ needs.hosted-sign-staging.outputs.staging_redline_tar_sha256 }}:${{ needs.hosted-sign-staging.outputs.staging_redline_record_sha256 }}
         run: |
           set -euo pipefail
-          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-staging-' || true)
-          [ -z "$existing" ] || { echo "the release already has staging assets: $existing"; exit 1; }
           node scripts/ci/assemble-release.mjs --dir "$RUNNER_TEMP/hosted" --env staging --version "$VERSION" --manifest-sha256 "$MANIFEST_SHA256" --bundle-sha256 "$BUNDLE_SHA256" --commit "$PUB_SHA" --lockfile pnpm-lock.yaml --out "$RUNNER_TEMP/signed" --release "$RELEASE" --redline "$REDLINE"
+          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-staging-' || true)
+          if [ -n "$existing" ]; then
+            # A rerun (release-retry, or by hand) after an earlier attempt
+            # attached them. The build is reproducible, so pass only when the
+            # attached files are byte-identical to this run's verified ones:
+            # same names, same sha256. Anything else is refused, never replaced.
+            mkdir -p "$RUNNER_TEMP/attached"
+            gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-staging-*' --dir "$RUNNER_TEMP/attached"
+            mine=$(cd "$RUNNER_TEMP/signed" && sha256sum oa-release-staging-* | sort)
+            theirs=$(cd "$RUNNER_TEMP/attached" && sha256sum oa-release-staging-* | sort)
+            [ "$mine" = "$theirs" ] || { echo "the release already has staging assets that differ from this run's: $existing"; exit 1; }
+            echo "the staging assets are already attached and identical to this run's; nothing to upload"
+            exit 0
+          fi
           gh release upload "$TAG" --repo "$REPO" "$RUNNER_TEMP"/signed/oa-release-staging-*
   hosted-attach-prod:
     needs: [hosted-guard, hosted-build, hosted-check, hosted-sign-prod]
@@ -596,7 +654,8 @@ jobs:
           path: ${{ runner.temp }}/hosted
       # Rebuilt from the same verified bytes; refused unless the tar and the
       # record hash to what hosted-sign-prod signed and the signature verifies
-      # (pinned key). Refuses if any prod asset is already on the release.
+      # (pinned key). If prod assets are already on the release, passes only
+      # when they are byte-identical to these (a rerun), else refuses.
       # The release is this repo's, created by the mirror.
       - name: Attach the signed prod release files to the GitHub release
         working-directory: public
@@ -611,9 +670,21 @@ jobs:
           RELEASE: ${{ needs.hosted-sign-prod.outputs.prod_release_signature }}:${{ needs.hosted-sign-prod.outputs.prod_release_tar_sha256 }}:${{ needs.hosted-sign-prod.outputs.prod_release_record_sha256 }}
         run: |
           set -euo pipefail
-          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-prod-' || true)
-          [ -z "$existing" ] || { echo "the release already has prod assets: $existing"; exit 1; }
           node scripts/ci/assemble-release.mjs --dir "$RUNNER_TEMP/hosted" --env prod --version "$VERSION" --manifest-sha256 "$MANIFEST_SHA256" --bundle-sha256 "$BUNDLE_SHA256" --commit "$PUB_SHA" --lockfile pnpm-lock.yaml --out "$RUNNER_TEMP/signed" --release "$RELEASE"
+          existing=$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | grep '^oa-release-prod-' || true)
+          if [ -n "$existing" ]; then
+            # A rerun (release-retry, or by hand) after an earlier attempt
+            # attached them. The build is reproducible, so pass only when the
+            # attached files are byte-identical to this run's verified ones:
+            # same names, same sha256. Anything else is refused, never replaced.
+            mkdir -p "$RUNNER_TEMP/attached"
+            gh release download "$TAG" --repo "$REPO" --pattern 'oa-release-prod-*' --dir "$RUNNER_TEMP/attached"
+            mine=$(cd "$RUNNER_TEMP/signed" && sha256sum oa-release-prod-* | sort)
+            theirs=$(cd "$RUNNER_TEMP/attached" && sha256sum oa-release-prod-* | sort)
+            [ "$mine" = "$theirs" ] || { echo "the release already has prod assets that differ from this run's: $existing"; exit 1; }
+            echo "the prod assets are already attached and identical to this run's; nothing to upload"
+            exit 0
+          fi
           gh release upload "$TAG" --repo "$REPO" "$RUNNER_TEMP"/signed/oa-release-prod-*
   # Dry run only: what hosted-attach-staging would do, without a release. The
   # signed files are re-assembled from the verified bytes (assemble-release.mjs

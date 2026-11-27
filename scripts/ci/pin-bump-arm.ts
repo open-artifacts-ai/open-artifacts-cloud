@@ -7,6 +7,7 @@
 // makes GitHub refuse). Needs GH_TOKEN; `arm` runs with the release App's token.
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { type Exec, type ExecResult, gh } from "./gh-retry.ts";
 import {
   BRANCH_PREFIX,
   compareTags,
@@ -35,7 +36,8 @@ export function requiredChecks(json: string): string[] {
     return [];
   }
 }
-const BRANCH = /^pin-bump\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
+/** A bump branch: pin-bump/vX.Y.Z. */
+export const BRANCH = /^pin-bump\/(v\d{1,6}\.\d{1,6}\.\d{1,6})$/;
 const SHA = /^[0-9a-f]{40}$/;
 
 export type PrFile = {
@@ -44,6 +46,17 @@ export type PrFile = {
   status: string;
   previous_filename?: string;
 };
+/** The committer GitHub records for a commit made through the API with an App token. */
+export const WEB_FLOW = "web-flow";
+/**
+ * Pure: a commit the bot made and GitHub verified. The committer is the bot, or
+ * web-flow (what GitHub records for an API-made App commit), but web-flow is
+ * accepted only for a verified commit authored by exactly the bot.
+ */
+export const commitOk = (c: Commit) =>
+  c.verified &&
+  c.author === BOT &&
+  (c.committer === BOT || c.committer === WEB_FLOW);
 export type Commit = { author: string; committer: string; verified: boolean };
 /** A root tree entry at the PR head. */
 export type TreeEntry = { path: string; mode: string; type: string };
@@ -53,6 +66,14 @@ export type Check = {
   status: string;
   conclusion: string | null;
   app?: string;
+};
+/** A merge-queue (merge_group) CI run for one PR: when it was created and how it ended. */
+export type QueueRun = {
+  /** The run's page, https://github.com/<repo>/actions/runs/<id>; "" if unknown. */
+  url?: string;
+  createdAt: string;
+  status: string;
+  conclusion: string | null;
 };
 export type Input = {
   author: string;
@@ -83,6 +104,10 @@ export type Input = {
   required: string[];
   /** Auto-merge is enabled or the PR is queued. */
   armed: boolean;
+  /** When the PR's head commit was made (ISO 8601); a queue run older than that is another head's. */
+  headAt: string;
+  /** The merge-queue CI runs for this PR, any head. */
+  queueRuns: QueueRun[];
   /** Auto-merge was enabled (not queued), and by whom. */
   autoMergeBy?: string;
 };
@@ -97,6 +122,94 @@ const field = (text: string, key: "tag" | "sha") => {
   }
 };
 
+/** Conclusions that hold a PR: the run itself failed. cancelled, skipped and neutral are no verdict. */
+export const HOLDING = ["failure", "timed_out", "startup_failure"];
+/** This many newest queue runs in a row, all cancelled, hold the PR (a cancel loop). */
+export const CANCEL_LIMIT = 3;
+export type QueueVerdict = {
+  why: string;
+  /** The run that decided, for the comment; absent for an unreadable date. */
+  run?: QueueRun;
+  /** Held by a run of cancelled queue runs, not by a failure. */
+  cancels?: boolean;
+};
+
+/**
+ * Pure: whether a PR's merge-queue history after its head commit holds it, or
+ * undefined. Pin bumps run the whole suite only in the merge queue, so a failure
+ * there drops the PR from the queue with every required check still green on the PR
+ * head; arming it again would loop on the same head. Looking at the runs made after
+ * the head commit, newest first: a newest run still going lets the PR through (a PR
+ * in the queue reads armed first). Otherwise the newest run that ended failure,
+ * timed_out or startup_failure holds it, unless a success is newer. cancelled,
+ * skipped and neutral give no verdict: GitHub cancels a queued PR's run when a PR
+ * ahead fails or the group is rebuilt, which is not this PR's fault. The one
+ * exception is a loop: the newest CANCEL_LIMIT runs all cancelled also hold it. An
+ * unreadable date fails closed.
+ */
+export function queueVerdict(
+  headAt: string,
+  runs: QueueRun[],
+): QueueVerdict | undefined {
+  const t = Date.parse(headAt);
+  if (Number.isNaN(t)) return { why: "the head commit's date is unreadable" };
+  const after: { r: QueueRun; at: number }[] = [];
+  for (const r of runs) {
+    const at = Date.parse(r.createdAt);
+    if (Number.isNaN(at))
+      return { why: "a merge queue run has no readable date" };
+    if (at >= t) after.push({ r, at });
+  }
+  const newest = after.sort((a, b) => b.at - a.at).map((x) => x.r);
+  const first = newest[0];
+  if (!first || first.status !== "completed") return undefined;
+  const top = newest.slice(0, CANCEL_LIMIT);
+  if (
+    top.length === CANCEL_LIMIT &&
+    top.every((r) => r.status === "completed" && r.conclusion === "cancelled")
+  )
+    return {
+      why: `its last ${CANCEL_LIMIT} merge queue runs on this head were all cancelled; a new commit or a person must act`,
+      run: first,
+      cancels: true,
+    };
+  const decisive = newest.find(
+    (r) =>
+      r.status === "completed" &&
+      (r.conclusion === "success" || HOLDING.includes(r.conclusion ?? "")),
+  );
+  if (!decisive || decisive.conclusion === "success") return undefined;
+  return {
+    why: `its merge queue run on this head ended ${decisive.conclusion}; a new commit or a person must act`,
+    run: decisive,
+  };
+}
+/** Pure: the reason a queue run holds the PR, or undefined. */
+export const queueFailure = (headAt: string, runs: QueueRun[]) =>
+  queueVerdict(headAt, runs)?.why;
+
+/** The hidden marker of the one comment per head sha that says a queue run failed. */
+export const queueMarker = (head: string) =>
+  `<!-- pin-bump-arm: merge queue failed head=${head} -->`;
+/** Pure: the PR comment for a failed queue run. Only a github.com run page is linked. */
+export function queueNotice(i: Input, repo: string): string {
+  const v = queueVerdict(i.headAt, i.queueRuns);
+  const run = v?.run;
+  const url =
+    run?.url && run.url.startsWith(`https://github.com/${repo}/actions/runs/`)
+      ? run.url
+      : "";
+  const what = v?.cancels
+    ? `was cancelled ${CANCEL_LIMIT} times in a row (GitHub cancels a run when a PR ahead fails or the group is rebuilt, so a loop of them needs a person)`
+    : `ended ${run?.conclusion ?? "unknown"}`;
+  return [
+    queueMarker(i.headOid),
+    `The merge queue run for this pin bump (head ${i.headOid.slice(0, 12)}) ${what}${url ? `: ${url}` : "."}`,
+    "",
+    "The checks on this PR were skipped on purpose (the suite runs once, in the merge queue), so it still looks green. pin-bump-arm will not arm this head again. A port or fix is needed. A new commit on this branch, or arming the PR by hand once the cause is fixed, is the way forward.",
+  ].join("\n");
+}
+
 /** Pure: should this PR be armed? Every rule must hold; the first that fails is the reason. */
 export function decide(i: Input): Decision {
   if (i.author !== BOT) return no(`author is ${i.author}, not ${BOT}`);
@@ -105,11 +218,11 @@ export function decide(i: Input): Decision {
   if (i.headRepo !== i.repo)
     return no(`head is in ${i.headRepo}, not ${i.repo}`);
   if (i.armed) return no("already armed or queued");
+  const failed = queueFailure(i.headAt, i.queueRuns);
+  if (failed) return no(failed);
 
   if (i.commits.length === 0) return no("the PR has no commits to check");
-  const human = i.commits.find(
-    (c) => c.author !== BOT || c.committer !== BOT || !c.verified,
-  );
+  const human = i.commits.find((c) => !commitOk(c));
   if (human)
     return no(
       `not pin-only: a commit is by ${human.author || "unknown"}, committed by ${human.committer || "unknown"}${human.verified ? "" : ", unverified"}`,
@@ -202,6 +315,20 @@ export const PROD_DEPLOY_WORKFLOW = "deploy-hosted-platform.yml";
 export const PROD_TITLE = "deploy-hosted-platform prod ";
 /** Pages of 100 successful dispatched deploy runs to look through for the pin's prod deploy. */
 export const DEPLOY_PAGES = 5;
+export const GATE_WORKFLOW = "redline-staging.yml";
+/** The newest completed gate runs to look through for main's pin. */
+export const GATE_RUNS = 20;
+type GateRun = { t: string; c: string | null; a: number };
+/**
+ * Pure: main's pin `tag` was rejected by the gate. The newest completed run titled
+ * `redline-staging <tag>` (the API lists newest first) failed on attempt 2 or later:
+ * redline-retry has already rerun it once, so nothing will deploy it. A first-attempt
+ * failure is not a rejection: the retry may still pass.
+ */
+export function gateRejected(runs: GateRun[], tag: string): boolean {
+  const run = runs.find((r) => r.t === `redline-staging ${tag}`);
+  return run !== undefined && run.c === "failure" && run.a >= 2;
+}
 /**
  * A full prod deploy of `tag`: the chain's run (prod-release-chain dispatches the
  * full target list, verify_only false, and puts its id in the run-name):
@@ -222,27 +349,23 @@ export type Gate = {
   prodDeployed: boolean;
   /** main's current PUBLIC_PIN tag. */
   mainTag: string;
+  /**
+   * main's pin was rejected: its latest redline-staging run failed on a rerun (the
+   * retry is spent), so it never reaches prod and must not hold the next bump (#448).
+   */
+  rejected?: boolean;
 };
 /** Pure: why a qualifying bump must wait (candidate open), or undefined. */
 export function gateRefusal(g: Gate): string | undefined {
   if (g.busy.length > 0)
     return `candidate open: ${g.busy.join(", ")} queued or in progress`;
-  if (!g.prodDeployed)
+  if (!g.prodDeployed && !g.rejected)
     return `candidate open: main's pin ${g.mainTag} has no successful prod deploy yet`;
   return undefined;
 }
 
-export type ExecResult = { code: number; stdout: string; stderr: string };
-export type Exec = (cmd: string, args: string[]) => ExecResult;
+export type { Exec, ExecResult };
 
-function gh(exec: Exec, args: string[]): string {
-  const r = exec("gh", args);
-  if (r.code !== 0)
-    throw new Error(
-      `gh ${args.slice(0, 2).join(" ")}: ${r.stderr.trim() || `exit ${r.code}`}`,
-    );
-  return r.stdout;
-}
 const raw = (exec: Exec, repo: string, path: string, ref: string) =>
   gh(exec, [
     "api",
@@ -362,9 +485,7 @@ function readCommits(exec: Exec, repo: string, n: number): Commit[] {
     verified: c.commit?.verification?.verified === true,
   }));
 }
-const botOnly = (cs: Commit[]) =>
-  cs.length > 0 &&
-  cs.every((c) => c.author === BOT && c.committer === BOT && c.verified);
+const botOnly = (cs: Commit[]) => cs.length > 0 && cs.every(commitOk);
 
 /** Everything else decide needs. Throws on any API error (the caller treats that as "does not qualify"). */
 function gather(
@@ -421,6 +542,20 @@ function gather(
       conclusion: c.conclusion,
       app: String(c.app?.slug ?? ""),
     }));
+  const headAt = String(
+    JSON.parse(gh(exec, ["api", `repos/${repo}/git/commits/${oid}`])).committer
+      ?.date ?? "",
+  );
+  // Merge-queue runs are named gh-readonly-queue/<base>/pr-<n>-<base sha>; --jq keeps
+  // the page small. The newest 100 are enough: arming makes a new run every time.
+  const queueRuns = JSON.parse(
+    gh(exec, [
+      "api",
+      `repos/${repo}/actions/workflows/ci.yml/runs?event=merge_group&per_page=100`,
+      "--jq",
+      `[.workflow_runs[] | select(.head_branch | startswith("gh-readonly-queue/main/pr-${p.number}-")) | {url: .html_url, createdAt: .created_at, status: .status, conclusion: .conclusion}]`,
+    ]),
+  ) as QueueRun[];
   let required: string[] = [];
   try {
     required = requiredChecks(
@@ -446,8 +581,30 @@ function gather(
     commits,
     required,
     armed: view.armed,
+    headAt,
+    queueRuns,
     autoMergeBy: view.autoMergeBy,
   };
+}
+
+/** True when the bot already left the failed-queue comment for this head. Throws on an API error. */
+function hasQueueNotice(
+  exec: Exec,
+  repo: string,
+  n: number,
+  head: string,
+): boolean {
+  const marker = queueMarker(head);
+  return (
+    JSON.parse(
+      gh(exec, [
+        "api",
+        "--paginate",
+        "--slurp",
+        `repos/${repo}/issues/${n}/comments?per_page=100`,
+      ]),
+    ).flat() as { user?: { login?: string } | null; body?: string }[]
+  ).some((c) => c.user?.login === BOT && (c.body ?? "").includes(marker));
 }
 
 /** Small reads only: one count per workflow and status, one short title list. Throws on any error. */
@@ -487,10 +644,24 @@ export function readGate(exec: Exec, repo: string, mainPin: string): Gate {
     prodDeployed = r.t.some((t) => isChainProdDeploy(t, mainTag));
     if (r.n < 100) break;
   }
+  let rejected = false;
+  if (!prodDeployed) {
+    const runs = JSON.parse(
+      gh(exec, [
+        "api",
+        `repos/${repo}/actions/workflows/${GATE_WORKFLOW}/runs?status=completed&event=workflow_dispatch&per_page=${GATE_RUNS}`,
+        "--jq",
+        "[.workflow_runs[] | {t: .display_title, c: .conclusion, a: .run_attempt}]",
+      ]),
+    ) as GateRun[];
+    if (!Array.isArray(runs)) throw new Error("unreadable gate runs");
+    rejected = gateRejected(runs, mainTag);
+  }
   return {
     busy,
     mainTag,
     prodDeployed,
+    rejected,
   };
 }
 
@@ -508,9 +679,16 @@ export function run(o: {
   repo: string;
   publicRepo: string;
   log: (line: string) => void;
-}): { write: boolean; armed: number[]; disarmed: number[] } {
+}): {
+  write: boolean;
+  armed: number[];
+  disarmed: number[];
+  noticed: number[];
+} {
   const armed: number[] = [];
   const disarmed: number[] = [];
+  const noticed: number[] = [];
+  let noticeError: unknown;
   let write = false;
   for (const p of listBumpPrs(o.exec, o.repo)) {
     let view: View;
@@ -535,6 +713,44 @@ export function run(o: {
       d = no(`could not read what it needs: ${msg(e)}`);
     }
     o.log(`#${p.number}: ${d.arm ? "arm" : "leave"}: ${d.why}`);
+    // One visible trace per head when a failed queue run is the only thing holding
+    // the PR back (a PR the bump otherwise qualifies for): a comment, once per head
+    // sha. The App token (pull-requests: write) posts it, so plan reports write.
+    if (
+      input &&
+      (!input.armed || ours) &&
+      queueFailure(input.headAt, input.queueRuns) &&
+      decide({ ...input, armed: false, queueRuns: [] }).arm
+    ) {
+      try {
+        if (!hasQueueNotice(o.exec, o.repo, p.number, input.headOid)) {
+          write = true;
+          if (o.mode === "arm") {
+            gh(
+              o.exec,
+              [
+                "api",
+                "-X",
+                "POST",
+                `repos/${o.repo}/issues/${p.number}/comments`,
+                "-f",
+                `body=${queueNotice(input, o.repo)}`,
+              ],
+              { write: true },
+            );
+            noticed.push(p.number);
+            o.log(`#${p.number}: commented that its merge queue run failed`);
+          }
+        }
+      } catch (e) {
+        // Logged now, thrown after the other PRs are judged: a notice that cannot
+        // be left turns the run red, so it is not lost quietly.
+        o.log(
+          `#${p.number}: could not leave the queue failure notice: ${msg(e)}`,
+        );
+        noticeError ??= e;
+      }
+    }
     if (d.arm && input) {
       let wait: string | undefined;
       try {
@@ -548,17 +764,23 @@ export function run(o: {
       }
       write = true;
       if (o.mode === "arm") {
-        gh(o.exec, [
-          "pr",
-          "merge",
-          String(p.number),
-          "--auto",
-          "--squash",
-          "--match-head-commit",
-          input.headOid,
-          "--repo",
-          o.repo,
-        ]);
+        gh(
+          o.exec,
+          [
+            "pr",
+            "merge",
+            String(p.number),
+            "--auto",
+            "--squash",
+            "--match-head-commit",
+            input.headOid,
+            "--repo",
+            o.repo,
+          ],
+          // Pinned to the head sha: a repeat after a 5xx enables the same
+          // auto-merge again, or is refused if the head moved.
+          { write: true, idempotent: true },
+        );
         armed.push(p.number);
       }
       continue;
@@ -573,19 +795,17 @@ export function run(o: {
     if (again.arm) continue;
     write = true;
     if (o.mode === "arm") {
-      gh(o.exec, [
-        "pr",
-        "merge",
-        String(p.number),
-        "--disable-auto",
-        "--repo",
-        o.repo,
-      ]);
+      gh(
+        o.exec,
+        ["pr", "merge", String(p.number), "--disable-auto", "--repo", o.repo],
+        { write: true, idempotent: true },
+      );
       disarmed.push(p.number);
       o.log(`#${p.number}: disabled auto-merge: ${again.why}`);
     }
   }
-  return { write, armed, disarmed };
+  if (noticeError) throw noticeError;
+  return { write, armed, disarmed, noticed };
 }
 
 const realExec: Exec = (cmd, args) => {

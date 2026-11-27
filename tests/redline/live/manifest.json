@@ -346,6 +346,14 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact ask slots [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact ask slots [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > artifact comments post [session]"
     },
     {
@@ -586,6 +594,70 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact mcp edit_doc [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc ops [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc ops [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comments ask withdraw [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comments ask withdraw [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact mcp withdraw_ask [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact mcp edit_comment [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc save version [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc save version [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc restore [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact rest doc restore [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/onboarding [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/onboarding [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org PUT /api/v1/onboarding [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/teammates [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/onboarding/listens-asked [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > artifact mcp undelete_artifact [pat]"
     },
     {
@@ -615,6 +687,10 @@
     {
       "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > artifact mcp list_comments [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact mcp get_comment_picture [pat]"
     },
     {
       "file": "live/surfaces.test.ts",
@@ -742,7 +818,19 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/settings/login [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/settings/login [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org GET /api/v1/spaces [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/settings/login/first-invite-seen [session]"
     },
     {
       "file": "live/surfaces.test.ts",
@@ -934,6 +1022,150 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/inbox/read [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/inbox/read-all [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/agent-asks/held [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/agent-asks/held/:id/allow [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/agent-asks/held/:id/allow/challenge [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/agent-asks/held/:id/not-now [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/bus/machines/:id/install-now [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org PUT /api/v1/me/agent-requests [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/agent-listens [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/agent-listens [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/agent-asks/history [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org PATCH /api/v1/me/agent-listens/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org DELETE /api/v1/me/agent-listens/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/agent-requests [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/agent-requests [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org PUT /api/v1/me/notification-prefs [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/inbox/mutes [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org DELETE /api/v1/me/inbox/mutes/:kind/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/inbox/:id/later [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/me/push/subscriptions [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org PATCH /api/v1/me/push/subscriptions/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org DELETE /api/v1/me/push/subscriptions/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/inbox/mutes [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/inbox/mutes [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/notification-prefs [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/notification-prefs [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/push/key [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/push/key [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/push/subscriptions [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/push/subscriptions [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact artifact mention candidates [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact artifact mention candidates [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comment picture read [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comment picture read [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comment picture reserve [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > artifact comment picture reserve [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org GET /api/v1/audit [session]"
     },
     {
@@ -963,6 +1195,14 @@
     {
       "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org GET /api/v1/oauth-clients [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/members/reach [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/members/reach [session]"
     },
     {
       "file": "live/surfaces.test.ts",

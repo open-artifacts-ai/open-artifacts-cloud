@@ -19,7 +19,9 @@
 #     public's release-please run (jobs release-please and verify-release) are
 #     read from PUBLIC_REPO. The two are tied: PUBLIC_PIN at the hosted commit
 #     must name the public tag and its commit. A dry run of hosted-release.yml
-#     (run name "(dry run)") never counts.
+#     (run name "(dry run)") never counts. A hosted-release run counts for the
+#     commit it built, not only the commit it ran on (#459): see
+#     check_hosted_run.
 #   legacy mode: a tag GITHUB_REPOSITORY has no release for (404), or a gate
 #     running in PUBLIC_REPO itself. Before the split the hosted jobs and
 #     assets live in the public repo's release-please run, so everything is
@@ -51,6 +53,14 @@ api() {
   body="$(gh api -X GET "$2" 2> /dev/null)" || fail "$1: GitHub API error"
   jq -e . > /dev/null 2>&1 <<< "$body" || fail "$1: unparsable response"
   printf '%s' "$body"
+}
+# api_pages <check> <path>: every page of a workflow-runs listing, merged into
+# one {workflow_runs: [...]}, or fail naming the check.
+api_pages() {
+  local body
+  body="$(gh api -X GET --paginate "$2" 2> /dev/null)" || fail "$1: GitHub API error"
+  jq -s -e '{workflow_runs: (map(.workflow_runs | if type == "array" then . else error("no runs") end) | add // [])}' 2> /dev/null <<< "$body" ||
+    fail "$1: unparsable response"
 }
 # raw <check> <path>: the raw text of a file, or fail naming the check.
 raw() {
@@ -84,6 +94,47 @@ check_run() {
   [ -n "$run" ] || fail "$label run: no push run for $s"
   run_id="$(jq -r '.id' <<< "$run")"
   [[ "$run_id" =~ ^[0-9]+$ ]] || fail "$label run: bad id"
+}
+
+# check_hosted_run <sha>: sets `run_id` to the latest non-dry hosted-release
+# run that built commit <sha> (#459). That is a push or dispatch run whose own
+# head is <sha> (it builds the commit it runs on), or a dispatch on main's
+# newer head that rebuilt an existing tag's older commit (#457): its head is
+# not <sha>, but hosted-release.yml's hosted-built job is named
+# "hosted-built <tag> <sha>" with hosted-guard's resolved tag and commit, and
+# succeeded only when the guard did.
+check_hosted_run() {
+  local s="$1" wf=hosted-release.yml head others cand id jobs hit="" skip='["push","workflow_dispatch"]'
+  head="$(api "hosted-release run" "$C/actions/workflows/$wf/runs?branch=main&head_sha=$s&per_page=100" |
+    jq -c --arg s "$s" --argjson ev "$skip" '[.workflow_runs[] | select(.head_sha == $s and (.event as $e | $ev | index($e))) | select((.display_title // "") | contains("(dry run)") | not) | {id, created_at}] | sort_by(.created_at) | last // empty')"
+  # Only a rebuild newer than the commit's own run can win (see below), so the
+  # dispatch list starts there; every page of it is read.
+  since=""
+  if [ -n "$head" ]; then
+    since="$(jq -r '.created_at' <<< "$head")"
+    [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] || fail "hosted-release run: bad created_at"
+  fi
+  others="$(api_pages "hosted-release runs" "$C/actions/workflows/$wf/runs?branch=main&event=workflow_dispatch&status=completed&per_page=100${since:+&created=%3E%3D$since}" |
+    jq -r --arg s "$s" --arg since "$since" '[.workflow_runs[] | select(.head_sha != $s and .event == "workflow_dispatch" and .status == "completed" and .created_at >= $since) | select((.display_title // "") | contains("(dry run)") | not)] | sort_by(.created_at) | reverse | .[] | "\(.id) \(.created_at)"')"
+  # Newest first: the first run whose hosted-built job names this tag and commit.
+  while read -r id cand; do
+    [ -n "$id" ] || continue
+    [[ "$id" =~ ^[0-9]+$ ]] || fail "hosted-release run: bad id"
+    jobs="$(api "hosted-release jobs" "$C/actions/runs/$id/jobs?filter=latest&per_page=100")"
+    if jq -e --arg n "hosted-built $tag $s" '[.jobs[] | select(.name == $n and .status == "completed" and .conclusion == "success")] | length > 0' > /dev/null <<< "$jobs"; then
+      hit="$id $cand"
+      break
+    fi
+  done <<< "$others"
+  # The newer of the two (created_at is ISO 8601, so it sorts as text).
+  if [ -n "$head" ] && { [ -z "$hit" ] || [[ "$(jq -r '.created_at' <<< "$head")" > "${hit#* }" ]]; }; then
+    run_id="$(jq -r '.id' <<< "$head")"
+  elif [ -n "$hit" ]; then
+    run_id="${hit%% *}"
+  else
+    fail "hosted-release run: no push run for $s"
+  fi
+  [[ "$run_id" =~ ^[0-9]+$ ]] || fail "hosted-release run: bad id"
 }
 
 # check_jobs <workflow-file> <repo-path> <run-id> <required-job>...: each
@@ -174,7 +225,7 @@ check_jobs release-please.yml "$P" "$prun" "${PUBLIC_REQUIRED[@]}"
 # ...and the hosted half.
 check_release "commit of $tag in $GITHUB_REPOSITORY" "$C" "$crel"
 csha="$sha"
-check_run hosted-release.yml "$C" "$csha" '["push","workflow_dispatch"]' yes
+check_hosted_run "$csha"
 crun="$run_id"
 check_jobs hosted-release.yml "$C" "$crun" "${HOSTED_REQUIRED[@]}"
 check_assets "$crel"

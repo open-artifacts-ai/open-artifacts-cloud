@@ -3,39 +3,81 @@
 # public repo's tag, the tag is newer than main's pin, and every required check is
 # green on the PR's current head, it enables auto-merge (the merge queue does the
 # rest). Anything else is left for a person. The rule is scripts/ci/pin-bump-arm.ts.
-# Always runs main's script (never the PR's), read-only until a PR qualifies; the
-# App token exists only right before the arm step.
+#
+# One suite run per bump (see ci.yml): on the PR the required checks end green at once
+# (scripts/ci/pin-only.ts), and the full suite runs once, in the merge queue, on the
+# commit that lands. A queue failure drops the PR from the queue with those PR checks
+# still green, so the rule also refuses a head whose merge queue run failed (it finds
+# the run by its pr-<number> branch and its date after the head commit). Only failure,
+# timed_out and startup_failure hold it: a cancelled run (GitHub cancels a queued PR's
+# run when a PR ahead fails or the group is rebuilt) gives no verdict, unless the newest
+# three are all cancelled. The PR then
+# stays un-armed until a new commit or a person acts; it is never armed again in a loop.
+# That refusal leaves one PR comment per head sha (with the failed run's link), posted
+# with the App token the Arm step already has (pull-requests: write); the plan step
+# reports write=true while the comment is missing. No new permission is used.
+# Always runs main's script (never the PR's), read-only until a PR qualifies. The
+# plan job is read-only and has no environment; only when it says write does the
+# arm job run (environment release-app, #302) and mint the App token right before
+# the arm step and the comment, so the environment logs a deployment only when
+# something is written.
 name: pin-bump-arm
 on:
+  # Event-only (cloud #264): no schedule. Every event below re-plans every open
+  # bump, and the plan is the same idempotent, read-only check whatever starts it.
+  #
+  # workflow_run:
+  # - CI on a bump branch: its required checks are now green (or not).
+  # - CI in the merge queue that did not pass: a queue failure is refused with
+  #   one PR comment, and a run of cancels re-arms (see the header above).
+  # - Any release pipeline gate workflow ending (GATE_WORKFLOWS in
+  #   scripts/ci/pin-bump-arm.ts): the gate opens only when one of them ends,
+  #   so a bump that waited on an open candidate is armed at once. The prod
+  #   chain is the usual last one; the others cover a gate held by another run.
+  #   The schedule this replaces was how a waiting bump got armed before, and
+  #   GitHub skipped 7 h of it on 11-24.
   workflow_run:
-    workflows: [CI]
+    workflows:
+      [
+        CI,
+        hosted-publish,
+        staging-release-chain,
+        deploy-hosted-platform,
+        redline-staging,
+        prod-release-chain,
+      ]
     types: [completed]
   # pull_request_target: this workflow only ever checks out main and runs main's
   # script; it must never check out or run the PR's code.
   pull_request_target:
     types: [opened, reopened, synchronize]
-  # The schedule is best-effort and may never fire, and CI on main is filtered
-  # out below, so a push to main (which changes what an open bump is judged
-  # against) and a manual run also re-evaluate every open bump. Every trigger
-  # checks out main and runs main's script; the plan is read-only.
+  # CI on main is filtered out below, so a push to main (which changes what an
+  # open bump is judged against) and a manual run also re-evaluate every open
+  # bump. Every trigger checks out main and runs main's script; the plan is
+  # read-only.
   push:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
 permissions: {}
-concurrency:
-  group: pin-bump-arm
-  cancel-in-progress: false
+# One plan or arm at a time, never cancelled. The group is on the jobs, not the
+# run: a run whose plan is skipped (CI on another branch) never takes it, so it
+# can never replace a pending run that has work to do. A newer pending job may
+# replace an older one; both judge every open bump afresh (arm runs the whole
+# rule again), so no event is lost.
 jobs:
-  arm:
-    # Cheap exits: a PR event for another branch, or a CI run for another branch.
+  plan:
+    # Cheap exits: a PR event for another branch, a CI run on another branch or
+    # a green queue run (a pass merges, and that push re-plans).
     if: >-
-      github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && startsWith(github.head_ref, 'pin-bump/')) ||
-      (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/'))
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'pin-bump/')) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI' && startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/') && github.event.workflow_run.conclusion != 'success') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.name != 'CI')
+    concurrency:
+      group: pin-bump-arm
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -43,6 +85,8 @@ jobs:
       pull-requests: read
       checks: read
       statuses: read
+    outputs:
+      write: ${{ steps.plan.outputs.write }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -56,8 +100,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node --experimental-strip-types scripts/ci/pin-bump-arm.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+  arm:
+    needs: plan
+    if: ${{ needs.plan.outputs.write == 'true' }}
+    concurrency:
+      group: pin-bump-arm
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: release-app
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
       - id: app
-        if: ${{ steps.plan.outputs.write == 'true' }}
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
@@ -65,7 +127,6 @@ jobs:
           permission-pull-requests: write
           permission-contents: write
       - name: Arm
-        if: ${{ steps.plan.outputs.write == 'true' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: node --experimental-strip-types scripts/ci/pin-bump-arm.ts arm --repo "$GITHUB_REPOSITORY"

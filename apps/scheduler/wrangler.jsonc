@@ -25,6 +25,9 @@
 // SIGNUPS_ENABLED are per-env placeholders that deploy-platform-worker.sh
 // fills (ALERT_TO is also ALERT_EMAIL's only destination_address); it
 // refuses a config without all of them.
+// The deploy's fleet wake (cloud #264): this Worker consumes
+// oa-<p>-fleet-wake, which the scheduler target creates when absent; the
+// platform deploy's last step posts one message to it (scripts/ci/fleet-wake.sh).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "compatibility_date": "2026-10-01",
@@ -46,14 +49,13 @@
         "SIGNUPS_ENABLED": "{{SIGNUPS_ENABLED_STAGING}}",
         // The fleet rollout's canary install id (#955); empty: no rollout.
         "FLEET_CANARY": "i33m6mbc3zuz",
-        // #1343: no install goes second on staging. The canary smoke's
-        // FLEET_SMOKE_TOKEN and FLEET_SMOKE_SHARE_TO are secrets the deploy
-        // puts from the Environment (docs/ops/hosted.md), never vars here.
-        "FLEET_SECOND": "",
+        // The canary smoke's FLEET_SMOKE_TOKEN and FLEET_SMOKE_SHARE_TO are
+        // secrets the deploy puts from the Environment (docs/ops/hosted.md),
+        // never vars here.
         // #1343: the canary smoke, "off" (the passive soak, as before) or
-        // "required". "off" until the user's one-time smoke setup for this
-        // env (docs/ops/hosted.md); "required" is a later one-line PR.
-        "FLEET_SMOKE": "off",
+        // "required". "required" since Leo's staging smoke setup (2026-11-26,
+        // cloud #264): the canary must pass the smoke, as on prod.
+        "FLEET_SMOKE": "required",
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
@@ -98,9 +100,21 @@
         }
       ],
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
-      // only; the provisioner consumes it.
+      // only; the provisioner consumes it. The consumer of oa-s-fleet-wake
+      // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
+      // message once the release is verified, and the fleet runs at once.
+      // One batch at a time; the fleet lease covers the 2-minute tick.
       "queues": {
-        "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }]
+        "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }],
+        "consumers": [
+          {
+            "queue": "oa-s-fleet-wake",
+            "max_batch_size": 10,
+            "max_batch_timeout": 0,
+            "max_retries": 3,
+            "max_concurrency": 1
+          }
+        ]
       },
       "send_email": [
         { "name": "ALERT_EMAIL", "destination_address": "{{ALERT_TO_STAGING}}" }
@@ -138,9 +152,8 @@
         // this, the scheduler upgrades prod's fleet to its own release, canary
         // first. Empty it in a release to switch the fleet off.
         "FLEET_CANARY": "ifhx5rpmrhwh",
-        // #1343: prod's leo, upgraded alone right after the canary has passed
-        // its smoke. The smoke's secrets: as staging's.
-        "FLEET_SECOND": "iwfhpuiwmfba",
+        // After the canary's smoke, every other install moves at once, leo
+        // included (cloud #433). The smoke's secrets: as staging's.
         // #1343: the canary smoke, "off" (the passive soak, as before) or
         // "required". Required: prod's smoke secrets are set
         // (docs/ops/hosted.md), and the canary must pass it before leo moves.
@@ -188,9 +201,21 @@
         }
       ],
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
-      // only; the provisioner consumes it.
+      // only; the provisioner consumes it. The consumer of oa-p-fleet-wake
+      // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
+      // message once the release is verified, and the fleet runs at once.
+      // One batch at a time; the fleet lease covers the 2-minute tick.
       "queues": {
-        "producers": [{ "binding": "SIGNUPS", "queue": "oa-p-signups" }]
+        "producers": [{ "binding": "SIGNUPS", "queue": "oa-p-signups" }],
+        "consumers": [
+          {
+            "queue": "oa-p-fleet-wake",
+            "max_batch_size": 10,
+            "max_batch_timeout": 0,
+            "max_retries": 3,
+            "max_concurrency": 1
+          }
+        ]
       },
       "send_email": [
         { "name": "ALERT_EMAIL", "destination_address": "{{ALERT_TO_PROD}}" }

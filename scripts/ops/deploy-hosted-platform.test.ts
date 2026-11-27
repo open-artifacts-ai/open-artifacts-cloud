@@ -92,7 +92,7 @@ case "$path" in
     elif jq -e 'type == "object"' "$STATE/queues.json" > /dev/null 2>&1; then cat "$STATE/queues.json"
     else ok "$(cat "$STATE/queues.json")"; fi
     exit 0 ;;
-  queues)
+  queues) [ -f "$STATE/fail-queue-create" ] && { bad; exit 0; }
     jq -c --argjson b "$body" 'if type == "object" then .result += [{queue_name: $b.queue_name}] else . + [{queue_name: $b.queue_name}] end' "$STATE/queues.json" 2>/dev/null > "$STATE/q.new" || jq -nc --argjson b "$body" '[{queue_name: $b.queue_name}]' > "$STATE/q.new"
     mv "$STATE/q.new" "$STATE/queues.json"; ok '{}'; exit 0 ;;
   r2/buckets/*) n="\${path#r2/buckets/}"
@@ -418,6 +418,13 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "secret_text", name: "ADMIN_SESSION_KEY" },
   { type: "secret_text", name: "ADMIN_BROKER_KEY" },
   { type: "secret_text", name: "ADMIN_IDENTITIES" },
+  // The staging tag turns the opt-out list on (open-artifacts#2652).
+  ...(env === "staging"
+    ? [
+        { type: "secret_text", name: "OPTOUT_STORE_KEY" },
+        { type: "secret_text", name: "OPTOUT_TOKEN_KEY" },
+      ]
+    : []),
 ];
 for (const [p, env] of [
   ["s", "staging"],
@@ -450,6 +457,9 @@ for (const [p, env] of [
       service: `oa-${p}-billing`,
       entrypoint: "BillingProvisionerRpc",
     });
+    // Staging's tag turns the opt-out list on (open-artifacts#2652): its root key.
+    if (env === "staging")
+      o.result.bindings.push({ type: "secret_text", name: "OPTOUT_ROOT_KEY" });
     return JSON.stringify(o);
   })();
 NEXT["oa-p-provisioning"] = settings(provisioningBindings());
@@ -593,7 +603,13 @@ const setup = (
     );
   const queues =
     opts.queues === undefined
-      ? queueList(["oa-p-signups", "oa-s-signups", "other"])
+      ? queueList([
+          "oa-p-signups",
+          "oa-s-signups",
+          "oa-p-fleet-wake",
+          "oa-s-fleet-wake",
+          "other",
+        ])
       : opts.queues;
   if (queues !== null) writeFileSync(join(state, "queues.json"), queues);
   for (const w of [
@@ -734,6 +750,14 @@ describe("deploy-hosted-platform.sh", () => {
     expect(puts(r.log)).toEqual([]);
     expect(r.err).toContain("list oa-p-auth-broker secrets failed");
     clean(r);
+  });
+  it("provisioner: a failed secrets listing fails the read-back instead of passing on an empty read", () => {
+    const r = setup({
+      exists: ["oa-p-billing", "oa-p-provisioner"],
+      failSecrets: true,
+    }).run("provisioner");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("list oa-p-provisioner secrets failed");
   });
   it("a deployed binding that doesn't match fails the run", () => {
     const bad = NEXT["oa-p-auth-broker"]?.replace(
@@ -1064,7 +1088,13 @@ describe("deploy-hosted-platform.sh", () => {
           // Verify only reads the live Worker (its settings file), deploys nothing.
           const base = {
             exists: [...DEPS[app], "oa-s-billing", `oa-s-${app}`],
-            queues: queueList(["oa-s-signups", "oa-s-signups-dlq"]),
+            queues: queueList([
+              "oa-s-signups",
+              "oa-s-signups-dlq",
+              "oa-s-fleet-wake",
+            ]),
+            // Staging's tag turns the opt-out list on: the provisioner's root key.
+            secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY"] },
           };
           const live = setup({ ...base, files: VERIFY_FILES }).run(
             app,
@@ -1087,6 +1117,7 @@ describe("deploy-hosted-platform.sh", () => {
             configs: { [app]: withoutBilling(APP_CONFIG(app)) },
             exists: [...DEPS[app], `oa-s-${app}`],
             queues: base.queues,
+            secrets: base.secrets,
             files: {
               ...VERIFY_FILES,
               [`oa-s-${app}.settings.json`]: liveWithout(`oa-s-${app}`),
@@ -1392,18 +1423,22 @@ describe("deploy-hosted-platform.sh", () => {
       if (app === "provisioning")
         next.result.bindings = next.result.bindings.filter(
           // v0.154.0 predates WELCOME_*, BUSINESS_REQUESTS_TO (open-artifacts#2404)
-          // and LOGIN_CHANGE (#2520).
+          // and LOGIN_CHANGE, LOGIN_CHANGE_SLUGS (#2520) and OPTOUT_LIST (#2652).
           (b: { name: string }) =>
             !b.name.startsWith("WELCOME_") &&
             b.name !== "BUSINESS_REQUESTS_TO" &&
-            b.name !== "LOGIN_CHANGE",
+            b.name !== "LOGIN_CHANGE" &&
+            b.name !== "LOGIN_CHANGE_SLUGS" &&
+            b.name !== "OPTOUT_LIST",
         );
       // v0.154.0 predates PROD_BUS_ALL (open-artifacts#2325) and OAUTH_BORN_D1
       // (open-artifacts#1008): its provisioner has neither var.
       if (app === "provisioner")
         next.result.bindings = next.result.bindings.filter(
           (b: { name: string }) =>
-            b.name !== "PROD_BUS_ALL" && b.name !== "OAUTH_BORN_D1",
+            b.name !== "PROD_BUS_ALL" &&
+            b.name !== "OAUTH_BORN_D1" &&
+            b.name !== "OPTOUT_LIST",
         );
       return JSON.stringify(next);
     };
@@ -1700,6 +1735,98 @@ describe("deploy-hosted-platform.sh", () => {
     expect(ok.log).toContain(
       `curl -sS -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100`,
     );
+  });
+  // cloud #264: the scheduler consumes oa-<p>-fleet-wake, so the target makes
+  // sure that queue exists before the deploy attaches to it.
+  const WAKE_CREATE = 'WRITE POST /queues {"queue_name":"oa-p-fleet-wake"}';
+  it("the scheduler creates oa-p-fleet-wake when absent, before its deploy, and only then", () => {
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups", "oa-s-fleet-wake"]),
+    }).run("scheduler");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([WAKE_CREATE]);
+    expect(r.out).toContain("queue oa-p-fleet-wake created");
+    const created = r.log.indexOf(WAKE_CREATE);
+    const deployed = r.log.findIndex((l) => l.startsWith("wrapper scheduler"));
+    expect(created).toBeGreaterThan(-1);
+    expect(created).toBeLessThan(deployed);
+    clean(r);
+    // Present: listed, never created again.
+    const again = setup({ exists: SCHED_DEPS("p") }).run("scheduler");
+    expect(again.code, again.err).toBe(0);
+    expect(again.writes).toEqual([]);
+    expect(again.log).toContain(
+      `curl -sS -K - https://api.cloudflare.com/client/v4/accounts/${ACCT}/queues?per_page=100&page=1`,
+    );
+  });
+  it("the scheduler, staging: creates oa-s-fleet-wake, never prod's", () => {
+    const r = setup({
+      exists: SCHED_DEPS("s"),
+      queues: queueList(["oa-s-signups", "oa-p-fleet-wake"]),
+    }).run("scheduler", {}, "staging");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([
+      'WRITE POST /queues {"queue_name":"oa-s-fleet-wake"}',
+    ]);
+  });
+  it("the scheduler, verify only: a missing oa-p-fleet-wake refuses and nothing is created", () => {
+    const s = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups"]),
+    });
+    writeFileSync(join(s.state, "oa-p-scheduler.exists"), "");
+    writeFileSync(
+      join(s.state, "oa-p-scheduler.settings.json"),
+      NEXT["oa-p-scheduler"] as string,
+    );
+    const r = s.run("scheduler", { VERIFY_ONLY: "1" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("queue oa-p-fleet-wake does not exist");
+    expect(r.writes).toEqual([]);
+    expect(noDeploy(r.log)).toEqual([]);
+  });
+  it("the scheduler: a failed queue creation stops the run before its deploy", () => {
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      queues: queueList(["oa-p-signups"]),
+      files: { "fail-queue-create": "" },
+    }).run("scheduler");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("create queue oa-p-fleet-wake failed");
+    expect(noDeploy(r.log)).toEqual([]);
+    clean(r);
+  });
+  it("the scheduler: a tag that consumes no queue lists and creates nothing; any other queue refuses", () => {
+    const none = SCHED_CONFIG.replace(
+      /"consumers": \[[\s\S]*?\n {8}\]/g,
+      '"consumers": []',
+    );
+    expect(none).not.toContain('fleet-wake"');
+    const r = setup({
+      exists: SCHED_DEPS("p"),
+      configs: { scheduler: none },
+      queues: queueList(["oa-p-signups"]),
+    }).run("scheduler");
+    expect(r.code, r.err).toBe(0);
+    expect(r.writes).toEqual([]);
+    expect(r.log.some((l) => l.includes("/queues?per_page=100&page="))).toBe(
+      false,
+    );
+    const other = SCHED_CONFIG.replaceAll(
+      '"queue": "oa-p-fleet-wake"',
+      '"queue": "oa-p-signups"',
+    );
+    const o = setup({
+      exists: SCHED_DEPS("p"),
+      configs: { scheduler: other },
+    }).run("scheduler");
+    expect(o.code).toBe(1);
+    expect(o.err).toContain(
+      "the tag's prod scheduler consumes 'oa-p-signups'; want none or oa-p-fleet-wake; refusing",
+    );
+    expect(o.writes).toEqual([]);
+    expect(noDeploy(o.log)).toEqual([]);
   });
   // The scheduler fails on a readback mismatch in each provisioning binding,
   // deployed or verify only. Its bindings with one changed (null: removed).
@@ -2872,6 +2999,37 @@ describe("deploy-hosted-platform.sh", () => {
       expect(r.out).toContain("prod provisioning: deployed and verified");
       clean(r);
     });
+    // #264 step 6: the workflow builds provisioning beside the migrations and
+    // says so with PROVISIONING_BUILT=1 (only once that build passed); then the
+    // target skips its own build and deploys the same way. Any other value
+    // builds as before.
+    it("PROVISIONING_BUILT=1 skips the build and still deploys; anything else builds", () => {
+      const built = setup({ exists: brokers }).run("provisioning", {
+        PROVISIONING_BUILT: "1",
+      });
+      expect(built.err).toBe("");
+      expect(built.code).toBe(0);
+      expect(built.log.filter((l) => l.startsWith("pnpm --filter"))).toEqual(
+        [],
+      );
+      expect(built.out).toContain(
+        "provisioning: built earlier in this run (PROVISIONING_BUILT)",
+      );
+      expect(
+        built.log.some((l) => l.startsWith("wrapper provisioning prod ")),
+      ).toBe(true);
+      expect(built.out).toContain("prod provisioning: deployed and verified");
+      for (const v of ["", "0", "yes", "1 "]) {
+        const r = setup({ exists: brokers }).run("provisioning", {
+          PROVISIONING_BUILT: v,
+        });
+        expect(r.code, v).toBe(0);
+        expect(
+          r.log.filter((l) => l.startsWith("pnpm --filter")),
+          v,
+        ).toEqual(["pnpm --filter @oa/provisioning... build"]);
+      }
+    });
     it("prod sign-up steps are off by default: PROD_SIGNUP_DEPLOY unset, empty or anything but exactly on leaves no entry, key or sitekey (#40)", () => {
       for (const extra of [
         {},
@@ -3441,6 +3599,8 @@ describe("deploy-hosted-platform.sh", () => {
       expect(sp).toContain('"domains":[]');
       expect(puts(r.log)).toEqual([
         "ADMIN_SESSION_KEY",
+        "OPTOUT_STORE_KEY",
+        "OPTOUT_TOKEN_KEY",
         "ADMIN_BROKER_KEY",
         "ADMIN_IDENTITIES",
         "SIGNUP_BROKER_KEY",
@@ -3463,6 +3623,133 @@ describe("deploy-hosted-platform.sh", () => {
         expect(puts(none.log)).not.toContain("TURNSTILE_SITEKEY");
         expect(none.err).toContain("TURNSTILE_SITEKEY not set");
       }
+    });
+  });
+
+  describe("the opt-out keys (open-artifacts#2652): only where the tag's config turns the list on", () => {
+    const KEYS = ["OPTOUT_STORE_KEY", "OPTOUT_TOKEN_KEY"];
+    const stg = ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"];
+    const widgets = {
+      "widgets.json": JSON.stringify([
+        { name: "oa-s-turnstile", sitekey: "0x4AAAAAAAtest_key-1" },
+      ]),
+    };
+    const base = ["ADMIN_BROKER_KEY", "ADMIN_IDENTITIES", "ADMIN_SESSION_KEY"];
+    const live = [...base, ...KEYS, "SIGNUP_BROKER_KEY"];
+    const SKEY = "install:i00000signup";
+    const AKEY = "install:i000000admin";
+    const entry = (id: string, origin: string) =>
+      JSON.stringify({
+        installId: id,
+        origin,
+        keys: [{ kid: "k".repeat(16), x: "x".repeat(43) }],
+        domains: [],
+      });
+    const files = {
+      ...widgets,
+      "kvns.json": JSON.stringify([
+        { id: OAUTH, title: "oa-s-provisioning-oauth" },
+      ]),
+      [`kv-${REG}-${AKEY}`]: entry(
+        "i000000admin",
+        "https://admin.open-artifacts-staging.app",
+      ),
+      [`kv-${REG}-${SKEY}`]: entry(
+        "i00000signup",
+        "https://signup.open-artifacts-staging.app",
+      ),
+    };
+    const go = (
+      secrets: string[],
+      extra: Record<string, string> = {},
+      env: Record<string, string> = {},
+    ) =>
+      setup({
+        exists: stg,
+        secrets: { "oa-s-provisioning": secrets },
+        files: { ...files, ...extra },
+      }).run("provisioning", { NEW_KV: OAUTH, ...env }, "staging");
+
+    it("staging: both are generated once when absent, never printed", () => {
+      const r = go(base.concat("SIGNUP_BROKER_KEY"));
+      expect(r.err).toBe("");
+      expect(r.code).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).toContain(k);
+      clean(r);
+    });
+    it("staging: present keys are never overwritten, even when the list is read wrongly empty", () => {
+      const r = go(live);
+      expect(r.code, r.err).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).not.toContain(k);
+      const again = go(live, { "empty-secret-reads": "99" });
+      for (const k of KEYS) expect(puts(again.log)).not.toContain(k);
+    });
+    it("staging: an optional POSTHOG_KEY (open-artifacts#2479, signed_up) passes the read-back", () => {
+      const r = go(live.concat("POSTHOG_KEY"), {}, { VERIFY_ONLY: "1" });
+      expect(r.code, r.err).toBe(0);
+    });
+    it("staging: the read-back requires them", () => {
+      const r = go(
+        live.filter((n) => n !== "OPTOUT_TOKEN_KEY"),
+        {},
+        { VERIFY_ONLY: "1" },
+      );
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("secrets are");
+    });
+    it("prod (OPTOUT_LIST 0): neither is made and neither is allowed", () => {
+      const r = setup({
+        exists: ["oa-p-provisioner", "oa-p-auth-broker"],
+      }).run("provisioning");
+      expect(r.code, r.err).toBe(0);
+      for (const k of KEYS) expect(puts(r.log)).not.toContain(k);
+    });
+    it("provisioner staging: OPTOUT_ROOT_KEY is made once, before the one deploy; absent from prod", () => {
+      const r = setup({ exists: ["oa-s-billing"] }).run(
+        "provisioner",
+        {},
+        "staging",
+      );
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual(["OPTOUT_ROOT_KEY"]);
+      // Put before the one deploy: the Worker never serves without it.
+      const w = r.log.flatMap((l, i) =>
+        l.startsWith("wrapper provisioner") ? [i] : [],
+      );
+      expect(w).toHaveLength(1);
+      const put = r.log.findIndex((l) =>
+        l.startsWith("stdin-len OPTOUT_ROOT_KEY"),
+      );
+      expect(put).toBeGreaterThanOrEqual(0);
+      expect(put).toBeLessThan(w[0] as number);
+      clean(r);
+      const kept = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY"] },
+      }).run("provisioner", {}, "staging");
+      expect(kept.code, kept.err).toBe(0);
+      expect(puts(kept.log)).toEqual([]);
+      const prod = setup().run("provisioner");
+      expect(puts(prod.log)).toEqual([]);
+    });
+    // open-artifacts#2479: POSTHOG_KEY is set by hand, present or absent is clean.
+    it("provisioner: an optional POSTHOG_KEY secret (binding and name) passes the read-back", () => {
+      const next = JSON.parse(NEXT["oa-s-provisioner"] as string);
+      next.result.bindings.push({ type: "secret_text", name: "POSTHOG_KEY" });
+      const r = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY", "POSTHOG_KEY"] },
+        next: { "oa-s-provisioner": JSON.stringify(next) },
+      }).run("provisioner", {}, "staging");
+      expect(r.code, r.err).toBe(0);
+      expect(puts(r.log)).toEqual([]);
+    });
+    it("provisioner: any other extra secret is still refused", () => {
+      const r = setup({
+        exists: ["oa-s-billing", "oa-s-provisioner"],
+        secrets: { "oa-s-provisioner": ["OPTOUT_ROOT_KEY", "OTHER_KEY"] },
+      }).run("provisioner", {}, "staging");
+      expect(r.code).toBe(1);
     });
   });
 

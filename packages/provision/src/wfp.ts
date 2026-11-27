@@ -69,10 +69,12 @@ import {
   ProvisionRetry,
 } from "./jobs.js";
 import {
+  assertNoHookBindings,
   assertSafeMigrations,
   assertUniqueBindings,
   epochBumpSql,
   googleNewlyEnabled,
+  isHookBinding,
   KNOWN_SECRETS,
   parseTemplate,
   scriptSubdomainSettings,
@@ -233,6 +235,23 @@ export interface WfpOptions {
    */
   oauthBornD1?: boolean;
   /**
+   * open-artifacts#2652: the hosted-wide opt-out purpose key. Set (by the
+   * provisioner Worker, only when its OPTOUT_LIST is "1"), every render, create
+   * and update, binds it as the install's OPTOUT_HASH_KEY secret_text; unset,
+   * no install gets it. Never logged.
+   */
+  optoutHashKey?: string;
+  /**
+   * open-artifacts#2479: the platform's PostHog project key, from the
+   * rendering Worker's own env (so staging installs only ever get staging's).
+   * Set, every render (create, update, rollback) binds it as the install's
+   * POSTHOG_KEY secret_text; unset, an install gets none and an upgrade
+   * removes one it holds. Never logged.
+   */
+  posthogKey?: string;
+  /** The optional POSTHOG_HOST var; rendered only with a key, only when set. */
+  posthogHost?: string;
+  /**
    * The env's one Turnstile widget (sitekey and secret from the keychain item
    * oa-hosted-<env>-turnstile). Required when codes are on.
    */
@@ -380,7 +399,37 @@ export const VERIFY_CLEAN_REFUSED_BINDING_TYPES = Object.freeze([
  * for an oauth copy job, and one the job couldn't delete is left rotated to a
  * value nobody holds (#1008).
  */
-const OPTIONAL_SECRETS: readonly string[] = ["OAUTH_COPY_KEY"];
+/**
+ * The install's web push pair (open-artifacts#2775), as the server reads it:
+ * the P-256 public key as an uncompressed point and the private scalar, both
+ * base64url. Minted once at create and never rotated: a new pair silently
+ * breaks every browser that turned notifications on. Optional to verify_clean
+ * until backfillPushKeys has run on every install made before this.
+ */
+export const PUSH_SECRETS = ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"] as const;
+
+/**
+ * The install's own opt-out hash key (open-artifacts#2820): 48 random bytes,
+ * base64url, the server's raw HMAC-SHA256 key for its opt-out table, apart
+ * from the platform-wide OPTOUT_HASH_KEY. Minted once at create and never
+ * rotated (a new key stops every stored opt-out from matching). Optional to
+ * verify_clean until backfillOptoutKey has run on every older install.
+ */
+export const INSTALL_OPTOUT_KEY = "INSTALL_OPTOUT_KEY";
+
+/**
+ * open-artifacts#2479: the platform's PostHog project key on an install, so
+ * the public server sends its activation events. Present or absent is clean
+ * to verify_clean (it follows the platform's env, which may change).
+ */
+export const POSTHOG_KEY = "POSTHOG_KEY";
+
+const OPTIONAL_SECRETS: readonly string[] = [
+  "OAUTH_COPY_KEY",
+  ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
+  POSTHOG_KEY,
+];
 
 /**
  * The exact secret names verify_clean expects on an install (design v7 5.2
@@ -391,12 +440,15 @@ export function expectedSecretNames(o: {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the install carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
 }): string[] {
   return [
     ...CREATE_SECRETS,
     ...(o.broker ? ["BROKER_SIGNING_KEY"] : []),
     ...(o.codes ? ["TURNSTILE_SECRET"] : []),
     ...(o.testHooks ? ["TEST_HOOK_KEY"] : []),
+    ...(o.optout ? ["OPTOUT_HASH_KEY"] : []),
   ].sort();
 }
 
@@ -410,8 +462,9 @@ export function expectedSecretNames(o: {
  * 3. Non-secret bindings minus OWNER_EMAIL equal `sent`'s by (name, type);
  *    for plain_text and json, sha256 of the value equals the render's.
  * 4. Secret names equal expectedSecretNames(...) exactly, OPTIONAL_SECRETS aside.
- * 5. TEST_HOOK_KEY, TEST_HOOKS and TEST_DOMAIN absent unless testHooks
- *    (keyed on testHooks, not OA_ENV).
+ * 5. TEST_HOOK_KEY, TEST_HOOKS, TEST_DOMAIN and any name matching /hook/i
+ *    (public #3200's RL_HOOKS) absent unless testHooks (keyed on testHooks,
+ *    not OA_ENV).
  * 6. The release record's variant is `release` unless testHooks, and the
  *    install's do_migration_tag equals the template's last tag.
  */
@@ -428,6 +481,8 @@ export interface VerifyCleanInput {
   broker: boolean;
   codes: boolean;
   testHooks: boolean;
+  /** open-artifacts#2652: the render carries OPTOUT_HASH_KEY. */
+  optout?: boolean;
   /** The template's last Durable Object migration tag (null: none). */
   lastTag: string | null;
   /** The tag the script runs: the upload's, or the row's when none ran. */
@@ -466,7 +521,8 @@ export function verifyCleanProblems(
       other(`binding ${b.name} is a ${b.type} binding`);
   if (!v.testHooks)
     for (const n of [...live.secrets, ...live.bindings.map((b) => b.name)])
-      if (HOOK_NAMES.includes(n)) other(`${n} is set on a non-test install`);
+      if (HOOK_NAMES.includes(n) || isHookBinding(n))
+        other(`${n} is set on a non-test install`);
   const plain = (bs: readonly { name: string; type: string }[]) =>
     bs.filter((b) => !b.type.startsWith("secret") && b.name !== "OWNER_EMAIL");
   const key = (b: { name: string; type: string }) => `${b.name} (${b.type})`;
@@ -568,7 +624,12 @@ export const CREATE_SECRETS = [
   "DIRECTORY_TOKEN_KEY",
 ] as const;
 /** Secrets metadata.ts does not know; appended to its bindings here. */
-const EXTRA_SECRETS = ["DIRECTORY_TOKEN_KEY", "TURNSTILE_SECRET"];
+const EXTRA_SECRETS: readonly string[] = [
+  "DIRECTORY_TOKEN_KEY",
+  "TURNSTILE_SECRET",
+  ...PUSH_SECRETS,
+  INSTALL_OPTOUT_KEY,
+];
 const SITEKEY_RE = /^[0-9A-Za-z_-]{8,64}$/;
 
 /**
@@ -607,6 +668,26 @@ export function normOwnerEmail(s: string): string | null {
 }
 
 /** 48 bytes from the CSPRNG, base64url. Generated per install, never derived. */
+/** A fresh web push pair (PUSH_SECRETS), never logged. */
+export async function newPushKeys(): Promise<
+  Record<(typeof PUSH_SECRETS)[number], string>
+> {
+  const k = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const j = await crypto.subtle.exportKey("jwk", k.privateKey);
+  if (!j.x || !j.y || !j.d) throw new Error("push key export is incomplete");
+  const pub = Buffer.concat([
+    Buffer.from([4]),
+    Buffer.from(j.x, "base64url"),
+    Buffer.from(j.y, "base64url"),
+  ]);
+  if (pub.length !== 65) throw new Error("push public key is not 65 bytes");
+  return { VAPID_PUBLIC_KEY: b64u(pub), VAPID_PRIVATE_KEY: j.d };
+}
+
 export function newSecret(): string {
   return b64u(crypto.getRandomValues(new Uint8Array(SECRET_BYTES)));
 }
@@ -842,9 +923,15 @@ export interface VarsResult {
 export interface RotationResult {
   id: InstallId;
   ok: boolean;
-  /** False for an install with codes off (nothing to rotate). */
+  /**
+   * False for an install with nothing to do: codes off (Turnstile), or a
+   * push pair already there (backfillPushKeys), or an opt-out key
+   * (backfillOptoutKey).
+   */
   rotated: boolean;
   reason?: string;
+  /** A dry run: this install would be written (nothing was). */
+  planned?: boolean;
 }
 
 /** H-DV: what delete prints when the directory revoke is skipped. */
@@ -1688,6 +1775,16 @@ export class WfpProvisioner {
       );
   }
 
+  /** The stored vars have google on and no AUTH_DOMAINS (false if they don't parse). */
+  private googleWithoutDomainsNow(prev: Record<string, string>): boolean {
+    if (!googleNewlyEnabled({}, prev)) return false;
+    try {
+      return registryDomains(prev.AUTH_DOMAINS).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
   /** Belt and braces before every upload: hooks only reach a staging test install. */
   private assertHooksAllowed(variant: BundleVariant, testHooks: boolean): void {
     if (variant === "release") return;
@@ -1913,6 +2010,8 @@ export class WfpProvisioner {
     const secrets: Record<string, string> = {};
     for (const k of CREATE_SECRETS) secrets[k] = newSecret();
     if (testHooks) secrets.TEST_HOOK_KEY = newSecret();
+    Object.assign(secrets, await newPushKeys());
+    secrets[INSTALL_OPTOUT_KEY] = newSecret();
     for (const v of Object.values(secrets)) this.sensitive.add(v);
     assertSessionSecret(
       secrets.SESSION_SECRET as string,
@@ -2205,9 +2304,11 @@ export class WfpProvisioner {
         rowKvId: row.kv_id,
         r2: names(id, this.env).r2,
         script,
-        planned: plannedBindings(o.template, row.rl_ns).filter(
-          (b) => o.kvId !== null || b.type !== "kv_namespace",
-        ),
+        planned: plannedBindings(
+          o.template,
+          row.rl_ns,
+          row.test_hooks === 1,
+        ).filter((b) => o.kvId !== null || b.type !== "kv_namespace"),
       });
       if (expired) return;
       await this.platform.audit(id, "verify_clean.binding_ids", {
@@ -2435,15 +2536,46 @@ export class WfpProvisioner {
       if (v !== undefined)
         meta.bindings.push({ type: "secret_text", name: k, text: v });
     }
+    // open-artifacts#2652: the hosted-wide opt-out key, on every render.
+    if (this.o.optoutHashKey !== undefined) {
+      this.sensitive.add(this.o.optoutHashKey);
+      meta.bindings.push({
+        type: "secret_text",
+        name: "OPTOUT_HASH_KEY",
+        text: this.o.optoutHashKey,
+      });
+      // Its plain vars (public #2665): where the unsubscribe link lands, and
+      // that the platform list is on. Hosted renders only, with the key.
+      meta.bindings.push(
+        {
+          type: "plain_text",
+          name: "OPTOUT_UNSUBSCRIBE_URL",
+          text: `https://signup.${this.o.domains.app}/unsubscribe`,
+        },
+        { type: "plain_text", name: "OPTOUT_PLATFORM", text: "on" },
+      );
+    }
+    // open-artifacts#2479: the platform's PostHog key (and host), when set.
+    if (this.o.posthogKey !== undefined) {
+      this.sensitive.add(this.o.posthogKey);
+      meta.bindings.push({
+        type: "secret_text",
+        name: POSTHOG_KEY,
+        text: this.o.posthogKey,
+      });
+      if (this.o.posthogHost !== undefined)
+        meta.bindings.push({
+          type: "plain_text",
+          name: "POSTHOG_HOST",
+          text: this.o.posthogHost,
+        });
+    }
     // An update never drops the secrets already on the script.
     if (r.mode === "update") meta.keep_bindings = ["secret_text", "secret_key"];
-    if (
-      !m.testHooks &&
-      meta.bindings.some((x) =>
-        ["TEST_HOOKS", "TEST_HOOK_KEY", "TEST_DOMAIN"].includes(x.name),
-      )
-    )
-      throw new Error("hooks bindings on a non-test install");
+    // The production hook guard, on the full render: no binding named like a
+    // hook (TEST_HOOKS, TEST_HOOK_KEY, public #3200's RL_HOOKS) nor
+    // TEST_DOMAIN on a non-test install.
+    assertNoHookBindings(meta.bindings, m.testHooks);
     try {
       assertUniqueBindings(meta.bindings);
     } catch (e) {
@@ -2509,6 +2641,9 @@ export class WfpProvisioner {
       ...CREATE_SECRETS,
       ...(testHooks ? ["TEST_HOOK_KEY"] : []),
       ...(m.sitekey !== null ? ["TURNSTILE_SECRET"] : []),
+      // Only on the first upload: an existing script gets its pair from
+      // backfillPushKeys, under the operator's own go (never by a rerun).
+      ...(exists ? [] : [...PUSH_SECRETS, INSTALL_OPTOUT_KEY]),
     ];
     const have = exists ? await cf.secretList(target, n.script) : [];
     const missing = required.filter((k) => !have.includes(k));
@@ -2605,6 +2740,7 @@ export class WfpProvisioner {
         rec,
         broker: this.o.brokerEnabled === true,
         codes: m.sitekey !== null,
+        optout: this.o.optoutHashKey !== undefined,
         testHooks,
         lastTag: latest,
         tag,
@@ -2741,6 +2877,13 @@ export class WfpProvisioner {
       assertOwnResource(u.script, env);
       await send(meta, mods.modules);
       sent = meta;
+      // keep_bindings keeps every secret, so a key the platform no longer has
+      // is deleted here (open-artifacts#2479): absent there is absent here.
+      if (u.exists && this.o.posthogKey === undefined) {
+        await this.hold();
+        if ((await cf.secretList(target, u.script)).includes(POSTHOG_KEY))
+          await cf.secretDelete(target, u.script, POSTHOG_KEY);
+      }
       // What the script now runs: the new tag when steps went, else the one sent against.
       if (u.out) u.out.reached = meta.migrations?.new_tag ?? tag;
     };
@@ -3975,6 +4118,7 @@ export class WfpProvisioner {
             rec: rel.rec,
             broker: row.broker_kid !== null,
             codes: m.sitekey !== null,
+            optout: this.o.optoutHashKey !== undefined,
             testHooks: m.testHooks,
             lastTag: tagsOf(rel.template).at(-1) ?? null,
             tag: reached,
@@ -4229,6 +4373,8 @@ export class WfpProvisioner {
       ...Object.keys(vars),
       "FEATURES",
       "TURNSTILE_SITE_KEY",
+      // Platform-rendered (open-artifacts#2479): follows the env, not the version.
+      "POSTHOG_HOST",
     ]);
     const notVars = (x: Record<string, unknown>) =>
       canonicalJson({
@@ -4344,6 +4490,7 @@ export class WfpProvisioner {
           rec: rel.rec,
           broker: row.broker_kid !== null,
           codes: p.m.sitekey !== null,
+          optout: this.o.optoutHashKey !== undefined,
           testHooks: p.m.testHooks,
           lastTag: tagsOf(rel.template).at(-1) ?? null,
           tag: row.do_migration_tag,
@@ -4422,7 +4569,11 @@ export class WfpProvisioner {
       const vars = { ...nextVars };
       this.brokerVars(vars);
       const m = this.renderInputs(row, vars);
-      this.checkGoogleBroker(vars);
+      // An install already on google with no AUTH_DOMAINS (a self-serve
+      // create, googleWithoutDomains) keeps that shape through a vars change
+      // (mit-ai, R29 AUTH_PROVIDERS). Turning google on, or dropping the
+      // domains of an install that had them, is still refused.
+      this.checkGoogleBroker(vars, this.googleWithoutDomainsNow(prev));
       // T8 review M2: only create's broker step issues the signing key and
       // the first registry entry. Without them google can't work, and the
       // session cut would log everyone out for nothing.
@@ -4688,6 +4839,171 @@ export class WfpProvisioner {
               ts.secret,
             );
             await this.logged("turnstile.rotate", { sitekey: ts.sitekey });
+            await this.release("active");
+          } catch (e) {
+            if (!(e instanceof LostLease))
+              await this.releaseQuietly("active", e);
+            throw e;
+          }
+          out.push({ id: row.id, ok: true, rotated: true });
+        } catch (e) {
+          out.push({
+            id: row.id,
+            ok: false,
+            rotated: false,
+            reason: this.reasonOf(e),
+          });
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
+   * open-artifacts#2775: puts a fresh web push pair on every active install of
+   * `env` that has none. An install that holds both keeps them (never
+   * rotated). The private key goes up first and the public key last, so a
+   * lone private key is this method's own interrupted run (no browser can
+   * subscribe without the public key) and a rerun finishes it; a lone public
+   * key was put by someone else and is refused, not overwritten.
+   * Run by an operator, once, on the user's go; create mints its own pair.
+   * `dryRun` reads only (no lease, no secret, no audit row) and marks each
+   * install it would write `planned`.
+   */
+  async backfillPushKeys(
+    env: Env,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<RotationResult[]> {
+    return this.guarded(async () => {
+      this.checkOptions();
+      if (env !== this.env)
+        throw new ProvisionRefused(
+          `this provisioner is for ${this.env}, not ${String(env)}`,
+          "invalid_state",
+        );
+      await this.checkToken();
+      await this.resolvePlatform();
+      const out: RotationResult[] = [];
+      for (const row of await this.platform.inStates([
+        "creating",
+        "active",
+        "upgrading",
+      ])) {
+        try {
+          if (row.state !== "active")
+            throw new ProvisionRefused(
+              `install ${row.id} is ${row.state}; rerun the backfill once it is active`,
+              "invalid_state",
+            );
+          const script = names(row.id, this.env).script;
+          assertOwnResource(script, this.env);
+          const have = (await this.cf.secretList(this.target, script)).filter(
+            (k) => (PUSH_SECRETS as readonly string[]).includes(k),
+          );
+          if (have.length === PUSH_SECRETS.length) {
+            out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          if (have.includes("VAPID_PUBLIC_KEY"))
+            throw new ProvisionRefused(
+              `install ${row.id} holds only ${have.join(", ")}; a half pair is never overwritten`,
+              "invalid_state",
+            );
+          if (opts.dryRun) {
+            out.push({ id: row.id, ok: true, rotated: false, planned: true });
+            continue;
+          }
+          await this.claim(row, ["active"], "active", "push_keys");
+          try {
+            const keys = await newPushKeys();
+            for (const v of Object.values(keys)) this.sensitive.add(v);
+            for (const k of [
+              "VAPID_PRIVATE_KEY",
+              "VAPID_PUBLIC_KEY",
+            ] as const) {
+              assertOwnResource(script, this.env);
+              await this.hold();
+              await this.cf.secretPut(this.target, script, k, keys[k]);
+            }
+            await this.logged("push_keys.backfill");
+            await this.release("active");
+          } catch (e) {
+            if (!(e instanceof LostLease))
+              await this.releaseQuietly("active", e);
+            throw e;
+          }
+          out.push({ id: row.id, ok: true, rotated: true });
+        } catch (e) {
+          out.push({
+            id: row.id,
+            ok: false,
+            rotated: false,
+            reason: this.reasonOf(e),
+          });
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
+   * open-artifacts#2820: puts a fresh INSTALL_OPTOUT_KEY on every active
+   * install of `env` that has none; one that holds it keeps it (never
+   * rotated). One secret, so a rerun after a failure simply finishes. Run by
+   * an operator, once, on the user's go; create mints its own.
+   */
+  async backfillOptoutKey(
+    env: Env,
+    opts: { dryRun?: boolean } = {},
+  ): Promise<RotationResult[]> {
+    return this.guarded(async () => {
+      this.checkOptions();
+      if (env !== this.env)
+        throw new ProvisionRefused(
+          `this provisioner is for ${this.env}, not ${String(env)}`,
+          "invalid_state",
+        );
+      await this.checkToken();
+      await this.resolvePlatform();
+      const out: RotationResult[] = [];
+      for (const row of await this.platform.inStates([
+        "creating",
+        "active",
+        "upgrading",
+      ])) {
+        try {
+          if (row.state !== "active")
+            throw new ProvisionRefused(
+              `install ${row.id} is ${row.state}; rerun the backfill once it is active`,
+              "invalid_state",
+            );
+          const script = names(row.id, this.env).script;
+          assertOwnResource(script, this.env);
+          if (
+            (await this.cf.secretList(this.target, script)).includes(
+              INSTALL_OPTOUT_KEY,
+            )
+          ) {
+            out.push({ id: row.id, ok: true, rotated: false });
+            continue;
+          }
+          if (opts.dryRun) {
+            out.push({ id: row.id, ok: true, rotated: false, planned: true });
+            continue;
+          }
+          await this.claim(row, ["active"], "active", "optout_key");
+          try {
+            const key = newSecret();
+            this.sensitive.add(key);
+            assertOwnResource(script, this.env);
+            await this.hold();
+            await this.cf.secretPut(
+              this.target,
+              script,
+              INSTALL_OPTOUT_KEY,
+              key,
+            );
+            await this.logged("optout_key.backfill");
             await this.release("active");
           } catch (e) {
             if (!(e instanceof LostLease))

@@ -59,6 +59,9 @@
         // open-artifacts#1008: "1" makes a new install born on d1 (OAUTH_STORE=d1, no
         // OAUTH_KV binding, no <id>-oauth namespace). Existing installs are unchanged.
         "OAUTH_BORN_D1": "1",
+        // open-artifacts#2652: "1" gives every hosted install OPTOUT_HASH_KEY (HKDF from the
+        // OPTOUT_ROOT_KEY secret). Matches OPTOUT_LIST on the provisioning Worker.
+        "OPTOUT_LIST": "1",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },
@@ -149,6 +152,8 @@
         // open-artifacts#1008: OFF ("0") in prod: new installs still get the KV namespace until
         // a reviewed PR flips it, after the staging rollout and red-line.
         "OAUTH_BORN_D1": "0",
+        // open-artifacts#2652: off in prod until the opt-out list is switched on there.
+        "OPTOUT_LIST": "0",
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },

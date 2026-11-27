@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertNoHookBindings,
   type Binding,
   buildBundle,
   epochBumpSql,
@@ -68,8 +69,14 @@ describe("userWorkerMetadata", () => {
       ...tpl.ratelimits.map((e: { name: string }) => e.name),
       ...Object.keys(tpl.vars),
     ];
+    // A hook binding (public #3200's RL_HOOKS) is the test variant's only:
+    // checked on the full render below.
     for (const n of want)
-      expect(have.has(n) || n in TEMPLATE_BINDINGS_EXCLUDED, n).toBe(true);
+      expect(
+        have.has(n) || n in TEMPLATE_BINDINGS_EXCLUDED || /hook/i.test(n),
+        n,
+      ).toBe(true);
+    for (const n of have) expect(/hook/i.test(n), n).toBe(false);
     for (const n of Object.keys(TEMPLATE_BINDINGS_EXCLUDED)) {
       expect(have.has(n), `${n} must not be uploaded`).toBe(false);
       if (!["ANALYTICS_TOKEN", "ACCESS_CLIENT_SECRET"].includes(n))
@@ -112,6 +119,9 @@ describe("userWorkerMetadata", () => {
     );
     for (const b of full.bindings)
       expect(allowed.has(b.name), b.name).toBe(true);
+    const fullNames = new Set(full.bindings.map((b) => b.name));
+    for (const n of want.filter((x) => /hook/i.test(x)))
+      expect(fullNames.has(n), n).toBe(true);
     expect(HOSTED_ADDED).toContain("TEST_HOOKS");
     expect(HOSTED_ADDED).toContain("TEST_HOOK_KEY");
     for (const [, why] of Object.entries(TEMPLATE_BINDINGS_EXCLUDED))
@@ -375,6 +385,87 @@ describe("userWorkerMetadata", () => {
     expect(() => userWorkerMetadata(inst(), res({ template: big }))).toThrow(
       /1000000/,
     );
+  });
+
+  describe("hook bindings (public #3200)", () => {
+    const HOOKS = {
+      name: "RL_HOOKS",
+      namespace_id: "1005",
+      simple: { limit: 600, period: 60 },
+    };
+    const rest = (tpl.ratelimits as { name: string }[]).filter(
+      (e) => e.name !== "RL_HOOKS",
+    );
+    // RL_HOOKS first, so a drop that renumbered would shift every other id.
+    const first = { ...tpl, ratelimits: [HOOKS, ...rest] };
+    const rl = (m: { bindings: Binding[] }) =>
+      Object.fromEntries(
+        m.bindings
+          .filter((b) => b.type === "ratelimit")
+          .map((b) => [b.name, b.namespace_id]),
+      );
+    const hookSecrets = {
+      SESSION_SECRET: "s",
+      CONTENT_SIGNING_KEY: "c",
+      TEST_HOOK_KEY: "k".repeat(32),
+    };
+
+    it.each(["staging", "prod"] as const)(
+      "a %s release render binds no hook, and the other ratelimits keep their slots",
+      (env) => {
+        const m = userWorkerMetadata(inst(), res({ env, template: first }));
+        expect(m.bindings.map((b) => b.name)).not.toContain("RL_HOOKS");
+        expect(JSON.stringify(m)).not.toMatch(/hook/i);
+        expect(rl(m)).toEqual(
+          Object.fromEntries(
+            rest.map((e, k) => [e.name, String(2_000_001 + k)]),
+          ),
+        );
+      },
+    );
+
+    it("a test-hook render binds RL_HOOKS in its own slot", () => {
+      const m = userWorkerMetadata(
+        inst({ testHooks: true }),
+        res({ template: first, secrets: hookSecrets }),
+      );
+      expect(rl(m)).toEqual(
+        Object.fromEntries(
+          [HOOKS, ...rest].map((e, k) => [e.name, String(2_000_000 + k)]),
+        ),
+      );
+    });
+
+    it("any template binding named like a hook is the test variant's only", () => {
+      const t = { ...tpl, vars: { ...tpl.vars, HOOK_LEDGER: "on" } };
+      expect(
+        userWorkerMetadata(inst(), res({ template: t })).bindings.map(
+          (b) => b.name,
+        ),
+      ).not.toContain("HOOK_LEDGER");
+      expect(
+        userWorkerMetadata(
+          inst({ testHooks: true }),
+          res({ template: t, secrets: hookSecrets }),
+        ).bindings.map((b) => b.name),
+      ).toContain("HOOK_LEDGER");
+    });
+
+    it("assertNoHookBindings refuses a hook name on a non-test install only", () => {
+      for (const name of ["RL_HOOKS", "TEST_HOOKS", "TEST_HOOK_KEY", "x_hook"])
+        expect(() => assertNoHookBindings([{ name }], false)).toThrow(
+          /non-test install/,
+        );
+      expect(() =>
+        assertNoHookBindings([{ name: "TEST_DOMAIN" }], false),
+      ).toThrow(/non-test install/);
+      expect(() =>
+        assertNoHookBindings([{ name: "RL_HOOKS" }], true),
+      ).not.toThrow();
+      expect(() =>
+        assertNoHookBindings([{ name: "RL_ANON" }], false),
+      ).not.toThrow();
+    });
   });
 
   it("test hooks", () => {
@@ -954,5 +1045,38 @@ describe("googleNewlyEnabled and epochBumpSql (H-ECD)", () => {
     expect(epochBumpSql()).toBe(
       "UPDATE users SET session_epoch = session_epoch + 1",
     );
+  });
+});
+
+// open-artifacts#2641: DOCS_PREVIEW opens doc creation and is staging only.
+describe("DOCS_PREVIEW var (staging only)", () => {
+  const meta = (v: string, env: "staging" | "prod") =>
+    userWorkerMetadata(inst({ vars: { DOCS_PREVIEW: v } }), res({ env }));
+  it("staging renders it as the plain var 1", () => {
+    expect(
+      meta("1", "staging").bindings.find((b) => b.name === "DOCS_PREVIEW"),
+    ).toEqual({ type: "plain_text", name: "DOCS_PREVIEW", text: "1" });
+  });
+  it("prod refuses it, with any value, naming DOCS_PREVIEW and staging only", () => {
+    for (const v of ["1", "0", ""])
+      expect(() => meta(v, "prod")).toThrow(/DOCS_PREVIEW is staging only/);
+  });
+  it("staging takes only 1", () => {
+    for (const v of ["0", "true", "", "11"])
+      expect(() => meta(v, "staging")).toThrow(/invalid var DOCS_PREVIEW/);
+  });
+  it("prod refuses it from the release template's vars too", () => {
+    const t = { ...tpl, vars: { ...tpl.vars, DOCS_PREVIEW: "1" } };
+    expect(() =>
+      userWorkerMetadata(inst(), res({ env: "prod", template: t })),
+    ).toThrow(/DOCS_PREVIEW is staging only/);
+  });
+  it("an install without it has no DOCS_PREVIEW binding, on either env", () => {
+    for (const env of ["staging", "prod"] as const)
+      expect(
+        userWorkerMetadata(inst(), res({ env })).bindings.some(
+          (b) => b.name === "DOCS_PREVIEW",
+        ),
+      ).toBe(false);
   });
 });

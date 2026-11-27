@@ -2,12 +2,24 @@ name: CI
 # Builds and tests the private packages on the overlay: the public repo at
 # PUBLIC_PIN, with this repo copied on top by scripts/overlay.sh.
 # No secrets, no environments, no deploys: those come at the cut-over (#1056).
+#
+# Pin bumps run once. The release bot's pin-bump/* PR (pin-bump.yml) changes only
+# PUBLIC_PIN, SYNCED_FROM and pnpm-lock.yaml. On the pull_request event the
+# overlay, lint and e2e jobs see that (scripts/ci/pin-only.ts) and end green at
+# once, so the required checks report and pin-bump-arm.yml can arm the PR. The
+# merge_group run, on the commit that lands, always does the full work. Every
+# other PR, and every push, dispatch and merge_group run, runs in full. The
+# decision is made inside each job, never by a paths filter or a job-level if: a
+# skipped job would leave a required check unreported. Any error means full.
+# A push to pin-land/* (pin-bump.yml direct mode, cloud #264) runs in full too:
+# main moves to that sha only once this push run passed in full (pin-land.yml,
+# pin-bump.ts land).
 on:
   pull_request:
   merge_group:
     types: [checks_requested]
   push:
-    branches: [main, scaffold]
+    branches: [main, scaffold, "pin-land/**"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -28,16 +40,76 @@ jobs:
       - name: Workers do not hardcode settings the hosted env files own
         run: node --experimental-strip-types --no-warnings scripts/ci/check-hosted-owned-vars.ts
 
-  overlay:
+  # The overlay's tests in three parallel shards (cloud #264: one job took 13
+  # min, most of a pin bump's queue run). Every shard runs the same prelude
+  # (pin checks, equivalence, install, build), then its own part: a and b split
+  # the private packages (shard-plan below, b also typechecks), c runs the
+  # root-vitest tests and the private tests inside public packages. The
+  # required check is the `overlay` job after it.
+  overlay-shard:
+    name: overlay (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c]
     env:
       # Real-build tests fail instead of skipping when the build is missing.
       OA_REQUIRE_REAL_BUILD: "1"
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: private
           persist-credentials: false
+          fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: private/.nvmrc
+      # Run once for the release bot's pin bumps: decided inside each job (a skipped
+      # or missing job would count as passing a required check). The script comes
+      # from the BASE commit, never from the code under test, and any error or any
+      # output other than exactly "pin-only" means the full run. merge_group, push
+      # and workflow_dispatch are always full. See scripts/ci/pin-only.ts.
+      - id: ro
+        name: pin-only bot PR? (decided by the base commit's script)
+        continue-on-error: true
+        working-directory: private
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pin_only=false
+          if [ "${EVENT_NAME:-}" = pull_request ]; then
+            d="$RUNNER_TEMP/pin-only"
+            mkdir -p "$d"
+            ok=true
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
+              git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
+            done
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
+            fi
+          fi
+          echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
+      - name: pin-only bot PR
+        if: ${{ steps.ro.outputs.pin_only == 'true' }}
+        run: echo "pin-only bot PR - the merge queue runs this job in full"
       - id: pin
         name: read PUBLIC_PIN
         run: |
@@ -49,6 +121,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: ${{ steps.ro.outputs.pin_only != 'true' }}
         with:
           repository: open-artifacts-ai/open-artifacts
           ref: refs/tags/${{ steps.pin.outputs.tag }}
@@ -58,17 +131,20 @@ jobs:
       # hosted paths (before the delete at cut-over F1) it removes them first
       # (--pre-split); once it holds none it is strict, so a collision fails.
       # A tree with only some of them fails. No hand-set flag.
-      - name: overlay (checks the pin; pre-split or strict, from the pinned tree)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: overlay (checks the pin; pre-split or strict, from the pinned tree)
         run: private/scripts/overlay.sh --auto-split public private
       # Private tests read the hosted workflows at .github/workflows/. They
       # live there in this repo (C2), so the overlay above copied them into
       # the tree. place-workflows.sh places only what is still parked in
       # hosted-workflows/ (nothing now) and refuses an existing target.
-      - name: place parked hosted workflows in the overlay tree
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: place parked hosted workflows in the overlay tree
         run: private/scripts/place-workflows.sh private public
       # The root .nvmrc here serves jobs that check out only this repo; it
       # must stay public's at the pin.
-      - name: .nvmrc matches public's at the pin
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: .nvmrc matches public's at the pin
         run: cmp private/.nvmrc public/.nvmrc
       # Equivalence (#1056 B2): overlay(public@S minus private paths, this
       # repo) must equal public@S, S being SYNCED_FROM's sha. Before the first
@@ -83,8 +159,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          # A staged pin's base is its one parent (the main it was built on), not
+          # the branch's previous head: a new branch has none, a rebuilt one moved.
+          if [ "$EVENT_NAME" = push ] && [[ "$REF" == refs/heads/pin-land/* ]]; then
+            BASE_SHA=$(gh api "repos/$REPO/commits/$GITHUB_SHA" --jq '.parents | if length == 1 then .[0].sha else "" end')
+            [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::a pin-land commit must have one parent"; exit 1; }
+          fi
           sha=""
           if [ -e private/SYNCED_FROM ] || [ -L private/SYNCED_FROM ]; then
             [ -f private/SYNCED_FROM ] && [ ! -L private/SYNCED_FROM ] || { echo "::error::SYNCED_FROM exists but is not a regular file"; exit 1; }
@@ -110,7 +194,7 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
-      - if: ${{ steps.synced.outputs.sha != '' }}
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && steps.synced.outputs.sha != '' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: open-artifacts-ai/open-artifacts
@@ -121,7 +205,7 @@ jobs:
       # PUBLIC_PIN is tied to SYNCED_FROM while public holds the hosted paths:
       # the pin may lead the sync only if public did not touch them (cloud #5),
       # and a moved SYNCED_FROM must carry the public fix (port check).
-      - if: ${{ steps.synced.outputs.sha != '' }}
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && steps.synced.outputs.sha != '' }}
         name: pin-check (PUBLIC_PIN is tied to SYNCED_FROM)
         env:
           PREV: ${{ steps.synced.outputs.prev }}
@@ -132,25 +216,29 @@ jobs:
           else
             private/scripts/pin-check.sh public-synced private
           fi
-      - if: ${{ steps.synced.outputs.sha != '' }}
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && steps.synced.outputs.sha != '' }}
         name: equivalence (outside the private paths, the overlay equals public at SYNCED_FROM)
         run: private/scripts/equivalence.sh public-synced private
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           package_json_file: public/package.json
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: public/.nvmrc
           cache: pnpm
           cache-dependency-path: public/pnpm-lock.yaml
-      - name: pnpm install
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: pnpm install
         working-directory: public
         run: pnpm install --frozen-lockfile
       # What to build and test, from this repo's tracked files: private
       # packages, root-vitest tests (scripts/ci, scripts/ops, scripts/audit) and private tests
       # inside public packages. Fails on a package without test or typecheck,
       # a test with no owning package, or an empty tree after the sync.
-      - id: pkgs
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        id: pkgs
         name: plan (private packages and tests)
         env:
           PLAN: ${{ runner.temp }}/plan
@@ -159,8 +247,28 @@ jobs:
           private/scripts/ci-plan.sh public private "$PLAN"
           echo "count=$(grep -c '' "$PLAN/packages.txt" || true)" >> "$GITHUB_OUTPUT"
           echo "dir=$PLAN" >> "$GITHUB_OUTPUT"
+      # Shard a takes the slowest packages, b the rest, c none. A name in A
+      # that the plan doesn't hold fails, so a rename can't drop a package
+      # from every shard; b is the plan minus A, so a new package lands in b.
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' }}
+        name: this shard's packages
+        env:
+          PLAN: ${{ steps.pkgs.outputs.dir }}
+        run: |
+          set -euo pipefail
+          A=(apps/provisioning packages/provision tests/redline)
+          for d in "${A[@]}"; do
+            grep -qxF "$d" "$PLAN/packages.txt" || { echo "::error::shard a names $d, which the plan does not hold"; exit 1; }
+          done
+          case "$SHARD" in
+            a) printf '%s\n' "${A[@]}" > "$PLAN/shard.txt" ;;
+            b) grep -vxF -f <(printf '%s\n' "${A[@]}") "$PLAN/packages.txt" > "$PLAN/shard.txt" || true ;;
+            c) : > "$PLAN/shard.txt" ;;
+            *) echo "::error::unknown shard '$SHARD'"; exit 1 ;;
+          esac
+          echo "shard $SHARD packages:"; cat "$PLAN/shard.txt"
       - name: no private packages yet
-        if: ${{ steps.pkgs.outputs.count == '0' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count == '0' }}
         run: |
           if [ -f private/SYNCED_FROM ]; then
             echo "::error::SYNCED_FROM exists but there are no private packages; the job must not pass empty"
@@ -168,12 +276,12 @@ jobs:
           fi
           echo "::warning::No private packages in this tree yet (before the sync). Build, typecheck and test are skipped."
       - name: SYNCED_FROM is required once there are private packages
-        if: ${{ steps.pkgs.outputs.count != '0' && steps.synced.outputs.sha == '' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' && steps.synced.outputs.sha == '' }}
         run: |
           echo "::error::the plan found private packages but there is no SYNCED_FROM: no pin tie and no equivalence check would run"
           exit 1
       - name: build
-        if: ${{ steps.pkgs.outputs.count != '0' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' }}
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
@@ -185,7 +293,7 @@ jobs:
       # Each private package must define typecheck and test (ci-plan checks);
       # run them one by one, without --if-present, so each one visibly runs.
       - name: typecheck
-        if: ${{ steps.pkgs.outputs.count != '0' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' && matrix.shard == 'b' }}
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
@@ -198,7 +306,7 @@ jobs:
             echo "typecheck ran: $d"
           done < "$PLAN/packages.txt"
       - name: test (private packages)
-        if: ${{ steps.pkgs.outputs.count != '0' }}
+        if: ${{ steps.ro.outputs.pin_only != 'true' && steps.pkgs.outputs.count != '0' }}
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
@@ -209,8 +317,9 @@ jobs:
             pnpm --filter "./$d" run test
             echo "::endgroup::"
             echo "test ran: $d"
-          done < "$PLAN/packages.txt"
-      - name: test (private scripts/ci, scripts/ops and scripts/audit)
+          done < "$PLAN/shard.txt"
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && matrix.shard == 'c' }}
+        name: test (private scripts/ci, scripts/ops and scripts/audit)
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
@@ -219,11 +328,27 @@ jobs:
           mapfile -t t < "$PLAN/root-tests.txt"
           if [ "${#t[@]}" -eq 0 ]; then echo "no private root-vitest tests"; exit 0; fi
           pnpm exec vitest run "${t[@]}"
-      - name: test (private tests inside public packages)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' && matrix.shard == 'c' }}
+        name: test (private tests inside public packages)
         working-directory: public
         env:
           PLAN: ${{ steps.pkgs.outputs.dir }}
         run: ../private/scripts/ci-public-tests.sh . "$PLAN"
+
+  # The required check: green only when every shard succeeded. always() so it
+  # runs, and reports red, when a shard fails or is cancelled: a skipped job
+  # would count as passing.
+  overlay:
+    needs: [overlay-shard]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: every overlay shard succeeded
+        env:
+          RESULT: ${{ needs.overlay-shard.result }}
+        run: |
+          [ "$RESULT" = success ] || { echo "::error::overlay shards: $RESULT"; exit 1; }
+          echo "every overlay shard succeeded"
 
   # The overlay prelude the hosted workflows use (.github/actions/overlay),
   # run for real: this repo at _cloud, then the action. Proves the tree lands
@@ -267,22 +392,78 @@ jobs:
         with:
           path: _cloud
           persist-credentials: false
-      - uses: ./_cloud/.github/actions/overlay
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+          fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: _cloud/.nvmrc
+      # Run once for the release bot's pin bumps: decided inside each job (a skipped
+      # or missing job would count as passing a required check). The script comes
+      # from the BASE commit, never from the code under test, and any error or any
+      # output other than exactly "pin-only" means the full run. merge_group, push
+      # and workflow_dispatch are always full. See scripts/ci/pin-only.ts.
+      - id: ro
+        name: pin-only bot PR? (decided by the base commit's script)
+        continue-on-error: true
+        working-directory: _cloud
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pin_only=false
+          if [ "${EVENT_NAME:-}" = pull_request ]; then
+            d="$RUNNER_TEMP/pin-only"
+            mkdir -p "$d"
+            ok=true
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
+              git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
+            done
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
+            fi
+          fi
+          echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
+      - name: pin-only bot PR
+        if: ${{ steps.ro.outputs.pin_only == 'true' }}
+        run: echo "pin-only bot PR - the merge queue runs this job in full"
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: ./_cloud/.github/actions/overlay
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: biome (error level)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        run: pnpm install --frozen-lockfile
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: biome (error level)
         run: pnpm exec biome check --diagnostic-level=error scripts/ci scripts/ops scripts/audit .github/workflows
-      - name: tsc (scripts/ci, scripts/ops, scripts/audit)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: tsc (scripts/ci, scripts/ops, scripts/audit)
         run: pnpm exec tsc --noEmit -p scripts/audit/tsconfig.json
       # Public's undeclared-workspace-read check, over the overlay so the
       # hosted packages are covered (#17). Prints the cloud packages it read.
-      - name: undeclared workspace reads (overlay, hosted packages included)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: undeclared workspace reads (overlay, hosted packages included)
         run: node --experimental-strip-types --no-warnings scripts/audit/workspace-reads-overlay.ts
-      - name: actionlint (runs shellcheck on run blocks)
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: actionlint (runs shellcheck on run blocks)
         run: |
           set -euo pipefail
           command -v shellcheck
@@ -293,7 +474,11 @@ jobs:
           mkdir "$RUNNER_TEMP/actionlint"
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
           cd _cloud
-          "$RUNNER_TEMP/actionlint/actionlint" -color .github/workflows/*.yml
+          # actionlint 1.7.12 predates concurrency's `queue` key (GitHub docs:
+          # single or max); cloud-flaky-tracker.yml uses `queue: max`.
+          "$RUNNER_TEMP/actionlint/actionlint" -color \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml
 
   # The provisioning and admin Playwright suites (#17), on the overlay. Both
   # start their own server (provisioning: the Worker in Miniflare; admin: vite
@@ -321,21 +506,75 @@ jobs:
         with:
           path: _cloud
           persist-credentials: false
-      - uses: ./_cloud/.github/actions/overlay
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+          fetch-depth: 0   # pin-only.ts diffs base...head
+      # The runner's own node is not relied on: the decision step needs Node 22.6+
+      # for --experimental-strip-types (ubuntu-latest ships 22 today).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: _cloud/.nvmrc
+      # Run once for the release bot's pin bumps: decided inside each job (a skipped
+      # or missing job would count as passing a required check). The script comes
+      # from the BASE commit, never from the code under test, and any error or any
+      # output other than exactly "pin-only" means the full run. merge_group, push
+      # and workflow_dispatch are always full. See scripts/ci/pin-only.ts.
+      - id: ro
+        name: pin-only bot PR? (decided by the base commit's script)
+        continue-on-error: true
+        working-directory: _cloud
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pin_only=false
+          if [ "${EVENT_NAME:-}" = pull_request ]; then
+            d="$RUNNER_TEMP/pin-only"
+            mkdir -p "$d"
+            ok=true
+            for f in pin-only pin-bump-arm pin-bump gh-retry; do
+              git show "$BASE_SHA:scripts/ci/$f.ts" > "$d/$f.ts" 2> /dev/null || ok=false
+            done
+            if [ "$ok" != true ]; then
+              echo "full run: the base commit has no scripts/ci/pin-only.ts yet"
+            else
+              out=$(node --experimental-strip-types --no-warnings "$d/pin-only.ts" 2> "$d/why") || out=""
+              cat "$d/why"
+              if [ "$out" = "pin-only" ]; then
+                pin_only=true
+              else
+                echo "full run: the decision did not answer pin-only"
+              fi
+            fi
+          fi
+          echo "pin_only=$pin_only" >> "$GITHUB_OUTPUT"
+      - name: pin-only bot PR
+        if: ${{ steps.ro.outputs.pin_only == 'true' }}
+        run: echo "pin-only bot PR - the merge queue runs this job in full"
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: ./_cloud/.github/actions/overlay
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: the image matches @playwright/test
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        run: pnpm install --frozen-lockfile
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: the image matches @playwright/test
         env:
           APP: ${{ matrix.app }}
         run: |
           set -euo pipefail
           v="$(node -p "require('./apps/$APP/node_modules/@playwright/test/package.json').version")"
           [ "$v" = "$PLAYWRIGHT_IMAGE_VERSION" ] || { echo "::error::@playwright/test is $v but the image is $PLAYWRIGHT_IMAGE_VERSION: bump the image in ci.yml"; exit 1; }
-      - name: e2e (@oa/${{ matrix.app }})
+      - if: ${{ steps.ro.outputs.pin_only != 'true' }}
+        name: e2e (@oa/${{ matrix.app }})
         env:
           APP: ${{ matrix.app }}
         run: pnpm --filter "@oa/$APP" test:e2e

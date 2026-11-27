@@ -5,6 +5,12 @@
 # it as any other: pin-check's port check and equivalence. This workflow never
 # arms or merges, and never opens a second PR: while any pin-bump/* PR is open,
 # or a PR already took the newest tag (open, merged or closed), it does nothing.
+# One exception (#425): an open bump for an older tag that is red and not armed
+# is closed, with a comment, and replaced by the bump to the newest release.
+# CI runs once for the bump: the required checks pass at once on the PR (ci.yml,
+# scripts/ci/pin-only.ts) and the full suite runs in the merge queue, on the commit
+# that lands. If that run fails, the PR leaves the queue and stays un-armed
+# (pin-bump-arm.yml); the stale rule below is what finally turns this run red.
 # An open pin-bump PR older than STALE_PR_MS (3 days) turns the run red, so a
 # stuck PR cannot quietly block later releases.
 #
@@ -13,35 +19,106 @@
 #   runs `pnpm install --lockfile-only` (it reads the public tree's pnpmfile,
 #   npmrc and workspace config, so it is inside no trust boundary) and uploads
 #   pnpm-lock.yaml, as data, and nothing else.
+#   It then runs the public workspace's dependency install and build code
+#   (--ignore-scripts, but the build is public code), so NOTHING from this job is
+#   trusted beyond its two artifacts, and `open` re-validates both as data. A
+#   future cache in any job that holds secrets would make this cache poisoning,
+#   so none may be added.
+#   It also derives the surfaces port's mechanical files (tests/redline/live/manifest.json,
+#   test/cases-added.ts and the counts in test/surfaces.test.ts) from the overlaid
+#   tree's src/surfaces.ts, with an install that runs no scripts, and uploads only
+#   the resulting plan (case names and counts) as data.
 # - open: a fresh runner on main's checkout. It never checks out or runs the
 #   public tree, and never installs. It plans again itself (nothing from
-#   prepare but the lockfile is trusted), re-applies the pin files, takes the
-#   lockfile as data, and only then mints the App token to push and open the PR.
+#   prepare but the lockfile and the plan are trusted), re-applies the pin files,
+#   takes the lockfile as data, applies the plan with main's own
+#   tests/redline/scripts/redline-regen.ts (which accepts only plain case names), and only then mints the App token to push and open the PR.
 # - report: issues: write, no checkout. Red keeps one `blocker` issue titled
 #   "pin-bump failed" open with the run URL; green closes it. A run past its
 #   timeout is reported as cancelled, so cancelled counts as red: anything but
 #   success is red, except an `open` skipped because there was nothing to bump.
+#
+# Direct mode (cloud #264): with the repo variable PIN_BUMP_DIRECT set to `on`,
+# both plans run `plan-direct` (no PR is read) and there is no PR, but CI still
+# gates main. `open` pushes the same App-signed commit to pin-land/<tag>, never to
+# main, and CI runs on it in full. pin-land.yml's `land` job then moves main to
+# it once CI passed there (its header has the rules). A bump whose surfaces port
+# is not empty is what pin-bump-arm leaves for a person, so it goes the PR path
+# below instead. plan-direct waits while pin-bump-arm's release pipeline gate is
+# shut (a gate workflow queued or running, or main's pin not yet on prod and not
+# rejected), so a direct bump lands no sooner than an armed PR would. The gate
+# opens only when a gate workflow ends, so in direct mode that end starts the
+# plan again (see Triggers below). Unset (or anything but `on`), the PR path
+# runs exactly as before.
+#
+# Triggers (cloud #264). Event-only: there is no schedule. A stable public
+# release starts this at once (public release-please.yml, cloud-pin-bump:
+# `gh workflow run pin-bump.yml --ref main`). That run does nothing while an
+# older bump is open and green, so when a pin lands on main (a pin PR merges, or
+# land moves main), the push that changes PUBLIC_PIN runs the same plan again at
+# once: a release that waited behind the open bump is bumped then. In direct
+# mode, a release that waited on the release pipeline gate is planned when a
+# gate workflow ends, on any branch (GATE_WORKFLOWS in scripts/ci/pin-bump-arm.ts):
+# readGate counts their queued and running runs on every branch, since a run
+# off main still uses the shared staging and prod environments, so the end of
+# any run it counts can open the gate. The branch is never trusted: the job
+# runs main's checkout and the plan decides from readGate itself. The
+# plan is the same idempotent check whatever starts it, so an event with nothing
+# newer does nothing. A failure is red and files the blocker issue (report,
+# below); no timer retries it. Every job runs only on main of this repo, never
+# on a fork.
+# This workflow only plans and opens; it never moves main, and the push never
+# starts the lander. Landing is pin-land.yml, with its own concurrency group.
+# GitHub keeps one pending run per group and a newer event replaces it, so each
+# group holds one kind of work: every run here plans and opens, every run there
+# lands. Whichever run survives in a pending slot does all the work of the one
+# it replaced (a release dispatch is never replaced by a run that only lands).
+# An event no job takes (a workflow_run outside direct mode) runs nothing,
+# report included, so it never closes the blocker issue.
 name: pin-bump
 
 on:
-  schedule:
-    - cron: "23 */6 * * *"
   workflow_dispatch:
+  # A pin landed on main: plan again for a newer release (see Triggers above).
+  push:
+    branches: [main]
+    paths: [PUBLIC_PIN]
+  # Direct mode only, from main's copy of this file and script; nothing from the
+  # event is used: a release pipeline gate workflow ended, on any branch (the
+  # gate counts runs on every branch), so the gate may be open now.
+  workflow_run:
+    workflows:
+      [
+        hosted-publish,
+        staging-release-chain,
+        deploy-hosted-platform,
+        redline-staging,
+        prod-release-chain,
+      ]
+    types: [completed]
 
 permissions: {}
 
+# One run at a time, never cancelled. GitHub keeps one pending run per group,
+# and a newer event replaces it, so every run in this group does the same work:
+# the plan, then open (Triggers above). An event no job takes (a workflow_run
+# outside direct mode) gets a group of its own, so it can never replace a
+# pending run that has work to do. The test for this group is the same as the
+# jobs' `if`s.
 concurrency:
-  group: pin-bump
+  group: ${{ (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on') && 'pin-bump' || format('pin-bump-idle-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+      statuses: read
     outputs:
       bump: ${{ steps.plan.outputs.bump }}
     steps:
@@ -54,11 +131,12 @@ jobs:
         with:
           node-version-file: private/.nvmrc
       - id: plan
-        name: Is there a newer public release with no PR
+        name: Is there a newer public release to take
         working-directory: private
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+          MODE: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'plan-direct' || 'plan' }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts "$MODE" --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -95,7 +173,9 @@ jobs:
           pnpm install --lockfile-only
           mkdir -p "$RUNNER_TEMP/lock"
           cp pnpm-lock.yaml "$RUNNER_TEMP/lock/pnpm-lock.yaml"
-      # Only the lockfile leaves this job, and open takes it as data.
+      # Only the lockfile and the surfaces plan leave this job, and open takes them as data.
+      # The lockfile is uploaded before any public build code runs, and v4
+      # artifacts can't be overwritten by name, so the build can't swap it.
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -103,15 +183,39 @@ jobs:
           path: ${{ runner.temp }}/lock/pnpm-lock.yaml
           if-no-files-found: error
           retention-days: 1
+      # The mechanical half of a surfaces port, derived from the overlaid tree's
+      # src/surfaces.ts (tests/redline/src/regen.ts). The install runs no
+      # lifecycle scripts. A route that still needs its classification is a
+      # warning here and a named failure in CI (tests/redline/test/regen.test.ts).
+      - if: steps.plan.outputs.bump == 'true'
+        name: Plan the surfaces port (manifest, cases-added, counts)
+        working-directory: public
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --filter "@oa/redline^..." build
+          mkdir -p "$RUNNER_TEMP/regen"
+          cd tests/redline
+          node --experimental-strip-types --no-warnings scripts/redline-regen.ts plan --out "$RUNNER_TEMP/regen/plan.json"
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/regen/plan.json
+          if-no-files-found: error
+          retention-days: 1
 
   open:
     needs: prepare
-    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.bump == 'true'
+    if: github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || vars.PIN_BUMP_DIRECT == 'on') && needs.prepare.outputs.bump == 'true'
     runs-on: ubuntu-latest
+    environment: release-app
     timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+      statuses: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -125,7 +229,8 @@ jobs:
         name: Plan again
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+          MODE: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'plan-direct' || 'plan' }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts "$MODE" --repo "$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.bump == 'true'
         name: Move the pin files
         env:
@@ -146,6 +251,38 @@ jobs:
           [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular pnpm-lock.yaml in the artifact"; exit 1; }
           [ "$(wc -c < "$f")" -le 10000000 ] || { echo "::error::the lockfile is over 10 MB"; exit 1; }
           cp "$f" pnpm-lock.yaml
+      - if: steps.plan.outputs.bump == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
+          path: ${{ runner.temp }}/regen
+      # The plan is data: main's own script validates every case name (plain
+      # printable text, no quote, backtick, backslash or dollar sign) and writes the
+      # three files from fixed templates. Nothing from the public tree runs here.
+      - if: steps.plan.outputs.bump == 'true'
+        name: Apply the surfaces plan as data
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/regen/plan.json"
+          [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular plan.json in the artifact"; exit 1; }
+          [ "$(wc -c < "$f")" -le 2000000 ] || { echo "::error::the plan is over 2 MB"; exit 1; }
+          node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan "$f" --dir tests/redline
+      # Direct mode lands only what pin-bump-arm would arm without a person: a
+      # surfaces port (new redline cases and counts) goes to a PR for review.
+      - id: route
+        if: steps.plan.outputs.bump == 'true'
+        name: Direct or a PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
+          DIRECT: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'on' || 'off' }}
+        run: |
+          set -euo pipefail
+          surfaces=same
+          git diff --quiet HEAD -- tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts || surfaces=changed
+          node --experimental-strip-types scripts/ci/pin-bump.ts route --repo "$GITHUB_REPOSITORY" --tag "$TAG" --direct "$DIRECT" --surfaces "$surfaces" --branch "$BRANCH" --supersede "$SUPERSEDE" >> "$GITHUB_OUTPUT"
       - id: app
         if: steps.plan.outputs.bump == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -157,18 +294,18 @@ jobs:
       # The commit is made through the git-data API with the App token, never with
       # local git: GitHub then records the App's bot as author and committer and
       # signs it (verified), and the push needs only the App's contents write.
-      - if: steps.plan.outputs.bump == 'true'
-        name: Commit and push the branch (App-signed, through the API)
+      - id: commit
+        if: steps.plan.outputs.bump == 'true' && (steps.route.outputs.route == 'direct' || steps.route.outputs.pr == 'true')
+        name: Commit the pin (App-signed, through the API)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
           REPO: ${{ github.repository }}
           BASE: ${{ github.sha }}
         run: |
           set -euo pipefail
           entries='[]'
-          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml; do
+          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts; do
             base64 < "$f" | tr -d '\n' | jq -Rs '{content: ., encoding: "base64"}' > "$RUNNER_TEMP/blob.json"
             blob=$(gh api "repos/$REPO/git/blobs" --input "$RUNNER_TEMP/blob.json" --jq .sha)
             entries=$(jq -c --arg p "$f" --arg s "$blob" '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<< "$entries")
@@ -178,6 +315,18 @@ jobs:
           tree=$(gh api "repos/$REPO/git/trees" --input "$RUNNER_TEMP/tree.json" --jq .sha)
           jq -n --arg m "chore(pin): bump PUBLIC_PIN to $TAG" --arg t "$tree" --arg p "$BASE" '{message: $m, tree: $t, parents: [$p]}' > "$RUNNER_TEMP/commit.json"
           commit=$(gh api "repos/$REPO/git/commits" --input "$RUNNER_TEMP/commit.json" --jq .sha)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "committed $commit on $BASE"
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
+        name: Push the branch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BRANCH: ${{ steps.route.outputs.branch }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          set -euo pipefail
+          commit="$COMMIT"
           # plan found no PR, open or closed, for this branch, so a leftover
           # branch from a run that died before opening one is safe to replace.
           if gh api "repos/$REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
@@ -186,18 +335,30 @@ jobs:
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" > /dev/null
           fi
           echo "pushed $BRANCH at $commit"
-      - if: steps.plan.outputs.bump == 'true'
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
         name: Open the PR (never armed)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
           SHA: ${{ steps.plan.outputs.sha }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
-        run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH"
+          BRANCH: ${{ steps.route.outputs.branch }}
+          SUPERSEDE: ${{ steps.route.outputs.supersede }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH" --supersede "$SUPERSEDE"
+      # Direct mode: the commit goes to pin-land/<tag> for CI; main does not move here.
+      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.route == 'direct'
+        name: Stage the pin for CI (direct mode)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ github.sha }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo "$GITHUB_REPOSITORY" --base "$BASE" --commit "$COMMIT" --tag "$TAG" --sha "$SHA"
 
   report:
     needs: [prepare, open]
-    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    # Only when prepare ran: an event no job took reports nothing.
+    if: ${{ always() && github.repository == 'open-artifacts-ai/open-artifacts-cloud' && github.ref == 'refs/heads/main' && needs.prepare.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -207,7 +368,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          RESULT: ${{ (needs.prepare.result != 'success' || needs.open.result == 'failure' || needs.open.result == 'cancelled') && 'failure' || 'success' }}
+          RESULT: ${{ (needs.prepare.result == 'failure' || needs.prepare.result == 'cancelled' || needs.open.result == 'failure' || needs.open.result == 'cancelled') && 'failure' || 'success' }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail

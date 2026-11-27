@@ -143,3 +143,43 @@ export function ownerVars(
     ...(o.testHooks ? { TEST_DOMAIN: STAGING_TEST_DOMAIN } : {}),
   };
 }
+
+/** The owner-intent keys ownerVars reads from an install's stored vars. */
+const OWNER_KEYS = [
+  "AUTH_PROVIDERS",
+  "TIER",
+  "EMAIL_CODE_DOMAIN",
+  "TEST_DOMAIN",
+  "AUTH_DOMAIN_JOIN",
+  DOMAIN_JOIN_SOURCE_VAR,
+] as const;
+
+/**
+ * R29's AUTH_PROVIDERS (open-artifacts-cloud#435): email codes on or off for
+ * an install that signs in with Google. `value` is "google" or
+ * "google,email" (the contract's AUTH_PROVIDERS_VALUES). Only email is added
+ * or removed: the stored list must already hold google and the new one keeps
+ * it, so Google never toggles and no broker key changes hands. Never with
+ * EMAIL_CODE_DOMAIN (domain codes need Google off). Returns the stored vars
+ * with AUTH_PROVIDERS replaced, after the owner part passes ownerVars as a
+ * login change would leave it; every other var stays as stored.
+ */
+export function withAuthProviders(
+  stored: Record<string, string>,
+  value: string,
+  o: Omit<OwnerVarsOptions, "login">,
+): Record<string, string> {
+  if (value !== "google" && value !== "google,email")
+    throw refused("AUTH_PROVIDERS must be google, or google,email");
+  if (!(stored.AUTH_PROVIDERS ?? "").split(",").includes("google"))
+    throw refused("AUTH_PROVIDERS changes only on a Google install");
+  if (stored.EMAIL_CODE_DOMAIN !== undefined)
+    throw refused("AUTH_PROVIDERS can't change with EMAIL_CODE_DOMAIN set");
+  const after: Record<string, string> = { ...stored, AUTH_PROVIDERS: value };
+  const owner: Record<string, string> = {};
+  for (const k of OWNER_KEYS)
+    if (after[k] !== undefined) owner[k] = after[k] as string;
+  owner.AUTH_DOMAINS = after.AUTH_DOMAINS ?? "";
+  ownerVars(JSON.stringify(owner), { ...o, login: true });
+  return after;
+}

@@ -506,3 +506,144 @@ export function scrubDirs(
     return { scrubbed: 0, dropped: reasonCode(e) };
   }
 }
+
+// ---- the report scan (#294) -------------------------------------------------
+// The report folder is public. A text grep can't see inside a zip (trace
+// copies, nested zips) or inside the base64 zip the Playwright HTML reporter
+// embeds in index.html, and error-context.md (a page snapshot on failure) can
+// hold any on-screen value. Both are handled here and fail closed.
+// The HTML report is kept (it is the report people open); the config that
+// picks the reporter lives in the public repo, so we scan it instead.
+
+/** Drops every error-context.md under `dirs`; returns how many. */
+export function dropErrorContext(dirs: readonly string[]): number {
+  let n = 0;
+  for (const d of dirs)
+    if (existsSync(d))
+      for (const f of walk(d))
+        if (f.endsWith("error-context.md")) {
+          rmSync(f, { force: true });
+          n++;
+        }
+  return n;
+}
+
+const MEDIA = /\.(?:png|jpe?g|webp|gif|webm|mp4)$/i;
+
+/** Drops every screenshot and video under `dirs` (a picture can show any on-screen value); returns how many. */
+export function dropMedia(dirs: readonly string[]): number {
+  let n = 0;
+  for (const d of dirs)
+    if (existsSync(d))
+      for (const f of walk(d))
+        if (MEDIA.test(f)) {
+          rmSync(f, { force: true });
+          n++;
+        }
+  return n;
+}
+
+const BLOB_RE = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
+
+/**
+ * Rebuilds each embedded base64 zip in the .html files under `dirs` without its
+ * media entries, in place, so a red run keeps its report. Any failure to read
+ * or rebuild deletes that html file (fail closed). Returns {stripped, dropped}.
+ */
+export function stripEmbeddedMedia(dirs: readonly string[]): {
+  stripped: number;
+  dropped: number;
+} {
+  let stripped = 0;
+  let dropped = 0;
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    for (const f of walk(d)) {
+      if (!f.endsWith(".html")) continue;
+      try {
+        // Inline image and video data URIs become an empty one.
+        const text = readFileSync(f, "latin1").replace(
+          /data:(?:image|video)\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/_=-]*/gi,
+          "data:,",
+        );
+        let changed = text !== readFileSync(f, "latin1");
+        const out = text.replace(BLOB_RE, (m) => {
+          const b = Buffer.from(m, "base64");
+          if (b.length < 4 || b.readUInt32LE(0) !== 0x04034b50) return m;
+          const entries = readZip(b);
+          if (!entries.some((e) => MEDIA.test(e.name))) return m;
+          changed = true;
+          const kept = entries.filter((e) => !MEDIA.test(e.name));
+          const nz = writeZip(kept);
+          readZip(nz); // read the rebuilt zip back
+          return nz.toString("base64");
+        });
+        if (changed) {
+          writeFileSync(f, out, "latin1");
+          stripped++;
+        }
+      } catch {
+        rmSync(f, { force: true });
+        dropped++;
+      }
+    }
+  }
+  return { stripped, dropped };
+}
+
+const SECRET_SHAPE = /oa_(?:pat|mac)_/;
+// Base64 split across lines is not reassembled (Playwright writes the embedded
+// zip on one line today); a split blob is scanned only in pieces.
+const BLOB = /[A-Za-z0-9+/_-]{64,}={0,2}/g;
+const MAX_DEPTH = 6;
+
+class Hit extends Error {}
+
+function scanBytes(b: Buffer, lit: readonly string[], depth: number): void {
+  if (depth > MAX_DEPTH) throw new Error("scan: nested too deep");
+  if (b.length >= 4 && b.readUInt32LE(0) === 0x04034b50) {
+    // A zip: every entry, which may itself be a zip or hold base64.
+    // An image or video inside a zip can't be inspected for on-screen values:
+    // fail closed (the file holding the zip is dropped).
+    for (const e of readZip(b)) {
+      if (MEDIA.test(e.name)) throw new Error("scan: media inside a zip");
+      scanBytes(e.data, lit, depth + 1);
+    }
+    return;
+  }
+  for (const l of lit) if (l && b.includes(l)) throw new Hit("hit");
+  const text = b.toString("latin1");
+  if (SECRET_SHAPE.test(text)) throw new Hit("hit");
+  for (const m of text.matchAll(BLOB))
+    scanBytes(Buffer.from(m[0], "base64"), lit, depth + 1);
+}
+
+/**
+ * Scans every file under `dirs`: its bytes, every zip inside (nested too) and
+ * every base64 blob (the HTML reporter's embedded zip). A file that can't be
+ * read as a whole is deleted (never uploaded); a hit is listed, never shown.
+ */
+export function scanDirs(
+  dirs: readonly string[],
+  literals: readonly string[],
+): { scanned: number; dropped: string[]; hits: string[] } {
+  const dropped: string[] = [];
+  const hits: string[] = [];
+  let scanned = 0;
+  for (const d of dirs) {
+    if (!existsSync(d)) continue;
+    for (const f of walk(d)) {
+      scanned++;
+      try {
+        scanBytes(readFileSync(f), literals, 0);
+      } catch (e) {
+        if (e instanceof Hit) hits.push(f);
+        else {
+          rmSync(f, { force: true });
+          dropped.push(f);
+        }
+      }
+    }
+  }
+  return { scanned, dropped, hits };
+}

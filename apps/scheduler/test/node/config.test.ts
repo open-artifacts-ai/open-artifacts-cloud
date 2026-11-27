@@ -46,12 +46,11 @@ describe("wrangler.jsonc", () => {
         SIGNUPS_ENABLED: `{{SIGNUPS_ENABLED_${env.toUpperCase()}}}`,
         // #1343: prod's fleet is on, its canary first.
         FLEET_CANARY: env === "staging" ? "i33m6mbc3zuz" : "ifhx5rpmrhwh",
-        // #1343: leo goes second on prod. The smoke's token and share
-        // target are secrets, never vars: no address is ever committed.
-        FLEET_SECOND: env === "staging" ? "" : "iwfhpuiwmfba",
-        // #1343: required on prod, its smoke secrets set; off on staging
-        // until its setup.
-        FLEET_SMOKE: env === "staging" ? "off" : "required",
+        // The smoke's token and share target are secrets, never vars: no
+        // address is ever committed. No install goes second (cloud #433).
+        // #1343: required on both, each env's smoke secrets set (staging's
+        // since 2026-11-26, cloud #264).
+        FLEET_SMOKE: "required",
         // The share check is on in both: an explicit, committed choice.
         FLEET_SMOKE_SHARE: "on",
         // #1299: on exactly when red-line's flag says the /bus routes are
@@ -98,10 +97,23 @@ describe("wrangler.jsonc", () => {
         },
       ]);
       // The signups duty's producer (src/provapi/signups.ts), this env's
-      // queue only.
+      // queue only; and the consumer of this env's fleet wake (cloud #264,
+      // src/provapi/wake.ts): delivered at once, one batch at a time.
       expect(e.queues).toEqual({
         producers: [{ binding: "SIGNUPS", queue: names.signups }],
+        consumers: [
+          {
+            queue: names.fleetWake,
+            max_batch_size: 10,
+            max_batch_timeout: 0,
+            max_retries: 3,
+            max_concurrency: 1,
+          },
+        ],
       });
+      expect(names.fleetWake).toBe(
+        env === "staging" ? "oa-s-fleet-wake" : "oa-p-fleet-wake",
+      );
       // The operator alerts' one sending binding (src/provapi/alerts.ts),
       // restricted to the env's ALERT_TO (the same placeholder as the var).
       expect(e.send_email).toEqual([
@@ -164,6 +176,7 @@ describe("wrangler.jsonc", () => {
       "services",
       "workflows",
       "send_email",
+      "queues",
     ])
       expect(cfg).not.toHaveProperty(k);
   });

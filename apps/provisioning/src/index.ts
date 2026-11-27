@@ -6,6 +6,7 @@ import { handle } from "./app.js";
 import { sweepOAuthClientsAll } from "./auth/oauth/endpoints.js";
 import type { Env } from "./env.js";
 import { loginChange } from "./routes/login-change.js";
+import { OPTOUT_PATHS, optout } from "./routes/optouts.js";
 
 export type { Env } from "./env.js";
 
@@ -16,6 +17,9 @@ export type { Env } from "./env.js";
  */
 export class LoginChangeGate extends WorkerEntrypoint<Env> {
   override fetch(req: Request): Promise<Response> {
+    // The opt-out list (#2652) shares this entrypoint and its gate.
+    if (OPTOUT_PATHS.has(new URL(req.url).pathname))
+      return optout(req, this.env);
     return loginChange(req, this.env);
   }
 }

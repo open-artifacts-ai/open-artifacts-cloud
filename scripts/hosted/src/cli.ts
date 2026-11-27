@@ -52,11 +52,13 @@ import {
   PROVISIONER_MAX_TOKEN_DAYS,
   platformNames,
   probeR2Conditionals,
+  pruneStaged,
   publishFloor,
   publishRelease,
   type R2Credentials,
   type R2Releases,
   type ReleaseReader,
+  type RotationResult,
   r2ReleaseReader,
   r2S3Client,
   WfpProvisioner,
@@ -78,15 +80,29 @@ export const RETIRED_COMMANDS = [
   "billing-backfill",
 ] as const;
 
-export const COMMANDS = ["status", "publish-release", "publish-floor"] as const;
+/** The two hosted backfills (open-artifacts#2775, #2820): each puts a secret on the active installs that lack it. */
+export const BACKFILL_COMMANDS = [
+  "backfill-push-keys",
+  "backfill-optout-key",
+] as const;
+
+export const COMMANDS = [
+  "status",
+  "publish-release",
+  "publish-floor",
+  ...BACKFILL_COMMANDS,
+] as const;
 type Command = (typeof COMMANDS)[number];
 
 export const HELP = `Usage: pnpm -s --filter @oa/hosted start <command> --env staging|prod [flags]
 
 Commands:
   status          --install <id>  (read-only)
-  publish-release --tag v<version>  (gh release download of oa-release-<env>-*, verified, then uploaded)
+  publish-release --tag v<version> [--stage-only]  (gh release download of oa-release-<env>-*, verified, then uploaded in parallel, the record last; --stage-only stops before the record)
   publish-floor   --floor <path to floor-<env>-<seq>.sig.json>
+  backfill-push-keys   [--dry-run] [--detail]  (a browser push key pair on every active install that has none; never rotates a pair)
+  backfill-optout-key  [--dry-run] [--detail]  (the email opt-out key on every active install that has none; never rotates it)
+                       --dry-run reads only and counts what it would write; --detail lists installs (never in CI: logs are public)
 
 Install writes (create, upgrade, rollback, update-vars, delete, release-lease,
 owner tokens, red-line creds) go through the Provisioning API.
@@ -180,10 +196,16 @@ interface Flags {
   install?: string;
   tag?: string;
   floor?: string;
+  stageOnly?: boolean;
+  dryRun?: boolean;
+  detail?: boolean;
 }
 
 /** Every refusal that needs no call: exits 1 before the token is read. */
-function parse(argv: string[]): { cmd: Command; f: Flags } {
+function parse(
+  argv: string[],
+  runEnv: Deps["env"],
+): { cmd: Command; f: Flags } {
   let p: ReturnType<typeof parseArgs>;
   try {
     p = parseArgs({
@@ -195,6 +217,9 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
         install: { type: "string" },
         tag: { type: "string" },
         floor: { type: "string" },
+        "stage-only": { type: "boolean" },
+        "dry-run": { type: "boolean" },
+        detail: { type: "boolean" },
       },
     });
   } catch (e) {
@@ -217,6 +242,9 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
     install: v.install as string | undefined,
     tag: v.tag as string | undefined,
     floor: v.floor as string | undefined,
+    ...(v["stage-only"] === true ? { stageOnly: true } : {}),
+    ...(v["dry-run"] === true ? { dryRun: true } : {}),
+    ...(v.detail === true ? { detail: true } : {}),
   };
   const need = (k: keyof Flags, flag: string) => {
     if (typeof f[k] !== "string" || f[k] === "")
@@ -233,6 +261,16 @@ function parse(argv: string[]): { cmd: Command; f: Flags } {
       throw new Refused("--tag must be a release tag like v1.2.3");
   } else if (f.tag !== undefined)
     throw new Refused("--tag is for publish-release only");
+  if (f.stageOnly && cmd !== "publish-release")
+    throw new Refused("--stage-only is for publish-release only");
+  const isBackfill = (BACKFILL_COMMANDS as readonly string[]).includes(cmd);
+  if (f.dryRun && !isBackfill)
+    throw new Refused("--dry-run is for the backfill commands only");
+  if (f.detail && !isBackfill)
+    throw new Refused("--detail is for the backfill commands only");
+  // The run log of a CI job is public: install ids go only to a laptop.
+  if (f.detail && inCi(runEnv))
+    throw new Refused("--detail is refused in CI: the log is public");
   if (cmd === "publish-floor") need("floor", "floor");
   else if (f.floor !== undefined)
     throw new Refused("--floor is for publish-floor only");
@@ -425,7 +463,7 @@ export async function main(argv: string[], d: Deps): Promise<number> {
   let cmd: Command;
   let f: Flags;
   try {
-    ({ cmd, f } = parse(argv));
+    ({ cmd, f } = parse(argv, d.env));
   } catch (e) {
     return fail("args", e);
   }
@@ -605,6 +643,46 @@ async function brokerOn(
   return row?.vars ? googleNewlyEnabled({}, JSON.parse(row.vars)) : false;
 }
 
+export type BackfillOutcome =
+  | "would_write"
+  | "written"
+  | "present"
+  | "not_active"
+  | "half_pair"
+  | "failed";
+
+function outcomeOf(r: RotationResult): BackfillOutcome {
+  if (r.ok)
+    return r.planned ? "would_write" : r.rotated ? "written" : "present";
+  // The reason names the install: only its kind is kept for a public log.
+  if (
+    / is (creating|upgrading|[a-z_]+); rerun the backfill/.test(r.reason ?? "")
+  )
+    return "not_active";
+  if (/half pair/.test(r.reason ?? "")) return "half_pair";
+  return "failed";
+}
+
+/** Counts per outcome: no install id, slug, reason text or key. */
+export function summarize(results: RotationResult[], dryRun: boolean) {
+  const counts: Record<BackfillOutcome, number> = {
+    would_write: 0,
+    written: 0,
+    present: 0,
+    not_active: 0,
+    half_pair: 0,
+    failed: 0,
+  };
+  for (const r of results) counts[outcomeOf(r)]++;
+  return {
+    dryRun,
+    installs: results.length,
+    ...counts,
+    // Not written, though it should be: a rerun after the cause is fixed.
+    failed_total: counts.not_active + counts.half_pair + counts.failed,
+  };
+}
+
 async function run(
   cmd: Command,
   f: Flags,
@@ -626,6 +704,28 @@ async function run(
   switch (cmd) {
     case "status":
       return { ok: true, data: await prov.status(id) };
+    case "backfill-push-keys":
+    case "backfill-optout-key": {
+      const dryRun = f.dryRun === true;
+      const results =
+        cmd === "backfill-push-keys"
+          ? await prov.backfillPushKeys(env, { dryRun })
+          : await prov.backfillOptoutKey(env, { dryRun });
+      const sum = summarize(results, dryRun);
+      return {
+        ok: sum.failed_total === 0,
+        data: f.detail
+          ? {
+              ...sum,
+              detail: results.map((r) => ({
+                id: r.id,
+                outcome: outcomeOf(r),
+                ...(r.reason ? { reason: r.reason } : {}),
+              })),
+            }
+          : sum,
+      };
+    }
     case "publish-floor": {
       const r2 = s3();
       await probeR2Conditionals(r2, env);
@@ -667,6 +767,7 @@ async function run(
             r2,
             env,
             version,
+            ...(f.stageOnly ? { stageOnly: true } : {}),
             files: {
               tar: d.readFile(`${base}.tar`),
               sig: d.readFile(`${base}.sig.json`),
@@ -687,7 +788,29 @@ async function run(
             status: r.status,
           });
         }
-        return { ok: true, data: { version, published: out } };
+        // Once this version has its record, older staged versions (files, no
+        // record) can never be published and read as dirty to prodClean:
+        // delete them (pruneStaged). Never fails the publish: the record is
+        // already written, and prodClean still reports any that are left.
+        let pruned: string[] = [];
+        if (!f.stageOnly && out.some((x) => x.variant === "release")) {
+          try {
+            const p = await pruneStaged({ cf, r2, env, published: version });
+            pruned = p.pruned;
+            c.emit({
+              step: "prune",
+              status: "ok",
+              data: { pruned: p.pruned, kept: p.kept },
+            });
+          } catch (e) {
+            c.emit({
+              step: "prune",
+              status: "warn",
+              message: `staged versions were not pruned: ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+            });
+          }
+        }
+        return { ok: true, data: { version, published: out, pruned } };
       } finally {
         d.removeTree(dir);
       }

@@ -52,7 +52,17 @@ export interface R2Releases {
   ): Promise<{ etag: string }>;
   /** Deletes a probe/<32 hex> key only (probeR2Conditionals); any other key is refused. */
   deleteProbe(key: string): Promise<void>;
+  /**
+   * Deletes one object of a staged release variant (pruneStaged): a key
+   * releases/<version>/release/<file> other than the record. The record,
+   * floor.json, a redline object and any other key are refused.
+   */
+  deleteStaged(key: string): Promise<void>;
 }
+
+/** A staged release object pruneStaged may delete: never the record or the floor. */
+export const STAGED_KEY =
+  /^releases\/\d{1,6}\.\d{1,6}\.\d{1,6}\/release\/(?!record\.sig\.json$).+$/;
 
 const sha256Hex = (b: Uint8Array) =>
   createHash("sha256").update(b).digest("hex");
@@ -197,6 +207,13 @@ export function r2S3Client(o: {
       if (typeof key !== "string" || !PROBE_KEY.test(key))
         throw new Error(
           "deleteProbe only deletes the R2 probe's throwaway keys (probe/<32 hex>)",
+        );
+      await call("DELETE", key, {}, [404]);
+    },
+    async deleteStaged(key) {
+      if (typeof key !== "string" || !STAGED_KEY.test(key) || !releaseKey(key))
+        throw new Error(
+          "deleteStaged only deletes a staged release object (releases/<version>/release/<file>, never the record)",
         );
       await call("DELETE", key, {}, [404]);
     },

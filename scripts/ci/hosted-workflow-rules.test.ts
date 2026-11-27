@@ -65,7 +65,13 @@ describe("W9b: the retired hosted writes stay retired", () => {
         /--filter @oa\/hosted start\s+(?:"\$\{[^}]*\}"|([a-z-]+))/g,
       ))
         expect(
-          ["status", "publish-release", "publish-floor"],
+          [
+            "status",
+            "publish-release",
+            "publish-floor",
+            "backfill-push-keys",
+            "backfill-optout-key",
+          ],
           `${f}: ${cmd}`,
         ).toContain(cmd ?? "(argv)");
     }

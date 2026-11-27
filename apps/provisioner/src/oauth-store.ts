@@ -22,7 +22,9 @@ import {
   NAMESPACES,
   names,
   newSecret,
+  OwnerVarsRefusal,
   ProvisionRefused,
+  withAuthProviders,
 } from "@oa/provision";
 import {
   COPY_KEY_GONE_ACTION,
@@ -31,7 +33,9 @@ import {
   OAUTH_DUAL_SETTLE_MS,
   OAUTH_MODE_LIVE_ACTION,
   OAUTH_MODE_LIVE_SQL,
+  OAUTH_STORE_MODES,
   type OAuthStoreMode,
+  parseOAuthJob,
   storedOAuthMode,
 } from "@oa/provisioning-contract";
 import { failingAt, tagFail } from "./errors.js";
@@ -162,26 +166,130 @@ async function checkModeChange(
   return { ok: true };
 }
 
+/**
+ * What an R29 job wants. Local to the cloud: it reads DOCS_PREVIEW itself, so
+ * it builds on a contract that has no docsPreview (before open-artifacts#2715)
+ * and on one that does, whether its mode is required or optional.
+ */
+export type SetWant = {
+  mode?: OAuthStoreMode;
+  docsPreview?: "1" | "";
+  /** cloud#435: "google" or "google,email", email codes off or on. */
+  authProviders?: "google" | "google,email";
+};
+export type OAuthOp = ({ op: "set" } & SetWant) | { op: "copy" };
+export const DOCS_PREVIEW_ACTION = "docs_preview.set";
+/** cloud#435: hosted_audit's record of an AUTH_PROVIDERS change by R29. */
+export const AUTH_PROVIDERS_ACTION = "auth_providers.set";
+
+/** An `update` job's args as its operation, or null for anything else. */
+export function parseOAuthOp(a: Record<string, unknown>): OAuthOp | null {
+  if (a.oauthCopy !== undefined)
+    return parseOAuthJob(a)?.op === "copy" ? { op: "copy" } : null;
+  const vars = a.vars;
+  if (!vars || typeof vars !== "object" || Array.isArray(vars)) return null;
+  const v = vars as Record<string, unknown>;
+  const keys = Object.keys(v);
+  if (
+    keys.length === 0 ||
+    keys.some(
+      (k) =>
+        k !== "OAUTH_STORE" && k !== "DOCS_PREVIEW" && k !== "AUTH_PROVIDERS",
+    )
+  )
+    return null;
+  const mode = v.OAUTH_STORE;
+  const docs = v.DOCS_PREVIEW;
+  const auth = v.AUTH_PROVIDERS;
+  if (auth !== undefined && auth !== "google" && auth !== "google,email")
+    return null;
+  if (mode !== undefined && !OAUTH_STORE_MODES.includes(mode as OAuthStoreMode))
+    return null;
+  if (docs !== undefined && docs !== "1" && docs !== "") return null;
+  return {
+    op: "set",
+    ...(mode !== undefined && { mode: mode as OAuthStoreMode }),
+    ...(docs !== undefined && { docsPreview: docs as "1" | "" }),
+    ...(auth !== undefined && {
+      authProviders: auth as "google" | "google,email",
+    }),
+  };
+}
+
+/**
+ * cloud#435: `stored` with AUTH_PROVIDERS = `value`, through @oa/provision's
+ * withAuthProviders (Google kept, ownerVars as a create); its refusals become
+ * the step's.
+ */
+export function checkAuthProviders(
+  stored: Record<string, string>,
+  value: "google" | "google,email",
+  source: "admin" | "self-serve",
+  selfServeTier: string,
+  testHooks: boolean,
+  env: ReturnType<typeof deployEnv>,
+): Record<string, string> {
+  try {
+    return withAuthProviders(stored, value, {
+      source,
+      selfServeTier,
+      testHooks,
+      env,
+    });
+  } catch (e) {
+    if (e instanceof OwnerVarsRefusal) throw refused(e.why);
+    throw e;
+  }
+}
+
+const authProvidersVars = (
+  ctx: CreateCtx,
+  job: ManageJob,
+  row: { test_hooks: number },
+  vars: Record<string, string>,
+  value: "google" | "google,email",
+): Record<string, string> => {
+  if (job.source === undefined) throw refused("no install source");
+  return checkAuthProviders(
+    vars,
+    value,
+    job.source,
+    ctx.env.SELF_SERVE_TIER,
+    row.test_hooks === 1,
+    deployEnv(ctx.env.OA_ENV),
+  );
+};
+
 /** updateVars with the merged vars. A LostLease leaves as it came. */
 async function putMode(
   ctx: CreateCtx,
   job: ManageJob,
   label: string,
-  want: OAuthStoreMode,
+  want: SetWant,
 ): Promise<{ version: string }> {
   const row = await installRow(ctx, job.installId);
   if (!row) throw refused("no installs row");
-  const vars = { ...storedVars(row.vars), OAUTH_STORE: want };
+  const vars = { ...storedVars(row.vars) };
+  if (want.mode !== undefined) vars.OAUTH_STORE = want.mode;
+  // open-artifacts#2641: "1" sets the staging preview var, "" removes it.
+  if (want.docsPreview === "1") vars.DOCS_PREVIEW = "1";
+  else if (want.docsPreview === "") delete vars.DOCS_PREVIEW;
+  // cloud#435: only email is added or removed, Google kept; the stored vars
+  // with it pass ownerVars as a create would, before anything is written.
+  const merged =
+    want.authProviders === undefined
+      ? vars
+      : authProvidersVars(ctx, job, row, vars, want.authProviders);
   const w = await renderOptions(ctx, {
     jobId: job.jobId,
     label,
     installId: job.installId,
     appHost: row.app_host,
-    vars,
+    vars: merged,
     testHooks: row.test_hooks === 1,
     registryDisabled: job.registryDisabled,
   });
-  const r = await w.updateVars(job.installId, vars);
+  const r = await w.updateVars(job.installId, merged);
   // The new vars are live but a check after them failed: a person looks.
   if (!r.ok)
     throw new ProvisionRefused(
@@ -284,26 +392,80 @@ async function removeKv(
   return { removed: true };
 }
 
-/** R29's steps. No catch here: LostLease must reach the step as it is. */
+/**
+ * R29's steps. No catch here: LostLease must reach the step as it is. A
+ * DOCS_PREVIEW-only job has no mode to check or verify: it skips both.
+ */
 export async function setOAuthStore(
   ctx: CreateCtx,
   step: WorkflowStep,
   job: ManageJob,
   label: string,
-  want: OAuthStoreMode,
+  want: SetWant,
 ): Promise<void> {
   const { jobId } = job;
-  await jobStep(ctx, step, jobId, "precheck", OAUTH_READ_STEP, () =>
-    checkModeChange(ctx, job, want),
-  );
+  const mode = want.mode;
+  if (mode !== undefined)
+    await jobStep(ctx, step, jobId, "precheck", OAUTH_READ_STEP, () =>
+      checkModeChange(ctx, job, mode),
+    );
   await jobStep(ctx, step, jobId, "update_vars", OAUTH_UPLOAD_STEP, () =>
     putMode(ctx, job, label, want),
   );
-  await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
-    modeLive(ctx, job, want),
-  );
+  if (mode !== undefined)
+    await jobStep(ctx, step, jobId, "mode_live", undefined, () =>
+      modeLive(ctx, job, mode),
+    );
+  // Marked as update_vars: the update kind's steps are fixed (JOB_STEPS).
+  if (want.docsPreview !== undefined) {
+    const value = want.docsPreview;
+    await jobStep(
+      ctx,
+      step,
+      jobId,
+      "docs_preview_audit",
+      undefined,
+      async () => {
+        await transient(
+          auditStatement(
+            ctx,
+            job.installId,
+            DOCS_PREVIEW_ACTION,
+            { value },
+            jobId,
+          ).run(),
+        );
+        return { value };
+      },
+      "update_vars",
+    );
+  }
+  // cloud#435, marked as update_vars like the preview's audit.
+  if (want.authProviders !== undefined) {
+    const value = want.authProviders;
+    await jobStep(
+      ctx,
+      step,
+      jobId,
+      "auth_providers_audit",
+      undefined,
+      async () => {
+        await transient(
+          auditStatement(
+            ctx,
+            job.installId,
+            AUTH_PROVIDERS_ACTION,
+            { value },
+            jobId,
+          ).run(),
+        );
+        return { value };
+      },
+      "update_vars",
+    );
+  }
   // Marked as mode_live: the update kind's steps are fixed (JOB_STEPS).
-  if (want === "d1")
+  if (mode === "d1")
     await jobStep(
       ctx,
       step,

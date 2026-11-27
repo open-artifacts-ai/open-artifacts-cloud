@@ -1,0 +1,112 @@
+# The flaky tracker (cloud #447, #264). Tracking only: it reruns nothing and
+# changes nothing that blocks. When a CI run, or a release gate (a
+# redline-staging run dispatched on main), passes on attempt 2 or later, every
+# test that failed on an earlier attempt of that same run (same head sha)
+# failed and then passed with nothing changed. scripts/ci/cloud-flaky-tracker.ts
+# reads the earlier attempts' failed job logs and records each such test, with
+# its run link, as a sighting in one `flaky-sightings` issue (the store). A
+# test seen in two runs within 7 days opens or bumps one open issue labelled
+# `flaky`, with the run links and the last author of the test file (assigned
+# when GitHub allows it, else named in plain text). The script says why the
+# store is an issue. Public's CI has its own copy in the public repo:
+# workflow_run can't see another repo's runs.
+# Runs from forks (a PR from another repo) count too. This job still runs in
+# this repo with this repo's code: it checks out github.sha (the default
+# branch for workflow_run), never the fork's head, and runs nothing from the
+# run under test. What a fork's run gives it (its title, branch, logs and the
+# test names in them) is data: passed through env, never put in an
+# expression inside a script, and made inert before it is written to an issue.
+# No clock (cloud #264): after every completed run of the watched workflows
+# (cancelled and skipped ones aside), and on dispatch, the same job
+# reconciles: it tracks every run of the watched workflows created in the
+# last 60 days and 26 hours (GitHub allows a rerun for 30 days, and the next
+# completion may come up to 30 quiet days after it; the 26 hours are slack)
+# that passed after a failed attempt and is not in the store yet, however
+# long ago it passed (same rules, same code), so a tracker run GitHub dropped
+# is tracked by the next completion and loses no sighting. Every handled run
+# is marked in the store, so the longer range costs only the listing. A listing of 1,000 runs or more (GitHub's limit for one
+# query) is split into smaller creation ranges, and the reconcile fails if
+# one second still has that many. A run already in the store adds nothing.
+# The default token only: it reads the run's jobs and logs and the commits of
+# the test files, and writes issues. No App, no secret, no Environment.
+#
+# TODO(lane 3): a run that calls redline-staging as a reusable workflow (the
+# nightly today, a queue gate later) raises workflow_run under the caller's
+# name, so this file never sees it. When the queue gate lands, add it to
+# `workflows` below and read its called jobs the same way. Not built yet.
+name: flaky-tracker
+on:
+  workflow_run:
+    workflows: [CI, redline-staging]
+    types: [completed]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  track:
+    # This repo's main only: workflow_run always runs the default branch, and
+    # a dispatch from another branch or a copy of this repo is skipped.
+    if: >-
+      github.repository == 'open-artifacts-ai/open-artifacts-cloud' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped'))
+    # One group per repo, with no per-run part: tracker runs never overlap,
+    # so two runs can't both open the same issue or store, or bump from a stale
+    # body. On the job, so a skipped run (a cancelled CI run) joins no group
+    # and can't displace a pending one. queue: max keeps up to 100 pending
+    # runs in order instead of only the newest; GitHub cancels any past that,
+    # and the next run's reconcile tracks their runs. It can't be combined with
+    # cancel-in-progress: true.
+    concurrency:
+      group: flaky-tracker
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      # The event's own run, when it passed after a failed attempt.
+      - name: Record the flaky tests
+        if: >-
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.run_attempt > 1 &&
+          (github.event.workflow_run.path == '.github/workflows/ci.yml' ||
+          (github.event.workflow_run.path == '.github/workflows/redline-staging.yml' &&
+          github.event.workflow_run.event == 'workflow_dispatch' &&
+          github.event.workflow_run.head_branch == 'main'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The workflow by its file: workflow_run.name is the run-name, which
+          # for redline-staging carries the tag ("redline-staging v0.247.0").
+          WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          case "$WORKFLOW_PATH" in
+            .github/workflows/ci.yml) WORKFLOW=CI ;;
+            .github/workflows/redline-staging.yml) WORKFLOW=redline-staging ;;
+            *) echo "not a watched workflow: $WORKFLOW_PATH"; exit 1 ;;
+          esac
+          node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --run-id "$RUN_ID" --attempt "$ATTEMPT" --head-sha "$HEAD_SHA" --title "$TITLE"
+      # Every run, right after the record step: a run whose tracker event
+      # GitHub dropped is tracked here. A failed record step fails the job
+      # (the alert) and skips this; the next completion reconciles.
+      - name: Reconcile runs the tracker missed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node --experimental-strip-types scripts/ci/cloud-flaky-tracker.ts --repo "$GITHUB_REPOSITORY" --reconcile

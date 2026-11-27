@@ -49,14 +49,25 @@ set -uo pipefail
 # And the staging Solo test-clock workflow with its script and test (M2 step 8):
 # new hosted files that public never had.
 # And the pin-bump self-arm (#264): a workflow, its script and its test.
+# And direct mode's lander (#264), split from the pin-bump opener: a workflow.
+# And the shared gh retry for the pin-bump scripts: a script and its test.
 # And the T19 dry-run workflow (#166): a workflow that public never had.
 # And the staging half of the release chain (#264 step 1): a workflow, its
 # script and its test that public never had.
+# And the deploy's CI guard and wave plan (#264 step 3): two scripts with their
+# tests that public never had.
+# And the pin-only decision for CI's run-once rule on pin bumps: a script and its test,
+# plus the test of ci.yml's shape, that public never had.
 ALLOW=(
   pnpm-lock.yaml
+  scripts/ci/tag-ci-green.sh
+  scripts/ci/tag-ci-green.test.ts
+  scripts/ops/deploy-waves.sh
+  scripts/ops/deploy-waves.test.ts
   .github/workflows/hosted-release.yml
   .github/workflows/pin-bump.yml
   .github/workflows/pin-bump-arm.yml
+  .github/workflows/pin-land.yml
   .github/workflows/hosted-release-alert.yml
   .github/workflows/staging-release-chain.yml
   scripts/ci/staging-release-chain.ts
@@ -67,6 +78,8 @@ ALLOW=(
   scripts/ci/pin-bump.test.ts
   scripts/ci/pin-bump-arm.ts
   scripts/ci/pin-bump-arm.test.ts
+  scripts/ci/gh-retry.ts
+  scripts/ci/gh-retry.test.ts
   scripts/ci/hosted-release-alert.test.ts
   scripts/ops/billing-db.ts
   scripts/ops/billing-db.test.ts
@@ -100,6 +113,39 @@ ALLOW=(
   # The hosted-owned vars check (#262), this repo's own.
   scripts/ci/check-hosted-owned-vars.ts
   scripts/ci/check-hosted-owned-vars.test.ts
+  # The release App environment check (#302), this repo's own.
+  scripts/ci/release-app-environment.test.ts
+  # The pin-only decision (run the suite once for the release bot's pin bumps).
+  scripts/ci/pin-only.ts
+  scripts/ci/pin-only.test.ts
+  scripts/ci/ci-pin-once-workflow.test.ts
+  # The operator-run hosted backfills (push keys, opt-out key): a dispatch-only
+  # workflow and the test of its shape that public never had.
+  .github/workflows/hosted-backfill.yml
+  scripts/ci/hosted-backfill-workflow.test.ts
+  # The read-only Cloudflare log read (cf-read env): a workflow and its test.
+  .github/workflows/cf-logs.yml
+  scripts/ci/cf-logs-workflow.test.ts
+  # The one automatic rerun of a red release gate (#428): a workflow and its test.
+  .github/workflows/redline-retry.yml
+  scripts/ci/redline-retry.test.ts
+  # The release watch (#264, measure only): a workflow, its script, its test and
+  # the test's recorded runs, this repo's own.
+  .github/workflows/release-watch.yml
+  scripts/ci/release-watch.ts
+  scripts/ci/release-watch.test.ts
+  scripts/ci/release-watch.fixture.json
+  # The flaky tracker (#447): a workflow, its script and its test.
+  .github/workflows/cloud-flaky-tracker.yml
+  scripts/ci/cloud-flaky-tracker.ts
+  scripts/ci/cloud-flaky-tracker.test.ts
+  .github/workflows/release-retry.yml
+  scripts/ci/release-retry.test.ts
+  # The platform deploy's fleet wake (cloud #264), this repo's own.
+  scripts/ci/fleet-wake.sh
+  scripts/ci/fleet-wake.test.ts
+  scripts/ci/fleet-wake-capable.sh
+  scripts/ci/fleet-wake-capable.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

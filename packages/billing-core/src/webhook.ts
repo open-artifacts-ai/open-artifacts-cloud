@@ -1205,7 +1205,8 @@ export async function handleStripeWebhook(
             stripeConfigOf(env),
           );
           const st = statusFromSubscription(got.status);
-          if (st === "active" || st === "past_due") live = got.subscription ?? null;
+          if (st === "active" || st === "past_due")
+            live = got.subscription ?? null;
         } catch {
           log("subscription_read_failed");
         }

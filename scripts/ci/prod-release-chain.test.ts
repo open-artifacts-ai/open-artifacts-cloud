@@ -2,7 +2,9 @@
 // prod-release-chain.yml (#1343): a green, dispatched redline-staging run for
 // a release tag deploys that tag to the prod platform. The tag comes only from
 // the run's display title, which is redline-staging.yml's run-name; main's
-// scripts prove it again before deploy-hosted-platform.yml is dispatched.
+// scripts prove it again before hosted-publish.yml and then
+// deploy-hosted-platform.yml are dispatched, each step on the previous step's
+// own completion event (cloud #264): nothing waits, sleeps or polls.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,14 +12,22 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
+  APP_ACTOR,
+  child,
   type Exec,
+  type ExecResult,
   fresh,
   isNewer,
+  OLD_CHAIN_ACTOR,
+  plan,
   published,
   report,
+  result,
+  start,
   TITLE_RE,
   tagOf,
 } from "./prod-release-chain.ts";
+import { APP_ACTOR as STAGING_APP_ACTOR } from "./staging-release-chain.ts";
 import { root, sandbox, script } from "./stubs.ts";
 
 const read = (p: string) => readFileSync(join(root, p), "utf8");
@@ -29,7 +39,22 @@ const redline: any = parse(read(".github/workflows/redline-staging.yml"));
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const deploy: any = parse(read(".github/workflows/deploy-hosted-platform.yml"));
 // biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+const publishWf: any = parse(read(".github/workflows/hosted-publish.yml"));
+type Step = {
+  id?: string;
+  name?: string;
+  uses?: string;
+  if?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+  env?: Record<string, string>;
+};
+// biome-ignore lint/suspicious/noExplicitAny: untyped YAML
 const gateSteps: Record<string, any>[] = w.jobs.gate.steps;
+// biome-ignore lint/suspicious/noExplicitAny: untyped YAML
+const planStep: Record<string, any> = w.jobs.plan.steps.find(
+  (s: Step) => s.id === "plan",
+);
 const named = (n: string) => {
   const s = gateSteps.find((x) => x.name === n || x.id === n);
   if (!s) throw new Error(`no step ${n}`);
@@ -40,8 +65,6 @@ const TAG = "v0.99.0";
 const SHA = "a".repeat(40);
 const FULL =
   "platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler";
-const ON =
-  "${{ vars.PROD_RELEASE_CHAIN == 'on' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}";
 
 /** The title redline-staging.yml gives a run for `tag`, from its run-name. */
 const titleFor = (tag: string) =>
@@ -61,67 +84,134 @@ function tagStep(title: string) {
 }
 
 describe("prod-release-chain.yml", () => {
-  it("runs only on a completed redline-staging run, green, dispatched, with the switch on", () => {
+  it("starts only on completed redline-staging, hosted-publish and deploy-hosted-platform runs on main, with the switch on; no clock", () => {
     expect(w.on).toEqual({
-      workflow_run: { workflows: ["redline-staging"], types: ["completed"] },
+      workflow_run: {
+        workflows: [
+          "redline-staging",
+          "hosted-publish",
+          "deploy-hosted-platform",
+        ],
+        types: ["completed"],
+        branches: ["main"],
+      },
     });
-    // The name it listens for is redline-staging.yml's own.
+    // The names it listens for are each workflow's own.
     expect(redline.name).toBe("redline-staging");
-    expect(w.jobs.gate.if).toBe(ON);
-    // The report reports only a chain that was meant to run.
-    expect(w.jobs.report.if).toBe(ON.replace("${{ ", "${{ always() && "));
-    expect(w.concurrency).toEqual({
-      group: "prod-release-chain",
-      "cancel-in-progress": false,
-    });
+    expect(deploy.name).toBe("deploy-hosted-platform");
+    expect(publishWf.name).toBe("hosted-publish");
+    // cloud #264: event-driven only. No schedule, no wait, no sleep, no poll.
+    expect(w.on.schedule).toBeUndefined();
+    expect(text).not.toMatch(/wait for its run|sleep |cron:/);
     expect(Object.keys(w.jobs)).toEqual([
+      "plan",
       "gate",
-      "publish",
+      "start",
       "deploy",
+      "finish",
       "report",
     ]);
+    // The switch: nothing runs unless it is on (and plan checks it again).
+    expect(w.jobs.plan.if).toBe("${{ vars.PROD_RELEASE_CHAIN == 'on' }}");
+    expect(planStep.env.SWITCH).toBe("${{ vars.PROD_RELEASE_CHAIN }}");
+    // Each step starts only on its own event, as the plan names it.
+    expect(w.jobs.gate.needs).toBe("plan");
+    expect(w.jobs.gate.if).toBe("needs.plan.outputs.step == 'gate'");
+    expect(w.jobs.start.needs).toEqual(["plan", "gate"]);
+    expect(w.jobs.start.if).toBe("needs.gate.outputs.go == 'true'");
+    expect(w.jobs.deploy.needs).toBe("plan");
+    expect(w.jobs.deploy.if).toBe("needs.plan.outputs.step == 'deploy'");
+    expect(w.jobs.finish.needs).toBe("plan");
+    expect(w.jobs.finish.if).toBe("needs.plan.outputs.step == 'report'");
   });
 
-  it("least privilege: nothing at the top, each job only what it needs", () => {
+  it("no run-level concurrency (a pending step is never replaced by an unrelated event); the two starting jobs share the tag's group", () => {
+    expect(w.concurrency).toBeUndefined();
+    for (const j of ["start", "deploy"])
+      expect(w.jobs[j].concurrency).toEqual({
+        group: "prod-release-chain-${{ needs.plan.outputs.tag }}",
+        "cancel-in-progress": false,
+      });
+    for (const j of ["plan", "gate", "finish", "report"])
+      expect(w.jobs[j].concurrency).toBeUndefined();
+  });
+
+  it("least privilege: nothing at the top, each job only what it needs; no job token can dispatch", () => {
     expect(w.permissions).toEqual({});
-    expect(w.jobs.gate.permissions).toEqual({
-      contents: "read",
-      actions: "read",
-    });
-    // The dispatching job alone gets actions: write.
-    for (const j of ["publish", "deploy"])
+    expect(w.jobs.plan.permissions).toEqual({ contents: "read" });
+    for (const j of ["gate", "start", "deploy", "finish"])
       expect(w.jobs[j].permissions).toEqual({
         contents: "read",
-        actions: "write",
+        actions: "read",
       });
-    expect(
-      Object.entries(w.jobs)
-        .filter(([, j]) => JSON.stringify(j).includes('"actions":"write"'))
-        .map(([n]) => n),
-    ).toEqual(["publish", "deploy"]);
     expect(w.jobs.report.permissions).toEqual({
       contents: "read",
       issues: "write",
     });
+    // The job tokens only read actions (a comment may say what the App holds).
+    expect(text.replace(/^\s*#.*$/gm, "")).not.toMatch(/^\s+actions: write/m);
     expect(text).not.toMatch(/id-token|write-all|read-all|secrets: inherit/);
+  });
+
+  it("dispatches with the release App's token (a default-token run raises no workflow_run event), minted only in the main-only release-app Environment, right before the dispatch", () => {
+    const envs = Object.fromEntries(
+      Object.entries(w.jobs).map(([n, j]) => [
+        n,
+        (j as { environment?: string }).environment,
+      ]),
+    );
+    expect(envs).toEqual({
+      plan: undefined,
+      gate: "hosted-prod-deploy",
+      start: "release-app",
+      deploy: "release-app",
+      finish: undefined,
+      report: undefined,
+    });
+    for (const j of ["start", "deploy"]) {
+      const steps = w.jobs[j].steps as Step[];
+      const ids = steps.map((s) => s.id ?? s.name ?? s.uses);
+      const app = steps.find((s) => s.id === "app") as Step;
+      const d = steps.find((s) => s.id === "dispatch") as Step;
+      expect(ids.indexOf("app"), j).toBe(ids.indexOf("dispatch") - 1);
+      expect(app.uses).toBe(
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
+      );
+      expect(app.with).toEqual({
+        "app-id": "${{ secrets.RELEASE_APP_ID }}",
+        "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+        "permission-actions": "write",
+      });
+      // Minted only when something will be dispatched.
+      expect(app.if).toBe("steps.start.outputs.go == 'true'");
+      expect(d.if).toBe("steps.start.outputs.go == 'true'");
+      expect(d.env?.GH_TOKEN).toBe("${{ steps.app.outputs.token }}");
+    }
+    // The App's secrets appear in those two steps only.
+    const withSecret = Object.values(w.jobs).flatMap((j) =>
+      ((j as { steps: Step[] }).steps ?? []).filter((s) =>
+        JSON.stringify(s).includes("RELEASE_APP_"),
+      ),
+    );
+    expect(withSecret).toHaveLength(2);
   });
 
   it("pins every action by SHA and keeps no git credentials", () => {
     for (const l of text.split("\n").filter((l) => /^\s*- uses: /.test(l)))
       expect(l).toMatch(/@[0-9a-f]{40} # v\d/);
-    for (const job of [w.jobs.gate, w.jobs.deploy, w.jobs.report])
+    for (const job of Object.values(w.jobs) as { steps: Step[] }[])
       for (const s of job.steps) {
         if (!s.uses) continue;
         expect(s.uses).toMatch(/@[0-9a-f]{40}$/);
         if (String(s.uses).startsWith("actions/checkout@")) {
-          expect(s.with.ref).toBe("${{ github.sha }}");
-          expect(s.with["persist-credentials"]).toBe(false);
+          expect(s.with?.ref).toBe("${{ github.sha }}");
+          expect(s.with?.["persist-credentials"]).toBe(false);
         }
       }
   });
 
   it("no expression in any run line: every value reaches a script through env", () => {
-    for (const job of [w.jobs.gate, w.jobs.deploy, w.jobs.report])
+    for (const job of Object.values(w.jobs) as { steps: Step[] }[])
       for (const s of job.steps)
         if (s.run) expect(String(s.run), s.name).not.toContain("${{");
     // The event's untrusted fields are only ever env values.
@@ -136,6 +226,25 @@ describe("prod-release-chain.yml", () => {
         GH_TOKEN: "${{ github.token }}",
       },
     );
+    expect(planStep.env).toEqual({
+      SWITCH: "${{ vars.PROD_RELEASE_CHAIN }}",
+      WORKFLOW: "${{ github.event.workflow_run.path }}",
+      CONCLUSION: "${{ github.event.workflow_run.conclusion }}",
+      RUN_EVENT: "${{ github.event.workflow_run.event }}",
+      BRANCH: "${{ github.event.workflow_run.head_branch }}",
+      HEAD_REPO: "${{ github.event.workflow_run.head_repository.full_name }}",
+      TITLE: "${{ github.event.workflow_run.display_title }}",
+      ACTOR: "${{ github.event.workflow_run.actor.login }}",
+      RUN_ID: "${{ github.event.workflow_run.id }}",
+    });
+    expect(planStep.run).toBe(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts plan --repo "$GITHUB_REPOSITORY" --switch "$SWITCH" --workflow "$WORKFLOW" --conclusion "$CONCLUSION" --event "$RUN_EVENT" --branch "$BRANCH" --head-repo "$HEAD_REPO" --title "$TITLE" --actor "$ACTOR" --run-id "$RUN_ID"',
+    );
+    expect(w.jobs.plan.outputs).toEqual({
+      step: "${{ steps.plan.outputs.step }}",
+      tag: "${{ steps.plan.outputs.tag }}",
+      child: "${{ steps.plan.outputs.child }}",
+    });
   });
 
   it("the tag parse matches redline-staging's run-name contract", () => {
@@ -260,22 +369,91 @@ describe("prod-release-chain.yml", () => {
     );
   });
 
-  it("dispatches deploy-hosted-platform.yml (no workflow_call): prod, every target, after the gate", () => {
-    const d = w.jobs.deploy;
-    expect(d.needs).toEqual(["gate", "publish"]);
-    expect(d.uses).toBeUndefined();
-    // Only when the gate says go: a skip deploys nothing.
-    expect(d.if).toBe("needs.gate.outputs.go == 'true'");
-    expect(d.environment).toBeUndefined();
-    const step = d.steps.find((s: { id?: string }) => s.id === "dispatch");
-    expect(step.env).toEqual({
+  it("start (after the gate): the publish, or the deploy when prod's bucket has the release, once, then ends", () => {
+    const steps = w.jobs.start.steps as Step[];
+    const st = steps.find((s) => s.id === "start") as Step;
+    expect(st.env).toEqual({
       GH_TOKEN: "${{ github.token }}",
       TAG: "${{ needs.gate.outputs.tag }}",
+    });
+    expect(st.run).toBe(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after gate --tag "$TAG"',
+    );
+    const d = steps.find((s) => s.id === "dispatch") as Step;
+    expect(d.env).toEqual({
+      GH_TOKEN: "${{ steps.app.outputs.token }}",
+      TAG: "${{ needs.gate.outputs.tag }}",
+      NEXT: "${{ steps.start.outputs.next }}",
+      // p for a publish, c for a deploy: the next step matches the run by it.
+      CHAIN_ID:
+        "${{ steps.start.outputs.next == 'publish' && 'p' || 'c' }}${{ github.run_id }}-${{ github.run_attempt }}",
+    });
+    expect(d.run).toBe(
+      'node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow "$NEXT" --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"',
+    );
+    expect(w.jobs.start["timeout-minutes"]).toBeLessThanOrEqual(10);
+  });
+
+  it("deploy (after the chain's publish ended): the publish is the chain's, for the tag, green, and in prod's bucket; then the deploy, once, then ends", () => {
+    const steps = w.jobs.deploy.steps as Step[];
+    expect(steps.map((s) => s.id ?? s.name ?? s.uses)).toEqual([
+      "On main",
+      steps[1]?.uses,
+      steps[2]?.uses,
+      "child",
+      "start",
+      "app",
+      "dispatch",
+    ]);
+    const c = steps.find((s) => s.id === "child") as Step;
+    expect(c.env).toEqual({
+      GH_TOKEN: "${{ github.token }}",
+      TAG: "${{ needs.plan.outputs.tag }}",
+      CHILD: "${{ needs.plan.outputs.child }}",
+    });
+    expect(c.run).toBe(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo "$GITHUB_REPOSITORY" --workflow publish --run-id "$CHILD" --tag "$TAG"',
+    );
+    const st = steps.find((s) => s.id === "start") as Step;
+    // A rerun still going (running) starts nothing.
+    expect(st.if).toBe("steps.child.outputs.state == 'success'");
+    expect(st.run).toBe(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts start --repo "$GITHUB_REPOSITORY" --public-repo "$PUBLIC_REPO" --after publish --tag "$TAG"',
+    );
+    const d = steps.find((s) => s.id === "dispatch") as Step;
+    expect(d.env).toEqual({
+      GH_TOKEN: "${{ steps.app.outputs.token }}",
+      TAG: "${{ needs.plan.outputs.tag }}",
       CHAIN_ID: "c${{ github.run_id }}-${{ github.run_attempt }}",
     });
-    expect(step.run).toBe(
+    expect(d.run).toBe(
       'node --experimental-strip-types scripts/ci/chain-dispatch.ts --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"',
     );
+    // The checkout has .github/hosted: the billing read of prod.json.
+    expect(steps[1]?.with?.["sparse-checkout"]).toBe(
+      "scripts/ci\n.github/hosted\n",
+    );
+    expect(w.jobs.deploy.outputs).toEqual({
+      url: "${{ steps.child.outputs.url }}",
+      note: "${{ steps.child.outputs.note || steps.dispatch.outputs.deploy_note }}",
+    });
+  });
+
+  it("finish (after the chain's deploy ended) reads the deploy again and dispatches nothing", () => {
+    const steps = w.jobs.finish.steps as Step[];
+    const c = steps.find((s) => s.id === "child") as Step;
+    expect(c.run).toBe(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts child --repo "$GITHUB_REPOSITORY" --workflow deploy --run-id "$CHILD" --tag "$TAG"',
+    );
+    expect(JSON.stringify(steps)).not.toMatch(/chain-dispatch|app-token/);
+    expect(w.jobs.finish.outputs).toEqual({
+      state: "${{ steps.child.outputs.state }}",
+      url: "${{ steps.child.outputs.url }}",
+      note: "${{ steps.child.outputs.note }}",
+    });
+  });
+
+  it("the deploy it dispatches is deploy-hosted-platform.yml (no workflow_call): prod, every target, require_newer", () => {
     // The chain's inputs live in the script, pinned here: prod, the full list.
     const sh = read("scripts/ci/chain-dispatch.ts");
     expect(sh).toContain('"env=prod"');
@@ -283,6 +461,7 @@ describe("prod-release-chain.yml", () => {
     expect(sh).toContain(
       `"platform-db,auth-broker,directory-broker,provision-token,provisioner,provisioning,dispatch,inventory,zones,scheduler"`,
     );
+    expect(deploy.on.workflow_call).toBeUndefined();
     // The full list is the deploy's own: its read-back and no-break-glass
     // `if:`s compare against it.
     expect(deploy.on.workflow_dispatch.inputs.targets.default).toBe(FULL);
@@ -290,8 +469,7 @@ describe("prod-release-chain.yml", () => {
     const ifOf = (n: string) => steps.find((s) => s.name === n)?.if;
     // The full list with billing (#1568) is the same list the deploy accepts
     // on both envs; the chain carries it only when prod's billing prices are
-    // filled in prod.json (chain-dispatch.test.ts), and the deploy job's
-    // checkout has .github/hosted for that read.
+    // filled in prod.json (chain-dispatch.test.ts).
     const FULLB = FULL.replace(
       "directory-broker,",
       "directory-broker,billing,",
@@ -309,35 +487,776 @@ describe("prod-release-chain.yml", () => {
       "${{ inputs.env == 'prod' && 'hosted-prod-deploy' || 'hosted-staging-deploy' }}",
     );
     expect(deploy.concurrency.group).toBe("hosted-platform-${{ inputs.env }}");
-    // Job outputs carry the dispatched run's link to the report.
-    expect(d.outputs).toEqual({
-      run: "${{ steps.dispatch.outputs.deploy_run }}",
-      url: "${{ steps.dispatch.outputs.deploy_url }}",
-      note: "${{ steps.dispatch.outputs.deploy_note }}",
-    });
-    expect(d["timeout-minutes"]).toBeGreaterThan(50);
   });
 
-  it("reports every chain run it was meant to run, the gate's failure included", () => {
+  it("reports every step the plan started, a failed plan or gate included, and nothing for an event that starts nothing", () => {
     const r = w.jobs.report;
-    expect(r.needs).toEqual(["gate", "publish", "deploy"]);
+    expect(r.needs).toEqual(["plan", "gate", "start", "deploy", "finish"]);
+    expect(r.if).toBe(
+      "${{ always() && needs.plan.result != 'skipped' && (needs.plan.result != 'success' || needs.plan.outputs.step != 'none') }}",
+    );
     const step = r.steps.find(
       (s: { name?: string }) => s.name === "Keep the blocker issue in step",
     );
     expect(step.env).toEqual({
       GH_TOKEN: "${{ github.token }}",
-      TAG: "${{ needs.gate.outputs.tag }}",
-      RESULT:
-        "${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}",
+      TAG: "${{ needs.plan.outputs.tag }}",
+      STEP: "${{ needs.plan.outputs.step }}",
+      PLAN: "${{ needs.plan.result }}",
+      GATE: "${{ needs.gate.result }}",
+      START: "${{ needs.start.result }}",
+      DEPLOY: "${{ needs.deploy.result }}",
+      FINISH: "${{ needs.finish.result }}",
+      STATE: "${{ needs.finish.outputs.state }}",
       RUN: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-      DEPLOY_RUN:
-        "${{ needs.publish.result != 'success' && needs.publish.outputs.url || needs.deploy.outputs.url }}",
+      DEPLOY_RUN: "${{ needs.finish.outputs.url || needs.deploy.outputs.url }}",
       DEPLOY_NOTE:
-        "${{ needs.publish.result != 'success' && needs.publish.outputs.note || needs.deploy.outputs.note }}",
+        "${{ needs.finish.outputs.note || needs.deploy.outputs.note || needs.start.outputs.note }}",
     });
-    expect(step.run).toBe(
-      'node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$RESULT" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"',
+    expect(step.run).toContain(
+      'result="$(node --experimental-strip-types scripts/ci/prod-release-chain.ts result --step "$STEP" --plan "$PLAN" --gate "$GATE" --start "$START" --deploy "$DEPLOY" --finish "$FINISH" --state "$STATE")"',
     );
+    expect(step.run).toContain(
+      'node --experimental-strip-types scripts/ci/prod-release-chain.ts report --repo "$GITHUB_REPOSITORY" --tag "$TAG" --result "$result" --run "$RUN" --deploy-run "$DEPLOY_RUN" --deploy-note "$DEPLOY_NOTE"',
+    );
+  });
+});
+
+const APP = "open-artifacts-release[bot]";
+it("the chain's App actor is the staging chain's (the same release App dispatches both)", () => {
+  expect(APP_ACTOR).toBe(APP);
+  expect(STAGING_APP_ACTOR).toBe(APP);
+  // deploy-hosted-platform.yml copies prod-release-chain.ts alone (require-newer).
+  expect(read("scripts/ci/prod-release-chain.ts")).not.toMatch(/from "\.\//);
+});
+const ev = (over: Partial<Parameters<typeof plan>[0]> = {}) =>
+  plan({
+    repo: REPO,
+    switch: "on",
+    workflow: ".github/workflows/redline-staging.yml",
+    conclusion: "success",
+    event: "workflow_dispatch",
+    branch: "main",
+    headRepo: REPO,
+    title: `redline-staging ${TAG}`,
+    actor: APP,
+    runId: "4242",
+    ...over,
+  });
+const PUB = {
+  workflow: ".github/workflows/hosted-publish.yml",
+  title: `hosted-publish prod ${TAG} [p77-1]`,
+};
+const DEP = {
+  workflow: ".github/workflows/deploy-hosted-platform.yml",
+  title: `deploy-hosted-platform prod ${TAG} [c78-1]`,
+};
+
+describe("plan: each step starts only on its own event", () => {
+  it("a green dispatched red-line run starts the gate, for the tag its title names", () => {
+    expect(ev()).toEqual({ step: "gate", tag: TAG });
+    // The workflow path may carry a ref suffix.
+    expect(
+      ev({ workflow: ".github/workflows/redline-staging.yml@refs/heads/main" }),
+    ).toEqual({ step: "gate", tag: TAG });
+    // A title that is not a release's leaves the tag empty: the gate's own
+    // tag step then fails red, and the report says so.
+    expect(ev({ title: "redline-staging v1.2" })).toEqual({
+      step: "gate",
+      tag: "",
+    });
+  });
+  it("a red, cancelled or called (nightly) red-line run starts nothing", () => {
+    for (const over of [
+      { conclusion: "failure" },
+      { conclusion: "cancelled" },
+      { event: "workflow_call" },
+      { event: "schedule" },
+    ])
+      expect(ev(over).step, JSON.stringify(over)).toBe("none");
+  });
+  it("the chain's prod publish ending, in any conclusion, starts the deploy step for its tag, naming the run", () => {
+    for (const conclusion of ["success", "failure", "cancelled"])
+      expect(ev({ ...PUB, conclusion })).toEqual({
+        step: "deploy",
+        tag: TAG,
+        child: "4242",
+      });
+  });
+  it("the chain's prod deploy ending starts the report step for its tag", () => {
+    expect(ev({ ...DEP, conclusion: "failure" })).toEqual({
+      step: "report",
+      tag: TAG,
+      child: "4242",
+    });
+  });
+  it("any other publish or deploy starts nothing: staging, a hand run, another actor, the other step's chain id, the default token", () => {
+    for (const over of [
+      // hosted-release's staging copy.
+      { ...PUB, event: "workflow_run", title: "hosted-publish" },
+      // A hand prod publish or deploy (no chain id).
+      { ...PUB, title: `hosted-publish prod ${TAG}` },
+      { ...DEP, title: `deploy-hosted-platform prod ${TAG}` },
+      // The staging chain's deploy.
+      { ...DEP, title: `deploy-hosted-platform staging ${TAG} [sc78-1]` },
+      { ...DEP, title: `deploy-hosted-platform prod ${TAG} [sc78-1]` },
+      // A chain id of the other step.
+      { ...PUB, title: `hosted-publish prod ${TAG} [c77-1]` },
+      { ...DEP, title: `deploy-hosted-platform prod ${TAG} [p78-1]` },
+      { ...PUB, title: `hosted-publish staging ${TAG} [p77-1]` },
+      // Not the release App.
+      { ...PUB, actor: "github-actions[bot]" },
+      { ...DEP, actor: "someone" },
+      { ...DEP, actor: "other-app[bot]" },
+      // Not a dispatch.
+      { ...DEP, event: "push" },
+      // A floor publish.
+      { ...PUB, title: "hosted-publish prod 123 [p77-1]" },
+    ])
+      expect(ev(over).step, JSON.stringify(over)).toBe("none");
+  });
+  it("nothing on another branch, from another repository (a fork), with the switch off, or for another workflow", () => {
+    for (const base of [{}, PUB, DEP])
+      for (const over of [
+        { branch: "feature" },
+        { headRepo: "someone/fork" },
+        { headRepo: "" },
+        { switch: "off" },
+        { switch: "" },
+        { switch: "ON" },
+      ])
+        expect(ev({ ...base, ...over }).step, JSON.stringify(over)).toBe(
+          "none",
+        );
+    expect(ev({ workflow: ".github/workflows/hosted-release.yml" }).step).toBe(
+      "none",
+    );
+    expect(() => ev({ ...PUB, runId: "x1" })).toThrow("bad run id");
+  });
+  it("the step reads the event as the runner would: env in, step/tag/child out", () => {
+    const d = mkdtempSync(join(tmpdir(), "chain-plan-"));
+    const out = join(d, "output");
+    const runPlan = (env: Record<string, string>) => {
+      writeFileSync(out, "");
+      const r = spawnSync("bash", ["-c", planStep.run], {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH,
+          GITHUB_OUTPUT: out,
+          GITHUB_REPOSITORY: REPO,
+          SWITCH: "on",
+          CONCLUSION: "success",
+          RUN_EVENT: "workflow_dispatch",
+          BRANCH: "main",
+          HEAD_REPO: REPO,
+          ACTOR: APP,
+          RUN_ID: "4242",
+          ...env,
+        },
+        encoding: "utf8",
+      });
+      return { status: r.status, output: readFileSync(out, "utf8") };
+    };
+    expect(runPlan({ WORKFLOW: PUB.workflow, TITLE: PUB.title })).toEqual({
+      status: 0,
+      output: `step=deploy\ntag=${TAG}\nchild=4242\n`,
+    });
+    expect(
+      runPlan({
+        WORKFLOW: ".github/workflows/redline-staging.yml",
+        TITLE: `redline-staging ${TAG}`,
+      }),
+    ).toEqual({ status: 0, output: `step=gate\ntag=${TAG}\n` });
+    // A forged second line in the title never reaches the output.
+    expect(
+      runPlan({
+        WORKFLOW: ".github/workflows/redline-staging.yml",
+        TITLE: `redline-staging ${TAG}\ntag=v9.9.9`,
+      }),
+    ).toEqual({ status: 0, output: "step=gate\ntag=\n" });
+    expect(
+      runPlan({ WORKFLOW: DEP.workflow, TITLE: DEP.title, SWITCH: "off" }),
+    ).toEqual({ status: 0, output: "step=none\n" });
+  });
+});
+
+type Api = Record<string, unknown>;
+const childRun = (over: Api = {}): Api => ({
+  id: 4242,
+  path: ".github/workflows/hosted-publish.yml",
+  status: "completed",
+  conclusion: "success",
+  event: "workflow_dispatch",
+  head_branch: "main",
+  display_title: `hosted-publish prod ${TAG} [p77-1]`,
+  html_url: "https://github.com/x/actions/runs/4242",
+  actor: { login: APP },
+  head_repository: { full_name: REPO },
+  ...over,
+});
+const readChild = (
+  r: Api | "fail",
+  which: "publish" | "deploy" = "publish",
+) => {
+  const calls: string[][] = [];
+  const res = child({
+    exec: (_c, a) => {
+      calls.push(a);
+      return r === "fail"
+        ? { code: 1, stdout: "", stderr: "HTTP 502" }
+        : { code: 0, stdout: JSON.stringify(r), stderr: "" };
+    },
+    repo: REPO,
+    which,
+    runId: "4242",
+    tag: TAG,
+  });
+  return { res, calls };
+};
+
+describe("child: the run that ended is read again by id, and must be the chain's own for the tag", () => {
+  it("green, running (a rerun going) or failed, from its newest attempt", () => {
+    const g = readChild(childRun());
+    expect(g.res).toEqual({
+      state: "success",
+      url: "https://github.com/x/actions/runs/4242",
+      conclusion: "success",
+    });
+    expect(g.calls).toEqual([
+      ["api", "-X", "GET", `repos/${REPO}/actions/runs/4242`],
+    ]);
+    expect(
+      readChild(childRun({ status: "in_progress", conclusion: null })).res
+        .state,
+    ).toBe("running");
+    expect(readChild(childRun({ status: "queued" })).res.state).toBe("running");
+    for (const conclusion of ["failure", "cancelled", "timed_out", null])
+      expect(readChild(childRun({ conclusion })).res.state).toBe("failed");
+    expect(
+      readChild(
+        childRun({
+          path: ".github/workflows/deploy-hosted-platform.yml",
+          display_title: `deploy-hosted-platform prod ${TAG} [c78-1]`,
+        }),
+        "deploy",
+      ).res.state,
+    ).toBe("success");
+  });
+  it("verifies the tag: a run for another tag, or not the chain's, throws (fail closed)", () => {
+    for (const over of [
+      { display_title: "hosted-publish prod v0.98.0 [p77-1]" },
+      { display_title: `hosted-publish prod ${TAG}` },
+      { display_title: `hosted-publish staging ${TAG} [p77-1]` },
+      { path: ".github/workflows/deploy-hosted-platform.yml" },
+      { event: "workflow_run" },
+      { head_branch: "feature" },
+      { head_repository: { full_name: "someone/fork" } },
+      { actor: { login: "github-actions[bot]" } },
+      { id: 1 },
+    ])
+      expect(() => readChild(childRun(over)), JSON.stringify(over)).toThrow(
+        "is not this chain's prod publish",
+      );
+    // The publish's run is never taken for the deploy's.
+    expect(() => readChild(childRun(), "deploy")).toThrow();
+    expect(() => readChild("fail")).toThrow(/HTTP 502/);
+    expect(() =>
+      child({
+        exec: () => ({ code: 0, stdout: "{}", stderr: "" }),
+        repo: REPO,
+        which: "publish",
+        runId: "4242",
+        tag: "v1.2",
+      }),
+    ).toThrow("not a release tag");
+  });
+  it("the step fails red on a failed run, naming it, and is neutral on a rerun still going", () => {
+    const d = mkdtempSync(join(tmpdir(), "chain-child-"));
+    const bin = join(d, "bin");
+    mkdirSync(bin);
+    const out = join(d, "output");
+    const step = (w.jobs.finish.steps as Step[]).find(
+      (s) => s.id === "child",
+    ) as Step;
+    const runStep = (r: Api) => {
+      writeFileSync(join(d, "run.json"), JSON.stringify(r));
+      writeFileSync(
+        join(bin, "gh"),
+        `#!/usr/bin/env bash\ncat "${d}/run.json"\n`,
+        {
+          mode: 0o755,
+        },
+      );
+      writeFileSync(out, "");
+      const p = spawnSync("bash", ["-c", String(step.run)], {
+        cwd: root,
+        env: {
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_OUTPUT: out,
+          GITHUB_REPOSITORY: REPO,
+          TAG,
+          CHILD: "4242",
+        },
+        encoding: "utf8",
+      });
+      return {
+        status: p.status,
+        out: p.stdout,
+        output: readFileSync(out, "utf8"),
+      };
+    };
+    const dep = {
+      path: ".github/workflows/deploy-hosted-platform.yml",
+      display_title: `deploy-hosted-platform prod ${TAG} [c78-1]`,
+    };
+    const red = runStep(childRun({ ...dep, conclusion: "failure" }));
+    expect(red.status).not.toBe(0);
+    expect(red.output).toBe(
+      "state=failed\nurl=https://github.com/x/actions/runs/4242\nnote=deploy run 4242 concluded failure: https://github.com/x/actions/runs/4242\n",
+    );
+    const going = runStep(childRun({ ...dep, status: "in_progress" }));
+    expect(going.status).toBe(0);
+    expect(going.output).toBe(
+      "state=running\nurl=https://github.com/x/actions/runs/4242\n",
+    );
+    expect(going.out).toContain(
+      "::notice title=Release chain waits for its event::",
+    );
+    const green = runStep(childRun(dep));
+    expect(green.status).toBe(0);
+    expect(green.output).toBe(
+      "state=success\nurl=https://github.com/x/actions/runs/4242\n",
+    );
+  });
+});
+
+describe("start: what the chain dispatches next for the tag, never twice", () => {
+  type W = {
+    deploys?: Api[];
+    publishes?: Api[];
+    /** Completed hosted-publish runs whose publish-prod job for TAG succeeded. */
+    inBucket?: boolean;
+    /** Runs of each list that are not the chain's prod runs, newer than ours (listed first). */
+    newer?: number;
+    /** A list page (url substring) that answers with an error. */
+    fail?: string;
+  };
+  const PUBLIC = "open-artifacts-ai/open-artifacts";
+  // The tag's commit date in the public repo, less a day.
+  const SINCE = encodeURIComponent(">=2026-11-19T12:00:00Z");
+  const NOW = Date.parse("2026-11-26T00:00:00Z");
+  /** Staging dispatches of the same tag: never the chain's prod runs. */
+  const staging = (which: "publish" | "deploy", n: number): Api[] =>
+    Array.from({ length: n }, (_, i) => ({
+      id: 10_000 + i,
+      status: "completed",
+      conclusion: "success",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      display_title:
+        which === "publish"
+          ? `hosted-publish staging ${TAG} [sp${i}-1]`
+          : `deploy-hosted-platform staging ${TAG} [sc${i}-1]`,
+      actor: { login: APP },
+      head_repository: { full_name: REPO },
+    }));
+  const chainRun = (which: "publish" | "deploy", over: Api = {}): Api => ({
+    id: which === "publish" ? 501 : 601,
+    status: "completed",
+    conclusion: "success",
+    event: "workflow_dispatch",
+    head_branch: "main",
+    display_title:
+      which === "publish"
+        ? `hosted-publish prod ${TAG} [p77-1]`
+        : `deploy-hosted-platform prod ${TAG} [c78-1]`,
+    actor: { login: APP },
+    head_repository: { full_name: REPO },
+    ...over,
+  });
+  const go = (after: "gate" | "publish", o: W = {}) => {
+    const calls: string[] = [];
+    const exec: Exec = (_c, a) => {
+      const u = a.at(-1) ?? "";
+      calls.push(u);
+      const json = (v: unknown) => ({
+        code: 0,
+        stdout: JSON.stringify(v),
+        stderr: "",
+      });
+      if (u === `repos/${PUBLIC}/commits/${TAG}`)
+        return { code: 0, stdout: "2026-11-20T12:00:00Z\n", stderr: "" };
+      if (o.fail && u.includes(o.fail))
+        return { code: 1, stdout: "", stderr: "HTTP 502" };
+      // One page of a list: every list is read since the tag's release.
+      const page = (all: Api[]) => {
+        if (!u.includes(`&created=${SINCE}&`))
+          throw new Error(`no created filter: ${u}`);
+        const p = Number(/[?&]page=(\d+)/.exec(u)?.[1]);
+        const n = Number(/[?&]per_page=(\d+)/.exec(u)?.[1]);
+        return json({
+          total_count: all.length,
+          workflow_runs: all.slice((p - 1) * n, p * n),
+        });
+      };
+      const newer = (which: "publish" | "deploy") =>
+        staging(which, o.newer ?? 0);
+      if (u.includes("/workflows/deploy-hosted-platform.yml/runs?"))
+        return page([...newer("deploy"), ...(o.deploys ?? [])]);
+      if (
+        u.includes("/workflows/hosted-publish.yml/runs?event=workflow_dispatch")
+      )
+        return page([...newer("publish"), ...(o.publishes ?? [])]);
+      if (u.includes("/workflows/hosted-publish.yml/runs?"))
+        return page([
+          ...newer("publish"),
+          ...(o.inBucket
+            ? [
+                {
+                  id: 900,
+                  status: "completed",
+                  conclusion: "success",
+                  head_branch: "main",
+                  head_repository: { full_name: REPO },
+                },
+              ]
+            : []),
+        ]);
+      if (u.includes("/runs/900/jobs"))
+        return json({
+          jobs: [
+            { name: `publish-prod release ${TAG}`, conclusion: "success" },
+          ],
+        });
+      if (/\/runs\/1\d{4}\/jobs/.test(u))
+        return json({
+          jobs: [
+            { name: `publish-staging release ${TAG}`, conclusion: "success" },
+          ],
+        });
+      throw new Error(`unexpected ${u}`);
+    };
+    return {
+      r: start({
+        exec,
+        repo: REPO,
+        publicRepo: PUBLIC,
+        after,
+        tag: TAG,
+        nowMs: NOW,
+      }),
+      calls,
+    };
+  };
+  it("after the gate: the publish; the deploy at once when prod's bucket has the release", () => {
+    expect(go("gate").r).toEqual({ go: true, next: "publish" });
+    expect(go("gate", { inBucket: true }).r).toEqual({
+      go: true,
+      next: "deploy",
+    });
+  });
+  it("after a green publish: the deploy, and the bucket must have the release (else red)", () => {
+    expect(go("publish", { inBucket: true }).r).toEqual({
+      go: true,
+      next: "deploy",
+    });
+    expect(() => go("publish")).toThrow("prod's bucket has no record");
+  });
+  it("nothing while the chain's publish or deploy of the tag is queued or running, or once its deploy succeeded", () => {
+    for (const status of ["queued", "in_progress", "waiting", "pending"]) {
+      const deploys = [chainRun("deploy", { status, conclusion: null })];
+      expect(go("gate", { deploys }).r.go, status).toBe(false);
+      expect(go("publish", { deploys, inBucket: true }).r.go, status).toBe(
+        false,
+      );
+      const publishes = [chainRun("publish", { status, conclusion: null })];
+      expect(go("gate", { publishes }).r).toEqual({
+        go: false,
+        why: `the chain's publish of ${TAG} is under way: its end is the next event`,
+      });
+    }
+    expect(
+      go("gate", { deploys: [chainRun("deploy")], inBucket: true }).r,
+    ).toEqual({
+      go: false,
+      why: `the chain already deployed ${TAG}`,
+    });
+  });
+  it("a failed earlier run does not block a new event", () => {
+    const failed = { conclusion: "failure" };
+    expect(go("gate", { publishes: [chainRun("publish", failed)] }).r).toEqual({
+      go: true,
+      next: "publish",
+    });
+    expect(
+      go("publish", { deploys: [chainRun("deploy", failed)], inBucket: true })
+        .r,
+    ).toEqual({ go: true, next: "deploy" });
+  });
+  it("counts only the chain's own runs of this tag", () => {
+    const going = { status: "in_progress", conclusion: null };
+    for (const over of [
+      { display_title: `deploy-hosted-platform prod v0.98.0 [c78-1]` },
+      { display_title: `deploy-hosted-platform prod ${TAG}` },
+      { display_title: `deploy-hosted-platform staging ${TAG} [sc78-1]` },
+      { actor: { login: "someone" } },
+      { head_branch: "feature" },
+      { head_repository: { full_name: "someone/fork" } },
+    ])
+      expect(
+        go("gate", { deploys: [chainRun("deploy", { ...going, ...over })] }).r,
+        JSON.stringify(over),
+      ).toEqual({ go: true, next: "publish" });
+  });
+  it("the previous chain's runs of the tag (github-actions[bot]) count too", () => {
+    const old = { actor: { login: OLD_CHAIN_ACTOR } };
+    expect(OLD_CHAIN_ACTOR).toBe("github-actions[bot]");
+    // Its green deploy of the tag (run 45797335479): no dispatch, after the
+    // gate or after a publish, and behind newer staging dispatches.
+    for (const newer of [0, 150]) {
+      expect(
+        go("gate", {
+          deploys: [chainRun("deploy", old)],
+          inBucket: true,
+          newer,
+        }).r,
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      expect(
+        go("publish", {
+          deploys: [chainRun("deploy", old)],
+          inBucket: true,
+          newer,
+        }).r,
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+    }
+    // Its deploy or publish still in flight: nothing.
+    const going = { ...old, status: "in_progress", conclusion: null };
+    expect(go("gate", { deploys: [chainRun("deploy", going)] }).r).toEqual({
+      go: false,
+      why: `the chain's deploy of ${TAG} is under way: its end is the next event`,
+    });
+    expect(go("gate", { publishes: [chainRun("publish", going)] }).r).toEqual({
+      go: false,
+      why: `the chain's publish of ${TAG} is under way: its end is the next event`,
+    });
+    // Its failed deploy does not block, as for this chain's own.
+    expect(
+      go("gate", {
+        deploys: [chainRun("deploy", { ...old, conclusion: "failure" })],
+        inBucket: true,
+      }).r,
+    ).toEqual({ go: true, next: "deploy" });
+    // But its run never starts a step: the event's trust check is the App.
+    expect(
+      plan({
+        repo: REPO,
+        switch: "on",
+        workflow: ".github/workflows/deploy-hosted-platform.yml",
+        conclusion: "success",
+        event: "workflow_dispatch",
+        branch: "main",
+        headRepo: REPO,
+        title: `deploy-hosted-platform prod ${TAG} [c45796848206-1]`,
+        actor: OLD_CHAIN_ACTOR,
+        runId: "45797335479",
+      }).step,
+    ).toBe("none");
+  });
+  it("an earlier success on a later page still counts: no second dispatch", () => {
+    // The Prover's case: the chain's green deploy of the tag behind 20, then
+    // 150, newer staging dispatches (page two, then page two of 100-run pages).
+    for (const newer of [20, 99, 100, 150, 250]) {
+      expect(
+        go("gate", { deploys: [chainRun("deploy")], inBucket: true, newer }).r,
+        String(newer),
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      expect(
+        go("publish", {
+          deploys: [chainRun("deploy")],
+          inBucket: true,
+          newer,
+        }).r,
+        String(newer),
+      ).toEqual({ go: false, why: `the chain already deployed ${TAG}` });
+      // A green prod publish behind them: the bucket has it, so the deploy.
+      expect(go("gate", { inBucket: true, newer }).r, String(newer)).toEqual({
+        go: true,
+        next: "deploy",
+      });
+      // The chain's publish still going, behind them: nothing.
+      expect(
+        go("gate", {
+          publishes: [
+            chainRun("publish", { status: "in_progress", conclusion: null }),
+          ],
+          newer,
+        }).r,
+        String(newer),
+      ).toEqual({
+        go: false,
+        why: `the chain's publish of ${TAG} is under way: its end is the next event`,
+      });
+    }
+    const { calls } = go("gate", {
+      deploys: [chainRun("deploy")],
+      newer: 150,
+    });
+    expect(
+      calls.filter((c) => c.includes("deploy-hosted-platform.yml/runs?")),
+    ).toEqual([
+      `repos/${REPO}/actions/workflows/deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created=${SINCE}&per_page=100&page=1`,
+      `repos/${REPO}/actions/workflows/deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created=${SINCE}&per_page=100&page=2`,
+    ]);
+  });
+  it("an unreadable page fails, with no dispatch", () => {
+    for (const fail of [
+      "deploy-hosted-platform.yml/runs?event=workflow_dispatch&branch=main&created",
+      "hosted-publish.yml/runs?branch=main&status=completed&created",
+      "hosted-publish.yml/runs?event=workflow_dispatch&branch=main&created",
+    ])
+      expect(
+        () =>
+          go("gate", {
+            newer: 150,
+            fail: `${fail}=${SINCE}&per_page=100&page=2`,
+          }),
+        fail,
+      ).toThrow("HTTP 502");
+    // A page that answers but does not parse, or is missing its count.
+    const lists =
+      (body: (p: number) => unknown): Exec =>
+      (_c, a) => {
+        const u = a.at(-1) ?? "";
+        if (u.endsWith(`/commits/${TAG}`))
+          return { code: 0, stdout: "2026-11-20T12:00:00Z", stderr: "" };
+        const p = Number(/[?&]page=(\d+)/.exec(u)?.[1]);
+        return { code: 0, stdout: JSON.stringify(body(p)), stderr: "" };
+      };
+    const full = staging("deploy", 100);
+    const run = (exec: Exec) =>
+      start({
+        exec,
+        repo: REPO,
+        publicRepo: PUBLIC,
+        after: "gate",
+        tag: TAG,
+        nowMs: NOW,
+      });
+    expect(() =>
+      run(
+        lists((p) =>
+          p === 1 ? { total_count: 101, workflow_runs: full } : {},
+        ),
+      ),
+    ).toThrow("unparsable page 2");
+    expect(() =>
+      run(lists((p) => (p === 1 ? { workflow_runs: full } : {}))),
+    ).toThrow("unparsable page 1");
+    expect(() => run(lists(() => "not json"))).toThrow("unparsable");
+    // Fewer runs than the first page counted (one went while reading).
+    expect(() =>
+      run(
+        lists((p) =>
+          p === 1
+            ? { total_count: 150, workflow_runs: full }
+            : { total_count: 149, workflow_runs: full.slice(0, 49) },
+        ),
+      ),
+    ).toThrow("refusing a partial list");
+    // More runs than GitHub lists for one query.
+    expect(() =>
+      run(lists(() => ({ total_count: 1000, workflow_runs: full }))),
+    ).toThrow("GitHub lists at most 1000");
+    // Every page full: stops at GitHub's limit instead of reading on.
+    expect(() =>
+      run(lists(() => ({ total_count: 999, workflow_runs: full }))),
+    ).toThrow("more than 1000 runs");
+  });
+  it("fails closed on an unreadable list, a bad tag or no release date", () => {
+    const at =
+      (date: string, rest: ExecResult): Exec =>
+      (_c, a) =>
+        (a.at(-1) ?? "").endsWith(`/commits/${TAG}`)
+          ? { code: 0, stdout: date, stderr: "" }
+          : rest;
+    const run = (exec: Exec, tag = TAG) =>
+      start({
+        exec,
+        repo: REPO,
+        publicRepo: PUBLIC,
+        after: "gate",
+        tag,
+        nowMs: NOW,
+      });
+    expect(() =>
+      run(at("2026-11-20T12:00:00Z", { code: 0, stdout: "{}", stderr: "" })),
+    ).toThrow("unparsable");
+    expect(() =>
+      run(
+        at("2026-11-20T12:00:00Z", { code: 1, stdout: "", stderr: "HTTP 502" }),
+      ),
+    ).toThrow("HTTP 502");
+    expect(() =>
+      run(() => ({ code: 1, stdout: "", stderr: "HTTP 404" })),
+    ).toThrow("HTTP 404");
+    for (const date of ["", "null", "yesterday", "2026-12-28T00:00:00Z"])
+      expect(
+        () => run(at(date, { code: 0, stdout: "{}", stderr: "" })),
+        date,
+      ).toThrow(/no commit date|in the future/);
+    expect(() =>
+      start({
+        exec: () => ({ code: 0, stdout: "{}", stderr: "" }),
+        repo: REPO,
+        publicRepo: "",
+        after: "gate",
+        tag: TAG,
+      }),
+    ).toThrow("--public-repo");
+    expect(() =>
+      run(() => ({ code: 0, stdout: "{}", stderr: "" }), "v1"),
+    ).toThrow("not a release tag");
+  });
+});
+
+describe("result: one result for the blocker issue", () => {
+  const r = (o: Partial<Parameters<typeof result>[0]>) =>
+    result({
+      step: "gate",
+      plan: "success",
+      gate: "skipped",
+      start: "skipped",
+      deploy: "skipped",
+      finish: "skipped",
+      state: "",
+      ...o,
+    });
+  it("only the deploy's own green end is a success (closes the issue)", () => {
+    expect(r({ step: "report", finish: "success", state: "success" })).toBe(
+      "success",
+    );
+    // The gate and the publish step starting the next one leave it.
+    expect(r({ gate: "success", start: "success" })).toBe("skipped");
+    expect(r({ step: "deploy", deploy: "success" })).toBe("skipped");
+  });
+  it("red anywhere is red: the plan, a gate, a refused dispatch, a failed publish, a failed deploy", () => {
+    expect(r({ plan: "failure" })).toBe("failure");
+    expect(r({ plan: "" })).toBe("failure");
+    expect(r({ gate: "failure" })).toBe("failure");
+    expect(r({ gate: "success", start: "failure" })).toBe("failure");
+    expect(r({ gate: "success", start: "cancelled" })).toBe("cancelled");
+    expect(r({ step: "deploy", deploy: "failure" })).toBe("failure");
+    expect(r({ step: "report", finish: "failure", state: "failed" })).toBe(
+      "failure",
+    );
+  });
+  it("a neutral skip, or a rerun still going, leaves the issue", () => {
+    // A stale or repeated event: the gate is green with go false.
+    expect(r({ gate: "success", start: "skipped" })).toBe("skipped");
+    expect(r({ step: "report", finish: "success", state: "running" })).toBe(
+      "skipped",
+    );
+    expect(r({ step: "none" })).toBe("skipped");
   });
 });
 
@@ -749,53 +1668,6 @@ describe("the gate's neutral skips", () => {
       expect(ok.out).not.toContain("::notice");
     });
   }
-  it("the report sees a skip as 'skipped': the deploy job doesn't run", () => {
-    const step = w.jobs.report.steps.find(
-      (s: { name?: string }) => s.name === "Keep the blocker issue in step",
-    );
-    // gate success and go false: deploy is skipped, so RESULT is "skipped".
-    expect(step.env.RESULT).toBe(
-      "${{ needs.gate.result != 'success' && needs.gate.result || (needs.publish.result != 'success' && needs.publish.result != 'skipped') && needs.publish.result || needs.deploy.result }}",
-    );
-    expect(w.jobs.deploy.if).toBe("needs.gate.outputs.go == 'true'");
-    expect(w.jobs.publish.if).toBe("needs.gate.outputs.go == 'true'");
-  });
-  it("the publish job (#1412) puts the release in prod's bucket before the deploy, unless it is there", () => {
-    const p = w.jobs.publish;
-    expect(p.needs).toBe("gate");
-    expect(p.if).toBe("needs.gate.outputs.go == 'true'");
-    expect(p.environment).toBeUndefined();
-    const check = p.steps.find((s: { id?: string }) => s.id === "published");
-    expect(check.run).toContain("prod-release-chain.ts published");
-    const step = p.steps.find((s: { id?: string }) => s.id === "dispatch");
-    expect(step.if).toBe("steps.published.outputs.published != 'true'");
-    expect(step.run).toBe(
-      'node --experimental-strip-types scripts/ci/chain-dispatch.ts --workflow publish --repo "$GITHUB_REPOSITORY" --tag "$TAG" --chain-id "$CHAIN_ID"',
-    );
-    // The deploy waits for it; a failed publish never reaches the deploy.
-    expect(w.jobs.deploy.needs).toEqual(["gate", "publish"]);
-    // The RESULT: gate failure, then publish failure, then the deploy's.
-    const result = (g: string, pu: string, d: string) =>
-      new Function(
-        "needs",
-        `return (${w.jobs.report.steps
-          .find(
-            (s: { name?: string }) =>
-              s.name === "Keep the blocker issue in step",
-          )
-          .env.RESULT.replace(/^\$\{\{\s*/, "")
-          .replace(/\s*\}\}$/, "")});`,
-      )({
-        gate: { result: g },
-        publish: { result: pu },
-        deploy: { result: d },
-      }) as string;
-    expect(result("success", "success", "success")).toBe("success");
-    expect(result("success", "failure", "skipped")).toBe("failure");
-    expect(result("success", "success", "failure")).toBe("failure");
-    expect(result("success", "skipped", "skipped")).toBe("skipped");
-    expect(result("failure", "skipped", "skipped")).toBe("failure");
-  });
   it("published: true only when a main hosted-publish run's publish-prod job for the tag succeeded", () => {
     const run = (
       jobsByRun: Record<number, { name: string; conclusion: string }[]>,
@@ -803,6 +1675,7 @@ describe("the gate's neutral skips", () => {
       published({
         repo: "o/r",
         tag: "v1.2.3",
+        since: "2026-11-19T12:00:00Z",
         exec: (_c, a) => {
           const u = a.at(-1) ?? "";
           if (u.includes("/workflows/hosted-publish.yml/runs"))
@@ -810,6 +1683,7 @@ describe("the gate's neutral skips", () => {
               code: 0,
               stderr: "",
               stdout: JSON.stringify({
+                total_count: Object.keys(jobsByRun).length,
                 workflow_runs: Object.keys(jobsByRun).map((id) => ({
                   id: Number(id),
                   status: "completed",
@@ -877,6 +1751,7 @@ describe("the gate's neutral skips", () => {
       published({
         repo: "o/r",
         tag: "v1.2.3",
+        since: "2026-11-19T12:00:00Z",
         exec: () => ({ code: 1, stdout: "", stderr: "boom" }),
       }),
     ).toThrow();

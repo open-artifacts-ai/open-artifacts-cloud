@@ -153,6 +153,7 @@ export async function listInstalls(a: HandlerArgs): Promise<RouteResult> {
   const billing = await billingTiersOf(
     a.env,
     page.map((x) => x.install_id),
+    new Map(page.map((x) => [x.install_id, x.tier])),
   );
   const items: InstallSummary[] = page.map((x) => ({
     ...summaryOf(a.env, x),

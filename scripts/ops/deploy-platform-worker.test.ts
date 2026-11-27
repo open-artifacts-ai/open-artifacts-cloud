@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  cpSync,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -10,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { root, sandbox, write } from "../ci/stubs.ts";
-import { alertPinProblems } from "./wrangler-env.ts";
+import { alertPinProblems, stripJsonc } from "./wrangler-env.ts";
 
 // The platform Worker deploy wrapper: an allowlisted app and one env, always from the app's dir,
 // this env's placeholders filled into a copy that is removed on exit, and
@@ -31,6 +32,24 @@ const HERMETIC = Object.fromEntries(
     .filter((k) => k.startsWith("GITHUB_"))
     .map((k) => [k, ""]),
 );
+// Each call runs the wrapper from its own temp mirror of the repo (the
+// wrapper, its helpers and the app's dir), so the copy it writes and removes
+// never lands in the shared tree where another test or file could see it.
+const mirror = (app: string | undefined) => {
+  const t = mkdtempSync(join(tmpdir(), "oa-deploy-mirror-"));
+  for (const f of [
+    "deploy-platform-worker.sh",
+    "wrangler-env.ts",
+    "check-migration-lock.mjs",
+  ])
+    cpSync(join(root, "scripts/ops", f), join(t, "scripts/ops", f));
+  if (app && /^[a-z-]+$/.test(app) && existsSync(join(root, "apps", app)))
+    cpSync(join(root, "apps", app), join(t, "apps", app), {
+      recursive: true,
+      filter: (src) => !src.includes("node_modules"),
+    });
+  return t;
+};
 const run = (
   args: string[],
   env: Record<string, string> = {},
@@ -38,11 +57,21 @@ const run = (
 ) => {
   const sb = sandbox({ pnpm });
   const snap = join(sb.dir, "snap.jsonc");
-  const r = sb.run(["bash", script, ...args], {
-    cwd: sb.dir,
-    env: { ...HERMETIC, SNAP: snap, ...env },
-  });
-  return { ...r, log: sb.log(), snap };
+  const mir = script === SCRIPT ? mirror(args[0]) : undefined;
+  const r = sb.run(
+    [
+      "bash",
+      mir ? join(mir, "scripts/ops/deploy-platform-worker.sh") : script,
+      ...args,
+    ],
+    {
+      cwd: sb.dir,
+      env: { ...HERMETIC, SNAP: snap, ...env },
+    },
+  );
+  // Report the app's dir as the repo's, as the cases expect.
+  const log = sb.log().map((l) => (mir ? l.split(mir).join(root) : l));
+  return { ...r, log, snap };
 };
 
 // The scheduler's alert wiring as placeholders the deploy fills (design
@@ -58,12 +87,17 @@ const F915 = readFileSync(
 );
 const PINNED = pinned(REAL) ? REAL : F915;
 
+const expectCode = (
+  r: { code: number | null; out: string; err: string },
+  n: number,
+) => expect(r.code, r.out + r.err).toBe(n);
+
 afterEach(() => expect(existsSync(COPY)).toBe(false));
 
 describe("deploy-platform-worker.sh", () => {
   it("staging: deploys from apps/auth-broker with exact argv, then removes the copy", () => {
     const r = run(["auth-broker", "staging"], { BROKER_REGISTRY_ID: REG });
-    expect(r.code).toBe(0);
+    expect(r.code, r.out + r.err).toBe(0);
     expect(r.log).toEqual([
       "pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env staging",
       APP,
@@ -80,7 +114,7 @@ describe("deploy-platform-worker.sh", () => {
       BROKER_REGISTRY_ID: REG,
       GOOGLE_CLIENT_ID_PROD: CLIENT,
     });
-    expect(r.code).toBe(0);
+    expect(r.code, r.out + r.err).toBe(0);
     expect(r.log[0]).toBe(
       "pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env prod",
     );
@@ -94,7 +128,7 @@ describe("deploy-platform-worker.sh", () => {
       BROKER_REGISTRY_ID: REG,
       DEPLOY_TAG: "v0.90.3",
     });
-    expect(r.code, r.err).toBe(0);
+    expect(r.code, r.out + r.err).toBe(0);
     expect(r.log[0]).toBe(
       "pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env staging --tag v0.90.3",
     );
@@ -104,7 +138,7 @@ describe("deploy-platform-worker.sh", () => {
       GITHUB_ACTIONS: "true",
       DEPLOY_TAG: "v1.2.3",
     });
-    expect(ci.code, ci.err).toBe(0);
+    expect(ci.code, ci.out + ci.err).toBe(0);
     expect(ci.log[0]).toBe(
       "pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env prod --tag v1.2.3",
     );
@@ -123,7 +157,7 @@ describe("deploy-platform-worker.sh", () => {
         GITHUB_ACTIONS: "true",
         DEPLOY_TAG,
       });
-      expect(r.code, DEPLOY_TAG).toBe(2);
+      expect(r.code, `${DEPLOY_TAG}\n${r.out}${r.err}`).toBe(2);
       expect(r.err).toContain("DEPLOY_TAG must be a stable vX.Y.Z");
       expect(r.log).toEqual([]);
     }
@@ -131,7 +165,7 @@ describe("deploy-platform-worker.sh", () => {
       BROKER_REGISTRY_ID: REG,
       DEPLOY_TAG: "latest",
     });
-    expect(bad.code).toBe(2);
+    expect(bad.code, bad.out + bad.err).toBe(2);
     expect(bad.log).toEqual([]);
   });
 
@@ -145,7 +179,7 @@ describe("deploy-platform-worker.sh", () => {
       ["staging"],
     ]) {
       const r = run(args, { BROKER_REGISTRY_ID: REG });
-      expect(r.code).toBe(2);
+      expect(r.code, r.out + r.err).toBe(2);
       expect(r.log).toEqual([]);
     }
   });
@@ -153,7 +187,7 @@ describe("deploy-platform-worker.sh", () => {
   it("refuses an app that isn't in the allowlist", () => {
     for (const a of ["landing", "../auth-broker", "apps/auth-broker", ""]) {
       const r = run([a, "staging"], { BROKER_REGISTRY_ID: REG });
-      expect(r.code).toBe(2);
+      expect(r.code, r.out + r.err).toBe(2);
       expect(r.log).toEqual([]);
     }
   });
@@ -161,14 +195,14 @@ describe("deploy-platform-worker.sh", () => {
   it("refuses a missing or malformed registry id", () => {
     for (const id of ["", "abc", `${REG}/x`, "../../etc"]) {
       const r = run(["auth-broker", "staging"], { BROKER_REGISTRY_ID: id });
-      expect(r.code).toBe(1);
+      expect(r.code, r.out + r.err).toBe(1);
       expect(r.log).toEqual([]);
     }
   });
 
   it("prod refuses while the client id placeholder is unfilled", () => {
     const r = run(["auth-broker", "prod"], { BROKER_REGISTRY_ID: REG });
-    expect(r.code).toBe(1);
+    expect(r.code, r.out + r.err).toBe(1);
     expect(r.log).toEqual([]);
     expect(r.err).toContain("{{GOOGLE_CLIENT_ID_PROD}}");
     expect(r.err).not.toContain(REG);
@@ -179,8 +213,72 @@ describe("deploy-platform-worker.sh", () => {
       BROKER_REGISTRY_ID: REG,
       GOOGLE_CLIENT_ID_PROD: "x/y&z",
     });
-    expect(r.code).toBe(1);
+    expect(r.code, r.out + r.err).toBe(1);
     expect(r.log).toEqual([]);
+  });
+
+  // open-artifacts#2641: DOCS_PREVIEW opens doc creation on an install and is
+  // staging only. A prod deploy refuses a config that mentions it, before
+  // anything is filled or deployed.
+  describe("DOCS_PREVIEW is staging only", () => {
+    const AB = readFileSync(join(APP, "wrangler.jsonc"), "utf8");
+    const prodEnv = { BROKER_REGISTRY_ID: REG, GOOGLE_CLIENT_ID_PROD: CLIENT };
+    const tree = (config: string, hosted?: string) => {
+      const t = mkdtempSync(join(tmpdir(), "oa-deploy-tree-"));
+      for (const f of ["deploy-platform-worker.sh", "wrangler-env.ts"])
+        write(
+          join(t, "scripts/ops", f),
+          readFileSync(join(root, "scripts/ops", f), "utf8"),
+        );
+      write(join(t, "apps/auth-broker/wrangler.jsonc"), config);
+      if (hosted !== undefined)
+        write(join(t, ".github/hosted/prod.json"), hosted);
+      return join(t, "scripts/ops/deploy-platform-worker.sh");
+    };
+    const withVar = (block: "prod" | "staging" | "top") => {
+      const c = JSON.parse(stripJsonc(AB));
+      if (block === "top") c.vars = { ...c.vars, DOCS_PREVIEW: "1" };
+      else c.env[block].vars = { ...c.env[block].vars, DOCS_PREVIEW: "1" };
+      return JSON.stringify(c, null, 2);
+    };
+    const refused = (r: {
+      code: number | null;
+      out: string;
+      err: string;
+      log: string[];
+    }) => {
+      expectCode(r, 1);
+      expect(r.log).toEqual([]);
+      expect(r.err).toContain("DOCS_PREVIEW");
+      expect(r.err).toContain("staging only");
+    };
+    it("the repo's own config deploys to prod", () => {
+      expectCode(run(["auth-broker", "prod"], prodEnv), 0);
+    });
+    it("prod refuses a config whose prod block or top level sets it", () => {
+      refused(run(["auth-broker", "prod"], prodEnv, tree(withVar("prod"))));
+      refused(run(["auth-broker", "prod"], prodEnv, tree(withVar("top"))));
+    });
+    it("prod refuses a prod constants file that mentions it", () => {
+      refused(
+        run(
+          ["auth-broker", "prod"],
+          prodEnv,
+          tree(AB, '{ "docs_preview": 1, "DOCS_PREVIEW": "1" }'),
+        ),
+      );
+    });
+    it("prod refuses a config it cannot parse", () => {
+      expectCode(run(["auth-broker", "prod"], prodEnv, tree("{ not json")), 1);
+    });
+    it("a staging block that sets it deploys to staging, and does not stop prod", () => {
+      const script = tree(withVar("staging"), '{ "app_zone": "x" }');
+      expectCode(
+        run(["auth-broker", "staging"], { BROKER_REGISTRY_ID: REG }, script),
+        0,
+      );
+      expectCode(run(["auth-broker", "prod"], prodEnv, script), 0);
+    });
   });
 
   describe("dispatch and scheduler", () => {
@@ -221,7 +319,7 @@ describe("deploy-platform-worker.sh", () => {
           ...(env === "staging" ? { SIGNUPS_ENABLED: "test-users" } : {}),
         });
         expect(r.err, env).toBe("");
-        expect(r.code, env).toBe(0);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(0);
         const snap = readFileSync(r.snap, "utf8");
         expect(snap).not.toMatch(
           new RegExp(`\\{\\{[A-Z0-9_]*_${env.toUpperCase()}\\}\\}`),
@@ -245,7 +343,7 @@ describe("deploy-platform-worker.sh", () => {
         '{ "name": "ALERT_EMAIL" }',
       );
       expect(BARE).not.toContain("{{ALERT_");
-      expect(run(["scheduler", "prod"], SCHED, schedTree(BARE)).code).toBe(0);
+      expectCode(run(["scheduler", "prod"], SCHED, schedTree(BARE)), 0);
       for (const bad of [
         { ALERT_TO: "" },
         { ALERT_FROM: "x" },
@@ -257,7 +355,7 @@ describe("deploy-platform-worker.sh", () => {
           { ...SCHED, ...bad },
           schedTree(BARE),
         );
-        expect(r.code, JSON.stringify(bad)).toBe(1);
+        expect(r.code, `${JSON.stringify(bad)}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
       }
     });
@@ -274,7 +372,7 @@ describe("deploy-platform-worker.sh", () => {
         );
         expect(config).not.toBe(PINNED);
         const r = run(["scheduler", "prod"], SCHED, schedTree(config));
-        expect(r.code, extra).toBe(1);
+        expect(r.code, `${extra}\n${r.out}${r.err}`).toBe(1);
         expect(r.log, extra).toEqual([]);
         expect(r.err, extra).toContain("a placeholder is still unfilled");
       }
@@ -325,7 +423,7 @@ describe("deploy-platform-worker.sh", () => {
       ] as const) {
         expect(config, what).not.toBe(PINNED);
         const r = run(["scheduler", "prod"], SCHED, schedTree(config));
-        expect(r.code, what).toBe(1);
+        expect(r.code, `${what}\n${r.out}${r.err}`).toBe(1);
         expect(r.log, what).toEqual([]);
         expect(r.err, what).toContain("doesn't pin the prod alerts");
       }
@@ -334,7 +432,7 @@ describe("deploy-platform-worker.sh", () => {
     it("dispatch: deploys from apps/dispatch with its HOSTS id, for either env", () => {
       for (const env of ["staging", "prod"]) {
         const r = run(["dispatch", env], { HOSTS_KV_ID: REG });
-        expect(r.code, env).toBe(0);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(0);
         expect(r.log).toEqual([
           `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           join(root, "apps/dispatch"),
@@ -351,7 +449,7 @@ describe("deploy-platform-worker.sh", () => {
 
     it("scheduler: fills the D1 id, the zone tags and the daily limit", () => {
       const r = run(["scheduler", "prod"], SCHED, schedTree(PINNED));
-      expect(r.code).toBe(0);
+      expect(r.code, r.out + r.err).toBe(0);
       const snap = readFileSync(r.snap, "utf8");
       expect(snap).toContain(`"database_id": "${UUID}"`);
       expect(snap).toContain(`"EMAIL_QUOTA_ZONES": "${REG},${REG}"`);
@@ -373,7 +471,7 @@ describe("deploy-platform-worker.sh", () => {
           schedTree(PINNED),
         );
         expect(r.err, env).toBe("");
-        expect(r.code, env).toBe(0);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(0);
         const snap = readFileSync(r.snap, "utf8");
         expect(snap).toContain('"ALERT_TO": "ops@example.com"');
         expect(snap).toContain('"destination_address": "ops@example.com"');
@@ -415,7 +513,9 @@ describe("deploy-platform-worker.sh", () => {
           env,
           app === "scheduler" ? schedTree(PINNED) : SCRIPT,
         );
-        expect(r.code, `${app} ${JSON.stringify(env)}`).toBe(1);
+        expect(r.code, `${app} ${JSON.stringify(env)}\n${r.out}${r.err}`).toBe(
+          1,
+        );
         expect(r.log).toEqual([]);
       }
     });
@@ -429,7 +529,7 @@ describe("deploy-platform-worker.sh", () => {
       const r = run(["directory-broker", "staging"], {
         DIRECTORY_REGISTRY_ID: REG,
       });
-      expect(r.code).toBe(0);
+      expect(r.code, r.out + r.err).toBe(0);
       expect(r.log).toEqual([
         "pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env staging",
         DIR,
@@ -446,7 +546,7 @@ describe("deploy-platform-worker.sh", () => {
         DIRECTORY_REGISTRY_ID: REG,
         GOOGLE_DIRECTORY_CLIENT_ID_PROD: DCLIENT,
       });
-      expect(r.code).toBe(0);
+      expect(r.code, r.out + r.err).toBe(0);
       const snap = readFileSync(r.snap, "utf8");
       expect(snap).toContain(DCLIENT);
       expect(snap).not.toMatch(/\{\{[A-Z0-9_]*_PROD\}\}/);
@@ -466,7 +566,7 @@ describe("deploy-platform-worker.sh", () => {
         ],
       ] as [string[], Record<string, string>][]) {
         const r = run(args, env);
-        expect(r.code).toBe(1);
+        expect(r.code, r.out + r.err).toBe(1);
         expect(r.log).toEqual([]);
       }
     });
@@ -500,7 +600,7 @@ describe("deploy-platform-worker.sh", () => {
     for (const env of ["staging", "prod"] as const)
       it(`${env}: the wrapper fills and verifies provisioner placeholders`, () => {
         const r = run(["provisioner", env], OK);
-        expect(r.code).toBe(0);
+        expect(r.code, r.out + r.err).toBe(0);
         expect(r.log).toEqual([
           `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           DIR,
@@ -531,14 +631,14 @@ describe("deploy-platform-worker.sh", () => {
     it("SIGNUPS_ENABLED true needs ALLOW_SIGNUPS=1", () => {
       for (const env of ["staging", "prod"] as const) {
         const r = run(["provisioner", env], { ...OK, SIGNUPS_ENABLED: "true" });
-        expect(r.code, env).toBe(1);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
         const ok = run(["provisioner", env], {
           ...OK,
           SIGNUPS_ENABLED: "true",
           ALLOW_SIGNUPS: "1",
         });
-        expect(ok.code, env).toBe(0);
+        expect(ok.code, `${env}\n${ok.out}${ok.err}`).toBe(0);
         expect(readFileSync(ok.snap, "utf8")).toContain(
           '"SIGNUPS_ENABLED": "true"',
         );
@@ -548,7 +648,7 @@ describe("deploy-platform-worker.sh", () => {
         SIGNUPS_ENABLED: "true",
         ALLOW_SIGNUPS: "yes",
       });
-      expect(other.code).toBe(1);
+      expect(other.code, other.out + other.err).toBe(1);
     });
 
     it("SIGNUPS_ENABLED test-users is staging only", () => {
@@ -556,7 +656,7 @@ describe("deploy-platform-worker.sh", () => {
         ...OK,
         SIGNUPS_ENABLED: "test-users",
       });
-      expect(s.code).toBe(0);
+      expect(s.code, s.out + s.err).toBe(0);
       expect(readFileSync(s.snap, "utf8")).toContain(
         '"SIGNUPS_ENABLED": "test-users"',
       );
@@ -564,11 +664,12 @@ describe("deploy-platform-worker.sh", () => {
         ...OK,
         SIGNUPS_ENABLED: "test-users",
       });
-      expect(p.code).toBe(1);
+      expect(p.code, p.out + p.err).toBe(1);
       expect(p.log).toEqual([]);
-      expect(
-        run(["provisioner", "prod"], { ...OK, SIGNUPS_ENABLED: "false" }).code,
-      ).toBe(0);
+      expectCode(
+        run(["provisioner", "prod"], { ...OK, SIGNUPS_ENABLED: "false" }),
+        0,
+      );
     });
 
     it("SIGNUPS_ENABLED invite (#2096) needs ALLOW_SIGNUPS=1, in both envs", () => {
@@ -577,14 +678,14 @@ describe("deploy-platform-worker.sh", () => {
           ...OK,
           SIGNUPS_ENABLED: "invite",
         });
-        expect(off.code, env).toBe(1);
+        expect(off.code, `${env}\n${off.out}${off.err}`).toBe(1);
         expect(off.log).toEqual([]);
         const on = run(["provisioner", env], {
           ...OK,
           SIGNUPS_ENABLED: "invite",
           ALLOW_SIGNUPS: "1",
         });
-        expect(on.code, env).toBe(0);
+        expect(on.code, `${env}\n${on.out}${on.err}`).toBe(0);
         expect(readFileSync(on.snap, "utf8")).toContain(
           '"SIGNUPS_ENABLED": "invite"',
         );
@@ -597,33 +698,35 @@ describe("deploy-platform-worker.sh", () => {
         ...inv,
         SIGNUPS_ENABLED: "invite",
       });
-      expect(on.code).toBe(0);
+      expect(on.code, on.out + on.err).toBe(0);
       expect(readFileSync(on.snap, "utf8")).toContain(
         '"SIGNUPS_ENABLED": "invite"',
       );
-      expect(
-        run(["provisioner", "prod"], { ...inv, SIGNUPS_ENABLED: "false" }).code,
-      ).toBe(0);
+      expectCode(
+        run(["provisioner", "prod"], { ...inv, SIGNUPS_ENABLED: "false" }),
+        0,
+      );
       for (const v of ["true", "test-users"]) {
         const r = run(["provisioner", "prod"], { ...inv, SIGNUPS_ENABLED: v });
-        expect(r.code, v).toBe(1);
+        expect(r.code, `${v}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
       }
       // Staging: invite needs one of the two; true still needs ALLOW_SIGNUPS=1.
-      expect(
-        run(["provisioner", "staging"], { ...inv, SIGNUPS_ENABLED: "true" })
-          .code,
-      ).toBe(1);
-      expect(
+      expectCode(
+        run(["provisioner", "staging"], { ...inv, SIGNUPS_ENABLED: "true" }),
+        1,
+      );
+      expectCode(
         run(["provisioner", "staging"], {
           ...inv,
           SIGNUPS_ENABLED: "test-users",
-        }).code,
-      ).toBe(0);
-      expect(
-        run(["provisioner", "staging"], { ...OK, SIGNUPS_ENABLED: "invite" })
-          .code,
-      ).toBe(1);
+        }),
+        0,
+      );
+      expectCode(
+        run(["provisioner", "staging"], { ...OK, SIGNUPS_ENABLED: "invite" }),
+        1,
+      );
     });
 
     it("refuses an unfilled or invalid value", () => {
@@ -646,12 +749,12 @@ describe("deploy-platform-worker.sh", () => {
       for (const [key, values] of Object.entries(bad)) {
         for (const v of [...values, `{{${key}_STAGING}}`]) {
           const r = run(["provisioner", "staging"], { ...OK, [key]: v });
-          expect(r.code, `${key}=${v}`).toBe(1);
+          expect(r.code, `${key}=${v}\n${r.out}${r.err}`).toBe(1);
           expect(r.log).toEqual([]);
         }
         const { [key as keyof typeof OK]: _, ...rest } = OK;
         const r = run(["provisioner", "staging"], { ...rest, [key]: "" });
-        expect(r.code, `${key} unset`).toBe(1);
+        expect(r.code, `${key} unset\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
       }
     });
@@ -670,7 +773,7 @@ describe("deploy-platform-worker.sh", () => {
             w === undefined ? rest : { ...rest, WELCOME_FROM: w },
             tree(old),
           );
-          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.code, `${env} ${w} ${r.err}\n${r.out}${r.err}`).toBe(0);
           expect(r.log[0]).toBe(
             `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           );
@@ -682,11 +785,11 @@ describe("deploy-platform-worker.sh", () => {
             .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
             .join("\n");
           const r = run(["provisioner", env], rest, tree(half));
-          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.code, `${env} only ${keep}\n${r.out}${r.err}`).toBe(1);
           expect(r.log).toEqual([]);
         }
         const cur = run(["provisioner", env], rest, tree(CONFIG));
-        expect(cur.code, env).toBe(1);
+        expect(cur.code, `${env}\n${cur.out}${cur.err}`).toBe(1);
         expect(cur.log).toEqual([]);
       }
     });
@@ -699,7 +802,7 @@ describe("deploy-platform-worker.sh", () => {
         ),
       );
       const r = run(["provisioner", "staging"], OK, script);
-      expect(r.code).toBe(1);
+      expect(r.code, r.out + r.err).toBe(1);
       expect(r.log).toEqual([]);
       expect(r.err).toContain("{{EXTRA_STAGING}}");
       expect(r.err).not.toContain(OK.SECRETS_STORE_ID);
@@ -718,13 +821,13 @@ describe("deploy-platform-worker.sh", () => {
           ),
         );
         const r = run(["provisioner", "staging"], OK, script);
-        expect(r.code, name).toBe(1);
+        expect(r.code, `${name}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
         expect(r.err).toMatch(/secret/);
       }
       // The repo's own config passes the same check (both envs).
       for (const env of ["staging", "prod"])
-        expect(run(["provisioner", env], OK, tree(CONFIG)).code).toBe(0);
+        expectCode(run(["provisioner", env], OK, tree(CONFIG)), 0);
     });
 
     it("swapped tokens are refused: each env block binds its own env's token", () => {
@@ -744,7 +847,7 @@ describe("deploy-platform-worker.sh", () => {
       );
       for (const env of ["staging", "prod"]) {
         const r = run(["provisioner", env], OK, swapped);
-        expect(r.code, env).toBe(1);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
         expect(r.err).toMatch(/block must bind/);
       }
@@ -769,13 +872,14 @@ describe("deploy-platform-worker.sh", () => {
         SIGNUPS_ENABLED: "test-users",
       };
       const r = run(["scheduler", "staging"], env, script);
-      expect(r.code).toBe(1);
+      expect(r.code, r.out + r.err).toBe(1);
       expect(r.log).toEqual([]);
       expect(r.err).toMatch(/provision token/);
       // The same tree without the binding deploys.
-      expect(
-        run(["scheduler", "staging"], env, tree(SCHED, "scheduler")).code,
-      ).toBe(0);
+      expectCode(
+        run(["scheduler", "staging"], env, tree(SCHED, "scheduler")),
+        0,
+      );
     });
   });
 
@@ -801,6 +905,10 @@ describe("deploy-platform-worker.sh", () => {
         join(t, "scripts/ops/deploy-platform-worker.sh"),
         readFileSync(SCRIPT, "utf8"),
       );
+      write(
+        join(t, "scripts/ops/wrangler-env.ts"),
+        readFileSync(join(root, "scripts/ops/wrangler-env.ts"), "utf8"),
+      );
       write(join(t, "apps/provisioning/wrangler.jsonc"), config);
       if (assets)
         write(
@@ -818,7 +926,7 @@ describe("deploy-platform-worker.sh", () => {
         const script = tree(CONFIG);
         const r = run(["provisioning", env], OK, script);
         expect(r.err).toBe("");
-        expect(r.code).toBe(0);
+        expect(r.code, r.out + r.err).toBe(0);
         expect(r.log).toEqual([
           `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           dirOf(script),
@@ -857,7 +965,7 @@ describe("deploy-platform-worker.sh", () => {
               { ...OK, [key]: v },
               tree(CONFIG),
             );
-            expect(r.code, `${env} ${key}=${v}`).toBe(1);
+            expect(r.code, `${env} ${key}=${v}\n${r.out}${r.err}`).toBe(1);
             expect(r.log).toEqual([]);
           }
     });
@@ -876,7 +984,7 @@ describe("deploy-platform-worker.sh", () => {
             w === undefined ? rest : { ...rest, WELCOME_FROM: w },
             tree(old),
           );
-          expect(r.code, `${env} ${w} ${r.err}`).toBe(0);
+          expect(r.code, `${env} ${w} ${r.err}\n${r.out}${r.err}`).toBe(0);
           expect(r.log[0]).toBe(
             `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           );
@@ -888,11 +996,11 @@ describe("deploy-platform-worker.sh", () => {
             .filter((l) => !l.includes("WELCOME_") || l.includes(keep))
             .join("\n");
           const r = run(["provisioning", env], rest, tree(half));
-          expect(r.code, `${env} only ${keep}`).toBe(1);
+          expect(r.code, `${env} only ${keep}\n${r.out}${r.err}`).toBe(1);
           expect(r.log).toEqual([]);
         }
         const cur = run(["provisioning", env], rest, tree(CONFIG));
-        expect(cur.code, env).toBe(1);
+        expect(cur.code, `${env}\n${cur.out}${cur.err}`).toBe(1);
         expect(cur.log).toEqual([]);
       }
     });
@@ -900,7 +1008,7 @@ describe("deploy-platform-worker.sh", () => {
     it("refuses to deploy without the admin build's dist-assets/index.html", () => {
       for (const env of ["staging", "prod"]) {
         const r = run(["provisioning", env], OK, tree(CONFIG, false));
-        expect(r.code, env).toBe(1);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(1);
         expect(r.err).toContain("dist-assets/index.html");
         expect(r.log).toEqual([]);
       }
@@ -916,7 +1024,7 @@ describe("deploy-platform-worker.sh", () => {
           ),
         );
         const r = run(["provisioning", env], OK, script);
-        expect(r.code, env).toBe(1);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(1);
         expect(r.log).toEqual([]);
         expect(r.err).toContain(`{{EXTRA_${up}}}`);
         // An unsuffixed one too; the other env's are left for its own deploy.
@@ -930,7 +1038,7 @@ describe("deploy-platform-worker.sh", () => {
             ),
           ),
         );
-        expect(bare.code, env).toBe(1);
+        expect(bare.code, `${env}\n${bare.out}${bare.err}`).toBe(1);
         expect(bare.err).toContain("{{EXTRA}}");
         expect(bare.log).toEqual([]);
       }
@@ -940,19 +1048,19 @@ describe("deploy-platform-worker.sh", () => {
       const script = tree(CONFIG);
       const open = { ...OK, SIGNUPS_ENABLED: "true" };
       const no = run(["provisioning", "staging"], open, script);
-      expect(no.code).toBe(1);
+      expect(no.code, no.out + no.err).toBe(1);
       expect(no.log).toEqual([]);
       const ok = run(
         ["provisioning", "staging"],
         { ...open, ALLOW_SIGNUPS: "1" },
         script,
       );
-      expect(ok.code, ok.err).toBe(0);
+      expect(ok.code, ok.out + ok.err).toBe(0);
       expect(readFileSync(ok.snap, "utf8")).toContain(
         '"SIGNUPS_ENABLED": "true"',
       );
       const closed = run(["provisioning", "prod"], OK, script);
-      expect(closed.code, closed.err).toBe(0);
+      expect(closed.code, closed.out + closed.err).toBe(0);
       expect(readFileSync(closed.snap, "utf8")).toContain(
         '"SIGNUPS_ENABLED": "false"',
       );
@@ -966,7 +1074,7 @@ describe("deploy-platform-worker.sh", () => {
         ),
       );
       const r = run(["provisioning", "staging"], OK, script);
-      expect(r.code).toBe(1);
+      expect(r.code, r.out + r.err).toBe(1);
       expect(r.err).toMatch(/provision token/);
       expect(r.log).toEqual([]);
     });
@@ -980,6 +1088,10 @@ describe("deploy-platform-worker.sh", () => {
       write(
         join(t, "scripts/ops/deploy-platform-worker.sh"),
         readFileSync(SCRIPT, "utf8"),
+      );
+      write(
+        join(t, "scripts/ops/wrangler-env.ts"),
+        readFileSync(join(root, "scripts/ops/wrangler-env.ts"), "utf8"),
       );
       write(join(t, "apps/inventory/wrangler.jsonc"), config);
       return join(t, "scripts/ops/deploy-platform-worker.sh");
@@ -996,25 +1108,26 @@ describe("deploy-platform-worker.sh", () => {
     );
 
     it("always needs the repository id, and fills it into W8's OIDC vars", () => {
-      expect(run(["inventory", "prod"], OK, tree(CONFIG)).code).toBe(1);
-      expect(
+      expectCode(run(["inventory", "prod"], OK, tree(CONFIG)), 1);
+      expectCode(
         run(
           ["inventory", "prod"],
           { ...OK, GITHUB_REPOSITORY_ID: "0" },
           tree(CONFIG),
-        ).code,
-      ).toBe(1);
+        ),
+        1,
+      );
       for (const env of ["staging", "prod"]) {
         const r = run(
           ["inventory", env],
           { ...OK, GITHUB_REPOSITORY_ID: "42" },
           tree(OIDC),
         );
-        expect(r.code, env).toBe(0);
+        expect(r.code, `${env}\n${r.out}${r.err}`).toBe(0);
         expect(readFileSync(r.snap, "utf8")).toContain(
           '"OIDC_REPOSITORY_ID": "42"',
         );
-        expect(run(["inventory", env], OK, tree(OIDC)).code, env).toBe(1);
+        expectCode(run(["inventory", env], OK, tree(OIDC)), 1);
       }
     });
   });
@@ -1057,7 +1170,7 @@ describe("deploy-platform-worker.sh", () => {
           ...IDS,
           MIGRATION_LOCK: FROZEN,
         });
-        expect(r.code).toBe(0);
+        expect(r.code, r.out + r.err).toBe(0);
         expect(r.log).toEqual([
           `pnpm exec wrangler deploy -c wrangler.deploy.jsonc --env ${env}`,
           DIR,
@@ -1108,7 +1221,7 @@ describe("deploy-platform-worker.sh", () => {
         STRIPE_PRICE_BUSINESS_YEARLY: "price_1BizYr",
         MIGRATION_LOCK: FROZEN,
       });
-      expect(r.code).toBe(0);
+      expect(r.code, r.out + r.err).toBe(0);
       const snap = readFileSync(r.snap, "utf8");
       expect(snap).toContain('"STRIPE_PRICE_TEAM_YEARLY": "price_1TeamYr"');
       expect(snap).toContain('"STRIPE_PRICE_BUSINESS_YEARLY": "price_1BizYr"');
@@ -1118,7 +1231,7 @@ describe("deploy-platform-worker.sh", () => {
         STRIPE_PRICE_TEAM_YEARLY: "prod_1",
         MIGRATION_LOCK: FROZEN,
       });
-      expect(bad.code).toBe(1);
+      expect(bad.code, bad.out + bad.err).toBe(1);
     });
 
     it("fills STRIPE_PORTAL_CONFIG when set, leaves it empty when unset, refuses a malformed one", () => {
@@ -1128,7 +1241,7 @@ describe("deploy-platform-worker.sh", () => {
         STRIPE_PORTAL_CONFIG: "bpc_1Abc",
         MIGRATION_LOCK: FROZEN,
       });
-      expect(set.code).toBe(0);
+      expect(set.code, set.out + set.err).toBe(0);
       expect(readFileSync(set.snap, "utf8")).toContain(
         '"STRIPE_PORTAL_CONFIG": "bpc_1Abc"',
       );
@@ -1137,7 +1250,7 @@ describe("deploy-platform-worker.sh", () => {
         ...IDS,
         MIGRATION_LOCK: FROZEN,
       });
-      expect(unset.code).toBe(0);
+      expect(unset.code, unset.out + unset.err).toBe(0);
       expect(readFileSync(unset.snap, "utf8")).toContain(
         '"STRIPE_PORTAL_CONFIG": ""',
       );
@@ -1147,7 +1260,7 @@ describe("deploy-platform-worker.sh", () => {
         STRIPE_PORTAL_CONFIG: "price_1",
         MIGRATION_LOCK: FROZEN,
       });
-      expect(bad.code).toBe(1);
+      expect(bad.code, bad.out + bad.err).toBe(1);
     });
 
     it("refuses a missing or malformed D1 or registry id", () => {
@@ -1173,7 +1286,7 @@ describe("deploy-platform-worker.sh", () => {
           ...env,
           MIGRATION_LOCK: FROZEN,
         });
-        expect(r.code).toBe(1);
+        expect(r.code, r.out + r.err).toBe(1);
         expect(r.log).toEqual([]);
       }
     });
@@ -1198,7 +1311,7 @@ describe("deploy-platform-worker.sh", () => {
           ...p,
           MIGRATION_LOCK: FROZEN,
         });
-        expect(r.code).toBe(1);
+        expect(r.code, r.out + r.err).toBe(1);
         expect(r.log).toEqual([]);
       }
     });
@@ -1232,14 +1345,14 @@ describe("deploy-platform-worker.sh", () => {
           ...IDS,
           ...(lock ? { MIGRATION_LOCK: lock } : {}),
         });
-        expect(r.code, why).toBe(1);
+        expect(r.code, `${why}\n${r.out}${r.err}`).toBe(1);
         expect(r.log, why).toEqual([]);
       }
     });
 
     it("the repo's own lock is frozen and holds: the first deploy needs no other lock (#1568)", () => {
       const r = run(["billing", "staging"], { ...PRICES, ...IDS });
-      expect(r.code, r.err).toBe(0);
+      expect(r.code, r.out + r.err).toBe(0);
     });
   });
 });
