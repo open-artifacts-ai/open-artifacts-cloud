@@ -2,10 +2,12 @@
 // and retry steps against the real platform schema, the rechecks, the
 // release gate, the 5.3 inputs, the step bookkeeping, the fail step.
 import {
+  CfError,
   FLOOR_KEY,
   HOSTED_DOMAINS,
   NAMESPACES,
   ProvisionRefused,
+  ProvisionRetry,
   STAGING_TEST_DOMAIN,
 } from "@oa/provision";
 import { JOB_STEPS } from "@oa/provisioning-contract";
@@ -15,7 +17,11 @@ import {
   signFloor,
   TEST_PUBKEY,
 } from "../../../../packages/provision/test/fixtures/release.js";
-import { JOB_ERROR_TEXT, LOG_DETAIL_MAX } from "../../src/errors.js";
+import {
+  ERROR_MESSAGE_MAX,
+  JOB_ERROR_TEXT,
+  LOG_DETAIL_MAX,
+} from "../../src/errors.js";
 import { jobStep } from "../../src/steps.js";
 import { welcomeEmail } from "../../src/welcome.js";
 import {
@@ -72,6 +78,7 @@ async function run(w: World, jobId: string, o: { twice?: boolean } = {}) {
 }
 
 let w: World;
+const reEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 beforeEach(async () => {
   w = await world();
 });
@@ -352,8 +359,13 @@ describe("ProvisionInstall: code sign-in refusals (#1088)", () => {
     expect(w.job(jobId)).toMatchObject({
       status: "failed",
       error_code: code,
-      error_message: JOB_ERROR_TEXT[code as keyof typeof JOB_ERROR_TEXT],
     });
+    // #461: the fixed text first, then the refusal's redacted reason.
+    expect(w.job(jobId)?.error_message).toMatch(
+      new RegExp(
+        `^${reEscape(JOB_ERROR_TEXT[code as keyof typeof JOB_ERROR_TEXT])} Reason: \\S`,
+      ),
+    );
     const lines = warn.mock.calls.map((c) => String(c[0]));
     warn.mockRestore();
     return lines.join("\n");
@@ -368,6 +380,10 @@ describe("ProvisionInstall: code sign-in refusals (#1088)", () => {
     const log = await failsWith(s.jobId, "domain_codes_refused");
     expect(log).toContain("EMAIL_CODE_DOMAIN=on needs");
     expect(log).not.toContain("finqore.test");
+    expect(w.job(s.jobId)?.error_message).toContain(
+      "Reason: EMAIL_CODE_DOMAIN=on needs",
+    );
+    expect(w.job(s.jobId)?.error_message).not.toContain("finqore.test");
     expect(w.fake.writes().length).toBe(before);
   });
 
@@ -576,9 +592,12 @@ describe("ProvisionInstall: release gate and failures", () => {
       status: "failed",
       error_code: "release_not_published",
       last_error_code: "release_not_published",
-      error_message: JOB_ERROR_TEXT.release_not_published,
       retry_at: null,
     });
+    // #461: the reason follows, the requested version redacted.
+    expect(w.job(s.jobId)?.error_message).toBe(
+      `${JOB_ERROR_TEXT.release_not_published} Reason: no release release record for [value]`,
+    );
     expect(w.signup(s.signupId)?.status).toBe("failed");
     expect(
       w.get("SELECT freed_at FROM signup_accounts WHERE owner_sub = ?", s.sub),
@@ -586,37 +605,59 @@ describe("ProvisionInstall: release gate and failures", () => {
     expect(w.fake.writes().length).toBe(before);
   });
 
-  it("a refusal echoing request values: jobs.error_message is the code's fixed text only", async () => {
-    const key = "LEAK_KEY_ACME";
-    const s = seedCreate(w, {
-      slug: "leakyslug",
-      vars: {
-        AUTH_PROVIDERS: "google",
-        AUTH_DOMAINS: "finqore.test",
-        TIER: "business",
-        [key]: "x",
-      },
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const r = await run(w, s.jobId);
-    const lines = warn.mock.calls.map((c) => String(c[0]));
-    warn.mockRestore();
-    expect(r.error).not.toBeNull();
-    // recheck's detail reaches only the log line, the key redacted.
-    expect(lines.join("\n")).toContain("var [value] is not allowed");
-    expect(lines.join("\n")).not.toContain(key);
-    // The engine's record is the fixed text too: no detail.
-    expect(r.log.find((l) => l.name === "recheck")?.error?.message).toBe(
-      `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
-    );
-    const job = w.job(s.jobId);
-    expect(job).toMatchObject({
-      status: "failed",
-      error_code: "invalid_state",
-    });
-    expect(job?.error_message).toBe(JOB_ERROR_TEXT.invalid_state);
-    expect(job?.last_error_code).toBe("invalid_state");
-  });
+  it.each(["q", "qz"])(
+    "stores the fixed conflict reason for short slug %s",
+    async (slug) => {
+      const s = seedCreate(w, { slug });
+      w.db
+        .prepare(
+          "INSERT INTO installs (id, slug, app_host, content_host, owner_email, rl_ns, inputs_hash, state, created_at, updated_at) VALUES ('iabcdefghjkm', ?, ?, ?, 'owner@example.test', 8000008, 'h', 'active', 1, 1)",
+        )
+        .run(slug, app(slug), `${slug}.content.test`);
+      await run(w, s.jobId);
+      expect(w.job(s.jobId)).toMatchObject({
+        status: "failed",
+        error_code: "slug_taken",
+        error_message: `${JOB_ERROR_TEXT.slug_taken} Reason: an active install already holds the requested slug`,
+      });
+    },
+  );
+
+  it.each(["LEAK_KEY_ACME", "QZ", "on"])(
+    "redacts unexpected var %s in both the log and the stored refusal",
+    async (key) => {
+      const s = seedCreate(w, {
+        slug: "leakyslug",
+        vars: {
+          AUTH_PROVIDERS: "google",
+          AUTH_DOMAINS: "finqore.test",
+          TIER: "business",
+          [key]: "x",
+        },
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const r = await run(w, s.jobId);
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      warn.mockRestore();
+      expect(r.error).not.toBeNull();
+      expect(lines.join("\n")).toContain("var [value] is not allowed");
+      expect(lines.join("\n")).not.toContain(`var ${key} is not allowed`);
+      // The engine's record is the fixed text too: no detail.
+      expect(r.log.find((l) => l.name === "recheck")?.error?.message).toBe(
+        `invalid_state: ${JOB_ERROR_TEXT.invalid_state}`,
+      );
+      const job = w.job(s.jobId);
+      expect(job).toMatchObject({
+        status: "failed",
+        error_code: "invalid_state",
+      });
+      // #461: the reason, redacted as in the log line.
+      expect(job?.error_message).toBe(
+        `${JOB_ERROR_TEXT.invalid_state} Reason: var [value] is not allowed`,
+      );
+      expect(job?.last_error_code).toBe("invalid_state");
+    },
+  );
 
   it("a failure logs one console line: code, step, job id, detail redacted and capped", async () => {
     const key = "LEAK_KEY_ACME";
@@ -665,8 +706,116 @@ describe("ProvisionInstall: release gate and failures", () => {
       ip6,
     ])
       expect(lines[0]).not.toContain(leak);
-    // Never in D1: the job keeps the fixed text.
-    expect(w.job(s.jobId)?.error_message).toBe(JOB_ERROR_TEXT.invalid_state);
+    // #461: D1 gets the same redaction, the whole within ERROR_MESSAGE_MAX.
+    const stored = String(w.job(s.jobId)?.error_message ?? "");
+    expect(stored.startsWith(`${JOB_ERROR_TEXT.invalid_state} Reason: `)).toBe(
+      true,
+    );
+    expect(stored).toContain("[value]");
+    expect(stored.length).toBeLessThanOrEqual(ERROR_MESSAGE_MAX);
+    for (const leak of [
+      key,
+      "leakvalue",
+      "leakyslug",
+      EMAIL,
+      EMAIL.toLowerCase(),
+      encodeURIComponent(EMAIL),
+      other,
+      "evil.example",
+      ip,
+      ip6,
+    ])
+      expect(stored).not.toContain(leak);
+  });
+
+  it("#461: the mit-ai refusal's reason reaches jobs.error_message; a domain, slug or email in it is redacted", async () => {
+    const s = seedCreate(w, {
+      slug: "mitslug",
+      vars: {
+        AUTH_PROVIDERS: "google",
+        AUTH_DOMAINS: "finqore.test",
+        TIER: "business",
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { step } = stepRunner(w.clock);
+    const e = await jobStep(w.ctx, step, s.jobId, "create", undefined, () =>
+      Promise.reject(
+        new ProvisionRefused(
+          `google needs AUTH_DOMAINS: the server refuses google when it is empty (mitslug, finqore.test, ${EMAIL})`,
+          "invalid_state",
+        ),
+      ),
+    ).catch((x: unknown) => x as Error);
+    warn.mockRestore();
+    // The engine's error stays the fixed text.
+    expect(e.message).toBe(`invalid_state: ${JOB_ERROR_TEXT.invalid_state}`);
+    expect(w.job(s.jobId)?.error_message).toBe(
+      `${JOB_ERROR_TEXT.invalid_state} Reason: google needs AUTH_DOMAINS: the server refuses google when it is empty ([value], [value], [value])`,
+    );
+  });
+
+  for (const read of [
+    "SELECT args, signup_id, install_id FROM jobs",
+    "SELECT slug, vars, owner_sub FROM signups",
+    "SELECT owner_email AS email FROM signup_secret",
+    "SELECT slug, vars FROM installs",
+  ])
+    it(`#461: a request-values read that throws (${read.split(" FROM ")[1]}) stores the fixed text alone`, async () => {
+      const s = seedCreate(w, {
+        slug: "readfail",
+        vars: {
+          AUTH_PROVIDERS: "google",
+          AUTH_DOMAINS: "finqore.test",
+          TIER: "business",
+        },
+      });
+      const db = w.ctx.env.PLATFORM_DB;
+      const prepare = db.prepare.bind(db);
+      const spy = vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+        if (!sql.startsWith(read)) return prepare(sql);
+        const fail = () => Promise.reject(new Error("D1 read failed"));
+        const st = { bind: () => st, first: fail, all: fail, run: fail };
+        return st as unknown as D1PreparedStatement;
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { step } = stepRunner(w.clock);
+      await jobStep(w.ctx, step, s.jobId, "create", undefined, () =>
+        Promise.reject(
+          new ProvisionRefused(
+            `readfail on finqore.test for ${EMAIL}`,
+            "invalid_state",
+          ),
+        ),
+      ).catch(() => {});
+      spy.mockRestore();
+      warn.mockRestore();
+      expect(w.job(s.jobId)?.error_message).toBe(JOB_ERROR_TEXT.invalid_state);
+    });
+
+  it("#461: a retryable or Cloudflare failure stores the fixed text alone", async () => {
+    const s = seedCreate(w, { slug: "retryco" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { step } = stepRunner(w.clock);
+    for (const [err, code] of [
+      [
+        new ProvisionRetry("lease held by job retryco", "lease_held"),
+        "lease_held",
+      ],
+      [new CfError("PUT", "/scripts/retryco", 500, "boom retryco"), "cf_error"],
+      [new Error("anything retryco"), "internal"],
+    ] as const) {
+      await jobStep(
+        w.ctx,
+        step,
+        s.jobId,
+        "create",
+        { retries: { limit: 0, delay: 1 } },
+        () => Promise.reject(err),
+      ).catch(() => {});
+      expect(w.job(s.jobId)?.error_message).toBe(JOB_ERROR_TEXT[code]);
+    }
+    warn.mockRestore();
   });
 
   it("a retryable failure records attempt, last_error_code and retry_at on the job", async () => {

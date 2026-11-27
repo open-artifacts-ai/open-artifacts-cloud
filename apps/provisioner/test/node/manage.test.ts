@@ -29,7 +29,7 @@ import {
   fleetConditions,
   fleetRequestId,
 } from "../../../scheduler/src/provapi/fleet.js";
-import { JOB_ERROR_TEXT } from "../../src/errors.js";
+import { ERROR_MESSAGE_MAX, JOB_ERROR_TEXT } from "../../src/errors.js";
 import {
   GRACE_MS,
   NEVER_ROUTED,
@@ -353,8 +353,19 @@ describe("upgrade and rollback (5.4)", () => {
     expect(r.job).toMatchObject({
       status: "failed",
       error_code: "do_step_required",
-      error_message: `Upgrade this install to ${STEP} first: the target adds Durable Object classes it can't jump to.`,
     });
+    // #461: the step's text first, then the refusal's redacted reason.
+    const msg = String(r.job?.error_message ?? "");
+    expect(
+      msg.startsWith(
+        `Upgrade this install to ${STEP} first: the target adds Durable Object classes it can't jump to. Reason: `,
+      ),
+    ).toBe(true);
+    expect(msg).toContain("BusHub");
+    // The install id is a request value: redacted.
+    expect(msg).not.toContain(s.installId);
+    expect(msg).toContain("Reason: install [value]");
+    expect(msg.length).toBeLessThanOrEqual(ERROR_MESSAGE_MAX);
     expect(w.fake.writes().length).toBe(writes);
     expect(w.install(s.installId)).toMatchObject({ version: V1, lease: null });
     // The fleet reads what was stored: the install from the row, the step
