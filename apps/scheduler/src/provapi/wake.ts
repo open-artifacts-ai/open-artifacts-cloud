@@ -117,6 +117,7 @@ export async function fleetWake(
         back = m;
   const canary = fleetCanary(env.FLEET_CANARY);
   const detail = {
+    check: run?.check,
     retried: back !== undefined,
     to: fleetTarget(env.CF_VERSION_METADATA),
     canary,
