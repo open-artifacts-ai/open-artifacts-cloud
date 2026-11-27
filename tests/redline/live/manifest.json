@@ -734,6 +734,14 @@
     },
     {
       "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/handle [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org GET /api/v1/me/handle [pat]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org PATCH /api/v1/me [session]"
     },
     {
@@ -1251,6 +1259,10 @@
     {
       "file": "live/surfaces.test.ts",
       "name": "surface probes (cross-install) > org DELETE /api/v1/bus/roles/:id [session]"
+    },
+    {
+      "file": "live/surfaces.test.ts",
+      "name": "surface probes (cross-install) > org POST /api/v1/bus/roles/proposals/:id [session]"
     },
     {
       "file": "live/surfaces.test.ts",
