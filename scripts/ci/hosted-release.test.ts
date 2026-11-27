@@ -1144,6 +1144,7 @@ describe("hosted-release.yml (the cloud repo's hosted release)", () => {
     expect(st[b]?.env?.VERSION).toBe(
       "${{ needs.hosted-guard.outputs.version }}",
     );
+    expect(st[b]?.env?.BUS_PIN_REQUIRED).toBe("1");
     const run = st[b]?.run ?? "";
     expect(run).toContain(
       'scripts/ci/bus-pin-build.ts "$VERSION" apps/server/src/version.gen.ts -- pnpm --filter @oa/server build',

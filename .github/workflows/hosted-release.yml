@@ -364,6 +364,7 @@ jobs:
       - name: Build both variants and the release files, with manifest.json
         working-directory: public
         env:
+          BUS_PIN_REQUIRED: "1"
           PUB_SHA: ${{ needs.hosted-guard.outputs.public_sha }}
           VERSION: ${{ needs.hosted-guard.outputs.version }}
         run: |
