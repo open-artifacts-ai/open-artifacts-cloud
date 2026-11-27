@@ -103,14 +103,12 @@ describe("wrangler.jsonc", () => {
       expect(e.queues).toEqual({
         producers: [
           { binding: "SIGNUPS", queue: names.signups },
-          ...(env === "staging"
-            ? [{ binding: "FLEET_WAKE", queue: names.fleetWake }]
-            : []),
+          { binding: "FLEET_WAKE", queue: names.fleetWake },
         ],
         consumers: [
           {
             queue: names.fleetWake,
-            max_batch_size: env === "staging" ? 1 : 10,
+            max_batch_size: 1,
             max_batch_timeout: 0,
             // The backoff's budget (wake.ts), pinned to the code's.
             max_retries: FLEET_WAKE_MAX_RETRIES,
