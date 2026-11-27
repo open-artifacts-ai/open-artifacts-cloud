@@ -364,10 +364,15 @@ jobs:
       - name: Build both variants and the release files, with manifest.json
         working-directory: public
         env:
+          BUS_PIN_REQUIRED: "1"
           PUB_SHA: ${{ needs.hosted-guard.outputs.public_sha }}
+          VERSION: ${{ needs.hosted-guard.outputs.version }}
         run: |
           pnpm --filter @oa/provision build
-          pnpm --filter @oa/server build
+          # The server build pins the published bus release (public #2586): the
+          # release's own, or an older stable that verifies (a warning). Build
+          # once; fail if version.gen.ts has no pin (no unpinned hosted release).
+          node --experimental-strip-types scripts/ci/bus-pin-build.ts "$VERSION" apps/server/src/version.gen.ts -- pnpm --filter @oa/server build
           node --experimental-strip-types scripts/ci/build-hosted-release.ts "$RUNNER_TEMP/hosted" --commit "$PUB_SHA"
       - name: The built server reports exactly the release version
         working-directory: public
