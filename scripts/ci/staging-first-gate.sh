@@ -78,6 +78,6 @@ got="$(printf '%s' "$got" | tr -d '[:space:]')"
 # rl-a and rl-b are brought up by R5. The normal staging fleet canary
 # crosses via its own fleet job before prod may release this tag.
 curl --fail --silent --show-error --max-time 15 https://canary.open-artifacts-staging.app/healthz |
-  jq -e --arg version "$version" '.ok == true and .version == $version' > /dev/null ||
+  jq -es --arg version "$version" 'length == 1 and (.[0] | type == "object" and .ok == true and .version == $version)' > /dev/null ||
   fail "staging fleet canary is not healthy on $tag"
 echo "staging first: redline-staging.yml passed $tag on version $version (run $run)"

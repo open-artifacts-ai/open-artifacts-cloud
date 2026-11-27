@@ -82,7 +82,7 @@ const gate = (
     fail?: "fail" | "fail-arts" | "fail-zip" | "fail-compare";
     /** compare/main...<head_sha>'s status (default behind). */
     compare?: string;
-    canary?: { ok: boolean; version: string };
+    canaryBody?: string;
     tag?: string;
     /** run id -> its artifacts (default: run 7's one artifact). */
     arts?: Record<string, Art[] | string>;
@@ -93,7 +93,7 @@ const gate = (
   const sb = sandbox({ gh, curl: 'cat "$STATE/canary.json"' });
   writeFileSync(
     join(sb.dir, "canary.json"),
-    JSON.stringify(opts.canary ?? { ok: true, version: "0.80.0" }),
+    opts.canaryBody ?? JSON.stringify({ ok: true, version: "0.80.0" }),
   );
   writeFileSync(
     join(sb.dir, "runs.json"),
@@ -142,11 +142,18 @@ describe("staging-first-gate.sh", () => {
     ]);
   });
   it("holds prod until the staging fleet canary is healthy on this release", () => {
-    for (const canary of [
-      { ok: false, version: "0.80.0" },
-      { ok: true, version: "0.79.0" },
+    const healthy = JSON.stringify({ ok: true, version: "0.80.0" });
+    for (const canaryBody of [
+      "",
+      "  \n\t",
+      "{",
+      "null",
+      `[${healthy}]`,
+      `${healthy}\n${healthy}`,
+      JSON.stringify({ ok: false, version: "0.80.0" }),
+      JSON.stringify({ ok: true, version: "0.79.0" }),
     ]) {
-      const r = gate([runOf()], { canary });
+      const r = gate([runOf()], { canaryBody });
       expect(r.code).toBe(1);
       expect(r.err).toContain("staging fleet canary");
     }
