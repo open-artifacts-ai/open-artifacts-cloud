@@ -2805,6 +2805,17 @@ describe("#433: no timers, leo with the rest", () => {
     );
     expect(last.retried).toEqual([]);
     expect(last.acked).toEqual([0]);
+    // No more deliveries. The alerts tick must start the canary clock itself.
+    await fleetMarks(f.env, NOW);
+    const before = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS - 1);
+    expect(before.fleet_halted.rows.map((row) => row.code)).not.toContain(
+      "canary_blocked",
+    );
+    await fleetMarks(f.env, NOW + FLEET_BLOCKED_MS);
+    const due = await fleetConditions(f.env, NOW + FLEET_BLOCKED_MS);
+    expect(due.fleet_halted.rows).toContainEqual(
+      expect.objectContaining({ code: "canary_blocked", since: NOW }),
+    );
     // Nothing moved, and the other run's lease is still its own.
     expect(await fleetJobs()).toEqual([]);
     expect(await getState(db, FLEET_LEASE_KEY)).toBe(NOW - MIN);

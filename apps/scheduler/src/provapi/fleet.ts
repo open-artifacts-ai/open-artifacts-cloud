@@ -794,7 +794,7 @@ async function markDone(
  * The fleet's alert marks, on every 2-minute tick (the alerts duty), so they
  * stay current where no tick runs the fleet (cloud #264, smoke required):
  * `fleet_unverified:` (platform_unverified) while the target has no verified
- * mark, and the `fleet_behind:` stamps (version_skew) once it has. The same
+ * mark, then the blocked-canary clock and `fleet_behind:` stamps. The same
  * writes, under the same conditions, as a fleet pass makes, so an install
  * that falls behind or catches up between releases, and a deploy that never
  * marked its release verified, alert as before. Moves nothing: no job, no
@@ -802,11 +802,40 @@ async function markDone(
  */
 export async function fleetMarks(env: FleetEnv, now: number): Promise<void> {
   const target = fleetTarget(env.CF_VERSION_METADATA);
-  if (target === null || fleetCanary(env.FLEET_CANARY) === null) return;
+  const canary = fleetCanary(env.FLEET_CANARY);
+  if (target === null || canary === null) return;
   const db = env.PLATFORM_DB;
   const st = await fleetState(db);
-  if (await verified(db, now, st, target))
-    await trackBehind(db, now, st, target);
+  if (!(await verified(db, now, st, target))) return;
+  await trackBehind(db, now, st, target);
+  if (
+    fleetSmokeMode(env.FLEET_SMOKE) !== "required" ||
+    st.rows.has(blockedKey(target)) ||
+    isHalted(st, target) ||
+    (st.rows.has(soakedKey(target, canary)) &&
+      st.rows.has(smokedKey(target, canary)))
+  )
+    return;
+  // A wake may settle or halt the canary after our read. Check its marks
+  // in the insert so a late alert tick cannot restart a finished clock.
+  await d1(
+    db
+      .prepare(
+        `INSERT INTO platform_state (key, value, updated_at)
+         SELECT ?1, ?2, ?2
+         WHERE NOT EXISTS (SELECT 1 FROM platform_state WHERE key GLOB ?3)
+           AND (SELECT COUNT(*) FROM platform_state WHERE key IN (?4, ?5)) < 2
+         ON CONFLICT (key) DO NOTHING`,
+      )
+      .bind(
+        blockedKey(target),
+        now,
+        `${FLEET_HALT_PREFIX}${target}:*`,
+        soakedKey(target, canary),
+        smokedKey(target, canary),
+      )
+      .run(),
+  );
 }
 
 /**
