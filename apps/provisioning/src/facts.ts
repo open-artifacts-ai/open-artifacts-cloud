@@ -41,3 +41,12 @@ export const isFixtureSlugRefused = (
   p.kind !== "oidc" &&
   p.kind !== "test-admin" &&
   !isTestUser(p, env);
+
+/**
+ * Disposable staging test-install slug prefix for admin-token test hooks
+ * (cloud #84): tokens cannot take `rl-*` (reserved for red-line above) and
+ * may never enable test hooks on an ordinary staging slug.
+ */
+export const TOKEN_TEST_HOOKS_SLUG_PREFIX = "t-";
+export const isTokenTestHooksSlug = (slug: string): boolean =>
+  slug.startsWith(TOKEN_TEST_HOOKS_SLUG_PREFIX);

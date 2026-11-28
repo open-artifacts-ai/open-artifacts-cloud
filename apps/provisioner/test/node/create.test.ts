@@ -550,7 +550,11 @@ VALUES (?, 'retry', 'provision_install', ?, ?, 'token', ?, 'token', ?, ?, 'h', '
     );
   });
 
-  it("refuses a token test-hooks job on prod before provisioning", async () => {
+  it("refuses a token test-hooks job on prod or on an ordinary staging slug before provisioning", async () => {
+    for (const slug of ["acme", "business", "rl-tok"])
+      await refusedWith(
+        seedCreate(w, { slug, actor: "token", testHooks: true }),
+      );
     w.ctx.env.OA_ENV = "prod";
     await refusedWith(
       seedCreate(w, { slug: "t-prod", actor: "token", testHooks: true }),

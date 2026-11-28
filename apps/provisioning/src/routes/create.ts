@@ -14,6 +14,7 @@ import {
   factsOf,
   isFixtureSlugRefused,
   isTestUser,
+  isTokenTestHooksSlug,
   type PrincipalFacts,
 } from "../facts.js";
 import { newInstallId } from "../ids.js";
@@ -123,6 +124,14 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   if (!rules) throw new ApiError("forbidden");
   const f = checkCreateFields(body, rules, env.OA_ENV, STAGING_TEST_DOMAIN);
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
+  // Cloud #84: staging admin tokens may enable test hooks only for disposable
+  // t-* test-install slugs, never on prod or on an ordinary staging slug.
+  if (
+    p.kind === "token" &&
+    body.testHooks === true &&
+    (env.OA_ENV !== "staging" || !isTokenTestHooksSlug(body.slug))
+  )
+    throw new ApiError("forbidden", "slug: forbidden");
   // Google with no auth.domains is allowed (#2520): the install admits the
   // owner and invited people only. Email codes still need a domain.
 

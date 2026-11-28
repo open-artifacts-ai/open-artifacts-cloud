@@ -4,6 +4,7 @@ import {
   fakeProvisionerRpc,
 } from "@oa/provisioning-contract/fakes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isTokenTestHooksSlug } from "../src/facts.js";
 import type { Principal } from "../src/principal.js";
 import { call, type HTTP } from "./call.js";
 import {
@@ -498,6 +499,22 @@ describe("R4 create by a token and by OIDC", () => {
       (await call(prod, WRITE, "R4", { body: { ...body, testHooks: true } }))
         .code,
     ).toBe("forbidden");
+    // Cloud #84: ordinary staging slugs and rl-* slugs never pass admin-token
+    // testHooks admission; only disposable t-* slugs are eligible.
+    expect(isTokenTestHooksSlug("t-smoke")).toBe(true);
+    for (const slug of ["acme", "business", "rl-smoke", "t"])
+      expect(isTokenTestHooksSlug(slug), slug).toBe(false);
+    for (const slug of ["acme", "rl-smoke"]) {
+      const refused = await call(e, WRITE, "R4", {
+        body: { ...body, requestId: requestId(), slug, testHooks: true },
+      });
+      expect(refused.code, slug).toBe("forbidden");
+    }
+    expect(
+      await row<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM jobs WHERE kind = 'create'",
+      ),
+    ).toEqual({ n: 0 });
     const r = await call(e, WRITE, "R4", { body });
     expect(r.status).toBe(202);
     expect(r.body.job.actor).toEqual({
