@@ -1195,3 +1195,122 @@ VALUES (?, ?, ?, ?, 'o@x.test', 8000008, 'h', 'deleted', 1, ?)`,
     expect(w.install(old)).toMatchObject({ slug: "finqore" });
   });
 });
+
+describe("staging disposable test-install OIDC create", () => {
+  const fixtureVars = () => ({
+    AUTH_PROVIDERS: "email",
+    AUTH_DOMAINS: STAGING_TEST_DOMAIN,
+    EMAIL_CODE_DOMAIN: "on",
+    TEST_DOMAIN: STAGING_TEST_DOMAIN,
+    TIER: "team",
+  });
+
+  const fixtureActor = `oidc:4242:test-install:1001:${"A".repeat(42)}A`;
+  const deleteActor = `oidc:4242:test-install-delete:${"A".repeat(42)}A:iabcdefgh234`;
+
+  it("creates a staging t-* test-hooks install on the pinned version", async () => {
+    const s = seedCreate(w, {
+      slug: "t-fixture",
+      actor: "oidc",
+      actorKey: fixtureActor,
+      testHooks: true,
+      version: V1,
+      vars: fixtureVars(),
+    });
+    const r = await run(w, s.jobId);
+    expect(r.error).toBeNull();
+    expect(w.job(s.jobId)?.status).toBe("done");
+    expect(w.install(s.installId)).toMatchObject({
+      state: "active",
+      slug: "t-fixture",
+      version: V1,
+      test_hooks: 1,
+    });
+  });
+
+  it("refuses delete-mode actorKey, malformed actorKey, wrong auth, non-t- slug, or prod at recheck with zero CF writes", async () => {
+    const cases = [
+      {
+        name: "delete-mode actorKey on create",
+        seed: {
+          slug: "t-bad1",
+          actor: "oidc" as const,
+          actorKey: deleteActor,
+          testHooks: true,
+          vars: fixtureVars(),
+        },
+      },
+      {
+        name: "legacy unbound actorKey on create",
+        seed: {
+          slug: "t-bad1b",
+          actor: "oidc" as const,
+          actorKey: "oidc:4242:test-install",
+          testHooks: true,
+          vars: fixtureVars(),
+        },
+      },
+      {
+        name: "rl- slug",
+        seed: {
+          slug: "rl-fixture",
+          actor: "oidc" as const,
+          actorKey: fixtureActor,
+          testHooks: true,
+          vars: fixtureVars(),
+        },
+      },
+      {
+        name: "google auth provider",
+        seed: {
+          slug: "t-bad2",
+          actor: "oidc" as const,
+          actorKey: fixtureActor,
+          testHooks: true,
+          vars: {
+            AUTH_PROVIDERS: "google",
+            AUTH_DOMAINS: STAGING_TEST_DOMAIN,
+            TEST_DOMAIN: STAGING_TEST_DOMAIN,
+            TIER: "team",
+          },
+        },
+      },
+      {
+        name: "domain codes off",
+        seed: {
+          slug: "t-bad3",
+          actor: "oidc" as const,
+          actorKey: fixtureActor,
+          testHooks: true,
+          vars: {
+            AUTH_PROVIDERS: "email",
+            AUTH_DOMAINS: STAGING_TEST_DOMAIN,
+            TEST_DOMAIN: STAGING_TEST_DOMAIN,
+            TIER: "team",
+          },
+        },
+      },
+      {
+        name: "non-test domain",
+        seed: {
+          slug: "t-bad4",
+          actor: "oidc" as const,
+          actorKey: fixtureActor,
+          testHooks: true,
+          vars: { ...fixtureVars(), AUTH_DOMAINS: "customer.test" },
+        },
+      },
+    ];
+    for (const c of cases) {
+      const writes = w.fake.writes().length;
+      const s = seedCreate(w, c.seed);
+      const r = await run(w, s.jobId);
+      expect(r.error, c.name).not.toBeNull();
+      expect(w.job(s.jobId), c.name).toMatchObject({
+        status: "failed",
+        error_code: "invalid_state",
+      });
+      expect(w.fake.writes().length, c.name).toBe(writes);
+    }
+  });
+});

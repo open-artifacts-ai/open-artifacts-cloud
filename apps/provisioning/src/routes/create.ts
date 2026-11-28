@@ -6,6 +6,7 @@ import {
   checkCreateFields,
   fieldRulesOf,
   type OidcWorkflow,
+  parseTestInstallActorKey,
   slugError,
   type Tier,
 } from "@oa/provisioning-contract";
@@ -125,6 +126,16 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const body = a.input.body as Body;
   const rules = fieldRulesOf(p.kind);
   if (!rules) throw new ApiError("forbidden");
+  if (
+    p.kind === "oidc" &&
+    p.oidcWorkflow === "test-install" &&
+    (p.testInstallMode === "delete" ||
+      parseTestInstallActorKey(p.actorKey)?.mode !== "create")
+  )
+    throw new ApiError(
+      "forbidden",
+      "fixture cleanup credentials cannot create an install",
+    );
   const tokenTestHookSlugs = tokenTestHooksAllowlist(env);
   const checkFields: (
     body: Body,

@@ -146,6 +146,13 @@ ALLOW=(
   scripts/ci/fleet-wake.test.ts
   scripts/ci/fleet-wake-capable.sh
   scripts/ci/fleet-wake-capable.test.ts
+  # Disposable staging test installs (t-*): a workflow, CLI, session helpers, Dockerfile and tests.
+  .github/workflows/staging-test-install.yml
+  scripts/ops/staging-fixture-session.ts
+  scripts/ops/staging-fixture-session.test.ts
+  scripts/ops/staging-test-bus.Dockerfile
+  scripts/ops/staging-test-install.ts
+  scripts/ops/staging-test-install.test.ts
 )
 
 die() { echo "equivalence: $*" >&2; exit 1; }

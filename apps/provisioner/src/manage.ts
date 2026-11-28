@@ -32,9 +32,12 @@ import {
   type UpgradeResult,
 } from "@oa/provision";
 import {
+  checkRedlineCreds,
   type JobKind,
   oauthJobOf,
+  parseTestInstallActorKey,
   redlineCredsJobArgs,
+  TEST_INSTALL,
   type WorkflowParams,
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
@@ -72,12 +75,11 @@ import {
   checkOidcScope,
   checkTokenLive,
   checkTransition,
-  isFixtureCreateActorKey,
   readStatus,
   refused,
   type StatusRow,
 } from "./recheck.js";
-import { parseRedlineCredsArgs, redlineCreds } from "./redline.js";
+import { redlineArgs, redlineCreds } from "./redline.js";
 import {
   argsOf,
   doneAuditStatement,
@@ -811,7 +813,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
           )
         )?.actor_key ?? null)
       : null;
-  checkOidcScope(job, env, { ...out, createdBy });
+  checkOidcScope(job, env, { ...out, id: out.installId, createdBy });
   const now = ctx.io.now();
   switch (kind) {
     case "upgrade":
@@ -901,28 +903,30 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       // R26 is O only (3.4); TRANSITIONS reads OIDC as A.
       if (job.actor_kind !== "oidc") throw refused("redline_creds is OIDC's");
       if (env !== "staging") throw refused("redline_creds is staging only");
-      if (!row || row.test_hooks !== 1)
-        throw refused("not a test-hooks install");
-      const fixture = isFixtureCreateActorKey(job.actor_key);
-      if (fixture) {
-        if (!row.slug.startsWith("t-"))
-          throw refused("not a disposable fixture install");
-        if (createdBy !== job.actor_key)
-          throw refused("fixture does not own this install");
-      } else if (!row.slug.startsWith("rl-")) {
-        throw refused("not a red-line test install");
-      }
+      const fixtureScope = parseTestInstallActorKey(job.actor_key);
+      const isFixture = fixtureScope !== null;
+      if (
+        !row ||
+        row.test_hooks !== 1 ||
+        (!isFixture && !row.slug.startsWith("rl-")) ||
+        (isFixture &&
+          (fixtureScope.mode !== "create" ||
+            !row.slug.startsWith(TEST_INSTALL.slugPrefix)))
+      )
+        throw refused(
+          isFixture
+            ? "not a disposable test install"
+            : "not a red-line test install",
+        );
       if (row.state !== "active") throw refused("the install is not active");
-      const parsed = parseRedlineCredsArgs(job);
-      if (fixture) {
-        if (parsed.revoke !== false || parsed.hookKeyOnly !== true)
-          throw refused("disposable fixtures only rotate TEST_HOOK_KEY");
-        out.args = { revoke: false, hookKeyOnly: true };
-      } else {
-        if (parsed.hookKeyOnly !== undefined)
-          throw refused("hookKeyOnly is only for disposable fixtures");
-        out.args = redlineCredsJobArgs(parsed);
-      }
+      const parsed = redlineArgs(job);
+      const denied = checkRedlineCreds(
+        parsed,
+        isFixture ? "test-install" : undefined,
+        fixtureScope?.mode,
+      );
+      if (denied) throw refused(`${denied.field}: ${denied.code}`);
+      out.args = redlineCredsJobArgs(parsed);
       break;
     }
     case "update": {

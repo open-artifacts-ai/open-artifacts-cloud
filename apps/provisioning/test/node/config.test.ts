@@ -221,6 +221,7 @@ describe("wrangler.jsonc", () => {
               "redline-staging.yml",
               "staging-test-admin.yml",
               "staging-test-member.yml",
+              "staging-test-install.yml",
             ].map(
               (w) =>
                 `open-artifacts-ai/open-artifacts-cloud/.github/workflows/${w}@refs/heads/main`,

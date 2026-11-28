@@ -33,22 +33,23 @@ describe("W9b: the retired hosted writes stay retired", () => {
   it("no workflow names a retired file, target or secret", () => {
     const banned =
       /hosted-ops|ci-args|redline-creds|redline-deploy|hosted-turnstile-keys|prod-clean-cli|inventory-key|INVENTORY_KEY|secrets\.REDLINE_RL_|CREATE_OWNER_EMAIL|TURNSTILE_KEYS/;
-    // The one allowed match: R26's own API path (ROUTES.R26), called by the
-    // test member's workflow through the Provisioning API, not the retired
-    // CLI command. Only that exact quoted path in that one file.
+    // The allowed matches: R26's own API path (ROUTES.R26), called by the
+    // staging test workflows through the Provisioning API, not the retired
+    // CLI command. Only that exact quoted path in those two files.
     const R26_PATH = '"/v1/installs/$id/redline-creds"';
+    const R26_WORKFLOWS = new Set([
+      "staging-test-member.yml",
+      "staging-test-install.yml",
+    ]);
     for (const f of workflows) {
       const text = read(`.github/workflows/${f}`);
       expect(
-        f === "staging-test-member.yml"
-          ? text.split(R26_PATH).join('"R26"')
-          : text,
+        R26_WORKFLOWS.has(f) ? text.split(R26_PATH).join('"R26"') : text,
         f,
       ).not.toMatch(banned);
     }
-    expect(read(".github/workflows/staging-test-member.yml")).toContain(
-      R26_PATH,
-    );
+    for (const f of R26_WORKFLOWS)
+      expect(read(`.github/workflows/${f}`), f).toContain(R26_PATH);
   });
 
   // The CLI's own command lists are checked in scripts/hosted/test/cli.test.ts,

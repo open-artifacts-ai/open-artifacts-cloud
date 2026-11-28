@@ -3368,3 +3368,210 @@ describe("a create's lease across its attempts (#1326)", () => {
     expect(w.status(s.installId)?.state).toBe("deleted");
   });
 });
+
+describe("disposable staging test-install (hookKeyOnly + authenticated delete/purge)", () => {
+  const fixtureVars = () => ({
+    AUTH_PROVIDERS: "email",
+    AUTH_DOMAINS: "oa-redline-a.fyi",
+    EMAIL_CODE_DOMAIN: "on",
+    TEST_DOMAIN: "oa-redline-a.fyi",
+    TIER: "team",
+  });
+  const keyIdA = `${"A".repeat(42)}A`;
+  const keyIdB = `${"B".repeat(42)}A`;
+  const createKeyA = `oidc:4242:test-install:1001:${keyIdA}`;
+  const createKeyB = `oidc:4242:test-install:1002:${keyIdB}`;
+  const deleteKeyA = (installId: string) =>
+    `oidc:4242:test-install-delete:${keyIdA}:${installId}`;
+  const deleteKeyB = (installId: string) =>
+    `oidc:4242:test-install-delete:${keyIdB}:${installId}`;
+
+  it("hookKeyOnly seals only {hookKey} with zero session or PAT calls, including on retry and replay", async () => {
+    const s = await active({
+      slug: "t-hook",
+      actor: "oidc",
+      actorKey: createKeyA,
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+    const { script, seen, probes } = stubInstall(s.installId, undefined, {
+      staleProbes: KEY_LIVE_WAITS_MS.length + 1,
+    });
+    const oldKey = script?.secrets.get("TEST_HOOK_KEY");
+    const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+      "deriveBits",
+    ])) as CryptoKeyPair;
+    const recipientKey = Buffer.from(
+      new Uint8Array(
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
+    ).toString("base64url");
+
+    const r = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: createKeyA,
+      args: { hookKeyOnly: true, recipientKey },
+      twice: true,
+    });
+    expect(r.error).toBeNull();
+    expect(r.job?.status).toBe("done");
+    const newKey = script?.secrets.get("TEST_HOOK_KEY") as string;
+    expect(newKey).not.toBe(oldKey);
+    expect(probes.length).toBeGreaterThanOrEqual(KEY_LIVE_WAITS_MS.length + 3);
+    // Never calls /__test/session (real session), /api/v1/tokens, or /api/v1/me.
+    expect(seen).toEqual([]);
+    const opened = JSON.parse(
+      await openSealed(pair, r.job?.sealed as string),
+    ) as Record<string, unknown>;
+    expect(opened).toEqual({ hookKey: newKey });
+    expect("pat" in opened).toBe(false);
+  });
+
+  it("refuses generic PAT mint, revoke, delete-mode R26, cross-fixture, admin-created t-, and rl- at recheck with zero CF writes", async () => {
+    const alpha = await active({
+      slug: "t-alpha",
+      actor: "oidc",
+      actorKey: createKeyA,
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+    const beta = await active({
+      slug: "t-beta",
+      actor: "oidc",
+      actorKey: createKeyB,
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+    const adminT = await active({
+      slug: "t-admin",
+      actor: "admin",
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+    const rlA = await active({ slug: "rl-a", actor: "oidc", testHooks: true });
+    const recipientKey = `${"C".repeat(42)}A`;
+
+    const cases: Array<{
+      name: string;
+      kind: string;
+      installId: string;
+      actorKey: string;
+      args?: Record<string, unknown>;
+    }> = [
+      {
+        name: "fixture generic PAT mint",
+        kind: "redline_creds",
+        installId: alpha.installId,
+        actorKey: createKeyA,
+        args: { recipientKey },
+      },
+      {
+        name: "fixture revoke",
+        kind: "redline_creds",
+        installId: alpha.installId,
+        actorKey: createKeyA,
+        args: { revoke: true },
+      },
+      {
+        name: "delete-mode actor calling hookKeyOnly R26",
+        kind: "redline_creds",
+        installId: alpha.installId,
+        actorKey: deleteKeyA(alpha.installId),
+        args: { hookKeyOnly: true, recipientKey },
+      },
+      {
+        name: "redline caller requesting hookKeyOnly",
+        kind: "redline_creds",
+        installId: rlA.installId,
+        actorKey: "oidc:4242",
+        args: { hookKeyOnly: true, recipientKey },
+      },
+      {
+        name: "cross-fixture create actor on R26",
+        kind: "redline_creds",
+        installId: beta.installId,
+        actorKey: createKeyA,
+        args: { hookKeyOnly: true, recipientKey },
+      },
+      {
+        name: "cross-fixture delete actor with wrong owner key",
+        kind: "delete",
+        installId: alpha.installId,
+        actorKey: deleteKeyB(alpha.installId),
+      },
+      {
+        name: "cross-fixture delete actor with wrong target ID",
+        kind: "delete",
+        installId: beta.installId,
+        actorKey: deleteKeyA(alpha.installId),
+      },
+      {
+        name: "fixture deleting admin-created t- install",
+        kind: "delete",
+        installId: adminT.installId,
+        actorKey: deleteKeyA(adminT.installId),
+      },
+      {
+        name: "fixture deleting rl- install",
+        kind: "delete",
+        installId: rlA.installId,
+        actorKey: deleteKeyA(rlA.installId),
+      },
+      {
+        name: "fixture upgrading its own install",
+        kind: "upgrade",
+        installId: alpha.installId,
+        actorKey: createKeyA,
+        args: { from: V1, to: V2 },
+      },
+    ];
+
+    for (const c of cases) {
+      const writes = w.fake.writes().length;
+      const r = await manage(c.kind, c.installId, {
+        actor: "oidc",
+        actorKey: c.actorKey,
+        args: c.args,
+      });
+      expect(r.job, c.name).toMatchObject({
+        status: "failed",
+        error_code: "invalid_state",
+      });
+      expect(w.fake.writes().length, c.name).toBe(writes);
+    }
+  });
+
+  it("authenticated delete and immediate purge remove only the target fixture and leave sibling intact", async () => {
+    const alpha = await active({
+      slug: "t-del-a",
+      actor: "oidc",
+      actorKey: createKeyA,
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+    const beta = await active({
+      slug: "t-del-b",
+      actor: "oidc",
+      actorKey: createKeyB,
+      testHooks: true,
+      vars: fixtureVars(),
+    });
+
+    const del = await manage("delete", alpha.installId, {
+      actor: "oidc",
+      actorKey: deleteKeyA(alpha.installId),
+    });
+    expect(del.error).toBeNull();
+    expect(del.job?.status).toBe("done");
+    expect(w.status(alpha.installId)?.state).toBe("deleting");
+
+    const purge = await manage("purge", alpha.installId, {
+      actor: "oidc",
+      actorKey: deleteKeyA(alpha.installId),
+    });
+    expect(purge.error).toBeNull();
+    expect(purge.job?.status).toBe("done");
+    expect(w.status(alpha.installId)?.state).toBe("deleted");
+    expect(w.status(beta.installId)?.state).toBe("active");
+  });
+});

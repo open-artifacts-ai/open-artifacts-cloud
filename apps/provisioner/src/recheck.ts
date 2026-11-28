@@ -14,10 +14,13 @@ import {
   canTransition,
   type InstallState,
   type JobKind,
+  parseTestInstallActorKey,
   slugError,
+  TEST_INSTALL,
   TEST_MEMBER,
   type TransitionActor,
   type TransitionFrom,
+  testInstallOwns,
   testMemberOwns,
 } from "@oa/provisioning-contract";
 import { StepRefusal } from "./errors.js";
@@ -85,23 +88,15 @@ export function actorOf(kind: JobRow["actor_kind"]): TransitionActor {
 }
 
 /**
- * Authenticated create-run actor key for disposable staging fixtures
- * (`oidc:<repoId>:test-install:<runId>:<ownerKeyId>`).
- */
-export const FIXTURE_CREATE_ACTOR_RE =
-  /^oidc:\d{1,32}:test-install:\d{1,32}:[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
-export const isFixtureCreateActorKey = (actorKey: string): boolean =>
-  FIXTURE_CREATE_ACTOR_RE.test(actorKey);
-
-/**
  * OIDC's scope (4.4, 5.1): staging only, and only an `rl-` install with test
- * hooks (or an owned `t-` disposable fixture for `redline_creds` hook-key
- * rotation). TRANSITIONS reads OIDC as A, so this is the rest of its check.
+ * hooks (or a disposable `t-` fixture install owned by the `test-install`
+ * workflow). TRANSITIONS reads OIDC as A, so this is the rest of its check.
  */
 export function checkOidcScope(
   job: JobRow,
   env: DeployEnv,
   install: {
+    id?: string;
     slug: string | null;
     testHooks: boolean;
     createdBy?: string | null;
@@ -109,16 +104,39 @@ export function checkOidcScope(
 ): void {
   if (job.actor_kind !== "oidc") return;
   if (env !== "staging") throw refused("OIDC is staging only");
-  if (job.actor_key.includes(":test-install")) {
-    if (
-      job.kind !== "redline_creds" ||
-      !isFixtureCreateActorKey(job.actor_key) ||
-      !install.slug?.startsWith("t-") ||
-      !install.testHooks ||
-      install.createdBy !== job.actor_key
-    )
+  if (job.actor_key.includes(TEST_INSTALL.actorSuffix)) {
+    const scope = parseTestInstallActorKey(job.actor_key);
+    if (!scope) throw refused("malformed fixture actor key");
+    if (job.kind === "create") {
+      if (
+        scope.mode !== "create" ||
+        !(install.slug ?? "").startsWith(TEST_INSTALL.slugPrefix) ||
+        !install.testHooks
+      )
+        throw refused(
+          "the fixture workflow creates only disposable t- test installs",
+        );
+      return;
+    }
+    const owned = testInstallOwns(
+      {
+        id: install.id ?? job.install_id,
+        slug: install.slug ?? "",
+        testHooks: install.testHooks,
+        createdBy: install.createdBy,
+      },
+      scope,
+    );
+    if (job.kind === "redline_creds") {
+      if (scope.mode !== "create" || !owned)
+        throw refused(
+          "the fixture workflow rotates TEST_HOOK_KEY only for its own create run",
+        );
+      return;
+    }
+    if (!["delete", "purge", "discard"].includes(job.kind) || !owned)
       throw refused(
-        "the fixture workflow acts only on its own disposable test install",
+        "the fixture workflow acts only on its owned disposable test install",
       );
     return;
   }

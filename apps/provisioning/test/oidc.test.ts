@@ -4,13 +4,22 @@ import {
   JwksCache,
   type VerifyOptions,
 } from "@oa/gh-oidc";
+import {
+  fixtureOwnerKeyId,
+  signFixtureDeleteProof,
+  testInstallActorKey,
+  testInstallDeleteActorKey,
+} from "@oa/provisioning-contract";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  FIXTURE_DELETE_PROOF_HEADER,
+  FIXTURE_OWNER_KEY_HEADER,
   oidcPins,
   oidcPrincipal,
   REDLINE_WORKFLOW_REF,
   STAGING_API_HOST,
   TEST_ADMIN_WORKFLOW_REF,
+  TEST_INSTALL_WORKFLOW_REF,
   TEST_MEMBER_WORKFLOW_REF,
   TEST_USER_HEADER,
 } from "../src/auth/oidc.js";
@@ -466,6 +475,213 @@ describe("each allowed workflow ref maps to its own scope; none falls back", () 
         req({ [TEST_USER_HEADER]: "a" }),
         stagingEnv(),
         await jwt({ job_workflow_ref: OTHER }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+  });
+});
+
+describe("the fixture workflow (staging-test-install.yml)", () => {
+  const TI = TEST_INSTALL_WORKFLOW_REF;
+  const env = () => stagingEnv({ OIDC_JOB_WORKFLOW_REFS: `${WF},${TI}` });
+  const mkOwner = async () => {
+    const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const raw = (await crypto.subtle.exportKey(
+      "raw",
+      pair.publicKey,
+    )) as ArrayBuffer;
+    const pub = b64u(raw);
+    return {
+      pub,
+      privateKey: pair.privateKey,
+      keyId: await fixtureOwnerKeyId(pub),
+    };
+  };
+
+  it("is pinned to staging-test-install.yml on main", () => {
+    expect(TI).toBe(
+      `${REPO}/.github/workflows/staging-test-install.yml@refs/heads/main`,
+    );
+  });
+
+  it("maps create runs to run_id + ownerKeyId and verifies signed Ed25519 delete proofs", async () => {
+    const ownerA = await mkOwner();
+    const ownerB = await mkOwner();
+    const createA = await oidcPrincipal(
+      req({ [FIXTURE_OWNER_KEY_HEADER]: ownerA.pub }),
+      env(),
+      await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+      vopts(),
+    );
+    const createB = await oidcPrincipal(
+      req({ [FIXTURE_OWNER_KEY_HEADER]: ownerB.pub }),
+      env(),
+      await jwt({ job_workflow_ref: TI, run_id: "1002" }),
+      vopts(),
+    );
+    expect(createA).toMatchObject({
+      kind: "oidc",
+      oidcWorkflow: "test-install",
+      testInstallMode: "create",
+      actorKey: testInstallActorKey("4242", "1001", ownerA.keyId),
+      rateKey: "oidc:4242:test-install",
+    });
+    expect(createB).toMatchObject({
+      kind: "oidc",
+      oidcWorkflow: "test-install",
+      testInstallMode: "create",
+      actorKey: testInstallActorKey("4242", "1002", ownerB.keyId),
+      rateKey: "oidc:4242:test-install",
+    });
+    expect((createA as { actorKey: string }).actorKey).not.toBe(
+      (createB as { actorKey: string }).actorKey,
+    );
+
+    const proofA = await signFixtureDeleteProof(ownerA.privateKey, {
+      repositoryId: "4242",
+      installId: "iabcdefgh234",
+      expiresAt: T + 10 * 60_000,
+    });
+    const delA = await oidcPrincipal(
+      req({
+        [FIXTURE_OWNER_KEY_HEADER]: ownerA.pub,
+        [FIXTURE_DELETE_PROOF_HEADER]: proofA,
+      }),
+      env(),
+      await jwt({ job_workflow_ref: TI, run_id: "2001" }),
+      vopts(),
+    );
+    expect(delA).toMatchObject({
+      kind: "oidc",
+      oidcWorkflow: "test-install",
+      testInstallMode: "delete",
+      actorKey: testInstallDeleteActorKey("4242", ownerA.keyId, "iabcdefgh234"),
+      rateKey: "oidc:4242:test-install",
+    });
+
+    // Wrong owner key, expired proof, or tampered install ID all fail closed (401).
+    expect(
+      await oidcPrincipal(
+        req({
+          [FIXTURE_OWNER_KEY_HEADER]: ownerB.pub,
+          [FIXTURE_DELETE_PROOF_HEADER]: proofA,
+        }),
+        env(),
+        await jwt({ job_workflow_ref: TI, run_id: "2002" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    const expiredProof = await signFixtureDeleteProof(ownerA.privateKey, {
+      repositoryId: "4242",
+      installId: "iabcdefgh234",
+      expiresAt: T - 1,
+    });
+    expect(
+      await oidcPrincipal(
+        req({
+          [FIXTURE_OWNER_KEY_HEADER]: ownerA.pub,
+          [FIXTURE_DELETE_PROOF_HEADER]: expiredProof,
+        }),
+        env(),
+        await jwt({ job_workflow_ref: TI, run_id: "2003" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+  });
+
+  it("refuses missing run_id, missing/malformed owner key, bad delete proof, and x-oa-test-user", async () => {
+    const owner = await mkOwner();
+    // Missing run_id
+    expect(
+      await oidcPrincipal(
+        req({ [FIXTURE_OWNER_KEY_HEADER]: owner.pub }),
+        env(),
+        await jwt({ job_workflow_ref: TI }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    // Missing or malformed owner key
+    const badOwnerHeaders: Record<string, string>[] = [
+      {},
+      { [FIXTURE_OWNER_KEY_HEADER]: "" },
+      { [FIXTURE_OWNER_KEY_HEADER]: "bad-key" },
+    ];
+    for (const h of badOwnerHeaders)
+      expect(
+        await oidcPrincipal(
+          req(h),
+          env(),
+          await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+          vopts(),
+        ),
+        JSON.stringify(h),
+      ).toEqual(unauth);
+    // Malformed delete proof
+    expect(
+      await oidcPrincipal(
+        req({
+          [FIXTURE_OWNER_KEY_HEADER]: owner.pub,
+          [FIXTURE_DELETE_PROOF_HEADER]: "bad.proof",
+        }),
+        env(),
+        await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    for (const u of ["a", "b", "c"])
+      expect(
+        await oidcPrincipal(
+          req({
+            [FIXTURE_OWNER_KEY_HEADER]: owner.pub,
+            [TEST_USER_HEADER]: u,
+          }),
+          env(),
+          await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+          vopts(),
+        ),
+        u,
+      ).toEqual(unauth);
+  });
+
+  it("refused unless listed in OIDC_JOB_WORKFLOW_REFS, off main, on prod, or off staging host", async () => {
+    const owner = await mkOwner();
+    const h = { [FIXTURE_OWNER_KEY_HEADER]: owner.pub };
+    expect(
+      await oidcPrincipal(
+        req(h),
+        stagingEnv(),
+        await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req(h),
+        env(),
+        await jwt({
+          job_workflow_ref: TI,
+          run_id: "1001",
+          ref: "refs/heads/feature",
+        }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req(h),
+        { ...env(), OA_ENV: "prod" } as Env,
+        await jwt({ job_workflow_ref: TI, run_id: "1001" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req(h, "api.open-artifacts.app"),
+        env(),
+        await jwt({ job_workflow_ref: TI, run_id: "1001" }),
         vopts(),
       ),
     ).toEqual(unauth);

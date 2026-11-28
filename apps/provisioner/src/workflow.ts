@@ -38,6 +38,7 @@ import {
 import { settledWith } from "@oa/provision/jobs";
 import {
   bodyHash,
+  parseTestInstallActorKey,
   type WorkflowParams,
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
@@ -367,7 +368,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
             !tokenTestHookSlugs.includes(slug)))))
   )
     throw refused("test hooks are not allowed for this principal");
-  checkOidcScope(job, env, { slug, testHooks });
+  checkOidcScope(job, env, { id: job.install_id, slug, testHooks });
   if (testHooks && s.send_welcome === 1)
     throw refused("a test-hooks install gets no welcome");
   const vars = strictVars(s.vars, {
@@ -376,6 +377,16 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
     testHooks,
     env,
   });
+  if (
+    job.actor_kind === "oidc" &&
+    parseTestInstallActorKey(job.actor_key) !== null &&
+    (vars.AUTH_PROVIDERS !== "email" ||
+      vars.EMAIL_CODE_DOMAIN !== "on" ||
+      vars.AUTH_DOMAINS !== vars.TEST_DOMAIN)
+  )
+    throw refused(
+      "fixture installs need domain codes in the staging test domain",
+    );
   const args = argsOf(job);
   const v = args.version ?? s.version ?? null;
   if (v !== null && typeof v !== "string") throw refused("bad version");
