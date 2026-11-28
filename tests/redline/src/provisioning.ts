@@ -374,6 +374,7 @@ export class Run {
     // Held: unknown until the probe answers, then the API's capability.
     let held: boolean | undefined = this.jobWaitHeld;
     let drops = 0;
+    let usedPlainRetry = false;
     for (;;) {
       let r: Res;
       try {
@@ -406,6 +407,23 @@ export class Run {
             `R15 ${jobId}: no answer (${drops} dropped connections in a row)`,
           );
         continue;
+      }
+      if (
+        held &&
+        !usedPlainRetry &&
+        r.status === 503 &&
+        errCode(r) === "job_wait_unavailable"
+      ) {
+        const seconds = Number(r.headers.get("retry-after"));
+        const delay =
+          Number.isSafeInteger(seconds) && seconds > 0
+            ? seconds * 1000
+            : POLL_MS;
+        if (delay >= end - this.io.now())
+          throw new ProbeFail(`R15 ${jobId}: hold unavailable before deadline`);
+        usedPlainRetry = true;
+        await this.io.wait(delay);
+        r = await this.v1(`/jobs/${jobId}`, { testUser: o.testUser });
       }
       if (r.status !== 200) throw new ProbeFail(`R15 ${jobId}: ${desc(r)}`);
       const j = r.json as Job;

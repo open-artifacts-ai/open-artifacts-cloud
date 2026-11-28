@@ -39,9 +39,7 @@ const stub = (ns: JobWaitNamespace, jobId: string) =>
 /**
  * Holds until the job changes or `ms` passes. `seen` is the job's
  * updated_at as this read saw it: a change made before the hold registers
- * answers at once. Unbound, or a failed call (the object reset by a
- * deploy), answers at once: the read then returns the job as it is, never
- * an error.
+ * answers at once. RPC failures propagate so callers can back off.
  */
 export async function holdJob(
   env: { JOB_WAIT?: JobWaitNamespace },
@@ -50,9 +48,7 @@ export async function holdJob(
   seen: number,
 ): Promise<void> {
   if (!env.JOB_WAIT || ms <= 0) return;
-  try {
-    await stub(env.JOB_WAIT, jobId).hold(jobId, ms, seen);
-  } catch {}
+  await stub(env.JOB_WAIT, jobId).hold(jobId, ms, seen);
 }
 
 /** The job ended here (R25 cancel): releases its held reads. Never throws. */

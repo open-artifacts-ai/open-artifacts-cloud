@@ -234,7 +234,20 @@ export async function getJob(a: HandlerArgs): Promise<RouteResult> {
   // answered as it is.
   const wait = (q(a).wait as number | undefined) ?? 0;
   if (wait > 0 && (row.status === "queued" || row.status === "running")) {
-    await holdJob(a.env, jobId, wait, row.updated_at);
+    try {
+      await holdJob(a.env, jobId, wait, row.updated_at);
+    } catch {
+      return {
+        status: 503,
+        headers: { "Retry-After": "3" },
+        body: {
+          error: {
+            code: "job_wait_unavailable",
+            message: "Job wait temporarily unavailable",
+          },
+        },
+      };
+    }
     row = await read();
   }
   let sealed: string | null = null;

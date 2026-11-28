@@ -177,7 +177,7 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
     expect((await r15(unbound, open, "25000")).body.status).toBe("running");
   });
 
-  it("a failed hold (the object reset by a deploy) answers the job as it is", async () => {
+  it("a failed hold returns 503 with a retry delay", async () => {
     const e = fakeEnv({
       JOB_WAIT: {
         idFromName: (n: string) => n as unknown as DurableObjectId,
@@ -194,8 +194,9 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
     const { id } = await seedInstall();
     const job = await seedJob(id, { status: "running" });
     const r = await r15(e, job, "25000");
-    expect(r.status).toBe(200);
-    expect(r.body.status).toBe("running");
+    expect(r.status).toBe(503);
+    expect(r.body.error.code).toBe("job_wait_unavailable");
+    expect(r.headers["Retry-After"]).toBe("3");
   });
 
   it("a caller who may not read the job is refused as before, and nothing is held", async () => {

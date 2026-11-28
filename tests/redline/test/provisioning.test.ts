@@ -1319,6 +1319,26 @@ describe("each probe fails on the behaviour it guards", () => {
         expect(waits).toEqual([]);
       });
 
+      it("backs off for one plain retry and stops on a second failed hold", async () => {
+        const unavailable = () =>
+          Response.json(
+            { error: { code: "job_wait_unavailable" } },
+            { status: 503, headers: { "Retry-After": "4" } },
+          );
+        const { run, seen } = runWith(
+          heldApi([unavailable, () => job("running"), unavailable]),
+        );
+        const waits = counted(run);
+        await expect(run.waitJob("j1")).rejects.toThrow("R15 j1: status 503");
+        expect(waits).toEqual([4000]);
+        expect(reads(seen)).toEqual([
+          "/jobs/j1?wait=invalid",
+          "/jobs/j1?wait=25000",
+          "/jobs/j1",
+          "/jobs/j1?wait=25000",
+        ]);
+      });
+
       it("a dropped held read is sent again at once; three in a row fail", async () => {
         const ok = runWith(heldApi([dropped, () => job("done")]));
         const waits = counted(ok.run);
