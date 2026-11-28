@@ -11,7 +11,9 @@ import {
   gatePasses,
   parseManifest,
 } from "../src/report.ts";
+import { loadManifest } from "../src/reporter.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
+import { SURFACES_FILE } from "../src/surfaces.ts";
 import {
   ACCEPTED_UNPROVEN_ADDED_SINCE_1730,
   CASES_ADDED_SINCE_1730,
@@ -20,6 +22,8 @@ import {
 // #1730 changes when and beside what the cases run, never which cases there
 // are or what passes. test/fixtures/main-cases.json is main's required cases
 // and pass bar at the base of the change: this test holds the suite to them.
+// live/surfaces.test.ts is derived directly from public's route policy table,
+// so neither manifest.json nor cases-added.ts duplicates it.
 interface Main {
   manifest: { file: string; name: string }[];
   acceptedUnproven: { name: string; reason: string; file: string }[];
@@ -33,27 +37,32 @@ const pkg = join(import.meta.dirname, "..");
 const read = (f: string) => readFileSync(join(pkg, f), "utf8");
 
 describe("the same cases", () => {
-  it("manifest.json holds exactly main's 329 cases, in main's order, plus the declared additions", () => {
+  it("manifest.json holds main's non-surfaces cases plus declared additions, and zero duplicated surfaces entries", () => {
     const m = parseManifest(read("live/manifest.json"));
     const all = m.cases.map((c) => ({ file: c.file, name: c.name }));
     const key = (c: { file: string; name: string }) =>
       `${c.file}\u0000${c.name}`;
+    const mainStatic = main.manifest.filter((c) => c.file !== SURFACES_FILE);
     const added = new Set(CASES_ADDED_SINCE_1730.map(key));
-    const base = new Set(main.manifest.map(key));
+    const base = new Set(mainStatic.map(key));
     expect(main.manifest).toHaveLength(329);
+    expect(all.filter((c) => c.file === SURFACES_FILE)).toEqual([]);
+    expect(
+      CASES_ADDED_SINCE_1730.filter((c) => c.file === SURFACES_FILE),
+    ).toEqual([]);
     expect(added.size).toBe(CASES_ADDED_SINCE_1730.length);
     // Every declared addition is in the manifest and not already main's.
     for (const k of added) {
       expect(all.map(key)).toContain(k);
       expect(base.has(k)).toBe(false);
     }
-    expect(all.filter((c) => !added.has(key(c)))).toEqual(main.manifest);
+    expect(all.filter((c) => !added.has(key(c)))).toEqual(mainStatic);
   });
 
   it("every manifest case runs in a lane, and the plan runs no file outside the manifest", () => {
-    const files = new Set(
-      [...main.manifest, ...CASES_ADDED_SINCE_1730].map((c) => c.file),
-    );
+    const m = loadManifest();
+    expect(m).not.toBeNull();
+    const files = new Set((m?.cases ?? []).map((c) => c.file));
     const lanes = new Set(PLAN.flat().flatMap((l) => l.files));
     expect(lanes).toEqual(files);
   });

@@ -31,9 +31,9 @@ import {
   buildReport,
   type CaseResult,
   exitCode,
-  parseManifest,
   type Report,
 } from "../src/report.ts";
+import { loadManifest } from "../src/reporter.ts";
 import { MAX_RETRIED_CASES } from "../src/retry.ts";
 
 const pkg = join(import.meta.dirname, "..");
@@ -77,8 +77,9 @@ describe("the lane plan", () => {
   });
 
   it("runs every file the manifest requires, each in exactly one lane", () => {
-    const m = parseManifest(read("live/manifest.json"));
-    for (const c of m.cases) {
+    const m = loadManifest();
+    expect(m).not.toBeNull();
+    for (const c of m?.cases ?? []) {
       const lanes = PLAN.flat().filter((l) => l.files.includes(c.file));
       // Surfaces' cases are split between its two shards, each case in one.
       expect(lanes, c.file).toHaveLength(
@@ -806,9 +807,12 @@ describe("scripts/redline.ts with no targets", () => {
         expect(existsSync(join(dir, "report.json.locks"))).toBe(true);
         const rep = JSON.parse(readFileSync(report, "utf8")) as Report;
         expect(existsSync(join(dir, "report.txt"))).toBe(true);
-        const m = parseManifest(read("live/manifest.json"));
+        const m = loadManifest();
+        expect(m).not.toBeNull();
         const names = new Set(rep.cases.map((c) => `${c.file} ${c.name}`));
-        for (const c of m.cases) expect(names).toContain(`${c.file} ${c.name}`);
+        for (const c of m?.cases ?? [])
+          expect(names).toContain(`${c.file} ${c.name}`);
+        expect(rep.coverage?.total).toBeGreaterThan(0);
         expect(rep.gate.passed).toBe(false);
         expect(rep.cases.some((c) => c.level === "pass")).toBe(false);
         expect(rep.cases.some((c) => /^lane /.test(c.name))).toBe(false);

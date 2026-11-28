@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { Reporter, TestCase, TestModule } from "vitest/node";
 import { suiteSha } from "./capture.ts";
 import {
@@ -22,6 +22,7 @@ import {
   setupHookCase,
   setupHookName,
 } from "./report.ts";
+import { coverageReport, surfaceManifestCases } from "./surfaces.ts";
 
 // Vitest reporter: one CaseResult per test (its proof level), plus a "fail"
 // case for every module or unhandled error, written as JSON and text to
@@ -41,14 +42,32 @@ const modeOf = (env = process.env) => {
   }
 };
 
-export const manifestPath = (env = process.env) =>
-  env.REDLINE_MANIFEST ||
-  join(import.meta.dirname, "..", "live", "manifest.json");
+const DEFAULT_MANIFEST = join(
+  import.meta.dirname,
+  "..",
+  "live",
+  "manifest.json",
+);
 
-/** The manifest, or null when missing or invalid (that is a FAIL case). */
+export const manifestPath = (env = process.env) =>
+  env.REDLINE_MANIFEST || DEFAULT_MANIFEST;
+
+const isDefaultManifest = (path: string) =>
+  resolve(path) === resolve(DEFAULT_MANIFEST);
+
+/**
+ * The manifest, or null when missing or invalid (that is a FAIL case).
+ * For the default live/manifest.json, live/surfaces.test.ts cases are derived
+ * directly from public's route policy table and surfaces instead of being
+ * duplicated in manifest.json.
+ */
 export function loadManifest(path = manifestPath()): Manifest | null {
   try {
-    return existsSync(path) ? parseManifest(readFileSync(path, "utf8")) : null;
+    if (!existsSync(path)) return null;
+    const m = parseManifest(readFileSync(path, "utf8"));
+    return isDefaultManifest(path)
+      ? { cases: [...m.cases, ...surfaceManifestCases()] }
+      : m;
   } catch {
     return null;
   }
@@ -227,11 +246,13 @@ export async function finalReport(
   fileNotes: readonly { file: string; note: string }[],
 ) {
   const binding = await bindingOf();
+  const path = manifestPath();
   return {
     ...buildReport(
-      applyManifest(cases, loadManifest()),
+      applyManifest(cases, loadManifest(path)),
       modeOf(),
       runKindOf(process.env),
+      isDefaultManifest(path) ? coverageReport() : undefined,
     ),
     ...(binding ? { binding } : {}),
     ...(fileNotes.length ? { fileNotes: [...fileNotes] } : {}),

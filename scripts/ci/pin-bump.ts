@@ -7,13 +7,12 @@
 // pin-land/<tag> (never main), and `land` fast-forwards main to that exact sha
 // only when a full ci.yml push run on that branch and sha passed, the commit is
 // the bot's verified one and it changes only PUBLIC_PIN, SYNCED_FROM and the
-// lockfile. A bump that also ports surfaces goes to a PR for a person (`route`).
+// lockfile.
 // Both plan-direct and land wait on the release pipeline gate pin-bump-arm uses
 // (readGate, gateRefusal). land writes with its own App (PIN_LAND_APP_*), the
 // only bypass actor main's ruleset needs, never with the release App.
 // Usage: node --experimental-strip-types scripts/ci/pin-bump.ts plan --repo owner/name [--public owner/name]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts plan-direct --repo owner/name [--public owner/name]
-//        node --experimental-strip-types scripts/ci/pin-bump.ts route --repo owner/name --tag vX.Y.Z --direct on|off --surfaces changed|same [--branch b --supersede n]
 //        node --experimental-strip-types scripts/ci/pin-bump.ts stage --repo owner/name --base <sha> --commit <sha> --tag vX.Y.Z --sha <sha>
 //        node --experimental-strip-types scripts/ci/pin-bump.ts land --repo owner/name [--public owner/name]   (READ_TOKEN reads, GH_TOKEN writes, LAND_BOT is the land App's bot)
 //        node --experimental-strip-types scripts/ci/pin-bump.ts apply --tag vX.Y.Z --sha <40 hex> [--dir .]
@@ -407,24 +406,17 @@ export function openPr(o: {
 
 /**
  * The files a direct-mode pin commit may change, each a plain modification:
- * exactly what pin-bump-arm.ts arms without a person (its PIN_FILES). A bump
- * that also ports surfaces (tests/redline/...) goes to a PR for review.
+ * exactly what pin-bump-arm.ts arms without a person (its PIN_FILES).
  */
 export const DIRECT_FILES = ["PUBLIC_PIN", "SYNCED_FROM", "pnpm-lock.yaml"];
 const REQUIRED_FILES = ["PUBLIC_PIN", "SYNCED_FROM"];
-/** The surfaces-port files the workflow writes; any change sends the bump to a PR. */
-export const SURFACES_FILES = [
-  "tests/redline/live/manifest.json",
-  "tests/redline/test/cases-added.ts",
-  "tests/redline/test/surfaces.test.ts",
-];
 /** Direct mode's staging branches: CI runs on them before main moves. */
 export const LAND_PREFIX = "pin-land/";
 export const landBranchOf = (tag: string) => `${LAND_PREFIX}${tag}`;
 
 /**
  * A change on main between the pin commit's base and now that would make its
- * lockfile or surfaces port stale, or that moved the pin itself.
+ * lockfile stale, or that moved the pin itself.
  * private-paths.txt decides pre-split vs strict in overlay.sh --auto-split and
  * which public paths are removed before the lockfile is regenerated.
  */
@@ -442,56 +434,8 @@ export function lockfileSensitive(path: string): boolean {
       "SYNCED_FROM",
       "private-paths.txt",
       "scripts/overlay.sh",
-    ].includes(path) ||
-    path.startsWith("tests/redline/")
+    ].includes(path)
   );
-}
-
-/**
- * Direct mode or a PR, for a bump the open job has written (cloud #264). Not
- * direct: the PR plan's own branch and supersede, as before. Direct with an
- * empty surfaces port: stage it. Direct with a surfaces port: a person reviews
- * it in a PR, so the PR plan is taken now, for this same tag only (anything
- * else opens nothing).
- */
-export function route(o: {
-  direct: boolean;
-  surfacesChanged: boolean;
-  tag: string;
-  planned: { branch: string; supersede?: number };
-  prPlan: () => Plan;
-}):
-  | { route: "direct" }
-  | {
-      route: "pr";
-      pr: boolean;
-      branch: string;
-      supersede?: number;
-      why: string;
-    } {
-  if (!o.direct)
-    return {
-      route: "pr",
-      pr: true,
-      ...o.planned,
-      why: "PIN_BUMP_DIRECT is off",
-    };
-  if (!o.surfacesChanged) return { route: "direct" };
-  const p = o.prPlan();
-  if (!p.bump || p.tag !== o.tag)
-    return {
-      route: "pr",
-      pr: false,
-      branch: "",
-      why: p.bump ? `the PR plan is for ${p.tag}, not ${o.tag}` : p.why,
-    };
-  return {
-    route: "pr",
-    pr: true,
-    branch: branchOf(p.tag),
-    supersede: p.supersede,
-    why: `the surfaces port is not empty: ${o.tag} goes to a PR for a person`,
-  };
 }
 
 type CompareFile = { filename: string; status: string; sha: string };
@@ -962,12 +906,6 @@ const realExec: Exec = (cmd, args) => {
   };
 };
 
-const gitShow = (spec: string) => {
-  const r = spawnSync("git", ["show", spec], { encoding: "utf8" });
-  if (r.status !== 0) throw new Error(`git show ${spec}: ${r.stderr.trim()}`);
-  return r.stdout;
-};
-
 const flag = (argv: string[], name: string, fallback?: string) => {
   const i = argv.indexOf(`--${name}`);
   const v = i >= 0 ? argv[i + 1] : fallback;
@@ -1011,39 +949,6 @@ function main(argv: string[]) {
     console.log(
       `bump=${p.bump}\ntag=${p.tag}\nsha=${p.sha}\nbranch=${p.tag ? branchOf(p.tag) : ""}\nsupersede=`,
     );
-    return;
-  }
-  if (mode === "route") {
-    const surfaces = flag(argv, "surfaces");
-    if (surfaces !== "changed" && surfaces !== "same")
-      throw new Error(`--surfaces ${surfaces} isn't changed or same`);
-    const repo = flag(argv, "repo");
-    const r = route({
-      direct: flag(argv, "direct") === "on",
-      surfacesChanged: surfaces === "changed",
-      tag: flag(argv, "tag"),
-      planned: {
-        branch: argv.includes("--branch") ? flag(argv, "branch") : "",
-        supersede: supersedeOf(argv),
-      },
-      prPlan: () =>
-        plan({
-          exec: realExec,
-          repo,
-          publicRepo: flag(argv, "public", PUBLIC_REPO),
-          // main's own pin: the working tree's was already moved by apply.
-          pin: gitShow("HEAD:PUBLIC_PIN"),
-        }),
-    });
-    if (r.route === "direct") {
-      console.error("pin-bump: route=direct");
-      console.log("route=direct\npr=false\nbranch=\nsupersede=");
-    } else {
-      console.error(`pin-bump: route=pr pr=${r.pr} ${r.why}`);
-      console.log(
-        `route=pr\npr=${r.pr}\nbranch=${r.branch}\nsupersede=${r.supersede ?? ""}`,
-      );
-    }
     return;
   }
   if (mode === "stage") {
@@ -1109,7 +1014,7 @@ function main(argv: string[]) {
     return;
   }
   throw new Error(
-    "usage: pin-bump.ts <plan|plan-direct|route|stage|land|apply|open-pr> ...",
+    "usage: pin-bump.ts <plan|plan-direct|stage|land|apply|open-pr> ...",
   );
 }
 

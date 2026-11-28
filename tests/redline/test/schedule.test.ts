@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { RECONNECT_AT_MS } from "../src/hosted-bus.ts";
 import { type Lane, type Phase, PLAN, PLAN_SERIAL } from "../src/lanes.ts";
 import { parseManifest } from "../src/report.ts";
-import { derive, inShard } from "../src/surfaces.ts";
+import { derive, inShard, SURFACES_FILE } from "../src/surfaces.ts";
 import { CASES_ADDED_SINCE_1730 } from "./cases-added.ts";
 
 // An offline replay of run 42402998826 (cloud, v0.135.0; 19m57s end to end):
@@ -158,22 +158,27 @@ const near = (got: number, want: number, tol = 3) =>
   expect(Math.abs(got - want), `${got} vs ${want}`).toBeLessThanOrEqual(tol);
 
 describe("the recording (run 42402998826)", () => {
-  it("holds every case of the manifest once, with a duration", () => {
+  it("holds every non-surfaces case of the manifest once, with a duration", () => {
     const m = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
     expect(fx.cases).toHaveLength(329);
     expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`)).size).toBe(329);
-    // The recording predates the cases declared in cases-added.ts: it holds
-    // the manifest minus exactly those, never a case with an invented time.
+    // The recording predates the cases declared in cases-added.ts: its
+    // non-surfaces cases hold the static manifest minus exactly those
+    // (live/surfaces.test.ts is derived directly from public's route table).
     const added = new Set(
       CASES_ADDED_SINCE_1730.map((c) => `${c.file} ${c.name}`),
     );
     const mk = m.cases.map((c) => `${c.file} ${c.name}`);
     for (const k of added) expect(mk).toContain(k);
-    expect(new Set(fx.cases.map((c) => `${c.file} ${c.name}`))).toEqual(
-      new Set(mk.filter((k) => !added.has(k))),
-    );
+    expect(
+      new Set(
+        fx.cases
+          .filter((c) => c.file !== SURFACES_FILE)
+          .map((c) => `${c.file} ${c.name}`),
+      ),
+    ).toEqual(new Set(mk.filter((k) => !added.has(k))));
     expect(fx.cases.every((c) => Number.isFinite(c.ms) && c.ms >= 0)).toBe(
       true,
     );
