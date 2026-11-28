@@ -8,6 +8,7 @@ import {
   type CancelJobSchema,
   canTransition,
   checkPurgeFields,
+  checkRedlineCreds,
   type DeleteSchema,
   dualLiveAt,
   fieldRulesOf,
@@ -287,11 +288,16 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   },
   R26: async (a, row) => {
     refuseUnless(can(row, "redline_creds", a.principal));
-    // Mint or revoke (C6): the shared helper narrows on `revoke` and owns
-    // the args shape, so a mint's key travels however C7 defines it.
+    const body = bodyOf<typeof RedlineCredsSchema>(a);
+    const f = checkRedlineCreds(
+      body,
+      a.principal.kind === "oidc" ? a.principal.oidcWorkflow : undefined,
+    );
+    if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
+    // Mint, hookKeyOnly, or revoke (C6): the shared helper owns the args shape.
     return {
       kind: "redline_creds",
-      args: redlineCredsJobArgs(bodyOf<typeof RedlineCredsSchema>(a)),
+      args: redlineCredsJobArgs(body),
     };
   },
   // #1008. The job re-reads all of this against /healthz; these are the

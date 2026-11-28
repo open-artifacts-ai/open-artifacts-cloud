@@ -4,6 +4,7 @@ import {
   canonicalJson,
   checkCreateFields,
   fieldRulesOf,
+  parseTestInstallActorKey,
   slugError,
   type Tier,
 } from "@oa/provisioning-contract";
@@ -121,7 +122,22 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const body = a.input.body as Body;
   const rules = fieldRulesOf(p.kind);
   if (!rules) throw new ApiError("forbidden");
-  const f = checkCreateFields(body, rules, env.OA_ENV, STAGING_TEST_DOMAIN);
+  if (
+    p.kind === "oidc" &&
+    p.oidcWorkflow === "test-install" &&
+    parseTestInstallActorKey(p.actorKey)?.installId !== null
+  )
+    throw new ApiError(
+      "forbidden",
+      "fixture install ID header is not allowed on create",
+    );
+  const f = checkCreateFields(
+    body,
+    rules,
+    env.OA_ENV,
+    STAGING_TEST_DOMAIN,
+    p.kind === "oidc" ? p.oidcWorkflow : undefined,
+  );
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
   // Google with no auth.domains is allowed (#2520): the install admits the
   // owner and invited people only. Email codes still need a domain.

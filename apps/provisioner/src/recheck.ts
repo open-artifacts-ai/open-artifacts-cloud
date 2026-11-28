@@ -14,10 +14,13 @@ import {
   canTransition,
   type InstallState,
   type JobKind,
+  parseTestInstallActorKey,
   slugError,
+  TEST_INSTALL,
   TEST_MEMBER,
   type TransitionActor,
   type TransitionFrom,
+  testInstallOwns,
   testMemberOwns,
 } from "@oa/provisioning-contract";
 import { StepRefusal } from "./errors.js";
@@ -91,10 +94,46 @@ export function actorOf(kind: JobRow["actor_kind"]): TransitionActor {
 export function checkOidcScope(
   job: JobRow,
   env: DeployEnv,
-  install: { slug: string | null; testHooks: boolean },
+  install: {
+    id?: string;
+    slug: string | null;
+    testHooks: boolean;
+    createdBy?: string | null;
+  },
 ): void {
   if (job.actor_kind !== "oidc") return;
   if (env !== "staging") throw refused("OIDC is staging only");
+  if (job.actor_key.includes(TEST_INSTALL.actorSuffix)) {
+    const scope = parseTestInstallActorKey(job.actor_key);
+    if (!scope) throw refused("malformed fixture actor key");
+    if (job.kind === "create") {
+      if (
+        scope.installId !== null ||
+        !(install.slug ?? "").startsWith(TEST_INSTALL.slugPrefix) ||
+        !install.testHooks
+      )
+        throw refused(
+          "the fixture workflow creates only disposable t- test installs",
+        );
+      return;
+    }
+    if (
+      !["delete", "purge", "discard", "redline_creds"].includes(job.kind) ||
+      !testInstallOwns(
+        {
+          id: install.id ?? job.install_id,
+          slug: install.slug ?? "",
+          testHooks: install.testHooks,
+          createdBy: install.createdBy,
+        },
+        scope,
+      )
+    )
+      throw refused(
+        "the fixture workflow acts only on its bound disposable test install",
+      );
+    return;
+  }
   if (!install.slug?.startsWith("rl-") || !install.testHooks)
     throw refused("OIDC acts only on rl- test installs");
   // The staging test member's workflow (authz TEST_MEMBER): one install only.

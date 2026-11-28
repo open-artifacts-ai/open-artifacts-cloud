@@ -12,9 +12,12 @@ import {
   JobFailPointSchema,
   type JobKind,
   jobStepsFor,
+  parseTestInstallActorKey,
   type ServingMode,
+  TEST_INSTALL,
   TEST_MEMBER,
   type Tier,
+  testInstallOwns,
   testMemberOwns,
   VersionSchema,
 } from "@oa/provisioning-contract";
@@ -59,12 +62,14 @@ export type StatusRow = {
   updated_at: number;
   install_vars: string | null;
   signup_vars: string | null;
+  creator_actor_key: string | null;
 };
 
-export const STATUS_SELECT = `SELECT st.*, i.vars AS install_vars, s.vars AS signup_vars
+export const STATUS_SELECT = `SELECT st.*, i.vars AS install_vars, s.vars AS signup_vars, cj.actor_key AS creator_actor_key
 FROM install_status st
 LEFT JOIN installs i ON i.id = st.install_id
-LEFT JOIN signups s ON s.signup_id = st.signup_id`;
+LEFT JOIN signups s ON s.signup_id = st.signup_id
+LEFT JOIN jobs cj ON cj.id = st.signup_id`;
 
 /**
  * Reach "own" (authz.ts): O and the staging test admin (#1053) their `rl-`
@@ -74,11 +79,22 @@ const rlReach = (p: Principal) => p.kind === "oidc" || p.kind === "test-admin";
 /** The staging test member's workflow: the one install `rl-agents` only. */
 const testMemberReach = (p: Principal) =>
   p.kind === "oidc" && p.oidcWorkflow === "test-member";
+/** The staging fixture workflow: its bound `t-` test-hooks install only. */
+const testInstallReach = (p: Principal) =>
+  p.kind === "oidc" && p.oidcWorkflow === "test-install";
 export function reachSql(
   p: Principal,
   reach: "all" | "own",
 ): { sql: string; binds: unknown[] } {
   if (reach === "all") return { sql: "1 = 1", binds: [] };
+  if (testInstallReach(p)) {
+    const scope = parseTestInstallActorKey(p.actorKey);
+    if (!scope || scope.installId === null) return { sql: "0 = 1", binds: [] };
+    return {
+      sql: "st.install_id = ? AND st.slug GLOB ? AND st.test_hooks = 1 AND cj.actor_key = ?",
+      binds: [scope.installId, `${TEST_INSTALL.slugPrefix}*`, scope.creatorKey],
+    };
+  }
   if (testMemberReach(p))
     return {
       sql: "st.slug = ? AND st.test_hooks = 1",
@@ -99,6 +115,21 @@ export function inReach(
   reach: "all" | "own",
 ): boolean {
   if (reach === "all") return true;
+  if (testInstallReach(p)) {
+    const scope = parseTestInstallActorKey(p.actorKey);
+    return (
+      scope !== null &&
+      testInstallOwns(
+        {
+          id: row.install_id,
+          slug: row.slug,
+          testHooks: row.test_hooks === 1,
+          createdBy: row.creator_actor_key,
+        },
+        scope,
+      )
+    );
+  }
   if (testMemberReach(p))
     return testMemberOwns({ slug: row.slug, testHooks: row.test_hooks === 1 });
   if (rlReach(p)) return row.slug.startsWith("rl-") && row.test_hooks === 1;

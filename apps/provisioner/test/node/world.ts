@@ -299,6 +299,8 @@ export type CreateSeed = {
   tier?: string;
   /** A self-serve signup's owner_sub; default one per job. */
   sub?: string;
+  /** Override jobs.actor_key (default `${actor}:${jobId}`). */
+  actorKey?: string;
   /** A token actor's jobs.token_id; default a live token (seedToken). */
   tokenId?: string | null;
 };
@@ -326,7 +328,7 @@ VALUES (?, 'create', 'provision_install', ?, ?, ?, ?, ?, ?, 'h', ?, 'queued', ?,
     installId,
     jobId,
     actor,
-    `${actor}:${jobId}`,
+    o.actorKey ?? `${actor}:${jobId}`,
     actor,
     `req-${jobId}`,
     JSON.stringify(o.version ? { version: o.version } : {}),

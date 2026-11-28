@@ -6,11 +6,13 @@ import {
 } from "@oa/gh-oidc";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  FIXTURE_INSTALL_HEADER,
   oidcPins,
   oidcPrincipal,
   REDLINE_WORKFLOW_REF,
   STAGING_API_HOST,
   TEST_ADMIN_WORKFLOW_REF,
+  TEST_INSTALL_WORKFLOW_REF,
   TEST_MEMBER_WORKFLOW_REF,
   TEST_USER_HEADER,
 } from "../src/auth/oidc.js";
@@ -466,6 +468,102 @@ describe("each allowed workflow ref maps to its own scope; none falls back", () 
         req({ [TEST_USER_HEADER]: "a" }),
         stagingEnv(),
         await jwt({ job_workflow_ref: OTHER }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+  });
+});
+
+describe("the fixture workflow (staging-test-install.yml)", () => {
+  const TI = TEST_INSTALL_WORKFLOW_REF;
+  const env = () => stagingEnv({ OIDC_JOB_WORKFLOW_REFS: `${WF},${TI}` });
+
+  it("is pinned to staging-test-install.yml on main", () => {
+    expect(TI).toBe(
+      `${REPO}/.github/workflows/staging-test-install.yml@refs/heads/main`,
+    );
+  });
+
+  it("maps unbound creates and bound install-ID calls to isolated actorKeys and rateKey", async () => {
+    const unbound = await oidcPrincipal(
+      req(),
+      env(),
+      await jwt({ job_workflow_ref: TI }),
+      vopts(),
+    );
+    expect(unbound).toMatchObject({
+      kind: "oidc",
+      oidcWorkflow: "test-install",
+      actorKey: "oidc:4242:test-install",
+      rateKey: "oidc:4242:test-install",
+    });
+    const bound = await oidcPrincipal(
+      req({ [FIXTURE_INSTALL_HEADER]: "iabcdefgh234" }),
+      env(),
+      await jwt({ job_workflow_ref: TI }),
+      vopts(),
+    );
+    expect(bound).toMatchObject({
+      kind: "oidc",
+      oidcWorkflow: "test-install",
+      actorKey: "oidc:4242:test-install:iabcdefgh234",
+      rateKey: "oidc:4242:test-install",
+    });
+  });
+
+  it("refuses malformed x-oa-fixture-install-id headers and x-oa-test-user", async () => {
+    for (const bad of ["", "   ", "bad:id", "a/b", "x".repeat(65)])
+      expect(
+        await oidcPrincipal(
+          req({ [FIXTURE_INSTALL_HEADER]: bad }),
+          env(),
+          await jwt({ job_workflow_ref: TI }),
+          vopts(),
+        ),
+        bad,
+      ).toEqual(unauth);
+    for (const u of ["a", "b", "c"])
+      expect(
+        await oidcPrincipal(
+          req({ [TEST_USER_HEADER]: u }),
+          env(),
+          await jwt({ job_workflow_ref: TI }),
+          vopts(),
+        ),
+        u,
+      ).toEqual(unauth);
+  });
+
+  it("refused unless listed in OIDC_JOB_WORKFLOW_REFS, off main, on prod, or off staging host", async () => {
+    expect(
+      await oidcPrincipal(
+        req(),
+        stagingEnv(),
+        await jwt({ job_workflow_ref: TI }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req(),
+        env(),
+        await jwt({ job_workflow_ref: TI, ref: "refs/heads/feature" }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req(),
+        { ...env(), OA_ENV: "prod" } as Env,
+        await jwt({ job_workflow_ref: TI }),
+        vopts(),
+      ),
+    ).toEqual(unauth);
+    expect(
+      await oidcPrincipal(
+        req({}, "api.open-artifacts.app"),
+        env(),
+        await jwt({ job_workflow_ref: TI }),
         vopts(),
       ),
     ).toEqual(unauth);

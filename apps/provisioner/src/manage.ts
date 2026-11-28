@@ -32,9 +32,12 @@ import {
   type UpgradeResult,
 } from "@oa/provision";
 import {
+  checkRedlineCreds,
   type JobKind,
   oauthJobOf,
+  parseTestInstallActorKey,
   redlineCredsJobArgs,
+  TEST_INSTALL,
   type WorkflowParams,
   WorkflowParamsSchema,
 } from "@oa/provisioning-contract";
@@ -136,6 +139,7 @@ export type ManageJob = {
     testFailCheck?: "health" | "kill" | "kill_after_write";
     /** redline_creds: the R26 variant (C6 RedlineCredsSchema; never the key). */
     revoke?: boolean;
+    hookKeyOnly?: boolean;
   };
   /** update: R29's mode or R30's copy (#1008). */
   oauth?: OAuthOp;
@@ -793,7 +797,19 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
     suspended: st.suspended_at !== null,
     args: {},
   };
-  checkOidcScope(job, env, out);
+  const createdBy =
+    job.actor_kind === "oidc" && st.signup_id
+      ? ((
+          await transient(
+            ctx.env.PLATFORM_DB.prepare(
+              "SELECT actor_key FROM jobs WHERE id = ? AND install_id = ? AND kind = 'create'",
+            )
+              .bind(st.signup_id, job.install_id)
+              .first<{ actor_key: string }>(),
+          )
+        )?.actor_key ?? null)
+      : null;
+  checkOidcScope(job, env, { ...out, id: out.installId, createdBy });
   const now = ctx.io.now();
   switch (kind) {
     case "upgrade":
@@ -879,15 +895,32 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       out.args = { force: args.force === true };
       if (!row) throw refused("no installs row");
       break;
-    case "redline_creds":
+    case "redline_creds": {
       // R26 is O only (3.4); TRANSITIONS reads OIDC as A.
       if (job.actor_kind !== "oidc") throw refused("redline_creds is OIDC's");
       if (env !== "staging") throw refused("redline_creds is staging only");
-      if (!row || !row.slug.startsWith("rl-") || row.test_hooks !== 1)
-        throw refused("not a red-line test install");
+      const isFixture = parseTestInstallActorKey(job.actor_key) !== null;
+      if (
+        !row ||
+        row.test_hooks !== 1 ||
+        (!isFixture && !row.slug.startsWith("rl-")) ||
+        (isFixture && !row.slug.startsWith(TEST_INSTALL.slugPrefix))
+      )
+        throw refused(
+          isFixture
+            ? "not a disposable test install"
+            : "not a red-line test install",
+        );
       if (row.state !== "active") throw refused("the install is not active");
-      out.args = redlineCredsJobArgs(redlineArgs(job));
+      const parsed = redlineArgs(job);
+      const denied = checkRedlineCreds(
+        parsed,
+        isFixture ? "test-install" : undefined,
+      );
+      if (denied) throw refused(`${denied.field}: ${denied.code}`);
+      out.args = redlineCredsJobArgs(parsed);
       break;
+    }
     case "update": {
       // #2520: an instance's login change is the platform's own job, with
       // exactly { login: true } and vars that still pass the login schema.

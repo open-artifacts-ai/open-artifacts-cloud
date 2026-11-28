@@ -1,0 +1,230 @@
+# Disposable staging test installs (t-* with test hooks, TEST_DOMAIN, email +
+# domain codes): create on a pinned or current staging release and return a
+# sealed TEST_HOOK_KEY (hookKeyOnly: true, never an admin PAT), or delete and
+# purge the original install by its immutable install ID.
+#
+# This JWT may call only R3, R4, R9, R11, R15 and R26, on staging only
+# (authz TEST_INSTALL). Every non-create route carries x-oa-fixture-install-id
+# bound to the install created by this workflow; R4 refuses that header.
+# The redline-staging Environment is the OIDC pin (OIDC_ENVIRONMENT); this job
+# reads none of its secrets. Staging only: prod has no OIDC principal.
+# scripts/ops/staging-test-install.ts runs this end to end.
+name: staging-test-install
+run-name: staging-test-install ${{ inputs.action }} ${{ inputs.slug }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "create a disposable t-* staging install, or delete and purge one"
+        required: true
+        type: choice
+        options:
+          - create
+          - delete
+      slug:
+        description: "Disposable staging install slug (t-<name>)"
+        required: true
+        type: string
+      version:
+        description: "Exact X.Y.Z release to install on create (omit for staging's current release)"
+        required: false
+        default: ""
+        type: string
+      recipient_key:
+        description: "X25519 public key, raw 32 bytes, base64url without padding (create only)"
+        required: false
+        default: ""
+        type: string
+      install_id:
+        description: "Immutable install ID returned by create (delete only)"
+        required: false
+        default: ""
+        type: string
+      request_id:
+        description: "Optional idempotency key base"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-test-install-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    environment: redline-staging
+    # The OIDC principal: this job only.
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 25
+    steps:
+      - name: Manage disposable staging test install
+        env:
+          REF: ${{ github.ref }}
+          ACTION: ${{ inputs.action }}
+          SLUG: ${{ inputs.slug }}
+          VERSION: ${{ inputs.version }}
+          RECIPIENT_KEY: ${{ inputs.recipient_key }}
+          INSTALL_ID: ${{ inputs.install_id }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # apps/provisioning/wrangler.jsonc env.staging OIDC_AUDIENCE.
+          AUDIENCE: https://api.open-artifacts-staging.app
+          TEST_DOMAIN: oa-redline-a.fyi
+        run: |
+          set +x
+          set -euo pipefail
+          [ "$REF" = refs/heads/main ] || { echo "dispatch staging-test-install on main"; exit 1; }
+          [ "$AUDIENCE" = https://api.open-artifacts-staging.app ] || { echo "staging only"; exit 1; }
+          [[ "$SLUG" =~ ^t-[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$ ]] || { echo "slug must be a t- staging fixture slug"; exit 1; }
+          APP_HOST="$SLUG.open-artifacts-staging.app"
+          RID="${REQUEST_ID:-test-install-$RUN_ID-$RUN_ATTEMPT}"
+          [[ "$RID" =~ ^[A-Za-z0-9._:-]{1,120}$ ]] || { echo "invalid request_id"; exit 1; }
+
+          d=$(mktemp -d)
+          trap 'rm -rf "$d"' EXIT
+          umask 077
+
+          # Fresh JWT per call; reaches curl on stdin, never argv or logs.
+          HTTP_STATUS=""
+          api_req() {
+            local out="$1" method="$2" path="$3" body="${4:-}" fid="${5:-}" jwt
+            jwt="$(printf 'header = "Authorization: Bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+              curl -fsS -K - "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" |
+              jq -er '.value | select(type == "string" and length > 0)')" || { echo "no OIDC token" >&2; return 1; }
+            local a=(-sS -K - -o "$d/$out" -w '%{http_code}' -X "$method")
+            [ -z "$fid" ] || a+=(-H "x-oa-fixture-install-id: $fid")
+            [ -z "$body" ] || a+=(-H 'content-type: application/json' --data "$body")
+            HTTP_STATUS="$(printf 'header = "Authorization: Bearer %s"\n' "$jwt" | curl "${a[@]}" "$AUDIENCE$path")"
+          }
+
+          err_code() {
+            jq -r '.error.code // empty' "$d/$1" 2> /dev/null || true
+          }
+
+          JOB_SEALED=""
+          wait_job() {
+            local job_id="$1" fid="$2" status="" s=""
+            JOB_SEALED=""
+            for _ in $(seq 1 110); do
+              sleep 10
+              api_req r15 GET "/v1/jobs/$job_id" "" "$fid"
+              [ "$HTTP_STATUS" = 200 ] || { echo "R15 $job_id failed: HTTP $HTTP_STATUS $(err_code r15)"; exit 1; }
+              s="$(jq -r '.sealed // empty' "$d/r15")"
+              [ -z "$s" ] || JOB_SEALED="$s"
+              status="$(jq -r '.status // empty' "$d/r15")"
+              case "$status" in "done" | "failed") break ;; esac
+            done
+            [ "$status" = "done" ] || { echo "job $job_id: $status $(jq -r '.error.code // empty' "$d/r15")"; exit 1; }
+          }
+
+          read_target() {
+            local fid="$1"
+            api_req r3 GET "/v1/installs/$fid" "" "$fid"
+            [ "$HTTP_STATUS" = 200 ] || { echo "R3 $fid failed: HTTP $HTTP_STATUS $(err_code r3)"; exit 1; }
+            jq -e --arg id "$fid" --arg s "$SLUG" --arg h "$APP_HOST" '
+              .id == $id and .slug == $s and .testHooks == true and
+              ((.state == "failed" or .state == "deleted") and (.appHost == null or .appHost == $h) or .appHost == $h)
+            ' "$d/r3" > /dev/null || { echo "fixture identity mismatch"; exit 1; }
+          }
+
+          case "$ACTION" in
+            create)
+              [ -z "$INSTALL_ID" ] || { echo "create takes no install_id"; exit 1; }
+              [[ "$RECIPIENT_KEY" =~ ^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$ ]] || { echo "recipient_key is not a base64url X25519 public key"; exit 1; }
+              if [ -n "$VERSION" ]; then
+                [[ "$VERSION" =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]] || { echo "version must be exact X.Y.Z"; exit 1; }
+              fi
+              body="$(jq -nc \
+                --arg r "$RID-create" \
+                --arg s "$SLUG" \
+                --arg d "$TEST_DOMAIN" \
+                --arg v "$VERSION" '
+                {
+                  requestId: $r,
+                  slug: $s,
+                  ownerEmail: ("fixture-owner@" + $d),
+                  tier: "team",
+                  testHooks: true,
+                  auth: { providers: ["email"], domains: [$d], domainCodes: true }
+                } + (if $v == "" then {} else { version: $v } end)
+              ')"
+              api_req r4 POST "/v1/installs" "$body"
+              [ "$HTTP_STATUS" = 202 ] || { echo "R4 create failed: HTTP $HTTP_STATUS $(err_code r4)"; exit 1; }
+              id="$(jq -r '.job.installId // empty' "$d/r4")"
+              create_job="$(jq -r '.job.id // empty' "$d/r4")"
+              [[ "$id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "R4 returned no installId"; exit 1; }
+              [[ "$create_job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "R4 returned no job id"; exit 1; }
+              wait_job "$create_job" "$id"
+              read_target "$id"
+              state="$(jq -r '.state // empty' "$d/r3")"
+              [ "$state" = active ] || { echo "created fixture is $state, not active"; exit 1; }
+              installed_version="$(jq -r '.version // empty' "$d/r3")"
+              [[ "$installed_version" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || { echo "installed version missing"; exit 1; }
+              if [ -n "$VERSION" ] && [ "$installed_version" != "$VERSION" ]; then
+                echo "installed version $installed_version != requested $VERSION"
+                exit 1
+              fi
+              creds_body="$(jq -nc --arg r "$RID-creds" --arg k "$RECIPIENT_KEY" '{requestId: $r, hookKeyOnly: true, recipientKey: $k}')"
+              api_req r26 POST "/v1/installs/$id/redline-creds" "$creds_body" "$id"
+              [ "$HTTP_STATUS" = 202 ] || { echo "R26 hookKeyOnly failed: HTTP $HTTP_STATUS $(err_code r26)"; exit 1; }
+              creds_job="$(jq -r '.job.id // empty' "$d/r26")"
+              [[ "$creds_job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "R26 returned no job id"; exit 1; }
+              wait_job "$creds_job" "$id"
+              [[ "$JOB_SEALED" =~ ^oa-seal-v1\.[A-Za-z0-9_.-]+$ ]] || { echo "no sealed hook key in R26 job"; exit 1; }
+              echo "test-install-id: $id"
+              echo "test-install-slug: $SLUG"
+              echo "test-install-app-host: $APP_HOST"
+              echo "test-install-version: $installed_version"
+              echo "test-install-create-job: $create_job"
+              echo "test-install-creds-job: $creds_job"
+              echo "test-install-sealed: $JOB_SEALED"
+              ;;
+            delete)
+              [ -z "$VERSION" ] || { echo "delete takes no version"; exit 1; }
+              [ -z "$RECIPIENT_KEY" ] || { echo "delete takes no recipient_key"; exit 1; }
+              [[ "$INSTALL_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "delete requires a valid install_id"; exit 1; }
+              read_target "$INSTALL_ID"
+              active_job="$(jq -r '.activeJobId // empty' "$d/r3")"
+              if [ -n "$active_job" ]; then
+                wait_job "$active_job" "$INSTALL_ID"
+                read_target "$INSTALL_ID"
+              fi
+              state="$(jq -r '.state // empty' "$d/r3")"
+              if [ "$state" = active ] || [ "$state" = suspended ]; then
+                del_body="$(jq -nc --arg r "$RID-delete" --arg s "$SLUG" '{requestId: $r, confirmSlug: $s}')"
+                api_req r9 POST "/v1/installs/$INSTALL_ID/delete" "$del_body" "$INSTALL_ID"
+                [ "$HTTP_STATUS" = 202 ] || { echo "R9 delete failed: HTTP $HTTP_STATUS $(err_code r9)"; exit 1; }
+                del_job="$(jq -r '.job.id // empty' "$d/r9")"
+                [[ "$del_job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "R9 returned no job id"; exit 1; }
+                wait_job "$del_job" "$INSTALL_ID"
+                read_target "$INSTALL_ID"
+                state="$(jq -r '.state // empty' "$d/r3")"
+              fi
+              if [ "$state" = deleting ] || [ "$state" = failed ]; then
+                purge_body="$(jq -nc --arg r "$RID-purge" --arg s "$SLUG" '{requestId: $r, confirmSlug: $s}')"
+                api_req r11 POST "/v1/installs/$INSTALL_ID/purge" "$purge_body" "$INSTALL_ID"
+                [ "$HTTP_STATUS" = 202 ] || { echo "R11 purge failed: HTTP $HTTP_STATUS $(err_code r11)"; exit 1; }
+                purge_job="$(jq -r '.job.id // empty' "$d/r11")"
+                [[ "$purge_job" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "R11 returned no job id"; exit 1; }
+                wait_job "$purge_job" "$INSTALL_ID"
+                read_target "$INSTALL_ID"
+                state="$(jq -r '.state // empty' "$d/r3")"
+              fi
+              [ "$state" = deleted ] || { echo "fixture $INSTALL_ID ended in state $state, not deleted"; exit 1; }
+              echo "test-install-id: $INSTALL_ID"
+              echo "test-install-slug: $SLUG"
+              echo "test-install-purged: true"
+              ;;
+            *)
+              echo "unknown action: $ACTION"
+              exit 1
+              ;;
+          esac

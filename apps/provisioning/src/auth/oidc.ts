@@ -4,7 +4,13 @@ import {
   type VerifyOptions,
   verify,
 } from "@oa/gh-oidc";
-import { type OidcWorkflow, TEST_MEMBER } from "@oa/provisioning-contract";
+import {
+  INSTALL_ID_RE,
+  type OidcWorkflow,
+  TEST_INSTALL,
+  TEST_MEMBER,
+  testInstallActorKey,
+} from "@oa/provisioning-contract";
 import type { Env } from "../env.js";
 import { type Principal, type Refusal, refusal } from "../principal.js";
 
@@ -18,6 +24,8 @@ import { type Principal, type Refusal, refusal } from "../principal.js";
 export const STAGING_API_HOST = "api.open-artifacts-staging.app";
 /** `x-oa-test-user` turns the caller into a self-serve test user (M4). */
 export const TEST_USER_HEADER = "x-oa-test-user";
+/** Binds disposable staging fixture calls to the created install ID. */
+export const FIXTURE_INSTALL_HEADER = TEST_INSTALL.installIdHeader;
 const TEST_USERS = new Set(["a", "b", "c"]);
 export const TEST_USER_DOMAIN = "test.invalid";
 /**
@@ -37,6 +45,15 @@ export const TEST_ADMIN_WORKFLOW_REF =
 export const TEST_MEMBER_WORKFLOW_REF =
   "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-member.yml@refs/heads/main";
 
+/**
+ * The pinned staging workflow for disposable test installs (TEST_INSTALL in
+ * authz). Its JWT may create a `t-` test-hooks fixture and, when bound via
+ * `x-oa-fixture-install-id`, read it, rotate its hook key (`hookKeyOnly`),
+ * soft-delete and purge that exact install only. Never a test user.
+ */
+export const TEST_INSTALL_WORKFLOW_REF =
+  "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-install.yml@refs/heads/main";
+
 /** Red-line's workflow (redline-staging.yml): the rl- test installs' scope. */
 export const REDLINE_WORKFLOW_REF =
   "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main";
@@ -50,6 +67,7 @@ const WORKFLOW_SCOPES: ReadonlyMap<string, OidcWorkflow> = new Map([
   [REDLINE_WORKFLOW_REF, "redline"],
   [TEST_ADMIN_WORKFLOW_REF, "test-admin"],
   [TEST_MEMBER_WORKFLOW_REF, "test-member"],
+  [TEST_INSTALL_WORKFLOW_REF, "test-install"],
 ]);
 
 /** The caller's pins, or null unless staging and every OIDC_* var is set. */
@@ -77,10 +95,11 @@ export async function oidcPrincipal(
   if (workflow === undefined) return refusal("unauthenticated");
   const testAdmin = workflow === "test-admin";
   const testMember = workflow === "test-member";
+  const testInstall = workflow === "test-install";
   const testUser = req.headers.get(TEST_USER_HEADER);
   if (testUser !== null) {
-    // The test admin's and test member's workflows are never a test user.
-    if (testAdmin || testMember) return refusal("unauthenticated");
+    // Only red-line's workflow may act as a test user.
+    if (workflow !== "redline") return refusal("unauthenticated");
     if (!TEST_USERS.has(testUser)) return refusal("unauthenticated");
     const sub = `rl-test-${testUser}`;
     const email = `${sub}@${TEST_USER_DOMAIN}`;
@@ -98,14 +117,35 @@ export async function oidcPrincipal(
   }
   const key = `oidc:${claims.repository_id}`;
   const str = (v: unknown) => (typeof v === "string" && v ? v : null);
-  // The test member's own key: its R26 jobs (and their sealed results, R15)
-  // are never red-line's, and red-line's never its.
+  let boundInstallId: string | null = null;
+  if (testInstall) {
+    const rawBound = req.headers.get(TEST_INSTALL.installIdHeader);
+    if (rawBound !== null) {
+      const trimmed = rawBound.trim();
+      if (!INSTALL_ID_RE.test(trimmed)) return refusal("unauthenticated");
+      boundInstallId = trimmed;
+    }
+  }
+  // Each workflow gets its own actorKey: R26 jobs and sealed results (R15) are
+  // isolated between red-line, test-member, and each bound fixture install.
   const memberKey = `${key}${TEST_MEMBER.actorSuffix}`;
+  const actorKey = testMember
+    ? memberKey
+    : testInstall
+      ? testInstallActorKey(claims.repository_id, boundInstallId)
+      : key;
+  const rateKey = testAdmin
+    ? `${key}:test-admin`
+    : testMember
+      ? memberKey
+      : testInstall
+        ? testInstallActorKey(claims.repository_id)
+        : key;
   return {
     kind: "oidc",
-    actorKey: testMember ? memberKey : key,
-    // Its own bucket: R28 and red-line never starve each other.
-    rateKey: testAdmin ? `${key}:test-admin` : testMember ? memberKey : key,
+    actorKey,
+    // Its own bucket: R28, test-member, test-install and red-line stay isolated.
+    rateKey,
     label: claims.repository,
     scopes: [],
     sub: claims.sub,
