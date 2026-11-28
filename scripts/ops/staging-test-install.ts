@@ -20,6 +20,7 @@ import {
   existsSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -196,6 +197,7 @@ export type FixtureReceipt = {
   host?: string;
   version?: string;
   createdAt?: number;
+  busRequested?: boolean;
   bus?: FixtureBusInfo;
   remotePurged?: boolean;
 };
@@ -753,12 +755,16 @@ function readReceipt(dir: string, slug: string): FixtureReceipt | null {
   const validRemotePurged =
     parsed.remotePurged === undefined ||
     typeof parsed.remotePurged === "boolean";
+  const validBusRequested =
+    parsed.busRequested === undefined ||
+    typeof parsed.busRequested === "boolean";
   if (
     parsed.slug !== slug ||
     !validInstallId ||
     !validRepoId ||
     !validRunId ||
     !validRemotePurged ||
+    !validBusRequested ||
     typeof parsed.requestId !== "string" ||
     parsed.requestId === "" ||
     typeof parsed.ownerKey?.publicKey !== "string" ||
@@ -768,12 +774,40 @@ function readReceipt(dir: string, slug: string): FixtureReceipt | null {
   return parsed as FixtureReceipt;
 }
 
+/** Exclusively reserves the slug's receipt path before dispatch (O_CREAT|O_EXCL). */
+function createReceiptExclusive(dir: string, receipt: FixtureReceipt): string {
+  const file = receiptPath(dir, receipt.slug);
+  try {
+    writeFileSync(file, `${JSON.stringify(receipt, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (e) {
+    if ((e as { code?: unknown } | null)?.code === "EEXIST")
+      throw new Error(
+        `fixture receipt already exists for ${receipt.slug}; run --slug ${receipt.slug} --delete first`,
+      );
+    throw e;
+  }
+  chmodSync(file, 0o600);
+  return file;
+}
+
+/** Atomically replaces an existing receipt via a 0600 sibling temp file + rename. */
 function writeReceipt(dir: string, receipt: FixtureReceipt): string {
   const file = receiptPath(dir, receipt.slug);
-  writeFileSync(file, `${JSON.stringify(receipt, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  chmodSync(file, 0o600);
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(receipt, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, file);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
   return file;
 }
 
@@ -865,17 +899,35 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
       let installId = receipt.installId;
       let repositoryId = receipt.repositoryId;
       if ((!installId || !repositoryId) && receipt.runId) {
-        const createLog = await d.gh(
-          "run",
-          "view",
-          receipt.runId,
-          "-R",
-          REPO,
-          "--log",
-        );
-        const recovered = parsePartialCreateLog(createLog);
-        installId = installId ?? recovered.installId;
-        repositoryId = repositoryId ?? recovered.repositoryId;
+        let createLog: string | null = null;
+        try {
+          createLog = await d.gh(
+            "run",
+            "view",
+            receipt.runId,
+            "-R",
+            REPO,
+            "--log",
+          );
+        } catch (logErr) {
+          // If the caller supplied --install-id (or the receipt already has one),
+          // an expired/unavailable create log must not block cleanup; fall back
+          // to repository metadata below.
+          if (!installId && !req.installId) throw logErr;
+        }
+        if (createLog !== null) {
+          const recovered = parsePartialCreateLog(createLog);
+          if (
+            req.installId &&
+            recovered.installId &&
+            recovered.installId !== req.installId
+          )
+            throw new Error(
+              `--install-id ${req.installId} does not match saved receipt ${recovered.installId} for ${req.slug}`,
+            );
+          installId = installId ?? recovered.installId;
+          repositoryId = repositoryId ?? recovered.repositoryId;
+        }
       }
       if (!installId && req.installId) installId = req.installId;
       if (installId && !repositoryId) {
@@ -923,7 +975,8 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
       receipt = { ...receipt, remotePurged: true };
       writeReceipt(receiptDir, receipt);
     }
-    await stopFixtureBus(req.slug, d.docker);
+    if (receipt.busRequested || receipt.bus !== undefined)
+      await stopFixtureBus(req.slug, d.docker);
     rmSync(receiptPath(receiptDir, req.slug), { force: true });
     d.log(
       JSON.stringify({
@@ -936,16 +989,12 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
     return 0;
   }
 
-  if (existsSync(receiptPath(receiptDir, req.slug)))
-    throw new Error(
-      `fixture receipt already exists for ${req.slug}; run --slug ${req.slug} --delete first`,
-    );
-
   const { privateKey, publicKey } = generateKeyPairSync("x25519");
   const pub = publicKey.export({ format: "jwk" }).x as string;
   const ownerKey = generateOwnerKey();
-  // Save owner key BEFORE dispatch so an interrupted dispatch, watch, mint,
-  // or log read never strands a created staging fixture.
+  // Atomically reserve the slug's receipt BEFORE dispatch (O_CREAT|O_EXCL) so
+  // concurrent creates cannot clobber the first owner and interrupted create,
+  // watch, mint, or log reads never strand a staging fixture.
   let receipt: FixtureReceipt = {
     slug: req.slug,
     installId: null,
@@ -957,7 +1006,7 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
     requestId: rid,
     createdAt: d.now(),
   };
-  writeReceipt(receiptDir, receipt);
+  createReceiptExclusive(receiptDir, receipt);
 
   const runId = await dispatchWorkflow(d, {
     action: "create",
@@ -1022,6 +1071,10 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
   );
   let bus: FixtureBusInfo | undefined;
   if (req.bus) {
+    // Record bus setup before touching Docker so even a partial start is
+    // cleaned up by --delete, while no-bus fixtures never require Docker.
+    receipt = { ...receipt, busRequested: true };
+    writeReceipt(receiptDir, receipt);
     bus = await startFixtureBus(
       {
         slug: got.slug,
@@ -1036,7 +1089,8 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
         approveBus: d.approveBus ?? approveFixtureBusInBrowser,
       },
     );
-    writeReceipt(receiptDir, { ...receipt, bus });
+    receipt = { ...receipt, bus };
+    writeReceipt(receiptDir, receipt);
   }
   d.log(
     JSON.stringify({

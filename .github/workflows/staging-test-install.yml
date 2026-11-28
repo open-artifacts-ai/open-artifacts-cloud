@@ -111,10 +111,11 @@ jobs:
           HTTP_STATUS=""
           api_req() {
             local out="$1" method="$2" path="$3" body="${4:-}" proof="${5:-}" jwt
+            HTTP_STATUS=""
             jwt="$(printf 'header = "Authorization: Bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
-              curl -fsS -K - "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" |
+              curl -fsS --max-time 20 -K - "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" |
               jq -er '.value | select(type == "string" and length > 0)')" || { echo "no OIDC token" >&2; return 1; }
-            local a=(-sS -K - -o "$d/$out" -w '%{http_code}' -X "$method" -H "x-oa-fixture-owner-key: $OWNER_KEY")
+            local a=(-sS --max-time 35 -K - -o "$d/$out" -w '%{http_code}' -X "$method" -H "x-oa-fixture-owner-key: $OWNER_KEY")
             [ -z "$proof" ] || a+=(-H "x-oa-fixture-delete-proof: $proof")
             [ -z "$body" ] || a+=(-H 'content-type: application/json' --data "$body")
             HTTP_STATUS="$(printf 'header = "Authorization: Bearer %s"\n' "$jwt" | curl "${a[@]}" "$AUDIENCE$path")"
@@ -124,19 +125,39 @@ jobs:
             jq -r '.error.code // empty' "$d/$1" 2> /dev/null || true
           }
 
+          probe_held_read() {
+            local proof="${1:-}"
+            api_req r15_probe GET "/v1/jobs/01000000000000000000000000?wait=invalid" "" "$proof"
+            if [ "$HTTP_STATUS" != 400 ] ||
+              ! jq -e '.error.code == "invalid_input" and ((.error.details.fields // []) | index("query.wait") != null)' "$d/r15_probe" > /dev/null 2>&1; then
+              echo "R15 held-read probe failed (HTTP $HTTP_STATUS $(err_code r15_probe)): staging provisioning requires cloud #504"
+              exit 1
+            fi
+          }
+
           JOB_SEALED=""
           wait_job() {
-            # Matches staging-test-member.yml's R15 wait; cloud #504 (held R15 read) replaces it later for everyone.
-            local job_id="$1" proof="${2:-}" status="" s="" i
+            # Held R15 read (cloud #504): server holds up to 25 s and releases on job end; zero sleeps.
+            local job_id="$1" proof="${2:-}" status="" s="" drops=0 deadline now left hold_ms
             JOB_SEALED=""
-            for i in $(seq 1 111); do
-              api_req r15 GET "/v1/jobs/$job_id" "" "$proof"
+            deadline=$(( $(date +%s) + 1100 ))
+            for _ in $(seq 1 60); do
+              now="$(date +%s)"
+              left=$(( (deadline - now) * 1000 ))
+              [ "$left" -gt 0 ] || break
+              hold_ms=25000
+              [ "$left" -lt "$hold_ms" ] && hold_ms="$left"
+              if ! api_req r15 GET "/v1/jobs/$job_id?wait=$hold_ms" "" "$proof"; then
+                drops=$((drops + 1))
+                [ "$drops" -lt 3 ] || { echo "R15 $job_id dropped $drops held reads in a row"; exit 1; }
+                continue
+              fi
+              drops=0
               [ "$HTTP_STATUS" = 200 ] || { echo "R15 $job_id failed: HTTP $HTTP_STATUS $(err_code r15)"; exit 1; }
               s="$(jq -r '.sealed // empty' "$d/r15")"
               [ -z "$s" ] || JOB_SEALED="$s"
               status="$(jq -r '.status // empty' "$d/r15")"
               case "$status" in "done" | "failed") break ;; esac
-              [ "$i" -lt 111 ] && sleep 10
             done
             [ "$status" = "done" ] || { echo "job $job_id: $status $(jq -r '.error.code // empty' "$d/r15")"; exit 1; }
           }
@@ -159,6 +180,7 @@ jobs:
               if [ -n "$VERSION" ]; then
                 [[ "$VERSION" =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]] || { echo "version must be exact X.Y.Z"; exit 1; }
               fi
+              probe_held_read
               body="$(jq -nc \
                 --arg r "$RID-create" \
                 --arg s "$SLUG" \
@@ -211,6 +233,7 @@ jobs:
               [[ "$INSTALL_ID" =~ ^i[a-z0-9]{11}$ ]] || { echo "delete requires a valid install_id"; exit 1; }
               [[ "$DELETE_PROOF" =~ ^i[a-z0-9]{11}\.[0-9]{1,16}\.[A-Za-z0-9_-]{85}[AQgw]$ ]] || { echo "delete requires a valid delete_proof"; exit 1; }
               [ "${DELETE_PROOF%%.*}" = "$INSTALL_ID" ] || { echo "delete_proof install_id mismatch"; exit 1; }
+              probe_held_read "$DELETE_PROOF"
               read_target "$INSTALL_ID" "$DELETE_PROOF"
               active_job="$(jq -r '.activeJobId // empty' "$d/r3")"
               if [ -n "$active_job" ]; then
