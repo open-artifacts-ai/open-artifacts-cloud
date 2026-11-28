@@ -2547,6 +2547,103 @@ describe("redline_creds (10.1, R26)", () => {
     });
     expect(admin.job?.error_code).toBe("invalid_state");
   });
+
+  it("hookKeyOnly rotates TEST_HOOK_KEY and seals {hookKey} with zero PAT creations, including on retry", async () => {
+    const ownerKeyIdA = `${"A".repeat(42)}A`;
+    const ownerKeyIdB = `${"B".repeat(42)}A`;
+    const fixtureActorA = `oidc:42:test-install:1001:${ownerKeyIdA}`;
+    const fixtureActorB = `oidc:42:test-install:1002:${ownerKeyIdB}`;
+    const s = await active({
+      slug: "t-hookonly",
+      actor: "admin",
+      testHooks: true,
+    });
+    w.db
+      .prepare(
+        "UPDATE jobs SET actor_kind = 'oidc', actor_key = ? WHERE id = ?",
+      )
+      .run(fixtureActorA, s.signupId);
+
+    // First attempt exhausts key-live probes and retries via REDLINE_STEP;
+    // also replay the step body (`twice: true`): zero sessions or PATs across all attempts.
+    const { script, seen, tokens, probes } = stubInstall(
+      s.installId,
+      undefined,
+      { staleProbes: KEY_LIVE_WAITS_MS.length + 1 },
+    );
+    const oldKey = script?.secrets.get("TEST_HOOK_KEY");
+    const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+      "deriveBits",
+    ])) as CryptoKeyPair;
+    const recipientKey = Buffer.from(
+      new Uint8Array(
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
+    ).toString("base64url");
+
+    const putsBefore = w.fake.log.filter(
+      (l) =>
+        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200,
+    ).length;
+    const r = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+      twice: true,
+    });
+    const putsAfter = w.fake.log.filter(
+      (l) =>
+        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200,
+    ).length;
+
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done", step: "done" });
+    expect(putsAfter - putsBefore).toBe(3); // 1 failed attempt + 2 (twice replay)
+    const newKey = script?.secrets.get("TEST_HOOK_KEY") as string;
+    expect(newKey).not.toBe(oldKey);
+    expect(probes.length).toBeGreaterThanOrEqual(KEY_LIVE_WAITS_MS.length + 3);
+    expect(seen).toEqual([]);
+    expect(tokens.map((t) => t.id)).toEqual(["t1", "t2"]);
+    expect(JSON.parse(await openSealed(pair, r.job?.sealed as string))).toEqual(
+      { hookKey: newKey },
+    );
+
+    // Refusals: redline/test-member cannot request hookKeyOnly; fixtures cannot
+    // mint PATs, revoke, or touch another fixture's install.
+    const rl = await active({
+      slug: "rl-guard",
+      actor: "oidc",
+      testHooks: true,
+    });
+    const rlStub = stubInstall(rl.installId);
+    const rlRefused = await manage("redline_creds", rl.installId, {
+      actor: "oidc",
+      actorKey: "oidc:42",
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+    });
+    expect(rlRefused.job?.error_code).toBe("invalid_state");
+    expect(rlStub.seen).toEqual([]);
+
+    const mintRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: false, recipientKey },
+    });
+    expect(mintRefused.job?.error_code).toBe("invalid_state");
+    const revokeRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: true },
+    });
+    expect(revokeRefused.job?.error_code).toBe("invalid_state");
+    const crossRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorB,
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+    });
+    expect(crossRefused.job?.error_code).toBe("invalid_state");
+    expect(seen).toEqual([]);
+  });
 });
 
 describe("near-expiry token mode per kind (5.7)", () => {

@@ -151,6 +151,26 @@ const mayCrossHeld = (p: Principal) =>
   (p.kind === "token" && p.tokenKind === "oauth") ||
   p.kind === "oidc";
 
+/**
+ * R26 variant guard: only the disposable staging fixture workflow may request
+ * `hookKeyOnly: true` (and it may request nothing else); every other OIDC
+ * workflow refuses `hookKeyOnly` before queueing a job.
+ */
+export function checkR26HookKeyOnly(
+  body: { revoke?: unknown; hookKeyOnly?: unknown },
+  workflow?: string,
+): { field: "hookKeyOnly" | "revoke"; code: "forbidden" } | null {
+  if (workflow === "test-install") {
+    if (body.revoke === true) return { field: "revoke", code: "forbidden" };
+    if (body.hookKeyOnly !== true)
+      return { field: "hookKeyOnly", code: "forbidden" };
+    return null;
+  }
+  if (body.hookKeyOnly !== undefined)
+    return { field: "hookKeyOnly", code: "forbidden" };
+  return null;
+}
+
 const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   R5: async (a, row) => {
     refuseUnless(can(row, "upgrade", a.principal));
@@ -287,11 +307,17 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   },
   R26: async (a, row) => {
     refuseUnless(can(row, "redline_creds", a.principal));
+    const body = bodyOf<typeof RedlineCredsSchema>(a);
+    const f = checkR26HookKeyOnly(
+      body as { revoke?: unknown; hookKeyOnly?: unknown },
+      a.principal.kind === "oidc" ? a.principal.oidcWorkflow : undefined,
+    );
+    if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
     // Mint or revoke (C6): the shared helper narrows on `revoke` and owns
     // the args shape, so a mint's key travels however C7 defines it.
     return {
       kind: "redline_creds",
-      args: redlineCredsJobArgs(bodyOf<typeof RedlineCredsSchema>(a)),
+      args: redlineCredsJobArgs(body),
     };
   },
   // #1008. The job re-reads all of this against /healthz; these are the
