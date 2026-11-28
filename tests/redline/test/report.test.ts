@@ -17,6 +17,7 @@ import {
 } from "../src/capture.ts";
 import {
   ACCEPTED_UNPROVEN,
+  applyManifest,
   BREACH_MARK,
   buildReport,
   type CaseResult,
@@ -40,7 +41,8 @@ import {
   redactReason,
   runKindOf,
 } from "../src/report.ts";
-import { bindingOf } from "../src/reporter.ts";
+import { bindingOf, loadManifest } from "../src/reporter.ts";
+import { SURFACES_FILE, surfaceManifestCases } from "../src/surfaces.ts";
 
 const c = (name: string, level: Level, reason?: string): CaseResult => ({
   name,
@@ -490,6 +492,67 @@ describe("report", () => {
     for (const n of r.nonPass) expect(t).toContain(n.name);
     expect(t).not.toContain("A's PAT at B");
     expect(t).toContain('Gate: FAIL (4 of 5 cases are not "pass")');
+  });
+
+  it("route coverage gaps are reported in JSON and text and never fail the gate, while actual test failures still block", () => {
+    const cov = {
+      total: 10,
+      probed: 6,
+      denyOnly: 2,
+      dropped: 1,
+      uncovered: ["POST /api/v1/new-route", "tool:new_tool"],
+      byDropWhy: {
+        "interactive-only": ["PUT /api/v1/a", "PUT /api/v1/b"],
+        "owner-only": ["PUT /api/v1/c"],
+      },
+    };
+    const ok = buildReport([c("A's PAT at B", "pass")], "staging", {}, cov);
+    expect(ok.gate.passed).toBe(true);
+    expect(exitCode(ok, true)).toBe(0);
+    expect(ok.coverage).toEqual(cov);
+    const text = formatReport(ok);
+    expect(text).toContain(
+      "Route coverage: 6/10 probed, 2 deny-only, 1 dropped, 2 uncovered",
+    );
+    expect(text).toContain("Uncovered routes (report only):");
+    expect(text).toContain("  POST /api/v1/new-route");
+    expect(text).toContain("  tool:new_tool");
+    expect(text).toContain("Gate: PASS");
+
+    const bad = buildReport(
+      [c("A's PAT at B", "pass"), c("probe leak", "fail", "status 200")],
+      "staging",
+      {},
+      cov,
+    );
+    expect(bad.gate.passed).toBe(false);
+    expect(exitCode(bad, true)).toBe(1);
+    expect(exitCode(bad, false)).toBe(1);
+  });
+
+  it("loadManifest merges derived surfaces cases for default manifest only, and applyManifest fails closed if one is missing", () => {
+    const custom = loadManifest(
+      join(import.meta.dirname, "fixtures", "gate.manifest.json"),
+    );
+    expect(custom?.cases.some((x) => x.file === SURFACES_FILE)).toBe(false);
+    const full = loadManifest();
+    const derived = surfaceManifestCases();
+    expect(derived.length).toBeGreaterThan(0);
+    expect(full?.cases.filter((x) => x.file === SURFACES_FILE)).toEqual(
+      derived,
+    );
+    const missingOne = (full?.cases ?? []).slice(0, -1).map((x) => ({
+      file: x.file,
+      name: x.name,
+      level: "pass" as const,
+    }));
+    const applied = applyManifest(missingOne, full);
+    expect(
+      applied.find((x) => x.reason === "required case did not run"),
+    ).toMatchObject({
+      file: SURFACES_FILE,
+      level: "fail",
+    });
   });
 });
 

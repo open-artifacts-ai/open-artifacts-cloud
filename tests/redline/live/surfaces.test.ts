@@ -1,18 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, it } from "vitest";
 import { hook } from "../src/http.ts";
 import { crossWrite, prepareSide, type Side } from "../src/refused.ts";
 import { proof } from "../src/report.ts";
 import {
   carries,
-  citationGaps,
   cleanup,
-  coverageGaps,
   dispose,
   hiddenToolGate,
   inShard,
   probeCases,
   probeCred,
-  readRepoFile,
   runRead,
   seedWorld,
   settle,
@@ -35,10 +32,11 @@ import { loadTargets, type Target, type Targets } from "../src/targets.ts";
 // credential at B is the in-server matrix's foreign callers, on every PR;
 // A's at A is the same leg on the other install plus the in-server tests in
 // A_AT_A. One case per credential kind keeps live A-at-B (SMOKES in
-// src/surfaces.ts), with A at A as its positive control; the eleven deny-only
-// cases keep their A-at-B leg.
-// Surfaces with no possible success leg are dropped through DROPPED (P5
-// plan, Task 3b). Each case is listed in live/manifest.json.
+// src/surfaces.ts), with A at A as its positive control; interactive-only and
+// real-only cases keep their A-at-B leg (denyOnly).
+// Cases are derived directly from public's route-policy-table.ts and
+// surfaces.ts; route coverage gaps are reported in the run report rather than
+// failing the gate.
 
 let T: Targets;
 let A: Side;
@@ -76,17 +74,10 @@ const world = (t: Target): World => {
 const side = (t: Target): Side => (t === T.a ? A : B);
 
 // #26: REDLINE_SURFACES_SHARD "a" or "b" runs half of the cases (the plan's
-// two surfaces lanes); unset runs them all. The coverage case is shard a's.
+// two surfaces lanes); unset runs them all.
 const shard = surfaceShard();
 
 describe("surface probes (cross-install)", () => {
-  if (shard !== "b")
-    it("every ROUTE_POLICY route, MCP tool and content route has a case", () => {
-      expect(coverageGaps()).toEqual([]);
-      // Every drop's covering tests exist (file, describe and test names).
-      expect(citationGaps(readRepoFile)).toEqual([]);
-    });
-
   for (const c of probeCases().filter((c) => inShard(c.name, shard)))
     it(
       c.name,

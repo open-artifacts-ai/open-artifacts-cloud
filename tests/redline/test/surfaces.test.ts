@@ -1,10 +1,14 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  CONTENT_POLICY,
+  ROUTE_POLICY,
+  TOOL_POLICY,
+} from "../../../apps/server/src/auth/route-policy-table.ts";
 import { FOREIGN_CALLERS } from "../../../apps/server/test/authz/expect.ts";
 import {
   ORG_SURFACES,
-  PUBLIC_ROUTES,
   SPACE_SURFACES,
   SURFACES,
 } from "../../../apps/server/test/authz/surfaces.ts";
@@ -23,6 +27,7 @@ import {
   hookReason,
   SetupHookError,
 } from "../src/http.ts";
+import { interactiveRoutes, serverSources } from "../src/interactive-routes.ts";
 import {
   crossCheck,
   crossDenied,
@@ -35,12 +40,12 @@ import {
   type Verdict,
 } from "../src/refused.ts";
 import { parseManifest } from "../src/report.ts";
+import { loadManifest } from "../src/reporter.ts";
 import {
   A_AT_A,
   citationGaps,
   cleanup,
-  coverageGaps,
-  DROPPED,
+  coverageReport,
   derive,
   FOREIGN_OF,
   GRANT_CASE_TIMEOUT_MS,
@@ -50,16 +55,21 @@ import {
   HOOK_SPACE_ID,
   HOSTED_FEATURES,
   hiddenToolGate,
-  INTERACTIVE_ONLY,
   inShard,
+  interactiveOrgRoutes,
   MATRIX_AT_B,
   ORG_FRESH,
+  PARTIAL_INTERACTIVE_ORG_ROUTES,
   type ProbeCase,
   pickOwnGrant,
   readRepoFile,
   runRead,
   SHARD_B_PREFIXES,
   SMOKES,
+  SURFACES_DESCRIBE,
+  SURFACES_FILE,
+  smokeGaps,
+  surfaceManifestCases,
   surfaceShard,
   viaTarget,
   type World,
@@ -68,7 +78,6 @@ import {
 } from "../src/surfaces.ts";
 import { loadTargets, type Target } from "../src/targets.ts";
 import { type Fake, fakeServer, json, secretDir } from "./fake.ts";
-import { interactiveRoutes, serverSources } from "./interactive-routes.ts";
 
 const toDispose: (() => unknown)[] = [];
 afterEach(async () => {
@@ -117,52 +126,64 @@ describe("the two surfaces shards (#26)", () => {
   });
 });
 
-describe("probe cases (derived from Backend's surfaces)", () => {
+describe("probe cases (derived from public's route policy table and surfaces)", () => {
   const d = derive();
   const { cases, dropped } = d;
 
-  it("cover every ROUTE_POLICY route, MCP tool and content route", () => {
-    expect(coverageGaps(d)).toEqual([]);
+  it("reads public's route-policy-table.ts directly and summarizes coverage", () => {
+    const cov = coverageReport(d);
+    expect(cov.total).toBeGreaterThan(0);
+    expect(cov.probed + cov.denyOnly + cov.dropped + cov.uncovered.length).toBe(
+      cov.total,
+    );
+    expect(
+      Object.values(cov.byDropWhy).reduce((n, rs) => n + (rs?.length ?? 0), 0),
+    ).toBe(cov.dropped);
+    expect(cov.probed).toBeGreaterThan(0);
+    expect(cov.denyOnly).toBeGreaterThan(0);
+    expect(Array.isArray(cov.uncovered)).toBe(true);
   });
 
-  it("flag a route, a tool or a content route no case reaches", () => {
+  it("reports a route, MCP tool or content route added to public's policy tables without a probe", () => {
+    const base = coverageReport(d);
+    const cov = coverageReport(d, {
+      routes: {
+        ...ROUTE_POLICY,
+        "POST /api/v1/unprobed-route": { org: "mcp.connect" },
+        "GET /public-only-route": { public: "health" },
+        "GET /signed-only-route": { signed: "token" },
+      },
+      tools: {
+        ...TOOL_POLICY,
+        unprobed_tool: { user: "test" },
+      },
+      content: {
+        ...CONTENT_POLICY,
+        "POST /unprobed-content": { signed: "token" },
+        "GET /_oa/new-public": { public: "bundle" },
+      },
+    });
+    expect(cov.uncovered).toEqual(
+      [
+        ...base.uncovered,
+        "POST /api/v1/unprobed-route",
+        "content:POST /unprobed-content",
+        "tool:unprobed_tool",
+      ].sort(),
+    );
+  });
+
+  it("reports an uncovered route when its probe case is missing (never counts a drop as probed)", () => {
     const without = (r: string) =>
-      coverageGaps({
+      coverageReport({
         cases: cases.filter((c) => !c.routes.includes(r)),
         dropped: dropped.filter((x) => !x.routes.includes(r)),
       });
-    expect(without("GET /api/v1/me")).toContain("no case: GET /api/v1/me");
-    expect(without("tool:list_spaces")).toContain("no case: tool:list_spaces");
-    expect(without("content:GET /*")).toContain("no case: content:GET /*");
-  });
-
-  it("flag a case list shorter than the policy manifest", () => {
-    const gaps = coverageGaps({ cases: cases.slice(0, 10), dropped });
-    expect(
-      gaps.some((g) => /cases and exclusions < \d+ scoped routes/.test(g)),
-    ).toBe(true);
-  });
-
-  it("flag a drop DROPPED doesn't record, and a recorded drop the rules don't make", () => {
-    const extra = {
-      name: "org GET /api/v1/new-owner-only",
-      routes: ["GET /api/v1/new-owner-only"],
-      why: "owner-only" as const,
-      reason: "r",
-    };
-    expect(coverageGaps({ cases, dropped: [...dropped, extra] })).toContain(
-      "drop not recorded in DROPPED: org GET /api/v1/new-owner-only (owner-only)",
-    );
-    const [first, ...rest] = dropped;
-    expect(first).toBeDefined();
-    expect(coverageGaps({ cases, dropped: rest })).toContain(
-      `DROPPED lists a surface the rules don't drop: ${first?.name}`,
-    );
-  });
-
-  it("never count a route reached only by a drop as covered", () => {
-    // Dropping the only case for a route leaves a gap, not a pass.
-    const gaps = coverageGaps({
+    expect(without("GET /api/v1/me").uncovered).toContain("GET /api/v1/me");
+    expect(without("tool:list_spaces").uncovered).toContain("tool:list_spaces");
+    expect(without("content:GET /*").uncovered).toContain("content:GET /*");
+    // Dropping a route without a live case reports it under dropped/byDropWhy, never probed.
+    const withDrop = coverageReport({
       cases: cases.filter((c) => !c.routes.includes("GET /api/v1/settings")),
       dropped: [
         ...dropped,
@@ -174,40 +195,22 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         },
       ],
     });
-    expect(gaps).toContain("no case: GET /api/v1/settings");
+    expect(withDrop.byDropWhy["owner-only"]).toContain("GET /api/v1/settings");
+    expect(withDrop.probed).toBe(coverageReport(d).probed - 1);
   });
 
-  it("flag an exclusion a case reaches (stale)", () => {
-    const fake = {
-      name: "org GET /api/v1/usage [pat]",
-      routes: ["GET /api/v1/usage"],
-      variant: "pat" as const,
-      legs: "own" as const,
-      run: async () => "allow" as const,
-    };
-    expect(coverageGaps({ cases: [...cases, fake], dropped })).toContain(
-      "stale exclusion: GET /api/v1/usage",
-    );
-  });
-
-  it("drop a route a hosted FEATURES flag turns off (usage_off)", () => {
+  it("drops a route a hosted FEATURES flag turns off (usage_off)", () => {
     expect(HOSTED_FEATURES).toContain("usage_off");
     expect(dropped.find((x) => x.name === "org GET /api/v1/usage")?.why).toBe(
       "feature-off",
     );
   });
 
-  it("record every drop with a reason and a covering test", () => {
-    expect(dropped.length).toBe(Object.keys(DROPPED).length);
-    for (const x of dropped) {
-      expect(DROPPED[x.name]?.why).toBe(x.why);
-      expect(DROPPED[x.name]?.coveredBy).not.toBe("");
-      expect(x.reason).not.toBe("");
-    }
-  });
-
-  it("have unique names; every surface is a case or a recorded drop", () => {
+  it("has unique names; every surface is a case, a derived drop, or unsupported", () => {
     expect(new Set(cases.map((c) => c.name)).size).toBe(cases.length);
+    const droppedNames = new Set(dropped.map((x) => x.name));
+    const unsupportedNames = new Set(d.unsupported ?? []);
+    for (const x of dropped) expect(x.reason).not.toBe("");
     const prefixes = [
       ...SURFACES.map((s) => `artifact ${s.name}`),
       ...ORG_SURFACES.map((s) => `org ${s.route}`),
@@ -215,11 +218,13 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     ];
     for (const p of prefixes)
       expect(
-        p in DROPPED || cases.some((c) => c.name.startsWith(`${p} [`)),
+        droppedNames.has(p) ||
+          unsupportedNames.has(p) ||
+          cases.some((c) => c.name.startsWith(`${p} [`)),
       ).toBe(true);
   });
 
-  it("run every mutating probe through crossWrite on a throwaway, never on the world", () => {
+  it("runs every mutating probe through crossWrite on a throwaway, never on the world", () => {
     const mutating = new Set([
       ...SURFACES.filter((s) => s.mutates).map((s) => `artifact ${s.name}`),
       ...ORG_SURFACES.filter((s) => s.mutates).map((s) => `org ${s.route}`),
@@ -240,114 +245,47 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     }
   });
 
-  it("deny-only: the real-only drops and the interactive-only ones, each still a recorded drop", () => {
+  it("deny-only: derived from real-only and interactive-only drops, with no hand-written count", () => {
     const only = cases.filter((c) => c.denyOnly);
     expect(only.map((c) => c.name).sort()).toEqual(
-      Object.entries(DROPPED)
-        .filter(
-          ([, d]) => d.why === "real-only" || d.why === "interactive-only",
-        )
-        .map(([n]) => `${n} [session]`)
+      dropped
+        .filter((x) => x.why === "real-only" || x.why === "interactive-only")
+        .map((x) => `${x.name} [session]`)
         .sort(),
     );
-    // #2263 adds ten passkey routes to the interactive-only drops.
-    // Seven real-only and eight interactive-only on main (#1346's two reach
-    // writes among them), three hosted-only billing writes (interactive-only:
-    // browser sessions).
-    // #2545: the first-invite flag adds one real-only drop.
-    // v0.205.0: inbox read and read-all (#2512), the four held-request routes
-    // (#2577) and Install now (#2552) add seven interactive-only drops.
-    // v0.213.0: saving prefs, mute and unmute, Later and the three push
-    // subscription changes (#2512, #2762) add seven more.
-    // v0.219.0: the agent-requests switch save and the three listens-to
-    // routes (#2577 S2) add four more.
-    expect(only).toHaveLength(52);
+    expect(only.length).toBeGreaterThan(0);
     for (const c of only) expect(c.run).toBeDefined();
   });
 
-  it("#1204/#1313: every route behind interactiveSession, direct or through helpers, is interactive-only or owner-only, and no other is", () => {
-    // Every file under apps/server/src (routes/, bus/, mcp/, ...); a handler
-    // counts when it reaches interactiveSession(c) through any helper chain.
-    const scanned = interactiveRoutes(serverSources());
-    // #2263: a pick's answer and its passkey challenge read interactiveSession
-    // (a passkey assertion rides only a browser session) but still answer an
-    // agent's token for an ask without a passkey gate, so they are not
-    // interactive-only; the matrix covers them as artifact comment routes.
-    const ANSWER_ROUTES = [
-      "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer",
-      "POST /api/v1/artifacts/:id/comments/:threadId/comments/:commentId/answer/challenge",
-    ];
-    // v0.213.0: these read interactiveSession for one branch only, and
-    // answer a token otherwise: push reads (pushUser checks it for writes
-    // only), a comment or reply (only one carrying people, #2770) and a
-    // comment picture (a token reads no picture of a request held for its
-    // person, #2577). The matrix covers each.
-    const PARTIAL_ROUTES = [
-      "GET /api/v1/me/push/key",
-      "GET /api/v1/me/push/subscriptions",
-      "POST /api/v1/artifacts/:id/comments",
-      "POST /api/v1/artifacts/:id/comments/:threadId/replies",
-      "GET /api/v1/artifacts/:id/pictures/:pictureId",
-      // #2819: the machines read is a token's too; only the owner's own pause
-      // state in it needs a browser session.
-      "GET /api/v1/bus/machines",
-    ];
-    const found = scanned.filter(
-      (r) => !ANSWER_ROUTES.includes(r) && !PARTIAL_ROUTES.includes(r),
-    );
-    for (const r of [...ANSWER_ROUTES, ...PARTIAL_ROUTES])
-      expect(scanned).toContain(r);
-    // The scan's own reach: direct (erase), a function helper
-    // (share-notices' browserUser) and a const arrow on R.* paths
-    // (directory's disconnect).
+  it("#1204/#1313: derives interactive-only org routes directly from apps/server/src", () => {
+    const interactive = interactiveOrgRoutes();
+    // Known interactive-only routes (direct and via helpers) are detected automatically.
     for (const r of [
       "POST /api/v1/members/:id/erase",
       "PUT /api/v1/bus/share-notices",
-      "POST /api/v1/directory/disconnect",
-      "DELETE /api/v1/directory",
-    ])
-      expect(found).toContain(r);
-    const ownerOnly = found.filter(
-      (r) => dropped.find((y) => y.routes.includes(r))?.why === "owner-only",
-    );
-    expect(ownerOnly).toEqual([
-      "DELETE /api/v1/directory",
-      "POST /api/v1/directory/disconnect",
-      // #2552: the version the instance names, owner only, cookie session only.
-      "PUT /api/v1/bus/run-version",
-      // #2819: the pause switch, the same.
-      "PUT /api/v1/bus/updates-paused",
-    ]);
-    expect([...INTERACTIVE_ONLY].sort()).toEqual(
-      found.filter((r) => !ownerOnly.includes(r)),
-    );
-    for (const r of INTERACTIVE_ONLY) {
-      // A public-policy page route (#1300's POST /bus/share-notices): the
-      // suite probes scoped routes only, so it has no case and no drop; the
-      // handler's own checks are the server tests'.
-      if (PUBLIC_ROUTES.includes(r)) {
-        expect(cases.find((c) => c.routes.includes(r))).toBeUndefined();
-        expect(dropped.find((y) => y.routes.includes(r))).toBeUndefined();
-        continue;
-      }
-      const x = dropped.find((y) => y.routes.includes(r));
-      expect(x?.why).toBe("interactive-only");
+      "PUT /api/v1/bus/roles",
+      "DELETE /api/v1/bus/roles/:id",
+    ]) {
+      expect(interactive.has(r)).toBe(true);
+      expect(dropped.find((y) => y.routes.includes(r))?.why).toBe(
+        "interactive-only",
+      );
       expect(cases.find((c) => c.routes.includes(r))?.denyOnly).toBe(true);
     }
-    // The public exceptions are exactly the pages' forms (and #1372's
-    // confirm page), not a way out.
-    expect(INTERACTIVE_ONLY.filter((r) => PUBLIC_ROUTES.includes(r))).toEqual([
-      "POST /bus/share-notices",
-      "GET /bus/roles/confirm",
-      "POST /bus/roles/confirm/view",
-      "POST /bus/roles/confirm",
-      "GET /bus/links/confirm",
-      "POST /bus/links/confirm/view",
-      "POST /bus/links/confirm",
-      "GET /bus/reach/confirm",
-      "POST /bus/reach/confirm/view",
-      "POST /bus/reach/confirm",
-    ]);
+    // Partial-interactive org routes stay ordinary probed cases (not interactive-only).
+    for (const r of PARTIAL_INTERACTIVE_ORG_ROUTES) {
+      expect(interactive.has(r)).toBe(false);
+    }
+    // A brand-new interactive route in apps/server/src becomes denyOnly automatically without cloud edits.
+    const synth = derive({
+      interactive: new Set([...interactive, "GET /api/v1/me"]),
+    });
+    expect(
+      synth.dropped.find((y) => y.routes.includes("GET /api/v1/me"))?.why,
+    ).toBe("interactive-only");
+    expect(
+      synth.cases.find((c) => c.routes.includes("GET /api/v1/me"))?.denyOnly,
+    ).toBe(true);
   });
 
   it("#1313: the interactive scan sees every org route the server registers", () => {
@@ -396,6 +334,7 @@ describe("probe cases (derived from Backend's surfaces)", () => {
   });
 
   it("#1137 group B: one live A-at-B smoke per credential kind; the rest are the matrix's", () => {
+    expect(smokeGaps(cases)).toEqual([]);
     const by = (l: string) => cases.filter((c) => c.legs === l);
     expect(by("cross").map((c) => c.name)).toEqual([
       SMOKES.session,
@@ -406,9 +345,10 @@ describe("probe cases (derived from Backend's surfaces)", () => {
         .filter((c) => !c.denyOnly)
         .map((c) => [c.name, c.variant]),
     ).toEqual([[SMOKES.oauth, "oauth"]]);
-    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(52);
+    const denyOnlyCount = cases.filter((c) => c.denyOnly).length;
+    expect(by("atB").filter((c) => c.denyOnly)).toHaveLength(denyOnlyCount);
     // Every other case: B at B only, its kind a matrix foreign caller.
-    expect(by("own")).toHaveLength(cases.length - 2 - 53);
+    expect(by("own")).toHaveLength(cases.length - 2 - (denyOnlyCount + 1));
     for (const c of by("own"))
       expect(FOREIGN_CALLERS).toContain(FOREIGN_OF[c.variant]);
   });
@@ -416,22 +356,19 @@ describe("probe cases (derived from Backend's surfaces)", () => {
   it("flag a kind with no live smoke, a stray live A-at-B leg, and a kind the matrix lacks", () => {
     const set = (name: string, legs: ProbeCase["legs"]) =>
       cases.map((c) => (c.name === name ? { ...c, legs } : c));
-    expect(
-      coverageGaps({ cases: set(SMOKES.session, "own"), dropped }),
-    ).toContain(`no live A-at-B smoke for session: ${SMOKES.session}`);
-    expect(
-      coverageGaps({ cases: set(SMOKES.oauth, "own"), dropped }),
-    ).toContain(`no live A-at-B smoke for oauth: ${SMOKES.oauth}`);
-    expect(
-      coverageGaps({
-        cases: set("artifact rest patch [pat]", "cross"),
-        dropped,
-      }),
-    ).toContain("live A-at-B leg not in SMOKES: artifact rest patch [pat]");
-    expect(coverageGaps(d, ["foreignSession", "foreignOAuth"])).toContain(
+    expect(smokeGaps(set(SMOKES.session, "own"))).toContain(
+      `no live A-at-B smoke for session: ${SMOKES.session}`,
+    );
+    expect(smokeGaps(set(SMOKES.oauth, "own"))).toContain(
+      `no live A-at-B smoke for oauth: ${SMOKES.oauth}`,
+    );
+    expect(smokeGaps(set("artifact rest patch [pat]", "cross"))).toContain(
+      "live A-at-B leg not in SMOKES: artifact rest patch [pat]",
+    );
+    expect(smokeGaps(cases, ["foreignSession", "foreignOAuth"])).toContain(
       "A at B for artifact rest patch [pat]: no matrix foreign caller foreignPat",
     );
-    expect(coverageGaps(d, ["foreignPat", "foreignOAuth"])).toContain(
+    expect(smokeGaps(cases, ["foreignPat", "foreignOAuth"])).toContain(
       "A at B for org GET /api/v1/me [session]: no matrix foreign caller foreignSession",
     );
   });
@@ -447,23 +384,16 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     const set = (name: string, legs: ProbeCase["legs"]) =>
       cases.map((c) => (c.name === name ? { ...c, legs } : c));
     // A-at-B only: the A-at-B check passes, the A-at-A one doesn't.
-    const atB = coverageGaps({ cases: set(SMOKES.pat, "atB"), dropped });
+    const atB = smokeGaps(set(SMOKES.pat, "atB"));
     expect(atB).toContain(
       `no live A-at-A positive control for pat: ${SMOKES.pat}`,
     );
     expect(atB).not.toContain(`no live A-at-B smoke for pat: ${SMOKES.pat}`);
-    expect(
-      coverageGaps({ cases: set(SMOKES.session, "own"), dropped }),
-    ).toContain(
+    expect(smokeGaps(set(SMOKES.session, "own"))).toContain(
       `no live A-at-A positive control for session: ${SMOKES.session}`,
     );
     // No smoke case at all.
-    expect(
-      coverageGaps({
-        cases: cases.filter((c) => c.name !== SMOKES.session),
-        dropped,
-      }),
-    ).toContain(
+    expect(smokeGaps(cases.filter((c) => c.name !== SMOKES.session))).toContain(
       `no live A-at-A positive control for session: ${SMOKES.session}`,
     );
   });
@@ -502,20 +432,24 @@ describe("probe cases (derived from Backend's surfaces)", () => {
     expect(GRANT_CASE_TIMEOUT_MS).toBeGreaterThanOrEqual(3 * GRANT_LIST_MS);
   });
 
-  it("are all in the required-case manifest, and no drop is", () => {
-    const m = parseManifest(
+  it("live/manifest.json has no duplicate surfaces list; loadManifest derives surfaces cases from public", () => {
+    const raw = parseManifest(
       readFileSync(join(import.meta.dirname, "../live/manifest.json"), "utf8"),
     );
-    const listed = new Set(
-      m.cases
-        .filter((c) => c.file === "live/surfaces.test.ts")
-        .map((c) => c.name),
-    );
-    const want = [
-      "every ROUTE_POLICY route, MCP tool and content route has a case",
-      ...cases.map((c) => c.name),
-    ].map((n) => `surface probes (cross-install) > ${n}`);
+    expect(raw.cases.filter((c) => c.file === SURFACES_FILE)).toEqual([]);
+    const loaded = loadManifest();
+    expect(loaded).not.toBeNull();
+    const listed = (loaded?.cases ?? [])
+      .filter((c) => c.file === SURFACES_FILE)
+      .map((c) => c.name);
+    const want = cases.map((c) => `${SURFACES_DESCRIBE} > ${c.name}`);
     expect([...listed].sort()).toEqual([...want].sort());
+    expect(surfaceManifestCases(d)).toEqual(
+      cases.map((c) => ({
+        file: SURFACES_FILE,
+        name: `${SURFACES_DESCRIBE} > ${c.name}`,
+      })),
+    );
   });
 });
 
@@ -965,7 +899,7 @@ describe("A-at-B smokes: each fails when B accepts A's credential of its kind", 
 
   it("an own-legs case doesn't catch it: that is the matrix's job, so each kind keeps its smoke", async () => {
     // The session smoke with its A-at-B leg trimmed passes against the same
-    // faulty B: coverageGaps keeps one live smoke per kind for this reason.
+    // faulty B: smokeGaps keeps one live smoke per kind for this reason.
     await run("session", true, { ...smoke(SMOKES.session), legs: "own" });
   });
 

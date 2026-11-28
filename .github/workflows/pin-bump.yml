@@ -19,20 +19,11 @@
 #   runs `pnpm install --lockfile-only` (it reads the public tree's pnpmfile,
 #   npmrc and workspace config, so it is inside no trust boundary) and uploads
 #   pnpm-lock.yaml, as data, and nothing else.
-#   It then runs the public workspace's dependency install and build code
-#   (--ignore-scripts, but the build is public code), so NOTHING from this job is
-#   trusted beyond its two artifacts, and `open` re-validates both as data. A
-#   future cache in any job that holds secrets would make this cache poisoning,
-#   so none may be added.
-#   It also derives the surfaces port's mechanical files (tests/redline/live/manifest.json,
-#   test/cases-added.ts and the counts in test/surfaces.test.ts) from the overlaid
-#   tree's src/surfaces.ts, with an install that runs no scripts, and uploads only
-#   the resulting plan (case names and counts) as data.
 # - open: a fresh runner on main's checkout. It never checks out or runs the
 #   public tree, and never installs. It plans again itself (nothing from
-#   prepare but the lockfile and the plan are trusted), re-applies the pin files,
-#   takes the lockfile as data, applies the plan with main's own
-#   tests/redline/scripts/redline-regen.ts (which accepts only plain case names), and only then mints the App token to push and open the PR.
+#   prepare but the lockfile is trusted), re-applies the pin files, takes the
+#   lockfile as data, and only then mints the App token to push and open the PR
+#   (or stage on pin-land/<tag> in direct mode).
 # - report: issues: write, no checkout. Red keeps one `blocker` issue titled
 #   "pin-bump failed" open with the run URL; green closes it. A run past its
 #   timeout is reported as cancelled, so cancelled counts as red: anything but
@@ -42,14 +33,12 @@
 # both plans run `plan-direct` (no PR is read) and there is no PR, but CI still
 # gates main. `open` pushes the same App-signed commit to pin-land/<tag>, never to
 # main, and CI runs on it in full. pin-land.yml's `land` job then moves main to
-# it once CI passed there (its header has the rules). A bump whose surfaces port
-# is not empty is what pin-bump-arm leaves for a person, so it goes the PR path
-# below instead. plan-direct waits while pin-bump-arm's release pipeline gate is
-# shut (a gate workflow queued or running, or main's pin not yet on prod and not
-# rejected), so a direct bump lands no sooner than an armed PR would. The gate
-# opens only when a gate workflow ends, so in direct mode that end starts the
-# plan again (see Triggers below). Unset (or anything but `on`), the PR path
-# runs exactly as before.
+# it once CI passed there (its header has the rules). plan-direct waits while
+# pin-bump-arm's release pipeline gate is shut (a gate workflow queued or running,
+# or main's pin not yet on prod and not rejected), so a direct bump lands no
+# sooner than an armed PR would. The gate opens only when a gate workflow ends,
+# so in direct mode that end starts the plan again (see Triggers below). Unset
+# (or anything but `on`), the PR path runs exactly as before.
 #
 # Triggers (cloud #264). Event-only: there is no schedule. A stable public
 # release starts this at once (public release-please.yml, cloud-pin-bump:
@@ -173,35 +162,12 @@ jobs:
           pnpm install --lockfile-only
           mkdir -p "$RUNNER_TEMP/lock"
           cp pnpm-lock.yaml "$RUNNER_TEMP/lock/pnpm-lock.yaml"
-      # Only the lockfile and the surfaces plan leave this job, and open takes them as data.
-      # The lockfile is uploaded before any public build code runs, and v4
-      # artifacts can't be overwritten by name, so the build can't swap it.
+      # Only the lockfile leaves this job, and open takes it as data.
       - if: steps.plan.outputs.bump == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pin-bump-lock-${{ steps.plan.outputs.tag }}
           path: ${{ runner.temp }}/lock/pnpm-lock.yaml
-          if-no-files-found: error
-          retention-days: 1
-      # The mechanical half of a surfaces port, derived from the overlaid tree's
-      # src/surfaces.ts (tests/redline/src/regen.ts). The install runs no
-      # lifecycle scripts. A route that still needs its classification is a
-      # warning here and a named failure in CI (tests/redline/test/regen.test.ts).
-      - if: steps.plan.outputs.bump == 'true'
-        name: Plan the surfaces port (manifest, cases-added, counts)
-        working-directory: public
-        run: |
-          set -euo pipefail
-          pnpm install --frozen-lockfile --ignore-scripts
-          pnpm --filter "@oa/redline^..." build
-          mkdir -p "$RUNNER_TEMP/regen"
-          cd tests/redline
-          node --experimental-strip-types --no-warnings scripts/redline-regen.ts plan --out "$RUNNER_TEMP/regen/plan.json"
-      - if: steps.plan.outputs.bump == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
-          path: ${{ runner.temp }}/regen/plan.json
           if-no-files-found: error
           retention-days: 1
 
@@ -251,38 +217,6 @@ jobs:
           [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular pnpm-lock.yaml in the artifact"; exit 1; }
           [ "$(wc -c < "$f")" -le 10000000 ] || { echo "::error::the lockfile is over 10 MB"; exit 1; }
           cp "$f" pnpm-lock.yaml
-      - if: steps.plan.outputs.bump == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: pin-bump-regen-${{ steps.plan.outputs.tag }}
-          path: ${{ runner.temp }}/regen
-      # The plan is data: main's own script validates every case name (plain
-      # printable text, no quote, backtick, backslash or dollar sign) and writes the
-      # three files from fixed templates. Nothing from the public tree runs here.
-      - if: steps.plan.outputs.bump == 'true'
-        name: Apply the surfaces plan as data
-        run: |
-          set -euo pipefail
-          f="$RUNNER_TEMP/regen/plan.json"
-          [ -f "$f" ] && [ ! -L "$f" ] || { echo "::error::no regular plan.json in the artifact"; exit 1; }
-          [ "$(wc -c < "$f")" -le 2000000 ] || { echo "::error::the plan is over 2 MB"; exit 1; }
-          node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan "$f" --dir tests/redline
-      # Direct mode lands only what pin-bump-arm would arm without a person: a
-      # surfaces port (new redline cases and counts) goes to a PR for review.
-      - id: route
-        if: steps.plan.outputs.bump == 'true'
-        name: Direct or a PR
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.plan.outputs.tag }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
-          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
-          DIRECT: ${{ vars.PIN_BUMP_DIRECT == 'on' && 'on' || 'off' }}
-        run: |
-          set -euo pipefail
-          surfaces=same
-          git diff --quiet HEAD -- tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts || surfaces=changed
-          node --experimental-strip-types scripts/ci/pin-bump.ts route --repo "$GITHUB_REPOSITORY" --tag "$TAG" --direct "$DIRECT" --surfaces "$surfaces" --branch "$BRANCH" --supersede "$SUPERSEDE" >> "$GITHUB_OUTPUT"
       - id: app
         if: steps.plan.outputs.bump == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
@@ -295,7 +229,7 @@ jobs:
       # local git: GitHub then records the App's bot as author and committer and
       # signs it (verified), and the push needs only the App's contents write.
       - id: commit
-        if: steps.plan.outputs.bump == 'true' && (steps.route.outputs.route == 'direct' || steps.route.outputs.pr == 'true')
+        if: steps.plan.outputs.bump == 'true'
         name: Commit the pin (App-signed, through the API)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -305,7 +239,7 @@ jobs:
         run: |
           set -euo pipefail
           entries='[]'
-          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts; do
+          for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml; do
             base64 < "$f" | tr -d '\n' | jq -Rs '{content: ., encoding: "base64"}' > "$RUNNER_TEMP/blob.json"
             blob=$(gh api "repos/$REPO/git/blobs" --input "$RUNNER_TEMP/blob.json" --jq .sha)
             entries=$(jq -c --arg p "$f" --arg s "$blob" '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<< "$entries")
@@ -317,11 +251,11 @@ jobs:
           commit=$(gh api "repos/$REPO/git/commits" --input "$RUNNER_TEMP/commit.json" --jq .sha)
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "committed $commit on $BASE"
-      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
+      - if: steps.plan.outputs.bump == 'true' && vars.PIN_BUMP_DIRECT != 'on'
         name: Push the branch
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          BRANCH: ${{ steps.route.outputs.branch }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
           REPO: ${{ github.repository }}
           COMMIT: ${{ steps.commit.outputs.commit }}
         run: |
@@ -335,17 +269,17 @@ jobs:
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" > /dev/null
           fi
           echo "pushed $BRANCH at $commit"
-      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.pr == 'true'
+      - if: steps.plan.outputs.bump == 'true' && vars.PIN_BUMP_DIRECT != 'on'
         name: Open the PR (never armed)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TAG: ${{ steps.plan.outputs.tag }}
           SHA: ${{ steps.plan.outputs.sha }}
-          BRANCH: ${{ steps.route.outputs.branch }}
-          SUPERSEDE: ${{ steps.route.outputs.supersede }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          SUPERSEDE: ${{ steps.plan.outputs.supersede }}
         run: node --experimental-strip-types scripts/ci/pin-bump.ts open-pr --repo "$GITHUB_REPOSITORY" --tag "$TAG" --sha "$SHA" --branch "$BRANCH" --supersede "$SUPERSEDE"
       # Direct mode: the commit goes to pin-land/<tag> for CI; main does not move here.
-      - if: steps.plan.outputs.bump == 'true' && steps.route.outputs.route == 'direct'
+      - if: steps.plan.outputs.bump == 'true' && vars.PIN_BUMP_DIRECT == 'on'
         name: Stage the pin for CI (direct mode)
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}

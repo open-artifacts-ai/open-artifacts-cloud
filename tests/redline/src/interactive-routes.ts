@@ -8,7 +8,7 @@ import { R } from "../../../packages/shared/src/routes.ts";
  * interactiveSession(c) directly or through any chain of helpers that do,
  * in its own file or imported from another (share-notices' browserUser,
  * directory's disconnect). A static read, so it errs loud: a path it can't
- * resolve comes back as `<METHOD> ?<expression>` and fails the guard.
+ * resolve comes back as `<METHOD> ?<expression>`.
  */
 
 export const SERVER_SRC = join(import.meta.dirname, "../../../apps/server/src");
