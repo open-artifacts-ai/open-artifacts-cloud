@@ -281,16 +281,12 @@ export async function approveFixtureBusInBrowser(
     });
     await page.goto(`${origin}/bus/approve`);
     await page.locator("#code").fill(userCode);
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded"),
-      page.getByRole("button", { name: "Continue", exact: true }).click(),
-    ]);
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded"),
-      page
-        .locator('button[type="submit"][name="decision"][value="approve"]')
-        .click(),
-    ]);
+    await page.getByRole("button", { name: "Continue", exact: true }).click();
+    const approveBtn = page.locator(
+      'button[type="submit"][name="decision"][value="approve"]',
+    );
+    await approveBtn.waitFor({ state: "visible", timeout: 15_000 });
+    await approveBtn.click();
     await page
       .getByRole("heading", { level: 1, name: "Machine connected" })
       .waitFor({ state: "visible", timeout: 15_000 });
