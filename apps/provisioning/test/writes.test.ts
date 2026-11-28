@@ -500,11 +500,14 @@ describe("R4 create by a token and by OIDC", () => {
         .code,
     ).toBe("forbidden");
     // Cloud #84: ordinary staging slugs and rl-* slugs never pass admin-token
-    // testHooks admission; only disposable t-* slugs are eligible.
-    expect(isTokenTestHooksSlug("t-smoke")).toBe(true);
-    for (const slug of ["acme", "business", "rl-smoke", "t"])
+    // testHooks admission; t-* and bus test slugs (e.g. bus1299-b) are eligible.
+    for (const slug of ["t-smoke", "t-rehearsal", "bus1299-b", "bus-smoke"])
+      expect(isTokenTestHooksSlug(slug), slug).toBe(true);
+    for (const slug of ["acme", "business", "bus", "busy", "rl-smoke", "t"])
       expect(isTokenTestHooksSlug(slug), slug).toBe(false);
-    for (const slug of ["acme", "rl-smoke"]) {
+    expect(isTokenTestHooksSlug("m2-walk", ["m2-walk"])).toBe(true);
+    expect(isTokenTestHooksSlug("rl-agents", ["rl-agents"])).toBe(false);
+    for (const slug of ["acme", "business", "bus", "rl-smoke"]) {
       const refused = await call(e, WRITE, "R4", {
         body: { ...body, requestId: requestId(), slug, testHooks: true },
       });

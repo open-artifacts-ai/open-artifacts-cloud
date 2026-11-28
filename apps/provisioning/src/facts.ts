@@ -43,10 +43,15 @@ export const isFixtureSlugRefused = (
   !isTestUser(p, env);
 
 /**
- * Disposable staging test-install slug prefix for admin-token test hooks
- * (cloud #84): tokens cannot take `rl-*` (reserved for red-line above) and
- * may never enable test hooks on an ordinary staging slug.
+ * Staging test-install slugs eligible for admin-token test hooks (cloud #84):
+ * disposable `t-*` fixtures and bus test fixtures (`bus-*` or `bus<digits>*`,
+ * e.g. `bus1299-b`, never ordinary words like `business` or `bus`), plus any
+ * explicit staging allowlist. Red-line `rl-*` slugs stay reserved above.
  */
-export const TOKEN_TEST_HOOKS_SLUG_PREFIX = "t-";
-export const isTokenTestHooksSlug = (slug: string): boolean =>
-  slug.startsWith(TOKEN_TEST_HOOKS_SLUG_PREFIX);
+export const TOKEN_TEST_HOOKS_SLUG_RE = /^(?:t-|bus(?:-|\d))/;
+export const isTokenTestHooksSlug = (
+  slug: string,
+  allowlist: readonly string[] = [],
+): boolean =>
+  !slug.startsWith(FIXTURE_SLUG_PREFIX) &&
+  (TOKEN_TEST_HOOKS_SLUG_RE.test(slug) || allowlist.includes(slug));

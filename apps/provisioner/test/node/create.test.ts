@@ -496,17 +496,19 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
   });
 
   it("creates and resumes a staging test-hooks install for an admin token, but refuses a separate token retry", async () => {
-    const seed = seedCreate(w, {
-      slug: "t-token",
-      actor: "token",
-      testHooks: true,
-    });
-    const r = await run(w, seed.jobId, { twice: true });
-    expect(r.error).toBeNull();
-    expect(w.job(seed.jobId)?.status).toBe("done");
-    expect(plain(w, seed.installId, "TEST_DOMAIN")?.text).toBe(
-      "oa-redline-a.fyi",
-    );
+    for (const slug of ["t-token", "bus1299-b"]) {
+      const seed = seedCreate(w, {
+        slug,
+        actor: "token",
+        testHooks: true,
+      });
+      const r = await run(w, seed.jobId, { twice: true });
+      expect(r.error, slug).toBeNull();
+      expect(w.job(seed.jobId)?.status, slug).toBe("done");
+      expect(plain(w, seed.installId, "TEST_DOMAIN")?.text, slug).toBe(
+        "oa-redline-a.fyi",
+      );
+    }
 
     const failed = seedCreate(w, {
       slug: "t-token-retry",
@@ -551,14 +553,15 @@ VALUES (?, 'retry', 'provision_install', ?, ?, 'token', ?, 'token', ?, ?, 'h', '
   });
 
   it("refuses a token test-hooks job on prod or on an ordinary staging slug before provisioning", async () => {
-    for (const slug of ["acme", "business", "rl-tok"])
+    for (const slug of ["acme", "business", "bus", "busy", "rl-tok"])
       await refusedWith(
         seedCreate(w, { slug, actor: "token", testHooks: true }),
       );
     w.ctx.env.OA_ENV = "prod";
-    await refusedWith(
-      seedCreate(w, { slug: "t-prod", actor: "token", testHooks: true }),
-    );
+    for (const slug of ["t-prod", "bus1299-b"])
+      await refusedWith(
+        seedCreate(w, { slug, actor: "token", testHooks: true }),
+      );
   });
 
   it("refuses self-serve test hooks and enforces the OIDC fixture rules", async () => {

@@ -124,8 +124,9 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   if (!rules) throw new ApiError("forbidden");
   const f = checkCreateFields(body, rules, env.OA_ENV, STAGING_TEST_DOMAIN);
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
-  // Cloud #84: staging admin tokens may enable test hooks only for disposable
-  // t-* test-install slugs, never on prod or on an ordinary staging slug.
+  // Cloud #84: staging admin tokens may enable test hooks only for test-install
+  // slugs (t-* and bus test fixtures such as bus1299-b), never on prod or on an
+  // ordinary staging slug.
   if (
     p.kind === "token" &&
     body.testHooks === true &&

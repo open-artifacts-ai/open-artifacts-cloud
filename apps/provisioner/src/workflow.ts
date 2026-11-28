@@ -339,15 +339,18 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
   const slug = checkSlug(s.slug);
   const testHooks = s.test_hooks === 1;
   // Test hooks belong to staging admin-created installs (OIDC, admin, and
-  // token creates for t-* fixture slugs; a separately submitted token retry
-  // or ordinary staging slug stays refused, cloud #84).
+  // token creates for test-install slugs: t-* and bus test fixtures such as
+  // bus1299-b; separately submitted token retries and ordinary staging slugs
+  // stay refused, cloud #84).
   if (
     testHooks &&
     (env !== "staging" ||
       s.source === "self-serve" ||
       job.actor_kind === "user" ||
       (job.actor_kind === "token" &&
-        (kind !== "create" || !slug.startsWith("t-"))))
+        (kind !== "create" ||
+          slug.startsWith("rl-") ||
+          !/^(?:t-|bus(?:-|\d))/.test(slug))))
   )
     throw refused("test hooks are not allowed for this principal");
   checkOidcScope(job, env, { slug, testHooks });
