@@ -5,6 +5,7 @@ import {
   canonicalJson,
   checkCreateFields,
   fieldRulesOf,
+  type OidcWorkflow,
   slugError,
   type Tier,
 } from "@oa/provisioning-contract";
@@ -130,6 +131,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
     principal: CreatePrincipal,
     env: Env["OA_ENV"],
     stagingTestDomain: string,
+    workflow?: OidcWorkflow,
     tokenTestHookSlugs?: readonly string[],
   ) => ReturnType<typeof checkCreateFields> = checkCreateFields;
   const f = checkFields(
@@ -137,6 +139,7 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
     rules,
     env.OA_ENV,
     STAGING_TEST_DOMAIN,
+    p.kind === "oidc" ? p.oidcWorkflow : undefined,
     tokenTestHookSlugs,
   );
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
