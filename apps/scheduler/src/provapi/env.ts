@@ -29,6 +29,15 @@ export interface ProvapiEnv {
   REMINDER_FROM?: string;
   /** The provisioner's self-serve daily cap; unset or 0 means no cap alert. */
   SIGNUP_DAILY_CAP?: string;
+  /** Sends canary smoke work and completion events to the fleet consumer. */
+  FLEET_WAKE?: Pick<
+    Queue<{
+      kind: "canary_smoke" | "smoke_finished";
+      target: string;
+      canary: string;
+    }>,
+    "send"
+  >;
   /** The producer of oa-<p>-signups (the provisioner consumes it). */
   SIGNUPS?: Queue<{ signupId: string }>;
   /** The provisioner's self-serve gate; see signups.ts signupsOn. */

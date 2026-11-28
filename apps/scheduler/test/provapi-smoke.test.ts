@@ -1,5 +1,5 @@
 import type { GetArtifactResult } from "@oa/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SMOKE_BUS_SKIPPED,
   SMOKE_SHARE_SKIPPED,
@@ -475,6 +475,84 @@ describe("the canary smoke", () => {
       });
       expect(c.arts).toEqual([]);
     });
+
+  it.each(["health", "share"] as const)(
+    "the request deadline includes the %s body read or cleanup cancellation",
+    async (check) => {
+      vi.useFakeTimers();
+      try {
+        const c = canary();
+        function event() {
+          let resolve!: () => void;
+          const promise = new Promise<void>((done) => {
+            resolve = done;
+          });
+          return { promise, resolve };
+        }
+        const started = event();
+        const headers = event();
+        const body = event();
+        let signal: AbortSignal | null | undefined;
+        const fetch: SmokeFetch = async (url, init) => {
+          const response = await c.fetch(url, init);
+          const path = new URL(url).pathname;
+          if (
+            !(check === "health"
+              ? path === "/healthz"
+              : init.method === "DELETE" && path.includes("/shares/"))
+          )
+            return response;
+          signal = init.signal;
+          const data = await response.text();
+          started.resolve();
+          await headers.promise;
+          return new Response(
+            new ReadableStream({
+              async pull(controller) {
+                await body.promise;
+                if (check === "health") {
+                  controller.enqueue(new TextEncoder().encode(data));
+                  controller.close();
+                }
+              },
+              cancel: () => body.promise,
+            }),
+          );
+        };
+        const result = smoke(
+          input(c, { fetch, callMs: 3000, budgetMs: undefined }),
+        );
+        await started.promise;
+        await vi.advanceTimersByTimeAsync(2000);
+        headers.resolve();
+        await vi.advanceTimersByTimeAsync(1000);
+        body.resolve();
+        expect(await result).toEqual({ ok: false, kind: "transport", check });
+        expect(signal?.aborted).toBe(true);
+        expect(live(c)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("the standalone job completes checks beyond the inline ten-second deadline", async () => {
+    const c = canary();
+    let elapsed = 0;
+    const r = await smoke(
+      input(c, {
+        budgetMs: undefined,
+        clock: () => elapsed,
+        fetch: (url, init) => {
+          elapsed += 1_000;
+          return c.fetch(url, init);
+        },
+      }),
+    );
+    expect(elapsed).toBeGreaterThan(10_000);
+    expect(r.ok).toBe(true);
+    expect(live(c)).toEqual([]);
+  });
 
   it("the budget: past it, the run stops as budget, and still cleans up", async () => {
     let t = 0;
