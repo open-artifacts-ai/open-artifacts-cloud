@@ -235,7 +235,6 @@ async function rotateHook(ctx: CreateCtx, jobId: string, job: ManageJob) {
     ),
   );
   await keyLive(ctx, f, app, hookKey);
-
   return { f, app, installId: row.id, hookKey, testDomain };
 }
 
@@ -374,8 +373,14 @@ async function rotateMintSeal(
 ): Promise<{ sealed: boolean }> {
   const j = await readJob(ctx, jobId);
   if (!j) throw refused("no job row");
-  if (j.actor_kind === "oidc" && parseTestInstallActorKey(j.actor_key) !== null)
+  if (
+    j.actor_kind === "oidc" &&
+    (parseTestInstallActorKey(j.actor_key) !== null ||
+      j.actor_key.includes(":test-install"))
+  )
     throw refused("disposable fixtures never mint an admin PAT");
+  if ("hookKeyOnly" in argsOf(j))
+    throw refused("hookKeyOnly never enters PAT mint");
   const args = redlineArgs(j);
   if (args.revoke !== false || ("hookKeyOnly" in args && args.hookKeyOnly))
     throw refused("not a mint");

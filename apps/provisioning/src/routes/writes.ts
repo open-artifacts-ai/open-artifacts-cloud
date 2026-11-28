@@ -152,6 +152,26 @@ const mayCrossHeld = (p: Principal) =>
   (p.kind === "token" && p.tokenKind === "oauth") ||
   p.kind === "oidc";
 
+/**
+ * R26 variant guard: only the disposable staging fixture workflow may request
+ * `hookKeyOnly: true` (and it may request nothing else); every other OIDC
+ * workflow refuses `hookKeyOnly` before queueing a job.
+ */
+export function checkR26HookKeyOnly(
+  body: { revoke?: unknown; hookKeyOnly?: unknown },
+  workflow?: string,
+): { field: "hookKeyOnly" | "revoke"; code: "forbidden" } | null {
+  if (workflow === "test-install") {
+    if (body.revoke === true) return { field: "revoke", code: "forbidden" };
+    if (body.hookKeyOnly !== true)
+      return { field: "hookKeyOnly", code: "forbidden" };
+    return null;
+  }
+  if (body.hookKeyOnly !== undefined)
+    return { field: "hookKeyOnly", code: "forbidden" };
+  return null;
+}
+
 const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   R5: async (a, row) => {
     refuseUnless(can(row, "upgrade", a.principal));

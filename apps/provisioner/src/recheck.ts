@@ -89,7 +89,8 @@ export function actorOf(kind: JobRow["actor_kind"]): TransitionActor {
 
 /**
  * OIDC's scope (4.4, 5.1): staging only, and only an `rl-` install with test
- * hooks. TRANSITIONS reads OIDC as A, so this is the rest of its check.
+ * hooks (or a disposable `t-` fixture install owned by the `test-install`
+ * workflow). TRANSITIONS reads OIDC as A, so this is the rest of its check.
  */
 export function checkOidcScope(
   job: JobRow,

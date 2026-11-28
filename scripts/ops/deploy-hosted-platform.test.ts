@@ -236,9 +236,7 @@ function schedulerBindings(
     },
     { type: "service", name: "BILLING", service: `oa-${p}-billing` },
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
-    ...(p === "s"
-      ? [{ type: "queue", name: "FLEET_WAKE", queue_name: "oa-s-fleet-wake" }]
-      : []),
+    { type: "queue", name: "FLEET_WAKE", queue_name: `oa-${p}-fleet-wake` },
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
     alerts
@@ -1912,6 +1910,7 @@ describe("deploy-hosted-platform.sh", () => {
     ["SIGNUPS", { queue_name: "oa-s-signups" }, "SIGNUPS: got"],
     ["SIGNUPS", { type: "service" }, "SIGNUPS type: got"],
     ["SIGNUPS", null, "SIGNUPS type: got ''"],
+    ["FLEET_WAKE", { queue_name: "oa-s-fleet-wake" }, "FLEET_WAKE: got"],
     ["PROVISION_INSTALL", { type: "service" }, "PROVISION_INSTALL: got"],
     ["PROVISION_INSTALL", null, "PROVISION_INSTALL: got ''"],
     ["MANAGE_INSTALL", { type: "queue" }, "MANAGE_INSTALL: got"],

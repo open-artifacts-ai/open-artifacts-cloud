@@ -6,6 +6,7 @@ import {
 } from "@oa/provisioning-contract";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Principal } from "../src/principal.js";
+import { checkR26HookKeyOnly } from "../src/routes/writes.js";
 import { call } from "./call.js";
 import {
   db,
@@ -245,6 +246,41 @@ describe("reach: rl-agents with test hooks, nothing else", () => {
       (await call(e, RL, "R26", { params: { id: s.rlA.id }, body: mint() }))
         .status,
     ).toBe(202);
+  });
+
+  it("R26 hookKeyOnly guard: refused for redline/test-member/unknown and required for test-install", async () => {
+    for (const wf of ["redline", "test-member", undefined]) {
+      expect(checkR26HookKeyOnly({ revoke: false }, wf)).toBeNull();
+      expect(checkR26HookKeyOnly({ revoke: true }, wf)).toBeNull();
+      expect(
+        checkR26HookKeyOnly({ revoke: false, hookKeyOnly: true }, wf),
+      ).toEqual({ field: "hookKeyOnly", code: "forbidden" });
+    }
+    expect(
+      checkR26HookKeyOnly({ revoke: false, hookKeyOnly: true }, "test-install"),
+    ).toBeNull();
+    expect(checkR26HookKeyOnly({ revoke: false }, "test-install")).toEqual({
+      field: "hookKeyOnly",
+      code: "forbidden",
+    });
+    expect(checkR26HookKeyOnly({ revoke: true }, "test-install")).toEqual({
+      field: "revoke",
+      code: "forbidden",
+    });
+
+    const e = fakeEnv();
+    const s = await seed();
+    for (const [p, id] of [
+      [TM, s.agents.id],
+      [RL, s.rlA.id],
+    ] as const) {
+      const r = await call(e, p, "R26", {
+        params: { id },
+        body: { ...mint(), hookKeyOnly: true },
+      });
+      expect(r.status).toBeGreaterThanOrEqual(400);
+    }
+    expect(e.manageInstall.created).toHaveLength(0);
   });
 });
 
