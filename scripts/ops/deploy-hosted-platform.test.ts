@@ -1636,13 +1636,14 @@ describe("deploy-hosted-platform.sh", () => {
       vars: Record<string, string> = {},
     ) => {
       const p = env[0] as "s" | "p";
-      // A config that does not declare BILLING is an older tag: its Worker
-      // is deployed without the binding (#1568).
+      // Historical scheduler configs predate these bindings.
       const live = JSON.parse(next);
-      if (!/"BILLING"/.test(config))
-        live.result.bindings = live.result.bindings.filter(
-          (b: { name: string }) => b.name !== "BILLING",
-        );
+      for (const name of ["BILLING", "JOB_WAIT"]) {
+        if (!config.includes(JSON.stringify(name)))
+          live.result.bindings = live.result.bindings.filter(
+            (b: { name: string }) => b.name !== name,
+          );
+      }
       const s = setup({
         exists: SCHED_DEPS(p),
         next: { [`oa-${p}-scheduler`]: JSON.stringify(live) },
