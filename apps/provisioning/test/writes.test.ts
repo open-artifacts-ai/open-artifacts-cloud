@@ -4,7 +4,7 @@ import {
   fakeProvisionerRpc,
 } from "@oa/provisioning-contract/fakes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isTokenTestHooksSlug } from "../src/facts.js";
+import { isTokenTestHooksSlug, tokenTestHooksAllowlist } from "../src/facts.js";
 import type { Principal } from "../src/principal.js";
 import { call, type HTTP } from "./call.js";
 import {
@@ -500,19 +500,49 @@ describe("R4 create by a token and by OIDC", () => {
         .code,
     ).toBe("forbidden");
     // Cloud #84: ordinary staging slugs and rl-* slugs never pass admin-token
-    // testHooks admission; t-* and bus test slugs (e.g. bus1299-b) are eligible.
+    // testHooks admission; t-*, bus test slugs (e.g. bus1299-b) and exact
+    // staging STAGING_BUS_SLUGS entries (e.g. m2-walk) are eligible.
+    const busList = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    const allowlist = tokenTestHooksAllowlist({
+      OA_ENV: "staging",
+      STAGING_BUS_SLUGS: busList,
+    });
+    expect(allowlist).toEqual([
+      "rl-agents",
+      "bus1299-b",
+      "m2-walk",
+      "rl-busa",
+      "rl-busb",
+    ]);
+    expect(
+      tokenTestHooksAllowlist({ OA_ENV: "prod", STAGING_BUS_SLUGS: busList }),
+    ).toEqual([]);
     for (const slug of ["t-smoke", "t-rehearsal", "bus1299-b", "bus-smoke"])
       expect(isTokenTestHooksSlug(slug), slug).toBe(true);
+    expect(isTokenTestHooksSlug("m2-walk")).toBe(false);
+    expect(isTokenTestHooksSlug("m2-walk", allowlist)).toBe(true);
     for (const slug of ["acme", "business", "bus", "busy", "rl-smoke", "t"])
-      expect(isTokenTestHooksSlug(slug), slug).toBe(false);
-    expect(isTokenTestHooksSlug("m2-walk", ["m2-walk"])).toBe(true);
-    expect(isTokenTestHooksSlug("rl-agents", ["rl-agents"])).toBe(false);
-    for (const slug of ["acme", "business", "bus", "rl-smoke"]) {
-      const refused = await call(e, WRITE, "R4", {
+      expect(isTokenTestHooksSlug(slug, allowlist), slug).toBe(false);
+    expect(isTokenTestHooksSlug("rl-agents", allowlist)).toBe(false);
+    const eWithList = fakeEnv({ STAGING_BUS_SLUGS: busList });
+    for (const slug of ["acme", "business", "bus", "rl-agents", "rl-smoke"]) {
+      const refused = await call(eWithList, WRITE, "R4", {
         body: { ...body, requestId: requestId(), slug, testHooks: true },
       });
       expect(refused.code, slug).toBe("forbidden");
     }
+    expect(
+      (
+        await call(e, WRITE, "R4", {
+          body: {
+            ...body,
+            requestId: requestId(),
+            slug: "m2-walk",
+            testHooks: true,
+          },
+        })
+      ).code,
+    ).toBe("forbidden");
     expect(
       await row<{ n: number }>(
         "SELECT COUNT(*) AS n FROM jobs WHERE kind = 'create'",

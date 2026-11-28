@@ -29,6 +29,7 @@ import {
   releaseGate as gate,
   NAMESPACES,
   names,
+  parseBusSlugs,
   type R2CatalogBucket,
   r2BindingReleaseReader,
   settleFailedStatements,
@@ -339,9 +340,12 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
   const slug = checkSlug(s.slug);
   const testHooks = s.test_hooks === 1;
   // Test hooks belong to staging admin-created installs (OIDC, admin, and
-  // token creates for test-install slugs: t-* and bus test fixtures such as
-  // bus1299-b; separately submitted token retries and ordinary staging slugs
-  // stay refused, cloud #84).
+  // token creates for test-install slugs: t-*, bus test fixtures such as
+  // bus1299-b, or exact staging entries in STAGING_BUS_SLUGS such as m2-walk;
+  // rl-* stays reserved, and separately submitted token retries and ordinary
+  // staging slugs stay refused, cloud #84).
+  const tokenTestHookSlugs =
+    env === "staging" ? parseBusSlugs(ctx.env.STAGING_BUS_SLUGS) : [];
   if (
     testHooks &&
     (env !== "staging" ||
@@ -350,7 +354,8 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
       (job.actor_kind === "token" &&
         (kind !== "create" ||
           slug.startsWith("rl-") ||
-          !/^(?:t-|bus(?:-|\d))/.test(slug))))
+          (!/^(?:t-|bus(?:-|\d))/.test(slug) &&
+            !tokenTestHookSlugs.includes(slug)))))
   )
     throw refused("test hooks are not allowed for this principal");
   checkOidcScope(job, env, { slug, testHooks });

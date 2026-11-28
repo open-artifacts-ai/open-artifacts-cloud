@@ -496,7 +496,8 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
   });
 
   it("creates and resumes a staging test-hooks install for an admin token, but refuses a separate token retry", async () => {
-    for (const slug of ["t-token", "bus1299-b"]) {
+    w.ctx.env.STAGING_BUS_SLUGS = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    for (const slug of ["t-token", "bus1299-b", "m2-walk"]) {
       const seed = seedCreate(w, {
         slug,
         actor: "token",
@@ -553,12 +554,23 @@ VALUES (?, 'retry', 'provision_install', ?, ?, 'token', ?, 'token', ?, ?, 'h', '
   });
 
   it("refuses a token test-hooks job on prod or on an ordinary staging slug before provisioning", async () => {
-    for (const slug of ["acme", "business", "bus", "busy", "rl-tok"])
+    await refusedWith(
+      seedCreate(w, { slug: "m2-walk", actor: "token", testHooks: true }),
+    );
+    w.ctx.env.STAGING_BUS_SLUGS = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    for (const slug of [
+      "acme",
+      "business",
+      "bus",
+      "busy",
+      "rl-agents",
+      "rl-tok",
+    ])
       await refusedWith(
         seedCreate(w, { slug, actor: "token", testHooks: true }),
       );
     w.ctx.env.OA_ENV = "prod";
-    for (const slug of ["t-prod", "bus1299-b"])
+    for (const slug of ["t-prod", "bus1299-b", "m2-walk"])
       await refusedWith(
         seedCreate(w, { slug, actor: "token", testHooks: true }),
       );
