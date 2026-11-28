@@ -37,6 +37,7 @@ import {
 } from "@oa/provisioning-contract";
 import { TEST_HOOK_REFUSALS, type TestHookRefusal } from "@oa/shared";
 import { failingAt, tagFail } from "./errors.js";
+import { jobChanged } from "./job-wait.js";
 import type { ManageJob } from "./manage.js";
 import { cfFor, installRow, provisionerWith, storedVars } from "./ops.js";
 import { deployEnv, transient } from "./provisioner.js";
@@ -471,5 +472,7 @@ async function storeSealed(
         .run(),
     );
   });
-  return (r.meta.changes ?? 0) > 0;
+  if ((r.meta.changes ?? 0) === 0) return false;
+  await jobChanged(ctx.env, jobId);
+  return true;
 }

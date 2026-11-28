@@ -61,6 +61,7 @@ import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import type { Condition } from "./conditions.js";
 import { bound, d1, type ProvapiEnv, within } from "./env.js";
 import { type HealthProbe, publicRouteProbe } from "./health.js";
+import { type JobWaitNamespace, jobsChanged } from "./job-wait.js";
 import { insertSystemJob, startJob } from "./jobs.js";
 import { dutyCategory } from "./run.js";
 import {
@@ -324,7 +325,8 @@ const OWE_EMAIL =
 // A started instance stops at its recheck (checkJob: the job is failed), so
 // no terminate. Queued only: one already running finishes.
 const CANCEL_QUEUED = `UPDATE jobs AS j SET status = 'failed', error_code = 'canceled', error_message = 'the fleet rollout of this version halted', finished_at = ?2, updated_at = ?2
-WHERE ${FLEET_UP} AND j.status = 'queued' AND json_extract(j.args, '$.to') = ?1`;
+WHERE ${FLEET_UP} AND j.status = 'queued' AND json_extract(j.args, '$.to') = ?1
+RETURNING id`;
 
 interface CanaryRow {
   install_id: string;
@@ -355,11 +357,16 @@ interface StateRow {
 interface FleetState {
   rows: Map<string, StateRow>;
   behind: Map<string, number>;
+  /** JobWait (cloud #264): the halt's canceled jobs are pushed to it. */
+  jobWait?: JobWaitNamespace;
 }
 
-async function fleetState(db: D1Database): Promise<FleetState> {
+async function fleetState(
+  db: D1Database,
+  jobWait?: JobWaitNamespace,
+): Promise<FleetState> {
   const { results } = await d1(db.prepare(STATE).all<StateRow>());
-  const s: FleetState = { rows: new Map(), behind: new Map() };
+  const s: FleetState = { rows: new Map(), behind: new Map(), jobWait };
   for (const r of results) {
     s.rows.set(r.key, r);
     if (r.key.startsWith(FLEET_BEHIND_PREFIX))
@@ -464,7 +471,7 @@ async function halt(
   id: string,
 ): Promise<void> {
   const key = haltKey(version, id);
-  await d1(
+  const r = await d1(
     db.batch([
       db.prepare(AUDIT).bind(now, id, JSON.stringify({ version }), key),
       db
@@ -474,6 +481,13 @@ async function halt(
       db.prepare(CANCEL_QUEUED).bind(version, now),
     ]),
   );
+  // The canceled jobs ended here: their held R15 reads answer (cloud #264).
+  const canceled = (
+    (r as D1Result<{ id?: unknown }>[] | undefined)?.[3]?.results ?? []
+  )
+    .map((x) => x.id)
+    .filter((x): x is string => typeof x === "string");
+  await jobsChanged(st.jobWait, canceled);
   if (!st.rows.has(key)) st.rows.set(key, { key, value: now, updated_at: now });
   console.log("provapi fleet halted_by", id, version);
 }
@@ -634,7 +648,7 @@ async function onePass(
   const ms = o.timeoutMs ?? FLEET_PROBE_TIMEOUT_MS;
   const target = fleetTarget(env.CF_VERSION_METADATA);
   const canaryId = fleetCanary(env.FLEET_CANARY);
-  const st = await fleetState(db);
+  const st = await fleetState(db, env.JOB_WAIT);
 
   await haltFailedJobs(db, now, st, canaryId);
   await prune(db, now, st, target);

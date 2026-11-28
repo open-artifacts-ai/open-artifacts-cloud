@@ -93,6 +93,17 @@
           "script_name": "oa-s-provisioner"
         }
       ],
+      // JobWait on oa-s-provisioner (cloud #264): R15's held read
+      // (?wait=) waits on the job's object, and a job's end releases it.
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JOB_WAIT",
+            "class_name": "JobWait",
+            "script_name": "oa-s-provisioner"
+          }
+        ]
+      },
       // The platform's own release: what an upgrade or create defaults to.
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       // The approval email (#2096): the provisioner's sender, no fixed destination.

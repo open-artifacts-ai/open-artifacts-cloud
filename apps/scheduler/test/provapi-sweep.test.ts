@@ -313,6 +313,42 @@ describe("sweep: dead runs", () => {
       ]);
     });
 
+  // cloud #264: the job ended here, so R15's held reads of it answer.
+  it("a dead run's settle is pushed to JobWait; not settled, nothing; a failing push changes nothing", async () => {
+    const f = fakes();
+    const pushed: string[] = [];
+    const ns = (fail = false) => ({
+      idFromName: (x: string) => x as unknown as DurableObjectId,
+      get: (id: DurableObjectId) => ({
+        changed: async () => {
+          if (fail) throw new Error("do reset");
+          pushed.push(id as unknown as string);
+          return 1;
+        },
+      }),
+    });
+    f.env.JOB_WAIT = ns();
+    const { id } = await started(f, "complete");
+    captureLogs(vi.spyOn);
+    await run(f.env);
+    expect(settled).toEqual([{ jobId: id, code: RUN_DEAD }]);
+    expect(pushed).toEqual([id]);
+    // The next tick finds it settled: no second push.
+    await run(f.env);
+    expect(pushed).toEqual([id]);
+    vi.restoreAllMocks();
+    const g = fakes();
+    g.env.JOB_WAIT = ns(true);
+    const down = await started(g, "complete");
+    const lines = captureLogs(vi.spyOn);
+    await run(g.env);
+    expect(settled.at(-1)).toEqual({ jobId: down.id, code: RUN_DEAD });
+    expect((await cleanups()).some((c) => c.parent_job_id === down.id)).toBe(
+      true,
+    );
+    expect(lines).toContain(`provapi job_changed failed ${down.id}`);
+  });
+
   it("an open job already holding a code (a cancel that died before its settle and cleanup): settled, the code kept, one cleanup, started once", async () => {
     const f = fakes();
     const { id } = await started(f, "complete", { error_code: "canceled" });

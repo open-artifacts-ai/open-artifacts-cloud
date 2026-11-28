@@ -1298,6 +1298,17 @@ describe("halts", () => {
       finished_at: null,
     });
     const f = fakes({ canary, answers: new Map([[id, "down"]]) });
+    // cloud #264: each canceled job's end is pushed to JobWait.
+    const pushed: string[] = [];
+    f.env.JOB_WAIT = {
+      idFromName: (x: string) => x as unknown as DurableObjectId,
+      get: (x: DurableObjectId) => ({
+        changed: async () => {
+          pushed.push(x as unknown as string);
+          return 1;
+        },
+      }),
+    };
     await ticks(f, NOW, NOW + 2 * MIN);
     const byId = new Map((await fleetJobs()).map((j) => [j.id, j]));
     expect(byId.get(queuedJob)).toMatchObject({
@@ -1306,6 +1317,7 @@ describe("halts", () => {
       finished_at: NOW + 2 * MIN,
     });
     expect(byId.get(running)).toMatchObject({ status: "running" });
+    expect(pushed).toEqual([queuedJob]);
     // The cancel itself isn't a second halt.
     expect(await marks()).toEqual([`fleet_halt:${TARGET}:${id}`]);
   });

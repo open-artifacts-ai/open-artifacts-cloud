@@ -21,6 +21,7 @@ import {
   stepError,
   storedMessage,
 } from "./errors.js";
+import { type JobWait, jobChanged } from "./job-wait.js";
 import { type ProvisionerIo, Transient, transient } from "./provisioner.js";
 // A cycle (workflow imports steps): called only at run time, never at load.
 import { ownerEmail } from "./workflow.js";
@@ -47,8 +48,17 @@ export type JobRow = {
   started_at: number | null;
 };
 
-/** What a step function reads: the platform D1 and the clock. */
-export type StepCtx = { env: { PLATFORM_DB: D1Database }; io: ProvisionerIo };
+/**
+ * What a step function reads: the platform D1 and the clock, and JobWait
+ * (cloud #264) to push a recorded failure to R15's held reads.
+ */
+export type StepCtx = {
+  env: {
+    PLATFORM_DB: D1Database;
+    JOB_WAIT?: DurableObjectNamespace<JobWait>;
+  };
+  io: ProvisionerIo;
+};
 
 const JOB =
   "SELECT id, kind, workflow, install_id, signup_id, parent_job_id, actor_kind, actor_key, token_id, request_id, args, status, step, attempt, last_error_code, error_code, started_at FROM jobs WHERE id = ?";
@@ -173,6 +183,9 @@ WHERE id = ?1 AND status = 'running'`,
     .bind(jobId, fail?.at ?? null, fail?.status ?? null, fail?.reason ?? null)
     .run()
     .catch(() => {});
+  // The attempt's code is on the row now: R15's held reads answer with it
+  // (a waiter for a state before the end, such as P53's lease_held).
+  await jobChanged(ctx.env, jobId);
 }
 
 /** Every key and scalar value under `v` (a parsed JSON request field). */

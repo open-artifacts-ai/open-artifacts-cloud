@@ -38,6 +38,7 @@ import {
 import type { Principal } from "../principal.js";
 import { platformRelease, releases, tokenStatus } from "../services/cache.js";
 import { ipKeyOf } from "../services/counters.js";
+import { holdJob } from "../services/job-wait.js";
 import { redactAuditEntry } from "../services/pii.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
@@ -216,11 +217,39 @@ export async function listJobs(a: HandlerArgs): Promise<RouteResult> {
 export async function getJob(a: HandlerArgs): Promise<RouteResult> {
   const { jobId } = a.input.params as { jobId: string };
   const p = a.principal;
-  const row = await loadJob(a.env, jobId);
-  if (!row) throw new ApiError("not_found");
-  const install = await loadStatus(a.env, row.install_id);
-  if (a.reach === "own" && !(install && inReach(install, p, a.reach)))
-    throw new ApiError("not_found");
+  const read = async () => {
+    const row = await loadJob(a.env, jobId);
+    if (!row) throw new ApiError("not_found");
+    if (a.reach === "own") {
+      const install = await loadStatus(a.env, row.install_id);
+      if (!install || !inReach(install, p, a.reach))
+        throw new ApiError("not_found");
+    }
+    return row;
+  };
+  let row = await read();
+  // ?wait= (cloud #264): an open job's read is held, only once the caller
+  // may read it, until the job changes (its end, a failed attempt, its
+  // sealed result) or the wait runs out; then the job is read again and
+  // answered as it is.
+  const wait = (q(a).wait as number | undefined) ?? 0;
+  if (wait > 0 && (row.status === "queued" || row.status === "running")) {
+    try {
+      await holdJob(a.env, jobId, wait, row.updated_at);
+    } catch {
+      return {
+        status: 503,
+        headers: { "Retry-After": "3" },
+        body: {
+          error: {
+            code: "job_wait_unavailable",
+            message: "Job wait temporarily unavailable",
+          },
+        },
+      };
+    }
+    row = await read();
+  }
   let sealed: string | null = null;
   if (
     p.kind === "oidc" &&
