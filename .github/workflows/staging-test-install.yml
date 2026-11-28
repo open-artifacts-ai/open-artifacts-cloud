@@ -126,16 +126,17 @@ jobs:
 
           JOB_SEALED=""
           wait_job() {
-            local job_id="$1" proof="${2:-}" status="" s=""
+            # Matches staging-test-member.yml's R15 wait; cloud #504 (held R15 read) replaces it later for everyone.
+            local job_id="$1" proof="${2:-}" status="" s="" i
             JOB_SEALED=""
-            for _ in $(seq 1 110); do
-              sleep 10
+            for i in $(seq 1 111); do
               api_req r15 GET "/v1/jobs/$job_id" "" "$proof"
               [ "$HTTP_STATUS" = 200 ] || { echo "R15 $job_id failed: HTTP $HTTP_STATUS $(err_code r15)"; exit 1; }
               s="$(jq -r '.sealed // empty' "$d/r15")"
               [ -z "$s" ] || JOB_SEALED="$s"
               status="$(jq -r '.status // empty' "$d/r15")"
               case "$status" in "done" | "failed") break ;; esac
+              [ "$i" -lt 111 ] && sleep 10
             done
             [ "$status" = "done" ] || { echo "job $job_id: $status $(jq -r '.error.code // empty' "$d/r15")"; exit 1; }
           }

@@ -184,18 +184,20 @@ export type FixtureOwnerKey = {
   privateKeyPkcs8: string;
 };
 
-// The receipt comes from this fixture's successful create. Use its immutable
-// install ID and owner keypair for cleanup, including retries after a soft delete.
+// The receipt is written before dispatch and updated as IDs and purge state
+// become known so interrupted create/mint/watch/log/cleanup steps remain recoverable.
 export type FixtureReceipt = {
   slug: string;
-  installId: string;
-  repositoryId: string;
+  installId: string | null;
+  repositoryId: string | null;
+  runId?: string | null;
   requestId: string;
   ownerKey: FixtureOwnerKey;
   host?: string;
   version?: string;
   createdAt?: number;
   bus?: FixtureBusInfo;
+  remotePurged?: boolean;
 };
 
 export function generateOwnerKey(): FixtureOwnerKey {
@@ -257,7 +259,7 @@ type CleanupClient = {
 };
 
 export async function cleanupFixture(
-  receipt: Pick<FixtureReceipt, "slug" | "installId" | "requestId">,
+  receipt: { slug: string; installId: string; requestId: string },
   client: CleanupClient,
 ): Promise<void> {
   const { slug, installId, requestId } = receipt;
@@ -305,17 +307,37 @@ export async function cleanupFixture(
   await finish("purge", target);
 }
 
+const ANSI_CSI_RE = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`,
+  "g",
+);
+const stripAnsi = (s: string) => s.replace(ANSI_CSI_RE, "");
+
 function markerValue(
   log: string,
   marker: string,
   value: string,
 ): string | null {
+  const clean = stripAnsi(log);
   const re = new RegExp(
     `(?:^|\\s)test-install-${marker}: (${value})(?=\\s|$)`,
     "gm",
   );
-  const found = new Set(Array.from(log.matchAll(re), (m) => m[1]));
+  const found = new Set(Array.from(clean.matchAll(re), (m) => m[1]));
   return found.size === 1 ? [...found][0] : null;
+}
+
+export type PartialCreateLog = {
+  installId: string | null;
+  repositoryId: string | null;
+};
+
+/** Early markers printed immediately after R4 202, before job waits or R26. */
+export function parsePartialCreateLog(log: string): PartialCreateLog {
+  return {
+    installId: markerValue(log, "id", "i[a-z0-9]{11}"),
+    repositoryId: markerValue(log, "repo-id", "[0-9]{1,32}"),
+  };
 }
 
 export type CreateLog = {
@@ -447,13 +469,75 @@ export type BusRunner = {
   approveBus: typeof approveFixtureBusInBrowser;
 };
 
+function dockerErrorText(error: unknown): string {
+  if (error && typeof error === "object") {
+    const e = error as { stderr?: unknown; message?: unknown };
+    const parts = [
+      typeof e.stderr === "string" ? e.stderr.trim() : "",
+      typeof e.message === "string" ? e.message.trim() : "",
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(": ");
+  }
+  return String(error);
+}
+
+function isDockerNotFound(
+  error: unknown,
+  kind: "container" | "volume",
+): boolean {
+  const text = dockerErrorText(error);
+  return kind === "container"
+    ? /no such container/i.test(text)
+    : /no such volume/i.test(text);
+}
+
+/**
+ * Extracts the XXXX-XXXX approval code from `oa-bus login --no-open` stdout,
+ * requiring the exact fixture approval URL `<origin>/bus/approve`. Supports
+ * both the released multi-line boxed transcript (UTF-8 or ASCII, with or
+ * without ANSI escapes) and the plain single-line login fallback.
+ */
+export function parseBusLoginApproval(
+  output: string,
+  origin: string,
+): string | null {
+  const clean = stripAnsi(output);
+  const approveUrl = `${origin}/bus/approve`;
+  const legacy = new RegExp(
+    `Open ${escapeRegExp(approveUrl)} and type this code to approve this machine: ([A-Z0-9]{4}-[A-Z0-9]{4})(?=\\s|$)`,
+  ).exec(clean);
+  if (legacy?.[1]) return legacy[1];
+  const urlMatch = new RegExp(
+    `(?:^|\\s)${escapeRegExp(approveUrl)}(?=\\s|$)`,
+    "m",
+  ).exec(clean);
+  if (!urlMatch) return null;
+  const afterUrl = clean.slice(urlMatch.index + urlMatch[0].length);
+  const boxMatch = /[|│]\s+([A-Z0-9]{4}-[A-Z0-9]{4})\s+[|│]/.exec(afterUrl);
+  return boxMatch?.[1] ?? null;
+}
+
 export async function stopFixtureBus(
   slug: string,
   docker: (...args: string[]) => Promise<string>,
 ): Promise<void> {
   const { container, volume } = busNames(slug);
-  await docker("rm", "-f", container).catch(() => "");
-  await docker("volume", "rm", "-f", volume).catch(() => "");
+  try {
+    await docker("rm", "-f", container);
+  } catch (e) {
+    if (!isDockerNotFound(e, "container"))
+      throw new Error(
+        `failed to remove Docker container ${container}: ${dockerErrorText(e)}`,
+      );
+  }
+  try {
+    await docker("volume", "rm", "-f", volume);
+  } catch (e) {
+    if (!isDockerNotFound(e, "volume"))
+      throw new Error(
+        `failed to remove Docker volume ${volume}: ${dockerErrorText(e)}`,
+      );
+  }
 }
 
 export async function startFixtureBus(
@@ -494,9 +578,6 @@ export async function startFixtureBus(
   await runner.docker("volume", "create", volume);
 
   try {
-    const codeRe = new RegExp(
-      `Open ${escapeRegExp(origin)}/bus/approve and type this code to approve this machine: ([A-Z0-9]{4}-[A-Z0-9]{4})`,
-    );
     await new Promise<void>((resolve, reject) => {
       const child = runner.spawnDocker([
         "run",
@@ -506,6 +587,7 @@ export async function startFixtureBus(
         image,
         "oa-bus",
         "login",
+        "--no-color",
         "--instance",
         origin,
         "--no-open",
@@ -526,15 +608,15 @@ export async function startFixtureBus(
       child.stdout?.on("data", (chunk: Buffer | string) => {
         out += chunk.toString();
         if (approvalStarted) return;
-        const m = codeRe.exec(out);
-        if (!m?.[1]) return;
+        const code = parseBusLoginApproval(out, origin);
+        if (!code) return;
         approvalStarted = true;
         approvalPromise = runner
           .approveBus(
             opts.slug,
             opts.installId,
             opts.hookKey,
-            m[1],
+            code,
             opts.fetcher,
             opts.launch,
           )
@@ -629,7 +711,18 @@ export async function startFixtureBus(
 
     return { container, volume, image, version: pin.version };
   } catch (e) {
-    await stopFixtureBus(opts.slug, runner.docker);
+    let cleanupErr: unknown;
+    try {
+      await stopFixtureBus(opts.slug, runner.docker);
+    } catch (ce) {
+      cleanupErr = ce;
+    }
+    if (cleanupErr) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const cmsg =
+        cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      throw new Error(`${msg} (bus cleanup also failed: ${cmsg})`);
+    }
     throw e;
   }
 }
@@ -645,12 +738,29 @@ function readReceipt(dir: string, slug: string): FixtureReceipt | null {
   const parsed = JSON.parse(
     readFileSync(file, "utf8"),
   ) as Partial<FixtureReceipt>;
+  const validInstallId =
+    parsed.installId === null ||
+    (typeof parsed.installId === "string" &&
+      INSTALL_ID_RE.test(parsed.installId));
+  const validRepoId =
+    parsed.repositoryId === null ||
+    (typeof parsed.repositoryId === "string" &&
+      /^\d{1,32}$/.test(parsed.repositoryId));
+  const validRunId =
+    parsed.runId === undefined ||
+    parsed.runId === null ||
+    (typeof parsed.runId === "string" && /^\d+$/.test(parsed.runId));
+  const validRemotePurged =
+    parsed.remotePurged === undefined ||
+    typeof parsed.remotePurged === "boolean";
   if (
     parsed.slug !== slug ||
-    typeof parsed.installId !== "string" ||
-    !INSTALL_ID_RE.test(parsed.installId) ||
-    typeof parsed.repositoryId !== "string" ||
-    !/^\d{1,32}$/.test(parsed.repositoryId) ||
+    !validInstallId ||
+    !validRepoId ||
+    !validRunId ||
+    !validRemotePurged ||
+    typeof parsed.requestId !== "string" ||
+    parsed.requestId === "" ||
     typeof parsed.ownerKey?.publicKey !== "string" ||
     typeof parsed.ownerKey?.privateKeyPkcs8 !== "string"
   )
@@ -685,10 +795,10 @@ export type Deps = {
   launch?: () => Promise<FixtureBrowser>;
 };
 
-async function dispatchAndWait(
+async function dispatchWorkflow(
   d: Deps,
   fields: Record<string, string>,
-): Promise<{ id: string; log: string }> {
+): Promise<string> {
   const id = (
     await d.gh(
       "api",
@@ -709,6 +819,14 @@ async function dispatchAndWait(
   ).trim();
   if (!/^\d+$/.test(id))
     throw new Error("the dispatched run's id is not a number");
+  return id;
+}
+
+async function dispatchAndWait(
+  d: Deps,
+  fields: Record<string, string>,
+): Promise<{ id: string; log: string }> {
+  const id = await dispatchWorkflow(d, fields);
   await d.gh("run", "watch", id, "-R", REPO, "--exit-status");
   return { id, log: await d.gh("run", "view", id, "-R", REPO, "--log") };
 }
@@ -733,43 +851,115 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
       throw new Error(
         `no saved receipt with owner key for ${req.slug}; cannot sign authenticated cleanup proof`,
       );
-    if (req.installId && saved.installId !== req.installId)
+    let receipt: FixtureReceipt = saved;
+    if (
+      req.installId &&
+      receipt.installId &&
+      receipt.installId !== req.installId
+    )
       throw new Error(
-        `--install-id ${req.installId} does not match saved receipt ${saved.installId} for ${req.slug}`,
+        `--install-id ${req.installId} does not match saved receipt ${receipt.installId} for ${req.slug}`,
       );
-    const installId = saved.installId;
-    const deleteProof = signOwnerDeleteProof(saved.ownerKey.privateKeyPkcs8, {
-      repositoryId: saved.repositoryId,
-      installId,
-      expiresAt: d.now() + DELETE_PROOF_TTL_MS,
-    });
+    let deleteRunId: string | undefined;
+    if (!receipt.remotePurged) {
+      let installId = receipt.installId;
+      let repositoryId = receipt.repositoryId;
+      if ((!installId || !repositoryId) && receipt.runId) {
+        const createLog = await d.gh(
+          "run",
+          "view",
+          receipt.runId,
+          "-R",
+          REPO,
+          "--log",
+        );
+        const recovered = parsePartialCreateLog(createLog);
+        installId = installId ?? recovered.installId;
+        repositoryId = repositoryId ?? recovered.repositoryId;
+      }
+      if (!installId && req.installId) installId = req.installId;
+      if (installId && !repositoryId) {
+        const fetchedRepoId = (
+          await d.gh("api", `repos/${REPO}`, "--jq", ".id")
+        ).trim();
+        if (/^\d{1,32}$/.test(fetchedRepoId)) repositoryId = fetchedRepoId;
+      }
+      if (!installId || !repositoryId)
+        throw new Error(
+          `cannot recover install ID for ${req.slug} from create run ${receipt.runId ?? "unknown"}; wait for the run log or pass --install-id <id>`,
+        );
+      if (
+        installId !== receipt.installId ||
+        repositoryId !== receipt.repositoryId
+      ) {
+        receipt = { ...receipt, installId, repositoryId };
+        writeReceipt(receiptDir, receipt);
+      }
+      if (req.installId && installId !== req.installId)
+        throw new Error(
+          `--install-id ${req.installId} does not match saved receipt ${installId} for ${req.slug}`,
+        );
+      const deleteProof = signOwnerDeleteProof(
+        receipt.ownerKey.privateKeyPkcs8,
+        {
+          repositoryId,
+          installId,
+          expiresAt: d.now() + DELETE_PROOF_TTL_MS,
+        },
+      );
+      const run = await dispatchAndWait(d, {
+        action: "delete",
+        slug: req.slug,
+        owner_key: receipt.ownerKey.publicKey,
+        install_id: installId,
+        delete_proof: deleteProof,
+        request_id: rid,
+      });
+      if (!parseDeleteLog(run.log, req.slug, installId))
+        throw new Error(`run ${run.id}: purge confirmation missing from log`);
+      deleteRunId = run.id;
+      // Record remote purge before local Docker cleanup so a volume/container
+      // removal error retains state for retrying local cleanup without re-purging.
+      receipt = { ...receipt, remotePurged: true };
+      writeReceipt(receiptDir, receipt);
+    }
     await stopFixtureBus(req.slug, d.docker);
-    const run = await dispatchAndWait(d, {
-      action: "delete",
-      slug: req.slug,
-      owner_key: saved.ownerKey.publicKey,
-      install_id: installId,
-      delete_proof: deleteProof,
-      request_id: rid,
-    });
-    if (!parseDeleteLog(run.log, req.slug, installId))
-      throw new Error(`run ${run.id}: purge confirmation missing from log`);
     rmSync(receiptPath(receiptDir, req.slug), { force: true });
     d.log(
       JSON.stringify({
         deleted: req.slug,
         purged: true,
-        installId,
-        run: run.id,
+        installId: receipt.installId,
+        ...(deleteRunId ? { run: deleteRunId } : {}),
       }),
     );
     return 0;
   }
 
+  if (existsSync(receiptPath(receiptDir, req.slug)))
+    throw new Error(
+      `fixture receipt already exists for ${req.slug}; run --slug ${req.slug} --delete first`,
+    );
+
   const { privateKey, publicKey } = generateKeyPairSync("x25519");
   const pub = publicKey.export({ format: "jwk" }).x as string;
   const ownerKey = generateOwnerKey();
-  const run = await dispatchAndWait(d, {
+  // Save owner key BEFORE dispatch so an interrupted dispatch, watch, mint,
+  // or log read never strands a created staging fixture.
+  let receipt: FixtureReceipt = {
+    slug: req.slug,
+    installId: null,
+    repositoryId: null,
+    runId: null,
+    ownerKey,
+    host: req.host,
+    ...(req.version === undefined ? {} : { version: req.version }),
+    requestId: rid,
+    createdAt: d.now(),
+  };
+  writeReceipt(receiptDir, receipt);
+
+  const runId = await dispatchWorkflow(d, {
     action: "create",
     slug: req.slug,
     owner_key: ownerKey.publicKey,
@@ -777,23 +967,47 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
     request_id: rid,
     ...(req.version === undefined ? {} : { version: req.version }),
   });
-  const got = parseCreateLog(run.log, req.slug);
+  receipt = { ...receipt, runId };
+  writeReceipt(receiptDir, receipt);
+
+  let watchErr: unknown;
+  try {
+    await d.gh("run", "watch", runId, "-R", REPO, "--exit-status");
+  } catch (e) {
+    watchErr = e;
+  }
+
+  let log = "";
+  try {
+    log = await d.gh("run", "view", runId, "-R", REPO, "--log");
+  } catch (logErr) {
+    if (watchErr) throw watchErr;
+    throw logErr;
+  }
+  const partial = parsePartialCreateLog(log);
+  if (partial.installId || partial.repositoryId) {
+    receipt = {
+      ...receipt,
+      installId: partial.installId ?? receipt.installId,
+      repositoryId: partial.repositoryId ?? receipt.repositoryId,
+    };
+    writeReceipt(receiptDir, receipt);
+  }
+  if (watchErr) throw watchErr;
+
+  const got = parseCreateLog(log, req.slug);
   if (!got)
-    throw new Error(`run ${run.id}: fixture create output missing from log`);
+    throw new Error(`run ${runId}: fixture create output missing from log`);
   const hookKey = hookKeyOnlyOf(
     openSealedNode(privateKey, got.sealed, SEAL_INFO),
   );
-  // Save receipt before browser/bus steps so a partial failure can still be
-  // cleaned up with --delete without losing the immutable install ID or owner key.
-  const receipt: FixtureReceipt = {
+  receipt = {
+    ...receipt,
     slug: got.slug,
     installId: got.installId,
     repositoryId: got.repositoryId,
-    ownerKey,
     host: got.host,
     version: got.version,
-    requestId: rid,
-    createdAt: d.now(),
   };
   writeReceipt(receiptDir, receipt);
 
@@ -830,7 +1044,7 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
       installId: got.installId,
       host: got.host,
       version: got.version,
-      run: run.id,
+      run: runId,
       sealedHookKey: got.sealed,
       storageState,
       ...(bus ? { bus } : {}),

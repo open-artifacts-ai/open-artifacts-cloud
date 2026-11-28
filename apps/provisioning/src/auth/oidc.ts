@@ -53,9 +53,10 @@ export const TEST_MEMBER_WORKFLOW_REF =
 
 /**
  * The pinned staging workflow for disposable test installs (TEST_INSTALL in
- * authz). Its JWT may create a `t-` test-hooks fixture and, when bound via
- * `x-oa-fixture-install-id`, read it, rotate its hook key (`hookKeyOnly`),
- * soft-delete and purge that exact install only. Never a test user.
+ * authz). Its JWT carries `x-oa-fixture-owner-key` (raw 32-byte Ed25519
+ * public key); create runs bind ownership to GitHub's signed `run_id` + owner
+ * key hash, and later cleanup runs carry a signed `x-oa-fixture-delete-proof`
+ * to read, soft-delete and purge that exact install only. Never a test user.
  */
 export const TEST_INSTALL_WORKFLOW_REF =
   "open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-install.yml@refs/heads/main";

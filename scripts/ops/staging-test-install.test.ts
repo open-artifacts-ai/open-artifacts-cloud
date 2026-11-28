@@ -31,10 +31,13 @@ import {
   HELP,
   hookKeyOnlyOf,
   main,
+  parseBusLoginApproval,
   parseCreateLog,
   parseDeleteLog,
+  parsePartialCreateLog,
   SEAL_INFO,
   startFixtureBus,
+  stopFixtureBus,
   WORKFLOW,
 } from "./staging-test-install.ts";
 
@@ -112,6 +115,106 @@ describe("staging-test-install.yml", () => {
     expect(run).toContain("x-oa-fixture-owner-key");
     expect(run).toContain("x-oa-fixture-delete-proof");
     expect(run).not.toContain("x-oa-fixture-install-id");
+    expect(run).toContain("#504");
+  });
+
+  it("reads R15 immediately with zero sleeps when jobs are already complete", () => {
+    const bin = mkdtempSync(join(tmpdir(), "oa-ti-nosleep-"));
+    try {
+      const pauseLog = join(bin, "pauses");
+      writeFileSync(
+        join(bin, "sleep"),
+        `#!/bin/sh\necho "$1" >> "${pauseLog}"\nexit 0\n`,
+      );
+      chmodSync(join(bin, "sleep"), 0o755);
+      // Fake curl handles OIDC token fetch + R4/R15/R3/R26/R15 with instant done jobs.
+      writeFileSync(
+        join(bin, "curl"),
+        `#!/bin/bash
+out=""
+write_code=0
+url=""
+method="GET"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) write_code=1; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    -H|--data|-K) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [[ "$url" == *"fake.invalid"* ]]; then
+  printf '{"value":"fake-jwt"}'
+  exit 0
+fi
+case "$method $url" in
+  "POST https://api.open-artifacts-staging.app/v1/installs")
+    printf '{"job":{"id":"job-create-1","installId":"iabcdefgh234"}}' > "$out"
+    code=202
+    ;;
+  "GET https://api.open-artifacts-staging.app/v1/jobs/job-create-1")
+    printf '{"id":"job-create-1","status":"done"}' > "$out"
+    code=200
+    ;;
+  "GET https://api.open-artifacts-staging.app/v1/installs/iabcdefgh234")
+    printf '{"id":"iabcdefgh234","slug":"t-abc","appHost":"t-abc.open-artifacts-staging.app","testHooks":true,"state":"active","version":"0.272.1"}' > "$out"
+    code=200
+    ;;
+  "POST https://api.open-artifacts-staging.app/v1/installs/iabcdefgh234/redline-creds")
+    printf '{"job":{"id":"job-creds-1"}}' > "$out"
+    code=202
+    ;;
+  "GET https://api.open-artifacts-staging.app/v1/jobs/job-creds-1")
+    printf '{"id":"job-creds-1","status":"done","sealed":"oa-seal-v1.abc.def.ghi"}' > "$out"
+    code=200
+    ;;
+  *)
+    echo "unexpected $method $url" >&2
+    exit 99
+    ;;
+esac
+[ "$write_code" = 1 ] && printf '%s' "$code"
+`,
+      );
+      chmodSync(join(bin, "curl"), 0o755);
+      const res = spawnSync("bash", ["-c", run], {
+        env: {
+          PATH: `${bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`,
+          ACTIONS_ID_TOKEN_REQUEST_URL: "https://fake.invalid/?x=1",
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: "fake-request-token",
+          ...step.env,
+          REF: "refs/heads/main",
+          ACTION: "create",
+          SLUG: "t-abc",
+          VERSION: "",
+          OWNER_KEY: `${"B".repeat(42)}A`,
+          RECIPIENT_KEY: `${"A".repeat(42)}A`,
+          INSTALL_ID: "",
+          DELETE_PROOF: "",
+          REQUEST_ID: "",
+          REPOSITORY_ID: "4242",
+          RUN_ID: "1",
+          RUN_ATTEMPT: "1",
+        },
+        encoding: "utf8",
+      });
+      expect(res.status, res.stderr || res.stdout).toBe(0);
+      expect(existsSync(pauseLog)).toBe(false);
+      expect(parseCreateLog(res.stdout, "t-abc")).toEqual({
+        installId: "iabcdefgh234",
+        repositoryId: "4242",
+        slug: "t-abc",
+        host: "t-abc.open-artifacts-staging.app",
+        version: "0.272.1",
+        createJob: "job-create-1",
+        credsJob: "job-creds-1",
+        sealed: "oa-seal-v1.abc.def.ghi",
+      });
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   describe("workflow guards refuse invalid inputs before any network call", () => {
@@ -393,12 +496,55 @@ describe("log parsing and hookKeyOnlyOf", () => {
   });
 });
 
-describe("startFixtureBus", () => {
-  it("pins @open-artifacts/bus from /llms.txt, approves in browser, starts daemon, and checks status", async () => {
+describe("parseBusLoginApproval and startFixtureBus", () => {
+  const origin = "https://t-bus.open-artifacts-staging.app";
+  const utf8Transcript = [
+    "oa-bus 0.272.1",
+    "",
+    "→  Open this URL on any machine:",
+    `   ${origin}/bus/approve`,
+    "",
+    "   ╭─────────────╮",
+    "   │  AB12-CD34  │  Your code. Type it on the approval page.",
+    "   ╰─────────────╯  Valid 10 minutes.",
+    "",
+    "Waiting for approval (up to 10 minutes)…",
+    "",
+  ].join("\n");
+  const asciiTranscript = [
+    "oa-bus 0.272.1",
+    "",
+    ">  Open this URL on any machine:",
+    `   ${origin}/bus/approve`,
+    "",
+    "   +-------------+",
+    "   |  ZX98-CV76  |  Your code. Type it on the approval page.",
+    "   +-------------+  Valid 10 minutes.",
+    "",
+    "Waiting for approval (up to 10 minutes)...",
+    "",
+  ].join("\n");
+
+  it("parses released multi-line UTF-8, ASCII, and ANSI transcripts and refuses wrong origins", () => {
+    expect(parseBusLoginApproval(utf8Transcript, origin)).toBe("AB12-CD34");
+    expect(parseBusLoginApproval(asciiTranscript, origin)).toBe("ZX98-CV76");
+    const colored = utf8Transcript
+      .replace(`${origin}/bus/approve`, `\x1b[36m${origin}/bus/approve\x1b[39m`)
+      .replace("AB12-CD34", "\x1b[38;2;90;150;255mAB12-CD34\x1b[39m");
+    expect(parseBusLoginApproval(colored, origin)).toBe("AB12-CD34");
+    expect(
+      parseBusLoginApproval(
+        utf8Transcript.replace(origin, "https://evil.example"),
+        origin,
+      ),
+    ).toBeNull();
+  });
+
+  it("pins @open-artifacts/bus from /llms.txt, approves released multi-line transcript in browser, starts daemon, and checks status", async () => {
     const dockerCalls: string[][] = [];
     const spawnCalls: string[][] = [];
     const approveCalls: string[] = [];
-    const llms = 'p.version==="0.15.0"&&p.integrity==="sha512-XYZ=="';
+    const llms = 'p.version==="0.272.1"&&p.integrity==="sha512-XYZ=="';
     const fetcher = vi.fn(async () => new Response(llms, { status: 200 }));
     const bus = await startFixtureBus(
       {
@@ -420,9 +566,10 @@ describe("startFixtureBus", () => {
           Object.assign(proc, { stdout, stderr, kill: vi.fn() });
           queueMicrotask(() => {
             if (args.includes("login")) {
-              stdout.write(
-                "Open https://t-bus.open-artifacts-staging.app/bus/approve and type this code to approve this machine: AB12-CD34\n",
-              );
+              // Emit URL and code box in separate chunks, as the released CLI does.
+              const splitAt = utf8Transcript.indexOf("╭");
+              stdout.write(utf8Transcript.slice(0, splitAt));
+              stdout.write(utf8Transcript.slice(splitAt));
             }
             proc.emit("close", 0);
           });
@@ -435,19 +582,22 @@ describe("startFixtureBus", () => {
     );
     expect(bus).toEqual({
       ...busNames("t-bus"),
-      image: "oa-staging-bus:0.15.0",
-      version: "0.15.0",
+      image: "oa-staging-bus:0.272.1",
+      version: "0.272.1",
     });
     expect(approveCalls).toEqual(["AB12-CD34"]);
+    expect(spawnCalls[0]).toEqual(
+      expect.arrayContaining(["login", "--no-color"]),
+    );
     expect(dockerCalls[0]).toEqual(
       expect.arrayContaining([
         "build",
         "--build-arg",
-        "BUS_VERSION=0.15.0",
+        "BUS_VERSION=0.272.1",
         "--build-arg",
         "BUS_INTEGRITY=sha512-XYZ==",
         "-t",
-        "oa-staging-bus:0.15.0",
+        "oa-staging-bus:0.272.1",
       ]),
     );
     expect(dockerCalls.at(-1)).toEqual([
@@ -459,6 +609,70 @@ describe("startFixtureBus", () => {
       "/home/node/.oa-bus",
     ]);
     expect(spawnCalls).toHaveLength(2);
+  });
+
+  it("refuses to approve when login prints a mismatched origin", async () => {
+    const approveBus = vi.fn();
+    const fetcher = vi.fn(
+      async () =>
+        new Response('p.version==="0.272.1"&&p.integrity==="sha512-XYZ=="', {
+          status: 200,
+        }),
+    );
+    await expect(
+      startFixtureBus(
+        {
+          slug: "t-bus",
+          installId: "inst-bus1",
+          hookKey: "hk-secret",
+          fetcher,
+        },
+        {
+          docker: async () => "",
+          spawnDocker: () => {
+            const proc = new EventEmitter() as ReturnType<Deps["spawnDocker"]>;
+            const stdout = new PassThrough();
+            const stderr = new PassThrough();
+            Object.assign(proc, { stdout, stderr, kill: vi.fn() });
+            queueMicrotask(() => {
+              stdout.write(
+                utf8Transcript.replace(origin, "https://other.example"),
+              );
+              proc.emit("close", 0);
+            });
+            return proc;
+          },
+          approveBus,
+        },
+      ),
+    ).rejects.toThrow("before printing approval code");
+    expect(approveBus).not.toHaveBeenCalled();
+  });
+
+  it("stopFixtureBus ignores already-absent resources and fails loudly on real Docker errors", async () => {
+    const absent = vi.fn(async (...args: string[]) => {
+      if (args[0] === "rm")
+        throw Object.assign(new Error("exit 1"), {
+          stderr: "Error response from daemon: No such container: oa-bus-t-a",
+        });
+      throw Object.assign(new Error("exit 1"), {
+        stderr:
+          "Error response from daemon: get oa-bus-home-t-a: no such volume",
+      });
+    });
+    await expect(stopFixtureBus("t-a", absent)).resolves.toBeUndefined();
+
+    const inUse = vi.fn(async (...args: string[]) => {
+      if (args[0] === "volume")
+        throw Object.assign(new Error("exit 1"), {
+          stderr:
+            "Error response from daemon: remove oa-bus-home-t-a: volume is in use",
+        });
+      return "";
+    });
+    await expect(stopFixtureBus("t-a", inUse)).rejects.toThrow(
+      "volume is in use",
+    );
   });
 });
 
@@ -602,5 +816,272 @@ describe("main", () => {
       "-f",
       "oa-bus-home-t-demo",
     );
+  });
+
+  it("persists ownership before dispatch and recovers immutable installId for --delete after watch and log-read failures", async () => {
+    const lines: string[] = [];
+    const receiptFile = join(receiptBase, "t-drop.json");
+    let receiptSeenAtDispatch = false;
+    let createOwnerPub = "";
+    let deleteOwnerPub = "";
+    let deleteProof = "";
+    let logReadAttempts = 0;
+    const gh = vi.fn(async (...args: string[]) => {
+      if (args[0] === "api") {
+        const action = args.find((a) => a.startsWith("inputs[action]="));
+        const owner = args.find((a) => a.startsWith("inputs[owner_key]="));
+        const proof = args.find((a) => a.startsWith("inputs[delete_proof]="));
+        if (action === "inputs[action]=create") {
+          receiptSeenAtDispatch = existsSync(receiptFile);
+          createOwnerPub = owner?.slice("inputs[owner_key]=".length) ?? "";
+          return "77101\n";
+        }
+        deleteOwnerPub = owner?.slice("inputs[owner_key]=".length) ?? "";
+        deleteProof = proof?.slice("inputs[delete_proof]=".length) ?? "";
+        return "77102\n";
+      }
+      if (args[0] === "run" && args[1] === "watch") {
+        if (args[2] === "77101") throw new Error("watch interrupted");
+        return "";
+      }
+      if (args[0] === "run" && args[1] === "view") {
+        if (args[2] === "77101") {
+          logReadAttempts++;
+          if (logReadAttempts === 1) throw new Error("log not ready yet");
+          return [
+            "test-install-id: irecover1234",
+            "test-install-repo-id: 4242",
+          ].join("\n");
+        }
+        return [
+          "test-install-id: irecover1234",
+          "test-install-slug: t-drop",
+          "test-install-purged: true",
+        ].join("\n");
+      }
+      throw new Error(`unexpected gh: ${args.join(" ")}`);
+    });
+    const deps: Deps = {
+      gh,
+      docker: vi.fn(async () => ""),
+      spawnDocker: vi.fn(),
+      fetch: vi.fn(),
+      now: () => 1_700_000_000_000,
+      requestId: () => "rid-drop",
+      tmp,
+      receiptBase,
+      log: (l) => lines.push(l),
+      memberState: vi.fn(),
+    };
+
+    await expect(main(["--slug", "t-drop"], deps)).rejects.toThrow(
+      "watch interrupted",
+    );
+    expect(receiptSeenAtDispatch).toBe(true);
+    expect(existsSync(receiptFile)).toBe(true);
+    expect(statSync(receiptFile).mode & 0o777).toBe(0o600);
+    const partial = JSON.parse(readFileSync(receiptFile, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(partial.runId).toBe("77101");
+    expect(partial.installId).toBeNull();
+    expect(parsePartialCreateLog("test-install-id: irecover1234")).toEqual({
+      installId: "irecover1234",
+      repositoryId: null,
+    });
+
+    // A duplicate create must refuse instead of overwriting the saved owner key.
+    await expect(main(["--slug", "t-drop"], deps)).rejects.toThrow(
+      "receipt already exists",
+    );
+
+    // Later --delete recovers installId + repoId from run 77101's log and purges.
+    expect(await main(["--slug", "t-drop", "--delete"], deps)).toBe(0);
+    expect(deleteOwnerPub).toBe(createOwnerPub);
+    expect(deleteProof.startsWith("irecover1234.")).toBe(true);
+    expect(JSON.parse(lines[0] ?? "{}")).toEqual({
+      deleted: "t-drop",
+      purged: true,
+      installId: "irecover1234",
+      run: "77102",
+    });
+    expect(existsSync(receiptFile)).toBe(false);
+  });
+
+  it("retains purge state when Docker volume removal fails and finishes local cleanup on retry without re-purging", async () => {
+    const lines: string[] = [];
+    const receiptFile = join(receiptBase, "t-vol.json");
+    let sealedOut = "";
+    let deleteDispatches = 0;
+    const gh = vi.fn(async (...args: string[]) => {
+      if (args[0] === "api") {
+        const rec = args.find((a) => a.startsWith("inputs[recipient_key]="));
+        if (rec) {
+          sealedOut = sealFor(
+            rec.slice("inputs[recipient_key]=".length),
+            JSON.stringify({ hookKey: "plain-hk-vol" }),
+          );
+          return "88001\n";
+        }
+        deleteDispatches++;
+        return "88002\n";
+      }
+      if (args[0] === "run" && args[1] === "watch") return "";
+      if (args[0] === "run" && args[1] === "view") {
+        if (args[2] === "88001") {
+          return [
+            "test-install-id: ivolume12345",
+            "test-install-repo-id: 4242",
+            "test-install-slug: t-vol",
+            "test-install-app-host: t-vol.open-artifacts-staging.app",
+            "test-install-version: 0.272.1",
+            "test-install-create-job: job-c1",
+            "test-install-creds-job: job-k1",
+            `test-install-sealed: ${sealedOut}`,
+          ].join("\n");
+        }
+        return [
+          "test-install-id: ivolume12345",
+          "test-install-slug: t-vol",
+          "test-install-purged: true",
+        ].join("\n");
+      }
+      throw new Error(`unexpected gh: ${args.join(" ")}`);
+    });
+    let volumeBusy = true;
+    const docker = vi.fn(async (...args: string[]) => {
+      if (args[0] === "volume" && volumeBusy)
+        throw Object.assign(new Error("exit 1"), {
+          stderr:
+            "Error response from daemon: remove oa-bus-home-t-vol: volume is in use",
+        });
+      return "";
+    });
+    const deps: Deps = {
+      gh,
+      docker,
+      spawnDocker: vi.fn(),
+      fetch: vi.fn(),
+      now: () => 1_700_000_000_000,
+      requestId: () => "rid-vol",
+      tmp,
+      receiptBase,
+      log: (l) => lines.push(l),
+      memberState: vi.fn(async () => "/tmp/state.json"),
+    };
+
+    expect(await main(["--slug", "t-vol"], deps)).toBe(0);
+
+    // First --delete: remote purge succeeds, volume removal fails loudly, receipt retained.
+    await expect(main(["--slug", "t-vol", "--delete"], deps)).rejects.toThrow(
+      "volume is in use",
+    );
+    expect(deleteDispatches).toBe(1);
+    expect(existsSync(receiptFile)).toBe(true);
+    expect(
+      (JSON.parse(readFileSync(receiptFile, "utf8")) as Record<string, unknown>)
+        .remotePurged,
+    ).toBe(true);
+
+    // Retry --delete once volume is free: skips remote purge, removes volume + receipt.
+    volumeBusy = false;
+    expect(await main(["--slug", "t-vol", "--delete"], deps)).toBe(0);
+    expect(deleteDispatches).toBe(1);
+    expect(existsSync(receiptFile)).toBe(false);
+    expect(JSON.parse(lines[1] ?? "{}")).toEqual({
+      deleted: "t-vol",
+      purged: true,
+      installId: "ivolume12345",
+    });
+  });
+
+  it("saves installId before failing on incomplete R26 output and supports --delete --install-id after pre-runId dispatch failure", async () => {
+    const receiptFile = join(receiptBase, "t-r26.json");
+    const lines: string[] = [];
+    let viewCount = 0;
+    const gh = vi.fn(async (...args: string[]) => {
+      if (args[0] === "api") {
+        const action = args.find((a) => a.startsWith("inputs[action]="));
+        return action === "inputs[action]=create" ? "66101\n" : "66102\n";
+      }
+      if (args[0] === "run" && args[1] === "watch") return "";
+      if (args[0] === "run" && args[1] === "view") {
+        viewCount++;
+        if (args[2] === "66101")
+          return [
+            "test-install-id: ipartial1234",
+            "test-install-repo-id: 4242",
+          ].join("\n");
+        return [
+          "test-install-id: ipartial1234",
+          "test-install-slug: t-r26",
+          "test-install-purged: true",
+        ].join("\n");
+      }
+      throw new Error(`unexpected gh: ${args.join(" ")}`);
+    });
+    const deps: Deps = {
+      gh,
+      docker: vi.fn(async () => ""),
+      spawnDocker: vi.fn(),
+      fetch: vi.fn(),
+      now: () => 1_700_000_000_000,
+      requestId: () => "rid-r26",
+      tmp,
+      receiptBase,
+      log: (l) => lines.push(l),
+      memberState: vi.fn(),
+    };
+
+    await expect(main(["--slug", "t-r26"], deps)).rejects.toThrow(
+      "fixture create output missing from log",
+    );
+    const saved = JSON.parse(readFileSync(receiptFile, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(saved.installId).toBe("ipartial1234");
+    expect(saved.repositoryId).toBe("4242");
+
+    // --delete uses already-persisted installId without re-reading run 66101's log.
+    expect(await main(["--slug", "t-r26", "--delete"], deps)).toBe(0);
+    expect(viewCount).toBe(2);
+    expect(existsSync(receiptFile)).toBe(false);
+
+    // Pre-runId dispatch failure: owner key is preserved; --delete --install-id recovers repoId and purges.
+    const gh2 = vi.fn(async (...args: string[]) => {
+      if (
+        args[0] === "api" &&
+        args[1] === "repos/open-artifacts-ai/open-artifacts-cloud"
+      )
+        return "4242\n";
+      if (args[0] === "api") {
+        const action = args.find((a) => a.startsWith("inputs[action]="));
+        if (action === "inputs[action]=create")
+          throw new Error("dispatch response dropped");
+        return "66202\n";
+      }
+      if (args[0] === "run" && args[1] === "watch") return "";
+      if (args[0] === "run" && args[1] === "view")
+        return [
+          "test-install-id: idrop0001234",
+          "test-install-slug: t-r26",
+          "test-install-purged: true",
+        ].join("\n");
+      throw new Error(`unexpected gh: ${args.join(" ")}`);
+    });
+    const deps2: Deps = { ...deps, gh: gh2 };
+    await expect(main(["--slug", "t-r26"], deps2)).rejects.toThrow(
+      "dispatch response dropped",
+    );
+    expect(existsSync(receiptFile)).toBe(true);
+    expect(
+      await main(
+        ["--slug", "t-r26", "--delete", "--install-id", "idrop0001234"],
+        deps2,
+      ),
+    ).toBe(0);
+    expect(existsSync(receiptFile)).toBe(false);
   });
 });
