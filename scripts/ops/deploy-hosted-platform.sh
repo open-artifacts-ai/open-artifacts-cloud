@@ -409,6 +409,30 @@ welcome_declared() {
   [ "$rc" -le 1 ] || { echo "can't read $1's committed wrangler.jsonc" >&2; exit 1; }
   [ "$rc" -ne 0 ] || WELCOME_DECLARED=1
 }
+# jobwait_declared <app> (cloud #264): in the main shell, sets
+# JOBWAIT_DECLARED=1 when the tag's apps/<app>/wrangler.jsonc names the
+# JOB_WAIT Durable Object binding (R15's held read), else "" (an older tag,
+# which must have none live). Unreadable: exit 1.
+JOBWAIT_DECLARED=""
+jobwait_declared() {
+  local declared rc=0
+  JOBWAIT_DECLARED=""
+  grep -q '"JOB_WAIT"' "$root/apps/$1/wrangler.jsonc" || rc=$?
+  [ "$rc" -ne 1 ] || return 0  # older tag, predating the job-wait section
+  [ "$rc" -eq 0 ] || exit 1
+  declared="$(committed "$1" job-wait)" || exit 1
+  if [ "$declared" = true ]; then JOBWAIT_DECLARED=1; fi
+}
+# jobwait_bound <settings json>, after jobwait_declared: when declared, the
+# live binding is the JobWait Durable Object namespace; otherwise none. The
+# read-back's script field is not documented, so only the type and class are
+# checked.
+jobwait_bound() {
+  local want=""
+  [ -z "$JOBWAIT_DECLARED" ] || want="durable_object_namespace JobWait"
+  expect "$1" '[.result.bindings[] | select(.name == "JOB_WAIT") | "\(.type) \(.class_name)"] | join(",")' \
+    "$want" "JOB_WAIT"
+}
 # welcome_bound <settings json>, after welcome_declared: when declared, the live binding is send_email; otherwise none.
 welcome_bound() {
   local want=""
@@ -538,10 +562,12 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | "\(.workflow_name) \(.class_name)"' \
       "oa-$P-manage-install ManageInstall" "MANAGE_INSTALL"
     billing_bound "$S" provisioner BillingProvisionerRpc
+    jobwait_declared provisioner
+    jobwait_bound "$S"
     if [ -n "$WAKE_DECLARED" ]; then
       expect "$S" '.result.bindings[] | select(.name == "FLEET_WAKE") | "\(.type) \(.queue_name)"' "queue oa-$P-fleet-wake" "FLEET_WAKE"
     fi
-    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,${WAKE_DECLARED:+FLEET_WAKE,}MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,${WAKE_DECLARED:+FLEET_WAKE,}${JOBWAIT_DECLARED:+JOB_WAIT,}MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
@@ -760,7 +786,9 @@ case "$target" in
       REG_DECLARED=1
       expect "$S" '.result.bindings[] | select(.name == "BROKER_REGISTRY") | .namespace_id' "$BROKER_REGISTRY_ID" "BROKER_REGISTRY"
     fi
-    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" --arg r "${REG_DECLARED:+BROKER_REGISTRY}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end) + (if $r == "" then [] else [$r] end)) | sort | join(",")' <<< "$want")"
+    jobwait_declared provisioning
+    jobwait_bound "$S"
+    names_are "$S" "$(jq -r --arg b "${BILLING_DECLARED:+BILLING}" --arg w "${WELCOME_DECLARED:+WELCOME_EMAIL}" --arg r "${REG_DECLARED:+BROKER_REGISTRY}" --arg j "${JOBWAIT_DECLARED:+JOB_WAIT}" '([.[].name, "ASSETS", "AUTH_BROKER", "CF_VERSION_METADATA", "MANAGE_INSTALL", "OAUTH_KV", "PLATFORM_DB", "PROVISIONER", "PROVISION_INSTALL", "SIGNUPS"] + (if $b == "" then [] else [$b] end) + (if $w == "" then [] else [$w] end) + (if $r == "" then [] else [$r] end) + (if $j == "" then [] else [$j] end)) | sort | join(",")' <<< "$want")"
     if [ "$env" = prod ]; then
       oidc="$(jq -r '[.result.bindings[] | select(.name | startswith("OIDC_")) | .name] | join(",")' <<< "$S")"
       [ -z "$oidc" ] || { echo "prod $W binds $oidc; prod has no OIDC principal" >&2; exit 1; }
@@ -1089,6 +1117,9 @@ case "$target" in
     # script are not documented, so only the type is checked.
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | .type' workflow "PROVISION_INSTALL"
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | .type' workflow "MANAGE_INSTALL"
+    # JobWait on the provisioner (cloud #264), when the tag declares it.
+    jobwait_declared scheduler
+    jobwait_bound "$S"
     expect "$S" '.result.bindings[] | select(.name == "ALERT_EMAIL") | .type' send_email "ALERT_EMAIL"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"

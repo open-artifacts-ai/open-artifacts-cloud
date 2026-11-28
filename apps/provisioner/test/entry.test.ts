@@ -1,8 +1,13 @@
-import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
+import {
+  DurableObject,
+  type WorkflowEvent,
+  type WorkflowStep,
+} from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { PROVISIONER_RPC_METHODS } from "@oa/provisioning-contract";
 import { describe, expect, it } from "vitest";
 import * as entry from "../src/index.js";
+import { JobWait } from "../src/job-wait.js";
 import { ManageInstall } from "../src/manage.js";
 import { ProvisionerRpc } from "../src/rpc.js";
 import {
@@ -20,8 +25,9 @@ import {
 const JOB = "01JBQ4ZKXW5V9R3M2N8P6T7Y0A";
 
 describe("entrypoint", () => {
-  it("exports the default handler, both Workflows and ProvisionerRpc, nothing else", () => {
+  it("exports the default handler, both Workflows, ProvisionerRpc and JobWait, nothing else", () => {
     expect(Object.keys(entry).sort()).toEqual([
+      "JobWait",
       "ManageInstall",
       "ProvisionInstall",
       "ProvisionerRpc",
@@ -30,6 +36,7 @@ describe("entrypoint", () => {
     expect(entry.ProvisionInstall).toBe(ProvisionInstall);
     expect(entry.ManageInstall).toBe(ManageInstall);
     expect(entry.ProvisionerRpc).toBe(ProvisionerRpc);
+    expect(entry.JobWait).toBe(JobWait);
   });
 
   it("the default handler has a queue consumer and no fetch handler", () => {
@@ -50,6 +57,18 @@ describe("Workflow classes (2.6)", () => {
         "run",
       ]);
     });
+});
+
+// cloud #264: R15's held read. Its RPC surface is every public method.
+describe("JobWait", () => {
+  it("is a Durable Object with exactly constructor, hold, changed", () => {
+    expect(JobWait.prototype).toBeInstanceOf(DurableObject);
+    expect(Object.getOwnPropertyNames(JobWait.prototype)).toEqual([
+      "constructor",
+      "hold",
+      "changed",
+    ]);
+  });
 });
 
 describe("ProvisionerRpc", () => {

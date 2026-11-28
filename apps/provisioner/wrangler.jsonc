@@ -92,6 +92,13 @@
           "class_name": "ManageInstall"
         }
       ],
+      // JobWait (cloud #264, src/job-wait.ts): one object per job; a job's
+      // end releases R15's held reads (GET /jobs/:jobId?wait=). The API binds
+      // it with script_name oa-s-provisioner.
+      "durable_objects": {
+        "bindings": [{ "name": "JOB_WAIT", "class_name": "JobWait" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["JobWait"] }],
       // STAGING ONLY (#1568): billing's BillingProvisionerRpc entrypoint, how the
       // provisioner starts an install's 30-day no-card Solo trial. oa-s-billing
       // must be deployed first (the billing target), and the deploy reads the

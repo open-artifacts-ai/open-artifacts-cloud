@@ -39,6 +39,7 @@ import {
 } from "../model.js";
 import type { Principal } from "../principal.js";
 import { platformRelease, releaseOf, releases } from "../services/cache.js";
+import { endJob } from "../services/job-wait.js";
 import {
   accept,
   activeJobId,
@@ -571,6 +572,8 @@ WHERE id = ?1 AND status IN ('queued', 'running')`,
       throw new ApiError("invalid_state", "the job is not running");
     },
     start: async (cleanupId) => {
+      // The job is failed now: its held reads (R15 ?wait=) answer.
+      await endJob(a.env, target.id);
       try {
         await (
           await binding(a.env, target.workflow).get(target.id)

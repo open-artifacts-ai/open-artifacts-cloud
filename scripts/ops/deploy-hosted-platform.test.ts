@@ -239,6 +239,17 @@ function schedulerBindings(
     { type: "queue", name: "FLEET_WAKE", queue_name: `oa-${p}-fleet-wake` },
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
+    // cloud #264: the provisioner's JobWait; the repo's config declares it.
+    ...(p === "s"
+      ? [
+          {
+            type: "durable_object_namespace",
+            name: "JOB_WAIT",
+            class_name: "JobWait",
+            script_name: `oa-${p}-provisioner`,
+          },
+        ]
+      : []),
     alerts
       ? {
           type: "send_email",
@@ -376,6 +387,16 @@ const provisionerSettings = (p = "p", env: "staging" | "prod" = "prod") =>
       workflow_name: `oa-${p}-manage-install`,
       class_name: "ManageInstall",
     },
+    // cloud #264: R15's held read; the tag declares it.
+    ...(p === "s"
+      ? [
+          {
+            type: "durable_object_namespace",
+            name: "JOB_WAIT",
+            class_name: "JobWait",
+          },
+        ]
+      : []),
     // cloud #264: every ManageInstall job's end wakes the fleet.
     { type: "queue", name: "FLEET_WAKE", queue_name: `oa-${p}-fleet-wake` },
     ...varsOf("provisioner", env),
@@ -405,6 +426,17 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   },
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
+  // cloud #264: R15's held read waits on the provisioner's JobWait.
+  ...(p === "s"
+    ? [
+        {
+          type: "durable_object_namespace",
+          name: "JOB_WAIT",
+          class_name: "JobWait",
+          script_name: `oa-${p}-provisioner`,
+        },
+      ]
+    : []),
   // The approval email (#2096): the provisioner's sender.
   { type: "send_email", name: "WELCOME_EMAIL" },
   ...[
@@ -1415,16 +1447,17 @@ describe("deploy-hosted-platform.sh", () => {
       "oa-p-provisioner",
       "oa-p-provisioning",
     ];
-    // v0.154.0 predates prod's BILLING binding: its live Workers have none.
+    // v0.154.0 predates prod's BILLING binding and JOB_WAIT (cloud #264):
+    // its live Workers have neither.
     const live = (key: string) => {
       const next = JSON.parse(NEXT[key] as string);
       next.result.observability = { enabled: false };
       next.result.bindings = next.result.bindings.filter(
-        (b: { name: string }) => b.name !== "BILLING",
+        (b: { name: string }) => b.name !== "BILLING" && b.name !== "JOB_WAIT",
       );
       return JSON.stringify(next);
     };
-    const tagLive = (app: "provisioner" | "provisioning") => {
+    const tagLive = (app: "provisioner" | "provisioning" | "scheduler") => {
       const key = `oa-p-${app}`;
       const next = JSON.parse(live(key));
       if (app === "provisioning")
@@ -1490,6 +1523,81 @@ describe("deploy-hosted-platform.sh", () => {
     }
   });
 
+  // cloud #264: R15's held read. The provisioner hosts JobWait and the API
+  // binds it; main's scripts deploy a tag with or without it.
+  describe("the JOB_WAIT binding follows the tag's own wrangler (cloud #264)", () => {
+    const withoutJobWait = (
+      app: "provisioner" | "provisioning" | "scheduler",
+    ) =>
+      readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8")
+        .replace(/"durable_objects":\s*\{[\s\S]*?\]\s*\},/g, "")
+        .replace(/"migrations":\s*\[[^\]]*\]\s*\}\],/g, "");
+    const liveWithout = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.filter(
+        (x: { name: string }) => x.name !== "JOB_WAIT",
+      );
+      return JSON.stringify(next);
+    };
+    const liveWrong = (key: string) => {
+      const next = JSON.parse(NEXT[key] as string);
+      next.result.bindings = next.result.bindings.map(
+        (x: { name: string; class_name?: string }) =>
+          x.name === "JOB_WAIT" ? { ...x, class_name: "Other" } : x,
+      );
+      return JSON.stringify(next);
+    };
+    const DEPS = {
+      scheduler: SCHED_DEPS("s"),
+      provisioner: ["oa-s-billing"],
+      provisioning: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
+    } as const;
+    for (const app of ["provisioner", "provisioning", "scheduler"] as const) {
+      const key = `oa-s-${app}`;
+      it(`${app}: the repo's config declares it; deployed with it, verified`, () => {
+        expect(
+          readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8"),
+        ).toMatch(/"name": "JOB_WAIT"/);
+        const ok = setup({ exists: DEPS[app] }).run(app, {}, "staging");
+        expect(ok.err, app).toBe("");
+        expect(ok.code, app).toBe(0);
+      });
+
+      it(`${app}: a tag that declares it fails the read-back without it, or with another class`, () => {
+        const none = setup({
+          exists: DEPS[app],
+          next: { [key]: liveWithout(key) },
+        }).run(app, {}, "staging");
+        expect(none.code, app).toBe(1);
+        expect(none.err, app).toContain("JOB_WAIT");
+        const wrong = setup({
+          exists: DEPS[app],
+          next: { [key]: liveWrong(key) },
+        }).run(app, {}, "staging");
+        expect(wrong.code, app).toBe(1);
+        expect(wrong.err, app).toContain("JOB_WAIT");
+      });
+
+      it(`${app}: an older tag without it deploys without it; a live one it did not declare fails`, () => {
+        const config = withoutJobWait(app);
+        expect(config).not.toMatch(/"JOB_WAIT"|"JobWait"/);
+        const old = setup({
+          configs: { [app]: config },
+          exists: DEPS[app],
+          next: { [key]: liveWithout(key) },
+        }).run(app, {}, "staging");
+        expect(old.err, app).toBe("");
+        expect(old.code, app).toBe(0);
+        const extra = setup({
+          configs: { [app]: config },
+          exists: DEPS[app],
+        }).run(app, {}, "staging");
+        expect(extra.code, app).toBe(1);
+        expect(extra.err, app).toContain("JOB_WAIT: got");
+      });
+    }
+  });
+
   describe("the scheduler's alert wiring (#915's placeholders, or none before it)", () => {
     // #915's config, and the repo's own once it carries the placeholders.
     const PINNED = [
@@ -1528,13 +1636,14 @@ describe("deploy-hosted-platform.sh", () => {
       vars: Record<string, string> = {},
     ) => {
       const p = env[0] as "s" | "p";
-      // A config that does not declare BILLING is an older tag: its Worker
-      // is deployed without the binding (#1568).
+      // Historical scheduler configs predate these bindings.
       const live = JSON.parse(next);
-      if (!/"BILLING"/.test(config))
-        live.result.bindings = live.result.bindings.filter(
-          (b: { name: string }) => b.name !== "BILLING",
-        );
+      for (const name of ["BILLING", "JOB_WAIT"]) {
+        if (!config.includes(JSON.stringify(name)))
+          live.result.bindings = live.result.bindings.filter(
+            (b: { name: string }) => b.name !== name,
+          );
+      }
       const s = setup({
         exists: SCHED_DEPS(p),
         next: { [`oa-${p}-scheduler`]: JSON.stringify(live) },

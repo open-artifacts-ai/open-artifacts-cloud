@@ -178,6 +178,13 @@ export const BUS_CLOSE_WITHIN_MS = 360_000;
 /** HOSTS is KV: a write takes up to 60 s to show everywhere. Two periods. */
 export const HOSTS_SETTLE_MS = 120_000;
 export const JOB_WITHIN_MS = 20 * 60_000;
+/**
+ * R15's held read (cloud #264): the API's longest hold, under the live
+ * suite's 30 s per-request bound (fetch-timeout.ts FETCH_TIMEOUT_MS).
+ */
+export const JOB_HOLD_MS = 25_000;
+/** Held R15 reads whose connection drops this many times in a row fail. */
+export const JOB_HOLD_DROPS = 3;
 /** A case's vitest timeout: its slowest wait plus margin. */
 export const PROBE_TIMEOUT_MS = JOB_WITHIN_MS + 5 * 60_000;
 /** The run's cleanup: one install can wait on a live job, a delete and a purge. */
@@ -318,7 +325,41 @@ export class Run {
       .replace(/-+$/, "");
   }
 
-  /** Polls R15 until the job is done or failed (or `until` holds). */
+  /**
+   * Whether the API holds R15 reads (cloud #264, GET /jobs/:jobId?wait=):
+   * asked once per run, see probeJobWait.
+   */
+  private jobWaitHeld?: boolean;
+  /** The read loop (no held reads) is noted once per run. */
+  private jobWaitNoted = false;
+
+  /**
+   * The capability probe: `?wait=invalid` is a 400 invalid_input on an API
+   * that holds R15 reads (the schema step runs before the handler, so any
+   * job id will do), and a plain 200 on one that drops the key. Any other
+   * answer fails, as a plain read's would.
+   */
+  async probeJobWait(
+    jobId: string,
+    testUser?: "a" | "b" | "c",
+  ): Promise<boolean> {
+    if (this.jobWaitHeld !== undefined) return this.jobWaitHeld;
+    const r = await this.v1(`/jobs/${jobId}?wait=invalid`, { testUser });
+    if (r.status === 400 && errCode(r) === "invalid_input")
+      this.jobWaitHeld = true;
+    else if (r.status === 200) this.jobWaitHeld = false;
+    else throw new ProbeFail(`R15 ${jobId} wait probe: ${desc(r)}`);
+    return this.jobWaitHeld;
+  }
+
+  /**
+   * R15 until the job is done or failed (or `until` holds). On an API that
+   * holds reads (probeJobWait), each read is held until the provisioner
+   * pushes a change of the job (its end, a failed attempt it records, its
+   * sealed result) or JOB_HOLD_MS passes, and is sent again only when it
+   * comes back unfinished: no timer but the request's own bound. Only an
+   * API without held reads is read every POLL_MS, and that is noted.
+   */
   async waitJob(
     jobId: string,
     o: {
@@ -327,20 +368,62 @@ export class Run {
       within?: number;
     } = {},
   ): Promise<Job> {
-    const end = this.io.now() + (o.within ?? JOB_WITHIN_MS);
+    const within = o.within ?? JOB_WITHIN_MS;
+    const end = this.io.now() + within;
+    const secs = Math.round(within / 1000);
+    // Held: unknown until the probe answers, then the API's capability.
+    let held: boolean | undefined = this.jobWaitHeld;
+    let drops = 0;
+    let usedPlainRetry = false;
     for (;;) {
       let r: Res;
       try {
-        r = await this.v1(`/jobs/${jobId}`, { testUser: o.testUser });
-      } catch {
-        // A dropped connection says nothing about the job: keep polling. Only
+        if (held === undefined)
+          held = await this.probeJobWait(jobId, o.testUser);
+        if (!held && !this.jobWaitNoted) {
+          this.jobWaitNoted = true;
+          note(
+            `R15: this API has no held reads (wait=); jobs are read every ${POLL_MS / 1000} s`,
+          );
+        }
+        const wait = Math.min(JOB_HOLD_MS, Math.max(1, end - this.io.now()));
+        r = await this.v1(`/jobs/${jobId}${held ? `?wait=${wait}` : ""}`, {
+          testUser: o.testUser,
+        });
+        drops = 0;
+      } catch (e) {
+        if (e instanceof ProbeFail) throw e;
+        // A dropped connection says nothing about the job: ask again. Only
         // the network throws here: an answer, however bad, fails below.
         if (this.io.now() >= end)
+          throw new ProbeFail(`R15 ${jobId}: no answer for ${secs} s`);
+        if (held === false) {
+          await this.io.wait(POLL_MS);
+          continue;
+        }
+        // Held (or not yet known): sent again at once, a few times only.
+        if (++drops >= JOB_HOLD_DROPS)
           throw new ProbeFail(
-            `R15 ${jobId}: no answer for ${Math.round((o.within ?? JOB_WITHIN_MS) / 1000)} s`,
+            `R15 ${jobId}: no answer (${drops} dropped connections in a row)`,
           );
-        await this.io.wait(POLL_MS);
         continue;
+      }
+      if (
+        held &&
+        !usedPlainRetry &&
+        r.status === 503 &&
+        errCode(r) === "job_wait_unavailable"
+      ) {
+        const seconds = Number(r.headers.get("retry-after"));
+        const delay =
+          Number.isSafeInteger(seconds) && seconds > 0
+            ? seconds * 1000
+            : POLL_MS;
+        if (delay >= end - this.io.now())
+          throw new ProbeFail(`R15 ${jobId}: hold unavailable before deadline`);
+        usedPlainRetry = true;
+        await this.io.wait(delay);
+        r = await this.v1(`/jobs/${jobId}`, { testUser: o.testUser });
       }
       if (r.status !== 200) throw new ProbeFail(`R15 ${jobId}: ${desc(r)}`);
       const j = r.json as Job;
@@ -348,9 +431,9 @@ export class Run {
         return j;
       if (this.io.now() >= end)
         throw new ProbeFail(
-          `R15 ${jobId}: still ${j.status} at ${j.step ?? "?"} after ${Math.round((o.within ?? JOB_WITHIN_MS) / 1000)} s`,
+          `R15 ${jobId}: still ${j.status} at ${j.step ?? "?"} after ${secs} s`,
         );
-      await this.io.wait(POLL_MS);
+      if (!held) await this.io.wait(POLL_MS);
     }
   }
 
@@ -2239,9 +2322,11 @@ export const PROBES: readonly Probe[] = [
       // not the kill), so the kill is lastErrorCode lease_held, at the upload
       // step while the job is still running. jobs.attempt is 0-based and is
       // not used. The window to see it running is the step's retry backoff, 2
-      // minutes (apps/provisioner/src/manage.ts MANAGE_UPLOAD_STEP) against
-      // POLL_MS = 3 s; a shorter backoff, or a slow poll, can show the job
-      // already done, and then the record alone decides.
+      // minutes (apps/provisioner/src/manage.ts MANAGE_UPLOAD_STEP). On an
+      // API with held reads the provisioner pushes the recorded lease_held
+      // to the held read (cloud #264); without them it is read every
+      // POLL_MS = 3 s. A shorter backoff can show the job already done, and
+      // then the record alone decides.
       const killed = await run.waitJob(a.job.id, {
         until: (j) =>
           j.status === "done" ||

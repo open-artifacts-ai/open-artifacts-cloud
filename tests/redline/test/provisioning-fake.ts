@@ -213,6 +213,15 @@ export interface FakeApi {
   /** Every request URL, in order. */
   log: string[];
   /**
+   * R15's held read (cloud #264). Off (the default), the API drops `wait`
+   * as a build without it does, and its probe reads without moving the job.
+   * On, `wait=invalid` is a 400 and a held read answers at the job's next
+   * pushed change (its end, a failed attempt's code, its sealed result),
+   * run to at once, unless `runOut` > 0: then that many held reads run out
+   * first and answer the job unmoved. `held` counts them.
+   */
+  heldReads: { on: boolean; runOut: number; held: number };
+  /**
    * /auth/start answers past `limit` starts in a minute are limited; the
    * limited 303 sends `limitedCookie` (default: clearFlowCookie()).
    */
@@ -269,6 +278,7 @@ export function fakeApi(): FakeApi {
     schemas.get(v) ?? { d1: [], doTags: [] };
   const replays = new Map<string, Response>();
   const log: string[] = [];
+  const heldReads = { on: false, runOut: 0, held: 0 };
   const creates: Record<string, unknown>[] = [];
   const signupAccounts = new Set<string>();
   /** Purged installs whose content host HOSTS keeps (fault p23_content_mapped). */
@@ -605,9 +615,28 @@ export function fakeApi(): FakeApi {
     m = path.match(/^\/jobs\/([^/]+)(\/cancel)?$/);
     if (m) {
       if (m[2]) return err(403, "forbidden");
+      const wait = url.searchParams.get("wait");
+      // The schema step (wait) runs before the read, as on the API.
+      if (heldReads.on && wait !== null && !/^\d{1,9}$/.test(wait))
+        return err(400, "invalid_input");
       const j = jobs.get(m[1] as string);
       if (!j || j.owner !== p) return err(404, "not_found");
-      advance(j);
+      if (heldReads.on && wait !== null && Number(wait) > 0) {
+        // Held: the job runs on until a change the provisioner pushes (its
+        // end, a failed attempt's code, its sealed result), then answers.
+        heldReads.held++;
+        const pushed = () =>
+          `${j.status}|${(jobView(j, false) as { lastErrorCode: unknown }).lastErrorCode}|${j.sealed !== null}`;
+        const before = pushed();
+        if (heldReads.runOut > 0) heldReads.runOut--;
+        else
+          for (
+            let n = 0;
+            n < 1000 && j.status === "running" && pushed() === before;
+            n++
+          )
+            advance(j);
+      } else if (wait !== "invalid") advance(j);
       // As W3/W5b: sealed is written while the job is still running (step
       // seal, before done) and handed out once, whatever the status.
       const withSealed = !j.sealedRead && j.sealed !== null;
@@ -1304,6 +1333,7 @@ export function fakeApi(): FakeApi {
     audit,
     schemas,
     log,
+    heldReads,
     signin,
     broker,
     creates,
