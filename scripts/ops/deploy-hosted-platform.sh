@@ -415,11 +415,13 @@ welcome_declared() {
 # which must have none live). Unreadable: exit 1.
 JOBWAIT_DECLARED=""
 jobwait_declared() {
-  local rc=0
+  local declared rc=0
   JOBWAIT_DECLARED=""
   grep -q '"JOB_WAIT"' "$root/apps/$1/wrangler.jsonc" || rc=$?
-  [ "$rc" -le 1 ] || { echo "can't read $1's committed wrangler.jsonc" >&2; exit 1; }
-  [ "$rc" -ne 0 ] || JOBWAIT_DECLARED=1
+  [ "$rc" -ne 1 ] || return 0  # older tag, predating the job-wait section
+  [ "$rc" -eq 0 ] || exit 1
+  declared="$(committed "$1" job-wait)" || exit 1
+  if [ "$declared" = true ]; then JOBWAIT_DECLARED=1; fi
 }
 # jobwait_bound <settings json>, after jobwait_declared: when declared, the
 # live binding is the JobWait Durable Object namespace; otherwise none. The

@@ -240,12 +240,16 @@ function schedulerBindings(
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
     // cloud #264: the provisioner's JobWait; the repo's config declares it.
-    {
-      type: "durable_object_namespace",
-      name: "JOB_WAIT",
-      class_name: "JobWait",
-      script_name: `oa-${p}-provisioner`,
-    },
+    ...(p === "s"
+      ? [
+          {
+            type: "durable_object_namespace",
+            name: "JOB_WAIT",
+            class_name: "JobWait",
+            script_name: `oa-${p}-provisioner`,
+          },
+        ]
+      : []),
     alerts
       ? {
           type: "send_email",
@@ -384,11 +388,15 @@ const provisionerSettings = (p = "p", env: "staging" | "prod" = "prod") =>
       class_name: "ManageInstall",
     },
     // cloud #264: R15's held read; the tag declares it.
-    {
-      type: "durable_object_namespace",
-      name: "JOB_WAIT",
-      class_name: "JobWait",
-    },
+    ...(p === "s"
+      ? [
+          {
+            type: "durable_object_namespace",
+            name: "JOB_WAIT",
+            class_name: "JobWait",
+          },
+        ]
+      : []),
     // cloud #264: every ManageInstall job's end wakes the fleet.
     { type: "queue", name: "FLEET_WAKE", queue_name: `oa-${p}-fleet-wake` },
     ...varsOf("provisioner", env),
@@ -419,12 +427,16 @@ const provisioningBindings = (p = "p", env: "staging" | "prod" = "prod") => [
   { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
   { type: "assets", name: "ASSETS" },
   // cloud #264: R15's held read waits on the provisioner's JobWait.
-  {
-    type: "durable_object_namespace",
-    name: "JOB_WAIT",
-    class_name: "JobWait",
-    script_name: `oa-${p}-provisioner`,
-  },
+  ...(p === "s"
+    ? [
+        {
+          type: "durable_object_namespace",
+          name: "JOB_WAIT",
+          class_name: "JobWait",
+          script_name: `oa-${p}-provisioner`,
+        },
+      ]
+    : []),
   // The approval email (#2096): the provisioner's sender.
   { type: "send_email", name: "WELCOME_EMAIL" },
   ...[
@@ -1445,7 +1457,7 @@ describe("deploy-hosted-platform.sh", () => {
       );
       return JSON.stringify(next);
     };
-    const tagLive = (app: "provisioner" | "provisioning") => {
+    const tagLive = (app: "provisioner" | "provisioning" | "scheduler") => {
       const key = `oa-p-${app}`;
       const next = JSON.parse(live(key));
       if (app === "provisioning")
@@ -1514,7 +1526,9 @@ describe("deploy-hosted-platform.sh", () => {
   // cloud #264: R15's held read. The provisioner hosts JobWait and the API
   // binds it; main's scripts deploy a tag with or without it.
   describe("the JOB_WAIT binding follows the tag's own wrangler (cloud #264)", () => {
-    const withoutJobWait = (app: "provisioner" | "provisioning") =>
+    const withoutJobWait = (
+      app: "provisioner" | "provisioning" | "scheduler",
+    ) =>
       readFileSync(join(root, "apps", app, "wrangler.jsonc"), "utf8")
         .replace(/"durable_objects":\s*\{[\s\S]*?\]\s*\},/g, "")
         .replace(/"migrations":\s*\[[^\]]*\]\s*\}\],/g, "");
@@ -1534,10 +1548,11 @@ describe("deploy-hosted-platform.sh", () => {
       return JSON.stringify(next);
     };
     const DEPS = {
+      scheduler: SCHED_DEPS("s"),
       provisioner: ["oa-s-billing"],
       provisioning: ["oa-s-provisioner", "oa-s-auth-broker", "oa-s-billing"],
     } as const;
-    for (const app of ["provisioner", "provisioning"] as const) {
+    for (const app of ["provisioner", "provisioning", "scheduler"] as const) {
       const key = `oa-s-${app}`;
       it(`${app}: the repo's config declares it; deployed with it, verified`, () => {
         expect(
@@ -1578,7 +1593,7 @@ describe("deploy-hosted-platform.sh", () => {
           exists: DEPS[app],
         }).run(app, {}, "staging");
         expect(extra.code, app).toBe(1);
-        expect(extra.err, app).toContain("bindings: got");
+        expect(extra.err, app).toContain("JOB_WAIT: got");
       });
     }
   });

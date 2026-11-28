@@ -37,10 +37,10 @@ import {
 } from "@oa/provisioning-contract";
 import { TEST_HOOK_REFUSALS, type TestHookRefusal } from "@oa/shared";
 import { failingAt, tagFail } from "./errors.js";
+import { jobChanged } from "./job-wait.js";
 import type { ManageJob } from "./manage.js";
 import { cfFor, installRow, provisionerWith, storedVars } from "./ops.js";
 import { deployEnv, transient } from "./provisioner.js";
-import { jobChanged } from "./job-wait.js";
 import { isFixtureCreateActorKey, refused } from "./recheck.js";
 import { sealTo } from "./seal.js";
 import { argsOf, type JobRow, jobStep, markStep, readJob } from "./steps.js";

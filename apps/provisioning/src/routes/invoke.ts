@@ -72,7 +72,11 @@ const CLOUD_QUERY: Partial<Record<ApiRouteId, typeof R15_QUERY>> = {
   R15: R15_QUERY,
 };
 
-export function parseInput(def: RouteDef, input: RouteInput): Parsed {
+export function parseInput(
+  def: RouteDef,
+  input: RouteInput,
+  jobWaitBound = false,
+): Parsed {
   const fields: string[] = [];
   const one = (where: string, schema: RouteDef["body"], v: unknown) => {
     const r = schema.safeParse(v);
@@ -82,7 +86,7 @@ export function parseInput(def: RouteDef, input: RouteInput): Parsed {
     return undefined;
   };
   const params = one("params", def.params, input.params ?? {});
-  const extra = CLOUD_QUERY[def.id as ApiRouteId];
+  const extra = jobWaitBound ? CLOUD_QUERY[def.id as ApiRouteId] : undefined;
   const query = one(
     "query",
     extra ? def.query.extend(extra.shape) : def.query,
@@ -154,7 +158,7 @@ export async function invokeRoute(
     const body =
       input.body instanceof LazyBody ? await input.body.read() : input.body;
     input2 = { ...input, body };
-    const parsed = parseInput(def, input2);
+    const parsed = parseInput(def, input2, !!env.JOB_WAIT);
     if (!parsed.ok)
       throw new ApiError("invalid_input", "invalid input", {
         fields: parsed.fields,

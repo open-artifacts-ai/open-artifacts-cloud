@@ -60,8 +60,8 @@ import { alertStateKey } from "@oa/provisioning-contract/state";
 import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import type { Condition } from "./conditions.js";
 import { bound, d1, type ProvapiEnv, within } from "./env.js";
-import { type JobWaitNamespace, jobsChanged } from "./job-wait.js";
 import { type HealthProbe, publicRouteProbe } from "./health.js";
+import { type JobWaitNamespace, jobsChanged } from "./job-wait.js";
 import { insertSystemJob, startJob } from "./jobs.js";
 import { dutyCategory } from "./run.js";
 import {
@@ -482,8 +482,9 @@ async function halt(
     ]),
   );
   // The canceled jobs ended here: their held R15 reads answer (cloud #264).
-  const canceled = ((r as D1Result<{ id?: unknown }>[] | undefined)?.[3]
-    ?.results ?? [])
+  const canceled = (
+    (r as D1Result<{ id?: unknown }>[] | undefined)?.[3]?.results ?? []
+  )
     .map((x) => x.id)
     .filter((x): x is string => typeof x === "string");
   await jobsChanged(st.jobWait, canceled);

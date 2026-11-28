@@ -31,6 +31,7 @@ import {
   type ProvapiEnv,
   Stall,
 } from "./env.js";
+import { jobsChanged } from "./job-wait.js";
 import {
   type JobGuard,
   type SystemJob,
@@ -38,7 +39,6 @@ import {
   systemJobStatement,
   wfCall,
 } from "./jobs.js";
-import { jobsChanged } from "./job-wait.js";
 import { dutyCategory } from "./run.js";
 import { getState, setState } from "./state.js";
 

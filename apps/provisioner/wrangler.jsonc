@@ -206,13 +206,6 @@
           "class_name": "ManageInstall"
         }
       ],
-      // JobWait (cloud #264, src/job-wait.ts): one object per job; a job's
-      // end releases R15's held reads (GET /jobs/:jobId?wait=). The API binds
-      // it with script_name oa-p-provisioner.
-      "durable_objects": {
-        "bindings": [{ "name": "JOB_WAIT", "class_name": "JobWait" }]
-      },
-      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["JobWait"] }],
       "dispatch_namespaces": [
         { "binding": "DISPATCHER", "namespace": "oa-prod" }
       ],

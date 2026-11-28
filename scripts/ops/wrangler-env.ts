@@ -44,6 +44,7 @@ export interface RateLimit {
   period: number | undefined;
 }
 interface Block {
+  durable_objects?: { bindings?: { name: string }[] };
   vars?: Record<string, unknown>;
   send_email?: { name?: string; destination_address?: string }[];
   observability?: { enabled?: boolean };
@@ -257,7 +258,7 @@ if (
   const [file, env, what] = process.argv.slice(2);
   if (!file || (env !== "staging" && env !== "prod") || !what) {
     console.error(
-      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|consumers|producers|observability|docs-preview",
+      "usage: wrangler-env.ts <wrangler.jsonc> staging|prod vars|ratelimits|alert-pins|signups|billing|login|job-wait|consumers|producers|observability|docs-preview",
     );
     process.exit(2);
   }
@@ -274,6 +275,11 @@ if (
       out = false;
     } else if (what === "billing") out = committedBilling(src, env);
     else if (what === "login") out = committedLogin(src, env);
+    else if (what === "job-wait")
+      out =
+        block(src, env).durable_objects?.bindings?.some(
+          (b) => b.name === "JOB_WAIT",
+        ) ?? false;
     else if (what === "consumers") out = committedConsumers(src, env);
     else if (what === "producers") out = committedProducers(src, env);
     else if (what === "alert-pins") {

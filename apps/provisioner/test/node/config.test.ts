@@ -170,21 +170,26 @@ describe("wrangler.jsonc", () => {
       for (const k of ["triggers", "assets"]) expect(e).not.toHaveProperty(k);
       // The one Durable Object (cloud #264): JobWait, R15's held read. The
       // API binds it with script_name.
-      expect(e.durable_objects).toEqual({
-        bindings: [{ name: "JOB_WAIT", class_name: "JobWait" }],
-      });
-      expect(e.migrations).toEqual([
-        { tag: "v1", new_sqlite_classes: ["JobWait"] },
-      ]);
-      expect(
-        api.env[env].durable_objects.bindings.find(
-          (b: { name: string }) => b.name === "JOB_WAIT",
-        ),
-      ).toEqual({
-        name: "JOB_WAIT",
-        class_name: "JobWait",
-        script_name: e.name,
-      });
+      if (env === "prod") {
+        expect(e.durable_objects).toBeUndefined();
+        expect(e.migrations).toBeUndefined();
+      } else {
+        expect(e.durable_objects).toEqual({
+          bindings: [{ name: "JOB_WAIT", class_name: "JobWait" }],
+        });
+        expect(e.migrations).toEqual([
+          { tag: "v1", new_sqlite_classes: ["JobWait"] },
+        ]);
+        expect(
+          api.env[env].durable_objects.bindings.find(
+            (b: { name: string }) => b.name === "JOB_WAIT",
+          ),
+        ).toEqual({
+          name: "JOB_WAIT",
+          class_name: "JobWait",
+          script_name: e.name,
+        });
+      }
       // The one service binding (#1568): billing's BillingProvisionerRpc, on
       // both envs, to start an install's Solo trial.
       expect(e.services).toEqual([

@@ -217,11 +217,17 @@ export async function listJobs(a: HandlerArgs): Promise<RouteResult> {
 export async function getJob(a: HandlerArgs): Promise<RouteResult> {
   const { jobId } = a.input.params as { jobId: string };
   const p = a.principal;
-  let row = await loadJob(a.env, jobId);
-  if (!row) throw new ApiError("not_found");
-  const install = await loadStatus(a.env, row.install_id);
-  if (a.reach === "own" && !(install && inReach(install, p, a.reach)))
-    throw new ApiError("not_found");
+  const read = async () => {
+    const row = await loadJob(a.env, jobId);
+    if (!row) throw new ApiError("not_found");
+    if (a.reach === "own") {
+      const install = await loadStatus(a.env, row.install_id);
+      if (!install || !inReach(install, p, a.reach))
+        throw new ApiError("not_found");
+    }
+    return row;
+  };
+  let row = await read();
   // ?wait= (cloud #264): an open job's read is held, only once the caller
   // may read it, until the job changes (its end, a failed attempt, its
   // sealed result) or the wait runs out; then the job is read again and
@@ -229,7 +235,7 @@ export async function getJob(a: HandlerArgs): Promise<RouteResult> {
   const wait = (q(a).wait as number | undefined) ?? 0;
   if (wait > 0 && (row.status === "queued" || row.status === "running")) {
     await holdJob(a.env, jobId, wait, row.updated_at);
-    row = (await loadJob(a.env, jobId)) ?? row;
+    row = await read();
   }
   let sealed: string | null = null;
   if (

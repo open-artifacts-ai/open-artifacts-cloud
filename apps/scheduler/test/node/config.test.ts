@@ -150,15 +150,17 @@ describe("wrangler.jsonc", () => {
         expect(e).not.toHaveProperty(k);
       // The one Durable Object binding (cloud #264): the provisioner's
       // JobWait, no class of its own.
-      expect(e.durable_objects).toEqual({
-        bindings: [
-          {
-            name: "JOB_WAIT",
-            class_name: "JobWait",
-            script_name: platformNames(env).provisioner,
-          },
-        ],
-      });
+      if (env === "prod") expect(e.durable_objects).toBeUndefined();
+      else
+        expect(e.durable_objects).toEqual({
+          bindings: [
+            {
+              name: "JOB_WAIT",
+              class_name: "JobWait",
+              script_name: platformNames(env).provisioner,
+            },
+          ],
+        });
     }
     expect(platformNames("staging").scheduler).toBe("oa-s-scheduler");
     expect(platformNames("prod").scheduler).toBe("oa-p-scheduler");

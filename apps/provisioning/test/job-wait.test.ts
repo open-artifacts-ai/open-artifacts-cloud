@@ -173,6 +173,7 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
     }
     expect(j.holds).toEqual([]);
     const unbound = fakeEnv();
+    expect((await r15(unbound, open, "invalid")).body.status).toBe("running");
     expect((await r15(unbound, open, "25000")).body.status).toBe("running");
   });
 
@@ -211,6 +212,26 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
     // Reach (another user's install): 404 before any hold.
     expect((await r15(e, job, "25000", userP("u1"))).code).toBe("not_found");
     expect(j.holds).toEqual([]);
+  });
+
+  it("checks the caller's current reach again after a held read", async () => {
+    const j = jobWait();
+    const e = fakeEnv({ JOB_WAIT: j.ns });
+    const { id } = await seedInstall({
+      source: "self-serve",
+      ownerSub: "owner",
+    });
+    const job = await seedJob(id, { status: "running" });
+    const read = r15(e, job, "25000", userP("owner"));
+    await j.held();
+    await db
+      .prepare(
+        "UPDATE install_lifecycle SET owner_sub = ? WHERE install_id = ?",
+      )
+      .bind("new-owner", id)
+      .run();
+    j.holds[0].release(true);
+    expect((await read).code).toBe("not_found");
   });
 
   it("a bad wait is a 400 invalid_input on query.wait (the probe); nothing is held", async () => {
