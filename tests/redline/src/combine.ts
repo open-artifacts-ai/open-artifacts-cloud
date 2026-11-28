@@ -105,7 +105,7 @@ export function combine(ci: Report, v: Verdicts, now = Date.now()): Combined {
         out.kind === "unproven" ? `unproven: ${out.reason}` : NEEDS_CAPTURE,
     };
   });
-  const report = buildReport(cases, ci.mode);
+  const report = buildReport(cases, ci.mode, {}, ci.coverage);
   return {
     ok: true,
     report: {

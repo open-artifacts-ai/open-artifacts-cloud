@@ -4,6 +4,7 @@ import {
   fakeProvisionerRpc,
 } from "@oa/provisioning-contract/fakes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isTokenTestHooksSlug, tokenTestHooksAllowlist } from "../src/facts.js";
 import type { Principal } from "../src/principal.js";
 import { call, type HTTP } from "./call.js";
 import {
@@ -483,7 +484,7 @@ describe("R4 auth.domainCodes (#1088)", () => {
 });
 
 describe("R4 create by a token and by OIDC", () => {
-  it("a token: owner domain must be in auth.domains; sendWelcome and testHooks forbidden", async () => {
+  it("a token: owner domain must be in auth.domains and sendWelcome is forbidden", async () => {
     const e = fakeEnv();
     expect(
       (await call(e, WRITE, "R4", { body: leo({ ownerEmail: "x@evil.test" }) }))
@@ -493,6 +494,60 @@ describe("R4 create by a token and by OIDC", () => {
       (await call(e, WRITE, "R4", { body: leo({ sendWelcome: true }) })).code,
     ).toBe("forbidden");
     const { sendWelcome: _s, ...body } = leo();
+    const prod = fakeEnv({ OA_ENV: "prod" });
+    expect(
+      (await call(prod, WRITE, "R4", { body: { ...body, testHooks: true } }))
+        .code,
+    ).toBe("forbidden");
+    // Cloud #84: ordinary staging slugs and rl-* slugs never pass admin-token
+    // testHooks admission; t-*, bus test slugs (e.g. bus1299-b) and exact
+    // staging STAGING_BUS_SLUGS entries (e.g. m2-walk) are eligible.
+    const busList = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    const allowlist = tokenTestHooksAllowlist({
+      OA_ENV: "staging",
+      STAGING_BUS_SLUGS: busList,
+    });
+    expect(allowlist).toEqual([
+      "rl-agents",
+      "bus1299-b",
+      "m2-walk",
+      "rl-busa",
+      "rl-busb",
+    ]);
+    expect(
+      tokenTestHooksAllowlist({ OA_ENV: "prod", STAGING_BUS_SLUGS: busList }),
+    ).toEqual([]);
+    for (const slug of ["t-smoke", "t-rehearsal", "bus1299-b", "bus-smoke"])
+      expect(isTokenTestHooksSlug(slug), slug).toBe(true);
+    expect(isTokenTestHooksSlug("m2-walk")).toBe(false);
+    expect(isTokenTestHooksSlug("m2-walk", allowlist)).toBe(true);
+    for (const slug of ["acme", "business", "bus", "busy", "rl-smoke", "t"])
+      expect(isTokenTestHooksSlug(slug, allowlist), slug).toBe(false);
+    expect(isTokenTestHooksSlug("rl-agents", allowlist)).toBe(false);
+    const eWithList = fakeEnv({ STAGING_BUS_SLUGS: busList });
+    for (const slug of ["acme", "business", "bus", "rl-agents", "rl-smoke"]) {
+      const refused = await call(eWithList, WRITE, "R4", {
+        body: { ...body, requestId: requestId(), slug, testHooks: true },
+      });
+      expect(refused.code, slug).toBe("forbidden");
+    }
+    expect(
+      (
+        await call(e, WRITE, "R4", {
+          body: {
+            ...body,
+            requestId: requestId(),
+            slug: "m2-walk",
+            testHooks: true,
+          },
+        })
+      ).code,
+    ).toBe("forbidden");
+    expect(
+      await row<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM jobs WHERE kind = 'create'",
+      ),
+    ).toEqual({ n: 0 });
     const r = await call(e, WRITE, "R4", { body });
     expect(r.status).toBe(202);
     expect(r.body.job.actor).toEqual({

@@ -35,8 +35,10 @@ import {
   event,
   NOW,
   seedCreate,
+  seedToken,
   stepRunner,
   TS,
+  ulid,
   V1,
   V2,
   type World,
@@ -493,10 +495,88 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
       );
   });
 
-  it("the 3.3 testHooks matrix: never a token or self-serve; OIDC needs it and an rl- slug", async () => {
-    await refusedWith(
-      seedCreate(w, { slug: "rl-tok", actor: "token", testHooks: true }),
+  it("creates and resumes a staging test-hooks install for an admin token, but refuses a separate token retry", async () => {
+    w.ctx.env.STAGING_BUS_SLUGS = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    for (const slug of ["t-token", "bus1299-b", "m2-walk"]) {
+      const seed = seedCreate(w, {
+        slug,
+        actor: "token",
+        testHooks: true,
+      });
+      const r = await run(w, seed.jobId, { twice: true });
+      expect(r.error, slug).toBeNull();
+      expect(w.job(seed.jobId)?.status, slug).toBe("done");
+      expect(plain(w, seed.installId, "TEST_DOMAIN")?.text, slug).toBe(
+        "oa-redline-a.fyi",
+      );
+    }
+
+    const failed = seedCreate(w, {
+      slug: "t-token-retry",
+      actor: "token",
+      testHooks: true,
+    });
+    w.db
+      .prepare(
+        "UPDATE jobs SET status = 'failed', error_code = 'cf_error', finished_at = ? WHERE id = ?",
+      )
+      .run(w.clock.t, failed.jobId);
+    const retryJobId = ulid();
+    const tokenId = seedToken(w);
+    w.db
+      .prepare(
+        `INSERT INTO jobs (id, kind, workflow, install_id, signup_id, actor_kind, actor_key, actor_label, token_id, request_id, body_hash, args, status, created_at, updated_at)
+VALUES (?, 'retry', 'provision_install', ?, ?, 'token', ?, 'token', ?, ?, 'h', '{}', 'queued', ?, ?)`,
+      )
+      .run(
+        retryJobId,
+        failed.installId,
+        failed.signupId,
+        `token:${retryJobId}`,
+        tokenId,
+        `req-${retryJobId}`,
+        w.clock.t,
+        w.clock.t,
+      );
+    w.db
+      .prepare(
+        "UPDATE signups SET job_id = ?, status = 'queued', error = NULL WHERE signup_id = ?",
+      )
+      .run(retryJobId, failed.signupId);
+    const rr = await refusedWith({
+      jobId: retryJobId,
+      signupId: failed.signupId,
+      installId: failed.installId,
+    });
+    expect(rr.log.find((l) => l.name === "recheck")?.error?.name).toBe(
+      "NonRetryableError",
     );
+  });
+
+  it("refuses a token test-hooks job on prod or on an ordinary staging slug before provisioning", async () => {
+    await refusedWith(
+      seedCreate(w, { slug: "m2-walk", actor: "token", testHooks: true }),
+    );
+    w.ctx.env.STAGING_BUS_SLUGS = "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb";
+    for (const slug of [
+      "acme",
+      "business",
+      "bus",
+      "busy",
+      "rl-agents",
+      "rl-tok",
+    ])
+      await refusedWith(
+        seedCreate(w, { slug, actor: "token", testHooks: true }),
+      );
+    w.ctx.env.OA_ENV = "prod";
+    for (const slug of ["t-prod", "bus1299-b", "m2-walk"])
+      await refusedWith(
+        seedCreate(w, { slug, actor: "token", testHooks: true }),
+      );
+  });
+
+  it("refuses self-serve test hooks and enforces the OIDC fixture rules", async () => {
     await refusedWith(
       seedCreate(w, {
         slug: "rl-ss",

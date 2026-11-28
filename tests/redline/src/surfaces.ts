@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CONTENT_POLICY,
+  type Policy,
   ROUTE_POLICY,
   TOOL_POLICY,
 } from "../../../apps/server/src/auth/route-policy-table.ts";
@@ -14,8 +15,6 @@ import {
   spaceExpected,
 } from "../../../apps/server/test/authz/expect.ts";
 import {
-  CONTENT_PUBLIC,
-  contentUnlisted,
   hiddenToolAnswer,
   needsCookie,
   ORG_SURFACES,
@@ -23,12 +22,9 @@ import {
   offeredTools,
   PROBE_SHARE_EMAIL,
   type Cred as ProbeCred,
-  PUBLIC_ROUTES,
   SPACE_SURFACES,
   type SpaceTarget,
   SURFACES,
-  uncovered,
-  unlisted,
 } from "../../../apps/server/test/authz/surfaces.ts";
 import {
   authorizeCode,
@@ -50,6 +46,7 @@ import {
   sessionCred,
   withCred,
 } from "./http.ts";
+import { interactiveRoutes, serverSources } from "./interactive-routes.ts";
 import { withLock } from "./locks.ts";
 import {
   crossDenied,
@@ -59,6 +56,7 @@ import {
   smokeAtB,
   type Verdict,
 } from "./refused.ts";
+import type { RouteCoverage } from "./report.ts";
 import { retryCase } from "./retry.ts";
 import type { Target } from "./targets.ts";
 
@@ -66,10 +64,9 @@ import type { Target } from "./targets.ts";
 // ORG_SURFACES and SPACE_SURFACES scripts/authz-probe.ts runs) driven
 // cross-install. Read-only probes run through crossProbe on a seeded world;
 // mutating probes through crossWrite on throwaways each install makes for
-// itself. The case list is derived from those lists, so a surface Backend
-// adds is a new case (and a required-case manifest entry) without a P5
-// change. A surface that can't run cross-install is dropped only through
-// DROPPED (an explicit, reasoned list the coverage check holds to the rule).
+// itself. The case list and required manifest entries are derived directly
+// from public's route-policy-table.ts, surfaces.ts and server sources at
+// PUBLIC_PIN; missing coverage is reported, never a pin/CI failure.
 
 /** What the probes need on one install (seeded by `seedWorld`). */
 export interface World {
@@ -259,15 +256,7 @@ export interface Citation {
 }
 
 const MATRIX = "apps/server/test/authz.surface-matrix.test.ts";
-const FOREIGN = "apps/server/test/redline.foreign-credential.test.ts";
-const FOREIGN_D =
-  "red line: another install's credential on the dropped directory surfaces";
 const INSTANCE: Citation = { file: MATRIX, describe: "instance routes" };
-/** Hosted billing's authz: owner and admin allowed, member, guest, anonymous refused. */
-const BILLING_AUTHZ: Citation = {
-  file: "apps/server/test/authz/plan.matrix.test.ts",
-  describe: "plan %s: billing and admin reads",
-};
 const ARTIFACTS: Citation = {
   file: MATRIX,
   describe: "artifact surfaces (sync stale 8 days)",
@@ -279,931 +268,19 @@ const BY_PERSONAL: Citation[] = [
   },
   { file: MATRIX, describe: "attack seeds: another member's personal space" },
 ];
-const DISCONNECT: Citation = {
-  file: MATRIX,
-  describe:
-    "directory disconnect: cookie sessions only, plus the platform system job",
-};
 
-// The decision route first shipped in v0.266.0. Classify it only in overlays
-// whose public policy table registers it.
-const proposalDecision = "POST /api/v1/bus/roles/proposals/:id";
-const hasProposalDecision = Object.hasOwn(ROUTE_POLICY, proposalDecision);
+let cachedInteractive: ReadonlySet<string> | undefined;
 
 /**
- * Routes and tools no case reaches, each only through a recorded drop
- * (DROPPED), with why. The coverage check fails on any other unreached
- * route and on an exclusion a case now reaches.
+ * Instance routes that require an interactive browser session, derived
+ * directly from public's apps/server/src at PUBLIC_PIN. Cached once per process.
  */
-const OWNER_ONLY =
-  "owner-only (the directory connection): no admin success leg";
-export const EXCLUDED_ROUTES: Readonly<Record<string, string>> = {
-  "GET /api/v1/directory/connect": OWNER_ONLY,
-  "POST /api/v1/directory/confirm": OWNER_ONLY,
-  "POST /api/v1/directory/cancel": OWNER_ONLY,
-  "POST /api/v1/directory/sync": OWNER_ONLY,
-  "POST /api/v1/directory/held/:groupId/confirm": OWNER_ONLY,
-  "POST /api/v1/directory/held/:groupId/snooze": OWNER_ONLY,
-  "DELETE /api/v1/directory/held/:groupId/snooze": OWNER_ONLY,
-  "POST /api/v1/directory/disconnect": OWNER_ONLY,
-  "DELETE /api/v1/directory": OWNER_ONLY,
-  "POST /api/v1/admin/broker-check":
-    "owner-only (the broker check): no admin success leg",
-  "POST /api/v1/notices/guest_summary/dismiss":
-    "owner-only (the guest summary notice, parity 2): no admin success leg",
-  "GET /api/v1/bus/ping":
-    "bus-off: 404 on every hosted install (the bus is off until #1299), the same as a refusal; no success leg",
-  "GET /api/v1/directory/callback":
-    "needs the Google directory connector (404 without it)",
-  "GET /api/v1/artifacts/:id/anon-id":
-    "anonymous callers only (signed-in callers get 401), so no tenant credential crosses",
-  "GET /api/v1/usage": "off on every hosted install (usage_off)",
-  // #839 real-only: no success leg, because the row each needs can't be made
-  // here. A deny-only case still runs A's session at B, but that alone doesn't
-  // cover the route (see `reached` in coverageGaps).
-  "DELETE /api/v1/members/:id/identities/google":
-    "real-only: a reset needs a member with a Google sign-in; A at B is deny-only",
-  "DELETE /api/v1/spaces/:id/mappings/:groupId":
-    "real-only: PUT refuses a mapping row while directory sync is off (409); A at B is deny-only",
-  "DELETE /api/v1/directory/org-mappings/:groupId":
-    "real-only: on rl-b no mapping row exists to delete, so the owner gets a 404 the same as a refusal; A at B is deny-only",
-  "PUT /api/v1/directory/restricted-groups/:groupId":
-    "real-only: on rl-b an unknown group is 404 past the owner rule, the same as a refusal; A at B is deny-only",
-  "DELETE /api/v1/directory/restricted-groups/:groupId":
-    "real-only: PUT refuses a restricted_groups row while directory sync is off (409), and the hook-seeded directory group is not that row; A at B is deny-only",
-  "POST /api/v1/members/:id/erase":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #1292: reached through share-notices.ts browserUser, not a direct call.
-  "PUT /api/v1/bus/share-notices":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #1291: a machine row comes only from the device flow, 404 on a hosted
-  // install until #1299.
-  "DELETE /api/v1/bus/machines/:id":
-    "real-only: no bus machine can be made on a hosted install (the device flow is 404 until #1299); A at B is deny-only",
-  // #1296: reached through bus/routes.ts roleWriter, not a direct call.
-  "POST /api/v1/bus/roles":
-    "interactive-only: a member moves or frees an away holder in a browser session; A at B is deny-only",
-  "PUT /api/v1/bus/roles":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/bus/roles/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  ...(hasProposalDecision && {
-    [proposalDecision]:
-      "interactive-only: the member answers the handover card in a browser session; A at B is deny-only",
-  }),
-  // #1567: reached through bus/routes.ts roleWriter, like the role writes.
-  "PUT /api/v1/bus/links":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/bus/links/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #1346: reached through bus/routes.ts roleWriter, like the link writes.
-  "PUT /api/v1/bus/reach":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/bus/reach/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #1372: offered only while the bus is on; never on a hosted install.
-  "tool:bus_role_propose":
-    "bus-off: the tool isn't offered on a hosted install (the bus is off until #1299)",
-  // #2263: passkeys. Every handler refuses anything but a browser session
-  // (routes/passkeys.ts member() calls interactiveSession).
-  "GET /api/v1/passkeys":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/register/begin":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/register/challenge":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/register/finish":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/:id/challenge":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "DELETE /api/v1/passkeys/:id":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/:id/cancel-removal":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "GET /api/v1/passkeys/settings":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "PATCH /api/v1/passkeys/settings":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  "POST /api/v1/passkeys/settings/challenge":
-    "interactive-only: a hook-minted session is not a fresh browser sign-in, so an allowed caller is answered reauth_required or no_passkey (or just the read); A at B is deny-only",
-  // #2545: the login settings. The owner rule is the PUT's, and the first
-  // visit flag is a write the red-line installs have no throwaway for.
-  "POST /api/v1/settings/login/first-invite-seen":
-    "real-only: it sets the caller's own first-invite flag, with no row to make on the red-line installs; A at B is deny-only",
-  "PUT /api/v1/settings/login":
-    "owner-only (the login settings): no admin success leg",
-  // Self-serve billing (hosted only): an allowed caller's request reaches
-  // billing (a Stripe session or a usage report), so no success leg runs
-  // live. A at B is deny-only.
-  "POST /api/v1/billing/checkout":
-    "interactive-only: an allowed request opens a Stripe Checkout session through billing, for a browser session only; A at B is deny-only",
-  "POST /api/v1/billing/portal":
-    "interactive-only: an allowed request opens a Stripe Customer Portal session through billing, for a browser session only; A at B is deny-only",
-  "POST /api/v1/billing/usage":
-    "interactive-only: an allowed request sends this month's usage report to billing, for a browser session only; A at B is deny-only",
-  // #2512: marking the For you inbox read (me.ts interactiveSession).
-  "POST /api/v1/me/inbox/read":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/inbox/read-all":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #2577: the receiver's held requests, a browser session only.
-  "GET /api/v1/me/agent-asks/held":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/agent-asks/held/:id/allow":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/agent-asks/held/:id/allow/challenge":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/agent-asks/held/:id/not-now":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // #2552: the bus version the instance names, and Install now.
-  "PUT /api/v1/bus/run-version":
-    "owner-only (the bus version the instance names): no admin success leg",
-  "POST /api/v1/bus/machines/:id/install-now":
-    "interactive-only: a hook-minted session is 404 here like a PAT, and no bus machine can be made on a hosted install; A at B is deny-only",
-  // #2819: the owner's pause switch, a cookie session only.
-  "PUT /api/v1/bus/updates-paused":
-    "owner-only (the bus pause switch): no admin success leg",
-  // v0.213.0: saving prefs, mutes and Later (#2512, #2762), and changing a
-  // browser push subscription (#2512 S5): the handlers refuse anything but a
-  // browser session.
-  "PUT /api/v1/me/notification-prefs":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/inbox/mutes":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/me/inbox/mutes/:kind/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/inbox/:id/later":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/push/subscriptions":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "PATCH /api/v1/me/push/subscriptions/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/me/push/subscriptions/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2),
-  // a browser session only.
-  "PUT /api/v1/me/agent-requests":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "GET /api/v1/me/agent-listens":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "PATCH /api/v1/me/agent-listens/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "DELETE /api/v1/me/agent-listens/:id":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  // v0.232.0: the teammates picker, the listens-asked flag, adding a listens-to
-  // entry and the asks history (#2577), a browser session only.
-  "GET /api/v1/me/teammates":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/onboarding/listens-asked":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "POST /api/v1/me/agent-listens":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-  "GET /api/v1/me/agent-asks/history":
-    "interactive-only: a hook-minted session is 404 here like a PAT; A at B is deny-only",
-};
-
-/**
- * #1204: instance routes that answer only an interactive sign-in
- * (apps/server/src/auth/authz.ts interactiveSession, called directly or
- * through a helper) and are not already dropped as owner-only. The suite's
- * hook sessions never pass that check, so each is a recorded drop with a
- * deny-only case. test/surfaces.test.ts reads apps/server/src and fails
- * unless this list is exactly the routes it finds (#1313).
- */
-export const INTERACTIVE_ONLY: readonly string[] = [
-  "POST /api/v1/members/:id/erase",
-  "PUT /api/v1/bus/share-notices",
-  "POST /api/v1/bus/roles",
-  "PUT /api/v1/bus/roles",
-  "DELETE /api/v1/bus/roles/:id",
-  ...(hasProposalDecision ? [proposalDecision] : []),
-  "PUT /api/v1/bus/links",
-  "DELETE /api/v1/bus/links/:id",
-  "PUT /api/v1/bus/reach",
-  "DELETE /api/v1/bus/reach/:id",
-  // #1300: the /bus page's share-notice form, as PUT R.shareNotices. A
-  // public-policy page route (PUBLIC_ROUTES), so no org surface or case:
-  // the suite probes scoped routes only (coverageGaps' `scoped`).
-  "POST /bus/share-notices",
-  // #1372: the role proposal confirm page, the same kind (PUBLIC_ROUTES).
-  "GET /bus/roles/confirm",
-  "POST /bus/roles/confirm/view",
-  "POST /bus/roles/confirm",
-  // #1567: the link confirm page, the same kind (PUBLIC_ROUTES).
-  "GET /bus/links/confirm",
-  "POST /bus/links/confirm/view",
-  "POST /bus/links/confirm",
-  // #1346: the reach confirm page, the same kind (PUBLIC_ROUTES).
-  "GET /bus/reach/confirm",
-  "POST /bus/reach/confirm/view",
-  "POST /bus/reach/confirm",
-  // #2263: passkeys, browser sessions only.
-  "GET /api/v1/passkeys",
-  "POST /api/v1/passkeys/register/begin",
-  "POST /api/v1/passkeys/register/challenge",
-  "POST /api/v1/passkeys/register/finish",
-  "POST /api/v1/passkeys/:id/challenge",
-  "DELETE /api/v1/passkeys/:id",
-  "POST /api/v1/passkeys/:id/cancel-removal",
-  "GET /api/v1/passkeys/settings",
-  "PATCH /api/v1/passkeys/settings",
-  "POST /api/v1/passkeys/settings/challenge",
-  // Hosted billing: Checkout, Portal and the usage report open Stripe or
-  // reach billing only for a person in a browser session (billing.ts
-  // requireBillingManager), so a hook-minted session is 404 here.
-  "POST /api/v1/billing/checkout",
-  "POST /api/v1/billing/portal",
-  "POST /api/v1/billing/usage",
-  // #2512: marking the For you inbox read, a person in a browser only (me.ts).
-  "POST /api/v1/me/inbox/read",
-  "POST /api/v1/me/inbox/read-all",
-  // #2577: the receiver's held requests from another person's agent; the
-  // handlers refuse anything but a browser session.
-  "GET /api/v1/me/agent-asks/held",
-  "POST /api/v1/me/agent-asks/held/:id/allow",
-  "POST /api/v1/me/agent-asks/held/:id/allow/challenge",
-  "POST /api/v1/me/agent-asks/held/:id/not-now",
-  // #2552: "Install now" for the caller's own machine, browser session only.
-  "POST /api/v1/bus/machines/:id/install-now",
-  // v0.213.0: prefs, mutes and Later (#2512, #2762) and push subscription
-  // changes (#2512 S5), a person in a browser only (me.ts, push.ts).
-  "PUT /api/v1/me/notification-prefs",
-  "POST /api/v1/me/inbox/mutes",
-  "DELETE /api/v1/me/inbox/mutes/:kind/:id",
-  "POST /api/v1/me/inbox/:id/later",
-  "POST /api/v1/me/push/subscriptions",
-  "PATCH /api/v1/me/push/subscriptions/:id",
-  "DELETE /api/v1/me/push/subscriptions/:id",
-  // v0.219.0: the agent-requests switch and the listens-to list (#2577 S2).
-  "PUT /api/v1/me/agent-requests",
-  "GET /api/v1/me/agent-listens",
-  "PATCH /api/v1/me/agent-listens/:id",
-  "DELETE /api/v1/me/agent-listens/:id",
-  // v0.232.0: the teammates picker, listens-asked, adding a listens-to entry
-  // and the asks history (#2577).
-  "GET /api/v1/me/teammates",
-  "POST /api/v1/me/onboarding/listens-asked",
-  "POST /api/v1/me/agent-listens",
-  "GET /api/v1/me/agent-asks/history",
-];
-
-const INBOX_READ: Citation = {
-  file: "apps/server/test/inbox.updates.test.ts",
-  describe:
-    "inbox items follow their comment, and the read routes are for a person",
-  test: "read and read-all are refused to a personal token, allowed to a session",
-};
-const HELD_ROUTES: Citation = {
-  file: "apps/server/test/agent-requests.test.ts",
-  describe: "the receiver's routes",
-  test: "are a browser session of the receiver only",
-};
-const PREFS_SAVE: Citation = {
-  file: "apps/server/test/notification-prefs.2512.test.ts",
-  describe: "GET and PUT /me/notification-prefs",
-  test: "saving takes a person in a browser: a token gets 404, anonymous 401; reading is open to a token",
-};
-const MUTES_CHANGE: Citation = {
-  file: "apps/server/test/inbox-mutes.2512.test.ts",
-  describe: "mutes",
-  test: "each person's own list; a token and anonymous can't change it",
-};
-const LATER_PERSON: Citation = {
-  file: "apps/server/test/inbox.needs-you.test.ts",
-  describe: "Later (#2762)",
-  test: "a personal token is refused, like the read routes",
-};
-const PUSH_CHANGE: Citation = {
-  file: "apps/server/test/push.2512.test.ts",
-  describe: "the routes",
-  test: "changes take a person in a browser: a token gets 404; deleting another's subscription is 404",
-};
-const AGENT_SWITCH: Citation = {
-  file: "apps/server/test/agent-requests.s2.2577.test.ts",
-  describe: "the switch",
-  test: "is saved by a browser session only: a token is refused and can read it; a bad body is 400",
-};
-const TEAMMATES: Citation = {
-  file: "apps/server/test/teammates.2577.test.ts",
-  describe: "GET R.meTeammates",
-  test: "refuses a token (404): a browser session only",
-};
-const LISTENS_ASKED: Citation = {
-  file: "apps/server/test/teammates.2577.test.ts",
-  describe: "POST R.meOnboardingListensAsked",
-  test: "refuses a token (404), a guest (403) and anonymous (401)",
-};
-const LISTENS_ADD: Citation = {
-  file: "apps/server/test/agent-listens-add.2577.test.ts",
-  describe: "POST agent-listens",
-  test: "refuses a token, an MCP-style bearer and a signed-out caller; a guest account cannot add",
-};
-const ASKS_HISTORY: Citation = {
-  file: "apps/server/test/agent-listens-add.2577.test.ts",
-  describe: "GET agent-asks/history",
-  test: "browser session only",
-};
-const AGENT_LISTENS: Citation = {
-  file: "apps/server/test/agent-requests.s2.2577.test.ts",
-  describe: "the listens-to list",
-  test: "a token or an agent can neither read nor change the list",
-};
-const RUN_VERSION_TESTS = "apps/server/test/bus/updates.2552.test.ts";
-/** #2819: the owner's pause switch. */
-const PAUSE_TESTS = "apps/server/test/bus/updates.follow.2552.test.ts";
-const ERASE_TESTS = "apps/server/test/members.erase.test.ts";
-const ERASE_AUTHZ = "POST R.memberErase(id): authorization";
-const SHARE_NOTICE_TESTS = "apps/server/test/follows.test.ts";
-const ROLE_TESTS = "apps/server/test/bus/roles.rest.test.ts";
-const ROLE_D = "roles REST (#1296)";
-const LINK_TESTS = "apps/server/test/bus/links.rest.test.ts";
-const LINK_D = "links REST (#1567)";
-const REACH_TESTS = "apps/server/test/bus/reach.rest.test.ts";
-const REACH_D = "reach REST (#1346)";
-const REACH_GATE_TESTS = "apps/server/test/bus/bus.billing-gate.test.ts";
-const REACH_GATE_D = "role reach for a plan-capped member under %s";
-const PROPOSAL_TESTS = "apps/server/test/bus/roles.proposals.test.ts";
-const PASSKEY_TESTS: readonly Citation[] = [
-  {
-    file: "apps/server/test/passkeys.test.ts",
-    describe: "registering a passkey",
-    test: "needs a fresh re-auth, in a browser session",
-  },
-  {
-    file: "apps/server/test/passkeys.test.ts",
-    describe: "the passkey settings",
-    test: "a token cannot read or change them",
-  },
-];
-const PROPOSAL_D = "role proposals over MCP (#1372)";
-
-/**
- * The surfaces dropped from the cross-install suite (P5 plan, Task 3b;
- * #655), each with the tests that cover it instead. The coverage check
- * fails unless this matches exactly the surfaces the rules drop, and
- * `citationGaps` fails unless every cited file, describe and test exists.
- */
-export const DROPPED: Readonly<
-  Record<string, { why: DropWhy; coveredBy: readonly Citation[] }>
-> = {
-  "artifact anon id": { why: "no-world-caller", coveredBy: [ARTIFACTS] },
-  "artifact content /p/": { why: "credential-free", coveredBy: [ARTIFACTS] },
-  "org GET /api/v1/directory/connect": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/confirm": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/cancel": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/sync": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/held/:groupId/confirm": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/held/:groupId/snooze": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org DELETE /api/v1/directory/held/:groupId/snooze": {
-    why: "owner-only",
-    coveredBy: [INSTANCE],
-  },
-  "org POST /api/v1/directory/disconnect": {
-    why: "owner-only",
-    coveredBy: [INSTANCE, DISCONNECT],
-  },
-  "org DELETE /api/v1/directory": {
-    why: "owner-only",
-    coveredBy: [INSTANCE, DISCONNECT],
-  },
-  "org POST /api/v1/admin/broker-check": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: FOREIGN,
-        describe: "red line: another install's credential on the broker check",
-        test: "POST admin/broker-check: another install's owner session or PAT is refused with no audit row and no broker call; this install's owner runs it",
-      },
-      {
-        file: "apps/server/test/broker-check.test.ts",
-        describe: "who may run it",
-      },
-    ],
-  },
-  "org POST /api/v1/notices/guest_summary/dismiss": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/notices.test.ts",
-        describe: "Me.notices.guestSummary (parity 2)",
-        test: "only the uncapped org owner sees it; others get 404 on dismiss",
-      },
-    ],
-  },
-  "org GET /api/v1/directory/callback": {
-    why: "no-directory",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: FOREIGN,
-        describe: FOREIGN_D,
-        test: "GET directory/callback: another install's session or PAT is refused with no audit row; this install's owner reaches the handler",
-      },
-    ],
-  },
-  "space mapping delete viewer": {
-    why: "no-directory",
-    coveredBy: [
-      BY_PERSONAL[0] as Citation,
-      {
-        file: FOREIGN,
-        describe: FOREIGN_D,
-        test: "DELETE a space viewer mapping: another install's session or PAT is refused and the mapping stays; this install's admin deletes it",
-      },
-    ],
-  },
-  "space mapping delete a manager mapping": {
-    why: "no-directory",
-    coveredBy: [
-      BY_PERSONAL[0] as Citation,
-      {
-        file: FOREIGN,
-        describe: FOREIGN_D,
-        test: "DELETE a space manager mapping: another install's session or PAT is refused and the mapping stays; this install's admin deletes it",
-      },
-    ],
-  },
-  "org GET /api/v1/usage": {
-    why: "feature-off",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/usage.test.ts",
-        describe: "usage_off",
-        test: "usage_off → GET /api/v1/usage 404 for the owner",
-      },
-    ],
-  },
-  "org DELETE /api/v1/members/:id/identities/google": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  // #1291: the matrix revokes each allowed caller's own D1 machine row.
-  "org DELETE /api/v1/bus/machines/:id": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  // The matrix erases a real removed, artifact-less person (erasableId) as
-  // each allowed caller in an Access session: 204 or the cell fails.
-  "org POST /api/v1/members/:id/erase": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: ERASE_TESTS,
-        describe: ERASE_AUTHZ,
-        test: "an admin's PAT or an AI agent's OAuth grant never erases (cookie sessions only); nothing changes",
-      },
-      {
-        file: ERASE_TESTS,
-        describe: "POST R.memberErase(id): what goes and what stays",
-        test: "audited once as user.erased by the admin, with no address or name in the row",
-      },
-    ],
-  },
-  // #1313: the matrix saves each allowed caller's own (empty) list in an
-  // Access session: 200 or the cell fails.
-  "org PUT /api/v1/bus/share-notices": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: SHARE_NOTICE_TESTS,
-        describe: "R.shareNotices",
-        test: "a member's own list: empty by default, replaced by PUT, deduplicated",
-      },
-      {
-        file: SHARE_NOTICE_TESTS,
-        describe: "R.shareNotices",
-        test: "a PAT reads but can't set it; guests and anonymous callers neither",
-      },
-    ],
-  },
-  "org POST /api/v1/bus/roles": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: ROLE_TESTS,
-        describe: ROLE_D,
-        test: "guards the away holder and lets the member %s its name",
-      },
-    ],
-  },
-  // #1296: the matrix sets a vacant role (200, or the named conflict while
-  // the caller has no bus) and removes one (204) in an Access session.
-  "org PUT /api/v1/bus/roles": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: ROLE_TESTS,
-        describe: ROLE_D,
-        test: "the member sets, lists, re-points, vacates and removes a role",
-      },
-      {
-        file: ROLE_TESTS,
-        describe: ROLE_D,
-        test: "a PAT may read but never set or remove; guests, capped and anonymous callers get nothing",
-      },
-    ],
-  },
-  "org DELETE /api/v1/bus/roles/:id": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: ROLE_TESTS,
-        describe: ROLE_D,
-        test: "another member reaches only their own hub: they can't see, set or remove the member's role",
-      },
-      {
-        file: ROLE_TESTS,
-        describe: ROLE_D,
-        test: "a PAT may read but never set or remove; guests, capped and anonymous callers get nothing",
-      },
-    ],
-  },
-  ...(hasProposalDecision && {
-    [`org ${proposalDecision}`]: {
-      why: "interactive-only",
-      coveredBy: [
-        INSTANCE,
-        {
-          file: "apps/server/test/bus/role-card.3132.test.ts",
-          describe: "the handover card (#3132)",
-          test: "no token answers for the member: a PAT, an OAuth grant or a machine token; guests and anonymous get nothing",
-        },
-        {
-          file: "apps/server/test/bus/role-card.3132.test.ts",
-          describe: "the handover card (#3132)",
-          test: "Yes moves the role to the asking session and audits confirmed and moved; it is single use",
-        },
-      ],
-    },
-  }),
-  // #1567: the matrix links two probe namespaces (200, or the named conflict
-  // while the caller has no bus) and removes one (204) in an Access session.
-  "org PUT /api/v1/bus/links": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: LINK_TESTS,
-        describe: LINK_D,
-        test: "the member links, lists, relinks idempotently and unlinks",
-      },
-      {
-        file: LINK_TESTS,
-        describe: LINK_D,
-        test: "a PAT may read but never link or unlink; a machine token, guests, capped and anonymous callers get nothing",
-      },
-    ],
-  },
-  "org DELETE /api/v1/bus/links/:id": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: LINK_TESTS,
-        describe: LINK_D,
-        test: "another member reaches only their own hub",
-      },
-      {
-        file: LINK_TESTS,
-        describe: LINK_D,
-        test: "a PAT may read but never link or unlink; a machine token, guests, capped and anonymous callers get nothing",
-      },
-    ],
-  },
-  // #1346: the matrix grants a role reach (200, or the named conflict while
-  // the caller has no bus or no such role) and removes one (204) in an Access
-  // session. PUT is also refused to a plan-capped member (busConfigCap); DELETE
-  // stays open under a cap, so the gate test covers both.
-  "org PUT /api/v1/bus/reach": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: REACH_TESTS,
-        describe: REACH_D,
-        test: "the member grants, lists, regrants idempotently and removes",
-      },
-      {
-        file: REACH_TESTS,
-        describe: REACH_D,
-        test: "a PAT may read but never grant or remove; a machine token, guests, restricted and anonymous callers get nothing",
-      },
-      {
-        file: REACH_GATE_TESTS,
-        describe: REACH_GATE_D,
-        test: "cannot grant reach, but can still read and remove an existing grant",
-      },
-    ],
-  },
-  "org DELETE /api/v1/bus/reach/:id": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: REACH_TESTS,
-        describe: REACH_D,
-        test: "another member reaches only their own hub",
-      },
-      {
-        file: REACH_TESTS,
-        describe: REACH_D,
-        test: "a PAT may read but never grant or remove; a machine token, guests, restricted and anonymous callers get nothing",
-      },
-      {
-        file: REACH_GATE_TESTS,
-        describe: REACH_GATE_D,
-        test: "cannot grant reach, but can still read and remove an existing grant",
-      },
-    ],
-  },
-  "org POST /api/v1/billing/checkout": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, BILLING_AUTHZ],
-  },
-  "org POST /api/v1/billing/portal": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, BILLING_AUTHZ],
-  },
-  "org POST /api/v1/billing/usage": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, BILLING_AUTHZ],
-  },
-  "org GET /api/v1/passkeys": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/register/begin": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/register/challenge": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/register/finish": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/:id/challenge": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org DELETE /api/v1/passkeys/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/:id/cancel-removal": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org GET /api/v1/passkeys/settings": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org PATCH /api/v1/passkeys/settings": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  "org POST /api/v1/passkeys/settings/challenge": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ...PASSKEY_TESTS],
-  },
-  // #2545: the login settings (public login-api.2520.test.ts).
-  "org POST /api/v1/settings/login/first-invite-seen": {
-    why: "real-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/login-api.2520.test.ts",
-        describe: "login settings",
-        test: "first-invite-seen is 204, per person, and sets the flag",
-      },
-    ],
-  },
-  "org PUT /api/v1/settings/login": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/login-api.2520.test.ts",
-        describe: "PUT login settings",
-        test: "no fresh login: 401 reauth_required",
-      },
-    ],
-  },
-  "org DELETE /api/v1/spaces/:id/mappings/:groupId": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  "org PUT /api/v1/spaces/:id/mappings/:groupId": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  "org DELETE /api/v1/directory/org-mappings/:groupId": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  "org PUT /api/v1/directory/restricted-groups/:groupId": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  "org DELETE /api/v1/directory/restricted-groups/:groupId": {
-    why: "real-only",
-    coveredBy: [INSTANCE],
-  },
-  // #1299: the matrix calls it as every caller (bus on in the test pool); its
-  // own tests prove the 404 while the bus is off and the reserved hub name.
-  "org GET /api/v1/bus/ping": {
-    why: "bus-off",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: "apps/server/test/bus/bus.routes.test.ts",
-        describe: "GET /api/v1/bus/ping (#1299)",
-        test: "is 404 while the bus is off, before any hub is touched: unbound, or hosted without FEATURES bus",
-      },
-      {
-        file: "apps/server/test/bus/bus.routes.test.ts",
-        describe: "GET /api/v1/bus/ping (#1299)",
-        test: "uses the reserved hub name, never the caller's hub",
-      },
-    ],
-  },
-  // #1372: the matrix calls it as every caller (bus on in the test pool);
-  // its own tests prove it only proposes.
-  "artifact mcp bus_role_propose": {
-    why: "bus-off",
-    coveredBy: [
-      ARTIFACTS,
-      {
-        file: PROPOSAL_TESTS,
-        describe: PROPOSAL_D,
-        test: "only the caller's own hub and agents: another member's agent can't be targeted",
-      },
-      {
-        file: PROPOSAL_TESTS,
-        describe: PROPOSAL_D,
-        test: "no bus: no_bus before a machine connected; bus off or hosted: no tool and no confirm page",
-      },
-    ],
-  },
-  "space patch {} (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  "space delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  "space member put (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  "space member delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  "space mapping put (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  "space mapping delete (personal)": { why: "nobody", coveredBy: BY_PERSONAL },
-  // #2512 (public inbox.updates.test.ts): read and read-all, a person only.
-  "org POST /api/v1/me/inbox/read": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, INBOX_READ],
-  },
-  "org POST /api/v1/me/inbox/read-all": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, INBOX_READ],
-  },
-  // #2577 (public agent-requests.test.ts): the receiver's routes.
-  "org GET /api/v1/me/agent-asks/held": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, HELD_ROUTES],
-  },
-  "org POST /api/v1/me/agent-asks/held/:id/allow": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, HELD_ROUTES],
-  },
-  "org POST /api/v1/me/agent-asks/held/:id/allow/challenge": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, HELD_ROUTES],
-  },
-  "org POST /api/v1/me/agent-asks/held/:id/not-now": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, HELD_ROUTES],
-  },
-  // #2552 (public bus/updates.2552.test.ts).
-  "org PUT /api/v1/bus/run-version": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: RUN_VERSION_TESTS,
-        describe: "PUT R.busRunVersion: the owner names it (#2552)",
-        test: "admins, members, guests, a PAT and anonymous callers are refused, writing nothing",
-      },
-    ],
-  },
-  "org POST /api/v1/bus/machines/:id/install-now": {
-    why: "interactive-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: RUN_VERSION_TESTS,
-        describe:
-          "POST R.busMachineInstallNow: the machine's own member (#2552)",
-        test: "another member's machine, an unknown id, a PAT or anonymous: nothing sent",
-      },
-    ],
-  },
-  "org PUT /api/v1/bus/updates-paused": {
-    why: "owner-only",
-    coveredBy: [
-      INSTANCE,
-      {
-        file: PAUSE_TESTS,
-        describe: "pause (#2552)",
-        test: "PUT R.busUpdatesPaused: the owner only, in a cookie session, audited",
-      },
-    ],
-  },
-  // v0.213.0 (#2512, #2762): each a person in a browser only.
-  "org PUT /api/v1/me/notification-prefs": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, PREFS_SAVE],
-  },
-  "org POST /api/v1/me/inbox/mutes": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, MUTES_CHANGE],
-  },
-  "org DELETE /api/v1/me/inbox/mutes/:kind/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, MUTES_CHANGE],
-  },
-  "org POST /api/v1/me/inbox/:id/later": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, LATER_PERSON],
-  },
-  "org POST /api/v1/me/push/subscriptions": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, PUSH_CHANGE],
-  },
-  "org PATCH /api/v1/me/push/subscriptions/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, PUSH_CHANGE],
-  },
-  "org DELETE /api/v1/me/push/subscriptions/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, PUSH_CHANGE],
-  },
-  // v0.219.0 (#2577 S2): a person in a browser only.
-  "org PUT /api/v1/me/agent-requests": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, AGENT_SWITCH],
-  },
-  "org GET /api/v1/me/agent-listens": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, AGENT_LISTENS],
-  },
-  "org PATCH /api/v1/me/agent-listens/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, AGENT_LISTENS],
-  },
-  "org DELETE /api/v1/me/agent-listens/:id": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, AGENT_LISTENS],
-  },
-  // v0.232.0 (#2577): a person in a browser only.
-  "org GET /api/v1/me/teammates": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, TEAMMATES],
-  },
-  "org POST /api/v1/me/onboarding/listens-asked": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, LISTENS_ASKED],
-  },
-  "org POST /api/v1/me/agent-listens": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, LISTENS_ADD],
-  },
-  "org GET /api/v1/me/agent-asks/history": {
-    why: "interactive-only",
-    coveredBy: [INSTANCE, ASKS_HISTORY],
-  },
-};
+export function interactiveOrgRoutes(): ReadonlySet<string> {
+  if (!cachedInteractive) {
+    cachedInteractive = new Set(interactiveRoutes(serverSources()));
+  }
+  return cachedInteractive;
+}
 
 /**
  * #1137 group B: the one case per credential kind that keeps a live
@@ -1377,7 +454,6 @@ export function citationGaps(
 ): string[] {
   return resolveCitations(
     [
-      ...Object.entries(DROPPED).map(([n, d]) => [n, d.coveredBy] as const),
       ...Object.entries(MATRIX_AT_B).map(
         ([f, coveredBy]) => [`A at B (${f})`, coveredBy] as const,
       ),
@@ -1430,12 +506,13 @@ export interface Derived {
   unsupported?: string[];
 }
 
-/** Every probe as cases or drops, by rule. Pure: derived from Backend's lists. */
-export function derive(): Derived {
+/** Every probe as cases or drops, by rule. Pure: derived from public's tables and server sources. */
+export function derive(o: { interactive?: ReadonlySet<string> } = {}): Derived {
   // Legs are set last, by the rule in legsOf.
   const cases: Omit<ProbeCase, "legs">[] = [];
   const dropped: Dropped[] = [];
   const unsupported: string[] = [];
+  const interactiveSet = o.interactive ?? interactiveOrgRoutes();
   const drop = (name: string, routes: readonly string[], why: DropWhy) =>
     dropped.push({ name, routes, why, reason: WHY[why] });
   const variants = (cookieOnly: boolean): Variant[] =>
@@ -1514,8 +591,8 @@ export function derive(): Derived {
       drop(name, [s.route], "no-directory");
       continue;
     }
-    // An instance route that writes has no throwaway to write to: it must
-    // be dropped with a reason, or the coverage check fails.
+    // An instance route that writes has no throwaway to write to: leave it
+    // unsupported so coverageReport lists it as uncovered.
     if (s.mutates) {
       unsupported.push(name);
       continue;
@@ -1525,7 +602,7 @@ export function derive(): Derived {
     // none exists; a realOnly route with no throwaway is a recorded drop.
     // #1204: an interactive-only route is the same, whatever its refusal.
     const fresh = ORG_FRESH[s.route];
-    const interactive = INTERACTIVE_ONLY.includes(s.route);
+    const interactive = interactiveSet.has(s.route);
     if ((s.realOnly === true || interactive) && !fresh) {
       drop(name, [s.route], interactive ? "interactive-only" : "real-only");
       // No success leg, but the tenant boundary is still checked: A's session
@@ -1652,79 +729,112 @@ function need<T>(v: T | undefined): T {
   return v;
 }
 
+export const SURFACES_FILE = "live/surfaces.test.ts";
+export const SURFACES_DESCRIBE = "surface probes (cross-install)";
+
 export const probeCases = (): ProbeCase[] => derive().cases;
 
-/**
- * What the suite misses: a ROUTE_POLICY key no probe lists (or that is not
- * classified public), an artifact-scoped route or MCP tool no artifact
- * surface lists, a content route nobody probes, a scoped route, tool or
- * content route no case reaches and no recorded drop covers, a drop the
- * rules make that DROPPED doesn't record (or records differently), or a
- * case list shorter than the policy manifest. Empty when covered.
- */
-export function coverageGaps(
+/** Required manifest entries for live/surfaces.test.ts, derived directly from public. */
+export function surfaceManifestCases(
   d: Derived = derive(),
-  /** The matrix's foreign callers (a parameter only so a test can drop one). */
-  foreign: readonly string[] = FOREIGN_CALLERS,
-): string[] {
-  const { cases, dropped, unsupported = [] } = d;
-  const recorded = dropped.filter((x) => DROPPED[x.name]?.why === x.why);
-  // Only a case with success legs covers a route: a drop never does, and a
-  // deny-only case or the OAuth smoke has none (a deny-only route stays a
-  // recorded drop).
+): { file: string; name: string }[] {
+  return d.cases.map((c) => ({
+    file: SURFACES_FILE,
+    name: `${SURFACES_DESCRIBE} > ${c.name}`,
+  }));
+}
+
+export interface PolicyTables {
+  routes: Readonly<Record<string, Policy>>;
+  tools: Readonly<Record<string, Policy>>;
+  content: Readonly<Record<string, Policy>>;
+}
+
+const PUBLIC_POLICY_TABLES: PolicyTables = {
+  routes: ROUTE_POLICY,
+  tools: TOOL_POLICY,
+  content: CONTENT_POLICY,
+};
+
+/**
+ * Route coverage against public's route-policy-table.ts at PUBLIC_PIN:
+ * how many scoped routes, MCP tools and content routes have a live probe,
+ * how many run deny-only or are dropped by rule, and which have no probe yet.
+ * Reported in the red-line run report; missing coverage never fails CI or a pin.
+ */
+export function coverageReport(
+  d: Derived = derive(),
+  policies: PolicyTables = PUBLIC_POLICY_TABLES,
+): RouteCoverage {
+  const { cases, dropped } = d;
   const reached = new Set(
     cases.filter((c) => c.legs !== "atB").flatMap((c) => c.routes),
   );
-  const droppedRoutes = new Set(recorded.flatMap((x) => x.routes));
-  const derivedNames = new Set(dropped.map((x) => x.name));
-  const scoped = Object.keys(ROUTE_POLICY).filter(
-    (k) => !PUBLIC_ROUTES.includes(k),
+  const denyOnlyRoutes = new Set(
+    cases.filter((c) => c.denyOnly).flatMap((c) => c.routes),
   );
-  const tools = Object.keys(TOOL_POLICY).map((t) => `tool:${t}`);
-  const content = Object.keys(CONTENT_POLICY)
-    .filter((k) => !CONTENT_PUBLIC.includes(k))
-    .map((k) => `content:${k}`);
-  const missing = [...scoped, ...tools, ...content].filter(
-    (k) => !reached.has(k),
-  );
-  const gaps = [
-    ...unsupported.map(
-      (n) => `mutating instance route with no throwaway: ${n}`,
-    ),
-    ...unlisted(ROUTE_POLICY).map((k) => `unclassified route: ${k}`),
-    ...uncovered(SURFACES, ROUTE_POLICY, TOOL_POLICY).map(
-      (k) => `no artifact surface: ${k}`,
-    ),
-    ...contentUnlisted(Object.keys(CONTENT_POLICY)).map(
-      (k) => `no content probe: ${k}`,
-    ),
-    ...dropped
-      .filter((x) => DROPPED[x.name]?.why !== x.why)
-      .map((x) => `drop not recorded in DROPPED: ${x.name} (${x.why})`),
-    ...Object.keys(DROPPED)
-      .filter((n) => !derivedNames.has(n))
-      .map((n) => `DROPPED lists a surface the rules don't drop: ${n}`),
-    ...Object.entries(DROPPED)
-      .filter(([, v]) => v.coveredBy.length === 0)
-      .map(([n]) => `drop without a covering test: ${n}`),
-    // A route no case reaches must be an explicit exclusion, reached by a
-    // recorded drop; an exclusion a case reaches (or no drop backs) is stale.
-    ...missing
-      .filter((k) => !(k in EXCLUDED_ROUTES))
-      .map((k) => `no case: ${k}`),
-    ...Object.keys(EXCLUDED_ROUTES)
-      .filter((k) => reached.has(k) || !droppedRoutes.has(k))
-      .map((k) => `stale exclusion: ${k}`),
-    ...atBGaps(cases, foreign),
-    ...atAGaps(cases),
-  ];
-  // The probe list is never shorter than the policy manifest it covers.
-  const n = cases.length + Object.keys(EXCLUDED_ROUTES).length;
-  if (n < scoped.length + tools.length)
-    gaps.push(
-      `${n} cases and exclusions < ${scoped.length} scoped routes + ${tools.length} tools`,
-    );
-  return gaps;
+  const dropWhyByRoute = new Map<string, DropWhy>();
+  for (const x of dropped)
+    for (const r of x.routes) dropWhyByRoute.set(r, x.why);
+
+  const scoped = Object.entries(policies.routes)
+    .filter(([, p]) => !("public" in p || "signed" in p))
+    .map(([k]) => k);
+  const tools = Object.keys(policies.tools).map((t) => `tool:${t}`);
+  const content = Object.entries(policies.content)
+    .filter(([, p]) => !("public" in p))
+    .map(([k]) => `content:${k}`);
+  const targets = [...scoped, ...tools, ...content];
+
+  let probed = 0;
+  let denyOnly = 0;
+  let droppedCount = 0;
+  const uncovered: string[] = [];
+  const byDropWhy: Partial<Record<DropWhy, string[]>> = {};
+  const recordDrop = (why: DropWhy, route: string) => {
+    const list = byDropWhy[why] ?? [];
+    list.push(route);
+    byDropWhy[why] = list;
+  };
+
+  for (const k of targets) {
+    if (reached.has(k)) {
+      probed++;
+    } else if (denyOnlyRoutes.has(k)) {
+      denyOnly++;
+    } else {
+      const why = dropWhyByRoute.get(k);
+      if (why) {
+        droppedCount++;
+        recordDrop(why, k);
+      } else {
+        uncovered.push(k);
+      }
+    }
+  }
+  uncovered.sort();
+  for (const list of Object.values(byDropWhy)) list?.sort();
+
+  return {
+    total: targets.length,
+    probed,
+    denyOnly,
+    dropped: droppedCount,
+    uncovered,
+    byDropWhy,
+  };
+}
+
+/**
+ * Structural invariants for the live A-at-B smokes and A-at-A positive controls
+ * (#1137 group B, #1235). Independent of which public routes exist.
+ */
+export function smokeGaps(
+  cases: readonly ProbeCase[] = derive().cases,
+  /** The matrix's foreign callers (a parameter only so a test can drop one). */
+  foreign: readonly string[] = FOREIGN_CALLERS,
+): string[] {
+  return [...atBGaps(cases, foreign), ...atAGaps(cases)];
 }
 
 /**

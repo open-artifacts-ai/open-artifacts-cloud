@@ -7,7 +7,13 @@ import {
   type Verdicts,
 } from "../src/capture.ts";
 import { COMBINE_MAX_AGE_MS, combine } from "../src/combine.ts";
-import { buildReport, type CaseResult, type Report } from "../src/report.ts";
+import {
+  buildReport,
+  type CaseResult,
+  formatReport,
+  type Report,
+  type RouteCoverage,
+} from "../src/report.ts";
 import type { FlowName } from "../src/signin.ts";
 
 const NOW = Date.UTC(2026, 9, 27, 12);
@@ -84,6 +90,29 @@ describe("combine (the gate binding)", () => {
       runNonce: "n".repeat(43),
       verdictsFinishedAt: NOW - 3_500_000,
     });
+  });
+
+  it("preserves CI route coverage in the combined JSON and text report", () => {
+    const coverage: RouteCoverage = {
+      total: 212,
+      probed: 141,
+      denyOnly: 51,
+      dropped: 19,
+      uncovered: ["GET /api/v1/new-unprobed"],
+      byDropWhy: { "owner-only": ["PUT /api/v1/settings/login"] },
+    };
+    const r = combine({ ...ciReport(), coverage }, verdicts(), NOW);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.report.gate.passed).toBe(true);
+    expect(r.report.coverage).toEqual(coverage);
+    const text = formatReport(r.report);
+    expect(text).toContain(
+      "Route coverage: 141/212 probed, 51 deny-only, 19 dropped, 1 uncovered",
+    );
+    expect(text).toContain(
+      "Uncovered routes (report only):\n  GET /api/v1/new-unprobed",
+    );
   });
 
   it("a failed leg makes the case fail with its reason and leg; a flow not captured is unproven", () => {

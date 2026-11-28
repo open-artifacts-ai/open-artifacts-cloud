@@ -1,3 +1,4 @@
+import { parseBusSlugs } from "@oa/provision";
 import type { TokenKind } from "@oa/provisioning-contract";
 import type { Principal } from "./principal.js";
 
@@ -41,3 +42,23 @@ export const isFixtureSlugRefused = (
   p.kind !== "oidc" &&
   p.kind !== "test-admin" &&
   !isTestUser(p, env);
+
+/**
+ * Staging test-install slugs eligible for admin-token test hooks (cloud #84):
+ * disposable `t-*` fixtures and bus test fixtures (`bus-*` or `bus<digits>*`,
+ * e.g. `bus1299-b`, never ordinary words like `business` or `bus`), plus any
+ * explicit staging allowlist (such as `STAGING_BUS_SLUGS`, e.g. `m2-walk`).
+ * Red-line `rl-*` slugs stay reserved above.
+ */
+export const TOKEN_TEST_HOOKS_SLUG_RE = /^(?:t-|bus(?:-|\d))/;
+export const tokenTestHooksAllowlist = (env: {
+  OA_ENV: string;
+  STAGING_BUS_SLUGS?: string;
+}): string[] =>
+  env.OA_ENV === "staging" ? parseBusSlugs(env.STAGING_BUS_SLUGS) : [];
+export const isTokenTestHooksSlug = (
+  slug: string,
+  allowlist: readonly string[] = [],
+): boolean =>
+  !slug.startsWith(FIXTURE_SLUG_PREFIX) &&
+  (TOKEN_TEST_HOOKS_SLUG_RE.test(slug) || allowlist.includes(slug));

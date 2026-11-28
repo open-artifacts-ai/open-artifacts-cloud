@@ -24,9 +24,7 @@ import {
   plan,
   planDirect,
   rewritePin,
-  route,
   STALE_PR_MS,
-  SURFACES_FILES,
   stage,
 } from "./pin-bump.ts";
 import {
@@ -1045,21 +1043,17 @@ describe("pin-bump.yml", () => {
     expect(jobs.prepare.permissions.contents).toBe("read");
   });
 
-  it("prepare sends out only the lockfile and the surfaces plan", () => {
+  it("prepare sends out only the lockfile (no surfaces regeneration)", () => {
     const ups = stepsOf("prepare").filter((s) =>
       s.uses?.startsWith("actions/upload-artifact@"),
     );
-    expect(ups).toHaveLength(2);
+    expect(ups).toHaveLength(1);
     expect(ups[0].with.path).toMatch(/\/pnpm-lock\.yaml$/);
-    expect(ups[1].with.path).toMatch(/\/regen\/plan\.json$/);
-    expect(ups[1].with.name).toBe(
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      "pin-bump-regen-${{ steps.plan.outputs.tag }}",
-    );
     expect(ups[0].with.name).toBe(
       // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
       "pin-bump-lock-${{ steps.plan.outputs.tag }}",
     );
+    expect(JSON.stringify(jobs.prepare)).not.toContain("redline-regen");
   });
 
   it("open never checks out or runs the public tree, and never installs", () => {
@@ -1082,15 +1076,18 @@ describe("pin-bump.yml", () => {
     expect(co[0].with.ref).toBe("${{ github.sha }}");
   });
 
-  it("open plans again itself and takes the lockfile by its own tag, as data", () => {
+  it("open plans again itself and takes only the lockfile by its own tag, as data", () => {
     const open = stepsOf("open");
     const names = open.map((s) => s.id ?? s.name ?? s.uses);
     expect(names.indexOf("plan")).toBeGreaterThan(-1);
-    const dl = open.find((s) =>
+    const dls = open.filter((s) =>
       s.uses?.startsWith("actions/download-artifact@"),
     );
+    expect(dls).toHaveLength(1);
+    const dl = dls[0];
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
     expect(dl.with.name).toBe("pin-bump-lock-${{ steps.plan.outputs.tag }}");
+    expect(JSON.stringify(jobs.open)).not.toContain("redline-regen");
     // the token is minted only after the lockfile is in place
     const at = (f: (s: Step) => boolean) => open.findIndex(f);
     const iApp = at((s) => s.id === "app");
@@ -1103,52 +1100,6 @@ describe("pin-bump.yml", () => {
     const take = open.find((s) => s.name === "Take the lockfile as data");
     expect(take.run).toContain("-L");
     expect(take.run).toContain("10000000");
-  });
-
-  it("open applies the surfaces plan as data, with main's own script, before the token is minted", () => {
-    const open = stepsOf("open");
-    const names = open.map((s) => s.id ?? s.name ?? s.uses);
-    const apply = open.find(
-      (s) => s.name === "Apply the surfaces plan as data",
-    );
-    expect(apply.run).toContain("-L");
-    expect(apply.run).toContain("2000000");
-    expect(apply.run).toContain(
-      "node --experimental-strip-types --no-warnings tests/redline/scripts/redline-regen.ts apply --plan",
-    );
-    expect(open.indexOf(apply)).toBeLessThan(names.indexOf("app"));
-    const dl = open.filter((s) =>
-      s.uses?.startsWith("actions/download-artifact@"),
-    );
-    expect(dl.map((s) => s.with.name)).toEqual([
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      "pin-bump-lock-${{ steps.plan.outputs.tag }}",
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      "pin-bump-regen-${{ steps.plan.outputs.tag }}",
-    ]);
-  });
-
-  it("prepare plans the surfaces port after the lockfile, with an install that runs no scripts", () => {
-    const prep = stepsOf("prepare");
-    const plan = prep.find((s) => s.name?.startsWith("Plan the surfaces port"));
-    expect(plan.run).toContain(
-      "pnpm install --frozen-lockfile --ignore-scripts",
-    );
-    expect(plan.run).toContain("scripts/redline-regen.ts plan --out");
-    expect(plan["working-directory"]).toBe("public");
-    const lock = prep.findIndex(
-      (s) => s.name === "Regenerate the merged lockfile",
-    );
-    expect(prep.indexOf(plan)).toBeGreaterThan(lock);
-    // The lockfile leaves before any public build code runs (v4 artifacts can't
-    // be overwritten by name, so the build can't swap it).
-    const upLock = prep.findIndex(
-      (s) =>
-        s.uses?.startsWith("actions/upload-artifact@") &&
-        s.with?.name?.startsWith("pin-bump-lock-"),
-    );
-    expect(upLock).toBeGreaterThan(lock);
-    expect(upLock).toBeLessThan(prep.indexOf(plan));
   });
 
   it("writes only with the release App's token, scoped to contents and PRs", () => {
@@ -1185,10 +1136,10 @@ describe("pin-bump.yml", () => {
     expect(push.env.COMMIT).toBe("${{ steps.commit.outputs.commit }}");
     for (const call of ["git/refs/heads/$BRANCH", "git/refs"])
       expect(push.run).toContain(call);
-    // Only the pin files, the lockfile and the three surfaces-port files the plan
-    // regenerates, as regular files, on top of the main sha the job checked out.
+    // Only the pin files and the lockfile, as regular files, on top of the main
+    // sha the job checked out.
     expect(c.run).toContain(
-      "for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts; do",
+      "for f in PUBLIC_PIN SYNCED_FROM pnpm-lock.yaml; do",
     );
     expect(c.run).toContain('mode: "100644"');
     expect(c.run).toContain("parents: [$p]");
@@ -1212,92 +1163,55 @@ describe("pin-bump.yml", () => {
 
   describe("direct mode (PIN_BUMP_DIRECT, cloud #264)", () => {
     // A step's `if` or a MODE expression is plain JS once its contexts are bound.
-    const evalExpr = (
-      expr: string,
-      direct: string | null,
-      route: Record<string, string> = {},
-    ) =>
+    const evalExpr = (expr: string, direct: string | null) =>
       new Function(
         "vars",
         "steps",
         `return ${String(expr)
           .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
           .replaceAll("vars.PIN_BUMP_DIRECT", "vars.direct")};`,
-      )(
-        { direct },
-        { plan: { outputs: { bump: "true" } }, route: { outputs: route } },
-      );
-    const runs = (direct: string | null, route: Record<string, string>) =>
+      )({ direct }, { plan: { outputs: { bump: "true" } } });
+    const runs = (direct: string | null) =>
       stepsOf("open")
-        .filter((s) => !s.if || evalExpr(s.if, direct, route))
+        .filter((s) => !s.if || evalExpr(s.if, direct))
         .map((s) => s.id ?? s.name ?? s.uses);
-    const PR = { route: "pr", pr: "true" };
-    const DIRECT = { route: "direct", pr: "false" };
     const STAGE = "Stage the pin for CI (direct mode)";
 
-    it("unset (or not exactly on), the plan is today's and the route passes the PR plan through", () => {
+    it("unset (or not exactly on), the plan is today's PR mode", () => {
       for (const v of [null, "", "off", "ON"]) {
         for (const j of ["prepare", "open"])
           expect(evalExpr(step(j, "plan").env.MODE, v)).toBe("plan");
-        expect(evalExpr(step("open", "route").env.DIRECT, v)).toBe("off");
       }
       expect(landJobs.land.if).toContain("vars.PIN_BUMP_DIRECT == 'on'");
     });
 
-    it("the PR route pushes the branch and opens the PR, and stages nothing", () => {
-      const names = runs(null, PR);
+    it("the PR mode pushes the branch and opens the PR, and stages nothing", () => {
+      const names = runs(null);
       expect(names).toContain("commit");
       expect(names).toContain("Push the branch");
       expect(names).toContain("Open the PR (never armed)");
       expect(names).not.toContain(STAGE);
+      const push = stepsOf("open").find((s) => s.name === "Push the branch");
+      const pr = stepsOf("open").find(
+        (s) => s.name === "Open the PR (never armed)",
+      );
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(push.env.BRANCH).toBe("${{ steps.plan.outputs.branch }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(pr.env.BRANCH).toBe("${{ steps.plan.outputs.branch }}");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
+      expect(pr.env.SUPERSEDE).toBe("${{ steps.plan.outputs.supersede }}");
     });
 
-    it("the direct route stages on pin-land and never pushes a PR branch, opens a PR or moves main", () => {
-      const names = runs("on", DIRECT);
+    it("the direct mode stages on pin-land and never pushes a PR branch, opens a PR or moves main", () => {
+      const names = runs("on");
       expect(names).toContain("commit");
       expect(names).not.toContain("Push the branch");
       expect(names).not.toContain("Open the PR (never armed)");
       expect(names).toContain(STAGE);
       for (const j of ["prepare", "open"])
         expect(evalExpr(step(j, "plan").env.MODE, "on")).toBe("plan-direct");
-      expect(evalExpr(step("open", "route").env.DIRECT, "on")).toBe("on");
       expect(JSON.stringify(jobs.open)).not.toContain("pin-bump.ts land");
-    });
-
-    it("a PR route with nothing to open commits nothing", () => {
-      const names = runs("on", { route: "pr", pr: "false" });
-      for (const n of [
-        "commit",
-        "Push the branch",
-        "Open the PR (never armed)",
-        STAGE,
-      ])
-        expect(names).not.toContain(n);
-    });
-
-    it("the route decides on the surfaces port, before the token is minted", () => {
-      const open = stepsOf("open");
-      const r = step("open", "route");
-      expect(r.run).toContain(
-        "git diff --quiet HEAD -- tests/redline/live/manifest.json tests/redline/test/cases-added.ts tests/redline/test/surfaces.test.ts || surfaces=changed",
-      );
-      expect(r.run).toContain("pin-bump.ts route");
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      expect(r.env.GH_TOKEN).toBe("${{ github.token }}");
-      expect(open.indexOf(r)).toBeGreaterThan(
-        open.findIndex((s) => s.name === "Apply the surfaces plan as data"),
-      );
-      expect(open.indexOf(r)).toBeLessThan(
-        open.findIndex((s) => s.id === "app"),
-      );
-      const push = open.find((s) => s.name === "Push the branch");
-      const pr = open.find((s) => s.name === "Open the PR (never armed)");
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      expect(push.env.BRANCH).toBe("${{ steps.route.outputs.branch }}");
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      expect(pr.env.BRANCH).toBe("${{ steps.route.outputs.branch }}");
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal workflow expression
-      expect(pr.env.SUPERSEDE).toBe("${{ steps.route.outputs.supersede }}");
     });
 
     it("stages with the App token, after the commit, with the plan's tag and sha", () => {
@@ -1681,7 +1595,7 @@ describe("planDirect", () => {
   });
 });
 
-describe("direct mode: stage, landBranch, land, route", () => {
+describe("direct mode: stage, landBranch, land", () => {
   const BASE = "b".repeat(40);
   const COMMIT = "c".repeat(40);
   const MAIN2 = "d".repeat(40);
@@ -2301,7 +2215,7 @@ describe("direct mode: stage, landBranch, land, route", () => {
       "pnpm-lock.yaml",
       "SYNCED_FROM",
       "private-paths.txt",
-      "tests/redline/src/regen.ts",
+      "tests/redline/package.json",
     ])(
       "a main moved under %s: drops the branch and throws, so the next run regenerates",
       (f) => {
@@ -2382,103 +2296,28 @@ describe("direct mode: stage, landBranch, land, route", () => {
     });
   });
 
-  describe("route", () => {
-    const pr =
-      (p: Partial<ReturnType<typeof plan>> = {}) =>
-      () => ({
-        bump: true,
-        tag: TAG,
-        sha: NEW_SHA,
-        why: "w",
-        ...p,
-      });
-    const never = () => {
-      throw new Error("no PR plan expected");
-    };
-    const planned = { branch: branchOf(TAG), supersede: 5 };
-
-    it("off: the PR path with the plan's own branch and supersede, planned once", () => {
-      for (const surfacesChanged of [true, false])
-        expect(
-          route({
-            direct: false,
-            surfacesChanged,
-            tag: TAG,
-            planned,
-            prPlan: never,
-          }),
-        ).toMatchObject({
-          route: "pr",
-          pr: true,
-          branch: branchOf(TAG),
-          supersede: 5,
-        });
-    });
-
-    it("on, with an empty surfaces port: direct", () => {
-      expect(
-        route({
-          direct: true,
-          surfacesChanged: false,
-          tag: TAG,
-          planned,
-          prPlan: never,
-        }),
-      ).toEqual({ route: "direct" });
-    });
-
-    it("on, with a surfaces port: a PR for a person, from the PR plan", () => {
-      expect(
-        route({
-          direct: true,
-          surfacesChanged: true,
-          tag: TAG,
-          planned,
-          prPlan: pr({ supersede: 8 }),
-        }),
-      ).toMatchObject({
-        route: "pr",
-        pr: true,
-        branch: branchOf(TAG),
-        supersede: 8,
-      });
-    });
-
-    it("on, with a surfaces port the PR plan will not take for this tag: nothing is opened", () => {
-      for (const p of [pr({ bump: false, tag: "" }), pr({ tag: "v0.138.0" })])
-        expect(
-          route({
-            direct: true,
-            surfacesChanged: true,
-            tag: TAG,
-            planned,
-            prPlan: p,
-          }),
-        ).toMatchObject({ route: "pr", pr: false });
-    });
-  });
-
   it("lands only the files pin-bump-arm arms without a person", () => {
     expect(DIRECT_FILES).toEqual(ARM_PIN_FILES);
-    for (const f of SURFACES_FILES) expect(DIRECT_FILES).not.toContain(f);
   });
 });
 
 describe("lockfileSensitive", () => {
-  it("names the install inputs, the pin and the redline tree, and nothing else", () => {
+  it("names the install inputs and the pin, and nothing else", () => {
     for (const p of [
       "package.json",
       "apps/scheduler/package.json",
+      "tests/redline/package.json",
       ".nvmrc",
       ".pnpmfile.cjs",
       "PUBLIC_PIN",
       "private-paths.txt",
       "scripts/overlay.sh",
-      "tests/redline/live/manifest.json",
     ])
       expect(lockfileSensitive(p)).toBe(true);
     for (const p of [
       "apps/scheduler/src/fleet.ts",
+      "tests/redline/live/manifest.json",
+      "tests/redline/src/surfaces.ts",
       "README.md",
       ".github/workflows/ci.yml",
       "scripts/ci/private-paths.txt.bak",
