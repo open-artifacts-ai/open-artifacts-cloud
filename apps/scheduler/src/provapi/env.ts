@@ -1,6 +1,7 @@
 import type { Env as OaEnv } from "@oa/provision/names";
 import type { ProvisionerRpc } from "@oa/provisioning-contract";
 import type { WorkflowLike } from "@oa/provisioning-contract/workflow";
+import type { JobWaitNamespace } from "./job-wait.js";
 
 /**
  * The Provisioning API duties' bindings (design v7 5.8). Optional: an
@@ -13,6 +14,11 @@ export interface ProvapiEnv {
   PROVISION_INSTALL?: WorkflowLike;
   /** oa-<p>-manage-install (ManageInstall on oa-<p>-provisioner). */
   MANAGE_INSTALL?: WorkflowLike;
+  /**
+   * JobWait on oa-<p>-provisioner (cloud #264): a job this Worker ends
+   * releases R15's held reads of it. Unbound, no push.
+   */
+  JOB_WAIT?: JobWaitNamespace;
   /** oa-<p>-provisioner's ProvisionerRpc entrypoint. */
   PROVISIONER?: ProvisionerRpc;
   /** Cloudflare Email Service; unbound means no destination. */

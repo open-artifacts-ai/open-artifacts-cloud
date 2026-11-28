@@ -1927,6 +1927,37 @@ describe("the rotated hook key is live before use (#1002)", () => {
     expect(seen.filter((c) => c === "POST /__test/session")).toHaveLength(1);
   });
 
+  // cloud #264: R15 hands `sealed` out on its next read, so the seal write
+  // is pushed to the held reads, while the job is still running.
+  it("the sealed result is pushed to R15's held reads when it is written", async () => {
+    const s = await active({ slug: "rl-a", actor: "oidc", testHooks: true });
+    stubInstall(s.installId);
+    const pushed: { id: string; status?: string; sealed: boolean }[] = [];
+    w.ctx.env.JOB_WAIT = {
+      idFromName: (x: string) => x,
+      get: (id: string) => ({
+        changed: async () => {
+          const j = w.get<{ status: string; sealed: string | null }>(
+            "SELECT status, sealed FROM jobs WHERE id = ?",
+            id,
+          );
+          pushed.push({ id, status: j?.status, sealed: j?.sealed != null });
+          return 0;
+        },
+      }),
+    } as unknown as NonNullable<typeof w.ctx.env.JOB_WAIT>;
+    const r = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      args: { recipientKey: await recipientKey() },
+    });
+    w.ctx.env.JOB_WAIT = undefined;
+    expect(r.job?.status).toBe("done");
+    expect(pushed.filter((p) => p.id === r.id)).toEqual([
+      { id: r.id, status: "running", sealed: true },
+      { id: r.id, status: "done", sealed: true },
+    ]);
+  });
+
   it("never rotates inside the wait: a key that never goes live fails at hook_key_live after 60 s, one PUT per attempt", async () => {
     const s = await active({ slug: "rl-a", actor: "oidc", testHooks: true });
     const { probes, seen } = stubInstall(s.installId, undefined, {

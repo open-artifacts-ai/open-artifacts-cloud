@@ -1,6 +1,7 @@
 // R15's held read (cloud #264): GET /jobs/:jobId?wait=<ms> holds an open
 // job's read on its JobWait object (oa-<p>-provisioner, apps/provisioner/
-// src/job-wait.ts) until a job end releases it or the wait runs out. Leo:
+// src/job-wait.ts) until the job changes (its end, a failed attempt it
+// records, its sealed result) or the wait runs out. Leo:
 // "Everything should be event-based, push, never PULL (no waits, sleeps,
 // polls)". This file is the API's side: the query, the hold and the end.
 import { z } from "zod";
@@ -24,8 +25,8 @@ export const R15_QUERY = z.object({
 
 /** The provisioner's JobWait RPC, as this Worker sees it (structural). */
 export interface JobWaitStub {
-  hold(jobId: string, ms: number): Promise<boolean>;
-  end(): Promise<number>;
+  hold(jobId: string, ms: number, seen?: number | null): Promise<boolean>;
+  changed(): Promise<number>;
 }
 export interface JobWaitNamespace {
   idFromName(name: string): DurableObjectId;
@@ -36,18 +37,21 @@ const stub = (ns: JobWaitNamespace, jobId: string) =>
   ns.get(ns.idFromName(jobId));
 
 /**
- * Holds until the job ends or `ms` passes. Unbound, or a failed call (the
- * object reset by a deploy), answers at once: the read then returns the
- * job as it is, never an error.
+ * Holds until the job changes or `ms` passes. `seen` is the job's
+ * updated_at as this read saw it: a change made before the hold registers
+ * answers at once. Unbound, or a failed call (the object reset by a
+ * deploy), answers at once: the read then returns the job as it is, never
+ * an error.
  */
 export async function holdJob(
   env: { JOB_WAIT?: JobWaitNamespace },
   jobId: string,
   ms: number,
+  seen: number,
 ): Promise<void> {
   if (!env.JOB_WAIT || ms <= 0) return;
   try {
-    await stub(env.JOB_WAIT, jobId).hold(jobId, ms);
+    await stub(env.JOB_WAIT, jobId).hold(jobId, ms, seen);
   } catch {}
 }
 
@@ -58,7 +62,7 @@ export async function endJob(
 ): Promise<void> {
   if (!env.JOB_WAIT) return;
   try {
-    await stub(env.JOB_WAIT, jobId).end();
+    await stub(env.JOB_WAIT, jobId).changed();
   } catch {
     console.warn("provisioning job_end failed", jobId);
   }

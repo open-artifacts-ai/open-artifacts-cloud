@@ -61,12 +61,12 @@ describe("Workflow classes (2.6)", () => {
 
 // cloud #264: R15's held read. Its RPC surface is every public method.
 describe("JobWait", () => {
-  it("is a Durable Object with exactly constructor, hold, end", () => {
+  it("is a Durable Object with exactly constructor, hold, changed", () => {
     expect(JobWait.prototype).toBeInstanceOf(DurableObject);
     expect(Object.getOwnPropertyNames(JobWait.prototype)).toEqual([
       "constructor",
       "hold",
-      "end",
+      "changed",
     ]);
   });
 });

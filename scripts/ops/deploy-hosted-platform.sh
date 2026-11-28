@@ -422,13 +422,14 @@ jobwait_declared() {
   [ "$rc" -ne 0 ] || JOBWAIT_DECLARED=1
 }
 # jobwait_bound <settings json>, after jobwait_declared: when declared, the
-# live binding is the JobWait Durable Object namespace; otherwise none (the
-# names check refuses one). The read-back's script field is not documented,
-# so only the type and class are checked.
+# live binding is the JobWait Durable Object namespace; otherwise none. The
+# read-back's script field is not documented, so only the type and class are
+# checked.
 jobwait_bound() {
-  [ -n "$JOBWAIT_DECLARED" ] || return 0
-  expect "$1" '.result.bindings[] | select(.name == "JOB_WAIT") | "\(.type) \(.class_name)"' \
-    "durable_object_namespace JobWait" "JOB_WAIT"
+  local want=""
+  [ -z "$JOBWAIT_DECLARED" ] || want="durable_object_namespace JobWait"
+  expect "$1" '[.result.bindings[] | select(.name == "JOB_WAIT") | "\(.type) \(.class_name)"] | join(",")' \
+    "$want" "JOB_WAIT"
 }
 # welcome_bound <settings json>, after welcome_declared: when declared, the live binding is send_email; otherwise none.
 welcome_bound() {
@@ -1096,6 +1097,9 @@ case "$target" in
     # script are not documented, so only the type is checked.
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | .type' workflow "PROVISION_INSTALL"
     expect "$S" '.result.bindings[] | select(.name == "MANAGE_INSTALL") | .type' workflow "MANAGE_INSTALL"
+    # JobWait on the provisioner (cloud #264), when the tag declares it.
+    jobwait_declared scheduler
+    jobwait_bound "$S"
     expect "$S" '.result.bindings[] | select(.name == "ALERT_EMAIL") | .type' send_email "ALERT_EMAIL"
     expect "$S" '.result.bindings[] | select(.name == "PLATFORM_DB") | .id' "$PLATFORM_DB_ID" "PLATFORM_DB"
     expect "$S" '.result.bindings[] | select(.name == "DISPATCHER") | .namespace' "$NS" "DISPATCHER"

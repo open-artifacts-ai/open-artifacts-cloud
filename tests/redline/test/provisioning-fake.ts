@@ -215,9 +215,10 @@ export interface FakeApi {
   /**
    * R15's held read (cloud #264). Off (the default), the API drops `wait`
    * as a build without it does, and its probe reads without moving the job.
-   * On, `wait=invalid` is a 400 and a held read answers at the job's end
-   * (run to it at once: the push), unless `runOut` > 0: then that many held
-   * reads run out first and answer the job unmoved. `held` counts them.
+   * On, `wait=invalid` is a 400 and a held read answers at the job's next
+   * pushed change (its end, a failed attempt's code, its sealed result),
+   * run to at once, unless `runOut` > 0: then that many held reads run out
+   * first and answer the job unmoved. `held` counts them.
    */
   heldReads: { on: boolean; runOut: number; held: number };
   /**
@@ -621,10 +622,20 @@ export function fakeApi(): FakeApi {
       const j = jobs.get(m[1] as string);
       if (!j || j.owner !== p) return err(404, "not_found");
       if (heldReads.on && wait !== null && Number(wait) > 0) {
+        // Held: the job runs on until a change the provisioner pushes (its
+        // end, a failed attempt's code, its sealed result), then answers.
         heldReads.held++;
+        const pushed = () =>
+          `${j.status}|${(jobView(j, false) as { lastErrorCode: unknown }).lastErrorCode}|${j.sealed !== null}`;
+        const before = pushed();
         if (heldReads.runOut > 0) heldReads.runOut--;
         else
-          for (let n = 0; n < 1000 && j.status === "running"; n++) advance(j);
+          for (
+            let n = 0;
+            n < 1000 && j.status === "running" && pushed() === before;
+            n++
+          )
+            advance(j);
       } else if (wait !== "invalid") advance(j);
       // As W3/W5b: sealed is written while the job is still running (step
       // seal, before done) and handed out once, whatever the status.

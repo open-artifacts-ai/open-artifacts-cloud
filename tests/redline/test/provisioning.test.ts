@@ -1331,19 +1331,54 @@ describe("each probe fails on the behaviour it guards", () => {
         expect(reads(down.seen)).toHaveLength(4);
       });
 
-      it("`until` (a state before the end) reads plainly, without the probe", async () => {
-        const { run, seen } = runWith(
+      it("`until` (a state before the end, as P53's lease_held) holds too: the pushed failed attempt answers it", async () => {
+        const { run, f, seen } = runWith(
           heldApi([
             () => job("running"),
             () =>
-              Response.json({ id: "j1", status: "running", step: "upload" }),
+              Response.json({
+                id: "j1",
+                status: "running",
+                step: "upload",
+                lastErrorCode: "lease_held",
+              }),
           ]),
         );
+        const waits = counted(run);
+        const t0 = f.clock.t;
         const j = await run.waitJob("j1", {
-          until: (x) => x.step === "upload",
+          until: (x) => x.lastErrorCode === "lease_held",
         });
-        expect(j.step).toBe("upload");
-        expect(reads(seen)).toEqual(["/jobs/j1", "/jobs/j1"]);
+        expect(j.lastErrorCode).toBe("lease_held");
+        expect(reads(seen)).toEqual([
+          "/jobs/j1?wait=invalid",
+          "/jobs/j1?wait=25000",
+          "/jobs/j1?wait=25000",
+        ]);
+        expect(waits).toEqual([]);
+        expect(f.clock.t).toBe(t0);
+      });
+
+      it("a build without held reads is read every 3 s, and that is noted once per run", async () => {
+        takeFileNotes();
+        let n = 0;
+        const { run, f } = runWith(
+          (u) =>
+            oldApi(u) ??
+            (u.includes("/jobs/j1")
+              ? job(++n < 3 ? "running" : "done")
+              : undefined),
+        );
+        const waits = counted(run);
+        const t0 = f.clock.t;
+        expect((await run.waitJob("j1")).status).toBe("done");
+        expect(waits).toEqual([POLL, POLL]);
+        expect(f.clock.t - t0).toBe(2 * POLL);
+        n = 0;
+        await run.waitJob("j1");
+        expect(takeFileNotes()).toEqual([
+          "R15: this API has no held reads (wait=); jobs are read every 3 s",
+        ]);
       });
 
       it("on the fake API: run.done holds, and the job's end answers it", async () => {
@@ -1643,8 +1678,10 @@ describe("each probe fails on the behaviour it guards", () => {
     takeFileNotes();
     const first = await p29?.run(new Run(CONFIG, f.io));
     expect(first).toEqual({ level: "unproven-live", reason: P29_UNPROVEN });
-    // The job id is a note, outside the reason the gate would match.
+    // The job id is a note, outside the reason the gate would match. The
+    // fake has no held reads (cloud #264), which the run notes first.
     expect(takeFileNotes()).toEqual([
+      "R15: this API has no held reads (wait=); jobs are read every 3 s",
       expect.stringMatching(/^P29: create job \S+ done and deleted$/),
     ]);
     const mine = [...f.installs.values()].filter(

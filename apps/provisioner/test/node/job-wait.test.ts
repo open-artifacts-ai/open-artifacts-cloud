@@ -91,11 +91,11 @@ describe("Holds", () => {
     const b = h.hold(25_000, async () => false);
     expect(await settled(a)).toBe(false);
     expect(h.size).toBe(2);
-    expect(h.end()).toBe(2);
+    expect(h.release()).toBe(2);
     expect(await a).toBe(true);
     expect(await b).toBe(true);
     expect(t.pending()).toBe(0);
-    expect(h.end()).toBe(0);
+    expect(h.release()).toBe(0);
   });
 
   it("the bound answers false, and not a millisecond before", async () => {
@@ -127,7 +127,7 @@ describe("Holds", () => {
           answer = r;
         }),
     );
-    h.end();
+    h.release();
     // The read, begun before the end, still says running.
     answer(false);
     expect(await a).toBe(true);
@@ -163,6 +163,8 @@ function namespace(w: World) {
   }
   const objects = new Map<string, TestJobWait>();
   const ends: string[] = [];
+  /** The job's row as each push found it. */
+  const rows: { id: string; status?: string; code: string | null }[] = [];
   const ns = {
     idFromName: (name: string) => name as unknown as DurableObjectId,
     get: (id: DurableObjectId) => {
@@ -174,10 +176,17 @@ function namespace(w: World) {
       }
       const obj = o;
       return {
-        hold: (jobId: string, ms: number) => obj.hold(jobId, ms),
-        end: () => {
+        hold: (jobId: string, ms: number, seen?: number | null) =>
+          obj.hold(jobId, ms, seen),
+        changed: () => {
           ends.push(name);
-          return obj.end();
+          const j = w.job(name);
+          rows.push({
+            id: name,
+            status: j?.status as string | undefined,
+            code: (j?.last_error_code as string | null | undefined) ?? null,
+          });
+          return obj.changed();
         },
       };
     },
@@ -186,6 +195,7 @@ function namespace(w: World) {
     ns: ns as unknown as DurableObjectNamespace<JobWait>,
     get: ns.get,
     ends,
+    rows,
     timer,
   };
 }
@@ -219,6 +229,28 @@ async function manage(
   );
   return { id, error, names: r.log.map((l) => l.name), job: w.job(id) };
 }
+
+describe("JobWait.hold reads the job once it is registered", () => {
+  it("a row changed since the caller's read (updated_at) answers at once; the same row holds", async () => {
+    const n = namespace(w);
+    const s = seedCreate(w, { slug: "seenco" });
+    const row = w.get("SELECT updated_at FROM jobs WHERE id = ?", s.jobId) as {
+      updated_at: number;
+    };
+    const o = n.get(s.jobId as unknown as DurableObjectId);
+    expect(await o.hold(s.jobId, 25_000, row.updated_at - 1)).toBe(true);
+    const same = o.hold(s.jobId, 25_000, row.updated_at);
+    expect(await settled(same)).toBe(false);
+    // No caller's row: only an end, a push or the bound.
+    const none = o.hold(s.jobId, 25_000, null);
+    expect(await settled(none)).toBe(false);
+    n.timer.advance(25_000);
+    expect(await same).toBe(false);
+    expect(await none).toBe(false);
+    // An unknown job is never held.
+    expect(await o.hold("01JE0000000000000000000000", 25_000, 1)).toBe(true);
+  });
+});
 
 describe("a job's end releases its held reads", () => {
   it("a create: the read held while it runs answers true at its end, no timer", async () => {
@@ -265,7 +297,14 @@ describe("a job's end releases its held reads", () => {
     });
     expect(bad.job?.status).toBe("failed");
     expect(bad.names.indexOf("job_end")).toBe(bad.names.indexOf("fail") + 1);
-    expect(n.ends).toEqual([a.s.jobId, ok.id, b.s.jobId, bad.id]);
+    // The failed attempt's code is pushed when it is recorded (the job
+    // still running: a waiter for a state before the end, such as P53's
+    // lease_held, gets it), then the end.
+    expect(n.ends).toEqual([a.s.jobId, ok.id, b.s.jobId, bad.id, bad.id]);
+    expect(n.rows.filter((x) => x.id === bad.id)).toEqual([
+      { id: bad.id, status: "running", code: "release_unverified" },
+      { id: bad.id, status: "failed", code: "release_unverified" },
+    ]);
   });
 
   it("a cleanup releases its parent's reads after the settle", async () => {
@@ -294,7 +333,7 @@ describe("a job's end releases its held reads", () => {
     w.ctx.env.JOB_WAIT = {
       idFromName: (x: string) => x,
       get: () => ({
-        end: async () => {
+        changed: async () => {
           throw new Error("do reset");
         },
       }),

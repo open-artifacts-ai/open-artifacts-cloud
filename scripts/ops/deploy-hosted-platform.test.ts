@@ -234,6 +234,13 @@ function schedulerBindings(
     { type: "queue", name: "SIGNUPS", queue_name: `oa-${p}-signups` },
     { type: "workflow", name: "PROVISION_INSTALL" },
     { type: "workflow", name: "MANAGE_INSTALL" },
+    // cloud #264: the provisioner's JobWait; the repo's config declares it.
+    {
+      type: "durable_object_namespace",
+      name: "JOB_WAIT",
+      class_name: "JobWait",
+      script_name: `oa-${p}-provisioner`,
+    },
     alerts
       ? {
           type: "send_email",

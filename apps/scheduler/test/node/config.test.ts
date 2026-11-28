@@ -141,13 +141,19 @@ describe("wrangler.jsonc", () => {
       // install ids, fixed categories and counts (pinned in scheduler.test.ts).
       expect(e.observability).toEqual({ enabled: true });
       // Only what the brief lists: no KV, R2 or other bindings.
-      for (const k of [
-        "kv_namespaces",
-        "r2_buckets",
-        "durable_objects",
-        "secrets",
-      ])
+      for (const k of ["kv_namespaces", "r2_buckets", "secrets", "migrations"])
         expect(e).not.toHaveProperty(k);
+      // The one Durable Object binding (cloud #264): the provisioner's
+      // JobWait, no class of its own.
+      expect(e.durable_objects).toEqual({
+        bindings: [
+          {
+            name: "JOB_WAIT",
+            class_name: "JobWait",
+            script_name: platformNames(env).provisioner,
+          },
+        ],
+      });
     }
     expect(platformNames("staging").scheduler).toBe("oa-s-scheduler");
     expect(platformNames("prod").scheduler).toBe("oa-p-scheduler");

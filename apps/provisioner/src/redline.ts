@@ -40,6 +40,7 @@ import { failingAt, tagFail } from "./errors.js";
 import type { ManageJob } from "./manage.js";
 import { cfFor, installRow, provisionerWith, storedVars } from "./ops.js";
 import { deployEnv, transient } from "./provisioner.js";
+import { jobChanged } from "./job-wait.js";
 import { refused } from "./recheck.js";
 import { sealTo } from "./seal.js";
 import { argsOf, type JobRow, jobStep, markStep, readJob } from "./steps.js";
@@ -383,7 +384,12 @@ async function rotateMintSeal(
         .run(),
     );
   });
-  if ((r.meta.changes ?? 0) > 0) return { sealed: true };
+  if ((r.meta.changes ?? 0) > 0) {
+    // R15 hands the sealed result out on its next read: push it to the
+    // held ones (cloud #264).
+    await jobChanged(ctx.env, jobId);
+    return { sealed: true };
+  }
   // The job closed under us (an R25 cancel, the sweep): no one can read the
   // PAT, so it is revoked here, before the step ends, never left live.
   await call(

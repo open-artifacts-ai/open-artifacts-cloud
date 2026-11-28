@@ -99,6 +99,18 @@
           "script_name": "oa-s-provisioner"
         }
       ],
+      // JobWait on oa-s-provisioner (cloud #264): a job this Worker ends
+      // (the sweep's dead run, the fleet halt's queued upgrades) releases
+      // R15's held reads of it.
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JOB_WAIT",
+            "class_name": "JobWait",
+            "script_name": "oa-s-provisioner"
+          }
+        ]
+      },
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-s-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
@@ -200,6 +212,18 @@
           "script_name": "oa-p-provisioner"
         }
       ],
+      // JobWait on oa-p-provisioner (cloud #264): a job this Worker ends
+      // (the sweep's dead run, the fleet halt's queued upgrades) releases
+      // R15's held reads of it.
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JOB_WAIT",
+            "class_name": "JobWait",
+            "script_name": "oa-p-provisioner"
+          }
+        ]
+      },
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-p-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one

@@ -38,6 +38,7 @@ import {
   systemJobStatement,
   wfCall,
 } from "./jobs.js";
+import { jobsChanged } from "./job-wait.js";
 import { dutyCategory } from "./run.js";
 import { getState, setState } from "./state.js";
 
@@ -248,6 +249,8 @@ export async function sweep(
       // (expectCode). Nothing more this tick; the next tick reads again.
       if (!r.settled) return;
       console.warn("provapi sweep settled", j.id, RUN_DEAD);
+      // The job ended here: its held R15 reads answer (cloud #264).
+      await jobsChanged(env.JOB_WAIT, [j.id]);
       await db
         .prepare("DELETE FROM platform_state WHERE key = ?1")
         .bind(sweepTerminatedKey(j.id))

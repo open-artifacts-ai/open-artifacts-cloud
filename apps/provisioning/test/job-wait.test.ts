@@ -32,19 +32,24 @@ afterEach(() => vi.restoreAllMocks());
  * runs the wait out (`runOut`): nothing here waits on a clock of its own.
  */
 function jobWait() {
-  const holds: { jobId: string; ms: number; release(v: boolean): void }[] = [];
+  const holds: {
+    jobId: string;
+    ms: number;
+    seen: number | null | undefined;
+    release(v: boolean): void;
+  }[] = [];
   const ends: string[] = [];
   let arrived: () => void = () => {};
   const ns = {
     idFromName: (name: string) => name as unknown as DurableObjectId,
     get: (id: DurableObjectId) => ({
-      hold: (jobId: string, ms: number) =>
+      hold: (jobId: string, ms: number, seen?: number | null) =>
         new Promise<boolean>((release) => {
           expect(id as unknown as string).toBe(jobId);
-          holds.push({ jobId, ms, release });
+          holds.push({ jobId, ms, seen, release });
           arrived();
         }),
-      end: async () => {
+      changed: async () => {
         ends.push(id as unknown as string);
         return 0;
       },
@@ -88,16 +93,45 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
     const j = jobWait();
     const e = fakeEnv({ JOB_WAIT: j.ns });
     const { id } = await seedInstall();
-    const job = await seedJob(id, { status: "running", step: "upload" });
+    const job = await seedJob(id, {
+      status: "running",
+      step: "upload",
+      updated_at: 7,
+    });
     const read = r15(e, job, "25000");
     await j.held();
-    expect(j.holds.map((h) => [h.jobId, h.ms])).toEqual([[job, 25_000]]);
+    // The row as this read saw it goes with the hold (updated_at).
+    expect(j.holds.map((h) => [h.jobId, h.ms, h.seen])).toEqual([
+      [job, 25_000, 7],
+    ]);
     // The provisioner's done step, then its job_end.
     await finish(job, "done");
     j.holds[0].release(true);
     const r = await read;
     expect(r.status).toBe(200);
     expect(JobSchema.parse(r.body)).toMatchObject({ id: job, status: "done" });
+  });
+
+  it("a failed attempt pushed while held: the read answers running with its lastErrorCode", async () => {
+    const j = jobWait();
+    const e = fakeEnv({ JOB_WAIT: j.ns });
+    const { id } = await seedInstall();
+    const job = await seedJob(id, { status: "running", step: "upload" });
+    const read = r15(e, job, "25000");
+    await j.held();
+    // The provisioner's noteFailure, then its push.
+    await db
+      .prepare(
+        "UPDATE jobs SET last_error_code = 'lease_held', attempt = 1, updated_at = ?2 WHERE id = ?1",
+      )
+      .bind(job, NOW)
+      .run();
+    j.holds[0].release(true);
+    const r = await read;
+    expect(r.body).toMatchObject({
+      status: "running",
+      lastErrorCode: "lease_held",
+    });
   });
 
   it("the wait runs out: the job as it is, still running", async () => {
@@ -152,7 +186,7 @@ describe("R15 ?wait= holds an open job's read until its end", () => {
               "Durable Object reset because its code was updated",
             );
           },
-          end: async () => 0,
+          changed: async () => 0,
         }),
       },
     });
