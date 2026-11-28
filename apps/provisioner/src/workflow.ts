@@ -29,7 +29,6 @@ import {
   releaseGate as gate,
   NAMESPACES,
   names,
-  parseBusSlugs,
   type R2CatalogBucket,
   r2BindingReleaseReader,
   settleFailedStatements,
@@ -341,22 +340,15 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
   const slug = checkSlug(s.slug);
   const testHooks = s.test_hooks === 1;
   // Test hooks belong to staging admin-created installs (OIDC, admin, and
-  // token creates for test-install slugs: t-*, bus test fixtures such as
-  // bus1299-b, or exact staging entries in STAGING_BUS_SLUGS such as m2-walk;
-  // rl-* stays reserved, and separately submitted token retries and ordinary
-  // staging slugs stay refused, cloud #84).
-  const tokenTestHookSlugs =
-    env === "staging" ? parseBusSlugs(ctx.env.STAGING_BUS_SLUGS) : [];
+  // token creates for t-* test installs; rl-* stays reserved for the red-line,
+  // and separately submitted token retries and ordinary slugs stay refused).
   if (
     testHooks &&
     (env !== "staging" ||
       s.source === "self-serve" ||
       job.actor_kind === "user" ||
       (job.actor_kind === "token" &&
-        (kind !== "create" ||
-          slug.startsWith("rl-") ||
-          (!/^(?:t-|bus(?:-|\d))/.test(slug) &&
-            !tokenTestHookSlugs.includes(slug)))))
+        (kind !== "create" || !slug.startsWith("t-"))))
   )
     throw refused("test hooks are not allowed for this principal");
   checkOidcScope(job, env, { id: job.install_id, slug, testHooks });

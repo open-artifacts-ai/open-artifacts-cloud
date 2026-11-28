@@ -163,6 +163,4 @@ export interface Env {
   OIDC_JOB_WORKFLOW_REFS?: string;
   OIDC_REPOSITORY?: string;
   OIDC_REPOSITORY_ID?: string;
-  /** Staging only (cloud #84): exact slugs eligible for token test hooks, matching provisioner's STAGING_BUS_SLUGS. Absent in prod. */
-  STAGING_BUS_SLUGS?: string;
 }
