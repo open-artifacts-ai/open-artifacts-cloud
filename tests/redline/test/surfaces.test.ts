@@ -59,7 +59,6 @@ import {
   interactiveOrgRoutes,
   MATRIX_AT_B,
   ORG_FRESH,
-  PARTIAL_INTERACTIVE_ORG_ROUTES,
   type ProbeCase,
   pickOwnGrant,
   readRepoFile,
@@ -173,6 +172,25 @@ describe("probe cases (derived from public's route policy table and surfaces)", 
     );
   });
 
+  it("trusts the pinned policy tables over legacy public-route lists when a route becomes scoped", () => {
+    const base = coverageReport(d);
+    const cov = coverageReport(d, {
+      routes: {
+        ...ROUTE_POLICY,
+        "GET /skill.md": { user: "the caller" },
+      },
+      tools: TOOL_POLICY,
+      content: {
+        ...CONTENT_POLICY,
+        "GET /robots.txt": { signed: "token" },
+      },
+    });
+    expect(cov.total).toBe(base.total + 2);
+    expect(cov.uncovered).toEqual(
+      [...base.uncovered, "GET /skill.md", "content:GET /robots.txt"].sort(),
+    );
+  });
+
   it("reports an uncovered route when its probe case is missing (never counts a drop as probed)", () => {
     const without = (r: string) =>
       coverageReport({
@@ -272,9 +290,23 @@ describe("probe cases (derived from public's route policy table and surfaces)", 
       );
       expect(cases.find((c) => c.routes.includes(r))?.denyOnly).toBe(true);
     }
-    // Partial-interactive org routes stay ordinary probed cases (not interactive-only).
-    for (const r of PARTIAL_INTERACTIVE_ORG_ROUTES) {
+    // Routes with optional/write-only interactiveSession checks stay ordinary probed cases automatically.
+    for (const r of [
+      "GET /api/v1/me/push/key",
+      "GET /api/v1/me/push/subscriptions",
+      "GET /api/v1/bus/machines",
+    ]) {
       expect(interactive.has(r)).toBe(false);
+      expect(cases.some((c) => c.routes.includes(r) && !c.denyOnly)).toBe(true);
+    }
+    // Write routes sharing a write-flag helper stay interactive-only.
+    for (const r of [
+      "POST /api/v1/me/push/subscriptions",
+      "PATCH /api/v1/me/push/subscriptions/:id",
+      "DELETE /api/v1/me/push/subscriptions/:id",
+    ]) {
+      expect(interactive.has(r)).toBe(true);
+      expect(cases.find((c) => c.routes.includes(r))?.denyOnly).toBe(true);
     }
     // A brand-new interactive route in apps/server/src becomes denyOnly automatically without cloud edits.
     const synth = derive({
@@ -296,20 +328,49 @@ describe("probe cases (derived from public's route policy table and surfaces)", 
     );
   });
 
-  it("#1313: the interactive scan follows helpers across functions and files", () => {
+  it("#1313: the interactive scan follows enforcing helpers and ignores optional browser checks", () => {
     const files = [
       {
         path: "auth.ts",
-        src: 'export function gate(c) {\n  // interactiveSession(c) in a comment is not a call\n  return interactiveSession(c) || "}";\n}\nexport const other = (c) => requireUser(c);\n',
+        src: [
+          "export function gate(c) {",
+          "  // interactiveSession(c) in a comment is not a call",
+          '  if (!interactiveSession(c)) throw new Error("}");',
+          "  return c;",
+          "}",
+          "export const isBrowser = (c) => interactiveSession(c);",
+          "export const other = (c) => requireUser(c);",
+        ].join("\n"),
       },
       {
         path: "a.ts",
         src: [
-          'import { gate, other } from "./auth.js";',
-          "const twice = async (c) => { if (!gate(c)) throw x; };",
+          'import { gate, isBrowser, other } from "./auth.js";',
+          "const twice = async (c) => { gate(c); };",
+          "const byPred = (c) => { if (!isBrowser(c)) throw new Error('no'); };",
+          "function flagGate(c, write: boolean) {",
+          "  const user = other(c);",
+          "  if (write && !interactiveSession(c)) throw new Error('no');",
+          "  return user;",
+          "}",
           "export function mountA(app) {",
           '  app.put(R.shareNotices, async (c) => { const user = await twice(c); return c.json({ re: /[{"]/ }); });',
           "  app.get(R.shareNotices, async (c) => { const user = other(c); return c.json(user); });",
+          "  // Optional browser check for an extra field: NOT interactive-only.",
+          '  app.get("/optional-field", async (c) => {',
+          "    const user = other(c);",
+          '    if (c.req.header("X-Opt") === "1" && interactiveSession(c)) return c.json({ user, extra: true });',
+          "    return c.json({ user });",
+          "  });",
+          "  // Optional conditional guard on body data: NOT interactive-only.",
+          '  app.post("/optional-guard", async (c) => {',
+          "    if (body.people?.length && !interactiveSession(c)) throw new Error('no');",
+          "    return c.json({ ok: true });",
+          "  });",
+          "  // Boolean-flag helper: false stays ordinary, true is interactive-only.",
+          '  app.get("/flag-read", async (c) => { flagGate(c, false); return c.json({}); });',
+          '  app.post("/flag-write", async (c) => { flagGate(c, true); return c.json({}); });',
+          '  app.post("/pred-enforced", async (c) => { byPred(c); return c.json({}); });',
           '  app.post("/x/:id", other);',
           // biome-ignore lint/suspicious/noTemplateCurlyInString: server source text
           "  app.delete(`${R.busMachines}/:id`, twice);",
@@ -328,6 +389,8 @@ describe("probe cases (derived from public's route policy table and surfaces)", 
       "DELETE /y",
       "PATCH ?SOME_PATH",
       "POST /api/v1/bus/machines/x",
+      "POST /flag-write",
+      "POST /pred-enforced",
       "PUT /api/v1/bus/share-notices",
       "PUT /y",
     ]);

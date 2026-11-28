@@ -171,11 +171,219 @@ const refers = (text: string, names: Iterable<string>) => {
   return false;
 };
 
+/** Split a parameter or argument list at depth-0 commas. */
+function splitTopLevel(code: string): [number, number][] {
+  const parts: [number, number][] = [];
+  let d = 0;
+  let s = 0;
+  for (let k = 0; k < code.length; k++) {
+    const ch = code[k];
+    if (ch === "(" || ch === "{" || ch === "[") d++;
+    else if (ch === ")" || ch === "}" || ch === "]") d--;
+    else if (ch === "," && d === 0) {
+      parts.push([s, k]);
+      s = k + 1;
+    }
+  }
+  parts.push([s, code.length]);
+  return parts;
+}
+
+/** Extract leading parameter identifiers for a function declaration or arrow/function initializer. */
+function extractParams(
+  code: string,
+  at: number,
+  isFuncDecl: boolean,
+): string[] {
+  let i = at;
+  const skipWs = () => {
+    while (i < code.length && /\s/.test(code[i] as string)) i++;
+  };
+  skipWs();
+  if (!isFuncDecl) {
+    if (code.startsWith("async", i) && /\s/.test(code[i + 5] ?? "")) {
+      i += 5;
+      skipWs();
+    }
+    if (code.startsWith("function", i) && /[\s*(<]/.test(code[i + 8] ?? "")) {
+      i += 8;
+      skipWs();
+      if (code[i] === "*") {
+        i++;
+        skipWs();
+      }
+      const nm = /^[A-Za-z_$][\w$]*/.exec(code.slice(i));
+      if (nm) {
+        i += nm[0].length;
+        skipWs();
+      }
+    }
+  }
+  // Skip optional generic type parameters `<T, U>` before `(`.
+  if (code[i] === "<") {
+    let d = 0;
+    for (; i < code.length; i++) {
+      if (code[i] === "<") d++;
+      else if (code[i] === ">") {
+        d--;
+        if (d === 0) {
+          i++;
+          break;
+        }
+      }
+    }
+    skipWs();
+  }
+  if (code[i] === "(") {
+    const close = closing(code, i);
+    const inner = code.slice(i + 1, close);
+    return splitTopLevel(inner).map(([a, b]) => {
+      const m = /^\s*(?:\.\.\.)?([A-Za-z_$][\w$]*)/.exec(inner.slice(a, b));
+      return m ? (m[1] as string) : "";
+    });
+  }
+  const single = /^([A-Za-z_$][\w$]*)\s*=>/.exec(code.slice(i));
+  return single ? [single[1] as string] : [];
+}
+
+/**
+ * Whether a negated predicate at `[bangIdx, afterEnd)` is conjunction-guarded
+ * (`cond && !pred(c)` or `!pred(c) && cond`), returning the guard identifier if
+ * the guard is a bare identifier (e.g. a helper's boolean `write` parameter).
+ */
+function guardOf(
+  body: string,
+  bangIdx: number,
+  afterEnd: number,
+): { kind: "unconditional" } | { kind: "and"; ident: string | null } {
+  let l = bangIdx - 1;
+  while (l >= 0 && /\s/.test(body[l] as string)) l--;
+  if (l >= 1 && body[l] === "&" && body[l - 1] === "&") {
+    let k = l - 2;
+    let d = 0;
+    for (; k >= 0; k--) {
+      const ch = body[k];
+      if (ch === ")" || ch === "}" || ch === "]") d++;
+      else if (ch === "(" || ch === "{" || ch === "[") {
+        if (d === 0) break;
+        d--;
+      } else if (d === 0) {
+        if (";,?:".includes(ch as string)) break;
+        if (
+          (ch === "|" && body[k - 1] === "|") ||
+          (ch === "&" && body[k - 1] === "&")
+        )
+          break;
+      }
+    }
+    const lhs = body.slice(k + 1, l - 1).trim();
+    return {
+      kind: "and",
+      ident: /^[A-Za-z_$][\w$]*$/.test(lhs) ? lhs : null,
+    };
+  }
+  let r = afterEnd;
+  while (r < body.length && /\s/.test(body[r] as string)) r++;
+  if (body[r] === "&" && body[r + 1] === "&") {
+    let k = r + 2;
+    let d = 0;
+    for (; k < body.length; k++) {
+      const ch = body[k];
+      if (ch === "(" || ch === "{" || ch === "[") d++;
+      else if (ch === ")" || ch === "}" || ch === "]") {
+        if (d === 0) break;
+        d--;
+      } else if (d === 0) {
+        if (";,?:".includes(ch as string)) break;
+        if (
+          (ch === "|" && body[k + 1] === "|") ||
+          (ch === "&" && body[k + 1] === "&")
+        )
+          break;
+      }
+    }
+    const rhs = body.slice(r + 2, k).trim();
+    return {
+      kind: "and",
+      ident: /^[A-Za-z_$][\w$]*$/.test(rhs) ? rhs : null,
+    };
+  }
+  return { kind: "unconditional" };
+}
+
+/**
+ * Classify whether `body` enforces an interactive session unconditionally,
+ * conditionally on a boolean parameter (`paramIdx`), or not at all (optional).
+ */
+function classifyBody(
+  body: string,
+  params: readonly string[],
+  predicates: ReadonlySet<string>,
+  enforcers: ReadonlySet<string>,
+  paramEnforcers: ReadonlyMap<string, number>,
+): { always: boolean; paramIdx: number | null } {
+  if (refers(body, enforcers)) return { always: true, paramIdx: null };
+
+  // Local aliases like `const ok = interactiveSession(c); if (!ok) throw ...`.
+  const aliases = new Set<string>();
+  for (const m of body.matchAll(
+    /\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*)\s*\(/g,
+  )) {
+    if (predicates.has(m[2] as string)) aliases.add(m[1] as string);
+  }
+
+  let paramIdx: number | null = null;
+  for (const m of body.matchAll(/!\s*([A-Za-z_$][\w$]*)/g)) {
+    const bangIdx = m.index;
+    if (bangIdx > 0 && body[bangIdx - 1] === "!") continue;
+    const name = m[1] as string;
+    const isPred = predicates.has(name);
+    const isAlias = aliases.has(name);
+    if (!isPred && !isAlias) continue;
+    let afterEnd = bangIdx + m[0].length;
+    if (isPred) {
+      let open = afterEnd;
+      while (open < body.length && /\s/.test(body[open] as string)) open++;
+      if (body[open] !== "(") continue;
+      afterEnd = closing(body, open) + 1;
+    }
+    const g = guardOf(body, bangIdx, afterEnd);
+    if (g.kind === "unconditional") return { always: true, paramIdx: null };
+    if (g.ident !== null) {
+      const idx = params.indexOf(g.ident);
+      if (idx >= 0) paramIdx = idx;
+    }
+  }
+
+  if (paramEnforcers.size > 0) {
+    for (const m of body.matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const name = m[1] as string;
+      const reqIdx = paramEnforcers.get(name);
+      if (reqIdx === undefined) continue;
+      const open = m.index + m[0].length - 1;
+      const close = closing(body, open);
+      const inner = body.slice(open + 1, close);
+      const args = splitTopLevel(inner);
+      const span = args[reqIdx];
+      const arg = span ? inner.slice(span[0], span[1]).trim() : "";
+      if (arg === "false") continue;
+      const idx = params.indexOf(arg);
+      if (idx >= 0) {
+        paramIdx = idx;
+        continue;
+      }
+      return { always: true, paramIdx: null };
+    }
+  }
+
+  return { always: false, paramIdx };
+}
+
 interface Parsed {
   path: string;
   src: string;
   code: string;
-  decls: { name: string; body: string; exported: boolean }[];
+  decls: { name: string; params: string[]; body: string; exported: boolean }[];
   imports: Set<string>;
   consts: Map<string, string>;
 }
@@ -190,7 +398,8 @@ function parse(f: SourceFile): Parsed {
     // handler is a value, and tainting it would flag every other `user`.
     if (m[2] && !isFunction(code, at)) continue;
     const body = code.slice(at, declEnd(code, at));
-    decls.push({ name, body, exported: m[0].startsWith("export") });
+    const params = extractParams(code, at, Boolean(m[1]));
+    decls.push({ name, params, body, exported: m[0].startsWith("export") });
   }
   const imports = new Set<string>();
   for (const m of code.matchAll(/\bimport\s+(?:type\s+)?\{([^}]*)\}/g))
@@ -259,60 +468,98 @@ const ROUTE =
   /\b(\w*[aA]pp)(?:\.(get|post|put|patch|delete|all|on)|\[(\w+)\])\s*\(/g;
 
 /**
- * Every route whose handler reaches interactiveSession(c), as "METHOD /path";
- * with `all`, every route the scan sees (to prove it misses none).
+ * Every route whose handler enforces interactiveSession(c) (directly or via an
+ * enforcing helper), as "METHOD /path"; optional browser checks (e.g. an extra
+ * field gated by `&& interactiveSession(c)`, or `helper(c, false)`) are not
+ * flagged. With `all`, every route the scan sees (to prove it misses none).
  */
 export function interactiveRoutes(
   files: readonly SourceFile[],
   { all = false } = {},
 ): string[] {
   const parsed = files.map(parse);
-  const tainted = new Map<Parsed, Set<string>>(
+  const predicates = new Map<Parsed, Set<string>>(
     parsed.map((p) => [p, new Set(["interactiveSession"])]),
   );
-  // Fixpoint: a declaration is tainted when it refers to a tainted name; an
-  // exported tainted name taints the files that import it.
+  const enforcers = new Map<Parsed, Set<string>>(
+    parsed.map((p) => [p, new Set()]),
+  );
+  const paramEnforcers = new Map<Parsed, Map<string, number>>(
+    parsed.map((p) => [p, new Map()]),
+  );
+  // Fixpoint across helpers and cross-file imports:
+  // - predicates: wrap interactiveSession(c) without enforcing it on their own
+  // - enforcers: unconditionally enforce !interactiveSession(c) (or call an enforcer)
+  // - paramEnforcers: enforce !interactiveSession(c) only when parameter #i isn't false
   for (let changed = true; changed; ) {
     changed = false;
-    const exported = new Set<string>();
-    for (const p of parsed)
-      for (const d of p.decls)
-        if (d.exported && tainted.get(p)?.has(d.name)) exported.add(d.name);
+    const expPred = new Set<string>();
+    const expEnf = new Set<string>();
+    const expParam = new Map<string, number>();
     for (const p of parsed) {
-      const t = tainted.get(p) as Set<string>;
-      for (const n of exported)
-        if (p.imports.has(n) && !t.has(n)) {
-          t.add(n);
+      const pr = predicates.get(p) as Set<string>;
+      const en = enforcers.get(p) as Set<string>;
+      const pe = paramEnforcers.get(p) as Map<string, number>;
+      for (const d of p.decls) {
+        if (!d.exported) continue;
+        if (en.has(d.name)) expEnf.add(d.name);
+        else if (pe.has(d.name)) expParam.set(d.name, pe.get(d.name) as number);
+        else if (pr.has(d.name)) expPred.add(d.name);
+      }
+    }
+    for (const p of parsed) {
+      const pr = predicates.get(p) as Set<string>;
+      const en = enforcers.get(p) as Set<string>;
+      const pe = paramEnforcers.get(p) as Map<string, number>;
+      for (const n of expEnf)
+        if (p.imports.has(n) && !en.has(n)) {
+          en.add(n);
+          pe.delete(n);
+          pr.delete(n);
           changed = true;
         }
-      for (const d of p.decls)
-        if (!t.has(d.name) && refers(d.body, t)) {
-          t.add(d.name);
+      for (const [n, idx] of expParam)
+        if (p.imports.has(n) && !en.has(n) && pe.get(n) !== idx) {
+          pe.set(n, idx);
+          pr.delete(n);
           changed = true;
         }
+      for (const n of expPred)
+        if (p.imports.has(n) && !en.has(n) && !pe.has(n) && !pr.has(n)) {
+          pr.add(n);
+          changed = true;
+        }
+      for (const d of p.decls) {
+        if (en.has(d.name)) continue;
+        const c = classifyBody(d.body, d.params, pr, en, pe);
+        if (c.always) {
+          en.add(d.name);
+          pe.delete(d.name);
+          pr.delete(d.name);
+          changed = true;
+        } else if (c.paramIdx !== null) {
+          if (pe.get(d.name) !== c.paramIdx) {
+            pe.set(d.name, c.paramIdx);
+            pr.delete(d.name);
+            changed = true;
+          }
+        } else if (!pe.has(d.name) && !pr.has(d.name) && refers(d.body, pr)) {
+          pr.add(d.name);
+          changed = true;
+        }
+      }
     }
   }
   const found: string[] = [];
   for (const p of parsed) {
-    const t = tainted.get(p) as Set<string>;
+    const pr = predicates.get(p) as Set<string>;
+    const en = enforcers.get(p) as Set<string>;
+    const pe = paramEnforcers.get(p) as Map<string, number>;
     for (const m of p.code.matchAll(ROUTE)) {
       const open = m.index + m[0].length - 1;
       const close = closing(p.code, open);
       const code = p.code.slice(open + 1, close);
-      // Split the arguments at depth 0.
-      const args: [number, number][] = [];
-      let d = 0;
-      let s = 0;
-      for (let k = 0; k < code.length; k++) {
-        const ch = code[k];
-        if (ch === "(" || ch === "{" || ch === "[") d++;
-        else if (ch === ")" || ch === "}" || ch === "]") d--;
-        else if (ch === "," && d === 0) {
-          args.push([s, k]);
-          s = k + 1;
-        }
-      }
-      args.push([s, code.length]);
+      const args = splitTopLevel(code);
       const text = (a: [number, number]) =>
         p.src.slice(open + 1 + a[0], open + 1 + a[1]);
       let methods = [(m[2] ?? "").toUpperCase()];
@@ -336,7 +583,7 @@ export function interactiveRoutes(
       const [pathArg, ...handlers] = rest;
       if (!pathArg) continue;
       const handlerCode = handlers.map((a) => code.slice(a[0], a[1])).join(",");
-      if (!all && !refers(handlerCode, t)) continue;
+      if (!all && !classifyBody(handlerCode, [], pr, en, pe).always) continue;
       const raw = text(pathArg).trim();
       const path = resolvePath(raw, p.consts) ?? `?${raw}`;
       for (const meth of methods) found.push(`${meth} ${path}`);

@@ -15,7 +15,6 @@ import {
   spaceExpected,
 } from "../../../apps/server/test/authz/expect.ts";
 import {
-  CONTENT_PUBLIC,
   hiddenToolAnswer,
   needsCookie,
   ORG_SURFACES,
@@ -23,7 +22,6 @@ import {
   offeredTools,
   PROBE_SHARE_EMAIL,
   type Cred as ProbeCred,
-  PUBLIC_ROUTES,
   SPACE_SURFACES,
   type SpaceTarget,
   SURFACES,
@@ -271,30 +269,15 @@ const BY_PERSONAL: Citation[] = [
   { file: MATRIX, describe: "attack seeds: another member's personal space" },
 ];
 
-/**
- * Org routes that read interactiveSession(c) on one optional branch only while
- * still answering a token or hook session on their main probe path.
- */
-export const PARTIAL_INTERACTIVE_ORG_ROUTES: ReadonlySet<string> = new Set([
-  "GET /api/v1/me/push/key",
-  "GET /api/v1/me/push/subscriptions",
-  "GET /api/v1/bus/machines",
-]);
-
 let cachedInteractive: ReadonlySet<string> | undefined;
 
 /**
- * Instance routes behind interactiveSession(c), derived directly from public's
- * apps/server/src at PUBLIC_PIN (excluding the partial-interactive org reads
- * above). Cached once per process.
+ * Instance routes that require an interactive browser session, derived
+ * directly from public's apps/server/src at PUBLIC_PIN. Cached once per process.
  */
 export function interactiveOrgRoutes(): ReadonlySet<string> {
   if (!cachedInteractive) {
-    cachedInteractive = new Set(
-      interactiveRoutes(serverSources()).filter(
-        (r) => !PARTIAL_INTERACTIVE_ORG_ROUTES.has(r),
-      ),
-    );
+    cachedInteractive = new Set(interactiveRoutes(serverSources()));
   }
   return cachedInteractive;
 }
@@ -795,14 +778,11 @@ export function coverageReport(
     for (const r of x.routes) dropWhyByRoute.set(r, x.why);
 
   const scoped = Object.entries(policies.routes)
-    .filter(
-      ([k, p]) =>
-        !("public" in p || "signed" in p) && !PUBLIC_ROUTES.includes(k),
-    )
+    .filter(([, p]) => !("public" in p || "signed" in p))
     .map(([k]) => k);
   const tools = Object.keys(policies.tools).map((t) => `tool:${t}`);
   const content = Object.entries(policies.content)
-    .filter(([k, p]) => !("public" in p) && !CONTENT_PUBLIC.includes(k))
+    .filter(([, p]) => !("public" in p))
     .map(([k]) => `content:${k}`);
   const targets = [...scoped, ...tools, ...content];
 
