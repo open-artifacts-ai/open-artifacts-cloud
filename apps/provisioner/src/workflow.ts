@@ -338,12 +338,14 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<CreateJob> {
     throw refused("only a self-serve owner creates a self-serve install");
   const slug = checkSlug(s.slug);
   const testHooks = s.test_hooks === 1;
-  // Test hooks belong to staging admin-created installs (including OIDC).
+  // Test hooks belong to staging admin-created installs (OIDC, admin, and
+  // token creates; a separately submitted token retry stays refused).
   if (
     testHooks &&
     (env !== "staging" ||
       s.source === "self-serve" ||
-      job.actor_kind === "user")
+      job.actor_kind === "user" ||
+      (job.actor_kind === "token" && kind !== "create"))
   )
     throw refused("test hooks are not allowed for this principal");
   checkOidcScope(job, env, { slug, testHooks });

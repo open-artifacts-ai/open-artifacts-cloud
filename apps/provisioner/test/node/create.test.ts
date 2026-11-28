@@ -35,8 +35,10 @@ import {
   event,
   NOW,
   seedCreate,
+  seedToken,
   stepRunner,
   TS,
+  ulid,
   V1,
   V2,
   type World,
@@ -493,17 +495,58 @@ describe("ProvisionInstall: rechecks (2.5)", () => {
       );
   });
 
-  it("creates a staging test-hooks install for an admin token", async () => {
+  it("creates and resumes a staging test-hooks install for an admin token, but refuses a separate token retry", async () => {
     const seed = seedCreate(w, {
       slug: "t-token",
       actor: "token",
       testHooks: true,
     });
-    const r = await run(w, seed.jobId);
+    const r = await run(w, seed.jobId, { twice: true });
     expect(r.error).toBeNull();
     expect(w.job(seed.jobId)?.status).toBe("done");
     expect(plain(w, seed.installId, "TEST_DOMAIN")?.text).toBe(
       "oa-redline-a.fyi",
+    );
+
+    const failed = seedCreate(w, {
+      slug: "t-token-retry",
+      actor: "token",
+      testHooks: true,
+    });
+    w.db
+      .prepare(
+        "UPDATE jobs SET status = 'failed', error_code = 'cf_error', finished_at = ? WHERE id = ?",
+      )
+      .run(w.clock.t, failed.jobId);
+    const retryJobId = ulid();
+    const tokenId = seedToken(w);
+    w.db
+      .prepare(
+        `INSERT INTO jobs (id, kind, workflow, install_id, signup_id, actor_kind, actor_key, actor_label, token_id, request_id, body_hash, args, status, created_at, updated_at)
+VALUES (?, 'retry', 'provision_install', ?, ?, 'token', ?, 'token', ?, ?, 'h', '{}', 'queued', ?, ?)`,
+      )
+      .run(
+        retryJobId,
+        failed.installId,
+        failed.signupId,
+        `token:${retryJobId}`,
+        tokenId,
+        `req-${retryJobId}`,
+        w.clock.t,
+        w.clock.t,
+      );
+    w.db
+      .prepare(
+        "UPDATE signups SET job_id = ?, status = 'queued', error = NULL WHERE signup_id = ?",
+      )
+      .run(retryJobId, failed.signupId);
+    const rr = await refusedWith({
+      jobId: retryJobId,
+      signupId: failed.signupId,
+      installId: failed.installId,
+    });
+    expect(rr.log.find((l) => l.name === "recheck")?.error?.name).toBe(
+      "NonRetryableError",
     );
   });
 
