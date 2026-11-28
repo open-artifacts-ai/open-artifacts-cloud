@@ -1,3 +1,4 @@
+import { InstallIdSchema } from "@oa/provisioning-contract";
 import type { z } from "zod";
 import type { Env } from "./env.js";
 import { ApiError } from "./errors.js";
@@ -22,6 +23,8 @@ import {
   ListBusinessInput,
   listBusinessRequests,
 } from "./routes/business.js";
+import { DOMAIN_CODES_TOOL, DomainCodesBody } from "./routes/domain-codes.js";
+import { invokeRoute } from "./routes/invoke.js";
 import {
   SET_TIER_TOOL,
   SetTierInputSchema,
@@ -48,8 +51,12 @@ export type HostedTool = {
     env: Env,
     principal: Principal,
     args: Record<string, unknown>,
-    client: { version: string | null },
-  ): Promise<{ body: Record<string, unknown>; text: string }>;
+    client: { version: string | null; ctx: ExecutionContext },
+  ): Promise<{
+    body: Record<string, unknown>;
+    text: string;
+    replayed?: boolean;
+  }>;
 };
 
 const READ = {
@@ -192,6 +199,30 @@ export const HOSTED_TOOLS: readonly HostedTool[] = [
       return {
         body: r.body as Record<string, unknown>,
         text: `${String(id)} is now on ${b.tier} (billing version ${b.version})`,
+      };
+    },
+  },
+  {
+    name: DOMAIN_CODES_TOOL,
+    description:
+      "Enable or disable domain sign-in codes on an existing install. Both settings require email-only sign-in and the owner's domain in the install's domain list. Returns the update job.",
+    input: DomainCodesBody.extend({ id: InstallIdSchema }),
+    annotations: { ...WRITE, idempotentHint: true },
+    async run(env, principal, args, client) {
+      const { id, ...body } = args;
+      const r = await invokeRoute(
+        env,
+        client.ctx,
+        principal,
+        "R29",
+        { params: { id: String(id) }, body },
+        { kind: "mcp", tool: DOMAIN_CODES_TOOL, clientVersion: client.version },
+      );
+      const result = r.body as { job: { id: string } };
+      return {
+        body: result,
+        text: `Update job ${result.job.id}`,
+        replayed: r.headers["oa-idempotent-replay"] === "1",
       };
     },
   },

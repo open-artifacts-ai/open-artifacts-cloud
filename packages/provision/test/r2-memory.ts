@@ -40,6 +40,12 @@ export class MemoryR2 implements R2CatalogBucket {
     });
   }
 
+  async head(key: string) {
+    await this.#read(`head ${key}`);
+    const object = this.objects.get(key);
+    return object ? { uploaded: object.uploaded } : null;
+  }
+
   async get(key: string) {
     await this.#read(`get ${key}`);
     const o = this.objects.get(key);

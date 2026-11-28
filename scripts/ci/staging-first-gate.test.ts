@@ -82,6 +82,7 @@ const gate = (
     fail?: "fail" | "fail-arts" | "fail-zip" | "fail-compare";
     /** compare/main...<head_sha>'s status (default behind). */
     compare?: string;
+    canaryBody?: string;
     tag?: string;
     /** run id -> its artifacts (default: run 7's one artifact). */
     arts?: Record<string, Art[] | string>;
@@ -89,7 +90,11 @@ const gate = (
     zips?: Record<string, Buffer>;
   } = {},
 ) => {
-  const sb = sandbox({ gh });
+  const sb = sandbox({ gh, curl: 'cat "$STATE/canary.json"' });
+  writeFileSync(
+    join(sb.dir, "canary.json"),
+    opts.canaryBody ?? JSON.stringify({ ok: true, version: "0.80.0" }),
+  );
   writeFileSync(
     join(sb.dir, "runs.json"),
     typeof runs === "string" ? runs : JSON.stringify({ workflow_runs: runs }),
@@ -133,7 +138,25 @@ describe("staging-first-gate.sh", () => {
       `gh api -X GET repos/${REPO}/compare/main...${SHA}`,
       `gh api -X GET repos/${REPO}/actions/runs/7/artifacts?name=redline-staged-version&per_page=100`,
       `gh api repos/${REPO}/actions/artifacts/70/zip`,
+      "curl --fail --silent --show-error --max-time 15 https://canary.open-artifacts-staging.app/healthz",
     ]);
+  });
+  it("holds prod until the staging fleet canary is healthy on this release", () => {
+    const healthy = JSON.stringify({ ok: true, version: "0.80.0" });
+    for (const canaryBody of [
+      "",
+      "  \n\t",
+      "{",
+      "null",
+      `[${healthy}]`,
+      `${healthy}\n${healthy}`,
+      JSON.stringify({ ok: false, version: "0.80.0" }),
+      JSON.stringify({ ok: true, version: "0.79.0" }),
+    ]) {
+      const r = gate([runOf()], { canaryBody });
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("staging fleet canary");
+    }
   });
   it("the run's head_sha must be on main: identical or behind pass; ahead, diverged, an API error or no head_sha refuse", () => {
     for (const compare of ["identical", "behind"]) {

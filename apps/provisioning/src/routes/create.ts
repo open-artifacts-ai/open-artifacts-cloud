@@ -1,9 +1,11 @@
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import {
   type CreateInstallSchema,
+  type CreatePrincipal,
   canonicalJson,
   checkCreateFields,
   fieldRulesOf,
+  type OidcWorkflow,
   slugError,
   type Tier,
 } from "@oa/provisioning-contract";
@@ -14,7 +16,9 @@ import {
   factsOf,
   isFixtureSlugRefused,
   isTestUser,
+  isTokenTestHooksSlug,
   type PrincipalFacts,
+  tokenTestHooksAllowlist,
 } from "../facts.js";
 import { newInstallId } from "../ids.js";
 import type { Principal } from "../principal.js";
@@ -121,8 +125,34 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   const body = a.input.body as Body;
   const rules = fieldRulesOf(p.kind);
   if (!rules) throw new ApiError("forbidden");
-  const f = checkCreateFields(body, rules, env.OA_ENV, STAGING_TEST_DOMAIN);
+  const tokenTestHookSlugs = tokenTestHooksAllowlist(env);
+  const checkFields: (
+    body: Body,
+    principal: CreatePrincipal,
+    env: Env["OA_ENV"],
+    stagingTestDomain: string,
+    workflow?: OidcWorkflow,
+    tokenTestHookSlugs?: readonly string[],
+  ) => ReturnType<typeof checkCreateFields> = checkCreateFields;
+  const f = checkFields(
+    body,
+    rules,
+    env.OA_ENV,
+    STAGING_TEST_DOMAIN,
+    p.kind === "oidc" ? p.oidcWorkflow : undefined,
+    tokenTestHookSlugs,
+  );
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
+  // Cloud #84: staging admin tokens may enable test hooks only for test-install
+  // slugs (t-*, bus test fixtures such as bus1299-b, or exact staging entries
+  // in STAGING_BUS_SLUGS such as m2-walk), never on prod or ordinary slugs.
+  if (
+    p.kind === "token" &&
+    body.testHooks === true &&
+    (env.OA_ENV !== "staging" ||
+      !isTokenTestHooksSlug(body.slug, tokenTestHookSlugs))
+  )
+    throw new ApiError("forbidden", "slug: forbidden");
   // Google with no auth.domains is allowed (#2520): the install admits the
   // owner and invited people only. Email codes still need a domain.
 

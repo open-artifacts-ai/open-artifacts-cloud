@@ -1,4 +1,8 @@
-import { OwnerVarsRefusal, withAuthProviders } from "@oa/provision";
+import {
+  OwnerVarsRefusal,
+  withAuthProviders,
+  withDomainCodes,
+} from "@oa/provision";
 import {
   type ApiRouteId,
   type CancelJobSchema,
@@ -26,7 +30,12 @@ import {
 import type { z } from "zod";
 import type { Env } from "../env.js";
 import { ApiError } from "../errors.js";
-import { loadInReach, loadJob, type StatusRow } from "../model.js";
+import {
+  loadInReach,
+  loadJob,
+  ownerEmailFor,
+  type StatusRow,
+} from "../model.js";
 import type { Principal } from "../principal.js";
 import { platformRelease, releaseOf, releases } from "../services/cache.js";
 import { endJob } from "../services/job-wait.js";
@@ -41,6 +50,7 @@ import {
   type Write,
   writeOf,
 } from "../services/jobs.js";
+import { DOMAIN_CODES_TOOL, type DomainCodesBody } from "./domain-codes.js";
 import type { HandlerArgs } from "./handlers.js";
 import type { RouteResult } from "./invoke.js";
 import { parseVars } from "./login-change.js";
@@ -141,6 +151,26 @@ const mayCrossHeld = (p: Principal) =>
   p.kind === "admin" ||
   (p.kind === "token" && p.tokenKind === "oauth") ||
   p.kind === "oidc";
+
+/**
+ * R26 variant guard: only the disposable staging fixture workflow may request
+ * `hookKeyOnly: true` (and it may request nothing else); every other OIDC
+ * workflow refuses `hookKeyOnly` before queueing a job.
+ */
+export function checkR26HookKeyOnly(
+  body: { revoke?: unknown; hookKeyOnly?: unknown },
+  workflow?: string,
+): { field: "hookKeyOnly" | "revoke"; code: "forbidden" } | null {
+  if (workflow === "test-install") {
+    if (body.revoke === true) return { field: "revoke", code: "forbidden" };
+    if (body.hookKeyOnly !== true)
+      return { field: "hookKeyOnly", code: "forbidden" };
+    return null;
+  }
+  if (body.hookKeyOnly !== undefined)
+    return { field: "hookKeyOnly", code: "forbidden" };
+  return null;
+}
 
 const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   R5: async (a, row) => {
@@ -278,11 +308,17 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   },
   R26: async (a, row) => {
     refuseUnless(can(row, "redline_creds", a.principal));
+    const body = bodyOf<typeof RedlineCredsSchema>(a);
+    const f = checkR26HookKeyOnly(
+      body as { revoke?: unknown; hookKeyOnly?: unknown },
+      a.principal.kind === "oidc" ? a.principal.oidcWorkflow : undefined,
+    );
+    if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
     // Mint or revoke (C6): the shared helper narrows on `revoke` and owns
     // the args shape, so a mint's key travels however C7 defines it.
     return {
       kind: "redline_creds",
-      args: redlineCredsJobArgs(bodyOf<typeof RedlineCredsSchema>(a)),
+      args: redlineCredsJobArgs(body),
     };
   },
   // #1008. The job re-reads all of this against /healthz; these are the
@@ -290,6 +326,25 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
   // job_in_progress already.
   R29: async (a, row) => {
     refuseUnless(can(row, "update", a.principal));
+    if (a.surface.kind === "mcp" && a.surface.tool === DOMAIN_CODES_TOOL) {
+      const { domainCodes } = bodyOf<typeof DomainCodesBody>(a);
+      const stored = parseVars(row.install_vars);
+      if (!stored)
+        throw new ApiError("invalid_state", "the install has no vars");
+      try {
+        withDomainCodes(stored, domainCodes, await ownerEmailFor(a.env, row), {
+          source: row.source,
+          selfServeTier: a.env.SELF_SERVE_TIER,
+          testHooks: row.test_hooks === 1,
+          env: a.env.OA_ENV,
+        });
+      } catch (e) {
+        if (e instanceof OwnerVarsRefusal)
+          throw new ApiError("invalid_state", e.why);
+        throw e;
+      }
+      return { kind: "update", args: { domainCodes } };
+    }
     const body = bodyOf<typeof SetOAuthStoreSchema>(a);
     // open-artifacts#2641: DOCS_PREVIEW is staging only, either value. The
     // job's recheck and provision's metadata guard refuse it on prod too.

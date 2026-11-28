@@ -41,7 +41,7 @@ import type { ManageJob } from "./manage.js";
 import { cfFor, installRow, provisionerWith, storedVars } from "./ops.js";
 import { deployEnv, transient } from "./provisioner.js";
 import { jobChanged } from "./job-wait.js";
-import { refused } from "./recheck.js";
+import { isFixtureCreateActorKey, refused } from "./recheck.js";
 import { sealTo } from "./seal.js";
 import { argsOf, type JobRow, jobStep, markStep, readJob } from "./steps.js";
 import type { CreateCtx } from "./workflow.js";
@@ -157,6 +157,39 @@ export function redlineArgs(job: JobRow): RedlineCreds {
   return r.data;
 }
 
+const X25519_PUBLIC_KEY = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
+
+export type ParsedRedlineCreds =
+  | (RedlineCreds & { hookKeyOnly?: undefined })
+  | { revoke: false; hookKeyOnly: true; recipientKey: string };
+
+/**
+ * Parses R26 args including the disposable-fixture `hookKeyOnly: true` variant
+ * even before `@oa/provisioning-contract` widens `RedlineCredsSchema`.
+ */
+export function parseRedlineCredsArgs(job: JobRow): ParsedRedlineCreds {
+  const raw = argsOf(job);
+  if ("hookKeyOnly" in raw) {
+    const allowedKeys = new Set(["revoke", "hookKeyOnly", "recipientKey"]);
+    for (const k of Object.keys(raw))
+      if (!allowedKeys.has(k))
+        throw refused("the redline_creds args do not parse");
+    if (
+      raw.hookKeyOnly !== true ||
+      (raw.revoke !== undefined && raw.revoke !== false) ||
+      typeof raw.recipientKey !== "string" ||
+      !X25519_PUBLIC_KEY.test(raw.recipientKey)
+    )
+      throw refused("the redline_creds args do not parse");
+    return {
+      revoke: false,
+      hookKeyOnly: true,
+      recipientKey: raw.recipientKey,
+    };
+  }
+  return redlineArgs(job);
+}
+
 export async function redlineCreds(
   ctx: CreateCtx,
   step: WorkflowStep,
@@ -165,7 +198,11 @@ export async function redlineCreds(
 ): Promise<void> {
   const kind: JobKind = "redline_creds";
   const steps = jobStepsFor(kind, job.args);
-  if (steps.includes("revoke"))
+  if (job.args.hookKeyOnly === true)
+    await jobStep(ctx, step, jobId, "rotate_hook_key", REDLINE_STEP, () =>
+      rotateHookKeyOnly(ctx, jobId, job),
+    );
+  else if (steps.includes("revoke"))
     await jobStep(ctx, step, jobId, "revoke", REDLINE_STEP, () =>
       revokeAll(ctx, jobId, job),
     );
@@ -184,14 +221,10 @@ type Session = {
 };
 
 /**
- * The checks, the token check (`refuse`), a fresh TEST_HOOK_KEY live on
- * the script, and a session for the suite's admin test user.
+ * The checks, the token check (`refuse`), and a fresh TEST_HOOK_KEY live on
+ * the script. Never opens a session or mints a PAT.
  */
-async function openSession(
-  ctx: CreateCtx,
-  jobId: string,
-  job: ManageJob,
-): Promise<Session> {
+async function rotateHook(ctx: CreateCtx, jobId: string, job: ManageJob) {
   const e = deployEnv(ctx.env.OA_ENV);
   if (e !== "staging")
     throw new ProvisionRefused(
@@ -235,7 +268,23 @@ async function openSession(
     ),
   );
   await keyLive(ctx, f, app, hookKey);
+  return { f, app, installId: row.id, hookKey, testDomain };
+}
 
+/**
+ * The checks, the token check (`refuse`), a fresh TEST_HOOK_KEY live on
+ * the script, and a session for the suite's admin test user.
+ */
+async function openSession(
+  ctx: CreateCtx,
+  jobId: string,
+  job: ManageJob,
+): Promise<Session> {
+  const { f, app, installId, hookKey, testDomain } = await rotateHook(
+    ctx,
+    jobId,
+    job,
+  );
   const s = await call(
     f,
     `${app}/__test/session`,
@@ -265,7 +314,7 @@ async function openSession(
       "x-oa-request": "1",
     },
   });
-  return { f, app, installId: row.id, hookKey, asAdmin };
+  return { f, app, installId, hookKey, asAdmin };
 }
 
 /** The install's live PATs, as RedlinePat rows of this install only. */
@@ -326,6 +375,24 @@ async function revokeAll(
   return { revoked: await revokeRedline(s) };
 }
 
+async function rotateHookKeyOnly(
+  ctx: CreateCtx,
+  jobId: string,
+  job: ManageJob,
+): Promise<{ sealed: boolean }> {
+  const j = await readJob(ctx, jobId);
+  if (!j) throw refused("no job row");
+  if (j.actor_kind !== "oidc" || !isFixtureCreateActorKey(j.actor_key))
+    throw refused("hookKeyOnly is only for a disposable fixture");
+  const parsed = parseRedlineCredsArgs(j);
+  if (parsed.revoke !== false || parsed.hookKeyOnly !== true)
+    throw refused("not a hookKeyOnly request");
+  const { hookKey } = await rotateHook(ctx, jobId, job);
+  return {
+    sealed: await storeSealed(ctx, jobId, parsed.recipientKey, { hookKey }),
+  };
+}
+
 async function rotateMintSeal(
   ctx: CreateCtx,
   jobId: string,
@@ -333,6 +400,10 @@ async function rotateMintSeal(
 ): Promise<{ sealed: boolean }> {
   const j = await readJob(ctx, jobId);
   if (!j) throw refused("no job row");
+  if (j.actor_kind === "oidc" && j.actor_key.includes(":test-install"))
+    throw refused("disposable fixtures never mint an admin PAT");
+  if ("hookKeyOnly" in argsOf(j))
+    throw refused("hookKeyOnly never enters PAT mint");
   const args = redlineArgs(j);
   if (args.revoke !== false) throw refused("not a mint");
   const { recipientKey } = args;
@@ -369,27 +440,8 @@ async function rotateMintSeal(
   );
   await revokeRedline(s, minted.id);
 
-  // seal: only the ciphertext reaches D1, and only while the job is open.
-  await markStep(ctx, jobId, "seal");
-  const r = await failingAt("seal", async () => {
-    const sealed = await sealTo(
-      recipientKey,
-      JSON.stringify({ pat, hookKey: s.hookKey }),
-    );
-    return transient(
-      ctx.env.PLATFORM_DB.prepare(
-        "UPDATE jobs SET sealed = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'running'",
-      )
-        .bind(jobId, sealed, ctx.io.now())
-        .run(),
-    );
-  });
-  if ((r.meta.changes ?? 0) > 0) {
-    // R15 hands the sealed result out on its next read: push it to the
-    // held ones (cloud #264).
-    await jobChanged(ctx.env, jobId);
+  if (await storeSealed(ctx, jobId, recipientKey, { pat, hookKey: s.hookKey }))
     return { sealed: true };
-  }
   // The job closed under us (an R25 cancel, the sweep): no one can read the
   // PAT, so it is revoked here, before the step ends, never left live.
   await call(
@@ -400,4 +452,27 @@ async function rotateMintSeal(
     [204, 404],
   );
   return { sealed: false };
+}
+
+async function storeSealed(
+  ctx: CreateCtx,
+  jobId: string,
+  recipientKey: string,
+  payload: { hookKey: string; pat?: string },
+): Promise<boolean> {
+  // seal: only the ciphertext reaches D1, and only while the job is open.
+  await markStep(ctx, jobId, "seal");
+  const r = await failingAt("seal", async () => {
+    const sealed = await sealTo(recipientKey, JSON.stringify(payload));
+    return transient(
+      ctx.env.PLATFORM_DB.prepare(
+        "UPDATE jobs SET sealed = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'running'",
+      )
+        .bind(jobId, sealed, ctx.io.now())
+        .run(),
+    );
+  });
+  if ((r.meta.changes ?? 0) === 0) return false;
+  await jobChanged(ctx.env, jobId);
+  return true;
 }

@@ -69,7 +69,7 @@ export function ownerVars(
   if (o.login) optional.push("AUTH_DOMAIN_JOIN", DOMAIN_JOIN_SOURCE_VAR);
   for (const k of Object.keys(vars))
     if (!allowed.includes(k) && !optional.includes(k))
-      throw refused(`var ${k.slice(0, 40)} is not allowed`);
+      throw refused("var [value] is not allowed");
   for (const k of allowed)
     if (typeof vars[k] !== "string") throw refused(`var ${k} is missing`);
   const providers = (vars.AUTH_PROVIDERS as string).split(",");
@@ -176,6 +176,28 @@ export function withAuthProviders(
   if (stored.EMAIL_CODE_DOMAIN !== undefined)
     throw refused("AUTH_PROVIDERS can't change with EMAIL_CODE_DOMAIN set");
   const after: Record<string, string> = { ...stored, AUTH_PROVIDERS: value };
+  return validateOwnerChange(after, o);
+}
+
+export function withDomainCodes(
+  stored: Record<string, string>,
+  enabled: boolean,
+  ownerEmail: string | null,
+  o: Omit<OwnerVarsOptions, "login">,
+): Record<string, string> {
+  const domain = ownerEmail?.split("@")[1]?.toLowerCase();
+  if (!domain || !(stored.AUTH_DOMAINS ?? "").split(",").includes(domain))
+    throw refused("the owner's domain must be in AUTH_DOMAINS");
+  // Both directions require an install eligible for domain codes.
+  const after = validateOwnerChange({ ...stored, EMAIL_CODE_DOMAIN: "on" }, o);
+  if (!enabled) delete after.EMAIL_CODE_DOMAIN;
+  return after;
+}
+
+function validateOwnerChange(
+  after: Record<string, string>,
+  o: Omit<OwnerVarsOptions, "login">,
+) {
   const owner: Record<string, string> = {};
   for (const k of OWNER_KEYS)
     if (after[k] !== undefined) owner[k] = after[k] as string;

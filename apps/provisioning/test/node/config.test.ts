@@ -209,6 +209,9 @@ describe("wrangler.jsonc", () => {
         else expect(e.vars).not.toHaveProperty("ADMIN_SESSION_TTL_HOURS");
         if (env === "staging") {
           expect(e.vars.OIDC_AUDIENCE).toBe(`https://api.${APP.staging}`);
+          expect(e.vars.STAGING_BUS_SLUGS).toBe(
+            "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb",
+          );
           // Red-line's, the test admin's (#1053) and the test member's
           // workflows, on main only.
           expect(e.vars.OIDC_JOB_WORKFLOW_REFS.split(",")).toEqual(
@@ -221,6 +224,8 @@ describe("wrangler.jsonc", () => {
                 `open-artifacts-ai/open-artifacts-cloud/.github/workflows/${w}@refs/heads/main`,
             ),
           );
+        } else {
+          expect(e.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
         }
       });
 

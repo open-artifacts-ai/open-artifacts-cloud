@@ -56,10 +56,13 @@ describe("release-retry", () => {
       "!contains(github.event.workflow_run.display_title, '(dry run)')",
       "github.event.workflow_run.event != 'workflow_dispatch'",
       "contains(github.event.workflow_run.display_title, ' [sc')",
+      "contains(github.event.workflow_run.display_title, ' [p')",
+      "contains(github.event.workflow_run.display_title, ' [c')",
     ])
       expect(cond).toContain(c);
-    // The one || only lets a staging-chain deploy (" [sc..]") through.
-    expect(cond.match(/\|\|/g)?.length).toBe(1);
+    // The three ||s only let a chain's own child through: the staging deploy
+    // (" [sc..]"), the prod publish (" [p..]") and the prod deploy (" [c..]").
+    expect(cond.match(/\|\|/g)?.length).toBe(3);
   });
 
   // Mirrors the job's condition for the cases that matter (GitHub's contains()
@@ -75,24 +78,33 @@ describe("release-retry", () => {
     r.attempt <= 2 &&
     (r.branch ?? "main") === "main" &&
     !r.title.toLowerCase().includes("(dry run)") &&
-    (r.event !== "workflow_dispatch" || r.title.toLowerCase().includes(" [sc"));
+    (r.event !== "workflow_dispatch" ||
+      [" [sc", " [p", " [c"].some((m) => r.title.toLowerCase().includes(m)));
   const fail = { conclusion: "failure", attempt: 1 };
 
-  it("a chain-id deploy or publish under a waiting prod chain is not retried; the chain is", () => {
+  it("the prod chain's own deploy and publish are retried on their own (cloud #264: the chain waits for nothing); so is a failed chain step", () => {
     expect(
       retried({
         ...fail,
         event: "workflow_dispatch",
         title: "deploy-hosted-platform prod v0.246.1 [c45669888802-1]",
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       retried({
         ...fail,
         event: "workflow_dispatch",
         title: "hosted-publish prod v0.246.1 [p45669888802-1]",
       }),
-    ).toBe(false);
+    ).toBe(true);
+    // A hand prod deploy or publish (no chain id) waits for a person.
+    for (const title of [
+      "deploy-hosted-platform prod v0.246.1",
+      "hosted-publish prod v0.246.1",
+    ])
+      expect(retried({ ...fail, event: "workflow_dispatch", title })).toBe(
+        false,
+      );
     expect(
       retried({ ...fail, event: "workflow_run", title: "prod-release-chain" }),
     ).toBe(true);
@@ -128,13 +140,16 @@ describe("release-retry", () => {
     ).toBe(false);
   });
 
-  it("the prod chain waits on its children, so they are its to redo", () => {
+  it("the prod chain waits on nothing, and a failed child's step reads the child again rather than dispatching it", () => {
     const chain = readFileSync(
       join(dir, "../../.github/workflows/prod-release-chain.yml"),
       "utf8",
     );
-    expect(chain).toContain("Dispatch the prod deploy and wait for its run");
-    expect(chain).toContain("Dispatch the prod publish and wait for its run");
+    expect(chain).not.toMatch(/and wait for its run/);
+    expect(chain).toContain("prod-release-chain.ts child");
+    expect(text).toContain(
+      "A rerun of a\n# failed prod-release-chain job never dispatches a child again",
+    );
   });
 
   it("backs off, then reruns only the failed jobs with an App token narrowed to actions, and never checks out code", () => {

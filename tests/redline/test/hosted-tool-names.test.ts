@@ -66,6 +66,7 @@ describe("HOSTED_TOOL_NAMES", () => {
       src("hosted-tools.ts"),
       constsFrom(
         src("routes/set-tier.ts"),
+        src("routes/domain-codes.ts"),
         src("routes/beta.ts"),
         src("routes/business.ts"),
       ),

@@ -17,6 +17,7 @@ import { limitRoute } from "../limits.js";
 import type { Principal } from "../principal.js";
 import { countRateLimited } from "../refuse.js";
 import { R15_QUERY } from "../services/job-wait.js";
+import { DOMAIN_CODES_TOOL, DomainCodesBody } from "./domain-codes.js";
 import { HANDLERS } from "./handlers.js";
 import { onAuthenticated } from "./hooks.js";
 
@@ -44,7 +45,11 @@ export type RouteInput = {
  */
 export type Surface =
   | { kind: "http"; client: { ip: string; host: string } }
-  | { kind: "mcp"; tool: AdminToolName; clientVersion: string | null };
+  | {
+      kind: "mcp";
+      tool: AdminToolName | typeof DOMAIN_CODES_TOOL;
+      clientVersion: string | null;
+    };
 export type RouteResult = {
   status: number;
   body: unknown;
@@ -110,7 +115,12 @@ export async function invokeRoute(
   input: RouteInput,
   surface: Surface,
 ): Promise<RouteResult> {
-  const def = ROUTES[route];
+  const def =
+    route === "R29" &&
+    surface.kind === "mcp" &&
+    surface.tool === DOMAIN_CODES_TOOL
+      ? { ...ROUTES.R29, body: DomainCodesBody }
+      : ROUTES[route];
   const r = await limitRoute(
     env,
     def.write ? "write" : "read",

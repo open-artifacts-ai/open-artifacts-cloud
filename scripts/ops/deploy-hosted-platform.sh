@@ -504,9 +504,20 @@ case "$target" in
     # Unbound it would silently skip the free month, so a tag that declares the
     # binding must not deploy without it (read back below).
     billing_pre provisioner BillingProvisionerRpc
+    # FLEET_WAKE (cloud #264, when the tag declares it): every ManageInstall
+    # job's end posts to the scheduler's oa-<p>-fleet-wake, so that queue
+    # must exist before this deploy binds it. A tag that produces nothing
+    # (from before it) wants nothing; any other producer refuses.
+    produces="$(committed provisioner producers | jq -r 'join(",")')" ||
+      { echo "can't read the provisioner's committed queue producers" >&2; exit 1; }
+    case "$produces" in
+      "") WAKE_DECLARED="" ;;
+      "FLEET_WAKE oa-$P-fleet-wake") WAKE_DECLARED=1 ;;
+      *) echo "the tag's $env provisioner produces to '$produces'; want none or FLEET_WAKE oa-$P-fleet-wake; refusing" >&2; exit 1 ;;
+    esac
     # Check first, create only when absent; a failed listing stops the run.
     queues="$(list_all "/queues?" "list queues" | jq -r '.[].queue_name')"
-    for q in "oa-$P-signups" "oa-$P-signups-dlq"; do
+    for q in "oa-$P-signups" "oa-$P-signups-dlq" ${WAKE_DECLARED:+"oa-$P-fleet-wake"}; do
       grep -qx "$q" <<< "$queues" && continue
       [ -z "$VERIFY_ONLY" ] || { echo "queue $q does not exist" >&2; exit 1; }
       cf_send POST /queues "$(jq -nc --arg n "$q" '{queue_name: $n}')" | must "create queue $q" > /dev/null
@@ -551,7 +562,10 @@ case "$target" in
     billing_bound "$S" provisioner BillingProvisionerRpc
     jobwait_declared provisioner
     jobwait_bound "$S"
-    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,${JOBWAIT_DECLARED:+JOB_WAIT,}MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
+    if [ -n "$WAKE_DECLARED" ]; then
+      expect "$S" '.result.bindings[] | select(.name == "FLEET_WAKE") | "\(.type) \(.queue_name)"' "queue oa-$P-fleet-wake" "FLEET_WAKE"
+    fi
+    names_are "$S" "${BILLING_DECLARED:+BILLING,}DISPATCHER,${WAKE_DECLARED:+FLEET_WAKE,}${JOBWAIT_DECLARED:+JOB_WAIT,}MANAGE_INSTALL,PLATFORM_DB,PROVISION_INSTALL,PROVISION_TOKEN,RELEASES${WELCOME_DECLARED:+,WELCOME_EMAIL}"
     signups_deployed "$S" oa-$P-provisioner
     vars_are "$S" provisioner
     # The settings API's key for query-string redaction is not recorded, so it is not read.
@@ -1093,6 +1107,10 @@ case "$target" in
     expect "$S" '.result.bindings[] | select(.name == "PROVISIONER") | .entrypoint' ProvisionerRpc "PROVISIONER entrypoint"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .type' queue "SIGNUPS type"
     expect "$S" '.result.bindings[] | select(.name == "SIGNUPS") | .queue_name' oa-$P-signups "SIGNUPS"
+    sched_producers="$(committed scheduler producers)" || exit 1
+    if jq -e 'any(.[]; startswith("FLEET_WAKE "))' <<< "$sched_producers" >/dev/null; then
+      expect "$S" '.result.bindings[] | select(.name == "FLEET_WAKE") | "\(.type) \(.queue_name)"' "queue $wake_q" "FLEET_WAKE"
+    fi
     # Workflow bindings: the read-back field names for the workflow's name and
     # script are not documented, so only the type is checked.
     expect "$S" '.result.bindings[] | select(.name == "PROVISION_INSTALL") | .type' workflow "PROVISION_INSTALL"

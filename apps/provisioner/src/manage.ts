@@ -72,11 +72,12 @@ import {
   checkOidcScope,
   checkTokenLive,
   checkTransition,
+  isFixtureCreateActorKey,
   readStatus,
   refused,
   type StatusRow,
 } from "./recheck.js";
-import { redlineArgs, redlineCreds } from "./redline.js";
+import { parseRedlineCredsArgs, redlineCreds } from "./redline.js";
 import {
   argsOf,
   doneAuditStatement,
@@ -132,10 +133,12 @@ export type ManageJob = {
     force?: boolean;
     /** upgrade: a person chose to cross a held migration (MIG-2). */
     nonAdditive?: boolean;
+    reviewedFleetMigration?: boolean;
     /** upgrade: the #1106 test seam (request id prefix; staging rl-f- only). */
     testFailCheck?: "health" | "kill" | "kill_after_write";
     /** redline_creds: the R26 variant (C6 RedlineCredsSchema; never the key). */
     revoke?: boolean;
+    hookKeyOnly?: boolean;
   };
   /** update: R29's mode or R30's copy (#1008). */
   oauth?: OAuthOp;
@@ -166,6 +169,42 @@ export const PURGE_STEP = {
 export const LEASED_STEP = {
   retries: { limit: 5, delay: "1 minute", backoff: "exponential" },
 } as const;
+
+/**
+ * fleet_wake (cloud #264): the send is retried with a backoff, 1 s doubling;
+ * a send that still fails is logged and the job's outcome stands (the
+ * scheduler's 2-minute tick is the backup).
+ */
+export const FLEET_WAKE_STEP = {
+  retries: { limit: 4, delay: "1 second", backoff: "exponential" },
+  timeout: "10 seconds",
+} as const;
+
+/**
+ * cloud #264, Leo: "Everything should be event-based, push, never PULL (no
+ * waits, sleeps, polls)". A job's end is the fleet's next event: the
+ * canary's upgrade ending starts its probe and smoke, the last of the rest
+ * ending writes fleet_done, a failed one halts its version, and any job
+ * that leaves an install idle lets the fleet reach it. So every job posts
+ * { jobId } to oa-<p>-fleet-wake once it is done or failed (the scheduler
+ * reads nothing from the body). Never throws.
+ */
+async function wakeFleet(
+  ctx: CreateCtx,
+  step: WorkflowStep,
+  jobId: string,
+): Promise<void> {
+  const q = ctx.env.FLEET_WAKE;
+  if (q === undefined) return;
+  try {
+    await step.do("fleet_wake", FLEET_WAKE_STEP, async () => {
+      await q.send({ jobId });
+      return { sent: true };
+    });
+  } catch {
+    console.warn("provisioner fleet_wake failed", jobId);
+  }
+}
 
 /** Soft delete grace (5.6). */
 export const GRACE_MS = 7 * 86_400_000;
@@ -219,6 +258,9 @@ export async function runManage(
     });
     // The job is failed now: its held reads answer before any lease wait.
     await jobEnded(ctx.env, step, jobId);
+    // The job is failed now: a failed fleet upgrade halts its version on
+    // this event, before any lease wait below.
+    await wakeFleet(ctx, step, jobId);
     // An upgrade or rollback left upgrading under its lease: wait it out,
     // then release it without force (5.4 fail).
     if (f.leaseUntil !== null) {
@@ -235,6 +277,7 @@ export async function runManage(
     throw e;
   }
   await jobEnded(ctx.env, step, jobId);
+  await wakeFleet(ctx, step, jobId);
 }
 
 /**
@@ -591,6 +634,9 @@ async function render(
     kind === "upgrade"
       ? await w.upgrade(job.installId, to, {
           nonAdditive: job.args.nonAdditive === true,
+          ...(job.args.reviewedFleetMigration
+            ? { reviewedFleetMigration: true }
+            : {}),
           ...(job.args.testFailCheck
             ? { testFailCheck: job.args.testFailCheck }
             : {}),
@@ -753,7 +799,19 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
     suspended: st.suspended_at !== null,
     args: {},
   };
-  checkOidcScope(job, env, out);
+  const createdBy =
+    job.actor_kind === "oidc" && st.signup_id
+      ? ((
+          await transient(
+            ctx.env.PLATFORM_DB.prepare(
+              "SELECT actor_key FROM jobs WHERE id = ? AND install_id = ? AND kind = 'create'",
+            )
+              .bind(st.signup_id, job.install_id)
+              .first<{ actor_key: string }>(),
+          )
+        )?.actor_key ?? null)
+      : null;
+  checkOidcScope(job, env, { ...out, createdBy });
   const now = ctx.io.now();
   switch (kind) {
     case "upgrade":
@@ -764,6 +822,11 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       out.args = {
         from: args.from,
         to: args.to,
+        ...(kind === "upgrade" &&
+        job.actor_kind === "system" &&
+        job.request_id.startsWith("fleet-")
+          ? { reviewedFleetMigration: true }
+          : {}),
         ...(kind === "upgrade" && args.nonAdditive === true
           ? { nonAdditive: true }
           : {}),
@@ -834,15 +897,34 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       out.args = { force: args.force === true };
       if (!row) throw refused("no installs row");
       break;
-    case "redline_creds":
+    case "redline_creds": {
       // R26 is O only (3.4); TRANSITIONS reads OIDC as A.
       if (job.actor_kind !== "oidc") throw refused("redline_creds is OIDC's");
       if (env !== "staging") throw refused("redline_creds is staging only");
-      if (!row || !row.slug.startsWith("rl-") || row.test_hooks !== 1)
+      if (!row || row.test_hooks !== 1)
+        throw refused("not a test-hooks install");
+      const fixture = isFixtureCreateActorKey(job.actor_key);
+      if (fixture) {
+        if (!row.slug.startsWith("t-"))
+          throw refused("not a disposable fixture install");
+        if (createdBy !== job.actor_key)
+          throw refused("fixture does not own this install");
+      } else if (!row.slug.startsWith("rl-")) {
         throw refused("not a red-line test install");
+      }
       if (row.state !== "active") throw refused("the install is not active");
-      out.args = redlineCredsJobArgs(redlineArgs(job));
+      const parsed = parseRedlineCredsArgs(job);
+      if (fixture) {
+        if (parsed.revoke !== false || parsed.hookKeyOnly !== true)
+          throw refused("disposable fixtures only rotate TEST_HOOK_KEY");
+        out.args = { revoke: false, hookKeyOnly: true };
+      } else {
+        if (parsed.hookKeyOnly !== undefined)
+          throw refused("hookKeyOnly is only for disposable fixtures");
+        out.args = redlineCredsJobArgs(parsed);
+      }
       break;
+    }
     case "update": {
       // #2520: an instance's login change is the platform's own job, with
       // exactly { login: true } and vars that still pass the login schema.
@@ -877,6 +959,8 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
         );
         out.source = st.source;
       }
+      if (oauth.op === "set" && oauth.domainCodes !== undefined)
+        out.source = st.source;
       out.oauth = oauth;
       break;
     }

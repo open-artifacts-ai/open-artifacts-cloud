@@ -90,6 +90,7 @@ const VERB: Record<string, string> = {
   "oauth_store.mode_live": "switched where agent sign-ins are stored",
   "oauth_copy.counts": "counted agent sign-ins to move",
   "oauth_copy.key_gone": "removed the key for moving agent sign-ins",
+  "fleet.wake": "evaluated the fleet rollout",
   "fleet.halted": "halted the fleet rollout",
   // Anonymous refusals, counted per bucket (audit_refusals); signin.refused is above.
   rate_limited: "were rate limited",
@@ -170,6 +171,7 @@ export const AUDIT_ACTIONS = [
   "upgrade.forward_fix",
   "rollback.unhealthy",
   "lease.force_release",
+  "fleet.wake",
   "fleet.halted",
   "prod_dirty.snapshot",
   "delete.revoke_unsupported",

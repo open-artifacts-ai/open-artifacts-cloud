@@ -85,16 +85,43 @@ export function actorOf(kind: JobRow["actor_kind"]): TransitionActor {
 }
 
 /**
+ * Authenticated create-run actor key for disposable staging fixtures
+ * (`oidc:<repoId>:test-install:<runId>:<ownerKeyId>`).
+ */
+export const FIXTURE_CREATE_ACTOR_RE =
+  /^oidc:\d{1,32}:test-install:\d{1,32}:[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
+export const isFixtureCreateActorKey = (actorKey: string): boolean =>
+  FIXTURE_CREATE_ACTOR_RE.test(actorKey);
+
+/**
  * OIDC's scope (4.4, 5.1): staging only, and only an `rl-` install with test
- * hooks. TRANSITIONS reads OIDC as A, so this is the rest of its check.
+ * hooks (or an owned `t-` disposable fixture for `redline_creds` hook-key
+ * rotation). TRANSITIONS reads OIDC as A, so this is the rest of its check.
  */
 export function checkOidcScope(
   job: JobRow,
   env: DeployEnv,
-  install: { slug: string | null; testHooks: boolean },
+  install: {
+    slug: string | null;
+    testHooks: boolean;
+    createdBy?: string | null;
+  },
 ): void {
   if (job.actor_kind !== "oidc") return;
   if (env !== "staging") throw refused("OIDC is staging only");
+  if (job.actor_key.includes(":test-install")) {
+    if (
+      job.kind !== "redline_creds" ||
+      !isFixtureCreateActorKey(job.actor_key) ||
+      !install.slug?.startsWith("t-") ||
+      !install.testHooks ||
+      install.createdBy !== job.actor_key
+    )
+      throw refused(
+        "the fixture workflow acts only on its own disposable test install",
+      );
+    return;
+  }
   if (!install.slug?.startsWith("rl-") || !install.testHooks)
     throw refused("OIDC acts only on rl- test installs");
   // The staging test member's workflow (authz TEST_MEMBER): one install only.

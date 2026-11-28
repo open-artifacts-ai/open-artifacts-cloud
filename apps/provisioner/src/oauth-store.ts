@@ -23,8 +23,10 @@ import {
   names,
   newSecret,
   OwnerVarsRefusal,
+  ownerEmailOf,
   ProvisionRefused,
   withAuthProviders,
+  withDomainCodes,
 } from "@oa/provision";
 import {
   COPY_KEY_GONE_ACTION,
@@ -172,6 +174,7 @@ async function checkModeChange(
  * and on one that does, whether its mode is required or optional.
  */
 export type SetWant = {
+  domainCodes?: boolean;
   mode?: OAuthStoreMode;
   docsPreview?: "1" | "";
   /** cloud#435: "google" or "google,email", email codes off or on. */
@@ -184,6 +187,10 @@ export const AUTH_PROVIDERS_ACTION = "auth_providers.set";
 
 /** An `update` job's args as its operation, or null for anything else. */
 export function parseOAuthOp(a: Record<string, unknown>): OAuthOp | null {
+  if ("domainCodes" in a)
+    return Object.keys(a).length === 1 && typeof a.domainCodes === "boolean"
+      ? { op: "set", domainCodes: a.domainCodes }
+      : null;
   if (a.oauthCopy !== undefined)
     return parseOAuthJob(a)?.op === "copy" ? { op: "copy" } : null;
   const vars = a.vars;
@@ -276,10 +283,34 @@ async function putMode(
   else if (want.docsPreview === "") delete vars.DOCS_PREVIEW;
   // cloud#435: only email is added or removed, Google kept; the stored vars
   // with it pass ownerVars as a create would, before anything is written.
-  const merged =
+  let merged =
     want.authProviders === undefined
       ? vars
       : authProvidersVars(ctx, job, row, vars, want.authProviders);
+  if (want.domainCodes !== undefined) {
+    if (!job.source) throw refused("no install source");
+    const owner = await transient(
+      ctx.env.PLATFORM_DB.prepare("SELECT * FROM installs WHERE id = ?")
+        .bind(job.installId)
+        .first<Record<string, unknown>>(),
+    );
+    try {
+      merged = withDomainCodes(
+        vars,
+        want.domainCodes,
+        owner ? ownerEmailOf(owner) : null,
+        {
+          source: job.source,
+          selfServeTier: ctx.env.SELF_SERVE_TIER,
+          testHooks: row.test_hooks === 1,
+          env: deployEnv(ctx.env.OA_ENV),
+        },
+      );
+    } catch (e) {
+      if (e instanceof OwnerVarsRefusal) throw refused(e.why);
+      throw e;
+    }
+  }
   const w = await renderOptions(ctx, {
     jobId: job.jobId,
     label,
@@ -441,20 +472,21 @@ export async function setOAuthStore(
     );
   }
   // cloud#435, marked as update_vars like the preview's audit.
-  if (want.authProviders !== undefined) {
-    const value = want.authProviders;
+  const value = want.domainCodes ?? want.authProviders;
+  if (value !== undefined) {
+    const domainChange = typeof value === "boolean";
     await jobStep(
       ctx,
       step,
       jobId,
-      "auth_providers_audit",
+      domainChange ? "domain_codes_audit" : "auth_providers_audit",
       undefined,
       async () => {
         await transient(
           auditStatement(
             ctx,
             job.installId,
-            AUTH_PROVIDERS_ACTION,
+            domainChange ? "domain_codes.set" : AUTH_PROVIDERS_ACTION,
             { value },
             jobId,
           ).run(),

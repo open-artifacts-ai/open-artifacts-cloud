@@ -21,6 +21,8 @@ import {
 
 /** A stable release version (no prerelease or build suffix). */
 const STABLE = /^\d{1,6}\.\d{1,6}\.\d{1,6}$/;
+export const isCatalogVersion = (value: unknown): value is string =>
+  typeof value === "string" && STABLE.test(value);
 const VARIANTS: readonly BundleVariant[] = ["release", "redline"];
 /** The most versions one listing walks (a bucket holds a few dozen). */
 const MAX_VERSIONS = 500;
@@ -42,6 +44,7 @@ export interface CatalogRelease {
  * `releases/` (one prefix per version) and the record objects' upload time.
  */
 export interface R2CatalogBucket extends R2ReleaseBucket {
+  head(key: string): Promise<{ uploaded: Date } | null>;
   list(o: {
     prefix: string;
     cursor?: string;
@@ -68,7 +71,7 @@ export async function bucketVersions(b: R2CatalogBucket): Promise<string[]> {
     });
     for (const p of r.delimitedPrefixes ?? []) {
       const v = p.slice("releases/".length).replace(/\/$/, "");
-      if (STABLE.test(v)) out.add(v);
+      if (isCatalogVersion(v)) out.add(v);
       if (out.size > MAX_VERSIONS)
         throw new Error(`more than ${MAX_VERSIONS} release versions`);
     }
@@ -201,8 +204,8 @@ export function bucketPublishedAt(
     let at: number | null = null;
     for (const v of VARIANTS) {
       const key = releaseKey(version, v, RECORD_FILE);
-      const r = await b.list({ prefix: key, limit: 1 });
-      const t = r.objects.find((x) => x.key === key)?.uploaded?.getTime();
+      const object = await b.head(key);
+      const t = object?.uploaded.getTime();
       if (typeof t === "number" && (at === null || t < at)) at = t;
     }
     return at;

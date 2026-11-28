@@ -355,7 +355,7 @@ describe("releaseCatalog (2.6 releases())", () => {
     ]);
   });
 
-  it("reads per call: the floor, then 2 record gets and 2 lists a version (#1029)", async () => {
+  it("reads per call: the floor, then 2 record gets and 2 metadata reads a version (#1029)", async () => {
     const { b, release } = await bucket([
       ["0.23.0", "release"],
       ["0.24.0", "release"],
@@ -370,7 +370,7 @@ describe("releaseCatalog (2.6 releases())", () => {
       publishedAt: bucketPublishedAt(b),
     });
     expect(b.reads.filter((k) => k.startsWith("get ")).length).toBe(1 + 3 * 2);
-    expect(b.reads.filter((k) => k.startsWith("list ")).length).toBe(3 * 2);
+    expect(b.reads.filter((k) => k.startsWith("head ")).length).toBe(3 * 2);
   });
 
   it(`at most ${CATALOG_CONCURRENCY} versions are read at once, newest first`, async () => {

@@ -30,6 +30,10 @@ describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_ALL");
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
     expect(cfg.env.staging.vars).not.toHaveProperty("PROD_BUS_ALL");
+    expect(api.env.staging.vars.STAGING_BUS_SLUGS).toBe(
+      cfg.env.staging.vars.STAGING_BUS_SLUGS,
+    );
+    expect(api.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
   });
 
   it('with the merged prod config, a prod install gets bus (prodBusAll only, never the staging flags); "0" turns it off', async () => {
@@ -73,6 +77,8 @@ describe("wrangler.jsonc", () => {
       expect(e.compatibility_flags).toEqual(["nodejs_compat"]);
       expect(e.limits).toEqual({ cpu_ms: 300000 });
       expect(e.queues).toEqual({
+        // cloud #264: every ManageInstall job's end wakes the fleet.
+        producers: [{ binding: "FLEET_WAKE", queue: `oa-${p}-fleet-wake` }],
         consumers: [
           {
             queue: `oa-${p}-signups`,

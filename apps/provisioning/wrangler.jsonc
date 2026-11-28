@@ -68,7 +68,9 @@
         "OIDC_REPOSITORY": "open-artifacts-ai/open-artifacts-cloud",
         "OIDC_REPOSITORY_ID": "{{GITHUB_REPOSITORY_ID_STAGING}}",
         "OIDC_JOB_WORKFLOW_REFS": "open-artifacts-ai/open-artifacts-cloud/.github/workflows/redline-staging.yml@refs/heads/main,open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-admin.yml@refs/heads/main,open-artifacts-ai/open-artifacts-cloud/.github/workflows/staging-test-member.yml@refs/heads/main",
-        "OIDC_ENVIRONMENT": "redline-staging"
+        "OIDC_ENVIRONMENT": "redline-staging",
+        // Cloud #84: staging exact-slug allowlist for token test hooks, matching provisioner. Staging only.
+        "STAGING_BUS_SLUGS": "rl-agents,bus1299-b,m2-walk,rl-busa,rl-busb"
       },
       "d1_databases": [
         {

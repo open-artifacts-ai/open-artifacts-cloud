@@ -165,8 +165,13 @@ export function createAdminServer(
         try {
           const r = await t.run(env, principal, args, {
             version: clientVersion(),
+            ctx,
           });
-          return { content: text(r.text), structuredContent: r.body };
+          return {
+            content: text(r.text),
+            structuredContent: r.body,
+            ...(r.replayed && { _meta: { "oa/replayed": true } }),
+          };
         } catch (e) {
           return errorResult(e);
         }

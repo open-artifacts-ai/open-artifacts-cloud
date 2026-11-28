@@ -1,18 +1,29 @@
 // What a Workflow step may say about a failure: a job code (design v7 3.5),
 // read from the error's own `code` (provisionErrorCode), never its message,
-// and the code's fixed text (JOB_ERROR_TEXT). Never an error's own text: a
-// refusal's message can echo request values (a slug, a key name) and a
-// Cloudflare or D1 message can quote input. One exception (#1343):
+// and the code's fixed text (JOB_ERROR_TEXT). The step's thrown error (the
+// Workflow engine's instance error) is only that. One exception (#1343):
 // do_step_required's text is a fixed template plus one structured value,
 // DoStepRequired.step, interpolated only when isReleaseVersion accepts it
 // (jobErrorText); otherwise the fixed text alone.
+// jobs.error_message (#461) is that text, then, for a terminal refusal only
+// (refusalDetail: a StepRefusal, an OwnerVarsRefusal or a non-retry
+// ProvisionRefused), " Reason: " and the refusal's own text through
+// redactDetail, the whole capped at ERROR_MESSAGE_MAX (storedMessage).
+// Retryable, cf_error and internal failures store their text alone (a
+// Cloudflare or D1 message can quote input that redactDetail doesn't know),
+// except an internal StepRefusal, whose detail the provisioner writes
+// itself. cf_error never takes a reason, whatever the wrapper.
+// So does any failure whose request values could not all be read (steps.ts
+// requestValues), since a value missed would go unredacted.
 import { NonRetryableError } from "cloudflare:workflows";
 import {
   CfError,
   DoStepRequired,
   isReleaseVersion,
+  OwnerVarsRefusal,
   PROVISION_ERROR_CODES,
   type ProvisionErrorCode,
+  ProvisionRefused,
   ProvisionRetry,
   provisionErrorCode,
 } from "@oa/provision";
@@ -99,9 +110,9 @@ export function redactDetail(text: string, values: readonly string[]): string {
 }
 
 /**
- * jobs.error_message per job code: a short, neutral sentence, never
- * interpolated, so a stored message carries no request value or inner
- * error text.
+ * Each job code's fixed text: a short, neutral sentence, never
+ * interpolated. jobs.error_message starts with it; only a terminal
+ * refusal's redacted reason follows (storedMessage).
  */
 export const JOB_ERROR_TEXT = Object.freeze({
   release_not_published: "The requested release is not published.",
@@ -142,7 +153,8 @@ export const JOB_ERROR_TEXT = Object.freeze({
 /**
  * A terminal refusal raised inside the provisioner (a recheck): its message
  * is exactly `<code>: <JOB_ERROR_TEXT>`, so the Workflow engine's instance
- * error holds no detail; `detail` goes only to the redacted log line.
+ * error holds no detail; `detail` goes only through redactDetail, to the log
+ * line and to jobs.error_message's reason (storedMessage).
  */
 export class StepRefusal extends NonRetryableError {
   readonly detail: string;
@@ -200,11 +212,53 @@ export function stepError(e: unknown): Error {
   return err;
 }
 
-/** An error's own text, for the redacted log line only. */
+/** An error's own text, for redactDetail only (the log line, a reason). */
 export function detailOf(e: unknown): string {
   if (e instanceof StepRefusal) return e.detail;
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+/**
+ * Codes whose stored text never takes a reason (#461): not refusals. A
+ * StepRefusal is exempt from `internal` (its detail is the provisioner's
+ * own), never from cf_error: Cloudflare errors stay as before #461.
+ */
+const NO_REASON: ReadonlySet<ProvisionErrorCode> = new Set([
+  "cf_error",
+  "internal",
+]);
+
+/**
+ * A refusal's own text (#461): a StepRefusal's detail (any code but
+ * cf_error), or, for a code outside NO_REASON, an OwnerVarsRefusal's `why`
+ * or the message of a ProvisionRefused that is not a ProvisionRetry. Null
+ * for anything else (a cf_error of any kind, a D1 error, a bare
+ * NonRetryableError, a retry). Stored only when the step's
+ * failure is terminal (noteFailure). Raw: redact before storing.
+ */
+export function refusalDetail(e: unknown): string | null {
+  if (e instanceof StepRefusal)
+    return codeOf(e) === "cf_error" ? null : e.detail;
+  if (e instanceof OwnerVarsRefusal)
+    return NO_REASON.has(e.code) ? null : e.why;
+  if (e instanceof ProvisionRefused && !classify(e).retryable)
+    return NO_REASON.has(e.code) ? null : e.message;
+  return null;
+}
+
+const REASON = " Reason: ";
+
+/**
+ * jobs.error_message: `text` (the code's stored text, errorTextOf), then
+ * " Reason: " and `reason` when there is one, cut so the whole is at most
+ * ERROR_MESSAGE_MAX. `reason` must already be redacted (redactDetail).
+ */
+export function storedMessage(text: string, reason: string | null): string {
+  const r = reason?.trim() ?? "";
+  if (!r || text.length + REASON.length >= ERROR_MESSAGE_MAX)
+    return text.slice(0, ERROR_MESSAGE_MAX);
+  return `${text}${REASON}${r}`.slice(0, ERROR_MESSAGE_MAX);
 }
 
 /** The code a step's error carries (its text up to the first ":"). */

@@ -10,6 +10,7 @@ import {
   parseTemplate,
 } from "@oa/provision";
 import { RESUME_JOB_MIN_VERSION } from "@oa/provision/versions";
+import { fakeProvisionerRpc } from "@oa/provisioning-contract/fakes";
 import { REDLINE_SCOPE_FIXTURE } from "@oa/provisioning-contract/fixtures";
 import { SYSTEM_ACTOR } from "@oa/provisioning-contract/system";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,10 +27,13 @@ import {
   claimedByOther,
 } from "../../../provisioning/src/routes/writes.js";
 import {
+  FLEET_VERIFIED_PREFIX,
   fleetConditions,
   fleetRequestId,
 } from "../../../scheduler/src/provapi/fleet.js";
-import { JOB_ERROR_TEXT } from "../../src/errors.js";
+import { fleetWake } from "../../../scheduler/src/provapi/wake.js";
+import { wakeBatch } from "../../../scheduler/test/provapi/batch.js";
+import { ERROR_MESSAGE_MAX, JOB_ERROR_TEXT } from "../../src/errors.js";
 import {
   GRACE_MS,
   NEVER_ROUTED,
@@ -278,6 +282,28 @@ describe("upgrade and rollback (5.4)", () => {
     expect(w.install(s.installId)).toMatchObject({ version: HELD });
   });
 
+  it("the scheduler's fleet job crosses the reviewed release without an admin flag", async () => {
+    w = await world({ held: true });
+    const s = await active({ slug: "canary", version: V1 });
+    const db = installDb(s.installId);
+    db.exec(
+      "CREATE TABLE held_probe (id INTEGER); INSERT INTO held_probe VALUES (1), (2)",
+    );
+    const r = await manage("upgrade", s.installId, {
+      actor: "system",
+      actorKey: SYSTEM_ACTOR.key,
+      requestId: fleetRequestId(s.installId, HELD),
+      args: { from: V1, to: HELD },
+    });
+    expect(r.job).toMatchObject({ status: "done", error_code: null });
+    expect(db.prepare("SELECT id FROM held_probe").all()).toEqual([{ id: 2 }]);
+    expect(
+      w.all(
+        "SELECT id FROM hosted_audit WHERE action = 'upgrade.restore_point'",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("#1343: an install on DO tag v3, to a release binding BusHub: do_step_required names the step, and the fleet halt shows it", async () => {
     // The server template binds BusHub (#1425): the target. The step,
     // 0.24.5, is the same template with BusHub added but unbound. V2 binds
@@ -331,8 +357,19 @@ describe("upgrade and rollback (5.4)", () => {
     expect(r.job).toMatchObject({
       status: "failed",
       error_code: "do_step_required",
-      error_message: `Upgrade this install to ${STEP} first: the target adds Durable Object classes it can't jump to.`,
     });
+    // #461: the step's text first, then the refusal's redacted reason.
+    const msg = String(r.job?.error_message ?? "");
+    expect(
+      msg.startsWith(
+        `Upgrade this install to ${STEP} first: the target adds Durable Object classes it can't jump to. Reason: `,
+      ),
+    ).toBe(true);
+    expect(msg).toContain("BusHub");
+    // The install id is a request value: redacted.
+    expect(msg).not.toContain(s.installId);
+    expect(msg).toContain("Reason: install [value]");
+    expect(msg.length).toBeLessThanOrEqual(ERROR_MESSAGE_MAX);
     expect(w.fake.writes().length).toBe(writes);
     expect(w.install(s.installId)).toMatchObject({ version: V1, lease: null });
     // The fleet reads what was stored: the install from the row, the step
@@ -376,6 +413,153 @@ describe("upgrade and rollback (5.4)", () => {
       error_code: "downgrade_refused",
     });
     expect(w.install(s.installId)?.version).toBe(V2);
+  });
+
+  it.each(["deploy", "token completion"] as const)(
+    "a %s wake starts the next system upgrade",
+    async (trigger) => {
+      const canary = await active({ slug: "wakecanary", version: V1 });
+      const member = await active({ slug: "wakemember", version: V1 });
+      w.db.prepare("UPDATE install_lifecycle SET health = 'ok'").run();
+      w.db
+        .prepare(
+          "INSERT INTO platform_state (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .run(FLEET_VERIFIED_PREFIX + V2, w.clock.t, w.clock.t);
+      const tag = `v${V2}`;
+      let body: unknown = { env: "staging", tag };
+      if (trigger === "token completion") {
+        const send = vi.fn(async (_message: { jobId: string }) => {});
+        w.ctx.env.FLEET_WAKE = { send } as unknown as Queue<{ jobId: string }>;
+        const completed = await manage("upgrade", canary.installId, {
+          actor: "token",
+          args: { from: V1, to: V2 },
+        });
+        expect(completed.job).toMatchObject({
+          actor_kind: "token",
+          status: "done",
+        });
+        expect(send.mock.calls).toEqual([[{ jobId: completed.id }]]);
+        body = send.mock.calls[0]?.[0];
+      }
+      const { batch, acked, retried } = wakeBatch([1], w.clock.t);
+      const smoke = vi.fn(async () => ({ ok: true as const, notes: [] }));
+      const env = {
+        OA_ENV: ENV,
+        PLATFORM_DB: w.env.PLATFORM_DB,
+        MANAGE_INSTALL: w.manage,
+        FLEET_CANARY: canary.installId,
+        FLEET_SMOKE: "required",
+        CF_VERSION_METADATA: {
+          id: "test",
+          tag,
+          timestamp: new Date(w.clock.t).toISOString(),
+        },
+        PROVISIONER: fakeProvisionerRpc({
+          releases: [
+            {
+              version: V2,
+              installable: true,
+              latest: true,
+              variants: ["release"],
+              publishedAt: 1,
+            },
+          ],
+        }),
+      };
+      const outcome = await fleetWake(
+        { ...batch, messages: batch.messages.map((m) => ({ ...m, body })) },
+        env,
+        w.clock.t,
+        {
+          fleet: {
+            probe: async (id) =>
+              Response.json({
+                ok: true,
+                installId: id,
+                version: w.install(id)?.version,
+              }),
+            smoke,
+          },
+        },
+      );
+      expect(outcome).toBe("ok");
+      expect(acked).toEqual([0]);
+      expect(retried).toEqual([]);
+      expect(smoke).toHaveBeenCalledTimes(trigger === "deploy" ? 0 : 1);
+      const next = trigger === "deploy" ? canary.installId : member.installId;
+      expect(
+        w.all(
+          "SELECT install_id, request_id FROM jobs WHERE kind = 'upgrade' AND actor_kind = 'system'",
+        ),
+      ).toEqual([{ install_id: next, request_id: fleetRequestId(next, V2) }]);
+      expect(w.manage.created).toHaveLength(1);
+    },
+  );
+
+  // cloud #264, Leo: "Everything should be event-based, push, never PULL".
+  // A job's end is the fleet's next event: { jobId } to oa-<p>-fleet-wake.
+  it("cloud #264: a job's end posts { jobId } to FLEET_WAKE after done, or after fail before any lease wait; unbound, nothing", async () => {
+    const sent: unknown[] = [];
+    const order: string[] = [];
+    const queue = {
+      send: async (m: unknown) => {
+        order.push("send");
+        sent.push(m);
+      },
+    } as unknown as Queue<{ jobId: string }>;
+    w.ctx.env.FLEET_WAKE = queue;
+    const s = await active({ slug: "wakeco", version: V1 });
+    const ok = await manage("upgrade", s.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(ok.job?.status).toBe("done");
+    expect(ok.log.map((l) => l.name)).toEqual([
+      "load",
+      "recheck",
+      "release_gate",
+      "upload",
+      "done",
+      "fleet_wake",
+    ]);
+    expect(sent).toEqual([{ jobId: ok.id }]);
+    // A failed job: the wake follows fail, so a failed fleet upgrade halts
+    // its version on that event.
+    await w.r2.put(FLOOR_KEY, JSON.stringify(signFloor(floorOf())));
+    const t = await active({ slug: "wakefail", version: V1 });
+    await w.r2.put(
+      FLOOR_KEY,
+      JSON.stringify(signFloor(floorOf({ revoked: [V2] }))),
+    );
+    const bad = await manage("upgrade", t.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(bad.job?.status).toBe("failed");
+    const names = bad.log.map((l) => l.name);
+    expect(names.indexOf("fleet_wake")).toBe(names.indexOf("fail") + 1);
+    expect(sent).toEqual([{ jobId: ok.id }, { jobId: bad.id }]);
+    // A send that keeps failing never changes the job's outcome.
+    await w.r2.put(FLOOR_KEY, JSON.stringify(signFloor(floorOf())));
+    w.ctx.env.FLEET_WAKE = {
+      send: async () => {
+        throw new Error("queue 503");
+      },
+    } as unknown as Queue<{ jobId: string }>;
+    const u = await active({ slug: "wakedown", version: V1 });
+    const down = await manage("upgrade", u.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(down.error).toBeNull();
+    expect(down.job?.status).toBe("done");
+    expect(logged()).toContain("provisioner fleet_wake failed");
+    // Unbound (a config from before it): no step, no message.
+    w.ctx.env.FLEET_WAKE = undefined;
+    const v = await active({ slug: "wakenone", version: V1 });
+    const none = await manage("upgrade", v.installId, {
+      args: { from: V1, to: V2 },
+    });
+    expect(none.log.map((l) => l.name)).not.toContain("fleet_wake");
+    expect(order).toEqual(["send", "send"]);
   });
 
   it("an upgrade to a below-floor or revoked version: release_unverified, still on from (3.5, #1029)", async () => {
@@ -2393,6 +2577,103 @@ describe("redline_creds (10.1, R26)", () => {
       args: { recipientKey: "A".repeat(43) },
     });
     expect(admin.job?.error_code).toBe("invalid_state");
+  });
+
+  it("hookKeyOnly rotates TEST_HOOK_KEY and seals {hookKey} with zero PAT creations, including on retry", async () => {
+    const ownerKeyIdA = `${"A".repeat(42)}A`;
+    const ownerKeyIdB = `${"B".repeat(42)}A`;
+    const fixtureActorA = `oidc:42:test-install:1001:${ownerKeyIdA}`;
+    const fixtureActorB = `oidc:42:test-install:1002:${ownerKeyIdB}`;
+    const s = await active({
+      slug: "t-hookonly",
+      actor: "admin",
+      testHooks: true,
+    });
+    w.db
+      .prepare(
+        "UPDATE jobs SET actor_kind = 'oidc', actor_key = ? WHERE id = ?",
+      )
+      .run(fixtureActorA, s.signupId);
+
+    // First attempt exhausts key-live probes and retries via REDLINE_STEP;
+    // also replay the step body (`twice: true`): zero sessions or PATs across all attempts.
+    const { script, seen, tokens, probes } = stubInstall(
+      s.installId,
+      undefined,
+      { staleProbes: KEY_LIVE_WAITS_MS.length + 1 },
+    );
+    const oldKey = script?.secrets.get("TEST_HOOK_KEY");
+    const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+      "deriveBits",
+    ])) as CryptoKeyPair;
+    const recipientKey = Buffer.from(
+      new Uint8Array(
+        (await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer,
+      ),
+    ).toString("base64url");
+
+    const putsBefore = w.fake.log.filter(
+      (l) =>
+        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200,
+    ).length;
+    const r = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+      twice: true,
+    });
+    const putsAfter = w.fake.log.filter(
+      (l) =>
+        l.method === "PUT" && l.path.endsWith("/secrets") && l.status === 200,
+    ).length;
+
+    expect(r.error).toBeNull();
+    expect(r.job).toMatchObject({ status: "done", step: "done" });
+    expect(putsAfter - putsBefore).toBe(3); // 1 failed attempt + 2 (twice replay)
+    const newKey = script?.secrets.get("TEST_HOOK_KEY") as string;
+    expect(newKey).not.toBe(oldKey);
+    expect(probes.length).toBeGreaterThanOrEqual(KEY_LIVE_WAITS_MS.length + 3);
+    expect(seen).toEqual([]);
+    expect(tokens.map((t) => t.id)).toEqual(["t1", "t2"]);
+    expect(JSON.parse(await openSealed(pair, r.job?.sealed as string))).toEqual(
+      { hookKey: newKey },
+    );
+
+    // Refusals: redline/test-member cannot request hookKeyOnly; fixtures cannot
+    // mint PATs, revoke, or touch another fixture's install.
+    const rl = await active({
+      slug: "rl-guard",
+      actor: "oidc",
+      testHooks: true,
+    });
+    const rlStub = stubInstall(rl.installId);
+    const rlRefused = await manage("redline_creds", rl.installId, {
+      actor: "oidc",
+      actorKey: "oidc:42",
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+    });
+    expect(rlRefused.job?.error_code).toBe("invalid_state");
+    expect(rlStub.seen).toEqual([]);
+
+    const mintRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: false, recipientKey },
+    });
+    expect(mintRefused.job?.error_code).toBe("invalid_state");
+    const revokeRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorA,
+      args: { revoke: true },
+    });
+    expect(revokeRefused.job?.error_code).toBe("invalid_state");
+    const crossRefused = await manage("redline_creds", s.installId, {
+      actor: "oidc",
+      actorKey: fixtureActorB,
+      args: { revoke: false, hookKeyOnly: true, recipientKey },
+    });
+    expect(crossRefused.job?.error_code).toBe("invalid_state");
+    expect(seen).toEqual([]);
   });
 });
 

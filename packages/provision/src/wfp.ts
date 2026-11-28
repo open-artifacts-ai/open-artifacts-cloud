@@ -105,7 +105,7 @@ import {
   registryKey,
   withDefaultVars,
 } from "./names.js";
-import { nonAdditiveReason } from "./non-additive.js";
+import { NON_ADDITIVE_MARK, nonAdditiveReason } from "./non-additive.js";
 import {
   canonicalJson,
   type DirectoryRevoke,
@@ -1167,6 +1167,8 @@ export function fenceWrites(cf: Cf, fence: () => Promise<void>): Cf {
 
 /** upgrade's options. */
 export type UpgradeOptions = {
+  /** Set internally for upgrades scheduled by the canary-first fleet. */
+  reviewedFleetMigration?: boolean;
   nonAdditive?: boolean;
   /**
    * #1106 test seam: fail the post-upgrade health check after the upload, so
@@ -2057,7 +2059,7 @@ export class WfpProvisioner {
     if (row) {
       if (row.state === "active")
         throw new ProvisionRefused(
-          `slug ${i.slug} already exists as active install ${row.id}`,
+          "an active install already holds the requested slug",
           "slug_taken",
         );
       // Covers deleted too: its slug and hosts stay held until a purge.
@@ -2101,7 +2103,7 @@ export class WfpProvisioner {
       ]);
       if (held.length > 0)
         throw new ProvisionRefused(
-          `host ${held[0]?.host} is already taken by ${held[0]?.install_id}`,
+          "the requested host is already taken",
           "slug_taken",
         );
       res = await this.resources(row);
@@ -2109,7 +2111,7 @@ export class WfpProvisioner {
       const holders = await this.platform.holdersOf([appHost, contentHost]);
       if (holders.length > 0)
         throw new ProvisionRefused(
-          `host or broker origin already taken by install ${holders[0]?.id} (slug ${i.slug})`,
+          "the requested host or broker origin is already taken",
           "slug_taken",
         );
     }
@@ -2119,7 +2121,7 @@ export class WfpProvisioner {
       const p = cur === null ? null : parseHostsValue(cur);
       if (cur !== null && (!p || p.installId !== row?.id))
         throw new ProvisionRefused(
-          `host ${h} is already taken by ${cur}`,
+          "the requested host is already taken",
           "slug_taken",
         );
     }
@@ -2413,13 +2415,13 @@ export class WfpProvisioner {
       const byId = await this.platform.byId(i.installId);
       if (byId && byId.slug !== i.slug)
         throw new ProvisionRefused(
-          `installId ${i.installId} is not the install for slug ${i.slug}`,
+          "the install ID does not match the requested slug",
           "invalid_state",
         );
-      // An active row keeps its own refusal (slug ... already exists).
+      // An active row keeps its own refusal.
       if (bySlug && bySlug.id !== i.installId && bySlug.state !== "active")
         throw new ProvisionRefused(
-          `slug ${i.slug} is already taken by install ${bySlug.id}`,
+          "another install already holds the requested slug",
           "slug_taken",
         );
       return bySlug;
@@ -2428,7 +2430,7 @@ export class WfpProvisioner {
     const byId = await this.platform.byId(i.resumeId);
     if (!byId || byId.slug !== i.slug || bySlug?.id !== byId.id)
       throw new ProvisionRefused(
-        `resumeId ${i.resumeId} is not the install for slug ${i.slug}`,
+        "the resume ID does not match the requested slug",
         "invalid_state",
       );
     return byId;
@@ -2798,7 +2800,7 @@ export class WfpProvisioner {
       if (cur !== null && parseHostsValue(cur)?.installId === id) continue;
       if (cur !== null)
         throw new ProvisionRefused(
-          `host ${h} is already taken by ${cur}`,
+          "the requested host is already taken",
           "slug_taken",
         );
       assertOwnResource(this.hostsKv.title, this.env);
@@ -3589,7 +3591,7 @@ export class WfpProvisioner {
         // The PUT is idempotent.
         if (cur !== null && parseHostsValue(cur)?.installId !== id)
           throw new ProvisionRefused(
-            `host ${h} is already taken by ${cur}`,
+            "the requested host is already taken",
             "slug_taken",
           );
         assertOwnResource(this.hostsKv.title, this.env);
@@ -3801,14 +3803,14 @@ export class WfpProvisioner {
 
   /**
    * MIG-2: this install's pending migrations, not the release's, are what an
-   * upgrade would run. One that can lose data needs o.nonAdditive, which a
-   * fleet job never has, and then a restore point: no bookmark, no upgrade.
+   * upgrade would run. A fleet job needs a reviewed marker on each risky file.
+   * An operator can explicitly consent. Both paths need a restore point.
    */
   private async migrationHold(
     id: InstallId,
     rel: Checked,
     d1Id: string,
-    o: { nonAdditive?: boolean },
+    o: UpgradeOptions,
     retry = false,
   ): Promise<{
     bookmark: string;
@@ -3819,12 +3821,22 @@ export class WfpProvisioner {
     const done = new Set((r[0]?.results ?? []).map((x) => String(x.name)));
     const held = rel.migrations.flatMap((f) => {
       if (done.has(f.name)) return [];
-      const why = nonAdditiveReason(new TextDecoder().decode(f.bytes));
-      return why ? [`${f.name} (${why})`] : [];
+      const sql = new TextDecoder().decode(f.bytes);
+      const why = nonAdditiveReason(sql, o.reviewedFleetMigration);
+      if (!why) return [];
+      const header = /^(?:--[^\n]*(?:\n|$)|[ \t]*\n)*/.exec(sql)?.[0] ?? "";
+      const reviewed =
+        sql.split("\n", 1)[0] === NON_ADDITIVE_MARK &&
+        /^-- oa:verify[ \t]+\S/m.test(header);
+      return [{ file: `${f.name} (${why})`, reviewed }];
     });
     if (held.length === 0) return null;
-    const files = held.join(", ");
-    if (o.nonAdditive !== true) {
+    const files = held.map((entry) => entry.file).join(", ");
+    if (
+      o.reviewedFleetMigration
+        ? held.some((entry) => !entry.reviewed)
+        : o.nonAdditive !== true
+    ) {
       await this.platform.audit(id, "upgrade.held", {
         to: rel.rec.version,
         migrations: files.slice(0, RESTORE_POINT_FILES_MAX),

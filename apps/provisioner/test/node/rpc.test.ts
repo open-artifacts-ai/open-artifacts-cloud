@@ -2,6 +2,7 @@
 // RELEASES, siteverify with the env widget's secret (or Turnstile's test
 // secret for a staging test user only), and the token's status. No answer
 // carries a token or secret.
+import { FLOOR_KEY, RECORD_FILE, releaseKey } from "@oa/provision";
 import { ReleaseSchema, TokenStatusSchema } from "@oa/provisioning-contract";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TEST_PUBKEY } from "../../../../packages/provision/test/fixtures/release.js";
@@ -14,7 +15,7 @@ import {
   clearTurnstilePairs,
   TURNSTILE_PAIR_TTL_MS,
 } from "../../src/turnstile.js";
-import { NOW, TS, V1, V2, type World, world } from "./world.js";
+import { FIX, NOW, TS, V1, V2, type World, world } from "./world.js";
 
 vi.mock(
   "../../../../packages/provision/src/internal/gates.js",
@@ -86,7 +87,34 @@ describe("releases()", () => {
     ]);
   });
 
+  it("reads only the signed floor and target keys among 512 other releases", async () => {
+    const source = FIX.makeRelease();
+    for (let i = 0; i < 512; i++) {
+      const version = `1.0.${i}`;
+      await w.r2.put(
+        releaseKey(version, "release", RECORD_FILE),
+        JSON.stringify(await source.record(version, "release")),
+      );
+    }
+    w.r2.reads.length = 0;
+    expect(await listReleases(w.env, { version: V2 })).toMatchObject([
+      { version: V2, installable: true, variants: ["release", "redline"] },
+    ]);
+    const release = releaseKey(V2, "release", RECORD_FILE);
+    const redline = releaseKey(V2, "redline", RECORD_FILE);
+    expect([...w.r2.reads].sort()).toEqual(
+      [
+        `get ${FLOOR_KEY}`,
+        `get ${release}`,
+        `get ${redline}`,
+        `head ${release}`,
+        `head ${redline}`,
+      ].sort(),
+    );
+  });
+
   it("{ version }: exactly that release; an unknown version is [] (#1029)", async () => {
+    w.r2.reads.length = 0;
     expect(await listReleases(w.env, { version: V1 })).toEqual([
       {
         version: V1,
@@ -96,7 +124,11 @@ describe("releases()", () => {
         latest: false,
       },
     ]);
+    expect(w.r2.reads.filter((read) => read.startsWith("list "))).toEqual([]);
     expect(await listReleases(w.env, { version: "99.0.0" })).toEqual([]);
+    w.r2.reads.length = 0;
+    expect(await listReleases(w.env, { version: "../floor" })).toEqual([]);
+    expect(w.r2.reads).toEqual([]);
   });
 });
 

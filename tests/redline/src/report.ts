@@ -167,6 +167,16 @@ export function legOf(errors: readonly unknown[]): Partial<CaseResult> {
   return out;
 }
 
+/** Route coverage against public's route-policy-table.ts: reported, never fails the gate. */
+export interface RouteCoverage {
+  total: number;
+  probed: number;
+  denyOnly: number;
+  dropped: number;
+  uncovered: string[];
+  byDropWhy: Partial<Record<string, string[]>>;
+}
+
 export interface Report {
   mode: string;
   finishedAt: string;
@@ -176,6 +186,8 @@ export interface Report {
   nonPass: CaseResult[];
   cases: CaseResult[];
   gate: { passed: boolean; reason: string };
+  /** Route coverage against public's route-policy-table.ts (report only; never fails the gate). */
+  coverage?: RouteCoverage;
   /** Accepted because this run was scheduled; never on a candidate. By name. */
   nightlyOnly?: string[];
   /** What this run ran against (the reporter): what combine() matches verdicts to. */
@@ -705,6 +717,7 @@ export function buildReport(
   raw: readonly CaseResult[],
   mode = "unknown",
   run: RunKind = {},
+  coverage?: RouteCoverage,
 ): Report {
   const cases = raw;
   const counts = Object.fromEntries(LEVELS.map((l) => [l, 0])) as Record<
@@ -734,6 +747,7 @@ export function buildReport(
     counts,
     nonPass,
     cases: [...cases],
+    ...(coverage ? { coverage } : {}),
     ...(nNightly
       ? {
           nightlyOnly: cases
@@ -822,6 +836,21 @@ export function formatReport(r: Report): string {
     for (const n of r.fileNotes ?? []) lines.push(`  [${n.file}] ${n.note}`);
     for (const c of noted)
       for (const n of c.notes ?? []) lines.push(`  ${c.name}: ${n}`);
+  }
+  if (r.coverage) {
+    const c = r.coverage;
+    lines.push(
+      `Route coverage: ${c.probed}/${c.total} probed, ${c.denyOnly} deny-only, ${c.dropped} dropped, ${c.uncovered.length} uncovered`,
+    );
+    const drops = Object.entries(c.byDropWhy)
+      .filter(([, rs]) => (rs?.length ?? 0) > 0)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([why, rs]) => `${why} ${rs?.length ?? 0}`);
+    if (drops.length) lines.push(`  dropped: ${drops.join(", ")}`);
+    if (c.uncovered.length) {
+      lines.push("Uncovered routes (report only):");
+      for (const u of c.uncovered) lines.push(`  ${u}`);
+    }
   }
   lines.push(`Gate: ${r.gate.passed ? "PASS" : "FAIL"} (${r.gate.reason})`);
   return `${lines.join("\n")}\n`;

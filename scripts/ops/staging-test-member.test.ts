@@ -61,7 +61,10 @@ describe("staging-test-member.yml", () => {
     expect(Object.keys(w.on.workflow_dispatch.inputs)).toEqual([
       "recipient_key",
       "revoke",
+      "upgrade_tag",
     ]);
+    // The credentials job runs only without upgrade_tag (cloud #264).
+    expect(job.if).toBe("inputs.upgrade_tag == ''");
     expect(w.permissions).toEqual({ contents: "read" });
     expect(job.environment).toBe("redline-staging");
     expect(job.permissions).toEqual({ contents: "read", "id-token": "write" });
@@ -455,14 +458,16 @@ describe("main, with gh and fetch mocked", () => {
     let key = "";
     const gh = vi.fn(async (...a: string[]) => {
       ghCalls.push(a);
-      if (a[0] === "workflow") {
-        const f = a.find((x) => x.startsWith("recipient_key="));
-        key = f ? f.slice("recipient_key=".length) : "";
-        return "";
+      if (a[0] === "api") {
+        const f = a.find((x) => x.startsWith("inputs[recipient_key]="));
+        key = f ? f.slice("inputs[recipient_key]=".length) : "";
+        return "4242\n";
       }
-      if (a[0] === "run" && a[1] === "list") return "4242\n";
+      // An upgrade dispatched immediately afterwards is now the newest run.
+      if (a[0] === "run" && a[1] === "list") return "4243\n";
       if (a[0] === "run" && a[1] === "watch") return "";
       if (a[0] === "run" && a[1] === "view") {
+        expect(a[2]).toBe("4242");
         if (o.revoke)
           return "x test-member-job: 01JOB\nx test-member-revoked: rl-agents\n";
         const sealed = sealTo(
@@ -489,7 +494,6 @@ describe("main, with gh and fetch mocked", () => {
       gh,
       fetch: fetchMock,
       now: () => NOW,
-      sleep: async () => {},
       tmp,
       mcpBase: join(home, ".oa-redline", "rl-agents"),
       log: (l) => lines.push(l),
@@ -501,16 +505,11 @@ describe("main, with gh and fetch mocked", () => {
     const { d, lines, ghCalls, fetchCalls } = deps();
     expect(await main([], d)).toBe(0);
     const dispatch = ghCalls[0] as string[];
-    expect(dispatch.slice(0, 7)).toEqual([
-      "workflow",
-      "run",
-      WORKFLOW,
-      "-R",
-      "open-artifacts-ai/open-artifacts-cloud",
-      "--ref",
-      "main",
-    ]);
-    expect(dispatch).toContain("revoke=false");
+    expect(dispatch).toContain(
+      `repos/open-artifacts-ai/open-artifacts-cloud/actions/workflows/${WORKFLOW}/dispatches`,
+    );
+    expect(dispatch).toContain("ref=main");
+    expect(dispatch).toContain("inputs[revoke]=false");
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0]?.url).toBe(`https://${APP_HOST}/__test/session`);
     expect(
@@ -566,8 +565,10 @@ describe("main, with gh and fetch mocked", () => {
     const { d, lines, ghCalls, fetchCalls } = deps({ revoke: true });
     expect(await main(["--revoke"], d)).toBe(0);
     const dispatch = ghCalls[0] as string[];
-    expect(dispatch).toContain("revoke=true");
-    expect(dispatch.some((a) => a.startsWith("recipient_key="))).toBe(false);
+    expect(dispatch).toContain("inputs[revoke]=true");
+    expect(dispatch.some((a) => a.startsWith("inputs[recipient_key]="))).toBe(
+      false,
+    );
     expect(fetchCalls).toHaveLength(0);
     expect(readdirSync(tmp)).toEqual([]);
     expect(JSON.parse(lines[0] as string)).toEqual({
@@ -711,8 +712,7 @@ describe("main, with gh and fetch mocked", () => {
   it("a run id that is not a number: no watch, no fetch, no file", async () => {
     const { d, ghCalls, fetchCalls } = deps();
     const gh = d.gh;
-    d.gh = async (...a: string[]) =>
-      a[0] === "run" && a[1] === "list" ? "../evil\n" : gh(...a);
+    d.gh = async (...a: string[]) => (a[0] === "api" ? "../evil\n" : gh(...a));
     await expect(main(ADMIN_MCP, d)).rejects.toThrow(/not a number/);
     expect(ghCalls.some((a) => a[1] === "watch" || a[1] === "view")).toBe(
       false,
@@ -749,5 +749,232 @@ describe("main, with gh and fetch mocked", () => {
     expect(readdirSync(tmp)).toEqual([]);
     // The directory was set up before the mint; no config went in it.
     expect(readdirSync(d.mcpBase)).toEqual([]);
+  });
+});
+
+// Cloud #264: the upgrade mode. rl-agents follows staging's release; the
+// staging release chain dispatches it with upgrade_tag once staging's deploy
+// is done. One deadline of 30 s, one R5 that waits only for the 202, every
+// problem a warning, and a 403 (the scope not live yet) a warning too.
+describe("staging-test-member.yml upgrade mode (cloud #264)", () => {
+  const up = w.jobs.upgrade;
+  const ustep = up.steps[0];
+  const urun = ustep.run as string;
+
+  it("its own job, only with upgrade_tag, in the redline-staging Environment, bounded, in its own concurrency group", () => {
+    expect(up.if).toBe("inputs.upgrade_tag != ''");
+    expect(up.environment).toBe("redline-staging");
+    expect(up.permissions).toEqual({ contents: "read", "id-token": "write" });
+    expect(up["timeout-minutes"]).toBe(1);
+    expect(up.steps).toHaveLength(1);
+    expect(urun).not.toContain("${{");
+    expect(urun).not.toMatch(/\b(sleep|while|until|wait)\b/);
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: a workflow expression
+    expect(ustep.env.TAG).toBe("${{ inputs.upgrade_tag }}");
+    expect(ustep.env.AUDIENCE).toBe("https://api.open-artifacts-staging.app");
+    expect(ustep.env.SLUG).toBe("rl-agents");
+    expect(ustep.env.APP_HOST).toBe(APP_HOST);
+    expect(w.concurrency.group).toBe(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: a workflow expression
+      "staging-test-member${{ inputs.upgrade_tag != '' && '-upgrade' || '' }}",
+    );
+    // Every token reaches curl on stdin, never argv.
+    expect(urun).not.toMatch(/-H "Authorization/);
+  });
+
+  /**
+   * The step's bash with a fake curl and a fake clock: `clock` is what each
+   * `date +%s` reads in order (the last repeats), so a slow request is a
+   * clock jump, never a wait.
+   */
+  function sandbox(o: {
+    tag?: string;
+    ref?: string;
+    version?: string | null;
+    activeJobId?: string | null;
+    statuses?: Partial<Record<"r2" | "r3" | "r5", number>>;
+    clock?: number[];
+  }) {
+    const d = mkdtempSync(join(tmpdir(), "oa-tm-up-"));
+    const bin = join(d, "bin");
+    mkdirSync(bin);
+    const r3 = {
+      id: "iagents",
+      slug: "rl-agents",
+      appHost: APP_HOST,
+      state: "active",
+      version: o.version === undefined ? "0.145.0" : o.version,
+      testHooks: true,
+      activeJobId: o.activeJobId ?? null,
+    };
+    const st = { r2: 200, r3: 200, r5: 202, ...o.statuses };
+    const answers: Record<string, [number, unknown]> = {
+      mint: [200, { value: "minted.oidc.jwt" }],
+      r2: [
+        st.r2,
+        st.r2 === 200 ? { items: [r3] } : { error: { code: "forbidden" } },
+      ],
+      r3: [st.r3, st.r3 === 200 ? r3 : { error: { code: "forbidden" } }],
+      r5: [
+        st.r5,
+        st.r5 === 202
+          ? { job: { id: "j01ABCDEF" } }
+          : {
+              error: { code: st.r5 === 403 ? "forbidden" : "job_in_progress" },
+            },
+      ],
+    };
+    for (const [k, [code, body]] of Object.entries(answers)) {
+      writeFileSync(join(d, `${k}.json`), JSON.stringify(body));
+      writeFileSync(join(d, `${k}.status`), String(code));
+    }
+    writeFileSync(join(d, "clock"), (o.clock ?? [1000]).join("\n"));
+    writeFileSync(
+      join(bin, "date"),
+      `#!/usr/bin/env bash
+n=$(cat "$D/clock.n" 2> /dev/null || echo 1)
+v=$(sed -n "\${n}p" "$D/clock"); [ -n "$v" ] || v=$(tail -n 1 "$D/clock")
+echo $((n + 1)) > "$D/clock.n"
+echo "$v"
+`,
+      { mode: 0o755 },
+    );
+    // Reads the bearer from its -K - config on stdin; records the call.
+    writeFileSync(
+      join(bin, "curl"),
+      `#!/usr/bin/env bash
+out=""; method=GET; data=""; max=""; url=""; auth=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
+    --max-time) max="$2"; shift 2 ;;
+    -K) auth=$(cat | sed -n 's/.*Bearer \\([^"]*\\)".*/\\1/p'); shift 2 ;;
+    -H|-w) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  https://fake.invalid/*) k=mint ;;
+  */v1/installs\\?q=rl-agents) k=r2 ;;
+  */v1/installs/iagents) k=r3 ;;
+  */v1/installs/iagents/upgrade) k=r5 ;;
+  *) exit 7 ;;
+esac
+printf '%s %s max=%s auth=%s data=%s\\n' "$method" "$url" "$max" "$auth" "$data" >> "$D/calls"
+if [ -n "$out" ]; then cp "$D/$k.json" "$out"; printf '%s' "$(cat "$D/$k.status")"; else cat "$D/$k.json"; fi
+`,
+      { mode: 0o755 },
+    );
+    const env = {
+      PATH: `${bin}:${process.env.PATH}`,
+      D: d,
+      ...ustep.env,
+      REF: o.ref ?? "refs/heads/main",
+      TAG: o.tag ?? "v0.250.0",
+      RUN_ID: "77",
+      RUN_ATTEMPT: "1",
+      ACTIONS_ID_TOKEN_REQUEST_URL: "https://fake.invalid/?x=1",
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: "fake-request-token",
+      GITHUB_STEP_SUMMARY: join(d, "summary"),
+    };
+    const r = spawnSync("bash", ["-c", urun], {
+      env,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const read = (f: string) => (existsSync(f) ? readFileSync(f, "utf8") : "");
+    const out = {
+      ...r,
+      summary: read(env.GITHUB_STEP_SUMMARY),
+      calls: read(join(d, "calls")).trim().split("\n").filter(Boolean),
+    };
+    rmSync(d, { recursive: true, force: true });
+    return out;
+  }
+  const posts = (calls: string[]) => calls.filter((c) => c.startsWith("POST "));
+
+  it("an older rl-agents: one R5 to the tag, with the minted JWT, and the summary records the accepted job id", () => {
+    const r = sandbox({});
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.calls.map((c) => c.split(" ").slice(0, 2).join(" "))).toEqual([
+      "GET https://fake.invalid/?x=1&audience=https://api.open-artifacts-staging.app",
+      "GET https://api.open-artifacts-staging.app/v1/installs?q=rl-agents",
+      "GET https://api.open-artifacts-staging.app/v1/installs/iagents",
+      "POST https://api.open-artifacts-staging.app/v1/installs/iagents/upgrade",
+    ]);
+    expect(r.calls[0]).toContain("auth=fake-request-token");
+    const post = posts(r.calls)[0] ?? "";
+    expect(post).toContain("auth=minted.oidc.jwt");
+    expect(post).toContain(
+      'data={"requestId":"test-member-up-77-1","version":"0.250.0","nonAdditive":true}',
+    );
+    expect(r.summary).toContain(
+      "rl-agents (https://rl-agents.open-artifacts-staging.app): upgrade from 0.145.0 to 0.250.0 accepted, job j01ABCDEF.",
+    );
+    expect(r.stdout).not.toContain("::warning");
+    for (const l of r.stdout.split("\n"))
+      if (l.includes("minted.oidc.jwt"))
+        expect(l).toBe("::add-mask::minted.oidc.jwt");
+    expect(r.summary).not.toContain("minted.oidc.jwt");
+    expect(r.stdout + r.stderr + r.summary).not.toContain("fake-request-token");
+  });
+
+  it("before the scope is live, a 403 on R3 or R5 warns and exits 0", () => {
+    for (const statuses of [{ r3: 403 }, { r5: 403 }]) {
+      const r = sandbox({ statuses });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain(
+        "::warning title=rl-agents upgrade::rl-agents: not upgraded,",
+      );
+      expect(r.stdout).toContain(
+        "answered 403: the test member's R3 and R5 are not live on staging yet",
+      );
+    }
+    expect(posts(sandbox({ statuses: { r3: 403 } }).calls)).toEqual([]);
+  });
+
+  it("warns without requesting an upgrade when R3 has no installed version", () => {
+    const r = sandbox({ version: null });
+    expect(r.status, r.stderr).toBe(0);
+    expect(posts(r.calls)).toEqual([]);
+    expect(r.stdout).toContain("the installed version is unknown");
+  });
+
+  it("not newer, busy, a refused R5, a bad tag or another ref: no upgrade, or a warning, and always exit 0", () => {
+    for (const o of [
+      { version: "0.250.0" },
+      { version: "0.260.0" },
+      { activeJobId: "jbusy" },
+      { tag: "main" },
+      { ref: "refs/heads/feature" },
+    ]) {
+      const r = sandbox(o);
+      expect(r.status, `${JSON.stringify(o)} ${r.stderr}`).toBe(0);
+      expect(posts(r.calls), JSON.stringify(o)).toEqual([]);
+    }
+    const refused = sandbox({ statuses: { r5: 409 } });
+    expect(refused.status).toBe(0);
+    expect(refused.stdout).toContain(
+      "the upgrade to 0.250.0 was not accepted, R5 answered 409, code job_in_progress.",
+    );
+  });
+
+  it("one 30 s deadline: a slow lookup leaves less time for the upgrade, and none left sends nothing", () => {
+    // Start at 1000 (deadline 1030). The mint and R2 are quick; R3 takes 25 s.
+    const slow = sandbox({ clock: [1000, 1001, 1002, 1003, 1028] });
+    expect(slow.status, slow.stderr).toBe(0);
+    const max = slow.calls.map((c) => Number(/max=(\d+)/.exec(c)?.[1]));
+    expect(max).toEqual([29, 28, 27, 2]);
+    for (const [i, s] of [1001, 1002, 1003, 1028].entries())
+      expect(s + (max[i] ?? 0)).toBe(1030);
+    const late = sandbox({ clock: [1000, 1001, 1002, 1003, 1031] });
+    expect(late.status, late.stderr).toBe(0);
+    expect(posts(late.calls)).toEqual([]);
+    expect(late.stdout).toContain(
+      "::warning title=rl-agents upgrade::rl-agents: not upgraded, the 30 s deadline passed.",
+    );
   });
 });

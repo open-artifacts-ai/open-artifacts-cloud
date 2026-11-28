@@ -233,7 +233,9 @@ const DROPPING: ReleaseFile = {
 };
 const MARKED: ReleaseFile = {
   name: "9003_marked.sql",
-  bytes: enc("-- oa:non-additive\nCREATE TABLE t5_marked (id INTEGER);"),
+  bytes: enc(
+    "-- oa:non-additive\n-- oa:verify Only the seeded obsolete row disappears.\nCREATE TABLE IF NOT EXISTS t5_marked (id INTEGER); DELETE FROM t5_marked WHERE id = 1;",
+  ),
 };
 const AFTER_MARKED: ReleaseFile = {
   name: "9004_after.sql",
@@ -7134,6 +7136,30 @@ describe("MIG-2: a migration that can lose data is held (#1137)", () => {
     expect(detail(s, inst.id, "upgrade.held")).toEqual([
       { to, migrations: files },
     ]);
+  });
+
+  it("fleet crosses a reviewed migration with a restore point and holds an unmarked rebuild", async () => {
+    const s = setup();
+    const inst = keep(await s.p.create(input()));
+    const db = s.installDb(inst.id);
+    db.exec(
+      "CREATE TABLE t5_marked (id INTEGER); INSERT INTO t5_marked VALUES (1), (2)",
+    );
+    const opts = { reviewedFleetMigration: true };
+    const held = await fails(s.p.upgrade(inst.id, "0.24.5", opts));
+    expect(held.code).toBe("migration_held");
+    s.fake.bookmarkFails = true;
+    expect((await fails(s.p.upgrade(inst.id, "0.24.6", opts))).code).toBe(
+      "restore_point_failed",
+    );
+    expect(db.prepare("SELECT id FROM t5_marked ORDER BY id").all()).toEqual([
+      { id: 1 },
+      { id: 2 },
+    ]);
+    s.fake.bookmarkFails = false;
+    expect(keep(await s.p.upgrade(inst.id, "0.24.6", opts)).ok).toBe(true);
+    expect(detail(s, inst.id, "upgrade.restore_point")).toHaveLength(1);
+    expect(db.prepare("SELECT id FROM t5_marked").all()).toEqual([{ id: 2 }]);
   });
 
   it("with the flag: a restore point first, then the upgrade", async () => {

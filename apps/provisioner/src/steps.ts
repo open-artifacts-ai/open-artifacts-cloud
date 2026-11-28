@@ -2,9 +2,9 @@
 // each step, `step`, `status = 'running'` and `updated_at`; in its catch,
 // `attempt`, `last_error_code`, `retry_at` and the redacted message, all
 // conditional on the job still being open, so a canceled or settled job is
-// never written back to running. Fixed categories only: a step's error is a
-// job code, and jobs.error_message that code's JOB_ERROR_TEXT (jobErrorText),
-// never an error's text.
+// never written back to running. A step's error is a job code and its
+// fixed text; jobs.error_message is that text (jobErrorText) plus, for a
+// terminal refusal only, its redacted reason (storedMessage, #461).
 import type { WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { PROVISION_ERROR_CODES, type ProvisionErrorCode } from "@oa/provision";
@@ -16,8 +16,10 @@ import {
   type FailAt,
   failOf,
   redactDetail,
+  refusalDetail,
   StepRefusal,
   stepError,
+  storedMessage,
 } from "./errors.js";
 import { type JobWait, jobChanged } from "./job-wait.js";
 import { type ProvisionerIo, Transient, transient } from "./provisioner.js";
@@ -139,12 +141,13 @@ async function noteFailure(
   config: WorkflowStepConfig | undefined,
   retryIn: number | null = null,
   fail: FailAt | null = null,
+  reason: string | null = null,
 ): Promise<void> {
   const terminal = err instanceof NonRetryableError;
   const code = codeOf(err);
-  // The code's fixed text: a refusal's message can echo request values.
-  // do_step_required's names its step, a checked release version (#1343).
-  const message = errorTextOf(err);
+  // The code's fixed text (do_step_required's names its step, a checked
+  // release version, #1343), then a terminal refusal's redacted reason.
+  const message = storedMessage(errorTextOf(err), terminal ? reason : null);
   const r = { ...DEFAULT_RETRIES, ...(config?.retries ?? {}) };
   const base = typeof r.delay === "function" ? 0 : delayMs(r.delay);
   // retry_at for the next attempt: delay, then doubled (exponential),
@@ -207,25 +210,41 @@ const parsed = (raw: unknown): unknown => {
 };
 
 /**
- * The request-provided values of a job (best effort): its args, the
- * signup's slug, vars and owner, the owner's email, the install's slug and
- * vars. They are redacted from the failure log line.
+ * The request-provided values of a job (best effort): its install id and
+ * args, the signup's slug, vars and owner, the owner's email, the install's
+ * slug and vars. They are redacted from the failure log line and a stored reason.
+ * `complete` is false when any read threw (a missing row is not a failure):
+ * then the values may miss one, and no reason is stored (#461).
  */
-async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
+async function requestValues(
+  ctx: StepCtx,
+  jobId: string,
+): Promise<{ values: string[]; complete: boolean }> {
   const out: string[] = [];
+  let complete = true;
+  const failed = () => {
+    complete = false;
+    return null;
+  };
   const db = ctx.env.PLATFORM_DB;
-  const one = <T>(sql: string, ...p: unknown[]) =>
-    db
-      .prepare(sql)
-      .bind(...p)
-      .first<T>()
-      .catch(() => null);
+  const one = async <T>(sql: string, ...p: unknown[]): Promise<T | null> => {
+    try {
+      return await db
+        .prepare(sql)
+        .bind(...p)
+        .first<T>();
+    } catch {
+      return failed();
+    }
+  };
   const job = await one<{
     args: string;
     signup_id: string | null;
     install_id: string;
   }>("SELECT args, signup_id, install_id FROM jobs WHERE id = ?", jobId);
-  if (!job) return out;
+  if (!job) return { values: out, complete };
+  // The install id: a do_step_required refusal names it (#461).
+  out.push(job.install_id);
   scalars(parsed(job.args), out);
   if (job.signup_id) {
     const su = await one<Record<string, unknown>>(
@@ -233,7 +252,7 @@ async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
       job.signup_id,
     );
     if (su) scalars([su.slug, parsed(su.vars), su.owner_sub], out);
-    const email = await ownerEmail(ctx, job.signup_id).catch(() => null);
+    const email = await ownerEmail(ctx, job.signup_id).catch(failed);
     if (email) out.push(email);
   }
   const ins = await one<Record<string, unknown>>(
@@ -241,13 +260,15 @@ async function requestValues(ctx: StepCtx, jobId: string): Promise<string[]> {
     job.install_id,
   );
   if (ins) scalars([ins.slug, parsed(ins.vars)], out);
-  return out;
+  return { values: out, complete };
 }
 
 /**
  * One console line per step failure: code, step, job id and the error's
  * detail with every request value, email, URL and IP redacted, capped.
- * The Worker's own log only: never D1, the API or the audit log.
+ * Returns a terminal refusal's reason, redacted the same way, for
+ * jobs.error_message (#461); null for any other failure, or when a read of
+ * the request values failed (so a value could go unredacted).
  */
 async function logFailure(
   ctx: StepCtx,
@@ -255,8 +276,12 @@ async function logFailure(
   step: string,
   code: string,
   e: unknown,
-): Promise<void> {
-  const values = await requestValues(ctx, jobId).catch(() => []);
+): Promise<string | null> {
+  const { values, complete } = await requestValues(ctx, jobId).catch(() => ({
+    values: [] as string[],
+    complete: false,
+  }));
+  const raw = refusalDetail(e);
   console.warn(
     JSON.stringify({
       evt: "job_step_failed",
@@ -266,6 +291,7 @@ async function logFailure(
       detail: redactDetail(detailOf(e), values),
     }),
   );
+  return raw === null || !complete ? null : redactDetail(raw, values);
 }
 
 /** 3.5: a Cloudflare token not active is retried every 15 min, up to 2 h. */
@@ -334,7 +360,7 @@ function stepOnce<T>(
         !(e instanceof NonRetryableError) &&
         codeOf(err) === "token_invalid";
       if (waits) err = new NonRetryableError(TOKEN_WAITING);
-      await logFailure(ctx, jobId, name, codeOf(err), e);
+      const reason = await logFailure(ctx, jobId, name, codeOf(err), e);
       await noteFailure(
         ctx,
         jobId,
@@ -342,6 +368,7 @@ function stepOnce<T>(
         config,
         waits ? delayMs(TOKEN_WAIT) : null,
         failOf(e),
+        waits ? null : reason,
       );
       throw err;
     }
@@ -384,7 +411,7 @@ export function auditStatement(
   ctx: StepCtx,
   installId: string,
   action: string,
-  detail: Record<string, string | number>,
+  detail: Record<string, string | number | boolean>,
   jobId: string,
 ): D1PreparedStatement {
   const sorted = Object.fromEntries(

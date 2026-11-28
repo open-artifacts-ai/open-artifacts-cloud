@@ -65,7 +65,11 @@
         // The tier a self-serve row must carry (2.5 recheck); the API's value.
         "SELF_SERVE_TIER": "trial"
       },
+      // FLEET_WAKE (cloud #264, src/manage.ts fleet_wake): every
+      // ManageInstall job's end posts { jobId } to the scheduler's
+      // oa-s-fleet-wake, the fleet's next event.
       "queues": {
+        "producers": [{ "binding": "FLEET_WAKE", "queue": "oa-s-fleet-wake" }],
         "consumers": [
           {
             "queue": "oa-s-signups",
@@ -175,7 +179,11 @@
           "entrypoint": "BillingProvisionerRpc"
         }
       ],
+      // FLEET_WAKE (cloud #264, src/manage.ts fleet_wake): every
+      // ManageInstall job's end posts { jobId } to the scheduler's
+      // oa-p-fleet-wake, the fleet's next event.
       "queues": {
+        "producers": [{ "binding": "FLEET_WAKE", "queue": "oa-p-fleet-wake" }],
         "consumers": [
           {
             "queue": "oa-p-signups",

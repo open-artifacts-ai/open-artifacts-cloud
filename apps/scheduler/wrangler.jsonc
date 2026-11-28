@@ -53,9 +53,9 @@
         // secrets the deploy puts from the Environment (docs/ops/hosted.md),
         // never vars here.
         // #1343: the canary smoke, "off" (the passive soak, as before) or
-        // "required". "off" until the user's one-time smoke setup for this
-        // env (docs/ops/hosted.md); "required" is a later one-line PR.
-        "FLEET_SMOKE": "off",
+        // "required". "required" since Leo's staging smoke setup (2026-11-26,
+        // cloud #264): the canary must pass the smoke, as on prod.
+        "FLEET_SMOKE": "required",
         // The smoke's share check, an explicit choice: "on" needs
         // FLEET_SMOKE_SHARE_TO (a secret); "off" skips it.
         "FLEET_SMOKE_SHARE": "on",
@@ -114,16 +114,22 @@
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-s-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
-      // message once the release is verified, and the fleet runs at once.
-      // One batch at a time; the fleet lease covers the 2-minute tick.
+      // message once the release is verified, and the provisioner one at
+      // every ManageInstall job's end; each batch is one fleet pass. One
+      // batch at a time, under the fleet lease. A pass only time can finish
+      // comes back with a backoff, up to max_retries (FLEET_WAKE_MAX_RETRIES,
+      // about 15 min).
       "queues": {
-        "producers": [{ "binding": "SIGNUPS", "queue": "oa-s-signups" }],
+        "producers": [
+          { "binding": "SIGNUPS", "queue": "oa-s-signups" },
+          { "binding": "FLEET_WAKE", "queue": "oa-s-fleet-wake" }
+        ],
         "consumers": [
           {
             "queue": "oa-s-fleet-wake",
-            "max_batch_size": 10,
+            "max_batch_size": 1,
             "max_batch_timeout": 0,
-            "max_retries": 3,
+            "max_retries": 20,
             "max_concurrency": 1
           }
         ]
@@ -227,16 +233,22 @@
       // The signups duty's producer (src/provapi/signups.ts): { signupId }
       // only; the provisioner consumes it. The consumer of oa-p-fleet-wake
       // (cloud #264, src/provapi/wake.ts): the platform deploy posts one
-      // message once the release is verified, and the fleet runs at once.
-      // One batch at a time; the fleet lease covers the 2-minute tick.
+      // message once the release is verified, and the provisioner one at
+      // every ManageInstall job's end; each batch is one fleet pass. One
+      // batch at a time, under the fleet lease. A pass only time can finish
+      // comes back with a backoff, up to max_retries (FLEET_WAKE_MAX_RETRIES,
+      // about 15 min).
       "queues": {
-        "producers": [{ "binding": "SIGNUPS", "queue": "oa-p-signups" }],
+        "producers": [
+          { "binding": "SIGNUPS", "queue": "oa-p-signups" },
+          { "binding": "FLEET_WAKE", "queue": "oa-p-fleet-wake" }
+        ],
         "consumers": [
           {
             "queue": "oa-p-fleet-wake",
-            "max_batch_size": 10,
+            "max_batch_size": 1,
             "max_batch_timeout": 0,
-            "max_retries": 3,
+            "max_retries": 20,
             "max_concurrency": 1
           }
         ]
