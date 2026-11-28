@@ -30,7 +30,9 @@ describe("wrangler.jsonc bus switches (open-artifacts#2325)", () => {
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_ALL");
     expect(cfg.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
     expect(cfg.env.staging.vars).not.toHaveProperty("PROD_BUS_ALL");
-    expect(api.env.staging.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
+    expect(api.env.staging.vars.STAGING_BUS_SLUGS).toBe(
+      cfg.env.staging.vars.STAGING_BUS_SLUGS,
+    );
     expect(api.env.prod.vars).not.toHaveProperty("STAGING_BUS_SLUGS");
   });
 

@@ -1,9 +1,11 @@
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import {
   type CreateInstallSchema,
+  type CreatePrincipal,
   canonicalJson,
   checkCreateFields,
   fieldRulesOf,
+  type OidcWorkflow,
   parseTestInstallActorKey,
   slugError,
   type Tier,
@@ -17,6 +19,7 @@ import {
   isTestUser,
   isTokenTestHooksSlug,
   type PrincipalFacts,
+  tokenTestHooksAllowlist,
 } from "../facts.js";
 import { newInstallId } from "../ids.js";
 import type { Principal } from "../principal.js";
@@ -133,20 +136,32 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
       "forbidden",
       "fixture cleanup credentials cannot create an install",
     );
-  const f = checkCreateFields(
+  const tokenTestHookSlugs = tokenTestHooksAllowlist(env);
+  const checkFields: (
+    body: Body,
+    principal: CreatePrincipal,
+    env: Env["OA_ENV"],
+    stagingTestDomain: string,
+    workflow?: OidcWorkflow,
+    tokenTestHookSlugs?: readonly string[],
+  ) => ReturnType<typeof checkCreateFields> = checkCreateFields;
+  const f = checkFields(
     body,
     rules,
     env.OA_ENV,
     STAGING_TEST_DOMAIN,
     p.kind === "oidc" ? p.oidcWorkflow : undefined,
+    tokenTestHookSlugs,
   );
   if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
-  // Cloud #84: staging admin tokens may enable test hooks only for t-* test
-  // installs, never on prod, rl-* or ordinary slugs.
+  // Cloud #84: staging admin tokens may enable test hooks only for test-install
+  // slugs (t-*, bus test fixtures such as bus1299-b, or exact staging entries
+  // in STAGING_BUS_SLUGS such as m2-walk), never on prod or ordinary slugs.
   if (
     p.kind === "token" &&
     body.testHooks === true &&
-    (env.OA_ENV !== "staging" || !isTokenTestHooksSlug(body.slug))
+    (env.OA_ENV !== "staging" ||
+      !isTokenTestHooksSlug(body.slug, tokenTestHookSlugs))
   )
     throw new ApiError("forbidden", "slug: forbidden");
   // Google with no auth.domains is allowed (#2520): the install admits the
