@@ -50,6 +50,8 @@ export type Principal = {
   session?: PrincipalSession;
   /** OIDC only: the pinned workflow behind the JWT (authorize, #1053). */
   oidcWorkflow?: OidcWorkflow;
+  /** Disposable staging fixture mode: create run vs signed delete cleanup. */
+  testInstallMode?: "create" | "delete";
   /**
    * The test admin workflow's run, from its JWT (audit only, #1053): who
    * dispatched it, which run, which workflow ref.

@@ -89,10 +89,19 @@ export function reachSql(
   if (reach === "all") return { sql: "1 = 1", binds: [] };
   if (testInstallReach(p)) {
     const scope = parseTestInstallActorKey(p.actorKey);
-    if (!scope || scope.installId === null) return { sql: "0 = 1", binds: [] };
+    if (!scope) return { sql: "0 = 1", binds: [] };
+    if (scope.mode === "create")
+      return {
+        sql: "st.slug GLOB ? AND st.test_hooks = 1 AND cj.actor_key = ?",
+        binds: [`${TEST_INSTALL.slugPrefix}*`, scope.actorKey],
+      };
     return {
-      sql: "st.install_id = ? AND st.slug GLOB ? AND st.test_hooks = 1 AND cj.actor_key = ?",
-      binds: [scope.installId, `${TEST_INSTALL.slugPrefix}*`, scope.creatorKey],
+      sql: "st.install_id = ? AND st.slug GLOB ? AND st.test_hooks = 1 AND cj.actor_key GLOB ?",
+      binds: [
+        scope.installId,
+        `${TEST_INSTALL.slugPrefix}*`,
+        `oidc:${scope.repositoryId}${TEST_INSTALL.actorSuffix}:*:${scope.ownerKeyId}`,
+      ],
     };
   }
   if (testMemberReach(p))

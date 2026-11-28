@@ -8,7 +8,13 @@ import {
   type SpawnOptionsWithoutStdio,
   spawn,
 } from "node:child_process";
-import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  generateKeyPairSync,
+  randomUUID,
+  sign as signBytes,
+} from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -44,8 +50,10 @@ export const BUS_CONTAINER_PREFIX = "oa-bus-";
 export const BUS_VOLUME_PREFIX = "oa-bus-home-";
 export const BUS_IMAGE_PREFIX = "oa-staging-bus:";
 const VERSION_RE = /^(?:0|[1-9]\d{0,5})(?:\.(?:0|[1-9]\d{0,5})){2}$/;
-const INSTALL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const INSTALL_ID_RE = /^i[a-z0-9]{11}$/;
 const JOB_ID_RE = "[A-Za-z0-9_-]{1,64}";
+const DELETE_PROOF_DOMAIN = "oa-fixture-delete-v1";
+const DELETE_PROOF_TTL_MS = 25 * 60_000;
 const OPS_DIR = dirname(fileURLToPath(import.meta.url));
 const BUS_DOCKERFILE = join(OPS_DIR, "staging-test-bus.Dockerfile");
 const BUS_HOME_IN_CONTAINER = "/home/node/.oa-bus";
@@ -169,17 +177,52 @@ export function fixtureRequest(
   };
 }
 
+export type FixtureOwnerKey = {
+  /** Raw 32-byte Ed25519 public key, base64url without padding. */
+  publicKey: string;
+  /** PKCS#8 DER Ed25519 private key, base64url; stored only in 0600 receipts. */
+  privateKeyPkcs8: string;
+};
+
 // The receipt comes from this fixture's successful create. Use its immutable
-// install ID for both jobs, including retries after a soft delete.
+// install ID and owner keypair for cleanup, including retries after a soft delete.
 export type FixtureReceipt = {
   slug: string;
   installId: string;
+  repositoryId: string;
   requestId: string;
+  ownerKey: FixtureOwnerKey;
   host?: string;
   version?: string;
   createdAt?: number;
   bus?: FixtureBusInfo;
 };
+
+export function generateOwnerKey(): FixtureOwnerKey {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  return {
+    publicKey: publicKey.export({ format: "jwk" }).x as string,
+    privateKeyPkcs8: privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64url"),
+  };
+}
+
+export function signOwnerDeleteProof(
+  privateKeyPkcs8: string,
+  input: { repositoryId: string; installId: string; expiresAt: number },
+): string {
+  const payload = `${DELETE_PROOF_DOMAIN}\n${input.repositoryId}\n${input.installId}\n${input.expiresAt}`;
+  const key = createPrivateKey({
+    key: Buffer.from(privateKeyPkcs8, "base64url"),
+    format: "der",
+    type: "pkcs8",
+  });
+  const sig = signBytes(null, Buffer.from(payload, "utf8"), key).toString(
+    "base64url",
+  );
+  return `${input.installId}.${input.expiresAt}.${sig}`;
+}
 
 export type FixtureBusInfo = {
   container: string;
@@ -277,6 +320,7 @@ function markerValue(
 
 export type CreateLog = {
   installId: string;
+  repositoryId: string;
   slug: string;
   host: string;
   version: string;
@@ -291,7 +335,8 @@ export function parseCreateLog(
   expectedSlug: string,
 ): CreateLog | null {
   const expectedHost = fixtureHost(expectedSlug);
-  const installId = markerValue(log, "id", JOB_ID_RE);
+  const installId = markerValue(log, "id", "i[a-z0-9]{11}");
+  const repositoryId = markerValue(log, "repo-id", "[0-9]{1,32}");
   const slug = markerValue(log, "slug", "[a-z0-9-]+");
   const host = markerValue(log, "app-host", "[a-z0-9.-]+");
   const version = markerValue(log, "version", "[0-9]+\\.[0-9]+\\.[0-9]+");
@@ -300,6 +345,7 @@ export function parseCreateLog(
   const sealed = markerValue(log, "sealed", "oa-seal-v1\\.[A-Za-z0-9_.-]+");
   if (
     !installId ||
+    !repositoryId ||
     slug !== expectedSlug ||
     host !== expectedHost ||
     !version ||
@@ -308,7 +354,16 @@ export function parseCreateLog(
     !sealed
   )
     return null;
-  return { installId, slug, host, version, createJob, credsJob, sealed };
+  return {
+    installId,
+    repositoryId,
+    slug,
+    host,
+    version,
+    createJob,
+    credsJob,
+    sealed,
+  };
 }
 
 /** True when a delete run's log confirms the exact install was purged. */
@@ -318,7 +373,7 @@ export function parseDeleteLog(
   expectedInstallId: string,
 ): boolean {
   return (
-    markerValue(log, "id", JOB_ID_RE) === expectedInstallId &&
+    markerValue(log, "id", "i[a-z0-9]{11}") === expectedInstallId &&
     markerValue(log, "slug", "[a-z0-9-]+") === expectedSlug &&
     markerValue(log, "purged", "true") === "true"
   );
@@ -593,7 +648,11 @@ function readReceipt(dir: string, slug: string): FixtureReceipt | null {
   if (
     parsed.slug !== slug ||
     typeof parsed.installId !== "string" ||
-    !INSTALL_ID_RE.test(parsed.installId)
+    !INSTALL_ID_RE.test(parsed.installId) ||
+    typeof parsed.repositoryId !== "string" ||
+    !/^\d{1,32}$/.test(parsed.repositoryId) ||
+    typeof parsed.ownerKey?.publicKey !== "string" ||
+    typeof parsed.ownerKey?.privateKeyPkcs8 !== "string"
   )
     throw new Error(`corrupt fixture receipt for ${slug}`);
   return parsed as FixtureReceipt;
@@ -670,25 +729,32 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
   const receiptDir = prepareMcpDir(d.receiptBase);
   if (req.action === "delete") {
     const saved = readReceipt(receiptDir, req.slug);
-    if (saved && req.installId && saved.installId !== req.installId)
+    if (!saved)
+      throw new Error(
+        `no saved receipt with owner key for ${req.slug}; cannot sign authenticated cleanup proof`,
+      );
+    if (req.installId && saved.installId !== req.installId)
       throw new Error(
         `--install-id ${req.installId} does not match saved receipt ${saved.installId} for ${req.slug}`,
       );
-    const installId = req.installId ?? saved?.installId;
-    if (!installId)
-      throw new Error(
-        `no saved receipt for ${req.slug}; pass --install-id <id> to delete and purge it`,
-      );
+    const installId = saved.installId;
+    const deleteProof = signOwnerDeleteProof(saved.ownerKey.privateKeyPkcs8, {
+      repositoryId: saved.repositoryId,
+      installId,
+      expiresAt: d.now() + DELETE_PROOF_TTL_MS,
+    });
     await stopFixtureBus(req.slug, d.docker);
     const run = await dispatchAndWait(d, {
       action: "delete",
       slug: req.slug,
+      owner_key: saved.ownerKey.publicKey,
       install_id: installId,
+      delete_proof: deleteProof,
       request_id: rid,
     });
     if (!parseDeleteLog(run.log, req.slug, installId))
       throw new Error(`run ${run.id}: purge confirmation missing from log`);
-    if (saved) rmSync(receiptPath(receiptDir, req.slug), { force: true });
+    rmSync(receiptPath(receiptDir, req.slug), { force: true });
     d.log(
       JSON.stringify({
         deleted: req.slug,
@@ -702,9 +768,11 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
 
   const { privateKey, publicKey } = generateKeyPairSync("x25519");
   const pub = publicKey.export({ format: "jwk" }).x as string;
+  const ownerKey = generateOwnerKey();
   const run = await dispatchAndWait(d, {
     action: "create",
     slug: req.slug,
+    owner_key: ownerKey.publicKey,
     recipient_key: pub,
     request_id: rid,
     ...(req.version === undefined ? {} : { version: req.version }),
@@ -716,10 +784,12 @@ export async function main(argv: readonly string[], d: Deps): Promise<number> {
     openSealedNode(privateKey, got.sealed, SEAL_INFO),
   );
   // Save receipt before browser/bus steps so a partial failure can still be
-  // cleaned up with --delete without losing the immutable install ID.
+  // cleaned up with --delete without losing the immutable install ID or owner key.
   const receipt: FixtureReceipt = {
     slug: got.slug,
     installId: got.installId,
+    repositoryId: got.repositoryId,
+    ownerKey,
     host: got.host,
     version: got.version,
     requestId: rid,

@@ -899,12 +899,15 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       // R26 is O only (3.4); TRANSITIONS reads OIDC as A.
       if (job.actor_kind !== "oidc") throw refused("redline_creds is OIDC's");
       if (env !== "staging") throw refused("redline_creds is staging only");
-      const isFixture = parseTestInstallActorKey(job.actor_key) !== null;
+      const fixtureScope = parseTestInstallActorKey(job.actor_key);
+      const isFixture = fixtureScope !== null;
       if (
         !row ||
         row.test_hooks !== 1 ||
         (!isFixture && !row.slug.startsWith("rl-")) ||
-        (isFixture && !row.slug.startsWith(TEST_INSTALL.slugPrefix))
+        (isFixture &&
+          (fixtureScope.mode !== "create" ||
+            !row.slug.startsWith(TEST_INSTALL.slugPrefix)))
       )
         throw refused(
           isFixture
@@ -916,6 +919,7 @@ async function recheck(ctx: CreateCtx, jobId: string): Promise<ManageJob> {
       const denied = checkRedlineCreds(
         parsed,
         isFixture ? "test-install" : undefined,
+        fixtureScope?.mode,
       );
       if (denied) throw refused(`${denied.field}: ${denied.code}`);
       out.args = redlineCredsJobArgs(parsed);

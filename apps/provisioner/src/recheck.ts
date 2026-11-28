@@ -108,7 +108,7 @@ export function checkOidcScope(
     if (!scope) throw refused("malformed fixture actor key");
     if (job.kind === "create") {
       if (
-        scope.installId !== null ||
+        scope.mode !== "create" ||
         !(install.slug ?? "").startsWith(TEST_INSTALL.slugPrefix) ||
         !install.testHooks
       )
@@ -117,20 +117,25 @@ export function checkOidcScope(
         );
       return;
     }
-    if (
-      !["delete", "purge", "discard", "redline_creds"].includes(job.kind) ||
-      !testInstallOwns(
-        {
-          id: install.id ?? job.install_id,
-          slug: install.slug ?? "",
-          testHooks: install.testHooks,
-          createdBy: install.createdBy,
-        },
-        scope,
-      )
-    )
+    const owned = testInstallOwns(
+      {
+        id: install.id ?? job.install_id,
+        slug: install.slug ?? "",
+        testHooks: install.testHooks,
+        createdBy: install.createdBy,
+      },
+      scope,
+    );
+    if (job.kind === "redline_creds") {
+      if (scope.mode !== "create" || !owned)
+        throw refused(
+          "the fixture workflow rotates TEST_HOOK_KEY only for its own create run",
+        );
+      return;
+    }
+    if (!["delete", "purge", "discard"].includes(job.kind) || !owned)
       throw refused(
-        "the fixture workflow acts only on its bound disposable test install",
+        "the fixture workflow acts only on its owned disposable test install",
       );
     return;
   }

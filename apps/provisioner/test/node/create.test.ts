@@ -1125,11 +1125,14 @@ describe("staging disposable test-install OIDC create", () => {
     TIER: "team",
   });
 
+  const fixtureActor = `oidc:4242:test-install:1001:${"A".repeat(42)}A`;
+  const deleteActor = `oidc:4242:test-install-delete:${"A".repeat(42)}A:iabcdefgh234`;
+
   it("creates a staging t-* test-hooks install on the pinned version", async () => {
     const s = seedCreate(w, {
       slug: "t-fixture",
       actor: "oidc",
-      actorKey: "oidc:4242:test-install",
+      actorKey: fixtureActor,
       testHooks: true,
       version: V1,
       vars: fixtureVars(),
@@ -1145,14 +1148,24 @@ describe("staging disposable test-install OIDC create", () => {
     });
   });
 
-  it("refuses bound actorKey, wrong auth, non-t- slug, or prod at recheck with zero CF writes", async () => {
+  it("refuses delete-mode actorKey, malformed actorKey, wrong auth, non-t- slug, or prod at recheck with zero CF writes", async () => {
     const cases = [
       {
-        name: "bound actorKey on create",
+        name: "delete-mode actorKey on create",
         seed: {
           slug: "t-bad1",
           actor: "oidc" as const,
-          actorKey: "oidc:4242:test-install:inst123",
+          actorKey: deleteActor,
+          testHooks: true,
+          vars: fixtureVars(),
+        },
+      },
+      {
+        name: "legacy unbound actorKey on create",
+        seed: {
+          slug: "t-bad1b",
+          actor: "oidc" as const,
+          actorKey: "oidc:4242:test-install",
           testHooks: true,
           vars: fixtureVars(),
         },
@@ -1162,7 +1175,7 @@ describe("staging disposable test-install OIDC create", () => {
         seed: {
           slug: "rl-fixture",
           actor: "oidc" as const,
-          actorKey: "oidc:4242:test-install",
+          actorKey: fixtureActor,
           testHooks: true,
           vars: fixtureVars(),
         },
@@ -1172,7 +1185,7 @@ describe("staging disposable test-install OIDC create", () => {
         seed: {
           slug: "t-bad2",
           actor: "oidc" as const,
-          actorKey: "oidc:4242:test-install",
+          actorKey: fixtureActor,
           testHooks: true,
           vars: {
             AUTH_PROVIDERS: "google",
@@ -1187,7 +1200,7 @@ describe("staging disposable test-install OIDC create", () => {
         seed: {
           slug: "t-bad3",
           actor: "oidc" as const,
-          actorKey: "oidc:4242:test-install",
+          actorKey: fixtureActor,
           testHooks: true,
           vars: {
             AUTH_PROVIDERS: "email",
@@ -1202,7 +1215,7 @@ describe("staging disposable test-install OIDC create", () => {
         seed: {
           slug: "t-bad4",
           actor: "oidc" as const,
-          actorKey: "oidc:4242:test-install",
+          actorKey: fixtureActor,
           testHooks: true,
           vars: { ...fixtureVars(), AUTH_DOMAINS: "customer.test" },
         },

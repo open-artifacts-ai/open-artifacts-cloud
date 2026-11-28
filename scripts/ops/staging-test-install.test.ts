@@ -6,6 +6,7 @@ import {
   generateKeyPairSync,
   hkdfSync,
   randomBytes,
+  verify as verifyBytes,
 } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -84,8 +85,10 @@ describe("staging-test-install.yml", () => {
       "action",
       "slug",
       "version",
+      "owner_key",
       "recipient_key",
       "install_id",
+      "delete_proof",
       "request_id",
     ]);
     expect(w.permissions).toEqual({ contents: "read" });
@@ -106,11 +109,14 @@ describe("staging-test-install.yml", () => {
     expect(step.env.TEST_DOMAIN).toBe("oa-redline-a.fyi");
     expect(run).not.toMatch(/Authorization: Bearer \$jwt/);
     expect(run).toContain("hookKeyOnly: true");
-    expect(run).toContain("x-oa-fixture-install-id");
+    expect(run).toContain("x-oa-fixture-owner-key");
+    expect(run).toContain("x-oa-fixture-delete-proof");
+    expect(run).not.toContain("x-oa-fixture-install-id");
   });
 
   describe("workflow guards refuse invalid inputs before any network call", () => {
     let bin: string;
+    const validProof = `iabcdefgh234.1700000000000.${"A".repeat(85)}A`;
     beforeEach(() => {
       bin = mkdtempSync(join(tmpdir(), "oa-ti-wf-"));
       writeFileSync(
@@ -132,9 +138,12 @@ describe("staging-test-install.yml", () => {
           ACTION: "create",
           SLUG: "t-abc",
           VERSION: "",
+          OWNER_KEY: `${"B".repeat(42)}A`,
           RECIPIENT_KEY: `${"A".repeat(42)}A`,
           INSTALL_ID: "",
+          DELETE_PROOF: "",
           REQUEST_ID: "",
+          REPOSITORY_ID: "4242",
           RUN_ID: "1",
           RUN_ATTEMPT: "1",
           ...env,
@@ -142,15 +151,38 @@ describe("staging-test-install.yml", () => {
         encoding: "utf8",
       });
 
-    it("refuses non-main refs, non-t- slugs, bad keys, bad versions, and missing delete install_id", () => {
+    it("refuses non-main refs, non-t- slugs, bad keys, bad versions, and missing/mismatched delete proof", () => {
       expect(sh({ REF: "refs/heads/feature" }).status).toBe(1);
       expect(sh({ SLUG: "rl-agents" }).status).toBe(1);
       expect(sh({ SLUG: "customer1" }).status).toBe(1);
+      expect(sh({ OWNER_KEY: "bad" }).status).toBe(1);
       expect(sh({ RECIPIENT_KEY: "bad" }).status).toBe(1);
       expect(sh({ VERSION: "v0.1.2" }).status).toBe(1);
-      expect(sh({ INSTALL_ID: "abc" }).status).toBe(1);
+      expect(sh({ INSTALL_ID: "iabcdefgh234" }).status).toBe(1);
+      expect(sh({ DELETE_PROOF: validProof }).status).toBe(1);
       expect(
-        sh({ ACTION: "delete", RECIPIENT_KEY: "", INSTALL_ID: "" }).status,
+        sh({
+          ACTION: "delete",
+          RECIPIENT_KEY: "",
+          INSTALL_ID: "",
+          DELETE_PROOF: validProof,
+        }).status,
+      ).toBe(1);
+      expect(
+        sh({
+          ACTION: "delete",
+          RECIPIENT_KEY: "",
+          INSTALL_ID: "iabcdefgh234",
+          DELETE_PROOF: "",
+        }).status,
+      ).toBe(1);
+      expect(
+        sh({
+          ACTION: "delete",
+          RECIPIENT_KEY: "",
+          INSTALL_ID: "iabcdefgh235",
+          DELETE_PROOF: validProof,
+        }).status,
       ).toBe(1);
       expect(existsSync(join(bin, "reached"))).toBe(false);
     });
@@ -163,7 +195,8 @@ describe("staging-test-install.yml", () => {
         sh({
           ACTION: "delete",
           RECIPIENT_KEY: "",
-          INSTALL_ID: "inst-123",
+          INSTALL_ID: "iabcdefgh234",
+          DELETE_PROOF: validProof,
         }).status,
       ).not.toBe(0);
       expect(existsSync(join(bin, "reached"))).toBe(true);
@@ -214,19 +247,19 @@ describe("fixtureRequest", () => {
     });
     expect(
       fixtureRequest(
-        ["--slug", "t-abc", "--delete", "--install-id", "inst-1"],
+        ["--slug", "t-abc", "--delete", "--install-id", "iabcdefgh234"],
         "id",
       ),
     ).toMatchObject({
       action: "delete",
       slug: "t-abc",
-      installId: "inst-1",
+      installId: "iabcdefgh234",
     });
     expect(() =>
       fixtureRequest(["--slug", "t-abc", "--delete", "--bus"], "id"),
     ).toThrow();
     expect(() =>
-      fixtureRequest(["--slug", "t-abc", "--install-id", "inst-1"], "id"),
+      fixtureRequest(["--slug", "t-abc", "--install-id", "iabcdefgh234"], "id"),
     ).toThrow("--install-id");
     expect(() =>
       fixtureRequest(["--slug", "rl-agents", "--delete"], "id"),
@@ -326,7 +359,8 @@ describe("log parsing and hookKeyOnlyOf", () => {
   it("parses create and delete markers and refuses PATs in hookKeyOnly payloads", () => {
     const createLog = [
       'echo "test-install-id: $id"',
-      "2026-11-28T00:00:00Z test-install-id: inst-abc1",
+      "2026-11-28T00:00:00Z test-install-id: iabcdefgh234",
+      "2026-11-28T00:00:00Z test-install-repo-id: 4242",
       "2026-11-28T00:00:00Z test-install-slug: t-demo",
       "2026-11-28T00:00:00Z test-install-app-host: t-demo.open-artifacts-staging.app",
       "2026-11-28T00:00:00Z test-install-version: 0.271.1",
@@ -335,7 +369,8 @@ describe("log parsing and hookKeyOnlyOf", () => {
       "2026-11-28T00:00:00Z test-install-sealed: oa-seal-v1.abc.def.ghi",
     ].join("\n");
     expect(parseCreateLog(createLog, "t-demo")).toEqual({
-      installId: "inst-abc1",
+      installId: "iabcdefgh234",
+      repositoryId: "4242",
       slug: "t-demo",
       host: "t-demo.open-artifacts-staging.app",
       version: "0.271.1",
@@ -345,12 +380,12 @@ describe("log parsing and hookKeyOnlyOf", () => {
     });
     expect(parseCreateLog(createLog, "t-other")).toBeNull();
     const deleteLog = [
-      "test-install-id: inst-abc1",
+      "test-install-id: iabcdefgh234",
       "test-install-slug: t-demo",
       "test-install-purged: true",
     ].join("\n");
-    expect(parseDeleteLog(deleteLog, "t-demo", "inst-abc1")).toBe(true);
-    expect(parseDeleteLog(deleteLog, "t-demo", "inst-other")).toBe(false);
+    expect(parseDeleteLog(deleteLog, "t-demo", "iabcdefgh234")).toBe(true);
+    expect(parseDeleteLog(deleteLog, "t-demo", "iabcdefgh235")).toBe(false);
     expect(hookKeyOnlyOf(JSON.stringify({ hookKey: "hk-1" }))).toBe("hk-1");
     expect(() =>
       hookKeyOnlyOf(JSON.stringify({ hookKey: "hk-1", pat: "oa_pat_x" })),
@@ -453,15 +488,24 @@ describe("main", () => {
     expect(lines[0]).toBe(HELP);
   });
 
-  it("creates a fixture, writes a 0600 receipt, returns sealed hook key + storageState, then deletes and purges it", async () => {
+  it("creates a fixture, writes a 0600 receipt with Ed25519 owner key, returns sealed hook key + storageState, then signs delete proof to delete+purge", async () => {
     const lines: string[] = [];
     let sealedOut = "";
+    let createdOwnerPub = "";
+    let deleteOwnerPub = "";
+    let deleteProof = "";
     const gh = vi.fn(async (...args: string[]) => {
       if (args[0] === "api") {
+        const owner = args.find((a) => a.startsWith("inputs[owner_key]="));
         const rec = args.find((a) => a.startsWith("inputs[recipient_key]="));
+        const proof = args.find((a) => a.startsWith("inputs[delete_proof]="));
         if (rec) {
+          createdOwnerPub = owner?.slice("inputs[owner_key]=".length) ?? "";
           const pub = rec.slice("inputs[recipient_key]=".length);
           sealedOut = sealFor(pub, JSON.stringify({ hookKey: "plain-hk-99" }));
+        } else if (proof) {
+          deleteOwnerPub = owner?.slice("inputs[owner_key]=".length) ?? "";
+          deleteProof = proof.slice("inputs[delete_proof]=".length);
         }
         return "99001\n";
       }
@@ -469,7 +513,8 @@ describe("main", () => {
       if (args[0] === "run" && args[1] === "view") {
         if (sealedOut) {
           const log = [
-            "test-install-id: inst-live1",
+            "test-install-id: iabcdefgh234",
+            "test-install-repo-id: 4242",
             "test-install-slug: t-demo",
             "test-install-app-host: t-demo.open-artifacts-staging.app",
             "test-install-version: 0.271.1",
@@ -481,7 +526,7 @@ describe("main", () => {
           return log;
         }
         return [
-          "test-install-id: inst-live1",
+          "test-install-id: iabcdefgh234",
           "test-install-slug: t-demo",
           "test-install-purged: true",
         ].join("\n");
@@ -510,25 +555,43 @@ describe("main", () => {
     const created = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
     expect(created).toEqual({
       slug: "t-demo",
-      installId: "inst-live1",
+      installId: "iabcdefgh234",
       host: "t-demo.open-artifacts-staging.app",
       version: "0.271.1",
       run: "99001",
       sealedHookKey: expect.stringMatching(/^oa-seal-v1\./),
       storageState: "/tmp/fake-storage-state.json",
     });
-    // Plaintext hook key never printed or stored in receipt.
+    // Plaintext hook key and owner private key are never printed.
     expect(lines[0]).not.toContain("plain-hk-99");
+    expect(lines[0]).not.toContain("privateKeyPkcs8");
     const receiptFile = join(receiptBase, "t-demo.json");
     expect(statSync(receiptFile).mode & 0o777).toBe(0o600);
     expect(readFileSync(receiptFile, "utf8")).not.toContain("plain-hk-99");
 
-    // Delete reads saved receipt, stops Docker bus, dispatches delete+purge, removes receipt.
+    // Delete signs a verifiable Ed25519 proof with the saved owner key, stops Docker bus,
+    // dispatches delete+purge, and removes the receipt.
     expect(await main(["--slug", "t-demo", "--delete"], deps)).toBe(0);
+    expect(deleteOwnerPub).toBe(createdOwnerPub);
+    const [pId, pExp, pSig] = deleteProof.split(".");
+    expect(pId).toBe("iabcdefgh234");
+    expect(Number(pExp)).toBe(1_700_000_000_000 + 25 * 60_000);
+    const edPub = createPublicKey({
+      key: { kty: "OKP", crv: "Ed25519", x: createdOwnerPub },
+      format: "jwk",
+    });
+    expect(
+      verifyBytes(
+        null,
+        Buffer.from(`oa-fixture-delete-v1\n4242\niabcdefgh234\n${pExp}`),
+        edPub,
+        Buffer.from(pSig ?? "", "base64url"),
+      ),
+    ).toBe(true);
     expect(JSON.parse(lines[1] ?? "{}")).toEqual({
       deleted: "t-demo",
       purged: true,
-      installId: "inst-live1",
+      installId: "iabcdefgh234",
       run: "99001",
     });
     expect(existsSync(receiptFile)).toBe(false);

@@ -5,11 +5,14 @@ import {
   verify,
 } from "@oa/gh-oidc";
 import {
-  INSTALL_ID_RE,
+  fixtureOwnerKeyId,
+  isFixtureOwnerPublicKey,
   type OidcWorkflow,
   TEST_INSTALL,
   TEST_MEMBER,
   testInstallActorKey,
+  testInstallDeleteActorKey,
+  verifyFixtureDeleteProof,
 } from "@oa/provisioning-contract";
 import type { Env } from "../env.js";
 import { type Principal, type Refusal, refusal } from "../principal.js";
@@ -24,8 +27,11 @@ import { type Principal, type Refusal, refusal } from "../principal.js";
 export const STAGING_API_HOST = "api.open-artifacts-staging.app";
 /** `x-oa-test-user` turns the caller into a self-serve test user (M4). */
 export const TEST_USER_HEADER = "x-oa-test-user";
-/** Binds disposable staging fixture calls to the created install ID. */
-export const FIXTURE_INSTALL_HEADER = TEST_INSTALL.installIdHeader;
+/** Raw 32-byte Ed25519 public key (base64url) identifying a fixture's owner. */
+export const FIXTURE_OWNER_KEY_HEADER = TEST_INSTALL.ownerKeyHeader;
+/** Signed Ed25519 cleanup proof for deleting/purging a fixture in a later run. */
+export const FIXTURE_DELETE_PROOF_HEADER = TEST_INSTALL.deleteProofHeader;
+const RUN_ID_RE = /^\d{1,32}$/;
 const TEST_USERS = new Set(["a", "b", "c"]);
 export const TEST_USER_DOMAIN = "test.invalid";
 /**
@@ -117,29 +123,54 @@ export async function oidcPrincipal(
   }
   const key = `oidc:${claims.repository_id}`;
   const str = (v: unknown) => (typeof v === "string" && v ? v : null);
-  let boundInstallId: string | null = null;
+  let testInstallKey: string | null = null;
+  let testInstallMode: "create" | "delete" | undefined;
   if (testInstall) {
-    const rawBound = req.headers.get(TEST_INSTALL.installIdHeader);
-    if (rawBound !== null) {
-      const trimmed = rawBound.trim();
-      if (!INSTALL_ID_RE.test(trimmed)) return refusal("unauthenticated");
-      boundInstallId = trimmed;
+    const runId = str(claims.run_id);
+    if (!runId || !RUN_ID_RE.test(runId)) return refusal("unauthenticated");
+    const rawOwnerKey = req.headers.get(TEST_INSTALL.ownerKeyHeader)?.trim();
+    if (!isFixtureOwnerPublicKey(rawOwnerKey))
+      return refusal("unauthenticated");
+    const rawProof = req.headers.get(TEST_INSTALL.deleteProofHeader);
+    if (rawProof !== null) {
+      const verified = await verifyFixtureDeleteProof({
+        ownerPublicKey: rawOwnerKey,
+        proof: rawProof.trim(),
+        repositoryId: claims.repository_id,
+        now: opts?.now?.(),
+      });
+      if (!verified) return refusal("unauthenticated");
+      testInstallMode = "delete";
+      testInstallKey = testInstallDeleteActorKey(
+        claims.repository_id,
+        verified.ownerKeyId,
+        verified.installId,
+      );
+    } else {
+      const ownerKeyId = await fixtureOwnerKeyId(rawOwnerKey);
+      testInstallMode = "create";
+      testInstallKey = testInstallActorKey(
+        claims.repository_id,
+        runId,
+        ownerKeyId,
+      );
     }
   }
   // Each workflow gets its own actorKey: R26 jobs and sealed results (R15) are
-  // isolated between red-line, test-member, and each bound fixture install.
+  // isolated between red-line, test-member, and each fixture create/cleanup.
   const memberKey = `${key}${TEST_MEMBER.actorSuffix}`;
+  const fixtureRateKey = `${key}${TEST_INSTALL.actorSuffix}`;
   const actorKey = testMember
     ? memberKey
-    : testInstall
-      ? testInstallActorKey(claims.repository_id, boundInstallId)
+    : testInstallKey !== null
+      ? testInstallKey
       : key;
   const rateKey = testAdmin
     ? `${key}:test-admin`
     : testMember
       ? memberKey
       : testInstall
-        ? testInstallActorKey(claims.repository_id)
+        ? fixtureRateKey
         : key;
   return {
     kind: "oidc",
@@ -151,6 +182,7 @@ export async function oidcPrincipal(
     sub: claims.sub,
     authAt: null,
     oidcWorkflow: workflow,
+    ...(testInstallMode ? { testInstallMode } : {}),
     ...(testAdmin
       ? {
           oidcRun: {

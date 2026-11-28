@@ -352,8 +352,8 @@ async function rotateHookKeyOnly(
   if (!j) throw refused("no job row");
   const scope =
     j.actor_kind === "oidc" ? parseTestInstallActorKey(j.actor_key) : null;
-  if (!scope || scope.installId !== job.installId)
-    throw refused("hookKeyOnly is only for a bound disposable fixture");
+  if (scope?.mode !== "create")
+    throw refused("hookKeyOnly is only for a disposable fixture create run");
   const args = redlineArgs(j);
   if (
     args.revoke !== false ||

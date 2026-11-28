@@ -1,11 +1,13 @@
 import { STAGING_TEST_DOMAIN } from "@oa/provision/names";
 import {
   authorize,
+  fixtureOwnerKeyId,
   isApiRoute,
   ROUTE_IDS,
   TEST_INSTALL,
   TEST_MEMBER,
   testInstallActorKey,
+  testInstallDeleteActorKey,
 } from "@oa/provisioning-contract";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Principal } from "../src/principal.js";
@@ -24,26 +26,47 @@ import {
 } from "./fakes.js";
 
 // The disposable staging test-install workflow (staging-test-install.yml):
-// R3, R4, R9, R11, R15 and R26 (hookKeyOnly only), staging only, bound by
-// x-oa-fixture-install-id + creator provenance to the exact t-* test-hooks
-// install it created.
+// R3, R4, R9, R11, R15 and R26 (hookKeyOnly only) in create mode, and R3, R9,
+// R11, R15 in verified delete mode (staging only). Ownership is bound to the
+// original create's GitHub-signed run_id + Ed25519 owner key fingerprint, and
+// later cleanup requires a verified Ed25519 delete proof.
 
 beforeEach(resetDb);
 
 const ALLOWED = TEST_INSTALL.routes;
+const DELETE_ALLOWED = TEST_INSTALL.deleteRoutes;
 const REPO_ID = "42";
-const TI_CREATE: Principal = {
+const OWNER_PUB_A = `${"A".repeat(42)}A`;
+const OWNER_PUB_B = `${"B".repeat(42)}A`;
+const KEY_ID_A = await fixtureOwnerKeyId(OWNER_PUB_A);
+const KEY_ID_B = await fixtureOwnerKeyId(OWNER_PUB_B);
+
+const tiCreate = (
+  runId: string,
+  ownerKeyId: string,
+  repoId = REPO_ID,
+): Principal => ({
   ...OIDC_P,
-  actorKey: testInstallActorKey(REPO_ID),
-  rateKey: testInstallActorKey(REPO_ID),
+  actorKey: testInstallActorKey(repoId, runId, ownerKeyId),
+  rateKey: `oidc:${repoId}${TEST_INSTALL.actorSuffix}`,
   oidcWorkflow: "test-install",
-};
-const tiBound = (installId: string, repoId = REPO_ID): Principal => ({
-  ...OIDC_P,
-  actorKey: testInstallActorKey(repoId, installId),
-  rateKey: testInstallActorKey(repoId),
-  oidcWorkflow: "test-install",
+  testInstallMode: "create",
 });
+
+const tiDelete = (
+  ownerKeyId: string,
+  installId: string,
+  repoId = REPO_ID,
+): Principal => ({
+  ...OIDC_P,
+  actorKey: testInstallDeleteActorKey(repoId, ownerKeyId, installId),
+  rateKey: `oidc:${repoId}${TEST_INSTALL.actorSuffix}`,
+  oidcWorkflow: "test-install",
+  testInstallMode: "delete",
+});
+
+const TI_CREATE_A = tiCreate("1001", KEY_ID_A);
+const TI_CREATE_B = tiCreate("1002", KEY_ID_B);
 const RL: Principal = { ...OIDC_P, oidcWorkflow: "redline" };
 const TM: Principal = {
   ...OIDC_P,
@@ -51,7 +74,7 @@ const TM: Principal = {
   rateKey: `${OIDC_P.actorKey}${TEST_MEMBER.actorSuffix}`,
   oidcWorkflow: "test-member",
 };
-const KEY = `${"A".repeat(42)}A`;
+const KEY = `${"C".repeat(42)}A`;
 
 const createBody = (slug: string, over: Record<string, unknown> = {}) => ({
   requestId: requestId(),
@@ -115,10 +138,12 @@ async function activateFixture(
 }
 
 describe("authz: test-install allowlist", () => {
-  it("pins prefix, suffix, header and routes (no R2)", () => {
+  it("pins prefix, suffixes, headers and routes (no R2; delete mode drops R4 and R26)", () => {
     expect(TEST_INSTALL.slugPrefix).toBe("t-");
     expect(TEST_INSTALL.actorSuffix).toBe(":test-install");
-    expect(TEST_INSTALL.installIdHeader).toBe("x-oa-fixture-install-id");
+    expect(TEST_INSTALL.deleteActorSuffix).toBe(":test-install-delete");
+    expect(TEST_INSTALL.ownerKeyHeader).toBe("x-oa-fixture-owner-key");
+    expect(TEST_INSTALL.deleteProofHeader).toBe("x-oa-fixture-delete-proof");
     expect(TEST_INSTALL.routes).toEqual([
       "R3",
       "R4",
@@ -127,15 +152,25 @@ describe("authz: test-install allowlist", () => {
       "R15",
       "R26",
     ]);
+    expect(TEST_INSTALL.deleteRoutes).toEqual(["R3", "R9", "R11", "R15"]);
   });
 
-  it("staging admits only TEST_INSTALL.routes with own reach; prod is 401", () => {
+  it("staging admits only TEST_INSTALL routes with own reach; prod is 401", () => {
+    const delP = tiDelete(KEY_ID_A, "iabcdefgh234");
     for (const route of ROUTE_IDS) {
-      const st = authorize(route, TI_CREATE, "staging");
+      const st = authorize(route, TI_CREATE_A, "staging");
       if ((ALLOWED as readonly string[]).includes(route))
         expect(st, route).toEqual({ ok: true, reach: "own" });
       else expect(st, route).toEqual({ ok: false, code: "forbidden" });
-      expect(authorize(route, TI_CREATE, "prod"), route).toEqual({
+      const dst = authorize(route, delP, "staging");
+      if ((DELETE_ALLOWED as readonly string[]).includes(route))
+        expect(dst, route).toEqual({ ok: true, reach: "own" });
+      else expect(dst, route).toEqual({ ok: false, code: "forbidden" });
+      expect(authorize(route, TI_CREATE_A, "prod"), route).toEqual({
+        ok: false,
+        code: "unauthenticated",
+      });
+      expect(authorize(route, delP, "prod"), route).toEqual({
         ok: false,
         code: "unauthenticated",
       });
@@ -147,7 +182,7 @@ describe("authz: test-install allowlist", () => {
     const { id } = await seedInstall({ slug: "t-any", testHooks: true });
     for (const route of ROUTE_IDS.filter(isApiRoute)) {
       if ((ALLOWED as readonly string[]).includes(route)) continue;
-      const r = await call(e, tiBound(id), route, { params: { id } });
+      const r = await call(e, TI_CREATE_A, route, { params: { id } });
       expect(r.status, route).toBe(403);
       expect(r.code, route).toBe("forbidden");
     }
@@ -155,9 +190,9 @@ describe("authz: test-install allowlist", () => {
 });
 
 describe("R4 create validation for test-install", () => {
-  it("refuses R4 when x-oa-fixture-install-id is set", async () => {
+  it("refuses R4 when authenticated with a delete-mode proof", async () => {
     const e = fakeEnv();
-    const r = await call(e, tiBound("iabcdefgh234"), "R4", {
+    const r = await call(e, tiDelete(KEY_ID_A, "iabcdefgh234"), "R4", {
       body: createBody("t-bound"),
     });
     expect(r.status).toBe(403);
@@ -168,7 +203,7 @@ describe("R4 create validation for test-install", () => {
     const e = fakeEnv();
     const missingAuth = createBody("t-noauth");
     delete (missingAuth as { auth?: unknown }).auth;
-    const r400 = await call(e, TI_CREATE, "R4", { body: missingAuth });
+    const r400 = await call(e, TI_CREATE_A, "R4", { body: missingAuth });
     expect(r400.status).toBe(400);
     expect(r400.code).toBe("invalid_input");
 
@@ -197,24 +232,24 @@ describe("R4 create validation for test-install", () => {
       createBody("rl-agents"),
       createBody("customer1"),
     ]) {
-      const res = await call(e, TI_CREATE, "R4", { body: bad });
+      const res = await call(e, TI_CREATE_A, "R4", { body: bad });
       expect(res.status, String(bad.slug)).toBe(403);
       expect(res.code, String(bad.slug)).toBe("forbidden");
     }
   });
 });
 
-describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+purge", () => {
-  it("isolates t-alpha and t-beta end-to-end and forbids generic PAT minting", async () => {
+describe("two same-repo staging fixtures: create-run & cleanup isolation, hookKeyOnly R26", () => {
+  it("isolates t-alpha and t-beta across create runs and later cleanup with zero cross-fixture writes", async () => {
     const e = fakeEnv();
     const adminT = await seedInstall({ slug: "t-admin", testHooks: true });
     const rlAgents = await seedInstall({ slug: "rl-agents", testHooks: true });
 
-    // Create two disposable staging fixtures.
-    const aCreate = await call(e, TI_CREATE, "R4", {
+    // Two independent creates in the same repository (42) produce distinct creator keys.
+    const aCreate = await call(e, TI_CREATE_A, "R4", {
       body: createBody("t-alpha"),
     });
-    const bCreate = await call(e, TI_CREATE, "R4", {
+    const bCreate = await call(e, TI_CREATE_B, "R4", {
       body: createBody("t-beta"),
     });
     expect(aCreate.status).toBe(202);
@@ -224,26 +259,30 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
     await activateFixture(alphaId, "t-alpha", aCreate.body.job.id as string);
     await activateFixture(betaId, "t-beta", bCreate.body.job.id as string);
 
-    const alphaP = tiBound(alphaId);
-    const betaP = tiBound(betaId);
+    const aDelP = tiDelete(KEY_ID_A, alphaId);
+    const bDelP = tiDelete(KEY_ID_B, betaId);
+    // Owner B signing alpha's install ID gets a delete scope with KEY_ID_B (mismatched).
+    const bForgingA = tiDelete(KEY_ID_B, alphaId);
 
-    // Unbound principal sees nothing on R3.
+    // During create run, each sees ONLY its own fixture, never the other or admin/rl installs.
     expect(
-      (await call(e, TI_CREATE, "R3", { params: { id: alphaId } })).status,
-    ).toBe(404);
-
-    // Each bound principal sees ONLY its own fixture, never the other or admin/rl installs.
-    expect(
-      (await call(e, alphaP, "R3", { params: { id: alphaId } })).status,
+      (await call(e, TI_CREATE_A, "R3", { params: { id: alphaId } })).status,
     ).toBe(200);
+    expect(
+      (await call(e, TI_CREATE_B, "R3", { params: { id: betaId } })).status,
+    ).toBe(200);
+    const jobsBeforeCross = await db
+      .prepare("SELECT COUNT(*) AS n FROM jobs")
+      .first<{ n: number }>();
     for (const foreignId of [betaId, adminT.id, rlAgents.id]) {
       expect(
-        (await call(e, alphaP, "R3", { params: { id: foreignId } })).status,
+        (await call(e, TI_CREATE_A, "R3", { params: { id: foreignId } }))
+          .status,
         foreignId,
       ).toBe(404);
       expect(
         (
-          await call(e, alphaP, "R26", {
+          await call(e, TI_CREATE_A, "R26", {
             params: { id: foreignId },
             body: {
               requestId: requestId(),
@@ -255,22 +294,45 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
         foreignId,
       ).toBe(404);
     }
-
-    // Wrong repo cannot reach alphaId even with the right install ID header.
+    // Same owner key in a DIFFERENT create run (1099 !== 1001) cannot reach alphaId.
     expect(
-      (await call(e, tiBound(alphaId, "99"), "R3", { params: { id: alphaId } }))
-        .status,
+      (
+        await call(e, tiCreate("1099", KEY_ID_A), "R3", {
+          params: { id: alphaId },
+        })
+      ).status,
     ).toBe(404);
+    // Wrong repo cannot reach alphaId even with matching run/owner key.
+    expect(
+      (
+        await call(e, tiCreate("1001", KEY_ID_A, "99"), "R3", {
+          params: { id: alphaId },
+        })
+      ).status,
+    ).toBe(404);
+    // Delete-mode principal cannot call R26 even on its own fixture.
+    expect(
+      (
+        await call(e, aDelP, "R26", {
+          params: { id: alphaId },
+          body: {
+            requestId: requestId(),
+            hookKeyOnly: true,
+            recipientKey: KEY,
+          },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      await db.prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>(),
+    ).toEqual(jobsBeforeCross);
 
     // Generic R26 PAT mint and revoke are 403 for test-install; zero jobs started.
-    const jobsBefore = await db
-      .prepare("SELECT COUNT(*) AS n FROM jobs")
-      .first<{ n: number }>();
     for (const badCreds of [
       { requestId: requestId(), recipientKey: KEY },
       { requestId: requestId(), revoke: true },
     ]) {
-      const r = await call(e, alphaP, "R26", {
+      const r = await call(e, TI_CREATE_A, "R26", {
         params: { id: alphaId },
         body: badCreds,
       });
@@ -279,7 +341,7 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
     }
     expect(
       await db.prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>(),
-    ).toEqual(jobsBefore);
+    ).toEqual(jobsBeforeCross);
 
     // Non-fixture workflows (redline, test-member) cannot request hookKeyOnly.
     for (const otherP of [RL, TM]) {
@@ -291,8 +353,9 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
       expect(r.code).toBe("forbidden");
     }
 
-    // hookKeyOnly R26 succeeds on alphaId and delivers sealed once to alphaP only.
-    const aCreds = await call(e, alphaP, "R26", {
+    // hookKeyOnly R26 succeeds on alphaId and delivers sealed once to TI_CREATE_A only
+    // (never to TI_CREATE_B or even aDelP).
+    const aCreds = await call(e, TI_CREATE_A, "R26", {
       params: { id: alphaId },
       body: { requestId: requestId(), hookKeyOnly: true, recipientKey: KEY },
     });
@@ -309,29 +372,47 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
       )
       .bind(credsJobId)
       .run();
-    // Cross-fixture R15 is 404; redline gets null; alphaP gets sealed once.
     expect(
-      (await call(e, betaP, "R15", { params: { jobId: credsJobId } })).status,
+      (await call(e, TI_CREATE_B, "R15", { params: { jobId: credsJobId } }))
+        .status,
     ).toBe(404);
     expect(
-      (await call(e, alphaP, "R15", { params: { jobId: credsJobId } })).body
-        .sealed,
-    ).toBe("sealed-hook-only");
-    expect(
-      (await call(e, alphaP, "R15", { params: { jobId: credsJobId } })).body
+      (await call(e, aDelP, "R15", { params: { jobId: credsJobId } })).body
         .sealed,
     ).toBeNull();
-
-    // Cross-fixture R9 delete is 404; own R9 delete + R11 immediate purge succeed.
     expect(
-      (
-        await call(e, alphaP, "R9", {
-          params: { id: betaId },
-          body: { requestId: requestId(), confirmSlug: "t-beta" },
-        })
-      ).status,
-    ).toBe(404);
-    const aDel = await call(e, alphaP, "R9", {
+      (await call(e, TI_CREATE_A, "R15", { params: { jobId: credsJobId } }))
+        .body.sealed,
+    ).toBe("sealed-hook-only");
+    expect(
+      (await call(e, TI_CREATE_A, "R15", { params: { jobId: credsJobId } }))
+        .body.sealed,
+    ).toBeNull();
+
+    // Later cleanup: cross-fixture delete creates ZERO jobs; own signed delete+purge succeed.
+    const jobsBeforeDel = await db
+      .prepare("SELECT COUNT(*) AS n FROM jobs")
+      .first<{ n: number }>();
+    for (const [p, targetId, slug] of [
+      [aDelP, betaId, "t-beta"],
+      [bDelP, alphaId, "t-alpha"],
+      [bForgingA, alphaId, "t-alpha"],
+      [TI_CREATE_A, betaId, "t-beta"],
+    ] as const) {
+      expect(
+        (
+          await call(e, p, "R9", {
+            params: { id: targetId },
+            body: { requestId: requestId(), confirmSlug: slug },
+          })
+        ).status,
+      ).toBe(404);
+    }
+    expect(
+      await db.prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>(),
+    ).toEqual(jobsBeforeDel);
+
+    const aDel = await call(e, aDelP, "R9", {
       params: { id: alphaId },
       body: { requestId: requestId(), confirmSlug: "t-alpha" },
     });
@@ -352,21 +433,21 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
       .run();
     expect(
       (
-        await call(e, betaP, "R11", {
+        await call(e, bForgingA, "R11", {
           params: { id: alphaId },
           body: { requestId: requestId(), confirmSlug: "t-alpha" },
         })
       ).status,
     ).toBe(404);
-    const aPurge = await call(e, alphaP, "R11", {
+    const aPurge = await call(e, aDelP, "R11", {
       params: { id: alphaId },
       body: { requestId: requestId(), confirmSlug: "t-alpha" },
     });
     expect(aPurge.status).toBe(202);
     expect(aPurge.body.job.kind).toBe("purge");
 
-    // t-beta independently runs hookKeyOnly R26 and delete.
-    const bCreds = await call(e, betaP, "R26", {
+    // t-beta independently runs hookKeyOnly R26 and later cleanup R9 delete.
+    const bCreds = await call(e, TI_CREATE_B, "R26", {
       params: { id: betaId },
       body: { requestId: requestId(), hookKeyOnly: true, recipientKey: KEY },
     });
@@ -375,22 +456,23 @@ describe("two staging fixtures: isolation, hookKeyOnly R26, and bound delete+pur
       .prepare("UPDATE jobs SET status = 'done', finished_at = 5 WHERE id = ?")
       .bind(bCreds.body.job.id)
       .run();
-    const bDel = await call(e, betaP, "R9", {
+    const bDel = await call(e, bDelP, "R9", {
       params: { id: betaId },
       body: { requestId: requestId(), confirmSlug: "t-beta" },
     });
     expect(bDel.status).toBe(202);
 
-    // Unused helper import check: seedJob still works for unbound R15 refusal.
+    // Stray job on admin-created t-* install is 404.
     const strayJob = await seedJob(adminT.id, {
       kind: "redline_creds",
       workflow: "manage_install",
       status: "done",
       actor_kind: "oidc",
-      actor_key: alphaP.actorKey,
+      actor_key: TI_CREATE_A.actorKey,
     });
     expect(
-      (await call(e, alphaP, "R15", { params: { jobId: strayJob } })).status,
+      (await call(e, TI_CREATE_A, "R15", { params: { jobId: strayJob } }))
+        .status,
     ).toBe(404);
   });
 });

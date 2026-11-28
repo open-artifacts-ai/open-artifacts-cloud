@@ -125,11 +125,12 @@ export async function createInstall(a: HandlerArgs): Promise<RouteResult> {
   if (
     p.kind === "oidc" &&
     p.oidcWorkflow === "test-install" &&
-    parseTestInstallActorKey(p.actorKey)?.installId !== null
+    (p.testInstallMode === "delete" ||
+      parseTestInstallActorKey(p.actorKey)?.mode !== "create")
   )
     throw new ApiError(
       "forbidden",
-      "fixture install ID header is not allowed on create",
+      "fixture cleanup credentials cannot create an install",
     );
   const f = checkCreateFields(
     body,

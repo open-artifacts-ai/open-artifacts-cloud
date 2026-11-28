@@ -292,6 +292,7 @@ const PLANS: Partial<Record<ApiRouteId, Planner>> = {
     const f = checkRedlineCreds(
       body,
       a.principal.kind === "oidc" ? a.principal.oidcWorkflow : undefined,
+      a.principal.kind === "oidc" ? a.principal.testInstallMode : undefined,
     );
     if (f) throw new ApiError(f.code, `${f.field}: ${f.code}`);
     // Mint, hookKeyOnly, or revoke (C6): the shared helper owns the args shape.

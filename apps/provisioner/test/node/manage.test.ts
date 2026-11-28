@@ -3241,7 +3241,7 @@ describe("a create's lease across its attempts (#1326)", () => {
   });
 });
 
-describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", () => {
+describe("disposable staging test-install (hookKeyOnly + authenticated delete/purge)", () => {
   const fixtureVars = () => ({
     AUTH_PROVIDERS: "email",
     AUTH_DOMAINS: "oa-redline-a.fyi",
@@ -3249,18 +3249,26 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
     TEST_DOMAIN: "oa-redline-a.fyi",
     TIER: "team",
   });
-  const creatorKey = "oidc:4242:test-install";
-  const boundKey = (installId: string) => `${creatorKey}:${installId}`;
+  const keyIdA = `${"A".repeat(42)}A`;
+  const keyIdB = `${"B".repeat(42)}A`;
+  const createKeyA = `oidc:4242:test-install:1001:${keyIdA}`;
+  const createKeyB = `oidc:4242:test-install:1002:${keyIdB}`;
+  const deleteKeyA = (installId: string) =>
+    `oidc:4242:test-install-delete:${keyIdA}:${installId}`;
+  const deleteKeyB = (installId: string) =>
+    `oidc:4242:test-install-delete:${keyIdB}:${installId}`;
 
-  it("hookKeyOnly seals only {hookKey} with zero session or PAT calls, including on replay", async () => {
+  it("hookKeyOnly seals only {hookKey} with zero session or PAT calls, including on retry and replay", async () => {
     const s = await active({
       slug: "t-hook",
       actor: "oidc",
-      actorKey: creatorKey,
+      actorKey: createKeyA,
       testHooks: true,
       vars: fixtureVars(),
     });
-    const { script, seen, probes } = stubInstall(s.installId);
+    const { script, seen, probes } = stubInstall(s.installId, undefined, {
+      staleProbes: KEY_LIVE_WAITS_MS.length + 1,
+    });
     const oldKey = script?.secrets.get("TEST_HOOK_KEY");
     const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
       "deriveBits",
@@ -3273,7 +3281,7 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
 
     const r = await manage("redline_creds", s.installId, {
       actor: "oidc",
-      actorKey: boundKey(s.installId),
+      actorKey: createKeyA,
       args: { hookKeyOnly: true, recipientKey },
       twice: true,
     });
@@ -3281,7 +3289,7 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
     expect(r.job?.status).toBe("done");
     const newKey = script?.secrets.get("TEST_HOOK_KEY") as string;
     expect(newKey).not.toBe(oldKey);
-    expect(probes.length).toBeGreaterThan(0);
+    expect(probes.length).toBeGreaterThanOrEqual(KEY_LIVE_WAITS_MS.length + 3);
     // Never calls /__test/session (real session), /api/v1/tokens, or /api/v1/me.
     expect(seen).toEqual([]);
     const opened = JSON.parse(
@@ -3291,18 +3299,18 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
     expect("pat" in opened).toBe(false);
   });
 
-  it("refuses generic PAT mint, revoke, mismatched install ID, admin-created t-, and rl- at recheck with zero CF writes", async () => {
+  it("refuses generic PAT mint, revoke, delete-mode R26, cross-fixture, admin-created t-, and rl- at recheck with zero CF writes", async () => {
     const alpha = await active({
       slug: "t-alpha",
       actor: "oidc",
-      actorKey: creatorKey,
+      actorKey: createKeyA,
       testHooks: true,
       vars: fixtureVars(),
     });
     const beta = await active({
       slug: "t-beta",
       actor: "oidc",
-      actorKey: creatorKey,
+      actorKey: createKeyB,
       testHooks: true,
       vars: fixtureVars(),
     });
@@ -3313,7 +3321,7 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
       vars: fixtureVars(),
     });
     const rlA = await active({ slug: "rl-a", actor: "oidc", testHooks: true });
-    const recipientKey = `${"A".repeat(42)}A`;
+    const recipientKey = `${"C".repeat(42)}A`;
 
     const cases: Array<{
       name: string;
@@ -3326,15 +3334,22 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
         name: "fixture generic PAT mint",
         kind: "redline_creds",
         installId: alpha.installId,
-        actorKey: boundKey(alpha.installId),
+        actorKey: createKeyA,
         args: { recipientKey },
       },
       {
         name: "fixture revoke",
         kind: "redline_creds",
         installId: alpha.installId,
-        actorKey: boundKey(alpha.installId),
+        actorKey: createKeyA,
         args: { revoke: true },
+      },
+      {
+        name: "delete-mode actor calling hookKeyOnly R26",
+        kind: "redline_creds",
+        installId: alpha.installId,
+        actorKey: deleteKeyA(alpha.installId),
+        args: { hookKeyOnly: true, recipientKey },
       },
       {
         name: "redline caller requesting hookKeyOnly",
@@ -3344,35 +3359,41 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
         args: { hookKeyOnly: true, recipientKey },
       },
       {
-        name: "mismatched install ID",
+        name: "cross-fixture create actor on R26",
         kind: "redline_creds",
         installId: beta.installId,
-        actorKey: boundKey(alpha.installId),
+        actorKey: createKeyA,
         args: { hookKeyOnly: true, recipientKey },
       },
       {
-        name: "unbound fixture key on delete",
+        name: "cross-fixture delete actor with wrong owner key",
         kind: "delete",
         installId: alpha.installId,
-        actorKey: creatorKey,
+        actorKey: deleteKeyB(alpha.installId),
+      },
+      {
+        name: "cross-fixture delete actor with wrong target ID",
+        kind: "delete",
+        installId: beta.installId,
+        actorKey: deleteKeyA(alpha.installId),
       },
       {
         name: "fixture deleting admin-created t- install",
         kind: "delete",
         installId: adminT.installId,
-        actorKey: boundKey(adminT.installId),
+        actorKey: deleteKeyA(adminT.installId),
       },
       {
         name: "fixture deleting rl- install",
         kind: "delete",
         installId: rlA.installId,
-        actorKey: boundKey(rlA.installId),
+        actorKey: deleteKeyA(rlA.installId),
       },
       {
         name: "fixture upgrading its own install",
         kind: "upgrade",
         installId: alpha.installId,
-        actorKey: boundKey(alpha.installId),
+        actorKey: createKeyA,
         args: { from: V1, to: V2 },
       },
     ];
@@ -3392,25 +3413,25 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
     }
   });
 
-  it("bound delete and immediate purge remove only the target fixture and leave sibling intact", async () => {
+  it("authenticated delete and immediate purge remove only the target fixture and leave sibling intact", async () => {
     const alpha = await active({
       slug: "t-del-a",
       actor: "oidc",
-      actorKey: creatorKey,
+      actorKey: createKeyA,
       testHooks: true,
       vars: fixtureVars(),
     });
     const beta = await active({
       slug: "t-del-b",
       actor: "oidc",
-      actorKey: creatorKey,
+      actorKey: createKeyB,
       testHooks: true,
       vars: fixtureVars(),
     });
 
     const del = await manage("delete", alpha.installId, {
       actor: "oidc",
-      actorKey: boundKey(alpha.installId),
+      actorKey: deleteKeyA(alpha.installId),
     });
     expect(del.error).toBeNull();
     expect(del.job?.status).toBe("done");
@@ -3418,7 +3439,7 @@ describe("disposable staging test-install (hookKeyOnly + bound delete/purge)", (
 
     const purge = await manage("purge", alpha.installId, {
       actor: "oidc",
-      actorKey: boundKey(alpha.installId),
+      actorKey: deleteKeyA(alpha.installId),
     });
     expect(purge.error).toBeNull();
     expect(purge.job?.status).toBe("done");
